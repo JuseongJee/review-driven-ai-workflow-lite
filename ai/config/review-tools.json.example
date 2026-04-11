@@ -1,0 +1,17 @@
+{
+  "default_priority": ["codex", "gemini", "claude"],
+  "tools": {
+    "gemini": {
+      "bin": null,
+      "model": null
+    },
+    "codex": {
+      "bin": null
+    },
+    "claude": {
+      "bin": null,
+      "model": null,
+      "self_review_warning": true
+    }
+  }
+}

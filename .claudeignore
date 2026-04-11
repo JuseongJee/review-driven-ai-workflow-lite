@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+vendor/
+
+# Cache & generated
+.cache/
+.turbo/
+
+# Environment & secrets
+.env
+.env.*
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+logs/
