@@ -15,7 +15,9 @@ REQUEST → 리뷰 → spec/plan → 실행 → 검증 → 최종 리뷰까지, 
 
 프로젝트 디렉토리에서 Claude Code를 열고:
 
-> 이 AI 워크플로 템플릿 적용해: https://github.com/JuseongJee/review-driven-ai-workflow-lite
+```text
+이 AI 워크플로 템플릿 적용해: https://github.com/JuseongJee/review-driven-ai-workflow-lite
+```
 
 AI가 필요한 파일을 가져와서 프로젝트에 맞게 배치하고, PROJECT_CONTEXT.md를 채워줍니다.
 
