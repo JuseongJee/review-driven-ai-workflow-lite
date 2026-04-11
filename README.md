@@ -8,24 +8,21 @@ REQUEST → 리뷰 → spec/plan → 실행 → 검증 → 최종 리뷰까지, 
 
 ## 전제 조건
 
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) 설치
+- [Claude Code](https://claude.ai/code) 설치 및 로그인
+- [Superpowers](https://github.com/anthropics/claude-code-superpowers) 플러그인 설치
 
 ## 빠른 시작
 
-```bash
-# 1. 템플릿 파일을 프로젝트 루트에 복사
-cp -r <이 repo>/* <프로젝트 루트>/
+프로젝트 디렉토리에서 Claude Code를 열고:
 
-# 2. PROJECT_CONTEXT.md 채우기
-#    프로젝트 목적, 도메인, 산출물 유형, 품질 기준, 대상 독자 등
+> 이 AI 워크플로 템플릿 적용해: https://github.com/JuseongJee/review-driven-ai-workflow-lite
 
-# 3. Claude Code 실행
-claude
+AI가 필요한 파일을 가져와서 프로젝트에 맞게 배치하고, PROJECT_CONTEXT.md를 채워줍니다.
 
-# 4. 첫 작업
-#    "이 요구사항으로 진행해줘: ..."    (큰 작업)
-#    "small-task로 바로 작성해줘: ..." (작은 작업)
-```
+### 적용 후 할 일
+
+1. AI에게 말한다: "프로젝트 분석해서 PROJECT_CONTEXT.md 채워줘"
+2. 첫 작업을 요청한다: "이 요구사항으로 진행해줘: ..."
 
 ## 핵심 구조
 
@@ -49,9 +46,9 @@ REQUEST 작성 → REQUEST review → spec/plan → spec/plan review → 실행 
 REQUEST 정리 → 실행 → 검증 → 아카이브
 ```
 
-## dev 버전과의 차이
+## Developer 버전과의 차이
 
-| 항목 | dev | lite |
+| 항목 | Developer | Lite |
 |------|-----|------|
 | 검증 | test.sh + lint.sh + typecheck.sh | verify.sh (프롬프트 기반) |
 | 최종 리뷰 | diff review (코드 변경) | output review (산출물 품질) |
