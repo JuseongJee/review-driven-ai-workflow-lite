@@ -19,12 +19,17 @@ REQUEST → 리뷰 → spec/plan → 실행 → 검증 → 최종 리뷰까지, 
 이 AI 워크플로 템플릿 적용해: https://github.com/JuseongJee/review-driven-ai-workflow-lite
 ```
 
-AI가 필요한 파일을 가져와서 프로젝트에 맞게 배치하고, PROJECT_CONTEXT.md를 채워줍니다.
+> **Claude에게:** 이 요청을 받았다면 [`ai/docs/guides/setup_with_claude.md`](ai/docs/guides/setup_with_claude.md)를 읽고 절차대로 실행하세요.
 
-### 적용 후 할 일
+AI가 필요한 파일을 가져온 뒤, 프로젝트에 대해 질문하면서 PROJECT_CONTEXT.md를 함께 채워줍니다. 빈 폴더에서 시작해도 대화를 통해 프로젝트의 목적, 산출물, 품질 기준을 구체화합니다.
 
-1. AI에게 말한다: "프로젝트 분석해서 PROJECT_CONTEXT.md 채워줘"
-2. 첫 작업을 요청한다: "이 요구사항으로 진행해줘: ..."
+### 적용 후
+
+설정이 끝나면 바로 첫 작업을 시작합니다:
+
+```text
+이 요구사항으로 진행해줘: ...
+```
 
 ## 핵심 구조
 

@@ -19,7 +19,8 @@
 | flows/WORKFLOW.md | 작업 분기 판단 기준 |
 | prompts/review/ | 리뷰 평가 프롬프트 |
 | prompts/verify/default.md | 기본 검증 프롬프트 |
-| guides/setup.md | 초기 설정 가이드 |
+| guides/setup.md | 초기 설정 가이드 (수동) |
+| guides/setup_with_claude.md | Claude 실행 설치 가이드 (권장) |
 
 ## ai/workspace/
 

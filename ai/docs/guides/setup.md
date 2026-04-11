@@ -1,11 +1,25 @@
 # 초기 설정 가이드
 
+## 권장: AI에게 설치 시키기
+
+프로젝트 디렉토리에서 Claude Code를 열고 한 마디만 하면 됩니다:
+
+```text
+이 AI 워크플로 템플릿 적용해: <배포 repo URL>
+```
+
+Claude가 [setup_with_claude.md](setup_with_claude.md)를 읽고 설치 → 프로젝트 파악 → PROJECT_CONTEXT.md 채우기까지 진행합니다.
+
+아래 내용은 수동으로 설정할 때 참고하세요.
+
+---
+
 ## 전제 조건
 
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) 설치 완료
 - 프로젝트 디렉토리 생성 완료
 
-## 설치 방법
+## 수동 설치
 
 1. 배포 저장소에서 템플릿 파일을 프로젝트 루트에 복사합니다.
 
