@@ -19,11 +19,11 @@
 
 1. 프로젝트 규칙과 제약은 `PROJECT_CONTEXT.md`에서 먼저 읽습니다.
 2. 현재 작업은 `REQUEST.md`와 `CURRENT_TASK.md`에 적힌 범위 안에서만 수행합니다.
-3. 현재 범위를 벗어나지만 가치가 있는 항목은 `ai/workspace/backlog/FUTURE_REQUESTS.md`에 기록합니다.
-4. 큰 작업과 기존 산출물의 중간 이상 변경은 reviewed spec / plan 없이 바로 작성하지 않습니다. 판단 기준은 `ai/docs/flows/WORKFLOW.md`에 있습니다.
+3. 현재 범위를 벗어나지만 가치가 있는 항목은 `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md`에 기록합니다.
+4. 큰 작업과 기존 산출물의 중간 이상 변경은 reviewed spec / plan 없이 바로 작성하지 않습니다. 판단 기준은 `rd-workflow/docs/flows/WORKFLOW.md`에 있습니다.
 5. 사용자가 명시적으로 small-task로 지정한 작업만 바로 작성할 수 있습니다. AI가 자체적으로 small로 판단하지 않습니다.
 6. 작성 후에는 검증을 실행합니다 (절대 규칙 참조).
-7. 중요한 구조 결정은 `ai/docs/adr/`에 기록합니다.
+7. 중요한 구조 결정은 `rd-workflow/docs/adr/`에 기록합니다.
 
 ## Workflow 우선순위
 
@@ -60,16 +60,16 @@
 
 ### REQUEST 아카이브
 
-- 작업 완료 시 현재 `REQUEST.md`를 `ai/workspace/backlog/request-archive/YYYY-MM-DD-HHMM-작업명.md`로 복사합니다.
+- 작업 완료 시 현재 `REQUEST.md`를 `rd-workflow-workspace/backlog/request-archive/YYYY-MM-DD-HHMM-작업명.md`로 복사합니다.
 - `REQUEST.md`의 `Source FR`이 `-`가 아니면 해당 FR 항목의 status를 `done`으로 변경하고 `FUTURE_REQUESTS.md` 인덱스에서 삭제합니다.
 - 아카이브 후 `REQUEST.md`를 초기 템플릿 상태로 비웁니다.
-- `PROJECT_CONTEXT.md`에 `auto_completion_report: true`이면 자동으로, 아니면 "작업 요약 report를 남길까요?" 질문 후 `ai/workspace/reports/completions/YYYY-MM-DD-HHMM-작업명.md`에 report를 작성합니다.
+- `PROJECT_CONTEXT.md`에 `auto_completion_report: true`이면 자동으로, 아니면 "작업 요약 report를 남길까요?" 질문 후 `rd-workflow-workspace/reports/completions/YYYY-MM-DD-HHMM-작업명.md`에 report를 작성합니다.
 
 ## 절대 규칙 (모든 skill에 공통 적용)
 
 - **실행 완료 후 반드시 `/final-output-review`를 거친다.** 이 단계를 건너뛰고 작업을 종료하지 않는다.
 - **Superpowers가 사용 가능한 환경에서는 반드시 사용한다.** 사용 불가능할 때만 직접 산출물을 작성한다.
-- **검증**: 실행 후 `bash ai/scripts/verify.sh`를 실행한다.
+- **검증**: 실행 후 `bash rd-workflow/scripts/verify.sh`를 실행한다.
 
 ## Review 규칙
 
@@ -77,8 +77,8 @@
 - review는 기본적으로 `prepare_review_pipeline.sh`로 세션을 만들고 `run_review_turn.sh`로 턴을 이어갑니다.
 - 최신 Reviewer 턴이 `이의 없음`을 명시할 때까지 review를 이어갑니다.
 - 사람 결정이 필요하거나 총 20턴에 도달하면 `awaiting-user`로 바꾸고 멈춥니다.
-- **autopilot 모드에서는** `ai/claude_skills/autopilot/SKILL.md`의 Autonomy Override가 이 Review 규칙 섹션보다 우선합니다 (예: review 턴 한도 50턴, 자율 판단 등). 절대 규칙과 일반 모드의 20턴 규칙은 변하지 않습니다.
-- review 세션 종료 시 `ai/workspace/reports/reviews/`에 주요 쟁점과 결론을 요약한 report를 작성합니다.
+- **autopilot 모드에서는** `rd-workflow/claude_skills/autopilot/SKILL.md`의 Autonomy Override가 이 Review 규칙 섹션보다 우선합니다 (예: review 턴 한도 50턴, 자율 판단 등). 절대 규칙과 일반 모드의 20턴 규칙은 변하지 않습니다.
+- review 세션 종료 시 `rd-workflow-workspace/reports/reviews/`에 주요 쟁점과 결론을 요약한 report를 작성합니다.
 
 ## Always Read
 
@@ -87,14 +87,14 @@
 - `REQUEST.md`
 - `PROJECT_CONTEXT.md`
 - `CURRENT_TASK.md`
-- `ai/claude_skills/*/rules.md` (설치된 extension이 있으면)
+- `rd-workflow/claude_skills/*/rules.md` (설치된 extension이 있으면)
 
 필요할 때만 읽을 파일:
 
-- `ai/workspace/backlog/FUTURE_REQUESTS.md` — future request 기록/조회/autopilot 시
-- `ai/docs/flows/WORKFLOW.md` — 작업 분기가 헷갈릴 때
-- `ai/docs/AI_DOC_MAP.md` — 문서 위치가 헷갈릴 때
-- `ai/docs/prompts/README.md` — 프롬프트 파일이 필요할 때
+- `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` — future request 기록/조회/autopilot 시
+- `rd-workflow/docs/flows/WORKFLOW.md` — 작업 분기가 헷갈릴 때
+- `rd-workflow/docs/AI_DOC_MAP.md` — 문서 위치가 헷갈릴 때
+- `rd-workflow/docs/prompts/README.md` — 프롬프트 파일이 필요할 때
 
 ## Task Tracking
 
@@ -121,9 +121,9 @@
 
 저장 위치:
 
-- 새 산출물 spec: `ai/workspace/specs/base/`
-- 기존 산출물 변경 change spec: `ai/workspace/specs/changes/`
-- plan: `ai/workspace/plans/`
+- 새 산출물 spec: `rd-workflow-workspace/specs/base/`
+- 기존 산출물 변경 change spec: `rd-workflow-workspace/specs/changes/`
+- plan: `rd-workflow-workspace/plans/`
 
 ## 토큰 효율 규칙
 

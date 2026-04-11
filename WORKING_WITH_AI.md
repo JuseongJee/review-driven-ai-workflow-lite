@@ -1,7 +1,7 @@
 # Working With AI
 
 일상적으로 AI에게 말하는 방법을 정리한 치트시트입니다.
-상세 워크플로는 `ai/docs/flows/WORKFLOW.md`, 전체 규칙은 `CLAUDE.md`를 참조하세요.
+상세 워크플로는 `rd-workflow/docs/flows/WORKFLOW.md`, 전체 규칙은 `CLAUDE.md`를 참조하세요.
 
 ## 상황별 프롬프트
 
@@ -31,6 +31,6 @@
 | 상황 | 해결 |
 |------|------|
 | AI가 워크플로를 안 따를 때 | "CLAUDE.md 다시 읽고 워크플로대로 진행해" |
-| skill이 원하는 출력을 안 낼 때 | `ai/docs/prompts/recovery/` 참조 |
-| 자동 review가 안 될 때 | `ai/docs/prompts/manual/` 참조 |
+| skill이 원하는 출력을 안 낼 때 | `rd-workflow/docs/prompts/recovery/` 참조 |
+| 자동 review가 안 될 때 | `rd-workflow/docs/prompts/manual/` 참조 |
 | 검증 프롬프트만 다시 채우고 싶을 때 | "프로젝트 파일 읽고 검증 프롬프트 채워줘" |

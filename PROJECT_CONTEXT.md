@@ -18,7 +18,7 @@
 - constraints: (분량, 마감, 브랜드 가이드 등)
 
 ## 검증
-- verify_prompt: ai/docs/prompts/verify/default.md
+- verify_prompt: rd-workflow/docs/prompts/verify/default.md
 - auto_completion_report: false
 
 ## 워크플로 설정

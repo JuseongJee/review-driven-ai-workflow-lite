@@ -19,7 +19,7 @@ REQUEST → 리뷰 → spec/plan → 실행 → 검증 → 최종 리뷰까지, 
 이 AI 워크플로 템플릿 적용해: https://github.com/JuseongJee/review-driven-ai-workflow-lite
 ```
 
-> **Claude에게:** 이 요청을 받았다면 [`ai/docs/guides/setup_with_claude.md`](ai/docs/guides/setup_with_claude.md)를 읽고 절차대로 실행하세요.
+> **Claude에게:** 이 요청을 받았다면 [`rd-workflow/docs/guides/setup_with_claude.md`](rd-workflow/docs/guides/setup_with_claude.md)를 읽고 절차대로 실행하세요.
 
 AI가 필요한 파일을 가져온 뒤, 프로젝트에 대해 질문하면서 PROJECT_CONTEXT.md를 함께 채워줍니다. 빈 폴더에서 시작해도 대화를 통해 프로젝트의 목적, 산출물, 품질 기준을 구체화합니다.
 
@@ -66,7 +66,7 @@ REQUEST 정리 → 실행 → 검증 → 아카이브
 
 ## 문서
 
-- [초기 설정 가이드](ai/docs/guides/setup.md)
-- [사용자 매뉴얼](ai/docs/USER_MANUAL.md)
-- [워크플로 판단 기준](ai/docs/flows/WORKFLOW.md)
-- [문서 인덱스](ai/docs/AI_DOC_MAP.md)
+- [초기 설정 가이드](rd-workflow/docs/guides/setup.md)
+- [사용자 매뉴얼](rd-workflow/docs/USER_MANUAL.md)
+- [워크플로 판단 기준](rd-workflow/docs/flows/WORKFLOW.md)
+- [문서 인덱스](rd-workflow/docs/AI_DOC_MAP.md)

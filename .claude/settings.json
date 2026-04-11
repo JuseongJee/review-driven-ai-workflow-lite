@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ai/scripts/hooks/session_start.sh"
+            "command": "bash rd-workflow/scripts/hooks/session_start.sh"
           }
         ]
       }
