@@ -27,7 +27,7 @@
 
 ## Workflow 우선순위
 
-> Superpowers는 Claude Code의 내장 워크플로 기능으로, 설계 -> 계획 -> 실행 순서를 구조화합니다.
+> Superpowers는 Claude Code의 내장 워크플로 기능으로, 설계 → 계획 → 실행 순서를 구조화합니다.
 
 이 프로젝트의 산출물은 코드가 아닌 문서/기획물/콘텐츠입니다. Superpowers의 설계/계획/구현 단계를 산출물 작성에 적용합니다.
 
@@ -52,11 +52,11 @@
 
 ### 큰 작업
 
-`REQUEST 작성 -> REQUEST review -> spec/change spec -> plan -> spec/plan review -> 실행 -> 검증 -> final output review -> REQUEST 아카이브`
+`REQUEST 작성 → REQUEST review → spec/change spec → plan → spec/plan review → 실행 → 검증 → final output review → REQUEST 아카이브`
 
 ### 작은 작업
 
-`REQUEST 정리 -> 실행 -> 검증 -> 필요 시 final output review -> REQUEST 아카이브`
+`REQUEST 정리 → 실행 → 검증 → 필요 시 final output review → REQUEST 아카이브`
 
 ### REQUEST 아카이브
 

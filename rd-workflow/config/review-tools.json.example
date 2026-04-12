@@ -13,5 +13,10 @@
       "model": null,
       "self_review_warning": true
     }
+  },
+  "overrides": {
+    "diff-review": {
+      "priority": ["codex"]
+    }
   }
 }

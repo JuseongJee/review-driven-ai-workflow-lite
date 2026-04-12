@@ -44,11 +44,11 @@
 
 ### 작은 작업
 
-`REQUEST 정리 -> 실행 -> 검증 -> 필요 시 final output review -> REQUEST 아카이브`
+`REQUEST 정리 → 실행 → 검증 → 필요 시 final output review → REQUEST 아카이브`
 
 ### 큰 작업 / 기존 산출물의 중간 이상 변경
 
-`REQUEST 정리 -> REQUEST review -> spec/change spec -> plan -> spec/plan review -> 실행 -> 검증 -> final output review -> REQUEST 아카이브`
+`REQUEST 정리 → REQUEST review → spec/change spec → plan → spec/plan review → 실행 → 검증 → final output review → REQUEST 아카이브`
 
 ## Spec 유형 선택
 
