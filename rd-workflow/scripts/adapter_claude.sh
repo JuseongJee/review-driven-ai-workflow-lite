@@ -28,7 +28,7 @@ if [[ -n "${TOOL_MODEL:-}" ]]; then
 fi
 
 # Claude CLI 실행
-if ! "$claude_bin" -p "${model_args[@]}" \
+if ! "$claude_bin" -p ${model_args[@]+"${model_args[@]}"} \
   --allowedTools "Edit,Write,Read,Glob,Grep,Bash" \
   < "$PROMPT_FILE"; then
   echo "Claude CLI가 비정상 종료했습니다" >&2
