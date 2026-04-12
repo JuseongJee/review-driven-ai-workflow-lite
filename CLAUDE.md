@@ -98,6 +98,19 @@
 
 ## Task Tracking
 
+### CURRENT_TASK.md 허용 상태값
+
+Status 필드는 아래 값만 사용합니다 (guard hook이 이 값으로 판정):
+
+- `대기 중`
+- `REQUEST review 대기`
+- `spec/plan 작성 중`
+- `spec/plan review 대기`
+- `실행 중`
+- `검증 중`
+- `output review 대기`
+- `완료`
+
 `CURRENT_TASK.md`는 아래 시점마다 다시 씁니다.
 
 - REQUEST 정리 후

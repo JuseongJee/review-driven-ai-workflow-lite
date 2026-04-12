@@ -9,6 +9,35 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash rd-workflow/scripts/hooks/pre_commit_review_gate.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash rd-workflow/scripts/hooks/implementation_gate.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash rd-workflow/scripts/hooks/implementation_gate.sh"
+          }
+        ]
+      }
     ]
   }
 }
