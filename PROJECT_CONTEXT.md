@@ -21,6 +21,9 @@
 - verify_prompt: rd-workflow/docs/prompts/verify/default.md
 - auto_completion_report: false
 
+## Template Source
+- template_repo: (배포 repo URL, 예: https://github.com/user/repo)
+
 ## 워크플로 설정
 - small_task_threshold: (어디까지 small-task로 볼지 기준)
 

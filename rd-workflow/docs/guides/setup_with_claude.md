@@ -37,6 +37,8 @@ git clone --depth 1 <배포 repo URL> /tmp/ai-workflow-lite-src
 
 이미 존재하는 파일이 있으면 사용자에게 덮어쓸지 확인합니다.
 
+사용자가 제공한 배포 repo URL을 `PROJECT_CONTEXT.md`의 `template_repo`에 저장합니다. (이후 `/tpl update`에서 사용)
+
 임시 clone 디렉토리 정리:
 ```bash
 rm -rf /tmp/ai-workflow-lite-src
