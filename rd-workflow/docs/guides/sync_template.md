@@ -45,7 +45,7 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 - `rd-workflow/claude_skills/`
 - `rd-workflow/config/` (설정 예제 파일)
 - `rd-workflow/docs/` (adr, flows, guides, prompts, backlog 구조 문서)
-- `rd-workflow/scripts/` 중 review pipeline 관련 스크립트
+- `rd-workflow/scripts/` (보존 대상 제외)
 
 **신규 추가** — 템플릿에 있지만 프로젝트에 없는 파일
 
@@ -59,6 +59,7 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 - `rd-workflow-workspace/specs/`, `rd-workflow-workspace/plans/` 안의 작업 산출물 (README 제외)
 - `rd-workflow/scripts/verify.sh` (프로젝트별 검증 명령이 들어 있음)
 - `rd-workflow-workspace/handoffs/` 안의 작업 내용물
+- `rd-workflow/docs/prompts/verify/` (프로젝트별 검증 프롬프트 커스터마이징)
 - `rd-workflow/config/review-tools.json` (프로젝트별 리뷰 도구 설정, `.example`은 동기화 대상)
 - 프로젝트 고유 설정 파일 (`.gitignore`, `.claude/` 등)
 
@@ -120,8 +121,8 @@ bash rd-workflow/scripts/install_claude_skills.sh project
 ```
 
 - link 모드로 설치된 기존 스킬: 파일 내용은 symlink으로 자동 반영되지만, **새로 추가된 스킬**은 symlink이 없으므로 재설치가 필요합니다.
-- copy 모드로 설치된 기존 스킬: 모든 스킬의 재설치가 필요합니다.
-- 스크립트가 이미 설치된 스킬은 자동으로 건너뛰므로 항상 실행해도 안전합니다.
+- copy 모드로 설치된 기존 스킬: 스크립트가 기존 디렉토리를 건너뛰므로, 먼저 `.claude/skills/` 아래의 해당 디렉토리를 삭제한 뒤 재실행해야 합니다.
+- 새로 추가된 스킬은 link/copy 모드 모두에서 자동 설치됩니다.
 
 ### 8. 완료 보고
 
