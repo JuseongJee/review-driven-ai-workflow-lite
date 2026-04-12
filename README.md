@@ -23,6 +23,7 @@ REQUEST → 리뷰 → spec/plan → 실행 → 검증 → 최종 리뷰까지, 
 
 AI가 필요한 파일을 가져온 뒤, 프로젝트에 대해 질문하면서 PROJECT_CONTEXT.md를 함께 채워줍니다. 빈 폴더에서 시작해도 대화를 통해 프로젝트의 목적, 산출물, 품질 기준을 구체화합니다.
 
+
 ### 적용 후
 
 설정이 끝나면 바로 첫 작업을 시작합니다:
@@ -63,6 +64,33 @@ REQUEST 정리 → 실행 → 검증 → 아카이브
 | 스킬 | 12개 | 6개 (핵심만) |
 | 리뷰 파이프라인 | 동일 | 동일 |
 | Superpowers | 동일 | 동일 |
+
+## 템플릿 업데이트
+
+이미 적용된 프로젝트에서 최신 버전으로 업데이트하는 방법입니다.
+
+### URL로 업데이트 (repo 접근 가능할 때)
+
+```text
+/tpl update
+```
+
+또는:
+
+```text
+이 템플릿으로 업데이트해: https://github.com/JuseongJee/review-driven-ai-workflow-lite
+```
+
+
+### zip으로 업데이트
+
+새 zip을 받아서:
+
+```text
+이 템플릿으로 업데이트해: ~/Downloads/rd-workflow-lite.zip
+```
+
+Claude가 압축 해제부터 동기화까지 자동으로 진행합니다.
 
 ## 문서
 
