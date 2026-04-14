@@ -9,15 +9,16 @@
 
 이 판단이 전체 흐름의 핵심 분기입니다.
 
-**작은 작업은 사용자가 직접 지정합니다.** AI가 자체적으로 작은 작업이라고 판단하지 않습니다.
-사용자가 "small-task로 처리해줘", "이건 small이야" 등 명시적으로 말한 경우에만 작은 작업 흐름을 탑니다.
+**작은 작업은 Intake 규칙에서 자동으로 판단합니다.** 판단이 애매하면 큰 작업으로 분류합니다.
 
-작은 작업의 일반적 특징 (참고용):
+판단 기준 (workflow-router의 Auto Intake 판단 기준 참조):
 - 변경/생성 파일이 2~3개 이하
 - 새 구조나 체계를 도입하지 않음
 - 기존 산출물에 미치는 영향이 거의 없음
 - 단순 수정, 문구 변경, 설정 조정 수준
 - 예: 오타 수정, 문구 다듬기, 설정값 변경, 짧은 메모 추가
+
+위 조건을 모두 만족하면 small, 그 외는 large.
 
 **큰 작업**으로 봐야 하는 경우:
 - 여러 산출물이 함께 바뀜
@@ -26,7 +27,7 @@
 - 품질 기준을 새로 정해야 함
 - 예: 새 보고서 작성, 기획서 전면 재구성, 콘텐츠 시리즈 기획
 
-사용자가 small로 지정하지 않은 모든 작업은 큰 작업으로 취급합니다.
+Intake 규칙에서 small로 판단하지 않은 모든 작업은 큰 작업으로 취급합니다.
 
 ## 입력 소스
 
@@ -34,21 +35,30 @@
 
 ### 자유 텍스트 요구사항 (기본)
 
-사용자가 직접 요구사항을 말하면 → `/request-to-reviewed-plan`
+사용자가 직접 요구사항을 말하면:
+1. FR에 자동 등록 (Intake 규칙 적용)
+2. small/large 자동 판단
+3. 해당 skill로 바로 진행
+
+### /fr add 직접 호출
+
+등록만 수행, 실행하지 않음 (기존과 동일).
 
 ### 기획 문서 (외부 문서)
 
-기획 문서나 참고 자료 텍스트가 있으면 → REQUEST.md에 정리 → `/request-to-reviewed-plan`
+기획 문서나 참고 자료 텍스트가 있으면:
+1. FR에 자동 등록 (Intake 규칙 적용)
+2. REQUEST.md에 정리 → `/request-to-reviewed-plan`
 
 ## 기본 분기
 
 ### 작은 작업
 
-`REQUEST 정리 → 실행 → 검증 → 필요 시 final output review → REQUEST 아카이브`
+`FR 자동 등록 → [small 판단] → REQUEST 정리 → 실행 → 검증 → 필요 시 final output review → REQUEST 아카이브`
 
 ### 큰 작업 / 기존 산출물의 중간 이상 변경
 
-`REQUEST 정리 → REQUEST review → spec/change spec → plan → spec/plan review → 실행 → 검증 → final output review → REQUEST 아카이브`
+`FR 자동 등록 → [large 판단] → REQUEST 정리 → REQUEST review → spec/change spec → plan → spec/plan review → 실행 → 검증 → final output review → REQUEST 아카이브`
 
 ## Spec 유형 선택
 

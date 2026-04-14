@@ -21,9 +21,25 @@
 2. 현재 작업은 `REQUEST.md`와 `CURRENT_TASK.md`에 적힌 범위 안에서만 수행합니다.
 3. 현재 범위를 벗어나지만 가치가 있는 항목은 `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md`에 기록합니다.
 4. 큰 작업과 기존 산출물의 중간 이상 변경은 reviewed spec / plan 없이 바로 작성하지 않습니다. 판단 기준은 `rd-workflow/docs/flows/WORKFLOW.md`에 있습니다.
-5. 사용자가 명시적으로 small-task로 지정한 작업만 바로 작성할 수 있습니다. AI가 자체적으로 small로 판단하지 않습니다.
+5. Intake 규칙에서 small로 판단한 작업은 바로 작성할 수 있습니다. 사용자가 명시적으로 small-task로 지정하면 auto intake 판단보다 우선합니다. 판단이 애매하면 큰 작업으로 분류합니다.
 6. 작성 후에는 검증을 실행합니다 (절대 규칙 참조).
-7. 중요한 구조 결정은 `rd-workflow/docs/adr/`에 기록합니다.
+
+## Intake 규칙
+
+사용자가 새로운 작업을 요청하면 (작성, 수정, 생성 등 실행 가능한 작업):
+
+1. FR에 등록한다 (`/fr add`와 동일 절차 — `FUTURE_REQUESTS.md` 인덱스 + `items/` 상세 파일)
+2. workflow-router의 Auto Intake 판단 기준을 참고하여 small/large를 판단한다
+3. 판단 결과에 따라 해당 skill을 호출한다 (사용자에게 별도 알림 없이)
+
+Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로 승격하여 REQUEST.md를 작성할 때 채운다.
+
+작업 진행 중(`CURRENT_TASK.md` Status ≠ `대기 중`)에 새로운 독립 요청이 들어오면: FR에 등록만 하고 현재 작업을 계속한다 (auto routing 안 함). "FR 등록: **{title}**. 현재 작업 완료 후 진행합니다." 알림 후 복귀.
+
+등록하지 않는 경우:
+- `/fr add` 직접 호출 (이미 FR skill이 처리)
+- 단순 질문/확인, 워크플로 지시 (진행 중 작업의 다음 단계), 메타 대화
+- 이미 FR 등록된 요청의 후속 대화 (clarification, 수정, 재시도)
 
 ## Workflow 우선순위
 
@@ -32,7 +48,7 @@
 이 프로젝트의 산출물은 코드가 아닌 문서/기획물/콘텐츠입니다. Superpowers의 설계/계획/구현 단계를 산출물 작성에 적용합니다.
 
 - 새 산출물, 큰 작업, 기존 산출물의 중간 이상 변경에서는 Superpowers workflow부터 호출합니다.
-- 사용자가 명시적으로 small-task로 지정한 작업, 초기 설정, 단순 수정은 일반 방식으로 바로 처리해도 됩니다.
+- Intake 규칙에서 small로 판단한 작업, 초기 설정, 단순 수정은 일반 방식으로 바로 처리해도 됩니다.
 - Superpowers 필수 사용은 절대 규칙 참조.
 
 사용 순서 (모두 Claude Code Superpowers의 모드입니다):
@@ -52,11 +68,11 @@
 
 ### 큰 작업
 
-`REQUEST 작성 → REQUEST review → spec/change spec → plan → spec/plan review → 실행 → 검증 → final output review → REQUEST 아카이브`
+`FR 자동 등록 → [large 판단] → REQUEST 작성 → REQUEST review → spec/change spec → plan → spec/plan review → 실행 → 검증 → final output review → REQUEST 아카이브`
 
 ### 작은 작업
 
-`REQUEST 정리 → 실행 → 검증 → 필요 시 final output review → REQUEST 아카이브`
+`FR 자동 등록 → [small 판단] → REQUEST 정리 → 실행 → 검증 → 필요 시 final output review → REQUEST 아카이브`
 
 ### REQUEST 아카이브
 

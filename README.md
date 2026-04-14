@@ -32,6 +32,41 @@ AI가 필요한 파일을 가져온 뒤, 프로젝트에 대해 질문하면서 
 이 요구사항으로 진행해줘: ...
 ```
 
+## 사용 예시 — 단계별 프롬프트
+
+### 큰 작업
+
+```text
+1. "이 요구사항으로 진행해줘: 면접 질문지에 컬쳐 인터뷰 항목 추가"
+   → AI가 REQUEST를 작성하고 review를 시작합니다
+
+2. (review 확인, AI의 질문에 답변 후) "진행해"
+   → AI가 spec과 plan을 작성하고 review를 시작합니다
+
+3. (spec/plan review 확인, 필요시 수정 방향 전달 후) "진행해"
+   → AI가 작성을 시작합니다
+
+4. 작성 완료 → AI가 자동으로 검증 + 산출물 review를 진행합니다
+
+5. (review 확인 후) "좋아, 마무리해줘"
+```
+
+### 작은 작업
+
+```text
+1. "small-task로 바로 해줘: 운영 매뉴얼의 고객 응대 섹션 업데이트"
+   → AI가 바로 작성 → 검증 → review까지 진행합니다
+```
+
+### Autopilot
+
+```text
+1. "/autopilot"
+   → 백로그에서 작업을 선택하고 전체 파이프라인을 자율 실행합니다
+```
+
+사용자가 하는 건 **요구사항 전달 + review 결과 판단** 정도입니다. 나머지는 워크플로가 이어갑니다.
+
 ## 핵심 구조
 
 | 파일 | 역할 |
@@ -46,13 +81,15 @@ AI가 필요한 파일을 가져온 뒤, 프로젝트에 대해 질문하면서 
 
 ### 큰 작업
 ```
-REQUEST 작성 → REQUEST review → spec/plan → spec/plan review → 실행 → 검증 → final output review → 아카이브
+FR 자동 등록 → [large 판단] → REQUEST 작성 → REQUEST review → spec/plan → spec/plan review → 실행 → 검증 → final output review → 아카이브
 ```
 
 ### 작은 작업
 ```
-REQUEST 정리 → 실행 → 검증 → 아카이브
+FR 자동 등록 → [small 판단] → REQUEST 정리 → 실행 → 검증 → 아카이브
 ```
+
+사용자가 작업을 요청하면 먼저 FR에 자동 등록된 뒤, Intake 규칙이 small/large를 자동 판단하여 해당 경로로 진행합니다.
 
 ## Developer 버전과의 차이
 
@@ -81,16 +118,6 @@ REQUEST 정리 → 실행 → 검증 → 아카이브
 이 템플릿으로 업데이트해: https://github.com/JuseongJee/review-driven-ai-workflow-lite
 ```
 
-
-### zip으로 업데이트
-
-새 zip을 받아서:
-
-```text
-이 템플릿으로 업데이트해: ~/Downloads/rd-workflow-lite.zip
-```
-
-Claude가 압축 해제부터 동기화까지 자동으로 진행합니다.
 
 ## 문서
 
