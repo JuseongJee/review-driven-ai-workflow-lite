@@ -57,17 +57,12 @@ bash rd-workflow/scripts/install_claude_skills.sh project
 
 설치 후 Claude Code를 재시작하면 skill이 인식됩니다.
 
-## 검증 프롬프트 커스터마이징
+## 검증 스크립트 설정
 
-`rd-workflow/docs/prompts/verify/default.md`에 검증 기준이 있습니다.
+`rd-workflow/scripts/test.sh`, `lint.sh`, `typecheck.sh`가 검증을 담당합니다.
 
-이 파일은 `bash rd-workflow/scripts/verify.sh` 실행 시 Claude CLI에 전달되는 프롬프트입니다.
-프로젝트 특성에 맞게 검증 항목을 수정하세요.
-
-예시 수정 항목:
-- 도메인 특화 품질 기준 추가
-- 필수 포함 요소 지정 (예: 데이터 출처, 법적 고지)
-- 문체/톤 기준 세분화
+각 스크립트는 `PROJECT_CONTEXT.md`의 Build/Test/Lint/Typecheck 섹션을 참조합니다.
+프로젝트에 맞게 검증 명령을 설정하세요.
 
 ## 리뷰 도구 감지 및 설정
 

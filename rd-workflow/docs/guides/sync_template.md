@@ -57,9 +57,8 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 - `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` (항목이 있는 경우)
 - `rd-workflow-workspace/backlog/request-archive/` 안의 아카이브 파일
 - `rd-workflow-workspace/specs/`, `rd-workflow-workspace/plans/` 안의 작업 산출물 (README 제외)
-- `rd-workflow/scripts/verify.sh` (프로젝트별 검증 명령이 들어 있음)
+- `rd-workflow/scripts/test.sh`, `lint.sh`, `typecheck.sh` (프로젝트별 검증 명령이 들어 있음)
 - `rd-workflow-workspace/handoffs/` 안의 작업 내용물
-- `rd-workflow/docs/prompts/verify/` (프로젝트별 검증 프롬프트 커스터마이징)
 - `rd-workflow/config/review-tools.json` (프로젝트별 리뷰 도구 설정, `.example`은 동기화 대상)
 - 프로젝트 고유 설정 파일 (`.gitignore`, `.claude/` 등)
 

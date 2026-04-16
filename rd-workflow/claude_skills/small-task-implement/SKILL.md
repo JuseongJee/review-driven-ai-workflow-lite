@@ -21,11 +21,11 @@ Execution rules:
 - Do not introduce unnecessary structure or speculative changes.
 - If the task no longer looks like a `small-task`, stop and recommend `/request-to-reviewed-plan`.
 - Update `CURRENT_TASK.md`.
-- Run `bash rd-workflow/scripts/verify.sh` unless the repository clearly lacks it.
-- **실행 완료 후 반드시 `/final-output-review`로 넘긴다. 이 단계를 건너뛰고 작업을 종료하지 않는다.**
+- Run `bash rd-workflow/scripts/test.sh`, `bash rd-workflow/scripts/lint.sh`, and `bash rd-workflow/scripts/typecheck.sh` unless the repository clearly lacks one of them.
+- **실행 완료 후 반드시 `/final-diff-review`로 넘긴다. 이 단계를 건너뛰고 작업을 종료하지 않는다.**
 
 Final output:
 - What changed
 - Verification status
-- `Next recommended skill: /final-output-review` (필수 -- 건너뛸 수 없음)
+- `Next recommended skill: /final-diff-review` (필수 -- 건너뛸 수 없음)
 - Any blocker that still needs user input

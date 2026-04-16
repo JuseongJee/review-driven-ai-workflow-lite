@@ -16,14 +16,15 @@ review-kind:
   project-context
   request
   spec-plan [spec-path] [plan-path]
-  output
+  diff [diff-target]
 
 예:
   bash rd-workflow/scripts/prepare_review_pipeline.sh project-context
   bash rd-workflow/scripts/prepare_review_pipeline.sh request
   bash rd-workflow/scripts/prepare_review_pipeline.sh spec-plan
   bash rd-workflow/scripts/prepare_review_pipeline.sh spec-plan rd-workflow-workspace/specs/changes/2026-03-12-campaign-plan-change-spec.md rd-workflow-workspace/plans/2026-03-12-campaign-plan-plan.md
-  bash rd-workflow/scripts/prepare_review_pipeline.sh output
+  bash rd-workflow/scripts/prepare_review_pipeline.sh diff
+  bash rd-workflow/scripts/prepare_review_pipeline.sh diff "git diff main...HEAD"
 EOF
 }
 
@@ -149,11 +150,12 @@ case "$review_kind" in
 ${plan_path}"
     review_goal="\`rd-workflow/docs/prompts/review/spec_review.md\` 기준으로 과도한 설계, 빠진 엣지 케이스, 더 단순한 대안, 품질 검증 전략 누락, 대상 적합성을 점검"
     ;;
-  output|output-review|final-output)
-    review_type="output-review"
-    session_slug="final-output-review"
-    review_target="CURRENT_TASK.md"
-    review_goal="\`rd-workflow/docs/prompts/review/output_review.md\` 기준으로 Acceptance Criteria 충족, 품질 기준 부합, 논리적 일관성, 제약 준수, 과잉 표현 여부를 점검"
+  diff|diff-review|final-diff)
+    diff_target="${1:-git diff main...HEAD}"
+    review_type="diff-review"
+    session_slug="final-diff-review"
+    review_target="${diff_target}"
+    review_goal="\`rd-workflow/docs/prompts/review/diff_review.md\` 기준으로 논리 버그, 회귀 위험, 성능 문제, 보안 문제, 유지보수성 저하, 불필요한 복잡성을 점검"
     ;;
   *)
     echo "알 수 없는 review-kind: ${review_kind}" >&2

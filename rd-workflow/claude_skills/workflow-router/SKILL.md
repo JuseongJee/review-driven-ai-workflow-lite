@@ -1,6 +1,6 @@
 ---
 name: workflow-router
-description: Recommend the next workflow skill. Use when a user is starting a task, when the next workflow step is unclear, or when you need to recommend the right next skill among request-to-reviewed-plan, small-task-implement, and final-output-review.
+description: Recommend the next workflow skill. Use when a user is starting a task, when the next workflow step is unclear, or when you need to recommend the right next skill among request-to-reviewed-plan, small-task-implement, and final-diff-review.
 user-invocable: false
 ---
 
@@ -18,7 +18,7 @@ Route the request like this:
    - If invoked via Intake 규칙 (auto intake): use the Auto Intake 판단 기준 below.
    - Otherwise recommend `/request-to-reviewed-plan`.
 2. If the task is already classified as `small-task` by the user and execution is next, recommend `/small-task-implement`.
-3. If execution is mostly done or the user wants final review or delivery readiness, recommend `/final-output-review`.
+3. If execution is mostly done or the user wants final review or delivery readiness, recommend `/final-diff-review`.
 4. If there is a reviewed spec / plan or the user is asking to execute from spec / plan, recommend the execution step described in the plan.
 
 When you answer, keep it short and use this format:

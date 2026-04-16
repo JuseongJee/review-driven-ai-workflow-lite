@@ -17,8 +17,7 @@
 - tone: (문체/톤 — 공식적, 캐주얼, 기술적 등)
 - constraints: (분량, 마감, 브랜드 가이드 등)
 
-## 검증
-- verify_prompt: rd-workflow/docs/prompts/verify/default.md
+## Workflow Settings
 - auto_completion_report: false
 
 ## Template Source
