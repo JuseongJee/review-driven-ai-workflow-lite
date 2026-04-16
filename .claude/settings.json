@@ -17,6 +17,10 @@
           {
             "type": "command",
             "command": "bash rd-workflow/scripts/hooks/pre_commit_review_gate.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"
           }
         ]
       },
