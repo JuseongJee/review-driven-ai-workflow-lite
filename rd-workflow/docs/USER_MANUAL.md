@@ -46,8 +46,8 @@ Claude Code의 내장 워크플로 기능입니다. 설계 → 계획 → 실행
 
 - **brainstorming**: 아이디어 탐색, 요구사항 정리
 - **writing-plans**: spec과 plan 작성
-- **subagent-driven-development**: 독립 태스크 병렬 실행 (기본)
-- **executing-plans**: 순차 실행 (태스크 3개 이하, 같은 파일일 때)
+- **subagent-driven-development**: 태스크를 subagent로 dispatch (기본, 병렬·순차 모두 가능)
+- **executing-plans**: 메인 세션에서 직접 실행 (태스크 1개+파일 3개 이하, 또는 태스크 2개+동일 파일 1개일 때)
 
 Superpowers가 사용 가능한 환경에서는 반드시 사용합니다.
 

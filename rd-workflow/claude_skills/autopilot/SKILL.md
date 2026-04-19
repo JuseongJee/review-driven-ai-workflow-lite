@@ -113,7 +113,7 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
 
 ### 4. 자율 실행
 
-- **Superpowers가 사용 가능하면 반드시 사용한다:** `brainstorming` → `writing-plans` → `executing-plans`. 사용 가능한데 건너뛰지 않는다.
+- **Superpowers가 사용 가능하면 반드시 사용한다:** `brainstorming` → `writing-plans` → CLAUDE.md 실행 모드 규칙에 따른 실행 모드. 사용 가능한데 건너뛰지 않는다.
 - 검증 실패 발생 시 `superpowers:systematic-debugging`으로 자율 디버깅한다
 - 디버깅 3회 실패 시 현재 상태를 보고하고 사용자에게 넘긴다
 - **model-strategy 적용**: `rd-workflow/config/model-strategy.json`이 존재하면 `subagent` 값을 읽어 subagent dispatch 시 Agent 도구의 `model` 파라미터로 전달한다. 파일 미존재/파싱 실패/키 누락/허용되지 않은 값(`opus`, `sonnet`, `haiku` 외) → 기본값 `"sonnet"`을 사용한다. 설정 형식 상세는 `/model-strategy` skill 참조.
@@ -121,6 +121,7 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
 ### 5. 세션 한계 대응
 
 컨텍스트가 커지면 `/compact`로 자동 압축을 시도한다. 세션 한계에 도달하기 전에 먼저 compact하고 작업을 이어간다.
+compact로도 부족하면 **먼저 `CURRENT_TASK.md`에 현재 상태를 저장**한 뒤 사용자에게 보고한다. 묻기 전에 저장부터 한다.
 
 compact 후에도 한계에 가까워지면:
 
