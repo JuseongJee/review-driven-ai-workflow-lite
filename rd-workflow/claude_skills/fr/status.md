@@ -16,11 +16,13 @@
      - 활성 → 활성: 인덱스의 status 컬럼 변경 + 상세 파일의 status 변경.
      - 활성 → done/dropped: 인덱스에서 해당 행 삭제 + 상세 파일의 status 변경.
    - **PARKED 인덱스에 있는 항목:**
-     - parked → 활성: PARKED 인덱스에서 해당 행 삭제 + FUTURE_REQUESTS.md 인덱스에 행 추가 (우선순위 `-`) + 상세 파일의 status 변경.
+     - parked → 활성: PARKED 인덱스에서 해당 행 삭제 + FUTURE_REQUESTS.md 인덱스에 행 추가 (종류는 상세 파일의 `kind`, 우선순위 `-`) + 상세 파일의 status 변경.
      - parked → done/dropped: PARKED 인덱스에서 해당 행 삭제 + 상세 파일의 status 변경.
    - **인덱스 없이 상세 파일만 있는 항목 (done/dropped):**
-     - done/dropped → 활성: 상세 파일의 status 변경 + FUTURE_REQUESTS.md 인덱스에 행 추가 (날짜, 제목, 요약은 상세 파일에서 읽음, 우선순위 `-`).
+     - done/dropped → 활성: 상세 파일의 status 변경 + FUTURE_REQUESTS.md 인덱스에 행 추가 (날짜, 제목, 요약, 종류는 상세 파일에서 읽음, 우선순위 `-`).
      - done ↔ dropped (종료 상태 간 전환): 상세 파일의 status만 변경. 인덱스에는 추가하지 않는다.
+
+   활성 인덱스에 행을 새로 추가할 때 컬럼 순서: 날짜 | 제목 | 요약 | **종류** | 상태 | 우선순위 | 상세. `종류` 값은 상세 파일의 `- kind:` 를 그대로 옮긴다. 상세 파일에 `kind` 가 없으면 `-` 로 표시하고 경고 출력.
 5. 완료 메시지 출력: "status 변경: **{short-title}** {old-status} → {new-status}"
 
 ### 규칙

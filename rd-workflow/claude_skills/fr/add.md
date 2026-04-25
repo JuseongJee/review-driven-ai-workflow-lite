@@ -28,8 +28,10 @@
 4. `FUTURE_REQUESTS.md`의 `## 인덱스` 테이블 끝에 행 추가:
 
 ```
-| {날짜} | {short-title} | {summary} | idea | - | - | [상세](items/YYYY-MM-DD-{short-title}.md) |
+| {날짜} | {short-title} | {summary} | {kind} | idea | - | [상세](items/YYYY-MM-DD-{short-title}.md) |
 ```
+
+컬럼 순서: 날짜 | 제목 | 요약 | **종류** | 상태 | 우선순위 | 상세. `종류` 값은 Step 2 에서 추론한 `kind` 를 그대로 사용한다. GitHub 연동이 활성이면 아래 `GitHub 연동` 섹션의 절차로 GitHub 정보를 추가한다 (인덱스에 GitHub 컬럼이 별도로 있는 변형 형식을 쓰는 경우에만 해당).
 
 5. 완료 메시지 출력:
 
