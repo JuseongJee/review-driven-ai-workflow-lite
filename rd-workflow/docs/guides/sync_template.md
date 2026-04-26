@@ -45,7 +45,7 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 - `rd-workflow/claude_skills/`
 - `rd-workflow/config/` (설정 예제 파일)
 - `rd-workflow/docs/` (adr, flows, guides, prompts, backlog 구조 문서)
-- `rd-workflow/scripts/` (보존 대상 제외)
+- `rd-workflow/scripts/` 중 review pipeline 관련 스크립트
 
 **신규 추가** — 템플릿에 있지만 프로젝트에 없는 파일
 
@@ -57,10 +57,12 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 - `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` (항목이 있는 경우)
 - `rd-workflow-workspace/backlog/request-archive/` 안의 아카이브 파일
 - `rd-workflow-workspace/specs/`, `rd-workflow-workspace/plans/` 안의 작업 산출물 (README 제외)
-- `rd-workflow/scripts/test.sh`, `lint.sh`, `typecheck.sh` (프로젝트별 검증 명령이 들어 있음)
+- `rd-workflow/scripts/{build,test,lint,typecheck}.sh` (프로젝트별 명령이 들어 있음)
 - `rd-workflow-workspace/handoffs/` 안의 작업 내용물
 - `rd-workflow/config/review-tools.json` (프로젝트별 리뷰 도구 설정, `.example`은 동기화 대상)
-- 프로젝트 고유 설정 파일 (`.gitignore`, `.claude/` 등)
+- `rd-workflow/config/verification.json` (프로젝트별 검증 설정, `.example`은 동기화 대상)
+- `rd-workflow/config/extensions.json` (설치된 extension 이력, `.example`은 동기화 대상)
+- 프로젝트 고유 설정 파일 (`.gitignore`, `.swiftlint.yml`, `.claude/` 등)
 
 ### 3. 사용자 확인
 
@@ -84,6 +86,37 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 
 파일이 없으면 마이그레이션이 불필요합니다. 파일이 있으면 각 항목의 **조건**을 프로젝트에 대해 확인하고, 해당하는 항목을 순서대로 실행합니다.
 
+아래는 현재 등록된 마이그레이션 내용의 사본입니다 (최신 버전은 항상 clone된 `MIGRATIONS.md`를 참조):
+
+#### M001: `ai/` → `rd-workflow/` 디렉토리 rename
+
+**조건**: 프로젝트 루트에 `ai/` 디렉토���가 존재하고 `rd-workflow/`가 없을 때
+
+**실행 절차**:
+1. `git mv ai rd-workflow` (git 추적 중이면) 또는 `mv ai rd-workflow` (아니면)
+2. 아래 파일들에서 `ai/` 경로 참조를 `rd-workflow/`로 일괄 치환:
+   - `CLAUDE.md`, `PROJECT_CONTEXT.md`, `WORKING_WITH_AI.md`
+   - `.claude/settings.json` (hooks 경로)
+   - `rd-workflow/` 하위 스크립트, skill, 문서 파일
+3. `rd-workflow-workspace/reports/`, `rd-workflow-workspace/backlog/request-archive/`, `rd-workflow-workspace/specs/`, `rd-workflow-workspace/handoffs/`는 과거 기록이므로 치환하지 않음
+4. 치환 시 URL의 `.ai/` (예: `claude.ai/code`)는 보존해야 함 — `(?<!\.)ai/` 패턴 사용
+5. 스크립트 문법 검증: `find rd-workflow/scripts -name "*.sh" -exec bash -n {} \;`
+
+**주의**: `.claude/settings.json`의 hooks에 `ai/scripts/` 경로가 있으면 반드시 `rd-workflow/scripts/`로 변경해야 세션 시작 훅이 작동합니다.
+
+#### M002: `rd-workflow/workspace/` → `rd-workflow-workspace/` 분리
+
+**조건**: `rd-workflow/workspace/` 디렉토리가 존재하고 루트에 `rd-workflow-workspace/`가 없을 때
+
+**실행 절차**:
+1. `git mv rd-workflow/workspace rd-workflow-workspace` (git 추적 중이면) 또는 `mv rd-workflow/workspace rd-workflow-workspace`
+2. 아래 파일들에서 `rd-workflow/workspace/` 경로 참조를 `rd-workflow-workspace/`로 일괄 치환:
+   - `CLAUDE.md`, `PROJECT_CONTEXT.md`
+   - `rd-workflow/` 하위 스크립트, skill, 문서 파일
+3. `rd-workflow-workspace/reports/`, `rd-workflow-workspace/backlog/request-archive/`, `rd-workflow-workspace/specs/`, `rd-workflow-workspace/handoffs/`는 과거 기록이므로 치환하지 않음
+
+**참고**: M001과 M002는 동시에 적용될 수 있습니다. M001을 먼저 실행한 후 M002를 실행합니다.
+
 ### 5. 동기화 실행
 
 사용자 확인 후:
@@ -91,37 +124,7 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 - 신규 파일을 추가합니다
 - 확인받은 삭제 후보를 제거합니다
 
-### 6. settings.json Hook 머지
-
-`.claude/settings.json`은 보존 대상이므로 5단계에서 덮어쓰지 않습니다. 대신 이 단계에서 템플릿의 새 hook 엔트리를 프로젝트에 머지합니다.
-
-**입력:**
-- 템플릿: `<임시 clone 경로>/.claude/settings.json`
-- 프로젝트: `.claude/settings.json`
-
-**머지 규칙:**
-
-1. 템플릿 settings.json이 없으면 건너뜁니다.
-2. 프로젝트 settings.json이 없으면 템플릿 것을 그대로 복사합니다.
-3. 양쪽 모두 있으면 `hooks` 객체를 이벤트별로 머지합니다:
-
-| 이벤트 (SessionStart, PreToolUse 등) | 템플릿 | 프로젝트 | 동작 |
-|---|---|---|---|
-| 있음 | 있음 | matcher별로 hook command 합집합 (아래 참조) |
-| 있음 | 없음 | 템플릿 엔트리 추가 |
-| 없음 | 있음 | 프로젝트 엔트리 유지 |
-
-**matcher별 hook command 합집합:**
-- matcher가 없는 엔트리 (SessionStart 등): 양쪽의 hooks 배열에서 `command` 문자열이 같으면 중복, 다르면 추가
-- matcher가 있는 엔트리 (PreToolUse 등): 같은 matcher 값끼리 hooks 배열의 `command` 합집합. 프로젝트에 없는 matcher는 통째로 추가
-
-4. 머지 결과를 `.claude/settings.json`에 저장합니다.
-
-**보고:**
-- 추가된 hook이 있으면: "settings.json에 N개 hook 추가됨: [command 목록]"
-- 변경 없으면: "settings.json hook 구성은 변경없음"
-
-### 7. 검증 및 버전 갱신
+### 6. 검증 및 버전 갱신
 
 동기화 후 임시 clone의 템플릿 파일과 프로젝트 파일이 일치하는지 확인합니다. (보존 대상 제외)
 
@@ -141,7 +144,7 @@ fi
 rm -rf <임시 clone 경로의 부모 디렉토리>
 ```
 
-### 8. Skill 재설치
+### 7. Skill 재설치
 
 `rd-workflow/claude_skills/`가 동기화되었으므로 `.claude/skills/`에도 반영합니다.
 
@@ -150,13 +153,216 @@ bash rd-workflow/scripts/install_claude_skills.sh project
 ```
 
 - link 모드로 설치된 기존 스킬: 파일 내용은 symlink으로 자동 반영되지만, **새로 추가된 스킬**은 symlink이 없으므로 재설치가 필요합니다.
-- copy 모드로 설치된 기존 스킬: 스크립트가 기존 디렉토리를 건너뛰므로, 먼저 `.claude/skills/` 아래의 해당 디렉토리를 삭제한 뒤 재실행해야 합니다.
-- 새로 추가된 스킬은 link/copy 모드 모두에서 자동 설치됩니다.
+- copy 모드로 설치된 기존 스킬: 모든 스킬의 재설치가 필요합니다.
+- 스크립트가 이미 설치된 스킬은 자동으로 건너뛰므로 항상 실행해도 안전합니다.
+
+**이 단계를 완료한 뒤 반드시 8단계로 진행합니다.**
+
+### 8. Extension 자동 재설치 및 신규 안내
+
+동기화 후 extension 설치 이력(`rd-workflow/config/extensions.json`)을 기반으로 자동 재설치하고, 새 extension만 사용자에게 안내합니다.
+
+#### 8.1 매니페스트 읽기
+
+`rd-workflow/config/extensions.json`을 읽고 파싱합니다.
+
+- 파일 없음 → `manifest = null`
+- JSON 파싱 실패 → `manifest = null` (손상된 매니페스트는 부재와 동일하게 처리)
+
+#### 8.1.1 Legacy presets 마이그레이션
+
+manifest에 `extensions.presets`가 있으면 1회 이전을 수행합니다:
+
+**Case A: `extensions.presets.preset` 값이 있고 `extensions.verify`도 있음**
+→ `extensions.verify.preset`으로 값 복사 후 `extensions.presets` 키 삭제
+
+**Case B: `extensions.presets.preset` 값이 있지만 `extensions.verify`가 없음 (orphan)**
+→ verify가 실제 설치되어 있으면(`rd-workflow/claude_skills/verify/SKILL.md` 존재) `extensions.verify` object를 생성(`installed_at: now`)하고 preset을 이전 후 `extensions.presets` 키 삭제
+→ verify가 미설치면 `extensions.presets` 키를 삭제하고 `new_extensions`로 내려 사용자에게 verify + preset 설치를 질문
+
+**Case C: `extensions.presets`는 있지만 `preset` 값이 없음**
+→ `extensions.presets` 키를 삭제. preset 선택은 질문하지 않음
+
+**Invalid preset validation:**
+모든 Case에서 preset 값이 허용 목록(`react-web`, `api`, `cli`, `ios`, `macos`) 밖이면 해당 키를 삭제하고 사용자에게 preset 선택을 질문합니다.
+
+**파일시스템 마이그레이션:**
+프로젝트에 `rd-workflow/extensions/presets/`가 남아 있으면 `rd-workflow/extensions/verify/presets/`로 통합된 구버전 잔재이므로 삭제합니다. 삭제 전 별도 질문 없이 진행하되, 완료 보고에 "presets → verify/presets 통합으로 구 폴더 삭제됨"을 포함합니다.
+
+이전 결과는 메모리에 보관 (8.8에서 저장)
+
+#### 8.2 파일시스템 상태 스캔
+
+`rd-workflow/extensions/` 내 각 extension 디렉토리에 대해 설치 여부를 확인합니다.
+
+설치 판정 기준 (extension별로 다름):
+- **verify, design-review**: `rd-workflow/claude_skills/{name}/SKILL.md`가 존재하면 설치됨. 디렉토리만 있고 SKILL.md가 없으면 미설치.
+
+두 집합을 구성합니다:
+- `fs_installed`: 위 판정 기준에 따라 설치된 것으로 확인된 extension
+- `fs_available`: `rd-workflow/extensions/` 내 모든 extension 디렉토리
+
+#### 8.3 매니페스트-파일시스템 조정
+
+`manifest != null`일 때만 실행합니다.
+
+**파일시스템 판정 가능 extension (verify, design-review):**
+
+| manifest | filesystem | 동작 |
+|----------|-----------|------|
+| 있음 | 설치됨 | 유지 (자동 재설치 대상) |
+| 있음 | 미설치 | manifest에서 제거 (삭제/손상된 것으로 판단) |
+| 없음 | 설치됨 | manifest에 추가 (`installed_at: now`) |
+
+조정 결과는 메모리에 보관합니다 (파일 저장은 8.8에서 한 번만).
+
+#### 8.4 분류
+
+- `manifest != null`: `auto_reinstall` = manifest에 있는 extension, `new_extensions` = `fs_available` 중 manifest에도 `fs_installed`에도 없는 것
+- `manifest == null`: `fs_installed`에 있는 extension은 `auto_reinstall`로, 나머지는 `new_extensions`로 분류합니다. 매니페스트가 없어도 이미 설치된 extension에 대해서는 불필요한 질문을 하지 않습니다.
+
+#### 8.5 자동 재설치
+
+`auto_reinstall`에 속한 extension을 **묻지 않고** 재설치합니다.
+
+- **verify, design-review**: `rd-workflow/extensions/{name}/SKILL.md`와 `rules.md`를 `rd-workflow/claude_skills/{name}/`에 복사 (덮어쓰기)
+- **verify의 preset 머지**: manifest에 `verify.preset` 값이 있고 허용 목록 내이면 8.6 머지 알고리즘 실행. 값이 허용 목록 밖이면 키를 삭제하고 사용자에게 질문. 값이 없으면 머지를 건너뛰고 조용히 유지 (preset 없는 verify는 정상 상태이므로 질문하지 않음)
+
+자동 재설치 실패 시: 해당 extension을 manifest에서 제거하고 `new_extensions`로 이동하여 8.7에서 사용자에게 질문합니다.
+
+각 성공한 extension의 `installed_at`을 현재 시각으로 갱신합니다 (메모리).
+
+#### 8.6 Verify Preset AI 자동 머지
+
+manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
+
+**입력:**
+- template preset: `rd-workflow/extensions/verify/presets/{manifest.verify.preset}/verification.json`
+- project current: `rd-workflow/config/verification.json`
+
+**머지 규칙 (2-way):**
+
+각 verifier를 name 기준으로 비교합니다:
+
+| template | project | 결과 |
+|----------|---------|------|
+| 있음 | 있음 | **구조적 머지** (아래 참조) |
+| 있음 | 없음 | template에서 추가 |
+| 없음 | 있음 | **프로젝트 고유 항목 — 유지** |
+
+**구조적 머지 (양쪽 모두 있는 verifier):**
+- `run`: template 값 사용 (CLI 플래그, 버그 수정 반영)
+- `adapter`: template 값 사용 (경로 변경 반영)
+- `evaluate`: project 값 유지 (사용자 커스텀 보존)
+- `criteria`: name 기준 머지
+  - project에 있고 template에도 있는 name → project 값 유지 (커스텀 weight/description 보존)
+  - template에만 있는 name → 추가
+  - project에만 있는 name → template에서 삭제된 것으로 판단, 제거
+
+머지 결과를 `rd-workflow/config/verification.json`에 저장합니다.
+
+**머지 요약을 기록합니다** (9단계 완료 보고에 포함):
+- 추가된 verifier
+- 보존된 프로젝트 고유 verifier
+- 구조 업데이트된 verifier (run/adapter 변경)
+- 추가/제거된 criteria
+
+#### 8.7 새 Extension 질문
+
+`new_extensions`가 있을 때만 실행합니다.
+
+프로젝트에 아직 설치되지 않은 extension을 사용자에게 안내합니다:
+
+```
+새로운 확장 기능이 감지되었습니다:
+1. {name} — {설명}
+...
+
+설치할 확장을 선택하세요 (예: 1,2 또는 건너뛰기):
+```
+
+사용자가 선택하면 해당 extension의 `rd-workflow/extensions/{name}/install.md`를 읽고 안내에 따라 설치합니다.
+`depends`가 있으면 먼저 설치할지 물어봅니다.
+
+설치 성공한 extension을 manifest에 추가합니다 (메모리). 거절한 extension은 추가하지 않습니다 (다음 sync에서 다시 질문).
+
+#### 8.8 매니페스트 저장
+
+최종 manifest를 `rd-workflow/config/extensions.json`에 저장합니다.
+
+- manifest가 null이었고 사용자가 모든 extension을 건너뛰어도, `fs_installed` 기준으로 manifest를 생성합니다 (다음 sync에서 다시 묻지 않도록)
+- 이 시점에서 1회만 파일에 기록합니다 (중간 저장 없음)
 
 ### 9. 완료 보고
 
 - 복사/추가/삭제된 파일 수
 - 마이그레이션 실행 여부와 결과
 - 보존된 파일 요약
-- settings.json Hook 머지 결과 (추가된 hook 수, 또는 변경없음)
 - Skill 재설치 결과 (설치/건너뛴 수)
+- Extension 자동 재설치 결과 (자동 재설치/신규 설치/건너뛴 수)
+- Verify Preset 머지 결과 요약 (추가/보존/업데이트된 verifier, 변경된 criteria) — verify preset이 자동 재설치된 경우에만
+
+## Raw Capture 마이그레이션 (기존 프로젝트)
+
+본 sync 가 raw-captures 인프라를 도입한다. 기존 프로젝트는 다음을 수동으로 적용:
+
+1. **`.gitignore` 에 2 라인 merge** (이미 있으면 skip):
+   ```
+   rd-workflow-workspace/raw-captures/*
+   !rd-workflow-workspace/raw-captures/README.md
+   ```
+   **Git ignore semantics 주의:** `raw-captures/` (디렉토리 자체) 가 아니라 `raw-captures/*` (entry 단위) 패턴이어야 README 예외가 동작.
+
+2. **`raw-captures/` 디렉토리 + README 생성:**
+   ```bash
+   mkdir -p rd-workflow-workspace/raw-captures
+   # 본 sync 가 README 를 함께 가져오므로 별도 생성 불필요. sync 후 다음 검증:
+   test -f rd-workflow-workspace/raw-captures/README.md
+   ```
+
+3. **기 커밋된 raw-captures 캡처 파일이 있다면 `git rm --cached`** (README 는 추적 유지):
+   ```bash
+   # macOS/zsh-safe (BSD xargs 는 -r 미지원, 빈 입력에서도 명령 실행 안 함)
+   # README 는 제외하고 cache 제거
+   git ls-files rd-workflow-workspace/raw-captures/ | while IFS= read -r f; do
+     case "$f" in
+       rd-workflow-workspace/raw-captures/README.md) continue ;;
+     esac
+     git rm --cached -- "$f"
+   done
+   ```
+   `.gitignore` 만 추가하면 이미 추적 중인 파일은 ignore 가 적용 안 되므로 캐시 제거 필수. README 는 새 ignore 패턴에서 추적 대상이므로 제외.
+
+4. **legacy capture frontmatter 변환** (예: photos-image-filter 가 프로토타입에서 sync 받는 경우):
+
+   **Step 4-a: `fr-title` → `short-title` 자동 변환** (macOS BSD sed 기준):
+   ```bash
+   # macOS BSD sed: sed -i ''
+   # GNU sed (Linux): sed -i (빈 인수 없이)
+   find rd-workflow-workspace/raw-captures -maxdepth 1 -type f -name "*.md" 2>/dev/null \
+     | while IFS= read -r f; do
+         sed -i '' 's/^fr-title:/short-title:/' "$f"
+       done
+   ```
+
+   **Step 4-b: `stage` 필드 추가** (수동 검토 후 적용 권장):
+
+   legacy 캡처가 `photos-image-filter` 프로토타입 출처이면 모두 `stage: fr` 이므로 아래 명령으로 일괄 삽입 가능. 다른 출처이거나 여러 stage 가 혼재할 경우 수동 편집 필수.
+
+   ```bash
+   # stage 필드가 없는 파일에 short-title 라인 직후 stage: fr 삽입 (macOS BSD sed 기준)
+   find rd-workflow-workspace/raw-captures -maxdepth 1 -type f -name "*.md" 2>/dev/null \
+     | while IFS= read -r f; do
+         if ! awk '/^---$/{c++; if(c==2)exit} c==1 && /^stage:/{found=1} END{exit !found}' "$f"; then
+           sed -i '' '/^short-title:/a\
+   stage: fr
+   ' "$f"
+         fi
+       done
+   ```
+
+   주의: `sed -i '' '/^---$/a\...'` 는 파일 안의 모든 `---` 라인 다음에 삽입될 수 있으므로 결과를 반드시 검토할 것. frontmatter 외부에 `---` 가 있으면 수동 편집 권장.
+
+   본 변환은 신 형식만 인식하는 runtime 코드와 호환을 맞춘다. runtime 호환 코드는 추가하지 않으므로 변환 누락 시 신 코드가 구 캡처를 인식 못 한다.
+
+5. **`CURRENT_TASK.md` 에 `## Short Title` 섹션 추가** (default 값 `-`).

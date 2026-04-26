@@ -7,9 +7,26 @@
 1. `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` 읽기 (인덱스 형식 확인 + 중복 체크).
 2. 입력에서 다음을 추출한다:
    - **short-title**: 영문 kebab-case, 간결하게 (예: `autopilot-review-gate`)
+     canonical 정규화: `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` (영문 kebab-case, 영숫자 시작·끝, 사이만 `-` 허용)
+     추가 거절 케이스: `-` 단독, empty, hyphen-only (`---` 등) — reserved sentinel 충돌이므로 보정 요청.
    - **summary**: 한국어 한두 문장 요약
    - **kind**: feature | bug | refactor | tech-debt | tooling | research | test (맥락에서 추론, 불확실하면 feature)
-3. 상세 파일 생성: `rd-workflow-workspace/backlog/items/YYYY-MM-DD-{short-title}.md`
+3. raw capture 파일 생성: `rd-workflow-workspace/raw-captures/{date}-fr-{short-title}.md`
+
+   frontmatter 형식:
+   ```yaml
+   ---
+   date: YYYY-MM-DD HH:MM
+   stage: fr
+   short-title: {short-title}
+   source: direct | routed
+   ---
+   ```
+   본문: `## 원본 입력` 섹션 + 사용자 원문 (byte-level 동일, 가공 금지).
+   충돌 시 `-2`, `-3` suffix.
+   캡처 실패 시 경고만 — FR 등록 차단 안 함.
+
+4. 상세 파일 생성: `rd-workflow-workspace/backlog/items/YYYY-MM-DD-{short-title}.md`
 
 ```md
 # YYYY-MM-DD {short-title}
@@ -25,7 +42,20 @@
 - request seed: {REQUEST로 만들 때 쓸 초안, 없으면 summary 반복}
 ```
 
-4. `FUTURE_REQUESTS.md`의 `## 인덱스` 테이블 끝에 행 추가:
+5. `CURRENT_TASK.md ## Short Title` 갱신 분기:
+
+   현재 `## Short Title` 값을 read 한다.
+
+   - **분기 1 — 필드 자체가 없음 (legacy repo, 구 템플릿):** `CURRENT_TASK.md` 갱신 안 함 (warn-only). FR 등록 절차(인덱스 + items/ + FR 캡처)는 정상 진행. 사용자에게 명시적 안내:
+     > `CURRENT_TASK.md ## Short Title` 섹션이 없습니다 (구 템플릿).
+     > FR 은 등록되었지만 진행 중 작업 추적이 없는 상태입니다.
+     > `sync_template` 마이그레이션 후 `CURRENT_TASK.md` 의 `## Short Title` 을 명시적으로 설정하세요.
+
+   - **분기 2 — 값이 `-`:** start point로서 부여. Step 2의 short-title 로 `## Short Title` 갱신.
+
+   - **분기 3 — 값이 이미 non-`-`:** 진행 중 작업의 short-title이므로 **read-only** (변경 금지). 새 FR 등록은 그대로 진행 — FR 자체와 FR 캡처는 새 short-title 사용, `CURRENT_TASK.md ## Short Title` 만 손대지 않음.
+
+6. `FUTURE_REQUESTS.md`의 `## 인덱스` 테이블 끝에 행 추가:
 
 ```
 | {날짜} | {short-title} | {summary} | {kind} | idea | - | [상세](items/YYYY-MM-DD-{short-title}.md) |
@@ -33,7 +63,7 @@
 
 컬럼 순서: 날짜 | 제목 | 요약 | **종류** | 상태 | 우선순위 | 상세. `종류` 값은 Step 2 에서 추론한 `kind` 를 그대로 사용한다. GitHub 연동이 활성이면 아래 `GitHub 연동` 섹션의 절차로 GitHub 정보를 추가한다 (인덱스에 GitHub 컬럼이 별도로 있는 변형 형식을 쓰는 경우에만 해당).
 
-5. 완료 메시지 출력:
+7. 완료 메시지 출력:
 
 > FR 등록: **{short-title}** — {summary}
 
