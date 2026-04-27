@@ -316,6 +316,7 @@ manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
 2. **`raw-captures/` 디렉토리 + README 생성:**
    ```bash
    mkdir -p rd-workflow-workspace/raw-captures
+   chmod 0700 rd-workflow-workspace/raw-captures
    # 본 sync 가 README 를 함께 가져오므로 별도 생성 불필요. sync 후 다음 검증:
    test -f rd-workflow-workspace/raw-captures/README.md
    ```
@@ -332,6 +333,20 @@ manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
    done
    ```
    `.gitignore` 만 추가하면 이미 추적 중인 파일은 ignore 가 적용 안 되므로 캐시 제거 필수. README 는 새 ignore 패턴에서 추적 대상이므로 제외.
+
+### 이미 push 된 raw capture 의 secret 처리 (중요)
+
+`git rm --cached` 는 working tree / index 에서만 제거 — 이미 push 된 commit 의 git history 와 기존 clone 에는 캡처 내용 (token / API key / password) 이 그대로 남습니다.
+
+**필수 조치 (capture 안에 secret 이 있는 경우):**
+
+1. **secret rotation 우선:** 노출된 token / API key / password 를 즉시 폐기 + 재발급. history rewrite 보다 rotation 이 안전 (이미 다른 곳에 캐시되었을 가능성).
+2. **history rewrite (선택):** git filter-repo 또는 BFG Repo-Cleaner 로 history 에서 capture 파일 제거.
+   - `git filter-repo --path rd-workflow-workspace/raw-captures/ --invert-paths`
+   - 협업 repo 라면 모든 collaborator 가 fresh clone 필요 (force push 후 기존 clone 무효화)
+3. **GitHub Secret Scanning** 활성화하여 향후 자동 감지.
+
+`git rm --cached` 만으로는 노출 해소되지 않음을 명심.
 
 4. **legacy capture frontmatter 변환** (예: photos-image-filter 가 프로토타입에서 sync 받는 경우):
 
@@ -366,3 +381,14 @@ manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
    본 변환은 신 형식만 인식하는 runtime 코드와 호환을 맞춘다. runtime 호환 코드는 추가하지 않으므로 변환 누락 시 신 코드가 구 캡처를 인식 못 한다.
 
 5. **`CURRENT_TASK.md` 에 `## Short Title` 섹션 추가** (default 값 `-`).
+
+### 기존 raw-captures 권한 보정
+
+기존 0644 capture / 0755 디렉토리 (이전 ambient umask 환경 생성분) 가 있다면:
+
+```bash
+find rd-workflow-workspace/raw-captures -type d -exec chmod 0700 {} +
+find rd-workflow-workspace/raw-captures -type f ! -name 'README.md' -exec chmod 0600 {} +
+```
+
+README 는 추적 대상 — 기존 mode (보통 0644) 유지.

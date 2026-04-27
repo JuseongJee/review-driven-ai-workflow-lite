@@ -13,15 +13,46 @@
    - **kind**: feature | bug | refactor | tech-debt | tooling | research | test (맥락에서 추론, 불확실하면 feature)
 3. raw capture 파일 생성: `rd-workflow-workspace/raw-captures/{date}-fr-{short-title}.md`
 
-   frontmatter 형식:
-   ```yaml
+   디렉토리 0700 보장 + umask 077 subshell 로 캡처 파일 0600 보장:
+   ```bash
+   assert_no_symlink_in_path() {
+     _aslnp_p="$1"
+     case "$_aslnp_p" in
+       /*) ;;
+       *)  _aslnp_p="$PWD/$_aslnp_p" ;;
+     esac
+     _aslnp_d="$_aslnp_p"
+     while [ "$_aslnp_d" != "/" ] && [ -n "$_aslnp_d" ]; do
+       if [ -L "$_aslnp_d" ]; then
+         echo "경고: path component ($_aslnp_d) 가 symlink 입니다. 보안상 중단합니다." >&2
+         unset _aslnp_p _aslnp_d
+         return 1
+       fi
+       _aslnp_d=$(dirname "$_aslnp_d")
+     done
+     unset _aslnp_p _aslnp_d
+     return 0
+   }
+   if ! assert_no_symlink_in_path "rd-workflow-workspace/raw-captures"; then
+     echo "경고: raw-captures 경로에 symlink 가 있어 캡처를 건너뜁니다." >&2
+   else
+     mkdir -p rd-workflow-workspace/raw-captures
+     chmod 0700 rd-workflow-workspace/raw-captures
+     ( umask 077 && cat > "$capture_path" <<EOF
    ---
    date: YYYY-MM-DD HH:MM
    stage: fr
    short-title: {short-title}
    source: direct | routed
    ---
+
+   ## 원본 입력
+   {사용자 원문}
+   EOF
+     )
+   fi
    ```
+   frontmatter 형식: `date`, `stage`, `short-title`, `source` (`direct` | `routed`) 4개 고정.
    본문: `## 원본 입력` 섹션 + 사용자 원문 (byte-level 동일, 가공 금지).
    충돌 시 `-2`, `-3` suffix.
    캡처 실패 시 경고만 — FR 등록 차단 안 함.

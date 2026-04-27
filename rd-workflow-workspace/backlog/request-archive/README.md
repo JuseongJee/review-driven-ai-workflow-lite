@@ -30,15 +30,46 @@ archive 실행 주체는 Claude (CLAUDE.md 의 Task Tracking 섹션 규약). 사
 
 1. **REQUEST.md 복사:**
    ```bash
+   # assert_no_symlink_in_path: POSIX dirname 반복으로 절대경로 component 단위 traverse
+   # bash/sh/zsh/dash 호환 — local 미사용, IFS split 의존 안 함
+   assert_no_symlink_in_path() {
+     _aslnp_p="$1"
+     case "$_aslnp_p" in
+       /*) ;;
+       *)  _aslnp_p="$PWD/$_aslnp_p" ;;
+     esac
+     _aslnp_d="$_aslnp_p"
+     while [ "$_aslnp_d" != "/" ] && [ -n "$_aslnp_d" ]; do
+       if [ -L "$_aslnp_d" ]; then
+         echo "경고: path component ($_aslnp_d) 가 symlink 입니다. 보안상 중단합니다." >&2
+         unset _aslnp_p _aslnp_d
+         return 1
+       fi
+       _aslnp_d=$(dirname "$_aslnp_d")
+     done
+     unset _aslnp_p _aslnp_d
+     return 0
+   }
+
    # collision-safe: 원본 basename 보존하면서 -2, -3 suffix 부여
    # (DEST 를 제자리 갱신하면 -2-3 누적이 되므로 BASE 를 immutable 로 유지)
-   BASE="rd-workflow-workspace/backlog/request-archive/{YYYY-MM-DD-HHMM}-{title}.md"
+   # SHORT_TITLE 은 CURRENT_TASK.md ## Short Title 에서 read (canonical 검증된 값)
+   BASE="rd-workflow-workspace/backlog/request-archive/{YYYY-MM-DD-HHMM}-${SHORT_TITLE}.md"
    DEST="$BASE"
+
+   # 조상 경로 symlink escape 방어
+   assert_no_symlink_in_path "$(dirname "$DEST")" || exit 1
+
    N=2
-   while [ -e "$DEST" ]; do
+   while [ -e "$DEST" ] || [ -L "$DEST" ]; do
      DEST="${BASE%.md}-${N}.md"
      N=$((N+1))
    done
+   # DEST 자체가 symlink 면 거부
+   if [ -L "$DEST" ]; then
+     echo "경고: archive 대상 ($DEST) 이 symlink 입니다. 보안상 중단합니다." >&2
+     exit 1
+   fi
    cp REQUEST.md "$DEST"
    ```
 
@@ -46,7 +77,17 @@ archive 실행 주체는 Claude (CLAUDE.md 의 Task Tracking 섹션 규약). 사
    ```bash
    # SHORT_TITLE 은 CURRENT_TASK.md ## Short Title 에서 read
    SHORT_TITLE="..."
-   mkdir -p rd-workflow-workspace/raw-captures/archive
+   archive_dir="rd-workflow-workspace/raw-captures/archive"
+   parent_dir="rd-workflow-workspace/raw-captures"
+
+   # 조상 경로 symlink escape 방어
+   assert_no_symlink_in_path "$archive_dir" || exit 1
+
+   # 디렉토리 생성 + 권한 hardening (기존 0755 보정 포함)
+   mkdir -p "$archive_dir"
+   chmod 0700 "$parent_dir"
+   chmod 0700 "$archive_dir"
+
    for STAGE in request spec plan; do
      find rd-workflow-workspace/raw-captures -maxdepth 1 -type f -name "*-${STAGE}-*.md" 2>/dev/null \
        | while IFS= read -r f; do
@@ -57,7 +98,7 @@ archive 실행 주체는 Claude (CLAUDE.md 의 Task Tracking 섹션 규약). 사
                c==1 && $0=="stage: " s {sg=1}
                END{exit !(st && sg)}
              ' "$f"; then
-             mv "$f" rd-workflow-workspace/raw-captures/archive/
+             mv "$f" "$archive_dir/"
            fi
          done
    done

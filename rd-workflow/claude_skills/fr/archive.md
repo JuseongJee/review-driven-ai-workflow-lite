@@ -12,7 +12,38 @@
 6. archive 대상 항목들의 short-title 을 모은다 — Step 2 에서 식별한 done/dropped 대상 행의 두 번째 컬럼 (short-title) 을 `TITLES` 배열로 수집. **Step 4 의 인덱스 행 삭제 전에 추출하거나 임시 보관해 두어야 함** (삭제 후에는 행 데이터 접근 불가).
 7. 각 short-title에 대해 frontmatter 기반 exact match로 `fr` stage 캡처를 `rd-workflow-workspace/raw-captures/archive/` 로 이동한다 (collision-safe matcher):
    ```bash
-   mkdir -p rd-workflow-workspace/raw-captures/archive
+   # assert_no_symlink_in_path: POSIX dirname 반복으로 절대경로 component 단위 traverse
+   # bash/sh/zsh/dash 호환 — local 미사용, IFS split 의존 안 함
+   assert_no_symlink_in_path() {
+     _aslnp_p="$1"
+     case "$_aslnp_p" in
+       /*) ;;
+       *)  _aslnp_p="$PWD/$_aslnp_p" ;;
+     esac
+     _aslnp_d="$_aslnp_p"
+     while [ "$_aslnp_d" != "/" ] && [ -n "$_aslnp_d" ]; do
+       if [ -L "$_aslnp_d" ]; then
+         echo "경고: path component ($_aslnp_d) 가 symlink 입니다. 보안상 중단합니다." >&2
+         unset _aslnp_p _aslnp_d
+         return 1
+       fi
+       _aslnp_d=$(dirname "$_aslnp_d")
+     done
+     unset _aslnp_p _aslnp_d
+     return 0
+   }
+
+   archive_dir="rd-workflow-workspace/raw-captures/archive"
+   parent_dir="rd-workflow-workspace/raw-captures"
+
+   # 조상 경로 symlink escape 방어
+   assert_no_symlink_in_path "$archive_dir" || exit 1
+
+   # 디렉토리 생성 + 권한 hardening (기존 0755 보정 포함)
+   mkdir -p "$archive_dir"
+   chmod 0700 "$parent_dir"
+   chmod 0700 "$archive_dir"
+
    for SHORT_TITLE in "${TITLES[@]}"; do
      find rd-workflow-workspace/raw-captures -maxdepth 1 -type f -name "*-fr-*.md" 2>/dev/null \
        | while IFS= read -r f; do
@@ -23,12 +54,12 @@
                c==1 && $0=="stage: " s {sg=1}
                END{exit !(st && sg)}
              ' "$f"; then
-             mv "$f" rd-workflow-workspace/raw-captures/archive/
+             mv "$f" "$archive_dir/"
            fi
          done
    done
    ```
-   - 디렉토리 없으면 생성
+   - 디렉토리 없으면 생성 (권한 0700 보장)
    - 매칭 0건이면 skip (경고 없음)
    - `request`/`spec`/`plan` stage 캡처는 이동 안 함 (REQUEST archive 책임)
 8. 완료 메시지에 "raw capture 이동: {N}건" 추가

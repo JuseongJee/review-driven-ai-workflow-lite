@@ -76,14 +76,44 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
 2. `SHORT_TITLE`이 없거나 `-`이면: 경고 출력 + 캡처 생략 (skill 진행은 차단 안 함)
    - 필드가 없거나 default `-`이면 경고 + 캡처 생략 (skill 진행 차단 안 함). 이는 `Source FR` 없는 진입이면서 `## Short Title`도 비어 있는 edge 케이스 — `Source FR` 없는 정상 continuing-work 진입은 active task의 valid `## Short Title`을 갖고 있으므로 정상 캡처됨. 이 경고가 뜨는 경우는 오직 진행 중 작업이 없어 캡처할 short-title을 알 수 없는 상태.
 3. `SHORT_TITLE`이 유효하면: `rd-workflow-workspace/raw-captures/{date}-request-{short-title}.md` 생성
-   - frontmatter:
-     ```yaml
+   - 디렉토리 0700 보장 + umask 077 subshell 로 캡처 파일 0600 보장:
+     ```bash
+     assert_no_symlink_in_path() {
+       _aslnp_p="$1"
+       case "$_aslnp_p" in
+         /*) ;;
+         *)  _aslnp_p="$PWD/$_aslnp_p" ;;
+       esac
+       _aslnp_d="$_aslnp_p"
+       while [ "$_aslnp_d" != "/" ] && [ -n "$_aslnp_d" ]; do
+         if [ -L "$_aslnp_d" ]; then
+           echo "경고: path component ($_aslnp_d) 가 symlink 입니다. 보안상 중단합니다." >&2
+           unset _aslnp_p _aslnp_d
+           return 1
+         fi
+         _aslnp_d=$(dirname "$_aslnp_d")
+       done
+       unset _aslnp_p _aslnp_d
+       return 0
+     }
+     if ! assert_no_symlink_in_path "rd-workflow-workspace/raw-captures"; then
+       echo "경고: raw-captures 경로에 symlink 가 있어 캡처를 건너뜁니다." >&2
+     else
+       mkdir -p rd-workflow-workspace/raw-captures
+       chmod 0700 rd-workflow-workspace/raw-captures
+       ( umask 077 && cat > "$capture_path" <<EOF
      ---
      date: YYYY-MM-DD HH:MM
      stage: request
      short-title: {short-title}
      source: direct | routed
      ---
+
+     ## 원본 입력
+     {사용자 입력 원문}
+     EOF
+       )
+     fi
      ```
      (`source`: 직접 호출이면 `direct`, 자연어 라우팅이면 `routed`)
    - 본문: 사용자 입력 원문
@@ -91,14 +121,26 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
 ## Step 2. spec / change-spec 작성 단계 직전 캡처
 
 1. 명시적 사용자 입력 원문이 있으면: `rd-workflow-workspace/raw-captures/{date}-spec-{short-title}.md` 생성
-   - frontmatter:
-     ```yaml
+   - 디렉토리 0700 보장 + umask 077 subshell 로 캡처 파일 0600 보장:
+     ```bash
+     if ! assert_no_symlink_in_path "rd-workflow-workspace/raw-captures"; then
+       echo "경고: raw-captures 경로에 symlink 가 있어 캡처를 건너뜁니다." >&2
+     else
+       mkdir -p rd-workflow-workspace/raw-captures
+       chmod 0700 rd-workflow-workspace/raw-captures
+       ( umask 077 && cat > "$capture_path" <<EOF
      ---
      date: YYYY-MM-DD HH:MM
      stage: spec
      short-title: {short-title}
      source: direct | routed
      ---
+
+     ## 원본 입력
+     {spec 작성 트리거 사용자 입력 원문}
+     EOF
+       )
+     fi
      ```
      (`source`: 직접 호출이면 `direct`, 자연어 라우팅이면 `routed`)
    - 본문: spec 작성 트리거 사용자 입력 원문
@@ -107,14 +149,26 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
 ## Step 3. plan 작성 단계 직전 캡처
 
 1. 명시적 사용자 입력 원문이 있으면: `rd-workflow-workspace/raw-captures/{date}-plan-{short-title}.md` 생성
-   - frontmatter:
-     ```yaml
+   - 디렉토리 0700 보장 + umask 077 subshell 로 캡처 파일 0600 보장:
+     ```bash
+     if ! assert_no_symlink_in_path "rd-workflow-workspace/raw-captures"; then
+       echo "경고: raw-captures 경로에 symlink 가 있어 캡처를 건너뜁니다." >&2
+     else
+       mkdir -p rd-workflow-workspace/raw-captures
+       chmod 0700 rd-workflow-workspace/raw-captures
+       ( umask 077 && cat > "$capture_path" <<EOF
      ---
      date: YYYY-MM-DD HH:MM
      stage: plan
      short-title: {short-title}
      source: direct | routed
      ---
+
+     ## 원본 입력
+     {plan 작성 트리거 사용자 입력 원문}
+     EOF
+       )
+     fi
      ```
      (`source`: 직접 호출이면 `direct`, 자연어 라우팅이면 `routed`)
    - 본문: plan 작성 트리거 사용자 입력 원문
