@@ -22,7 +22,7 @@ review-kind:
   bash rd-workflow/scripts/prepare_review_pipeline.sh project-context
   bash rd-workflow/scripts/prepare_review_pipeline.sh request
   bash rd-workflow/scripts/prepare_review_pipeline.sh spec-plan
-  bash rd-workflow/scripts/prepare_review_pipeline.sh spec-plan rd-workflow-workspace/specs/changes/2026-03-12-campaign-plan-change-spec.md rd-workflow-workspace/plans/2026-03-12-campaign-plan-plan.md
+  bash rd-workflow/scripts/prepare_review_pipeline.sh spec-plan rd-workflow-workspace/specs/changes/2026-03-12-image-compression-change-spec.md rd-workflow-workspace/plans/2026-03-12-image-compression-plan.md
   bash rd-workflow/scripts/prepare_review_pipeline.sh diff
   bash rd-workflow/scripts/prepare_review_pipeline.sh diff "git diff main...HEAD"
 EOF
@@ -111,13 +111,13 @@ case "$review_kind" in
     review_type="project-context-review"
     session_slug="project-context-review"
     review_target="PROJECT_CONTEXT.md"
-    review_goal="\`rd-workflow/docs/prompts/review/project_context_review.md\` 기준으로 품질 기준, 대상, 제약 조건 등 프로젝트 규칙이 실행 입력으로 충분한지 점검"
+    review_goal="\`rd-workflow/docs/prompts/review/project_context_review.md\` 기준으로 build / test / lint / typecheck 명령과 프로젝트 규칙이 구현 입력으로 충분한지 점검"
     ;;
   request|request-review)
     review_type="request-review"
     session_slug="request-review"
     review_target="REQUEST.md"
-    review_goal="\`rd-workflow/docs/prompts/review/request_review.md\` 기준으로 제약, 완료 조건, 산출물 유형, 위험 요소, 영향 범위 누락이 없는지 점검"
+    review_goal="\`rd-workflow/docs/prompts/review/request_review.md\` 기준으로 제약, 완료 조건, 플랫폼, 위험 요소, 영향 범위 누락이 없는지 점검"
     ;;
   spec-plan|spec-plan-review|spec-review)
     spec_path="${1:-}"
@@ -148,7 +148,7 @@ case "$review_kind" in
     session_slug="$(derive_task_slug "$plan_path")-spec-plan-review"
     review_target="${spec_path}
 ${plan_path}"
-    review_goal="\`rd-workflow/docs/prompts/review/spec_review.md\` 기준으로 과도한 설계, 빠진 엣지 케이스, 더 단순한 대안, 품질 검증 전략 누락, 대상 적합성을 점검"
+    review_goal="\`rd-workflow/docs/prompts/review/spec_review.md\` 기준으로 과도한 설계, 빠진 엣지 케이스, 더 단순한 대안, 테스트 전략 누락, 플랫폼 리스크를 점검"
     ;;
   diff|diff-review|final-diff)
     diff_target="${1:-git diff main...HEAD}"
@@ -212,6 +212,38 @@ ${session_path}
 - 총 턴 수는 최대 ${turn_limit}개이며, ${turn_limit}턴에 도달하면 남은 쟁점을 정리하고 \`awaiting-user\`로 넘긴다.
 - 현재 차례는 \`SESSION.md\`의 \`Current Owner\`를 본다.
 - \`awaiting-user\`가 되면 \`USER_ACTION.md\` 질문에 답하거나 마무리를 승인한다.
+EOF
+
+# Branch Context section (Task 8 — fr-branch-tag-lifecycle)
+CTX_FR_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+[[ "$CTX_FR_BRANCH" != fr/* ]] && CTX_FR_BRANCH="null"
+CTX_WT_PATH="$(git rev-parse --show-toplevel 2>/dev/null || echo "null")"
+CTX_SHORT_TITLE="$(awk '/^## Short Title/{flag=1; next} flag && /^[^#]/{sub(/^[ \t]+/,""); sub(/[ \t]+$/,""); print; exit}' CURRENT_TASK.md 2>/dev/null || true)"
+[[ -z "$CTX_SHORT_TITLE" || "$CTX_SHORT_TITLE" == "-" ]] && CTX_SHORT_TITLE="unknown"
+# lifecycle-stage 는 alias 가 정규화된 review_type 을 source-of-truth 로 삼는다.
+# review_kind 는 alias(`request|request-review`, `diff|diff-review|final-diff` 등)를 받지만
+# review_type 은 case 문에서 단일 값으로 정규화된 뒤 stage 매핑된다.
+case "${review_type:-}" in
+  request-review) CTX_STAGE="request-review" ;;
+  spec-plan-review) CTX_STAGE="spec-review" ;;
+  diff-review) CTX_STAGE="validating" ;;
+  project-context-review) CTX_STAGE="implementing" ;;
+  *) CTX_STAGE="implementing" ;;
+esac
+if git remote get-url origin >/dev/null 2>&1 && [[ -z "${RD_LIFECYCLE_NO_REMOTE:-}" ]]; then
+  CTX_REMOTE_MODE="remote"
+else
+  CTX_REMOTE_MODE="local-only"
+fi
+
+cat >> "${session_path}/SESSION.md" <<EOF
+
+## Branch Context
+- fr-branch: $CTX_FR_BRANCH
+- worktree-path: $CTX_WT_PATH
+- short-title: $CTX_SHORT_TITLE
+- lifecycle-stage: $CTX_STAGE
+- remote-mode: $CTX_REMOTE_MODE
 EOF
 
 cat <<EOF

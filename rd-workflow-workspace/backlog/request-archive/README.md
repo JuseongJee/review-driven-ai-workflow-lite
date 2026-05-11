@@ -110,3 +110,18 @@ archive 실행 주체는 Claude (CLAUDE.md 의 Task Tracking 섹션 규약). 사
 
 4. **REQUEST.md 비우기:**
    초기 템플릿 상태로 reset (또는 새 REQUEST 로 덮어쓰기).
+
+5. **lifecycle 일괄 마무리 (큰 작업 — fr branch 사용 시):**
+   위 1–4단계가 fr branch 에서 완료(commit)된 후, main 으로 switch 하고 아래 명령을 실행한다:
+   ```bash
+   git checkout main
+   bash rd-workflow/scripts/lifecycle/archive.sh
+   ```
+   `archive.sh` 가 merge + tag + push + branch/worktree 정리를 일괄 처리한다.
+
+   **small-task (fr branch 없이 main 직접 commit 흐름):**
+   fr branch lifecycle 을 거치지 않으므로 `archive.sh` 호출은 생략할 수 있다. 대신 commit 시 다음 환경변수를 명시한다:
+   ```bash
+   RD_LIFECYCLE_BYPASS_REASON=small-task git commit -m "..."
+   ```
+   bypass reason 을 명시하면 guard hook 이 lifecycle skip 을 정상 처리로 기록한다.

@@ -95,6 +95,14 @@ fi
 validate_session_dir "$session_dir"
 load_session_state "$SESSION_FILE"
 
+# Branch Context strict 검증 (Task 8 — fr-branch-tag-lifecycle)
+if declare -f validate_branch_context >/dev/null 2>&1; then
+  if ! validate_branch_context "$session_dir"; then
+    echo "review turn: branch context 불일치로 중단" >&2
+    exit 1
+  fi
+fi
+
 if [[ "$STATUS" != "awaiting-reviewer" ]]; then
   echo "session is not awaiting reviewer: status=$STATUS" >&2
   exit 1

@@ -6,6 +6,9 @@
 ## Short Title
 -
 
+## Branch / Worktree
+main
+
 ## Status
 대기 중
 

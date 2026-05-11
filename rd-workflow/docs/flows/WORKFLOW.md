@@ -70,6 +70,9 @@ Design Reference가 있으면 추천. 없어도 에러/엣지 케이스 점검 �
 
 `FR 자동 등록 → REQUEST 정리 → REQUEST review → spec/change spec → plan → spec/plan review → 구현 → 검증 → final diff review → REQUEST 아카이브`
 
+FR 승격 시 `bash rd-workflow/scripts/lifecycle/promote.sh` 호출로 fr branch를 생성한다.
+rollback이 필요하면 `bash rd-workflow/scripts/lifecycle/promote_rollback.sh`로 abandon 가능.
+
 ## REQUEST 아카이브
 
 작업이 완료되면 현재 `REQUEST.md`를 `rd-workflow-workspace/backlog/request-archive/`에 보관합니다.
@@ -77,6 +80,7 @@ Design Reference가 있으면 추천. 없어도 에러/엣지 케이스 점검 �
 - 파일명: `YYYY-MM-DD-HHMM-${SHORT_TITLE}.md` (`SHORT_TITLE` 은 `CURRENT_TASK.md ## Short Title` 에서 read — canonical regex 검증된 값)
 - 새 REQUEST로 덮어쓰기 전에 먼저 아카이브합니다
 - 아카이브 후 `REQUEST.md`는 빈 템플릿으로 되돌립니다
+- 큰 작업: fr branch에서 archive content commit 후 main으로 switch, `bash rd-workflow/scripts/lifecycle/archive.sh` 호출로 merge + tag + push + branch 정리를 일괄 처리한다.
 
 ## Raw Capture
 
@@ -123,6 +127,20 @@ archive 매칭은 frontmatter exact match (filename prefix collision + body-cont
 ### git 미추적
 
 `rd-workflow-workspace/raw-captures/` 는 `.gitignore` 로 제외 (소스 dev / `_ROOT_FILES*` / 마이그레이션 가이드 3중 보장).
+
+## Lifecycle 자동화
+
+fr branch lifecycle 관련 스크립트 요약:
+
+| 스크립트 | 역할 |
+|----------|------|
+| `rd-workflow/scripts/lifecycle/promote.sh` | FR 승격 시 fr branch 생성 |
+| `rd-workflow/scripts/lifecycle/archive.sh` | 작업 완료 시 merge + tag + push + branch 삭제 일괄 처리 |
+| `rd-workflow/scripts/lifecycle/promote_rollback.sh` | fr branch abandon (rollback) |
+| `rd-workflow/scripts/lifecycle/slug.sh` | slug 정규화 (`normalize_slug()`) |
+| `rd-workflow/scripts/lifecycle/test_lifecycle.sh` | lifecycle 전체 self-test |
+
+세부 사용법은 `rd-workflow/scripts/lifecycle/README.md` 참조.
 
 ## 기본 원칙
 

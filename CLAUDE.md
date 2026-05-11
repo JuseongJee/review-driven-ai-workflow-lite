@@ -55,6 +55,7 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 - 계획: `writing-plans`
 - 구현: `subagent-driven-development` (기본) 또는 `executing-plans`
 - worktree 가능 시: `using-git-worktrees`
+  - `superpowers:using-git-worktrees` 사용 시 worktree branch가 곧 fr branch로 동작 (lifecycle 정책 결정 2). worktree path는 metadata authoritative.
 
 실행 모드 규칙:
 
@@ -69,11 +70,11 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 
 ### 큰 작업
 
-`FR 자동 등록 → REQUEST 작성 → REQUEST review → spec/change spec → plan → spec/plan review → 구현 → 검증 → final diff review → REQUEST 아카이브`
+`FR 자동 등록 → REQUEST 작성 → REQUEST review → spec/change spec → plan → spec/plan review → 구현 → 검증 → final diff review → REQUEST 아카이브 (fr branch에서 archive content commit → main switch → bash rd-workflow/scripts/lifecycle/archive.sh)`
 
 ### 작은 작업
 
-`FR 자동 등록 → REQUEST 정리 → 구현 → 검증 → 필요 시 final diff review → REQUEST 아카이브`
+`FR 자동 등록 → REQUEST 정리 → 구현 → 검증 → 필요 시 final diff review → REQUEST 아카이브 (small-task — main 직접 commit 가능, RD_LIFECYCLE_BYPASS_REASON=small-task 명시)`
 
 ### REQUEST 아카이브
 
@@ -82,11 +83,16 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 - 아카이브 후 `REQUEST.md`를 초기 템플릿 상태로 비웁니다.
 - `PROJECT_CONTEXT.md`에 `auto_completion_report: true`이면 자동으로, 아니면 "작업 요약 report를 남길까요?" 질문 후 `rd-workflow-workspace/reports/completions/YYYY-MM-DD-HHMM-작업명.md`에 report를 작성합니다.
 
+**큰 작업 lifecycle 절차:**
+1. fr branch에서 archive content commit 수행 (REQUEST.md 비우기, archive 파일 생성, FR done 처리, completion report, CURRENT_TASK.md reset).
+2. main으로 switch 후 `bash rd-workflow/scripts/lifecycle/archive.sh` 호출 → merge + tag + push + branch/worktree 정리 일괄 처리.
+
 ## 절대 규칙 (모든 skill에 공통 적용)
 
 - **구현 완료 후 반드시 `/final-diff-review`를 거친다.** 이 단계를 건너뛰고 merge하거나 작업을 종료하지 않는다.
 - **Superpowers가 사용 가능한 환경에서는 반드시 사용한다.** 사용 불가능할 때만 직접 산출물을 작성한다.
 - **검증**: 구현 후 `bash rd-workflow/scripts/test.sh`, `bash rd-workflow/scripts/lint.sh`, `bash rd-workflow/scripts/typecheck.sh`를 실행한다.
+- **본 프로젝트 자체의 self-test**: `bash rd-workflow/scripts/lifecycle/test_lifecycle.sh` 직접 호출. `rd-workflow/scripts/test.sh`는 generated project용 placeholder (별도 FR `workflow-self-test-entrypoint`가 처리 예정).
 
 ## Review 규칙
 
