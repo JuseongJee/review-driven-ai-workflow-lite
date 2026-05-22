@@ -124,9 +124,9 @@ archive trigger 3 가지:
 
 archive 매칭은 frontmatter exact match (filename prefix collision + body-content collision 모두 차단).
 
-### git 미추적
+### git 추적
 
-`rd-workflow-workspace/raw-captures/` 는 `.gitignore` 로 제외 (소스 dev / `_ROOT_FILES*` / 마이그레이션 가이드 3중 보장).
+`rd-workflow-workspace/raw-captures/` 는 git 추적 대상이다 (정책 변경 — 이전엔 `.gitignore` 제외). capture 본문은 입력 원문이라 민감정보 (token / API key / password) 포함 가능 — commit 전 검토와 노출 시 secret rotation 은 프로젝트 책임 (`raw-captures/README.md` 보안 경고 참조).
 
 ## Lifecycle 자동화
 

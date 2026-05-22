@@ -304,16 +304,9 @@ manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
 
 ## Raw Capture 마이그레이션 (기존 프로젝트)
 
-본 sync 가 raw-captures 인프라를 도입한다. 기존 프로젝트는 다음을 수동으로 적용:
+본 sync 가 raw-captures 인프라를 도입한다. **capture 는 git 추적 대상이다** (정책 — 입력 원문을 백업·이력 보존). 기존 프로젝트는 다음을 적용:
 
-1. **`.gitignore` 에 2 라인 merge** (이미 있으면 skip):
-   ```
-   rd-workflow-workspace/raw-captures/*
-   !rd-workflow-workspace/raw-captures/README.md
-   ```
-   **Git ignore semantics 주의:** `raw-captures/` (디렉토리 자체) 가 아니라 `raw-captures/*` (entry 단위) 패턴이어야 README 예외가 동작.
-
-2. **`raw-captures/` 디렉토리 + README 생성:**
+1. **`raw-captures/` 디렉토리 + README 생성:**
    ```bash
    mkdir -p rd-workflow-workspace/raw-captures
    chmod 0700 rd-workflow-workspace/raw-captures
@@ -321,32 +314,23 @@ manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
    test -f rd-workflow-workspace/raw-captures/README.md
    ```
 
-3. **기 커밋된 raw-captures 캡처 파일이 있다면 `git rm --cached`** (README 는 추적 유지):
-   ```bash
-   # macOS/zsh-safe (BSD xargs 는 -r 미지원, 빈 입력에서도 명령 실행 안 함)
-   # README 는 제외하고 cache 제거
-   git ls-files rd-workflow-workspace/raw-captures/ | while IFS= read -r f; do
-     case "$f" in
-       rd-workflow-workspace/raw-captures/README.md) continue ;;
-     esac
-     git rm --cached -- "$f"
-   done
+2. **이전에 raw-captures 를 `.gitignore` 로 제외했다면 그 2 라인을 제거** (추적 정책으로 전환):
    ```
-   `.gitignore` 만 추가하면 이미 추적 중인 파일은 ignore 가 적용 안 되므로 캐시 제거 필수. README 는 새 ignore 패턴에서 추적 대상이므로 제외.
+   rd-workflow-workspace/raw-captures/*
+   !rd-workflow-workspace/raw-captures/README.md
+   ```
+   제거 후 기존 capture 들이 추적 대상이 된다. 추적하고 싶지 않은 특정 capture 만 프로젝트 `.gitignore` 에 개별 추가한다.
 
-### 이미 push 된 raw capture 의 secret 처리 (중요)
+### 보안 경고 — capture 가 추적되므로 secret 노출 위험 (중요)
 
-`git rm --cached` 는 working tree / index 에서만 제거 — 이미 push 된 commit 의 git history 와 기존 clone 에는 캡처 내용 (token / API key / password) 이 그대로 남습니다.
+capture 본문은 입력 원문이라 token / API key / password 가 포함될 수 있고, 추적·commit·push 되면 git history 에 영구 기록된다. **보안은 프로젝트 책임이다:**
 
-**필수 조치 (capture 안에 secret 이 있는 경우):**
-
-1. **secret rotation 우선:** 노출된 token / API key / password 를 즉시 폐기 + 재발급. history rewrite 보다 rotation 이 안전 (이미 다른 곳에 캐시되었을 가능성).
-2. **history rewrite (선택):** git filter-repo 또는 BFG Repo-Cleaner 로 history 에서 capture 파일 제거.
+1. **commit 전 검토:** 민감 capture 는 commit 전에 확인. 추적을 원치 않으면 프로젝트 `.gitignore` 에 개별 추가.
+2. **이미 push 된 secret rotation 우선:** 노출된 token / API key / password 를 즉시 폐기 + 재발급. history rewrite 보다 rotation 이 안전 (이미 다른 곳에 캐시되었을 가능성).
+3. **history rewrite (선택):** git filter-repo 또는 BFG Repo-Cleaner 로 history 에서 capture 파일 제거.
    - `git filter-repo --path rd-workflow-workspace/raw-captures/ --invert-paths`
    - 협업 repo 라면 모든 collaborator 가 fresh clone 필요 (force push 후 기존 clone 무효화)
-3. **GitHub Secret Scanning** 활성화하여 향후 자동 감지.
-
-`git rm --cached` 만으로는 노출 해소되지 않음을 명심.
+4. **GitHub Secret Scanning** 활성화하여 향후 자동 감지.
 
 4. **legacy capture frontmatter 변환** (예: photos-image-filter 가 프로토타입에서 sync 받는 경우):
 
