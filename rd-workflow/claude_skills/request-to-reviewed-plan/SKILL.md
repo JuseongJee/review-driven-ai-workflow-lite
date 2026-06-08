@@ -43,7 +43,7 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
 ## Short Title 정책
 
 이 skill은 `CURRENT_TASK.md`의 `## Short Title`을 **read-only**로만 사용한다.
-**예외:** Step 0의 rebind branch (`CURRENT_TITLE = -`) 일 때 한정 1회 기록.
+**예외:** Step 0의 rebind branch (`CURRENT_TITLE = -`) 또는 (c-2) stale 케이스 (`CURRENT_TITLE ≠ FR_TITLE` AND `## Status = 대기 중`) 일 때 한정 1회 기록.
 그 외 `## Short Title` 변경 / 삭제 금지.
 
 ## Step 0. FR 승격 3-way 분기 (skill 진입 직후, 캡처 전)
@@ -63,8 +63,16 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
    **(b) `CURRENT_TITLE = FR_TITLE` (equal) → baseline proceed:**
    - 정상 baseline 승격. `CURRENT_TASK.md` 변경 없이 read-only로 Step 1 진행
 
-   **(c) `CURRENT_TITLE ≠ FR_TITLE` AND `CURRENT_TITLE ≠ -` → active-task guard:**
-   - skill 진행 차단 + 다음 경고 출력:
+   **(c) `CURRENT_TITLE ≠ FR_TITLE` AND `CURRENT_TITLE ≠ -` → Status-aware guard:**
+   `CURRENT_TASK.md`의 `## Status` 값 read → `CURRENT_STATUS` (`## Status` heading 다음부터 다음 `## ` heading 직전까지에서 첫 비어있지 않은 줄. 다음 `## ` heading을 먼저 만나거나 그 범위가 공백뿐이면 값 없음 = 파싱 불가).
+
+   - **(c-1) `## Status` 섹션 부재 또는 위 read 규칙으로 값 없음(파싱 불가) → 보수적 차단:**
+     > `CURRENT_TASK.md ## Status` 가 없거나 파싱할 수 없습니다. 유효한 Status 를 설정하거나 `sync_template` 마이그레이션 후 다시 진입하세요. (active-task guard 는 상태를 확정할 수 없어 보수적으로 차단합니다.)
+
+   - **(c-2) `CURRENT_STATUS = 대기 중` → stale Short Title:** 차단하지 않는다. `FR_TITLE` 을 `CURRENT_TASK.md ## Short Title` 에 1회 rebind 기록하고 다음 알림 후 Step 1 로 진행:
+     > 이전 Short Title (`${CURRENT_TITLE}`) 이 `Status = 대기 중` 인 stale 값이라 FR `${FR_TITLE}` 로 교체하고 진행합니다.
+
+   - **(c-3) `CURRENT_STATUS` 가 읽혔고 `대기 중` 이 아님 (`완료` 포함) → active-task guard:** skill 진행 차단 + 다음 경고 출력:
      > 현재 진행 중인 작업 (`${CURRENT_TITLE}`) 이 archive 되지 않았습니다.
      > FR `${FR_TITLE}` 을 promote 하려면 먼저 현재 작업을 archive 한 뒤 다시 진입하세요.
 

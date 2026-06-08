@@ -103,12 +103,15 @@ rollback이 필요하면 `bash rd-workflow/scripts/lifecycle/promote_rollback.sh
   - **`planning-design-intake` / `small-task-implement` — equality-aware 3-way:**
     - (a) `## Short Title = -` 또는 섹션 부재 → CANDIDATE 기록 (부재 시 섹션 자동 추가)
     - (b) `## Short Title = CANDIDATE` (equal) → read-only continue
-    - (c) `## Short Title ≠ CANDIDATE` AND ≠ `-` → active-task guard (명시 경고 + skill 차단)
+    - (c) `## Short Title ≠ CANDIDATE` AND ≠ `-` → `## Status` 판정 (Status-aware guard):
+      - `## Status` 부재/파싱 불가 → 보수적 차단 + 별도 malformed 경고
+      - `## Status = 대기 중` → stale Short Title, 차단 없이 (a)처럼 CANDIDATE 기록(+교체 알림) 후 진행
+      - `## Status ≠ 대기 중` (`완료` 포함) → active-task guard (명시 경고 + skill 차단)
   - **`/fr add` — `Intake 규칙` 따라:**
     - `## Short Title = -` → 새로 부여 (baseline)
     - non-`-` → read-only (FR 등록 + FR 캡처는 새 short-title, `CURRENT_TASK` 변경 안 함)
     - 섹션 부재 → warn-only (legacy active task 보호)
-- `request-to-reviewed-plan` FR 승격 진입 — 3-way (rebind / baseline equal / active-task guard) 별도 항목
+- `request-to-reviewed-plan` FR 승격 진입 — 3-way (rebind / baseline equal / active-task guard) 별도 항목. active-task guard는 `## Status` 판정으로 stale(`대기 중`)이면 rebind, 그 외(완료 포함) 차단, 부재/파싱불가는 보수적 차단.
 - 부여 후 ~ archive 까지 immutable (변경 금지)
 - 캡처 단계 (`request-to-reviewed-plan` 의 일반 진입) 는 short-title 부재 시 부여 안 함, 캡처 생략 + 경고
 - post-plan skill (`implement-reviewed-plan`, `final-diff-review`) 은 read-only

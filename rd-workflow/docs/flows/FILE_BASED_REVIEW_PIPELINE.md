@@ -169,9 +169,20 @@ cp rd-workflow/config/review-tools.json.example rd-workflow/config/review-tools.
 | `default_priority` | 도구 우선순위 | `["codex", "claude"]` |
 | `tools.<name>.bin` | 바이너리 경로 (`null`이면 PATH 탐색) | `null` |
 | `tools.claude.self_review_warning` | 셀프 리뷰 경고 표시 | `true` |
+| `tools.claude.self_review_policy` | self-review 정책 `block`(기본,차단) / `warn`(경고 후 통과) / `off`(무음 통과) | `block` |
 | `overrides.<type>.priority` | 리뷰 타입별 우선순위 오버라이드 | - |
 
 `REVIEW_TOOLS_CONFIG` 환경변수로 설정 파일 경로를 override할 수 있다.
 
 `jq`가 설치되지 않으면 설정 파일을 무시하고 기본값(`codex → claude`)으로 동작한다.
 설정 파일이 없어도 기본값으로 동작한다.
+
+### self-review 차단 게이트 (safeguard-self-review-block)
+
+독립 reviewer(codex 등)가 없어 reviewer가 `claude`로 fallback되면 generator와 동일 모델이 평가하는 self-review가 된다. `self_review_policy=block`(기본)이면:
+
+- **일반 모드**: review turn을 차단한다(reviewer turn 미생성, exit 3). `USER_ACTION.md`에 재개 안내를 남기고 세션 Status는 `awaiting-reviewer`로 유지한다.
+- **autopilot**(`RD_AUTOPILOT=1`): 자율성 보존을 위해 자동 진행하되 `mode=self-review`로 기록한다.
+- **1회 승인**(`RD_SELF_REVIEW_APPROVE=1`): 해당 실행 1회만 통과한다.
+
+`warn`은 기존 동작(경고 후 통과), `off`는 무음 통과다. `self_review_policy` 미설정 시 `self_review_warning=false`이면 `off`, 그 외에는 `block`으로 해석한다(하위호환). 이는 기존 `self_review_warning=true` 환경의 동작을 "경고 후 통과"에서 "차단"으로 격상한다.

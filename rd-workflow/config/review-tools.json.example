@@ -11,7 +11,8 @@
     "claude": {
       "bin": null,
       "model": null,
-      "self_review_warning": true
+      "self_review_warning": true,
+      "self_review_policy": "block"
     }
   },
   "overrides": {

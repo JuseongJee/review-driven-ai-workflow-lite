@@ -343,3 +343,65 @@ append_tool_history() {
 
   printf '| %s | %s | %s |\n' "$turn_number" "$tool_name" "$mode" >> "$session_file"
 }
+
+# self-review 정책 해석 (순수 함수): policy 우선, 미설정/미인식이면 self_review_warning 하위호환.
+# 사용: resolve_self_review_policy "<policy_raw>" "<warning_raw>" → block|warn|off
+resolve_self_review_policy() {
+  local policy_raw="$1"
+  local warning_raw="$2"
+  case "$policy_raw" in
+    block|warn|off) printf '%s' "$policy_raw"; return ;;
+  esac
+  # 명시된 미인식 값(오타 등) → fail-safe block. 빈 값(미설정)만 self_review_warning 하위호환 적용.
+  if [[ -n "$policy_raw" ]]; then
+    printf 'block'
+    return
+  fi
+  if [[ "$warning_raw" == "false" ]]; then
+    printf 'off'
+  else
+    printf 'block'
+  fi
+}
+
+# self-review 게이트 판정 (순수 함수).
+# 사용: evaluate_self_review_gate "<policy>" "<autopilot>" "<approve>"
+#   → proceed-silent | proceed-warn | proceed-autopilot | block
+evaluate_self_review_gate() {
+  local policy="$1"
+  local autopilot="$2"
+  local approve="$3"
+  case "$policy" in
+    off)  printf 'proceed-silent'; return ;;
+    warn) printf 'proceed-warn';   return ;;
+  esac
+  # block (및 안전상 그 외 전부) — autopilot 우선, 다음 approve, 아니면 차단
+  if [[ "$autopilot" == "1" ]]; then
+    printf 'proceed-autopilot'
+  elif [[ "$approve" == "1" ]]; then
+    printf 'proceed-warn'
+  else
+    printf 'block'
+  fi
+}
+
+# self-review 차단 안내로 USER_ACTION.md를 전체 재작성 (멱등). SESSION.md Status는 건드리지 않음.
+# append-only가 아니라 전체 재작성하여 기본 템플릿의 "확인 불필요" 문구와의 모순을 제거.
+# 사용: record_self_review_block "<user_action_file>"
+record_self_review_block() {
+  local user_action_file="$1"
+  cat > "$user_action_file" <<EOF
+# User Action
+
+## Current Recommendation
+독립 reviewer(codex 등)를 찾을 수 없어 self-review(claude)가 차단되었습니다. 독립 reviewer 없이 진행하려면 명시 승인이 필요합니다.
+
+## Why
+\`self_review_policy=block\`(기본)입니다. 같은 모델이 자기 작업을 평가하는 자가평가 편향을 막기 위한 게이트입니다.
+
+## Question For User
+독립 reviewer 없이 진행하려면 다음 중 하나를 선택하세요:
+1. (1회 승인) \`RD_SELF_REVIEW_APPROVE=1 bash rd-workflow/scripts/run_review_turn.sh <session-path>\` 로 재실행
+2. (정책 변경) \`rd-workflow/config/review-tools.json\` 의 \`tools.claude.self_review_policy\` 를 \`warn\`(경고 후 통과) 또는 \`off\`(무음 통과) 로 바꾼 뒤 재실행
+EOF
+}

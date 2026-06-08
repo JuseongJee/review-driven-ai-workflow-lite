@@ -16,34 +16,22 @@ if ! [[ "$cmd" == *git\ *commit* || "$cmd" == *git$'\t'*commit* || "$cmd" == git
   exit 0
 fi
 
-# autopilot 활성 시 통과
-is_autopilot_active && exit 0
-
-# 최신 diff-review 세션 확인
+# 현재 fr 범위 diff-review 세션 (fr-scope, short-title 매칭)
 review_dir="$(get_latest_diff_review_dir)"
-if [[ -z "$review_dir" ]]; then
-  echo "[guard] diff review 세션이 없습니다. 커밋 전에 diff review를 실행하세요." >&2
-  exit 2
-fi
+# 세션 없음 = 아직 구현/검증 단계 → 통과 (autopilot rollback commit 보호, unscoped 세션 제외)
+[[ -z "$review_dir" ]] && exit 0
 
-# CHECKPOINT.md에서 Open Issues 확인
-checkpoint="${review_dir}/CHECKPOINT.md"
-if [[ ! -f "$checkpoint" ]]; then
-  echo "[guard] diff review CHECKPOINT.md가 없습니다." >&2
-  exit 2
-fi
-
-# Open Issues 판정: "- "로 시작하는 줄 중 "- 없음"이 아닌 줄이 있으면 미완료
-has_real_issues="$(awk '
-  /^## Open Issues/ { in_section = 1; next }
-  in_section && /^## / { exit }
-  in_section && /^- / && !/^- 없음/ { found = 1; exit }
-  END { print (found ? "yes" : "no") }
-' "$checkpoint")"
-
-if [[ "$has_real_issues" == "no" ]]; then
+# 세션 존재: SESSION Status + Open Issues 종결성 검사 (autopilot 여부 무관)
+if is_review_session_resolved "$review_dir"; then
   exit 0
 fi
-
-echo "[guard] diff review가 완료되지 않았습니다. Open Issues가 남아있습니다." >&2
-exit 2
+# 미종결: archive/종결 신호 commit만 차단(B1). iteration 수정 commit 은 허용(A1).
+# review 루프의 review target 은 main...HEAD 이므로 iteration 수정은 commit 되어야 reviewer 가 본다.
+# malformed 세션(미종결 취급)도 동일 — archive 신호일 때만 차단, iteration 은 허용.
+#   "malformed = fail-closed" 는 commit 전체 차단에서 archive 경로 fail-closed 로 좁혀진다.
+# 안전 경계의 최종 보루는 archive.sh 의 archive_review_precheck(B2).
+if commit_has_archive_signal; then
+  echo "[guard] diff review가 종결되지 않았습니다. archive/완료 commit 은 review 종결 후 수행하세요 (iteration 수정 commit 은 허용)." >&2
+  exit 2
+fi
+exit 0

@@ -4,14 +4,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/slug.sh"
 source "$SCRIPT_DIR/_lifecycle_common.sh"
 
-DRY_RUN=0; FORCE_DIRTY=0; NO_REMOTE=0; FR_BRANCH_OVERRIDE=""
+DRY_RUN=0; FORCE_DIRTY=0; NO_REMOTE=0; FR_BRANCH_OVERRIDE=""; FORCE_SKIP_REVIEW=0; SKIP_REASON=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fr-branch) FR_BRANCH_OVERRIDE="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --force-dirty) FORCE_DIRTY=1; shift ;;
     --no-remote) NO_REMOTE=1; shift ;;
-    -h|--help) printf '%s\n' "usage: archive.sh [--fr-branch <ref>] [--no-remote] [--force-dirty] [--dry-run]"; exit 0 ;;
+    --force-skip-review-check)
+      FORCE_SKIP_REVIEW=1
+      # 다음 토큰이 없거나 -로 시작하면 사유 누락 → 빈 값 유지 (precheck에서 차단)
+      if [[ $# -ge 2 && "$2" != -* ]]; then SKIP_REASON="$2"; shift 2; else shift 1; fi
+      ;;
+    -h|--help) printf '%s\n' "usage: archive.sh [--fr-branch <ref>] [--no-remote] [--force-dirty] [--force-skip-review-check <사유>] [--dry-run]"; exit 0 ;;
     *) printf 'archive: unknown arg: %s\n' "$1" >&2; exit 1 ;;
   esac
 done
@@ -78,6 +83,13 @@ fi
 if [[ "$DRY_RUN" -eq 1 ]]; then
   printf 'would archive: branch=%s (tag는 cleanup commit 부착 후 결정)\n' "$FR_BRANCH"; exit 0
 fi
+
+# review 종결성 자체 검증 (dry-run exit 이후 = 실제 archive 경로에만 실행, dry-run 비파괴성 보존).
+# 판정/audit/사유검증은 헬퍼에 위임.
+project_root="$CURRENT_WT"
+source "$SCRIPT_DIR/../hooks/_guard_common.sh"
+AUDIT_LOG="$CURRENT_WT/rd-workflow-workspace/.lifecycle/review-skip-audit.log"
+archive_review_precheck "$FORCE_SKIP_REVIEW" "$SKIP_REASON" "$SLUG" "$AUDIT_LOG" "$FR_BRANCH" || exit 1
 
 # Step 2 — archive content 휴리스틱 (warning만)
 LAST_COMMIT_FILES="$(git log -1 "$FR_BRANCH" --name-only --pretty=format: 2>/dev/null || true)"

@@ -17,7 +17,7 @@ digraph autopilot {
     select [label="1. FUTURE_REQUESTS 목록 제시\n사용자가 선택"];
     request [label="2. REQUEST.md 생성"];
     request_review [label="3. REQUEST review (Reviewer)"];
-    branch [label="4. rollback 브랜치 생성"];
+    branch [label="4. fr 브랜치 승격 (promote.sh)"];
     design [label="5. brainstorming → spec → plan"];
     spec_review [label="6. spec/plan review (Reviewer)"];
     implement [label="7. 구현 (TDD + auto-debug)"];
@@ -92,6 +92,8 @@ REVIEW_TURN_LIMIT=50 bash rd-workflow/scripts/prepare_review_pipeline.sh <review
 bash rd-workflow/scripts/run_review_turn.sh <session-path>
 ```
 
+- self-review(독립 reviewer 부재로 claude fallback) 시, autopilot은 `self_review_policy=block`이어도 차단되지 않고 자동 진행한다(자율성 보존). self-review 사용은 `mode=self-review`로 Tool History에 기록된다.
+
 | 단계 | review-kind | 타이밍 |
 |------|------------|--------|
 | REQUEST review | `request` | REQUEST.md 생성 직후 |
@@ -103,13 +105,15 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
 - 50턴 도달 시 `awaiting-user`로 전환하고 사용자에게 보고한다 (일반 review의 20턴 대신 50턴)
 - Reviewer 피드백으로 수정이 필요하면 자율적으로 반영한다
 
-### 3. Rollback 준비
+### 3. fr 브랜치 승격 (promote)
 
-- spec/plan review 통과 후, 구현 시작 전에 rollback 브랜치를 만든다:
+- spec/plan review 통과 후, 구현 시작 전에 lifecycle 정규 경로로 fr 브랜치를 만든다. **main worktree에서** 호출한다:
   ```bash
-  git checkout -b autopilot/<작업명>-<timestamp>
+  bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug>
   ```
-- 구현 중 커밋은 이 브랜치에 쌓인다
+  - `<slug>`는 `CURRENT_TASK.md ## Short Title` 값이다(생략 시 promote.sh가 자동 추출).
+  - promote.sh가 `fr/<slug>` 브랜치 + active-fr metadata(commit) + CURRENT_TASK 갱신을 생성하고 fr 브랜치로 전환한다. 이는 §6 step 7 archive.sh가 요구하는 형식과 일치한다.
+- 구현 중 커밋은 이 `fr/<slug>` 브랜치에 쌓인다
 - 마무리 단계에서 merge/PR/cleanup 중 추천 옵션을 자동 선택한다
 
 ### 4. 자율 구현
@@ -264,6 +268,6 @@ compact 후에도 한계에 가까워지면:
 - 토큰 사용량: N/A (Claude Code CLI 출력에서 확인)
 
 ## Rollback
-- 브랜치: `autopilot/<작업명>-<timestamp>`
-- 되돌리기: `git checkout master && git branch -D autopilot/...`
+- 브랜치: `fr/<slug>` (promote.sh 생성)
+- 되돌리기: `bash rd-workflow/scripts/lifecycle/promote_rollback.sh` (main worktree에서 호출 — worktree 제거 + branch 삭제 + active-fr metadata clear + loop-guard 카운터 + CURRENT_TASK reset 일괄)
 ```

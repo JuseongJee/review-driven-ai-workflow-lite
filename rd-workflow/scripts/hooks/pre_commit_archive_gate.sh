@@ -16,9 +16,6 @@ if ! [[ "$cmd" == *git\ *commit* || "$cmd" == *git$'\t'*commit* || "$cmd" == git
   exit 0
 fi
 
-# autopilot 활성 시 통과
-is_autopilot_active && exit 0
-
 # REQUEST.md에서 Source FR 추출
 request_file="${project_root}/REQUEST.md"
 [[ ! -f "$request_file" ]] && exit 0
@@ -36,18 +33,8 @@ source_fr="$(awk '
 review_dir="$(get_latest_diff_review_dir)"
 [[ -z "$review_dir" ]] && exit 0
 
-checkpoint="${review_dir}/CHECKPOINT.md"
-[[ ! -f "$checkpoint" ]] && exit 0
-
-has_real_issues="$(awk '
-  /^## Open Issues/ { in_section = 1; next }
-  in_section && /^## / { exit }
-  in_section && /^- / && !/^- 없음/ { found = 1; exit }
-  END { print (found ? "yes" : "no") }
-' "$checkpoint")"
-
-# diff review가 아직 미완료면 통과 (review_gate가 처리)
-[[ "$has_real_issues" == "yes" ]] && exit 0
+# diff review가 아직 미종결이면 통과 (review_gate가 처리). 종결성 판정은 헬퍼로 통일.
+is_review_session_resolved "$review_dir" || exit 0
 
 # diff review 통과 + Source FR 있음 → FR 상세 파일 status 확인
 items_dir="${project_root}/rd-workflow-workspace/backlog/items"

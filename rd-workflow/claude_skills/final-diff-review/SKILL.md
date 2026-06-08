@@ -22,6 +22,7 @@ Execution rules:
 - Draft the PR description with `rd-workflow/docs/PR_TEMPLATE.md`.
 - Start the final diff review with `bash rd-workflow/scripts/prepare_review_pipeline.sh diff` and continue with `bash rd-workflow/scripts/run_review_turn.sh ...` until the session reaches `awaiting-user` or the latest Reviewer turn has no objections.
 - Update `CURRENT_TASK.md` if the task status changes.
+- 독립 reviewer가 없어 self-review(claude)로 fallback될 때, 기본 정책 `self_review_policy=block`이면 일반 모드에서 차단된다. 독립 reviewer 없이 진행하려면 `RD_SELF_REVIEW_APPROVE=1`로 재실행하거나 `review-tools.json`에서 정책을 `warn`/`off`로 바꾼다.
 
 Final output:
 - Verification status

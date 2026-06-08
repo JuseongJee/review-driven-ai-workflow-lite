@@ -1,0 +1,58 @@
+1a2
+> # session_start.sh — 세션 시작 시 환경 확인
+8c9
+< task_file="${project_root}/CURRENT_TASK.md"
+---
+> PROJECT_CONTEXT="${project_root}/PROJECT_CONTEXT.md"
+10,18c11,13
+< extract_section() {
+<   local file="$1"
+<   local section="$2"
+<   awk -v target="## ${section}" '
+<     $0 == target { in_section = 1; next }
+<     in_section && /^## / { exit }
+<     in_section { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); if (NF) print }
+<   ' "$file"
+< }
+---
+> echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+> echo " AI Workflow (Lite) 세션 시작"
+> echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+20,22c15,18
+< if [[ ! -f "$task_file" ]]; then
+<   echo "[hooks] CURRENT_TASK.md가 없습니다. 작업 추적이 불가합니다." >&2
+<   exit 0
+---
+> if [[ ! -f "$PROJECT_CONTEXT" ]]; then
+>   echo ""
+>   echo "WARNING: PROJECT_CONTEXT.md가 없습니다."
+>   echo "  프로젝트 설정을 먼저 완료하세요."
+25,27c21,25
+< task="$(extract_section "$task_file" "Task")"
+< status="$(extract_section "$task_file" "Status")"
+< next_step="$(extract_section "$task_file" "Next Step")"
+---
+> # CURRENT_TASK.md 상태 출력
+> task_file="${project_root}/CURRENT_TASK.md"
+> if [[ -f "$task_file" ]]; then
+>   task="$(_extract_task_section "Task")"
+>   status="$(get_task_status)"
+29,31c27,28
+< [[ "$task" == "-" || -z "$task" ]] && task="(설정되지 않음)"
+< [[ "$status" == "-" || -z "$status" ]] && status="(설정되지 않음)"
+< [[ "$next_step" == "-" || -z "$next_step" ]] && next_step="(설정되지 않음)"
+---
+>   [[ "$task" == "-" || -z "$task" ]] && task="(설정되지 않음)"
+>   [[ "$status" == "-" || -z "$status" ]] && status="(설정되지 않음)"
+33,36c30,32
+< echo "[hooks] 현재 작업 상태:"
+< echo "  Task: ${task}"
+< echo "  Status: ${status}"
+< echo "  Next Step: ${next_step}"
+---
+>   echo ""
+>   echo "[hooks] 현재 작업: ${task} (${status})"
+> fi
+64,65d59
+< 
+< exit 0

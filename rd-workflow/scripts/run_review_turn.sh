@@ -164,6 +164,33 @@ for tool in $PRIORITY; do
     continue
   fi
 
+  # self-review 게이트 (safeguard-self-review-block)
+  # reviewer tool 이 claude 이면 generator==reviewer(self-review) — 정책에 따라 차단/승인/진행
+  if [[ "$tool" == "claude" ]]; then
+    sr_policy="$(resolve_self_review_policy \
+      "$(get_tool_config claude self_review_policy "")" \
+      "$self_review_warning")"
+    sr_decision="$(evaluate_self_review_gate "$sr_policy" "${RD_AUTOPILOT:-}" "${RD_SELF_REVIEW_APPROVE:-}")"
+    case "$sr_decision" in
+      block)
+        record_self_review_block "$USER_ACTION_FILE"
+        echo "self-review 차단: 독립 reviewer 부재 + self_review_policy=block." >&2
+        echo "재개 방법은 ${relative_user_action_file} 를 참조하세요." >&2
+        exit 3
+        ;;
+      proceed-silent)
+        self_review_warning="false"
+        ;;
+      proceed-warn)
+        self_review_warning="true"
+        ;;
+      proceed-autopilot)
+        self_review_warning="true"
+        echo "autopilot: self-review 차단 정책이나 자율성 보존을 위해 자동 진행합니다 (mode=self-review 기록)." >&2
+        ;;
+    esac
+  fi
+
   echo "--- 리뷰 도구 실행: ${tool} ---" >&2
 
   export SESSION_PATH="$session_dir"

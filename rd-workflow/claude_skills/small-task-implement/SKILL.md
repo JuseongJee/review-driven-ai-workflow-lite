@@ -38,8 +38,16 @@ Typical user requests can be short:
    **(b) `CURRENT_TITLE = CANDIDATE` (equal) → read-only continue:**
    - `CURRENT_TASK.md` 변경 없이 Step 4로 진행
 
-   **(c) `CURRENT_TITLE ≠ CANDIDATE` AND `CURRENT_TITLE ≠ -` → active-task guard:**
-   - skill 진행 차단 + 다음 경고 출력:
+   **(c) `CURRENT_TITLE ≠ CANDIDATE` AND `CURRENT_TITLE ≠ -` → Status-aware guard:**
+   `CURRENT_TASK.md`의 `## Status` 값 read → `CURRENT_STATUS` (`## Status` heading 다음부터 다음 `## ` heading 직전까지에서 첫 비어있지 않은 줄. 다음 `## ` heading을 먼저 만나거나 그 범위가 공백뿐이면 값 없음 = 파싱 불가).
+
+   - **(c-1) `## Status` 섹션 부재 또는 위 read 규칙으로 값 없음(파싱 불가) → 보수적 차단:**
+     > `CURRENT_TASK.md ## Status` 가 없거나 파싱할 수 없습니다. 유효한 Status 를 설정하거나 `sync_template` 마이그레이션 후 다시 진입하세요. (active-task guard 는 상태를 확정할 수 없어 보수적으로 차단합니다.)
+
+   - **(c-2) `CURRENT_STATUS = 대기 중` → stale Short Title:** 차단하지 않는다. `CANDIDATE` 를 `CURRENT_TASK.md ## Short Title` 에 기록(교체)하고 다음 알림 후 Step 4 로 진행:
+     > 이전 Short Title (`${CURRENT_TITLE}`) 이 `Status = 대기 중` 인 stale 값이라 새 작업 (`${CANDIDATE}`) 으로 교체하고 진행합니다.
+
+   - **(c-3) `CURRENT_STATUS` 가 읽혔고 `대기 중` 이 아님 (`완료` 포함) → active-task guard:** skill 진행 차단 + 다음 경고 출력:
      > 다른 작업 (`${CURRENT_TITLE}`) 이 진행 중입니다. 새 작업 (`${CANDIDATE}`) 을 small-task 로 시작하려면 현재 작업을 archive 한 뒤 다시 진입하세요.
 
 4. **(a) (b) 통과 후) raw-capture 생성:**
