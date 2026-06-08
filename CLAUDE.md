@@ -82,6 +82,7 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 - `REQUEST.md`의 `Source FR`이 `-`가 아니면 해당 FR 항목의 status를 `done`으로 변경하고 `FUTURE_REQUESTS.md` 인덱스에서 삭제합니다.
 - 아카이브 후 `REQUEST.md`를 초기 템플릿 상태로 비웁니다.
 - `PROJECT_CONTEXT.md`에 `auto_completion_report: true`이면 자동으로, 아니면 "작업 요약 report를 남길까요?" 질문 후 `rd-workflow-workspace/reports/completions/YYYY-MM-DD-HHMM-작업명.md`에 report를 작성합니다.
+- **작업 완전 마감 후 `/clear` 안내 (필수)**: 작업이 완전히 마감되면(REQUEST 아카이브 완료 + 모든 산출물 손실 없음 확인 — remote-mode는 push까지, local-only는 commit·merge까지) 마지막 응답에서 컨텍스트 `/clear` 가능 여부를 사용자에게 반드시 한 줄 명시합니다. 단 사용자가 추가 FR 등록 의사를 보이면 FR 등록을 먼저 처리한 뒤 안내합니다.
 
 **큰 작업 lifecycle 절차:**
 1. fr branch에서 archive content commit 수행 (REQUEST.md 비우기, archive 파일 생성, FR done 처리, completion report, CURRENT_TASK.md reset).
