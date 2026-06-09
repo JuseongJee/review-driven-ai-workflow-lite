@@ -2,7 +2,7 @@
 name: fr
 description: >
   Manage future requests — add, list, prioritize, lifecycle, sync with GitHub Issues.
-  Subcommands: /fr add, /fr list, /fr pri, /fr archive, /fr park, /fr status, /fr pull, /fr push, /fr sync.
+  Subcommands: /fr add, /fr list, /fr pri, /fr inspect, /fr archive, /fr park, /fr status, /fr pull, /fr push, /fr sync.
   Use when the user wants to manage backlog items.
 user-invocable: true
 disable-model-invocation: true
@@ -21,6 +21,8 @@ Typical user requests:
 - "future request에 기록해줘" → `/fr add`로 라우팅
 - "FR 목록 보여줘" → `/fr list`로 라우팅
 - "FR 우선순위 검토해줘" → `/fr pri`로 라우팅
+- "이 FR 검토해줘" → `/fr inspect <short-title>`로 라우팅
+- "N번 검토해줘" / "N번 autopilot 가능한지 봐줘" → 직전 `/fr list` 출력에서 N번 행의 short-title을 찾아 `/fr inspect <short-title>`로 라우팅 (번호는 inspect의 공식 인자가 아니라 라우팅 단계 변환용)
 - "done 항목 정리해줘" → `/fr archive`로 라우팅
 - "이거 parked로 옮겨줘" → `/fr park`로 라우팅
 
@@ -33,6 +35,7 @@ Typical user requests:
 - `add` → Read `rd-workflow/claude_skills/fr/add.md` and follow it.
 - `list` → Read `rd-workflow/claude_skills/fr/list.md` and follow it.
 - `pri` → Read `rd-workflow/claude_skills/fr/pri.md` and follow it.
+- `inspect` → Read `rd-workflow/claude_skills/fr/inspect.md` and follow it.
 - `archive` → Read `rd-workflow/claude_skills/fr/archive.md` and follow it.
 - `park` → Read `rd-workflow/claude_skills/fr/park.md` and follow it.
 - `status` → Read `rd-workflow/claude_skills/fr/status.md` and follow it.
@@ -41,7 +44,7 @@ Typical user requests:
 - `sync` → Read `rd-workflow/claude_skills/fr/sync.md` and follow it.
 - 그 외 / 인자 없음 → 아래 사용법 출력 후 종료 (파일 수정 없음 보장)
 
-**Legacy call 처리**: 첫 번째 단어가 `add`, `list`, `pri`, `archive`, `park`, `status`, `pull`, `push`, `sync` 중 어느 것도 아니면 사용법 help를 출력한다. 파일을 절대 수정하지 않는다.
+**Legacy call 처리**: 첫 번째 단어가 `add`, `list`, `pri`, `inspect`, `archive`, `park`, `status`, `pull`, `push`, `sync` 중 어느 것도 아니면 사용법 help를 출력한다. 파일을 절대 수정하지 않는다.
 
 ### 사용법 출력
 
@@ -50,6 +53,7 @@ Typical user requests:
 - `/fr add 내용` — FR 등록
 - `/fr list` — 활성 항목 목록 출력
 - `/fr pri` — 우선순위 검토
+- `/fr inspect <제목>` — 단일 FR 심층 검토 + autopilot 가능 여부 보고
 - `/fr archive` — done 항목 인덱스에서 일괄 삭제
 - `/fr park <제목>` — 항목을 parked로 이동
 - `/fr status <제목> <상태>` — 항목 상태 변경
