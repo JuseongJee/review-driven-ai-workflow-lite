@@ -80,11 +80,14 @@ fi
 # CURRENT_TASK.md baseline reset (inline heredoc, runtime accessible)
 emit_current_task_baseline > CURRENT_TASK.md
 
-# Metadata clear
+# Metadata clear + LC-14: task-state baseline reset (fr-branch/worktree-path null + short-title/status 초기화)
 metadata_clear
+# v2 2b: task-state baseline reset — short-title·status를 sentinel 값으로 되돌림 (LC-14)
+state_write_fields "short-title=-" "status=대기 중"
 
-# Commit (CURRENT_TASK.md + metadata 변경)
-git add CURRENT_TASK.md "$(dirname "$LIFECYCLE_METADATA_PATH")" 2>/dev/null || true
+# Commit (CURRENT_TASK.md + task-state 변경)
+# v2 2b: LIFECYCLE_METADATA_PATH 폐지 → TASK_STATE_PATH 사용
+git add CURRENT_TASK.md "$TASK_STATE_PATH" 2>/dev/null || true
 if ! git diff --cached --quiet 2>/dev/null; then
   RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit -m "chore(lifecycle): rollback 완료 — $TARGET"
 fi

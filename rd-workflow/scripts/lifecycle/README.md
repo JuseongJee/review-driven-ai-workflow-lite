@@ -27,15 +27,15 @@ FR 작업의 git 라이프사이클 — branch 생성 → 작업 → main merge 
 | `ensure_worktree_clean` | 현재 worktree dirty 여부 (return 0/1) |
 | `resolve_unique_ref <branch\|tag> <base>` | 충돌 시 `-N` suffix 자동 부여 |
 | `get_main_worktree_path` | main worktree 절대 경로 (없으면 return 1) |
-| `metadata_read_field` | `rd-workflow-workspace/.lifecycle/active-fr` 메타데이터 읽기 |
-| `metadata_write` | 메타데이터 쓰기 |
-| `metadata_clear` | 메타데이터 삭제 |
-| `metadata_exists` | 메타데이터 존재 여부 |
+| `metadata_read_field` | `task-state` 파일(`TASK_STATE_PATH`) 필드 읽기 |
+| `metadata_write` | `task-state` 파일 필드 쓰기 |
+| `metadata_clear` | `task-state` fr 필드 reset (`fr-branch=null` 등 sentinel 복원 — 파일 삭제 아님) |
+| `metadata_exists` | `task-state` 파일 존재 여부 |
 | `emit_current_task_baseline` | 빈 CURRENT_TASK.md 형태 출력 (heredoc) |
 
 ### `promote.sh`
 
-REQUEST 승격 시 호출. fr branch 생성 + checkout(또는 worktree) + CURRENT_TASK.md 갱신.
+REQUEST 승격 시 호출. fr branch 생성 + checkout(또는 worktree) + task-state fr 필드 기록 + CURRENT_TASK.md 갱신.
 
 **용법:**
 
@@ -53,7 +53,7 @@ bash rd-workflow/scripts/lifecycle/promote.sh \
 ### `archive.sh`
 
 작업 완료 + final-diff-review 통과 후 archive 단계에서 호출.
-main에 `--no-ff` merge → metadata cleanup commit → tag(`fr/{YYYY-MM-DD-HHMM}/{slug}`) → push → branch / worktree 정리.
+main에 `--no-ff` merge → task-state cleanup commit(fr 필드 sentinel 복원) → tag(`fr/{YYYY-MM-DD-HHMM}/{slug}`) → push → branch / worktree 정리.
 
 **용법:**
 
@@ -72,7 +72,7 @@ bash rd-workflow/scripts/lifecycle/archive.sh \
 ### `promote_rollback.sh`
 
 승격 후 작업을 abandon하고 fr branch를 폐기할 때 호출.
-branch + worktree 강제 삭제 + CURRENT_TASK.md baseline reset.
+branch + worktree 강제 삭제 + task-state fr 필드 reset + CURRENT_TASK.md baseline reset.
 
 **용법:**
 
@@ -90,11 +90,11 @@ bash rd-workflow/scripts/lifecycle/promote_rollback.sh \
 
 모든 entrypoint는 동일 인자로 재실행해도 안전하다.
 
-- **`promote.sh`**: metadata 확인 → 동일 short-title이면 남은 step만 수행. 다른 fr 진행 중이면 hard error.
+- **`promote.sh`**: task-state 확인 → 동일 short-title이면 남은 step만 수행. 다른 fr 진행 중이면 hard error.
 - **`archive.sh`**: 각 step idempotent. merge / tag / branch 삭제 / push 모두 git이 up-to-date 판정.
-  metadata cleanup 후 publish 실패 시 재실행으로 publish 재시도.
+  task-state cleanup 후 publish 실패 시 재실행으로 publish 재시도.
   fr branch 부재 + 동일 slug tag 존재 시 "이미 archive 완료" success exit.
-- **`promote_rollback.sh`**: branch 부재 시 skip. metadata 부재 시 `--fr-branch` 명시 필수.
+- **`promote_rollback.sh`**: branch 부재 시 skip. task-state 부재 시 `--fr-branch` 명시 필수.
   이미 archive된 fr (tag 존재)은 hard error.
 
 ---
@@ -105,7 +105,7 @@ bash rd-workflow/scripts/lifecycle/promote_rollback.sh \
 |------|------|
 | `RD_LIFECYCLE_BYPASS_REASON=<reason>` | `fr_branch_gate.sh` hook 우회용. command string에 노출되어 hook이 grep 검출. valid reason: `bootstrap` / `lifecycle` / `small-task` / `legacy` |
 | `RD_LIFECYCLE_NO_REMOTE=1` | `detect_remote_mode`를 강제로 `local-only`로 판정 |
-| `LIFECYCLE_METADATA_PATH` | metadata 파일 경로 override (기본 `rd-workflow-workspace/.lifecycle/active-fr`) |
+| `TASK_STATE_PATH` | task-state 파일 경로 override (기본 `rd-workflow-workspace/.lifecycle/task-state`) |
 
 ---
 
@@ -113,7 +113,7 @@ bash rd-workflow/scripts/lifecycle/promote_rollback.sh \
 
 ### `promote.sh` partial 실패
 
-동일 명령 재실행. metadata가 source-of-truth.
+동일 명령 재실행. task-state가 source-of-truth.
 
 ### `archive.sh` partial 실패
 

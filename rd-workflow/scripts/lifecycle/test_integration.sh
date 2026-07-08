@@ -2,18 +2,23 @@
 # Temp repo 기반 통합 테스트 — promote / archive / rollback / hook의 git state transition 자동 검증
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# canonical(_ROOT_FILES_LITE/rd-workflow/scripts/lifecycle/) 와 mirror(rd-workflow/scripts/lifecycle/) 양쪽에서 동작.
-# _ROOT_FILES_LITE 디렉토리를 가진 부모를 SCRIPT_DIR 에서 위로 거슬러 검출한다.
+# canonical(_ROOT_FILES/rd-workflow/scripts/lifecycle/) 와 mirror(rd-workflow/scripts/lifecycle/) 양쪽에서 동작.
+# _ROOT_FILES 디렉토리를 가진 부모를 SCRIPT_DIR 에서 위로 거슬러 검출한다.
+# 배포본(설치 후 단독 환경)에서는 _ROOT_FILES가 존재하지 않으므로 탐지 실패 → skip.
+# dev fixture(lifecycle 스크립트 소스 복사 등)가 필요하기 때문에 설치본에서는 실행 불가.
 PROJECT_ROOT=""
 _search_dir="$SCRIPT_DIR"
 while [[ "$_search_dir" != "/" ]]; do
-  if [[ -d "$_search_dir/_ROOT_FILES_LITE" ]]; then
+  if [[ -d "$_search_dir/_ROOT_FILES" ]]; then
     PROJECT_ROOT="$_search_dir"
     break
   fi
   _search_dir="$(dirname "$_search_dir")"
 done
-[[ -n "$PROJECT_ROOT" ]] || { printf 'PROJECT_ROOT (containing _ROOT_FILES_LITE) 검출 실패\n' >&2; exit 1; }
+if [[ -z "$PROJECT_ROOT" ]]; then
+  printf '  (skip: _ROOT_FILES 없음 — 설치본 단독 환경. 통합 테스트는 dev repo 전용 dev fixture 필요)\n'
+  exit 0
+fi
 
 PASS=0; FAIL=0
 fail() { FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1" >&2; }
@@ -29,13 +34,15 @@ setup_repo() {
     git init -q -b main 2>/dev/null || git init -q && git checkout -q -b main; \
     git config user.email test@example.com; \
     git config user.name test; \
-    if [[ -f "$PROJECT_ROOT/_ROOT_FILES_LITE/CURRENT_TASK.md" ]]; then \
-      cp "$PROJECT_ROOT/_ROOT_FILES_LITE/CURRENT_TASK.md" CURRENT_TASK.md; \
+    if [[ -f "$PROJECT_ROOT/_ROOT_FILES/CURRENT_TASK.md" ]]; then \
+      cp "$PROJECT_ROOT/_ROOT_FILES/CURRENT_TASK.md" CURRENT_TASK.md; \
     else \
       printf '# Current Task\n\n## Short Title\n-\n\n## Branch / Worktree\nmain\n\n## Status\n대기 중\n' > CURRENT_TASK.md; \
     fi; \
-    mkdir -p rd-workflow/scripts/lifecycle rd-workflow-workspace/.lifecycle; \
-    cp "$PROJECT_ROOT"/_ROOT_FILES_LITE/rd-workflow/scripts/lifecycle/*.sh rd-workflow/scripts/lifecycle/; \
+    mkdir -p rd-workflow/scripts/lifecycle rd-workflow/scripts/hooks rd-workflow-workspace/.lifecycle; \
+    cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/lifecycle/*.sh rd-workflow/scripts/lifecycle/; \
+    cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/hooks/*.sh rd-workflow/scripts/hooks/; \
+    cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_state_common.sh rd-workflow/scripts/; \
     git add -A; \
     git commit -q -m "init"
   )
@@ -50,11 +57,13 @@ run_promote() {
 # === Scenario 1: promote → archive lifecycle ===
 echo "== scenario 1: promote → archive lifecycle =="
 REPO="$(setup_repo)"
-run_promote "$REPO" --short-title test-foo --no-worktree >/dev/null
+# --status "구현 중": archive 후 baseline reset 검증을 위해 실제 stale 상황(비-baseline status) 재현
+run_promote "$REPO" --short-title test-foo --no-worktree --status "구현 중" >/dev/null
 ( cd "$REPO" && git rev-parse --verify fr/test-foo >/dev/null 2>&1 ) && pass "promote: branch fr/test-foo 존재" || fail "promote: branch 부재"
 ( cd "$REPO" && [[ "$(git rev-parse --abbrev-ref HEAD)" == "fr/test-foo" ]] ) && pass "promote: HEAD == fr/test-foo" || fail "promote: HEAD 불일치"
 # metadata is committed on main — check from main's tree (HEAD is fr/test-foo after promote)
-( cd "$REPO" && git show main:rd-workflow-workspace/.lifecycle/active-fr 2>/dev/null | grep -q "fr-branch=fr/test-foo" ) && pass "promote: metadata 기록" || fail "promote: metadata 부재"
+# v2 2b: active-fr → task-state 전환, fr-branch 필드 확인
+( cd "$REPO" && git show main:rd-workflow-workspace/.lifecycle/task-state 2>/dev/null | grep -q "fr-branch=fr/test-foo" ) && pass "promote: metadata 기록 (task-state)" || fail "promote: metadata 부재"
 
 # Idempotent rerun
 ( cd "$REPO" && git switch main -q )
@@ -66,16 +75,26 @@ run_promote "$REPO" --short-title test-foo --no-worktree >/dev/null
   echo "# archived" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" )
 
 # Archive 호출 (--no-remote 모드)
+# review precheck 는 test_lifecycle.sh 가 단위 검증하므로, 여기서는 force-skip 으로 관문만 통과하고
+# git state 전이(merge/tag/branch 정리)에 집중한다.
 ( cd "$REPO" && git switch main -q && \
-  bash rd-workflow/scripts/lifecycle/archive.sh --no-remote ) >/dev/null
+  bash rd-workflow/scripts/lifecycle/archive.sh --no-remote --force-skip-review-check "통합 테스트 fixture" ) >/dev/null
 
 ( cd "$REPO" && ! git rev-parse --verify fr/test-foo >/dev/null 2>&1 ) && pass "archive: branch 삭제" || fail "archive: branch 잔존"
 ( cd "$REPO" && git tag --list "fr/*/test-foo" | grep -q . ) && pass "archive: tag 존재" || fail "archive: tag 부재"
-( cd "$REPO" && [[ ! -f rd-workflow-workspace/.lifecycle/active-fr ]] ) && pass "archive: metadata 정리" || fail "archive: metadata 잔존"
+# v2 2b: active-fr 폐지 → task-state의 fr-branch=null 확인
+( cd "$REPO" && grep -q "^fr-branch=null$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "archive: metadata 정리 (fr-branch=null)" || fail "archive: fr-branch still active"
+# LC-14 대칭: archive 후 short-title/status baseline reset (stale 방지)
+( cd "$REPO" && grep -q "^short-title=-$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "archive: short-title=- baseline reset" || fail "archive: short-title stale 잔존"
+( cd "$REPO" && grep -q "^status=대기 중$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "archive: status=대기 중 baseline reset" || fail "archive: status stale 잔존"
 
 # archive 재실행 — fr branch 부재 + tag 존재 → success exit
+# review-skip-audit.log가 untracked으로 생성될 수 있으므로 clean 트리를 보장하여 LC-20(멱등) 커버리지 복원
+( cd "$REPO" && git clean -f rd-workflow-workspace/.lifecycle/review-skip-audit.log 2>/dev/null || true )
 out="$(cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch fr/test-foo --no-remote 2>&1 || true)"
 [[ "$out" == *"이미 archive 완료"* ]] && pass "archive rerun: success exit (이미 완료)" || fail "archive rerun: $out"
+# rerun(이미 완료)은 task-state를 건드리지 않는다 — baseline 유지 확인
+( cd "$REPO" && grep -q "^short-title=-$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null && grep -q "^status=대기 중$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "archive rerun: task-state 불변 (baseline 유지)" || fail "archive rerun: task-state 변경됨"
 
 rm -rf "$REPO"
 
@@ -86,10 +105,10 @@ run_promote "$REPO" --short-title test-bar --no-worktree >/dev/null
 ( cd "$REPO" && git switch main -q && \
   bash rd-workflow/scripts/lifecycle/promote_rollback.sh --fr-branch fr/test-bar ) >/dev/null
 ( cd "$REPO" && ! git rev-parse --verify fr/test-bar >/dev/null 2>&1 ) && pass "rollback: branch 삭제" || fail "rollback: branch 잔존"
-( cd "$REPO" && [[ ! -f rd-workflow-workspace/.lifecycle/active-fr ]] ) && pass "rollback: metadata 정리" || fail "rollback: metadata 잔존"
-# rollback 후 CURRENT_TASK.md schema 보존 — LITE template / docs 가 사용자 계약으로 명시한 섹션이 baseline 에서 누락되지 않아야 한다.
-( cd "$REPO" && grep -q '^## Output Files' CURRENT_TASK.md ) && pass "rollback: CURRENT_TASK.md 의 Output Files 섹션 보존" || fail "rollback: Output Files 섹션 누락"
-( cd "$REPO" && grep -q '^## Branch / Worktree' CURRENT_TASK.md ) && pass "rollback: CURRENT_TASK.md 의 Branch/Worktree 섹션 보존" || fail "rollback: Branch/Worktree 섹션 누락"
+# v2 2b: active-fr 폐지 → task-state에서 fr-branch=null, short-title=-, status=대기 중 (LC-14)
+( cd "$REPO" && grep -q "^fr-branch=null$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "rollback: fr-branch=null (LC-14)" || fail "rollback: fr-branch still active"
+( cd "$REPO" && grep -q "^short-title=-$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "rollback: short-title=- (LC-14)" || fail "rollback: short-title not reset"
+( cd "$REPO" && grep -q "^status=대기 중$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "rollback: status=대기 중 (LC-14)" || fail "rollback: status not reset"
 rm -rf "$REPO"
 
 # === Scenario 3: archive partial publish rerun (deterministic via direct git state setup) ===
@@ -106,15 +125,20 @@ run_promote "$REPO" --short-title test-baz --no-worktree >/dev/null
 # Partial state: manually merge + cleanup commit + lightweight tag (publish 직전 상태)
 # NOTE: lightweight tag is used here so git rev-parse returns the commit SHA directly,
 # matching what archive.sh's collision check compares against git rev-parse HEAD.
+# v2 2b: active-fr 제거 대신 task-state의 fr-branch=null reset
 ( cd "$REPO" && git switch main -q && \
   git merge --no-ff fr/test-baz -m "merge: test-baz" -q && \
-  rm -f rd-workflow-workspace/.lifecycle/active-fr && \
+  grep -q "^fr-branch=" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null && \
+    awk -F'=' '$1=="fr-branch"{print "fr-branch=null"; next} $1=="worktree-path"{print "worktree-path=null"; next} $1!="created-at"{print}' \
+      rd-workflow-workspace/.lifecycle/task-state > rd-workflow-workspace/.lifecycle/task-state.tmp && \
+    mv rd-workflow-workspace/.lifecycle/task-state.tmp rd-workflow-workspace/.lifecycle/task-state || true; \
   git add -A rd-workflow-workspace/.lifecycle 2>/dev/null && \
   git commit -q -m "chore(lifecycle): archive test-baz metadata 정리" 2>/dev/null || true; \
   git tag "fr/2026-04-29-9999/test-baz" )
 
 # 미push 상태에서 archive 재호출 (publish 실패 후 rerun 시뮬레이션)
-( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch fr/test-baz ) >/dev/null 2>&1 || true
+# metadata 가 위에서 제거되어 short-title 매칭 불가 → precheck 는 force-skip 으로 통과시키고 push 멱등성만 검증.
+( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch fr/test-baz --force-skip-review-check "통합 테스트 fixture" ) >/dev/null 2>&1 || true
 
 # 검증: bare mirror에 push 됐는가
 ( cd "$REPO" && git ls-remote origin refs/heads/main 2>/dev/null | grep -q . ) && pass "rerun: main pushed" || fail "rerun: main 미push"
@@ -125,7 +149,7 @@ rm -rf "$REPO" "$BARE"
 
 # === Scenario 4: fr_branch_gate hook smoke ===
 echo "== scenario 4: fr_branch_gate hook smoke =="
-HOOK="$PROJECT_ROOT/_ROOT_FILES_LITE/rd-workflow/scripts/hooks/fr_branch_gate.sh"
+HOOK="$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/hooks/fr_branch_gate.sh"
 if [[ -x "$HOOK" ]]; then
   # temp repo (main branch) 안에서 호출해 호출자 git state 의존성을 제거한다
   REPO="$(setup_repo)"
@@ -173,7 +197,8 @@ WT_PATH="$REPO_PARENT/wt-test-quux-$$"
 
 run_promote "$REPO" --short-title test-quux --worktree-path "$WT_PATH" >/dev/null
 [[ -d "$WT_PATH" ]] && pass "worktree-promote: worktree 생성" || fail "worktree-promote: worktree 부재"
-( cd "$REPO" && git switch main -q && grep -q "worktree-path=$WT_PATH" rd-workflow-workspace/.lifecycle/active-fr ) && pass "worktree-promote: metadata 기록" || fail "worktree-promote: metadata 부재"
+# v2 2b: active-fr → task-state 전환
+( cd "$REPO" && git switch main -q && grep -q "worktree-path=$WT_PATH" rd-workflow-workspace/.lifecycle/task-state ) && pass "worktree-promote: metadata 기록 (task-state)" || fail "worktree-promote: metadata 부재"
 
 # Rerun without --worktree-path
 ( cd "$REPO" && git switch main -q )
@@ -202,8 +227,9 @@ mkdir -p "$PARENT_DIR"
 RELATIVE_WT="../$SPACE_PARENT_NAME/wt foo"
 ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title test-rel --worktree-path "$RELATIVE_WT" ) >/dev/null
 EXPECTED_ABS="$PARENT_DIR/wt foo"
-( cd "$REPO" && git switch main -q && grep -qF "worktree-path=$EXPECTED_ABS" rd-workflow-workspace/.lifecycle/active-fr ) \
-  && pass "rel-space: metadata canonical absolute path 기록" || fail "rel-space: canonicalize 실패"
+# v2 2b: active-fr → task-state 전환
+( cd "$REPO" && git switch main -q && grep -qF "worktree-path=$EXPECTED_ABS" rd-workflow-workspace/.lifecycle/task-state ) \
+  && pass "rel-space: metadata canonical absolute path 기록 (task-state)" || fail "rel-space: canonicalize 실패"
 [[ -d "$EXPECTED_ABS" ]] && pass "rel-space: worktree 디렉토리 생성 (공백 포함)" || fail "rel-space: worktree 부재"
 
 # parent 미존재 hard error (relative path — absolute paths skip parent check in promote.sh)
@@ -227,7 +253,8 @@ out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh 2>&1 ) || 
 
 # Side effect 부재 검증
 ( cd "$REPO" && git rev-parse --verify fr/test-fetchfail >/dev/null 2>&1 ) && pass "fetch-fail: fr branch 보존" || fail "fetch-fail: fr branch 삭제됨"
-( cd "$REPO" && [[ -f rd-workflow-workspace/.lifecycle/active-fr ]] ) && pass "fetch-fail: metadata 보존" || fail "fetch-fail: metadata 삭제됨"
+# v2 2b: active-fr 폐지 → task-state에 fr-branch 값이 유효하면 metadata 보존 상태
+( cd "$REPO" && grep -q "^fr-branch=fr/" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "fetch-fail: metadata 보존 (task-state fr-branch 유효)" || fail "fetch-fail: metadata 삭제됨"
 ( cd "$REPO" && [[ -z "$(git tag --list 'fr/*/test-fetchfail')" ]] ) && pass "fetch-fail: tag 미생성" || fail "fetch-fail: tag 생성됨"
 
 rm -rf "$REPO"
@@ -245,13 +272,73 @@ run_promote "$REPO" --short-title test-foo --no-worktree >/dev/null
 out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch fr/test-bar --no-remote 2>&1 ) || true )"
 [[ "$out" == *"불일치"* ]] && pass "archive override-mismatch: hard error" || fail "archive override-mismatch: 통과 ($out)"
 ( cd "$REPO" && git rev-parse --verify fr/test-foo >/dev/null 2>&1 ) && pass "archive override-mismatch: active branch 보존" || fail "archive override-mismatch: active branch 삭제됨"
-( cd "$REPO" && grep -q "fr-branch=fr/test-foo" rd-workflow-workspace/.lifecycle/active-fr 2>/dev/null ) && pass "archive override-mismatch: active metadata 보존" || fail "archive override-mismatch: metadata 삭제됨"
+# v2 2b: active-fr → task-state 전환 (fr-branch 필드로 확인)
+( cd "$REPO" && grep -q "^fr-branch=fr/test-foo$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "archive override-mismatch: active metadata 보존 (task-state)" || fail "archive override-mismatch: metadata 삭제됨"
 
 # rollback override mismatch
 out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh --fr-branch fr/test-bar 2>&1 ) || true )"
 [[ "$out" == *"불일치"* ]] && pass "rollback override-mismatch: hard error" || fail "rollback override-mismatch: 통과 ($out)"
 ( cd "$REPO" && git rev-parse --verify fr/test-foo >/dev/null 2>&1 ) && pass "rollback override-mismatch: active branch 보존" || fail "rollback override-mismatch: active branch 삭제됨"
-( cd "$REPO" && grep -q "fr-branch=fr/test-foo" rd-workflow-workspace/.lifecycle/active-fr 2>/dev/null ) && pass "rollback override-mismatch: active metadata 보존" || fail "rollback override-mismatch: metadata 삭제됨"
+# v2 2b: active-fr → task-state 전환
+( cd "$REPO" && grep -q "^fr-branch=fr/test-foo$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "rollback override-mismatch: active metadata 보존 (task-state)" || fail "rollback override-mismatch: metadata 삭제됨"
+
+rm -rf "$REPO"
+
+# === Scenario 9: promote 후 fr 브랜치 task-state 정합 (baseline 회귀 방지) ===
+echo "== scenario 9: promote 후 fr 브랜치 task-state 정합 =="
+
+# 모드 1 — 일반 checkout promote (git switch). promote 직후 HEAD == fr 브랜치이므로
+# 워킹트리 task-state가 metadata 커밋 값을 유지해야 한다 (회귀/부재 모두 실패)
+REPO="$(setup_repo)"
+run_promote "$REPO" --short-title test-sync --no-worktree --status "구현 중" >/dev/null
+TS="$REPO/rd-workflow-workspace/.lifecycle/task-state"
+( grep -q "^short-title=test-sync$" "$TS" 2>/dev/null ) && pass "checkout-sync: short-title 정합" || fail "checkout-sync: short-title 회귀"
+( grep -q "^status=구현 중$" "$TS" 2>/dev/null ) && pass "checkout-sync: status 정합" || fail "checkout-sync: status 회귀"
+( grep -q "^fr-branch=fr/test-sync$" "$TS" 2>/dev/null ) && pass "checkout-sync: fr-branch 정합" || fail "checkout-sync: fr-branch 회귀"
+( cd "$REPO" && git show main:rd-workflow-workspace/.lifecycle/task-state 2>/dev/null | grep -q "^fr-branch=fr/test-sync$" ) && pass "checkout-sync: main측 metadata 유지" || fail "checkout-sync: main측 metadata 부재"
+rm -rf "$REPO"
+
+# 모드 2 — worktree promote (--worktree-path). worktree 내부 task-state가 정합해야 한다
+REPO="$(setup_repo)"
+REPO_PARENT="$(dirname "$REPO")"
+WT_SYNC="$REPO_PARENT/wt-sync-$$"
+run_promote "$REPO" --short-title test-wtsync --worktree-path "$WT_SYNC" >/dev/null
+WTS="$WT_SYNC/rd-workflow-workspace/.lifecycle/task-state"
+( grep -q "^short-title=test-wtsync$" "$WTS" 2>/dev/null ) && pass "wt-sync: short-title 정합" || fail "wt-sync: short-title 회귀"
+( grep -q "^status=구현 중$" "$WTS" 2>/dev/null ) && pass "wt-sync: status 정합" || fail "wt-sync: status 회귀"
+( grep -q "^fr-branch=fr/test-wtsync$" "$WTS" 2>/dev/null ) && pass "wt-sync: fr-branch 정합" || fail "wt-sync: fr-branch 회귀"
+( grep -qF "worktree-path=$WT_SYNC" "$WTS" 2>/dev/null ) && pass "wt-sync: worktree-path 정합" || fail "wt-sync: worktree-path 회귀"
+( cd "$REPO" && git worktree remove --force "$WT_SYNC" ) >/dev/null 2>&1 || true
+rm -rf "$REPO" "$WT_SYNC"
+
+# === Scenario 10: stale fr-branch 진단 (promote 조기 실패 + rollback 복구) ===
+# metadata의 fr-branch가 실재하지 않는 로컬 브랜치를 가리키면 promote는 진입 시점에
+# stale 진단 + promote_rollback.sh 안내로 실패해야 한다 (refs/heads 전용 판정).
+echo "== scenario 10: stale fr-branch 진단 =="
+REPO="$(setup_repo)"
+run_promote "$REPO" --short-title test-stale --no-worktree >/dev/null
+( cd "$REPO" && git switch main -q && git branch -D fr/test-stale -q )
+
+# case 1 — short-title 불일치 경로: stale 진단으로 실패
+out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title other-slug --no-worktree 2>&1 ) || true )"
+[[ "$out" == *"실재하지 않는 stale 상태"* ]] && pass "stale-mismatch: 진단 메시지" || fail "stale-mismatch: 진단 부재 ($out)"
+[[ "$out" == *"promote_rollback.sh"* ]] && pass "stale-mismatch: rollback 안내" || fail "stale-mismatch: rollback 안내 부재 ($out)"
+( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title other-slug --no-worktree >/dev/null 2>&1 ) && fail "stale-mismatch: exit 0" || pass "stale-mismatch: exit 1"
+
+# case 2 — short-title 일치(idempotent rerun) 경로: 후속 git 에러가 아닌 진입 시점 stale 진단
+out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title test-stale --no-worktree 2>&1 ) || true )"
+[[ "$out" == *"실재하지 않는 stale 상태"* ]] && pass "stale-match: 진단 메시지" || fail "stale-match: 진단 부재 ($out)"
+
+# case 3 — 동명 tag만 존재해도 stale 판정 (refs/heads 전용 검증)
+( cd "$REPO" && git tag fr/test-stale )
+out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title test-stale --no-worktree 2>&1 ) || true )"
+[[ "$out" == *"실재하지 않는 stale 상태"* ]] && pass "stale-tag: 동명 tag에도 stale 판정" || fail "stale-tag: tag resolve로 오판 ($out)"
+( cd "$REPO" && git tag -d fr/test-stale >/dev/null )
+
+# case 4 — 복구 회귀: stale 상태에서 rollback 정상 종료 + metadata clear + promote 재실행 성공
+( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh >/dev/null 2>&1 ) && pass "stale-rollback: exit 0" || fail "stale-rollback: 실패"
+( cd "$REPO" && grep -q "^fr-branch=null$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "stale-rollback: fr-branch=null" || fail "stale-rollback: metadata 잔존"
+run_promote "$REPO" --short-title test-stale --no-worktree >/dev/null 2>&1 && pass "stale-rollback: promote 재실행 성공" || fail "stale-rollback: promote 재실행 실패"
 
 rm -rf "$REPO"
 

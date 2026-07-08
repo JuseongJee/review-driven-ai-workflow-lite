@@ -1,55 +1,61 @@
 {
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash rd-workflow/scripts/hooks/session_start.sh"
-          }
+    "hooks": {
+        "Stop": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash rd-workflow/scripts/hooks/stop_task_save_reminder.sh"
+                    }
+                ]
+            }
+        ],
+        "SessionStart": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash rd-workflow/scripts/hooks/session_start.sh"
+                    }
+                ]
+            }
+        ],
+        "PreToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash rd-workflow/scripts/hooks/pre_commit_review_gate.sh"
+                    },
+                    {
+                        "type": "command",
+                        "command": "bash rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"
+                    },
+                    {
+                        "type": "command",
+                        "command": "bash rd-workflow/scripts/hooks/fr_branch_gate.sh"
+                    }
+                ]
+            },
+            {
+                "matcher": "Edit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash rd-workflow/scripts/hooks/implementation_gate.sh"
+                    }
+                ]
+            },
+            {
+                "matcher": "Write",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash rd-workflow/scripts/hooks/implementation_gate.sh"
+                    }
+                ]
+            }
         ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash rd-workflow/scripts/hooks/pre_commit_verify.sh"
-          },
-          {
-            "type": "command",
-            "command": "bash rd-workflow/scripts/hooks/pre_commit_review_gate.sh"
-          },
-          {
-            "type": "command",
-            "command": "bash rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"
-          },
-          {
-            "type": "command",
-            "command": "bash rd-workflow/scripts/hooks/fr_branch_gate.sh"
-          }
-        ]
-      },
-      {
-        "matcher": "Edit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash rd-workflow/scripts/hooks/implementation_gate.sh"
-          }
-        ]
-      },
-      {
-        "matcher": "Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash rd-workflow/scripts/hooks/implementation_gate.sh"
-          }
-        ]
-      }
-    ]
-  }
+    }
 }

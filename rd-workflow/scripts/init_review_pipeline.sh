@@ -33,6 +33,10 @@ session_dir="rd-workflow-workspace/handoffs/review_pipeline/${session_id}"
 
 mkdir -p "${session_dir}/turns"
 
+# 아래 SESSION.md 의 "## Turn Limit" 줄은 정본 형식이다:
+#   <N> total turns in `turns/*.md`
+# review_common.sh:parse_turn_limit_line 이 이 형식을 anchored regex 로 파싱한다.
+# 이 형식을 바꾸면 parse_turn_limit_line 의 정규식과 test_lifecycle.sh 단위 테스트를 함께 갱신할 것.
 cat <<EOF > "${session_dir}/SESSION.md"
 # Review Session
 
@@ -82,6 +86,7 @@ cat <<EOF > "${session_dir}/CHECKPOINT.md"
 - 
 
 ## Open Issues
+<!-- 미해결 이슈가 없으면 정확히 \`- 없음\` 또는 \`- None\` 한 줄로만 표기한다 (후행 마침표 1개 허용). 그 외 표기는 미해결로 판정된다. -->
 - 
 
 ## Questions For Next Agent

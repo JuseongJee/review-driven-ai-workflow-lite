@@ -1,17 +1,9 @@
-# 리뷰 파이프라인 이어가기 (수동)
+붙어 있는 세션 경로(예: `rd-workflow-workspace/handoffs/review_pipeline/YYYYMMDD_HHMMSS_세션명`)와 `rd-workflow/docs/flows/FILE_BASED_REVIEW_PIPELINE.md`를 읽고 파일 기반 review를 이어줘.
 
-아래 세션 경로의 리뷰를 이어가세요.
-
-## 절차
-
-1. `SESSION.md`를 읽어 현재 상태를 파악합니다.
-2. `Current Owner`가 `Author`이면:
-   - 최신 Reviewer 턴을 읽습니다.
-   - 지적 사항에 대해 Author 턴을 작성합니다.
-   - 턴 파일명: `NNN_author.md` (NNN은 다음 번호)
-3. `Current Owner`가 `Reviewer`이면:
-   - 최신 Author 턴을 읽습니다.
-   - `bash rd-workflow/scripts/run_review_turn.sh <session-path>`를 실행합니다.
-   - CLI를 사용할 수 없으면 직접 Reviewer 턴을 작성합니다.
-4. 최신 Reviewer 턴이 `이의 없음`을 명시하면 리뷰를 종료합니다.
-5. 총 턴이 제한(기본 20)에 도달하면 남은 쟁점을 정리하고 `awaiting-user`로 전환합니다.
+절차:
+1. `SESSION.md`, `CHECKPOINT.md`, 최신 턴 파일 1개, 검토 대상을 읽는다. 이전 턴은 `turns/` 디렉토리에서 필요할 때만 참조한다
+2. 자기 차례가 아니면 상태만 짧게 알린다
+3. 자기 차례면 `turns/NNN_<agent>.md` 한 파일만 추가한다
+4. `CHECKPOINT.md`와 `SESSION.md`를 갱신한다
+5. 최신 Reviewer 턴이 `이의 없음`을 명시할 때까지 반복한다
+6. 사람 결정이 필요하거나 총 턴 수가 20에 도달하면 `awaiting-user`로 바꾸고 멈춘다

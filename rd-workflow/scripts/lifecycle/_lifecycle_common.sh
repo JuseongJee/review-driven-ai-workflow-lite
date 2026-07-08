@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Lifecycle 공통 함수 — git 상태 / remote 검출 / metadata I/O / branch ref helpers
+# v2 Phase 2b: metadata_* 함수는 task-state(_state_common.sh)를 대상으로 동작.
+# LIFECYCLE_METADATA_PATH 변수 폐지 — TASK_STATE_PATH 경유 (env override는 TASK_STATE_PATH 사용).
 
-LIFECYCLE_METADATA_PATH="${LIFECYCLE_METADATA_PATH:-rd-workflow-workspace/.lifecycle/active-fr}"
+# _state_common.sh 로드 — task-state 단일 상태 파일 I/O 제공
+source "$(dirname "${BASH_SOURCE[0]}")/../_state_common.sh"
 
 # detect_remote_mode: stdout = "remote" | "local-only"
 detect_remote_mode() {
@@ -49,37 +52,56 @@ get_main_worktree_path() {
   printf '%s\n' "$p"
 }
 
-# Lifecycle metadata I/O (key=value lines)
+# Lifecycle metadata I/O — task-state 대상 (v2 Phase 2b, 시그니처 불변)
+
+# metadata_read_field <key>: task-state에서 값 읽기 (파일/키 부재 시 빈 출력)
+# task-state 부재 시에만 legacy active-fr 파일에서 같은 키를 읽는 read-only fallback 적용.
+# task-state 존재 시 절대 legacy를 읽지 않음 (guard hook fallback 원칙).
 metadata_read_field() {
   local key="$1"
-  # Returns empty stdout if file missing OR key missing OR value empty.
-  # Callers should use metadata_exists() + [[ -n "$val" ]] for full check.
-  [[ -f "$LIFECYCLE_METADATA_PATH" ]] || return 0
-  awk -F'=' -v k="$key" '$1==k{sub(/^[^=]+=/,""); print; exit}' "$LIFECYCLE_METADATA_PATH"
+  if state_file_exists; then
+    state_read_field "$key"
+  else
+    local _legacy_afr="${project_root:-$PWD}/rd-workflow-workspace/.lifecycle/active-fr"
+    if [[ -f "$_legacy_afr" ]]; then
+      awk -F'=' -v k="$key" '$1==k{sub(/^[^=]+=/,""); print; exit}' "$_legacy_afr"
+    fi
+  fi
 }
 
+# metadata_write <fr-branch> <short-title> <worktree-path>: task-state에 3필드 + created-at 기록
 metadata_write() {
   local fr_branch="$1" short_title="$2" worktree_path="$3"
   if [[ "$fr_branch" == *$'\n'* || "$short_title" == *$'\n'* || "$worktree_path" == *$'\n'* ]]; then
     printf 'metadata_write: values must not contain newlines\n' >&2; return 1
   fi
-  mkdir -p "$(dirname "$LIFECYCLE_METADATA_PATH")"
-  cat > "$LIFECYCLE_METADATA_PATH" <<EOF
-fr-branch=$fr_branch
-short-title=$short_title
-worktree-path=${worktree_path:-null}
-created-at=$(date +%Y-%m-%d-%H%M)
-status=active
-EOF
+  state_write_fields \
+    "fr-branch=$fr_branch" \
+    "short-title=$short_title" \
+    "worktree-path=${worktree_path:-null}" \
+    "created-at=$(date +%Y-%m-%d-%H%M)"
 }
 
+# metadata_clear: fr-branch=null, worktree-path=null reset + created-at 줄 제거 (파일 삭제 아님)
+# legacy active-fr 파일이 잔존하면 함께 삭제 (merge 후 main에 남는 legacy 잔재 정리).
 metadata_clear() {
-  [[ -f "$LIFECYCLE_METADATA_PATH" ]] && rm -f "$LIFECYCLE_METADATA_PATH"
+  state_file_exists || return 0
+  state_write_fields "fr-branch=null" "worktree-path=null"
+  # created-at 줄 제거 (fr 비활성 시 부재 계약)
+  local tmp
+  tmp="$(mktemp "$(dirname "$TASK_STATE_PATH")/.task-state.XXXXXX")"
+  awk -F'=' '$1!="created-at"' "$TASK_STATE_PATH" > "$tmp" && mv "$tmp" "$TASK_STATE_PATH"
+  # legacy active-fr 잔재 정리 (archive cleanup 커밋에 자연 포함)
+  local _legacy_afr="${project_root:-$PWD}/rd-workflow-workspace/.lifecycle/active-fr"
+  [[ -f "$_legacy_afr" ]] && rm -f "$_legacy_afr"
   return 0
 }
 
+# metadata_exists: fr-branch 값이 비어있지 않고 null이 아니면 참 (파일 존재 여부가 아님)
+# 존재 판정도 읽기와 동일한 legacy fallback을 공유 — pre-migration repo의 active 작업 보호
 metadata_exists() {
-  [[ -f "$LIFECYCLE_METADATA_PATH" ]]
+  local v; v="$(metadata_read_field "fr-branch")"
+  [[ -n "$v" && "$v" != "null" ]]
 }
 
 # CURRENT_TASK.md baseline form (Reviewer Turn 008 Issue 2 — runtime accessible inline heredoc)

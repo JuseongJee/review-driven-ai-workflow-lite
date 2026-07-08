@@ -4,8 +4,10 @@
 set -uo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPTS_DIR="$(cd "$HOOK_DIR/.." && pwd)"
 HOOK_SOURCE="$HOOK_DIR/implementation_gate.sh"
 GUARD_COMMON="$HOOK_DIR/_guard_common.sh"
+STATE_COMMON="$SCRIPTS_DIR/_state_common.sh"
 PASS=0
 FAIL=0
 
@@ -32,6 +34,7 @@ make_fixture() {
   mkdir -p "$fixture/rd-workflow/scripts/hooks"
   cp "$HOOK_SOURCE" "$fixture/rd-workflow/scripts/hooks/implementation_gate.sh"
   cp "$GUARD_COMMON" "$fixture/rd-workflow/scripts/hooks/_guard_common.sh"
+  cp "$STATE_COMMON"  "$fixture/rd-workflow/scripts/_state_common.sh"
   if [[ "$status" != "__NONE__" ]]; then
     printf '%s\n' "# Current Task" "" "## Status" "$status" > "$fixture/CURRENT_TASK.md"
   fi

@@ -95,6 +95,49 @@ load_session_state() {
   REVIEW_GOAL="$(extract_section "$session_file" "Review Goal" | trim_blank_lines)"
 }
 
+# SESSION.md "## Turn Limit" 섹션 첫 줄의 정본 형식에서 turn limit 정수를 추출한다.
+# 정본 형식 (init_review_pipeline.sh 가 작성하는 형식 — 변경 시 양쪽을 함께 갱신):
+#   <N> total turns in `turns/*.md`
+# 인자: $1 = 검사할 한 줄
+# 성공: 정수 N 을 stdout 으로 출력하고 0 반환
+# 실패(형식 불일치): 아무것도 출력하지 않고 1 반환
+parse_turn_limit_line() {
+  local line="$1"
+  # 백틱과 glob(*) 메타문자는 작은따옴표 리터럴 구간으로 묶어 정규식 메타 해석을 막는다.
+  # ^([0-9]+) 만 캡처 그룹. 앵커(^...$)로 줄 전체 일치를 요구한다. (bash 3.2 BASH_REMATCH 호환)
+  if [[ "$line" =~ ^([0-9]+)' total turns in `turns/*.md`'$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+# Turn Limit을 SESSION.md에서 읽음 (source-of-truth).
+# session_file 우선 → REVIEW_TURN_LIMIT env → default 20 순.
+# "## Turn Limit" 섹션 첫 줄을 parse_turn_limit_line 으로 정본 형식 검증 후 추출한다.
+# 섹션이 존재하나 정본 형식과 불일치하면 숫자를 채택하지 않고 stderr 경고 후 fallback 한다.
+read_session_turn_limit() {
+  local session_file="$1"
+  local from_session="" first_line=""
+  if [[ -f "$session_file" ]]; then
+    first_line="$(extract_section "$session_file" "Turn Limit" | trim_blank_lines | awk 'NR==1')"
+    if [[ -n "$first_line" ]]; then
+      # if ! 로 받아 set -e 트리거를 막는다 (parse 실패 시 1 반환).
+      if ! from_session="$(parse_turn_limit_line "$first_line")"; then
+        from_session=""
+        printf '경고: SESSION.md Turn Limit 형식 미인식 — fallback 적용\n' >&2
+      fi
+    fi
+  fi
+  if [[ -n "$from_session" && "$from_session" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$from_session"
+  elif [[ -n "${REVIEW_TURN_LIMIT:-}" && "${REVIEW_TURN_LIMIT}" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$REVIEW_TURN_LIMIT"
+  else
+    printf '20\n'
+  fi
+}
+
 # 다음 턴 번호 계산
 # 사용: compute_next_turn <turns_dir> <agent_label>
 # 설정: LATEST_TURN_FILE, NEXT_TURN_NUMBER, NEXT_TURN_INDEX, EXPECTED_TURN_FILE, EXISTING_TURN_COUNT 변수
@@ -134,6 +177,72 @@ compute_next_turn() {
   EXPECTED_TURN_FILE="${turns_dir}/${NEXT_TURN_NUMBER}_${agent_label}.md"
 }
 
+
+# HTML comment(한 줄 + multi-line 블록) 제거. stdin → stdout.
+# 한 줄 sed(`s/<!--.*-->//g`)는 multi-line 블록 내부 줄을 못 지워 빈 AC 오판을 유발하므로
+# awk 로 `<!--` ~ `-->` 블록 상태를 추적하며 제거한다.
+_strip_html_comments() {
+  awk '
+    {
+      line = $0
+      while (1) {
+        if (inc) {                          # 블록 comment 진행 중
+          e = index(line, "-->")
+          if (e == 0) { line = ""; break }  # 이 줄 전체가 comment 내부
+          line = substr(line, e + 3); inc = 0
+        }
+        s = index(line, "<!--")
+        if (s == 0) break
+        rest = substr(line, s + 4)
+        e = index(rest, "-->")
+        if (e == 0) { line = substr(line, 1, s - 1); inc = 1; break }  # 블록 시작, 이 줄서 미종료
+        line = substr(line, 1, s - 1) substr(rest, e + 3)              # 한 줄서 열고 닫힘
+      }
+      print line
+    }
+  '
+}
+
+# AC 누락 enforcement notice 생성 (safeguard-ac-enforcement)
+# 사용: build_ac_enforcement_notice [request_md_path]
+# 출력: 주입할 notice 문자열. 주입 불필요(AC 채워짐) 시 빈 문자열.
+build_ac_enforcement_notice() {
+  local req="${1:-${PROJECT_ROOT:-.}/REQUEST.md}"
+  [[ -f "$req" ]] || return 0
+
+  local ac_meaningful reason
+  # AC 비어있음 판정 (강화): HTML comment(한 줄+multi-line) 제거 → '-' 단독/공백 줄 제외 → 남은 의미있는 줄
+  ac_meaningful="$(extract_section "$req" "Acceptance Criteria" \
+    | _strip_html_comments \
+    | awk 'NF && $0 !~ /^[[:space:]]*-[[:space:]]*$/ {print}')"
+
+  # 의미있는 AC 내용이 있으면 → 채워짐 → 무주입
+  if [[ -n "$ac_meaningful" ]]; then
+    return 0
+  fi
+
+  # bypass 파싱도 comment 무시. '-' / 빈 값 = 면제 없음
+  reason="$(extract_section "$req" "AC Bypass Reason" \
+    | _strip_html_comments \
+    | trim_blank_lines)"
+  [[ "$reason" == "-" ]] && reason=""
+
+  # 허용 면제 값 정확 일치 → 면제 인정 (정보성 주석)
+  case "$reason" in
+    small-task|spike|bugfix|refactor)
+      printf '## AC Bypass\n- AC 면제 사유: %s (면제 인정 — 완료 기준 평가 생략)\n' "$reason"
+      return 0
+      ;;
+  esac
+
+  # AC 비어있음 + 면제 없음/허용 외 값 → 주입
+  printf '## AC Enforcement (완료 기준 누락)\n'
+  printf -- '- REQUEST.md 의 Acceptance Criteria 가 비어 있습니다. 완료 기준이 정의되지 않았습니다 — 무엇을 기준으로 통과/불통을 판정할지 먼저 합의하세요.\n'
+  if [[ -n "$reason" ]]; then
+    printf -- '- 인식할 수 없는 AC_BYPASS_REASON 값: %s (유효 값: small-task | spike | bugfix | refactor). 면제로 인정하지 않습니다.\n' "$reason"
+  fi
+}
+
 # 리뷰 프롬프트 생성
 build_review_prompt() {
   local output_file="$1"
@@ -149,7 +258,52 @@ build_review_prompt() {
   local turn_limit="${11}"
   local next_turn_number="${12}"
 
-  cat <<EOF > "$output_file"
+  # M2: autopilot 모드에서만 Attempt History prepend (Reviewer turn 002 Finding 2)
+  local _attempt_history=""
+  if [[ "${RD_AUTOPILOT:-}" == "1" ]]; then
+    local _short_title=""
+    # 정본: review 대상 SESSION.md ($3 = session_file_rel) Branch Context short-title
+    if [[ -f "${PROJECT_ROOT:-.}/${session_file_rel}" ]]; then
+      _short_title="$(awk '/^## Branch Context/{f=1} f&&/^- short-title:/{sub(/^- short-title:[ \t]*/,"");sub(/[ \t]+$/,"");print;exit}' "${PROJECT_ROOT:-.}/${session_file_rel}")"
+    fi
+    # fallback: CURRENT_TASK.md
+    if [[ -z "$_short_title" || "$_short_title" == "unknown" || "$_short_title" == "-" ]]; then
+      if [[ -f "${PROJECT_ROOT:-.}/CURRENT_TASK.md" ]]; then
+        _short_title="$(awk '/^## Short Title/{f=1;next} f&&/^[^#]/{sub(/^[ \t]+/,"");sub(/[ \t]+$/,"");print;exit}' "${PROJECT_ROOT:-.}/CURRENT_TASK.md")"
+      fi
+    fi
+    # 유효 slug 일 때만 주입. unknown/-/빈 값이면 섹션 생략 (legacy session 기존 동작 유지)
+    if [[ -n "$_short_title" && "$_short_title" != "unknown" && "$_short_title" != "-" ]]; then
+      _attempt_history="$(build_attempt_history "$_short_title" "$session_dir_rel" || true)"
+    fi
+  fi
+
+  # AC enforcement notice (safeguard-ac-enforcement)
+  # request-review / diff-review 의 첫 reviewer 턴에만 주입.
+  local _ac_notice=""
+  case "$review_type" in
+    request-review|diff-review)
+      local _turns_dir="${PROJECT_ROOT:-.}/${session_dir_rel}/turns"
+      local _rev_count=0
+      if [[ -d "$_turns_dir" ]]; then
+        # legacy 세션은 reviewer 턴을 *_codex.md 로 쓴다 (compute_next_turn 이 codex→reviewer alias 정규화).
+        # 둘 다 reviewer 턴으로 세어 legacy 재진입 시 재주입을 막는다.
+        _rev_count="$(find "$_turns_dir" -maxdepth 1 \( -name '*_reviewer.md' -o -name '*_codex.md' \) 2>/dev/null | wc -l | tr -d ' ')"
+      fi
+      if [[ "$_rev_count" -eq 0 ]]; then
+        _ac_notice="$(build_ac_enforcement_notice || true)"
+      fi
+      ;;
+  esac
+
+  {
+    if [[ -n "$_ac_notice" ]]; then
+      printf '%s\n\n' "$_ac_notice"
+    fi
+    if [[ -n "$_attempt_history" ]]; then
+      printf '%s\n\n' "$_attempt_history"
+    fi
+    cat <<EOF
 You are continuing an existing file-based review session.
 
 Follow the rules in:
@@ -179,6 +333,8 @@ You must do all of the following:
 2. Create exactly one new turn file at EXPECTED_TURN_FILE.
 3. Update CHECKPOINT_FILE.
 4. Update SESSION_FILE so that Current Owner is no longer Reviewer.
+   - Modify ONLY the "Status" and "Current Owner" sections.
+   - Do NOT modify "Turn Limit", "Stop Rule", "Finalize Rule", "Tool History", "Branch Context", or any other section in SESSION.md. Those sections are managed by the harness.
 5. If unresolved objections remain after your review, default to Status=awaiting-author and hand the session back to Author.
 6. Only set Status=awaiting-user if one of these is true: you explicitly have no remaining objections, user input is required, or this turn reaches the ${turn_limit}-turn limit.
 7. If you have no remaining objections, say that explicitly in Disagreement and Proposed Decision.
@@ -205,6 +361,7 @@ Required turn file sections:
 If you cannot continue safely, record the blocker in CHECKPOINT_FILE and set Current Owner to User with Status awaiting-user.
 At the end, print a short summary of what you changed.
 EOF
+  } > "$output_file"
 }
 
 # 턴 실행 후 출력 검증
@@ -329,7 +486,7 @@ validate_branch_context() {
   return 0
 }
 
-# SESSION.md에 Tool History 행 추가
+# SESSION.md에 Tool History 행 추가 (idempotent — 같은 turn_number 행이 있으면 skip)
 append_tool_history() {
   local session_file="$1"
   local turn_number="$2"
@@ -339,6 +496,11 @@ append_tool_history() {
   # Tool History 섹션이 없으면 추가
   if ! grep -q "^## Tool History" "$session_file"; then
     printf '\n## Tool History\n| Turn | Tool | Mode |\n|------|------|------|\n' >> "$session_file"
+  fi
+
+  # LLM이 SESSION.md 갱신 시 자기 turn 행을 이미 추가했을 수 있음 → 중복 회피
+  if grep -qE "^\| ${turn_number} \|" "$session_file"; then
+    return 0
   fi
 
   printf '| %s | %s | %s |\n' "$turn_number" "$tool_name" "$mode" >> "$session_file"

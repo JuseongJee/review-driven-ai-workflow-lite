@@ -125,6 +125,8 @@ fi
 
 installed_count=0
 skipped_count=0
+refreshed_count=0
+run_timestamp="$(date +%Y%m%d%H%M%S)"
 
 for skill_name in "${skill_names[@]}"; do
   src="${skills_source_dir}/${skill_name}"
@@ -147,6 +149,56 @@ for skill_name in "${skill_names[@]}"; do
     elif [[ -d "$dst" && "$(canonical_dir "$dst")" == "$src_real" ]]; then
       echo "already installed: $skill_name"
       skipped_count=$((skipped_count + 1))
+      continue
+    elif [[ -d "$dst" && ! -L "$dst" ]]; then
+      # copy 모드 설치본 — 내용이 같으면 skip, 다르면 백업 후 갱신.
+      # 기존 설치본 갱신은 이번 실행의 mode 인자와 무관하다 (mode는 신규 설치에만 적용).
+      diff_rc=0
+      diff -rq "$src" "$dst" >/dev/null 2>&1 || diff_rc=$?
+      if [[ "$diff_rc" -eq 0 ]]; then
+        echo "already up to date (copy): $skill_name"
+        skipped_count=$((skipped_count + 1))
+        continue
+      elif [[ "$diff_rc" -ne 1 ]]; then
+        echo "copy 설치본 비교 실패 (diff exit ${diff_rc}), 건너뜁니다: $dst" >&2
+        skipped_count=$((skipped_count + 1))
+        continue
+      fi
+
+      backup_root="$(dirname "$dest_base")/skills-backup"
+      mkdir -p "$backup_root"
+      backup="${backup_root}/${skill_name}-${run_timestamp}"
+      backup_suffix=2
+      while [[ -e "$backup" ]]; do
+        backup="${backup_root}/${skill_name}-${run_timestamp}-${backup_suffix}"
+        backup_suffix=$((backup_suffix + 1))
+      done
+
+      # 새 내용을 임시 경로에 먼저 복사한 뒤 교체한다 — 어느 단계가 실패해도
+      # 기존 설치본이 $dst 또는 $backup 에 항상 남는다.
+      tmp_new="${backup_root}/.${skill_name}-new-$$"
+      rm -rf "$tmp_new"
+      if ! cp -R "$src" "$tmp_new"; then
+        rm -rf "$tmp_new"
+        echo "재복사 실패로 갱신을 건너뜁니다 (기존 설치본 유지): $dst" >&2
+        skipped_count=$((skipped_count + 1))
+        continue
+      fi
+      if ! mv "$dst" "$backup"; then
+        rm -rf "$tmp_new"
+        echo "백업 실패로 갱신을 건너뜁니다: $dst" >&2
+        skipped_count=$((skipped_count + 1))
+        continue
+      fi
+      if ! mv "$tmp_new" "$dst"; then
+        mv "$backup" "$dst"
+        rm -rf "$tmp_new"
+        echo "교체 실패로 기존 설치본을 복구했습니다: $dst" >&2
+        skipped_count=$((skipped_count + 1))
+        continue
+      fi
+      echo "refreshed: $skill_name -> $dst (backup: $backup)"
+      refreshed_count=$((refreshed_count + 1))
       continue
     else
       echo "destination already exists, skipping: $dst" >&2
@@ -194,5 +246,6 @@ echo "mode: $mode"
 echo "source: $source_base_real"
 echo "destination: $dest_base"
 echo "installed: $installed_count"
+echo "refreshed: $refreshed_count"
 echo "skipped: $skipped_count"
 echo "Restart Claude Code to pick up new skills."

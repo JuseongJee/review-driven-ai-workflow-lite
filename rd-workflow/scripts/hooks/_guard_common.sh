@@ -4,6 +4,10 @@
 
 [[ -z "${project_root:-}" ]] && { echo "[guard] project_root가 설정되지 않았습니다" >&2; exit 1; }
 
+# --- task-state I/O (v2 2b) ---
+# _state_common.sh는 project_root 검증 직후 source — $PWD fallback 불사용, project_root 보장 후 진입
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_state_common.sh"
+
 # --- autopilot ---
 
 is_autopilot_active() {
@@ -23,14 +27,22 @@ _extract_task_section() {
   ' "$file"
 }
 
+# 판정 소스 단일화 (v2 2b): task-state 존재 시 task-state만 읽는다.
+# 부재(마이그레이션 전)에만 legacy 산문 파싱 fallback — 어느 시점에도 소스는 정확히 하나.
 get_task_status() {
+  if state_file_exists; then state_read_field "status"; return 0; fi
   _extract_task_section "Status"
 }
 
 # --- diff-review 세션 (fr-scope 인식 + 종결성) ---
 
-# 현재 작업 short-title (CURRENT_TASK.md ## Short Title 우선, 없으면 lifecycle metadata)
+# 현재 작업 short-title.
+# task-state 존재 시 task-state만 읽는다 (v2 2b).
+# 부재 시 legacy 체인(CURRENT_TASK.md → active-fr fallback)을 기존 구현 그대로 보존
+# — pre-migration 세계에서 "CURRENT_TASK.md + active-fr 조합"이 하나의 단위이며,
+#   task-state 생성 이후에는 이 체인 전체가 도달 불가가 됨.
 get_current_short_title() {
+  if state_file_exists; then state_read_field "short-title"; return 0; fi
   local st
   st="$(_extract_task_section "Short Title")"
   if [[ -z "$st" || "$st" == "-" ]]; then
@@ -73,6 +85,10 @@ get_latest_diff_review_dir() {
 
 # review 종결성.
 # 루프 진행 중(awaiting-author/reviewer/claude)=미종결. 루프 종료(awaiting-user/closed)+Open Issues 없음=종결.
+# "이슈 없음"은 canonical 마커(- 없음 | - None, 후행 마침표 1개·공백 허용, 라인 전체 매칭)가 최소 1개
+# 존재하고 그 외 내용 라인이 없을 때만 인정 (빈 줄·<!-- 시작 단일 라인 주석은 무시).
+# 그 외 산문·마커 뒤 후행 텍스트·empty/comment-only 섹션=이슈로 판정(fail-closed).
+# 표기 규약: FILE_BASED_REVIEW_PIPELINE.md.
 # SESSION/CHECKPOINT/Open Issues 섹션 부재=malformed=미종결(fail-closed, scope 확정 세션 한정).
 # return 0 = 종결, 1 = 미종결.
 is_review_session_resolved() {
@@ -86,7 +102,9 @@ is_review_session_resolved() {
   [[ -f "$cp" ]] || return 1
   awk '/^## Open Issues/{print "y";exit}' "$cp" | grep -q y || return 1
   local has_issues
-  has_issues="$(awk '/^## Open Issues/{s=1;next} s&&/^## /{exit} s&&/^- /&&!/^- 없음/{print "yes";exit}' "$cp")"
+  # bad=비허용 내용 라인, m=canonical 마커. 빈 줄·<!-- 시작 주석은 무시.
+  # bad 발견 즉시 exit해도 END는 실행되므로 출력은 END 한 곳에서만 한다 (중복 "yes" 방지).
+  has_issues="$(awk '/^## Open Issues/{s=1;next} s&&/^## /{exit} !s{next} /^[ \t]*$/{next} /^<!--/{next} /^- (없음|None)\.?[ \t]*$/{m=1;next} {bad=1;exit} END{if(bad||!m)print "yes"}' "$cp")"
   [[ "$has_issues" == "yes" ]] && return 1
   return 0
 }
@@ -152,12 +170,13 @@ commit_has_archive_signal() {
        | grep -qE 'rd-workflow-workspace/backlog/request-archive/'; then
     return 0
   fi
-  # AS2: CURRENT_TASK.md baseline reset (Status 대기 중 + Short Title -).
-  #   표준 atomic archive 는 commit 직전 disk 에서 CURRENT_TASK 를 reset 하므로
+  # AS2: task-state baseline reset (status=대기 중, short-title=-).
+  #   표준 atomic archive 는 commit 직전 disk 에서 task-state 를 reset 하므로
   #   commit 호출 방식(commit / commit -a / 단일 Bash add && commit)과 무관하게 잡힌다.
+  #   task-state 부재 시 legacy fallback(get_task_status·get_current_short_title)으로 동작.
   local _status _short
   _status="$(get_task_status)"
-  _short="$(_extract_task_section "Short Title")"
+  _short="$(get_current_short_title)"
   if [[ "$_status" == "대기 중" && "$_short" == "-" ]]; then
     return 0
   fi
@@ -176,6 +195,86 @@ is_workflow_file() {
     rd-workflow-workspace/*) return 0 ;;
   esac
   return 1
+}
+
+# --- Stop hook 전용 헬퍼 ---
+
+# is_nonblocking_status <status>
+# 비차단 집합 단일 출처. CLAUDE.md 'CURRENT_TASK.md 허용 상태값' 참조.
+# 인자가 빈값 / '대기 중' / '완료'면 return 0 (비차단=통과 대상), 아니면 return 1 (진행 중=차단 대상).
+is_nonblocking_status() {
+  local s="$1"
+  case "$s" in
+    ""|"대기 중"|"완료") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# read_stop_hook_active
+# _hook_input(read_hook_input이 채운 전역 변수)에서 최상위 stop_hook_active 필드를 읽어
+# 'true' 또는 'false'를 stdout에 출력. extract_json_field는 .tool_input. 하위만 보므로 별도 처리.
+read_stop_hook_active() {
+  local val=""
+  if command -v jq &>/dev/null; then
+    val="$(printf '%s' "$_hook_input" | jq -r '.stop_hook_active // false' 2>/dev/null || true)"
+  fi
+  if [[ -z "$val" ]]; then
+    # bash 폴백: 최상위 "stop_hook_active" 값 추출
+    local tmp="${_hook_input#*\"stop_hook_active\"}"
+    if [[ "$tmp" != "$_hook_input" ]]; then
+      tmp="${tmp#*:}"
+      tmp="${tmp#*[[:space:]]}"
+      # true/false 판별 (따옴표 없는 boolean)
+      case "$tmp" in
+        true*) val="true" ;;
+        false*) val="false" ;;
+        \"true\"*) val="true" ;;
+        \"false\"*) val="false" ;;
+        *) val="false" ;;
+      esac
+    else
+      val="false"
+    fi
+  fi
+  printf '%s' "$val"
+}
+
+# current_task_is_stale
+# return 0 = stale (CURRENT_TASK.md 갱신 필요), return 1 = not stale 또는 판정 불가 (fail-open).
+# 판정 기준: git 추적 파일(rd-workflow-workspace/ 및 CURRENT_TASK.md 제외) 중
+# mtime > CURRENT_TASK.md mtime인 파일이 하나라도 있으면 stale.
+current_task_is_stale() {
+  local ct="${project_root}/CURRENT_TASK.md"
+  [[ -f "$ct" ]] || return 1
+
+  # mtime 취득 헬퍼 (BSD stat → GNU stat 폴백)
+  local ct_mtime
+  ct_mtime="$(stat -f %m "$ct" 2>/dev/null || stat -c %Y "$ct" 2>/dev/null || true)"
+  [[ -z "$ct_mtime" ]] && return 1
+
+  # git ls-files로 추적 파일 순회
+  local tracked_files
+  tracked_files="$(git -C "$project_root" ls-files 2>/dev/null)" || return 1
+  [[ -z "$tracked_files" ]] && return 1
+
+  local f abs_path f_mtime
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    # rd-workflow-workspace/ 하위 및 CURRENT_TASK.md 자신은 skip
+    case "$f" in
+      rd-workflow-workspace/*) continue ;;
+      CURRENT_TASK.md) continue ;;
+    esac
+    abs_path="${project_root}/${f}"
+    [[ -f "$abs_path" ]] || continue
+    f_mtime="$(stat -f %m "$abs_path" 2>/dev/null || stat -c %Y "$abs_path" 2>/dev/null || true)"
+    [[ -z "$f_mtime" ]] && continue
+    if [[ "$f_mtime" -gt "$ct_mtime" ]]; then
+      return 0  # stale 발견 — 즉시 반환
+    fi
+  done <<< "$tracked_files"
+
+  return 1  # stale 없음
 }
 
 # --- JSON 파싱 ---

@@ -31,70 +31,23 @@ Typical user requests can be short:
 
 3. **3-way 분기 (CANDIDATE 확정 후):**
 
-   **(a) `CURRENT_TITLE = -` 또는 부재 → write:**
-   - `CANDIDATE`를 `CURRENT_TASK.md ## Short Title`에 기록
-   - Step 4로 진행
-
-   **(b) `CURRENT_TITLE = CANDIDATE` (equal) → read-only continue:**
-   - `CURRENT_TASK.md` 변경 없이 Step 4로 진행
-
-   **(c) `CURRENT_TITLE ≠ CANDIDATE` AND `CURRENT_TITLE ≠ -` → Status-aware guard:**
-   `CURRENT_TASK.md`의 `## Status` 값 read → `CURRENT_STATUS` (`## Status` heading 다음부터 다음 `## ` heading 직전까지에서 첫 비어있지 않은 줄. 다음 `## ` heading을 먼저 만나거나 그 범위가 공백뿐이면 값 없음 = 파싱 불가).
-
-   - **(c-1) `## Status` 섹션 부재 또는 위 read 규칙으로 값 없음(파싱 불가) → 보수적 차단:**
-     > `CURRENT_TASK.md ## Status` 가 없거나 파싱할 수 없습니다. 유효한 Status 를 설정하거나 `sync_template` 마이그레이션 후 다시 진입하세요. (active-task guard 는 상태를 확정할 수 없어 보수적으로 차단합니다.)
-
-   - **(c-2) `CURRENT_STATUS = 대기 중` → stale Short Title:** 차단하지 않는다. `CANDIDATE` 를 `CURRENT_TASK.md ## Short Title` 에 기록(교체)하고 다음 알림 후 Step 4 로 진행:
-     > 이전 Short Title (`${CURRENT_TITLE}`) 이 `Status = 대기 중` 인 stale 값이라 새 작업 (`${CANDIDATE}`) 으로 교체하고 진행합니다.
-
-   - **(c-3) `CURRENT_STATUS` 가 읽혔고 `대기 중` 이 아님 (`완료` 포함) → active-task guard:** skill 진행 차단 + 다음 경고 출력:
-     > 다른 작업 (`${CURRENT_TITLE}`) 이 진행 중입니다. 새 작업 (`${CANDIDATE}`) 을 small-task 로 시작하려면 현재 작업을 archive 한 뒤 다시 진입하세요.
+   `bash rd-workflow/scripts/rd task guard --candidate "${CANDIDATE}" --mode intake` 를 실행하고 출력의 `decision` 에 따라 진행한다:
+   - `write` / `rebind`: `message` 를 사용자에게 알리고 Step 4로 진행
+   - `proceed-readonly`: 변경 없이 Step 4로 진행
+   - `block-parse` / `block-active` (exit 2): `message` 를 출력하고 skill 진행을 중단
 
 4. **(a) (b) 통과 후) raw-capture 생성:**
    - `rd-workflow-workspace/raw-captures/{date}-request-{short-title}.md` 생성
-   - 디렉토리 0700 보장 + umask 077 subshell 로 캡처 파일 0600 보장:
+   - frontmatter(date/stage/short-title/source)는 CLI가 생성한다. stdin에는 본문만 전달한다:
      ```bash
-     assert_no_symlink_in_path() {
-       _aslnp_p="$1"
-       case "$_aslnp_p" in
-         /*) ;;
-         *)  _aslnp_p="$PWD/$_aslnp_p" ;;
-       esac
-       _aslnp_d="$_aslnp_p"
-       while [ "$_aslnp_d" != "/" ] && [ -n "$_aslnp_d" ]; do
-         if [ -L "$_aslnp_d" ]; then
-           echo "경고: path component ($_aslnp_d) 가 symlink 입니다. 보안상 중단합니다." >&2
-           unset _aslnp_p _aslnp_d
-           return 1
-         fi
-         _aslnp_d=$(dirname "$_aslnp_d")
-       done
-       unset _aslnp_p _aslnp_d
-       return 0
-     }
-     if ! assert_no_symlink_in_path "rd-workflow-workspace/raw-captures"; then
-       echo "경고: raw-captures 경로에 symlink 가 있어 캡처를 건너뜁니다." >&2
-     else
-       mkdir -p rd-workflow-workspace/raw-captures
-       chmod 0700 rd-workflow-workspace/raw-captures
-       ( umask 077 && cat > "$capture_path" <<EOF
-     ---
-     date: YYYY-MM-DD HH:MM
-     stage: request
-     short-title: {short-title}
-     source: direct | routed
-     ---
-
+     bash rd-workflow/scripts/rd task capture --stage request --source direct <<'CAPTURE_EOF'
      ## 원본 입력
-     {사용자 입력 원문}
-     EOF
-       )
-     fi
+     {사용자 원본 입력 무가공}
+     CAPTURE_EOF
      ```
-     (`source`: 직접 호출이면 `direct`, 자연어 라우팅이면 `routed`)
-   - 본문: 사용자 입력 원문
+     (`--source`: 직접 호출이면 `--source direct`, 자연어 라우팅이면 `--source routed`. CLI 기본값은 `routed`)
 
-5. 캡처 실패 시: 경고만 출력, 본 작업 차단 안 함
+5. 캡처 실패 시: 경고만 출력, 본 작업 차단 안 함 — CLI 가 fail-open (exit 0) 으로 처리
 
 ## Execution rules
 
@@ -103,7 +56,7 @@ Typical user requests can be short:
 - Do not introduce unnecessary structure or speculative refactors.
 - If the task no longer looks like a `small-task`, stop and recommend `/request-to-reviewed-plan`.
 - Update `CURRENT_TASK.md`.
-- Run `bash rd-workflow/scripts/test.sh`, `bash rd-workflow/scripts/lint.sh`, and `bash rd-workflow/scripts/typecheck.sh` unless the repository clearly lacks one of them.
+- Run `bash rd-workflow/scripts/test.sh`, `bash rd-workflow/scripts/lint.sh`, `bash rd-workflow/scripts/typecheck.sh`, and `bash rd-workflow/scripts/build.sh` unless the repository clearly lacks one of them.
 - **구현 완료 후 반드시 `/final-diff-review`로 넘긴다. 이 단계를 건너뛰고 merge하거나 작업을 종료하지 않는다.**
 
 Final output:

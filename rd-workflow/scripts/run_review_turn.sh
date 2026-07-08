@@ -8,7 +8,8 @@ cd "${project_root}"
 source "${script_dir}/review_common.sh"
 PROJECT_ROOT="$project_root"
 
-turn_limit="${REVIEW_TURN_LIMIT:-20}"
+# turn_limit은 session 검증 후 SESSION.md에서 읽음 (source-of-truth).
+# 변수는 read_session_turn_limit 호출 시점에 설정.
 
 usage() {
   cat <<'EOF' >&2
@@ -22,53 +23,83 @@ EOF
 
 # --- 설정 경로 (단일 변수, 모든 config 조회에 공유) ---
 CONFIG_FILE="${REVIEW_TOOLS_CONFIG:-${project_root}/rd-workflow/config/review-tools.json}"
+review_type=""   # load_review_config가 설정 — set -u 방어용 전역 초기화
 
-# --- 설정 로드 ---
-load_review_config() {
-  local review_type="${1:-}"
+# --- 설정 로드 (통합 파싱 — spec §2 결정 3) ---
+# review-tools.json 을 프로세스당 jq 정확히 최대 1회 호출로 파싱한다.
+# 출력 형식: TSV(key<TAB>value) — 값 내 '='·공백이 있어도 경계가 보존된다 (jq @tsv).
+# null 필드는 문자열 "null" 로, missing 필드는 행 자체 부재로 구분된다 (현행 has($f) 계약 보존).
+# jq 부재 또는 JSON 손상 시 기본값으로 fallback — 별도 유효성 검사 호출 없음.
+REVIEW_CFG_KV=""
 
+load_review_config_once() {
   PRIORITY="codex claude"
 
-  if [[ -f "$CONFIG_FILE" ]] && command -v jq &>/dev/null; then
-    # config 파일 파싱 실패 시 기본값으로 fallback (hard error 방지)
-    if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
-      echo "⚠️  설정 파일 파싱 실패: $CONFIG_FILE" >&2
-      echo "    기본 설정으로 진행합니다: codex → claude" >&2
-      PRIORITY="codex claude"
-      return
-    fi
+  if ! [[ -f "$CONFIG_FILE" ]]; then
+    return 0
+  fi
 
-    PRIORITY="$(jq -r '.default_priority | join(" ")' "$CONFIG_FILE")"
-
-    # 리뷰 타입별 오버라이드
-    if [[ -n "$review_type" ]]; then
-      local override
-      override="$(jq -r --arg rt "$review_type" '.overrides[$rt].priority // empty | join(" ")' "$CONFIG_FILE")"
-      if [[ -n "$override" ]]; then
-        PRIORITY="$override"
-      fi
-    fi
-  elif [[ -f "$CONFIG_FILE" ]]; then
+  if ! command -v jq &>/dev/null; then
     echo "⚠️  jq가 설치되지 않아 기본 설정을 사용합니다." >&2
     echo "    설정 파일을 적용하려면: brew install jq" >&2
+    return 0
   fi
+
+  local kv
+  # TSV 통합 추출 — jq 1회 호출 (별도 유효성 검사 없음, 파싱 실패 시 || fallback)
+  # 추출 항목:
+  #   priority<TAB><공백 구분 우선순위 문자열>
+  #   tool.<이름>.<필드><TAB><값 또는 "null">
+  # null 필드는 tostring → "null" 문자열, missing 필드는 행 부재 (has($f) 계약과 동일).
+  if ! kv="$(jq -r --arg rt "$review_type" '
+    ( [ "priority",
+        (((.overrides // {})[$rt].priority // .default_priority) | join(" ")) ]
+      | @tsv ),
+    ( (.tools // {}) | to_entries[] | .key as $t | .value | to_entries[]
+      | [ "tool.\($t).\(.key)", (.value | tostring) ]
+      | @tsv )
+  ' "$CONFIG_FILE" 2>/dev/null)"; then
+    echo "⚠️  설정 파일 파싱 실패: $CONFIG_FILE" >&2
+    echo "    기본 설정으로 진행합니다: codex → claude" >&2
+    return 0
+  fi
+
+  REVIEW_CFG_KV="$kv"
+  local p
+  p="$(printf '%s\n' "$kv" | awk -F'\t' '$1=="priority"{print $2; exit}')"
+  [[ -n "$p" ]] && PRIORITY="$p"
+}
+
+# load_review_config — 기존 호출자(L118)와의 인터페이스 유지.
+# review_type 을 전역 변수로 노출 후 통합 파싱 함수를 위임한다.
+load_review_config() {
+  review_type="${1:-}"
+  load_review_config_once
 }
 
 # --- 도구별 설정 조회 ---
+# 시그니처·null/missing 계약 불변 — 내부만 REVIEW_CFG_KV 조회로 교체.
+# jq 재호출 없음 (spec AC 3).
+# null 필드: REVIEW_CFG_KV 에 "null" 문자열로 저장 → 기본값 반환.
+# missing 필드: 행 부재 → awk 출력 없음 → 빈 값 → 기본값 반환.
 get_tool_config() {
   local tool_name="$1"
   local field="$2"
   local default_val="$3"
 
-  if [[ -f "$CONFIG_FILE" ]] && command -v jq &>/dev/null; then
-    # config 유효성은 load_review_config에서 이미 검증됨
+  if [[ -n "${REVIEW_CFG_KV:-}" ]]; then
     local val
-    val="$(jq -r --arg t "$tool_name" --arg f "$field" 'if .tools[$t] | has($f) then .tools[$t][$f] else null end' "$CONFIG_FILE")"
+    val="$(printf '%s\n' "$REVIEW_CFG_KV" \
+      | awk -F'\t' -v k="tool.${tool_name}.${field}" '$1==k{print $2; exit}')"
     if [[ "$val" != "null" && -n "$val" ]]; then
       printf '%s' "$val"
       return
     fi
+    printf '%s' "$default_val"
+    return
   fi
+
+  # jq 부재 또는 파싱 실패 시 fallback (REVIEW_CFG_KV 가 비어있는 경우)
   printf '%s' "$default_val"
 }
 
@@ -94,6 +125,7 @@ fi
 
 validate_session_dir "$session_dir"
 load_session_state "$SESSION_FILE"
+turn_limit="$(read_session_turn_limit "$SESSION_FILE")"
 
 # Branch Context strict 검증 (Task 8 — fr-branch-tag-lifecycle)
 if declare -f validate_branch_context >/dev/null 2>&1; then

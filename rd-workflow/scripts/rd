@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# rd — 워크플로 task CLI (v2 Phase 2b). 사용: bash rd-workflow/scripts/rd task <subcommand> [args]
+set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/_task_common.sh"
+# 진입 시 task-state 보장 — 부재 시 마이그레이션 수행 (결정 4). 손상 legacy → exit 3.
+state_ensure || exit 3
+
+usage() {
+  cat <<'EOF'
+사용법: bash rd-workflow/scripts/rd task <subcommand>
+  status                                   Status 출력 (파싱 불가 exit 3)
+  title                                    Short Title 출력 (섹션 부재 exit 3)
+  mode                                     autopilot | manual (RD_AUTOPILOT=1 판정)
+  set-status <값> [--force]                전이표 검증 후 Status 갱신 (위반 exit 4)
+  guard --candidate <slug> --mode <m>      m: intake|promote|fr-add. decision=... 출력 (차단 exit 2)
+  capture --stage <s> [--title <slug>] [--source <src>]   본문은 stdin (fail-open)
+  backup-request [--orphan] [--title <slug>]               REQUEST.md collision-safe 백업
+  archive-captures --stages <csv> [--title <slug>]         캡처를 raw-captures/archive/로 이동
+EOF
+}
+
+ns="${1:-}"; [[ $# -gt 0 ]] && shift
+if [[ "$ns" != "task" ]]; then usage; exit 1; fi
+cmd="${1:-}"; [[ $# -gt 0 ]] && shift
+
+case "$cmd" in
+  status)
+    task_read_status || exit 3
+    ;;
+  title)
+    # task-state 존재 시 task-state에서 읽기 (결정 3: 기계 소비는 task-state 단일 소스)
+    if state_file_exists; then
+      v="$(state_read_field "short-title")"
+      [[ -z "$v" ]] && exit 3
+      printf '%s\n' "$v"
+    else
+      # 마이그레이션 전 fallback: CURRENT_TASK.md 산문 파싱
+      grep -q '^## Short Title' "${project_root}/CURRENT_TASK.md" 2>/dev/null || exit 3
+      printf '%s\n' "$(_extract_task_section "Short Title")"
+    fi
+    ;;
+  mode)
+    if [[ "${RD_AUTOPILOT:-}" == "1" ]]; then echo "autopilot"; else echo "manual"; fi
+    ;;
+  set-status)
+    to="${1:-}"; [[ $# -gt 0 ]] && shift
+    force=0; [[ "${1:-}" == "--force" ]] && force=1
+    [[ -z "$to" ]] && { usage; exit 1; }
+    task_set_status "$to" "$force"
+    ;;
+  guard)
+    cand="" gmode=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --candidate) cand="${2:-}"; shift 2 ;;
+        --mode) gmode="${2:-}"; shift 2 ;;
+        *) usage; exit 1 ;;
+      esac
+    done
+    case "$gmode" in intake|promote|fr-add) ;; *) usage; exit 1 ;; esac
+    [[ -z "$cand" ]] && { usage; exit 1; }
+    task_guard_decide "$cand" "$gmode"
+    ;;
+  capture)
+    stage="" title="" src="routed"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --stage) stage="${2:-}"; shift 2 ;;
+        --title) title="${2:-}"; shift 2 ;;
+        --source) src="${2:-}"; shift 2 ;;
+        *) usage; exit 1 ;;
+      esac
+    done
+    case "$stage" in request|spec|plan|fr) ;; *) usage; exit 1 ;; esac
+    [[ -z "$title" ]] && title="$(get_current_short_title)"
+    if [[ -z "$title" || "$title" == "-" ]]; then
+      echo "경고: short-title 을 알 수 없어 캡처를 생략합니다 (작업은 계속)." >&2
+      exit 0
+    fi
+    task_capture_write "$stage" "$title" "$src"
+    ;;
+  backup-request)
+    orphan=0 title=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --orphan) orphan=1; shift ;;
+        --title) title="${2:-}"; shift 2 ;;
+        *) usage; exit 1 ;;
+      esac
+    done
+    if [[ "$orphan" == 0 && -z "$title" ]]; then title="$(get_current_short_title)"; fi
+    if [[ "$orphan" == 0 && ( -z "$title" || "$title" == "-" ) ]]; then
+      echo "short-title 을 알 수 없습니다. --title 또는 --orphan 을 지정하세요." >&2
+      exit 2
+    fi
+    task_backup_request "$title" "$orphan"
+    ;;
+  archive-captures)
+    stages="" title=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --stages) stages="${2:-}"; shift 2 ;;
+        --title) title="${2:-}"; shift 2 ;;
+        *) usage; exit 1 ;;
+      esac
+    done
+    [[ -z "$stages" ]] && { usage; exit 1; }
+    [[ -z "$title" ]] && title="$(get_current_short_title)"
+    if [[ -z "$title" || "$title" == "-" ]]; then
+      echo "short-title 을 알 수 없습니다. --title 을 지정하세요." >&2
+      exit 2
+    fi
+    task_archive_captures "$stages" "$title"
+    ;;
+  *) usage; exit 1 ;;
+esac

@@ -47,17 +47,146 @@ assert_in_set "$rc" "0,1" "ensure_worktree_clean exit code"
 echo "== metadata I/O =="
 TMPDIR_TEST="$(mktemp -d)"
 trap "rm -rf '$TMPDIR_TEST'" EXIT
-LIFECYCLE_METADATA_PATH="$TMPDIR_TEST/active-fr"
+# v2 2b: task-state 경로로 격리 (LIFECYCLE_METADATA_PATH 폐지 — TASK_STATE_PATH 사용)
+TASK_STATE_PATH="$TMPDIR_TEST/task-state"
 if metadata_exists; then FAIL=$((FAIL+1)); echo "  FAIL: empty metadata 인데 exists 반환" >&2; \
-  else PASS=$((PASS+1)); echo "  PASS: metadata 부재"; fi
+  else PASS=$((PASS+1)); echo "  PASS: metadata 부재 (fr-branch=null 또는 파일 없음)"; fi
 metadata_write "fr/foo" "foo" "/path"
-if metadata_exists; then PASS=$((PASS+1)); echo "  PASS: write 후 exists"; \
-  else FAIL=$((FAIL+1)); echo "  FAIL: metadata write 실패" >&2; fi
+if metadata_exists; then PASS=$((PASS+1)); echo "  PASS: write 후 exists (fr-branch=fr/foo)"; \
+  else FAIL=$((FAIL+1)); echo "  FAIL: metadata write 실패 — fr-branch 값 없음" >&2; fi
 assert_eq "$(metadata_read_field fr-branch)" "fr/foo" "metadata_read fr-branch"
 assert_eq "$(metadata_read_field short-title)" "foo" "metadata_read short-title"
+assert_eq "$(metadata_read_field worktree-path)" "/path" "metadata_read worktree-path"
+# created-at 존재 확인 (write 후 생성)
+if grep -q "^created-at=" "$TASK_STATE_PATH" 2>/dev/null; then PASS=$((PASS+1)); echo "  PASS: write 후 created-at 존재"; \
+  else FAIL=$((FAIL+1)); echo "  FAIL: created-at 누락" >&2; fi
 metadata_clear
-if metadata_exists; then FAIL=$((FAIL+1)); echo "  FAIL: clear 후에도 exists" >&2; \
-  else PASS=$((PASS+1)); echo "  PASS: metadata clear"; fi
+# clear 후: fr-branch=null, worktree-path=null, created-at 제거
+assert_eq "$(metadata_read_field fr-branch)" "null" "metadata_clear 후 fr-branch=null"
+assert_eq "$(metadata_read_field worktree-path)" "null" "metadata_clear 후 worktree-path=null"
+if grep -q "^created-at=" "$TASK_STATE_PATH" 2>/dev/null; then FAIL=$((FAIL+1)); echo "  FAIL: clear 후 created-at 잔존" >&2; \
+  else PASS=$((PASS+1)); echo "  PASS: clear 후 created-at 제거"; fi
+if metadata_exists; then FAIL=$((FAIL+1)); echo "  FAIL: clear 후에도 metadata_exists true" >&2; \
+  else PASS=$((PASS+1)); echo "  PASS: metadata_exists false (fr-branch=null)"; fi
+
+# --- legacy active-fr fallback (수정 2: metadata_read_field legacy fallback) ---
+echo "== legacy active-fr fallback =="
+LEGACY_AFR_DIR="$TMPDIR_TEST/legacy-root/rd-workflow-workspace/.lifecycle"
+mkdir -p "$LEGACY_AFR_DIR"
+printf 'fr-branch=fr/legacy-test\nshort-title=legacy-task\nworktree-path=/tmp/legacy\n' > "$LEGACY_AFR_DIR/active-fr"
+# task-state 없는 상태 + project_root 격리
+(
+  set +e
+  export project_root="$TMPDIR_TEST/legacy-root"
+  export TASK_STATE_PATH="$TMPDIR_TEST/legacy-root/rd-workflow-workspace/.lifecycle/task-state"
+  rm -f "$TASK_STATE_PATH"
+  source "$SCRIPT_DIR/_lifecycle_common.sh"
+  got="$(metadata_read_field fr-branch)"
+  if [[ "$got" == "fr/legacy-test" ]]; then
+    echo "  PASS: task-state 부재 + active-fr → fr-branch=fr/legacy-test"
+    exit 0
+  else
+    echo "  FAIL: task-state 부재 legacy fallback — got=[$got] want=[fr/legacy-test]" >&2
+    exit 1
+  fi
+) && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+# task-state 존재 시 legacy active-fr 무시 확인
+(
+  set +e
+  export project_root="$TMPDIR_TEST/legacy-root"
+  export TASK_STATE_PATH="$TMPDIR_TEST/legacy-root/rd-workflow-workspace/.lifecycle/task-state2"
+  mkdir -p "$(dirname "$TASK_STATE_PATH")"
+  printf 'schema=1\nfr-branch=fr/real-state\nshort-title=real\nstatus=구현 중\nworktree-path=null\nsource-fr=-\n' > "$TASK_STATE_PATH"
+  # active-fr도 존재 (무시 대상)
+  printf 'fr-branch=fr/legacy-test\nshort-title=legacy-task\n' > "$LEGACY_AFR_DIR/active-fr"
+  source "$SCRIPT_DIR/_lifecycle_common.sh"
+  got="$(metadata_read_field fr-branch)"
+  if [[ "$got" == "fr/real-state" ]]; then
+    echo "  PASS: task-state 존재 시 active-fr 무시 → fr-branch=fr/real-state"
+    exit 0
+  else
+    echo "  FAIL: task-state 존재 시 legacy 값이 노출됨 — got=[$got] want=[fr/real-state]" >&2
+    exit 1
+  fi
+) && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+# metadata_clear — legacy active-fr 삭제 확인 (수정 3)
+(
+  set +e
+  export project_root="$TMPDIR_TEST/legacy-root"
+  export TASK_STATE_PATH="$TMPDIR_TEST/legacy-root/rd-workflow-workspace/.lifecycle/task-state3"
+  mkdir -p "$(dirname "$TASK_STATE_PATH")"
+  printf 'schema=1\nfr-branch=fr/to-clear\nshort-title=clr\nstatus=구현 중\nworktree-path=null\nsource-fr=-\n' > "$TASK_STATE_PATH"
+  printf 'fr-branch=fr/to-clear\nshort-title=clr\n' > "$LEGACY_AFR_DIR/active-fr"
+  source "$SCRIPT_DIR/_lifecycle_common.sh"
+  metadata_clear
+  if [[ ! -f "$LEGACY_AFR_DIR/active-fr" ]]; then
+    echo "  PASS: metadata_clear → legacy active-fr 삭제됨"
+    exit 0
+  else
+    echo "  FAIL: metadata_clear 후 active-fr 잔존" >&2
+    exit 1
+  fi
+) && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+# metadata_exists — legacy fallback 회귀 테스트
+# metadata_exists가 metadata_read_field 경유로 legacy fallback을 공유하는지 검증
+echo "== metadata_exists legacy fallback =="
+# Case 1: task-state 부재 + active-fr(fr-branch=fr/x) → metadata_exists return 0 (참)
+(
+  set +e
+  export project_root="$TMPDIR_TEST/exists-legacy-root"
+  export TASK_STATE_PATH="$TMPDIR_TEST/exists-legacy-root/rd-workflow-workspace/.lifecycle/task-state"
+  local_afr="$TMPDIR_TEST/exists-legacy-root/rd-workflow-workspace/.lifecycle"
+  mkdir -p "$local_afr"
+  rm -f "$TASK_STATE_PATH"
+  printf 'fr-branch=fr/x\nshort-title=legacy-x\n' > "$local_afr/active-fr"
+  source "$SCRIPT_DIR/_lifecycle_common.sh"
+  if metadata_exists; then
+    echo "  PASS: task-state 부재 + active-fr(fr/x) → metadata_exists true"
+    exit 0
+  else
+    echo "  FAIL: task-state 부재 + active-fr(fr/x) → metadata_exists false (legacy fallback 미적용)" >&2
+    exit 1
+  fi
+) && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+# Case 2: task-state 존재(fr-branch=null) + active-fr 잔존(fr-branch=fr/x) → metadata_exists return 1 (task-state 우선)
+(
+  set +e
+  export project_root="$TMPDIR_TEST/exists-ts-root"
+  export TASK_STATE_PATH="$TMPDIR_TEST/exists-ts-root/rd-workflow-workspace/.lifecycle/task-state"
+  local_afr="$TMPDIR_TEST/exists-ts-root/rd-workflow-workspace/.lifecycle"
+  mkdir -p "$local_afr"
+  printf 'schema=1\nfr-branch=null\nshort-title=cleared\nstatus=대기 중\nworktree-path=null\nsource-fr=-\n' > "$TASK_STATE_PATH"
+  printf 'fr-branch=fr/x\nshort-title=legacy-x\n' > "$local_afr/active-fr"
+  source "$SCRIPT_DIR/_lifecycle_common.sh"
+  if metadata_exists; then
+    echo "  FAIL: task-state(fr-branch=null) + active-fr → metadata_exists true (legacy 값이 우선됨)" >&2
+    exit 1
+  else
+    echo "  PASS: task-state(fr-branch=null) + active-fr → metadata_exists false (task-state 우선)"
+    exit 0
+  fi
+) && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+# Case 3: task-state 부재 + active-fr 부재 → metadata_exists return 1
+(
+  set +e
+  export project_root="$TMPDIR_TEST/exists-empty-root"
+  export TASK_STATE_PATH="$TMPDIR_TEST/exists-empty-root/rd-workflow-workspace/.lifecycle/task-state"
+  mkdir -p "$(dirname "$TASK_STATE_PATH")"
+  rm -f "$TASK_STATE_PATH" "$TMPDIR_TEST/exists-empty-root/rd-workflow-workspace/.lifecycle/active-fr"
+  source "$SCRIPT_DIR/_lifecycle_common.sh"
+  if metadata_exists; then
+    echo "  FAIL: task-state 부재 + active-fr 부재 → metadata_exists true" >&2
+    exit 1
+  else
+    echo "  PASS: task-state 부재 + active-fr 부재 → metadata_exists false"
+    exit 0
+  fi
+) && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
 
 echo "== Task 2 누적: PASS=$PASS FAIL=$FAIL =="
 
@@ -77,6 +206,10 @@ mk_session() {
 }
 
 project_root="$GUARD_ROOT"
+# v2 2b: task-state 격리 — metadata I/O 테스트의 잔여 상태가 오염되지 않도록 TASK_STATE_PATH 재설정
+TASK_STATE_PATH="$GUARD_ROOT/rd-workflow-workspace/.lifecycle/task-state"
+# task-state 초기값: 대기 중 (get_current_short_title이 task-state에서 short-title을 읽음)
+printf 'schema=1\nshort-title=mytask\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' > "$TASK_STATE_PATH"
 source "$LITE_HOOKS_DIR/_guard_common.sh"
 
 assert_eq "$(get_current_short_title)" "mytask" "get_current_short_title — CURRENT_TASK"
@@ -119,10 +252,56 @@ printf '# Review Checkpoint\n\n## Current Summary\n-\n' > "$RP/20260109_000000_f
 is_review_session_resolved "$RP/20260109_000000_final-diff-review" && rc=0 || rc=1
 assert_eq "$rc" "1" "fail-closed — Open Issues 섹션 부재"
 
+# (h)~(q) canonical 마커 계약 (precheck-open-issues-marker) — 별도 short-title(markertask)로
+# 격리해 아래 get_latest_diff_review_dir(mytask 최신=20260109) assert에 간섭하지 않는다.
+# (h) closed + None (영어 canonical 마커) → 종결(0)
+mk_session "20260301_000000_final-diff-review" "closed" "- None" "markertask"
+is_review_session_resolved "$RP/20260301_000000_final-diff-review" && rc=0 || rc=1
+assert_eq "$rc" "0" "resolved — closed + None (영어 마커)"
+# (i) closed + None. (후행 마침표 — 실제 관측된 거짓 양성 사례) → 종결(0)
+mk_session "20260302_000000_final-diff-review" "closed" "- None." "markertask"
+is_review_session_resolved "$RP/20260302_000000_final-diff-review" && rc=0 || rc=1
+assert_eq "$rc" "0" "resolved — closed + None. (후행 마침표)"
+# (j) closed + 없음. (한국어 + 후행 마침표) → 종결(0)
+mk_session "20260303_000000_final-diff-review" "closed" "- 없음." "markertask"
+is_review_session_resolved "$RP/20260303_000000_final-diff-review" && rc=0 || rc=1
+assert_eq "$rc" "0" "resolved — closed + 없음. (후행 마침표)"
+# (k) closed + 비마커 산문 → 미종결(1) (fail-closed)
+mk_session "20260304_000000_final-diff-review" "closed" "- no issues" "markertask"
+is_review_session_resolved "$RP/20260304_000000_final-diff-review" && rc=0 || rc=1
+assert_eq "$rc" "1" "unresolved — 비마커 산문 (no issues)"
+# (l) closed + 마커 뒤 후행 텍스트 → 미종결(1) (라인 전체 매칭, fail-closed 강화)
+mk_session "20260305_000000_final-diff-review" "closed" "- 없음 (단, 후속 확인 필요)" "markertask"
+is_review_session_resolved "$RP/20260305_000000_final-diff-review" && rc=0 || rc=1
+assert_eq "$rc" "1" "unresolved — 마커 뒤 후행 텍스트"
+# (m) closed + 빈 섹션 (내용 라인 없음) → 미종결(1) (마커 존재 요구)
+mk_session "20260306_000000_final-diff-review" "closed" "" "markertask"
+is_review_session_resolved "$RP/20260306_000000_final-diff-review" && rc=0 || rc=1
+assert_eq "$rc" "1" "unresolved — 빈 Open Issues 섹션 (마커 부재)"
+# (n) closed + HTML 주석만 → 미종결(1) (주석은 무시, 마커 부재)
+mk_session "20260307_000000_final-diff-review" "closed" "<!-- 규약 주석 -->" "markertask"
+is_review_session_resolved "$RP/20260307_000000_final-diff-review" && rc=0 || rc=1
+assert_eq "$rc" "1" "unresolved — 주석만 있는 섹션 (마커 부재)"
+# (o) closed + 비-bullet 산문 (dash 없는 None) → 미종결(1)
+mk_session "20260308_000000_final-diff-review" "closed" "None" "markertask"
+is_review_session_resolved "$RP/20260308_000000_final-diff-review" && rc=0 || rc=1
+assert_eq "$rc" "1" "unresolved — 비-bullet 산문 (None)"
+# (p) closed + 마커와 실제 이슈 혼재 → 미종결(1)
+mk_session "20260309_000000_final-diff-review" "closed" "$(printf -- '- 없음\n- 실제 이슈')" "markertask"
+is_review_session_resolved "$RP/20260309_000000_final-diff-review" && rc=0 || rc=1
+assert_eq "$rc" "1" "unresolved — 마커와 실제 이슈 혼재"
+# (q) closed + 규약 주석 + 마커 (신규 템플릿 정상 종결 형태) → 종결(0)
+mk_session "20260310_000000_final-diff-review" "closed" "$(printf -- '<!-- 규약 주석 -->\n- 없음')" "markertask"
+is_review_session_resolved "$RP/20260310_000000_final-diff-review" && rc=0 || rc=1
+assert_eq "$rc" "0" "resolved — 규약 주석 + 마커 (신규 템플릿 형태)"
+
 # fr 세션 부재 시 빈 값 (다른 fr만 존재)
 printf '# Current Task\n\n## Short Title\nlonelytask\n' > "$GUARD_ROOT/CURRENT_TASK.md"
+# v2 2b: task-state도 함께 업데이트 (get_current_short_title이 task-state에서 읽음)
+printf 'schema=1\nshort-title=lonelytask\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' > "$TASK_STATE_PATH"
 assert_eq "$(get_latest_diff_review_dir)" "" "fr-scope — 현재 fr 세션 없으면 빈 값"
 printf '# Current Task\n\n## Short Title\nmytask\n' > "$GUARD_ROOT/CURRENT_TASK.md"
+printf 'schema=1\nshort-title=mytask\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' > "$TASK_STATE_PATH"
 
 # malformed 세션은 short-title 미상 → fr-scope 후보 제외 (legacy/unscoped 통과, 3d 오발화 방지)
 mkdir -p "$RP/20260110_000000_final-diff-review"
@@ -130,13 +309,16 @@ mkdir -p "$RP/20260111_000000_final-diff-review"
 printf '## Status\nclosed\n' > "$RP/20260111_000000_final-diff-review/SESSION.md"
 assert_eq "$(basename "$(get_latest_diff_review_dir)")" "20260109_000000_final-diff-review" "malformed 제외 — short-title 매칭 세션만 반환"
 printf '# Current Task\n\n## Short Title\nzzz\n' > "$GUARD_ROOT/CURRENT_TASK.md"
+printf 'schema=1\nshort-title=zzz\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' > "$TASK_STATE_PATH"
 assert_eq "$(get_latest_diff_review_dir)" "" "malformed-only → 빈 값 (unscoped 통과, 오발화 방지)"
 printf '# Current Task\n\n## Short Title\nmytask\n' > "$GUARD_ROOT/CURRENT_TASK.md"
+printf 'schema=1\nshort-title=mytask\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' > "$TASK_STATE_PATH"
 
 # archive_review_precheck (3c)
 PRECHECK_AUDIT="$GUARD_ROOT/rd-workflow-workspace/.lifecycle/review-skip-audit.log"
 rm -f "$PRECHECK_AUDIT"
 printf '# Current Task\n\n## Short Title\nlonelytask\n' > "$GUARD_ROOT/CURRENT_TASK.md"
+printf 'schema=1\nshort-title=lonelytask\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' > "$TASK_STATE_PATH"
 archive_review_precheck "0" "" "lonelytask" "$PRECHECK_AUDIT" 2>/dev/null && rc=0 || rc=1
 assert_eq "$rc" "1" "precheck — 미종결 + force-skip 아님 → 차단"
 archive_review_precheck "1" "" "lonelytask" "$PRECHECK_AUDIT" 2>/dev/null && rc=0 || rc=1
@@ -146,6 +328,7 @@ assert_eq "$rc" "0" "precheck — force-skip + 사유 → 통과"
 assert_eq "$(awk -F' \\| ' 'END{print $2}' "$PRECHECK_AUDIT")" "lonelytask" "precheck — audit slug 기록"
 assert_eq "$(awk -F' \\| ' 'END{print $3}' "$PRECHECK_AUDIT")" "긴급 핫픽스" "precheck — audit 사유 기록"
 printf '# Current Task\n\n## Short Title\nmytask\n' > "$GUARD_ROOT/CURRENT_TASK.md"
+printf 'schema=1\nshort-title=mytask\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' > "$TASK_STATE_PATH"
 mk_session "20260120_000000_final-diff-review" "closed" "- 없음" "mytask"   # 최신 종결 mytask 세션
 archive_review_precheck "0" "" "mytask" "$PRECHECK_AUDIT" 2>/dev/null && rc=0 || rc=1
 assert_eq "$rc" "0" "precheck — 종결 세션 존재 → 통과"
@@ -157,9 +340,10 @@ git -C "$FT_REPO" init -q -b main
 git -C "$FT_REPO" config user.email t@t && git -C "$FT_REPO" config user.name t
 mkdir -p "$FT_REPO/rd-workflow-workspace/handoffs/review_pipeline" "$FT_REPO/rd-workflow-workspace/.lifecycle"
 # 실제 archive 시점 재현: main 의 CURRENT_TASK ## Short Title 은 baseline(-),
-# short-title 은 .lifecycle/active-fr metadata fallback 으로 해소된다(get_current_short_title).
+# short-title 은 task-state metadata fallback 으로 해소된다(get_current_short_title).
 printf '# Current Task\n\n## Short Title\n-\n' > "$FT_REPO/CURRENT_TASK.md"
-printf 'fr-branch=fr/fttask\nshort-title=fttask\nworktree-path=null\nstatus=active\n' > "$FT_REPO/rd-workflow-workspace/.lifecycle/active-fr"
+# v2 2b: active-fr → task-state 전환 (schema=1, fr-branch=fr/fttask)
+printf 'schema=1\nshort-title=fttask\nstatus=구현 중\nfr-branch=fr/fttask\nworktree-path=null\nsource-fr=-\ncreated-at=2026-07-05-0000\n' > "$FT_REPO/rd-workflow-workspace/.lifecycle/task-state"
 git -C "$FT_REPO" add -A && git -C "$FT_REPO" commit -q -m seed
 # fr branch 에 종결 diff-review 세션 commit
 git -C "$FT_REPO" branch fr/fttask
@@ -171,24 +355,25 @@ printf '## Open Issues\n- 없음\n' > "$FTS/CHECKPOINT.md"
 git -C "$FT_REPO" add -A && git -C "$FT_REPO" commit -q -m "diff-review session on fr"
 git -C "$FT_REPO" switch -q main
 FT_AUDIT="$FT_REPO/rd-workflow-workspace/.lifecycle/review-skip-audit.log"
-# sanity 1: short-title 은 metadata fallback 으로 해소 (CURRENT_TASK Short Title=-)
-assert_eq "$( ( project_root="$FT_REPO"; get_current_short_title ) )" "fttask" "fr-tip — metadata fallback 으로 short-title 해소(Short Title=-)"
+# sanity 1: short-title 은 task-state fallback 으로 해소 (CURRENT_TASK Short Title=-)
+# v2 2b: TASK_STATE_PATH를 명시적으로 FT_REPO 기반으로 설정 (서브셸에서 재설정 필요)
+assert_eq "$( ( project_root="$FT_REPO"; TASK_STATE_PATH="$FT_REPO/rd-workflow-workspace/.lifecycle/task-state"; get_current_short_title ) )" "fttask" "fr-tip — metadata fallback 으로 short-title 해소(Short Title=-)"
 # sanity 2: 세션은 fr branch tip 에만 있고 main 워킹트리엔 없음
-assert_eq "$( ( project_root="$FT_REPO"; get_latest_diff_review_dir ) )" "" "fr-tip — main 워킹트리에 세션 없음(sanity)"
+assert_eq "$( ( project_root="$FT_REPO"; TASK_STATE_PATH="$FT_REPO/rd-workflow-workspace/.lifecycle/task-state"; get_latest_diff_review_dir ) )" "" "fr-tip — main 워킹트리에 세션 없음(sanity)"
 # Case A (핵심 회귀): main Short Title=- + metadata fallback + fr_ref 지정 → fr tip 종결 세션 인식 → 통과(0)
-( project_root="$FT_REPO"; archive_review_precheck "0" "" "fttask" "$FT_AUDIT" "fr/fttask" ) 2>/dev/null && rc=0 || rc=1
+( project_root="$FT_REPO"; TASK_STATE_PATH="$FT_REPO/rd-workflow-workspace/.lifecycle/task-state"; archive_review_precheck "0" "" "fttask" "$FT_AUDIT" "fr/fttask" ) 2>/dev/null && rc=0 || rc=1
 assert_eq "$rc" "0" "fr-tip — 종결 세션을 fr branch tip 에서 검증 → 통과 (metadata fallback 결합)"
 # Case B (안전 회귀): fr tip 세션을 미종결로 변경 → 차단(1)
 git -C "$FT_REPO" switch -q fr/fttask
 printf '## Status\nawaiting-reviewer\n\n## Branch Context\n- fr-branch: fr/fttask\n- short-title: fttask\n' > "$FTS/SESSION.md"
 git -C "$FT_REPO" add -A && git -C "$FT_REPO" commit -q -m "session unterminated"
 git -C "$FT_REPO" switch -q main
-( project_root="$FT_REPO"; archive_review_precheck "0" "" "fttask" "$FT_AUDIT" "fr/fttask" ) 2>/dev/null && rc=0 || rc=1
+( project_root="$FT_REPO"; TASK_STATE_PATH="$FT_REPO/rd-workflow-workspace/.lifecycle/task-state"; archive_review_precheck "0" "" "fttask" "$FT_AUDIT" "fr/fttask" ) 2>/dev/null && rc=0 || rc=1
 assert_eq "$rc" "1" "fr-tip — 미종결(awaiting-reviewer) 세션 → 차단 (안전 속성 보존)"
 # Case C (audit 정규화): 미종결 fr 세션(위 Case B 상태) + force-skip + 사유 → 통과(0)
 #   + audit 의 세션참조 필드가 temp 절대경로가 아닌 repo-상대 경로여야 한다.
 FT_AUDIT2="$FT_REPO/rd-workflow-workspace/.lifecycle/audit2.log"
-( project_root="$FT_REPO"; archive_review_precheck "1" "긴급 사유" "fttask" "$FT_AUDIT2" "fr/fttask" ) 2>/dev/null && rc=0 || rc=1
+( project_root="$FT_REPO"; TASK_STATE_PATH="$FT_REPO/rd-workflow-workspace/.lifecycle/task-state"; archive_review_precheck "1" "긴급 사유" "fttask" "$FT_AUDIT2" "fr/fttask" ) 2>/dev/null && rc=0 || rc=1
 assert_eq "$rc" "0" "fr-tip — force-skip + 사유 → 통과"
 assert_eq "$(awk -F' \\| ' 'END{print $4}' "$FT_AUDIT2")" "rd-workflow-workspace/handoffs/review_pipeline/20260301_000000_final-diff-review" "fr-tip — audit 세션참조 repo-상대 경로(temp 절대경로 금지)"
 rm -rf "$FT_REPO"
@@ -201,11 +386,13 @@ FT2="$(mktemp -d)"
 git -C "$FT2" init -q -b main
 git -C "$FT2" config user.email t@t && git -C "$FT2" config user.name t
 mkdir -p "$FT2/rd-workflow-workspace/handoffs/review_pipeline" "$FT2/rd-workflow-workspace/.lifecycle"
-# main: baseline Short Title=- + active-fr metadata 부재 → get_current_short_title "-" 반환(fr-scope 미해소)
+# main: baseline Short Title=- + task-state 부재 → get_current_short_title "-" 반환(fr-scope 미해소)
+# v2 2b: active-fr 폐지 → task-state도 없는 상태로 테스트 (legacy fallback: CURRENT_TASK.md Short Title=-)
 printf '# Current Task\n\n## Short Title\n-\n' > "$FT2/CURRENT_TASK.md"
 git -C "$FT2" add -A && git -C "$FT2" commit -q -m seed
 FT2_AUDIT="$FT2/rd-workflow-workspace/.lifecycle/review-skip-audit.log"
-assert_eq "$( ( project_root="$FT2"; get_current_short_title ) )" "-" "metadata 부재 — short-title 빈 값(회귀 전제)"
+# task-state 없음 → legacy CURRENT_TASK.md Short Title=- 반환 (TASK_STATE_PATH 격리)
+assert_eq "$( ( project_root="$FT2"; TASK_STATE_PATH="$FT2/rd-workflow-workspace/.lifecycle/task-state"; get_current_short_title ) )" "-" "metadata 부재 — short-title 빈 값(회귀 전제)"
 
 # Case D (AC1 — metadata 부재 핵심 회귀): fr/d1 tip 종결 세션(fr-branch=fr/d1) → 통과(0)
 git -C "$FT2" branch fr/d1
@@ -262,39 +449,47 @@ echo "== commit_has_archive_signal =="
 SIG_REPO="$(mktemp -d)"
 git -C "$SIG_REPO" init -q
 git -C "$SIG_REPO" config user.email t@t && git -C "$SIG_REPO" config user.name t
-mkdir -p "$SIG_REPO/rd-workflow-workspace/backlog/request-archive"
+mkdir -p "$SIG_REPO/rd-workflow-workspace/backlog/request-archive" "$SIG_REPO/rd-workflow-workspace/.lifecycle"
 printf '# Current Task\n\n## Status\n구현 중\n\n## Short Title\nsigtask\n' > "$SIG_REPO/CURRENT_TASK.md"
+# v2 2b: task-state 격리 — TASK_STATE_PATH를 SIG_REPO 기반으로 재설정
+TASK_STATE_PATH="$SIG_REPO/rd-workflow-workspace/.lifecycle/task-state"
+# task-state 초기값: 구현 중, short-title=sigtask (비-baseline)
+printf 'schema=1\nshort-title=sigtask\nstatus=구현 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' > "$TASK_STATE_PATH"
 ARCH="rd-workflow-workspace/backlog/request-archive/2026-05-24-0000-sigtask.md"
 # 신호 없음: 비-baseline + staged archive 없음 → 1(허용)
-( project_root="$SIG_REPO"; commit_has_archive_signal ) && rc=0 || rc=1
+( project_root="$SIG_REPO"; TASK_STATE_PATH="$SIG_REPO/rd-workflow-workspace/.lifecycle/task-state"; commit_has_archive_signal ) && rc=0 || rc=1
 assert_eq "$rc" "1" "archive_signal — 신호 없음 → 1(허용)"
 # AS1 경계: untracked stale archive 파일(add 안 함) → 1(허용, false-positive 방지)
 printf 'x\n' > "$SIG_REPO/$ARCH"
-( project_root="$SIG_REPO"; commit_has_archive_signal ) && rc=0 || rc=1
+( project_root="$SIG_REPO"; TASK_STATE_PATH="$SIG_REPO/rd-workflow-workspace/.lifecycle/task-state"; commit_has_archive_signal ) && rc=0 || rc=1
 assert_eq "$rc" "1" "archive_signal — AS1 untracked stale archive → 1(허용)"
 # AS1: staged 추가 → 0(차단)
 git -C "$SIG_REPO" add "$ARCH"
-( project_root="$SIG_REPO"; commit_has_archive_signal ) && rc=0 || rc=1
+( project_root="$SIG_REPO"; TASK_STATE_PATH="$SIG_REPO/rd-workflow-workspace/.lifecycle/task-state"; commit_has_archive_signal ) && rc=0 || rc=1
 assert_eq "$rc" "0" "archive_signal — AS1 staged request-archive 추가 → 0(차단)"
 # AS1 경계: 기존 archive 파일 삭제(staged D) → 1(허용, 추가 아님)
 git -C "$SIG_REPO" commit -q -m seed
 git -C "$SIG_REPO" rm -q "$ARCH"
-( project_root="$SIG_REPO"; commit_has_archive_signal ) && rc=0 || rc=1
+( project_root="$SIG_REPO"; TASK_STATE_PATH="$SIG_REPO/rd-workflow-workspace/.lifecycle/task-state"; commit_has_archive_signal ) && rc=0 || rc=1
 assert_eq "$rc" "1" "archive_signal — request-archive 삭제(staged D) → 1(허용)"
-# AS2: CURRENT_TASK baseline → 0(차단)  (staged archive 추가 없이도)
+# AS2: task-state baseline(status=대기 중, short-title=-) → 0(차단)
+# v2 2b: task-state가 권위 소스 — CURRENT_TASK.md 변경과 함께 task-state도 베이스라인으로 설정
 printf '# Current Task\n\n## Status\n대기 중\n\n## Short Title\n-\n' > "$SIG_REPO/CURRENT_TASK.md"
-( project_root="$SIG_REPO"; commit_has_archive_signal ) && rc=0 || rc=1
-assert_eq "$rc" "0" "archive_signal — AS2 CURRENT_TASK baseline → 0(차단)"
+printf 'schema=1\nshort-title=-\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' > "$TASK_STATE_PATH"
+( project_root="$SIG_REPO"; TASK_STATE_PATH="$SIG_REPO/rd-workflow-workspace/.lifecycle/task-state"; commit_has_archive_signal ) && rc=0 || rc=1
+assert_eq "$rc" "0" "archive_signal — AS2 task-state baseline → 0(차단)"
 rm -rf "$SIG_REPO"
 
 echo "== review_gate hook exit code (iteration-commit 허용) =="
 HOOK_REPO="$(mktemp -d)"
 mkdir -p "$HOOK_REPO/rd-workflow/scripts/hooks"
+mkdir -p "$HOOK_REPO/rd-workflow/scripts"
 mkdir -p "$HOOK_REPO/rd-workflow-workspace/handoffs/review_pipeline"
 mkdir -p "$HOOK_REPO/rd-workflow-workspace/backlog/request-archive"
 mkdir -p "$HOOK_REPO/rd-workflow-workspace/.lifecycle"
 cp "$LITE_HOOKS_DIR/_guard_common.sh" "$HOOK_REPO/rd-workflow/scripts/hooks/"
 cp "$LITE_HOOKS_DIR/pre_commit_review_gate.sh" "$HOOK_REPO/rd-workflow/scripts/hooks/"
+cp "$LITE_HOOKS_DIR/../_state_common.sh" "$HOOK_REPO/rd-workflow/scripts/"
 git -C "$HOOK_REPO" init -q
 git -C "$HOOK_REPO" config user.email t@t && git -C "$HOOK_REPO" config user.name t
 printf '# Current Task\n\n## Status\ndiff review 대기\n\n## Short Title\nhooktask\n' > "$HOOK_REPO/CURRENT_TASK.md"
@@ -324,12 +519,14 @@ assert_eq "$(run_review_gate)" "0" "review_gate — A1 미종결 + untracked sta
 git -C "$HOOK_REPO" add "$HARCH"
 assert_eq "$(run_review_gate)" "2" "review_gate — B1(AS1) 미종결 + staged archive 추가 → 차단 (exit 2)"
 git -C "$HOOK_REPO" reset -q; rm -f "$HOOK_REPO/$HARCH"
-# B1-AS2: 미종결 + CURRENT_TASK baseline (metadata fallback 로 세션 매칭) → 차단
-printf 'short-title=hooktask\n' > "$HOOK_REPO/rd-workflow-workspace/.lifecycle/active-fr"
+# B1-AS2: 미종결 + task-state baseline(status=대기 중, short-title=-) → 차단 (v2: task-state 우선)
+printf 'schema=1\nshort-title=-\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' \
+  > "$HOOK_REPO/rd-workflow-workspace/.lifecycle/task-state"
 printf '# Current Task\n\n## Status\n대기 중\n\n## Short Title\n-\n' > "$HOOK_REPO/CURRENT_TASK.md"
-assert_eq "$(run_review_gate)" "2" "review_gate — B1(AS2) 미종결 + CURRENT_TASK baseline → 차단 (exit 2)"
+assert_eq "$(run_review_gate)" "2" "review_gate — B1(AS2) 미종결 + task-state baseline → 차단 (exit 2)"
 printf '# Current Task\n\n## Status\ndiff review 대기\n\n## Short Title\nhooktask\n' > "$HOOK_REPO/CURRENT_TASK.md"
-rm -f "$HOOK_REPO/rd-workflow-workspace/.lifecycle/active-fr"
+printf 'schema=1\nshort-title=hooktask\nstatus=diff review 대기\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' \
+  > "$HOOK_REPO/rd-workflow-workspace/.lifecycle/task-state"
 # autopilot 활성 + 미종결 + iteration → 허용 (3a 우회 제거 후에도 iteration 은 신호 아님)
 touch "$HOOK_REPO/.autopilot_active"
 assert_eq "$(run_review_gate)" "0" "review_gate — autopilot + 미종결 + iteration → 허용"
@@ -348,9 +545,10 @@ rm -rf "$HOOK_REPO"
 
 echo "== archive_gate hook exit code =="
 AG_REPO="$(mktemp -d)"
-mkdir -p "$AG_REPO/rd-workflow/scripts/hooks" "$AG_REPO/rd-workflow-workspace/handoffs/review_pipeline" "$AG_REPO/rd-workflow-workspace/backlog/items"
+mkdir -p "$AG_REPO/rd-workflow/scripts/hooks" "$AG_REPO/rd-workflow/scripts" "$AG_REPO/rd-workflow-workspace/handoffs/review_pipeline" "$AG_REPO/rd-workflow-workspace/backlog/items"
 cp "$LITE_HOOKS_DIR/_guard_common.sh" "$AG_REPO/rd-workflow/scripts/hooks/"
 cp "$LITE_HOOKS_DIR/pre_commit_archive_gate.sh" "$AG_REPO/rd-workflow/scripts/hooks/"
+cp "$LITE_HOOKS_DIR/../_state_common.sh" "$AG_REPO/rd-workflow/scripts/"
 printf '# Current Task\n\n## Short Title\nagtask\n' > "$AG_REPO/CURRENT_TASK.md"
 printf '# Change Request\n\n## Source FR\n2026-05-15-agtask\n' > "$AG_REPO/REQUEST.md"
 printf '# agtask\n- status: idea\n' > "$AG_REPO/rd-workflow-workspace/backlog/items/2026-05-15-agtask.md"

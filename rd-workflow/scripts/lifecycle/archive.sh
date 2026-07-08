@@ -109,7 +109,15 @@ fi
 # Step 4 — metadata cleanup commit on main (publish 전)
 if metadata_exists; then
   metadata_clear
-  git add -A "$(dirname "$LIFECYCLE_METADATA_PATH")" 2>/dev/null || true
+  # LC-14 대칭: archive 완료 시 short-title/status baseline reset (stale 방지 — promote_rollback.sh와 동일 패턴)
+  state_write_fields "short-title=-" "status=대기 중"
+  # v2 2b: LIFECYCLE_METADATA_PATH 폐지 → TASK_STATE_PATH 사용
+  git add "$TASK_STATE_PATH" 2>/dev/null || true
+  # legacy active-fr 잔재가 tracked 파일로 존재하면 삭제분도 staged (metadata_clear가 rm -f 처리)
+  _legacy_afr_path="$CURRENT_WT/rd-workflow-workspace/.lifecycle/active-fr"
+  if git ls-files --error-unmatch "$_legacy_afr_path" >/dev/null 2>&1; then
+    git add "$_legacy_afr_path" 2>/dev/null || true
+  fi
   if ! git diff --cached --quiet 2>/dev/null; then
     RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit -m "chore(lifecycle): archive $SLUG metadata 정리"
     printf 'archive: metadata cleanup commit 완료\n'

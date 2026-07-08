@@ -43,7 +43,7 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
 ## Short Title 정책
 
 이 skill은 `CURRENT_TASK.md`의 `## Short Title`을 **read-only**로만 사용한다.
-**예외:** Step 0의 rebind branch (`CURRENT_TITLE = -`) 또는 (c-2) stale 케이스 (`CURRENT_TITLE ≠ FR_TITLE` AND `## Status = 대기 중`) 일 때 한정 1회 기록.
+**예외:** Step 0 guard 의 `write` 또는 `rebind` decision 발생 시 한정 1회 기록.
 그 외 `## Short Title` 변경 / 삭제 금지.
 
 ## Step 0. FR 승격 3-way 분기 (skill 진입 직후, 캡처 전)
@@ -53,28 +53,10 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
 승격 진입이 감지되면:
 
 1. source FR의 short-title 추출 → `FR_TITLE` 변수
-2. `CURRENT_TASK.md`의 `## Short Title` 값 read → `CURRENT_TITLE` 변수
-3. **3-way 분기:**
-
-   **(a) `CURRENT_TITLE = -` → rebind:**
-   - `FR_TITLE`을 `CURRENT_TASK.md ## Short Title`에 1회 기록 (busy `/fr add` deferred 케이스)
-   - Step 1으로 진행
-
-   **(b) `CURRENT_TITLE = FR_TITLE` (equal) → baseline proceed:**
-   - 정상 baseline 승격. `CURRENT_TASK.md` 변경 없이 read-only로 Step 1 진행
-
-   **(c) `CURRENT_TITLE ≠ FR_TITLE` AND `CURRENT_TITLE ≠ -` → Status-aware guard:**
-   `CURRENT_TASK.md`의 `## Status` 값 read → `CURRENT_STATUS` (`## Status` heading 다음부터 다음 `## ` heading 직전까지에서 첫 비어있지 않은 줄. 다음 `## ` heading을 먼저 만나거나 그 범위가 공백뿐이면 값 없음 = 파싱 불가).
-
-   - **(c-1) `## Status` 섹션 부재 또는 위 read 규칙으로 값 없음(파싱 불가) → 보수적 차단:**
-     > `CURRENT_TASK.md ## Status` 가 없거나 파싱할 수 없습니다. 유효한 Status 를 설정하거나 `sync_template` 마이그레이션 후 다시 진입하세요. (active-task guard 는 상태를 확정할 수 없어 보수적으로 차단합니다.)
-
-   - **(c-2) `CURRENT_STATUS = 대기 중` → stale Short Title:** 차단하지 않는다. `FR_TITLE` 을 `CURRENT_TASK.md ## Short Title` 에 1회 rebind 기록하고 다음 알림 후 Step 1 로 진행:
-     > 이전 Short Title (`${CURRENT_TITLE}`) 이 `Status = 대기 중` 인 stale 값이라 FR `${FR_TITLE}` 로 교체하고 진행합니다.
-
-   - **(c-3) `CURRENT_STATUS` 가 읽혔고 `대기 중` 이 아님 (`완료` 포함) → active-task guard:** skill 진행 차단 + 다음 경고 출력:
-     > 현재 진행 중인 작업 (`${CURRENT_TITLE}`) 이 archive 되지 않았습니다.
-     > FR `${FR_TITLE}` 을 promote 하려면 먼저 현재 작업을 archive 한 뒤 다시 진입하세요.
+2. `bash rd-workflow/scripts/rd task guard --candidate "${FR_TITLE}" --mode promote` 를 실행하고 출력의 `decision` 에 따라 진행한다:
+   - `write` / `rebind`: `message` 를 사용자에게 알리고 Step 1 로 진행
+   - `proceed-readonly`: 변경 없이 Step 1 로 진행
+   - `block-parse` / `block-active` (exit 2): `message` 를 출력하고 skill 진행을 중단
 
 **비-promotion 진입** (기존 REQUEST 이어서 작업 등): 이 분기 skip → Step 1부터 read-only로 진행.
 
@@ -84,102 +66,42 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
 2. `SHORT_TITLE`이 없거나 `-`이면: 경고 출력 + 캡처 생략 (skill 진행은 차단 안 함)
    - 필드가 없거나 default `-`이면 경고 + 캡처 생략 (skill 진행 차단 안 함). 이는 `Source FR` 없는 진입이면서 `## Short Title`도 비어 있는 edge 케이스 — `Source FR` 없는 정상 continuing-work 진입은 active task의 valid `## Short Title`을 갖고 있으므로 정상 캡처됨. 이 경고가 뜨는 경우는 오직 진행 중 작업이 없어 캡처할 short-title을 알 수 없는 상태.
 3. `SHORT_TITLE`이 유효하면: `rd-workflow-workspace/raw-captures/{date}-request-{short-title}.md` 생성
-   - 디렉토리 0700 보장 + umask 077 subshell 로 캡처 파일 0600 보장:
+   - frontmatter(date/stage/short-title/source)는 CLI가 생성한다. stdin에는 본문만 전달한다:
      ```bash
-     assert_no_symlink_in_path() {
-       _aslnp_p="$1"
-       case "$_aslnp_p" in
-         /*) ;;
-         *)  _aslnp_p="$PWD/$_aslnp_p" ;;
-       esac
-       _aslnp_d="$_aslnp_p"
-       while [ "$_aslnp_d" != "/" ] && [ -n "$_aslnp_d" ]; do
-         if [ -L "$_aslnp_d" ]; then
-           echo "경고: path component ($_aslnp_d) 가 symlink 입니다. 보안상 중단합니다." >&2
-           unset _aslnp_p _aslnp_d
-           return 1
-         fi
-         _aslnp_d=$(dirname "$_aslnp_d")
-       done
-       unset _aslnp_p _aslnp_d
-       return 0
-     }
-     if ! assert_no_symlink_in_path "rd-workflow-workspace/raw-captures"; then
-       echo "경고: raw-captures 경로에 symlink 가 있어 캡처를 건너뜁니다." >&2
-     else
-       mkdir -p rd-workflow-workspace/raw-captures
-       chmod 0700 rd-workflow-workspace/raw-captures
-       ( umask 077 && cat > "$capture_path" <<EOF
-     ---
-     date: YYYY-MM-DD HH:MM
-     stage: request
-     short-title: {short-title}
-     source: direct | routed
-     ---
-
+     bash rd-workflow/scripts/rd task capture --stage request --source direct <<'CAPTURE_EOF'
      ## 원본 입력
      {사용자 입력 원문}
-     EOF
-       )
-     fi
+     CAPTURE_EOF
      ```
-     (`source`: 직접 호출이면 `direct`, 자연어 라우팅이면 `routed`)
-   - 본문: 사용자 입력 원문
+     (`--source`: 직접 호출이면 `--source direct`, 자연어 라우팅이면 `--source routed`. CLI 기본값은 `routed`)
+   - 캡처 실패 시 경고만 (skill 진행 차단 안 함) — CLI 가 fail-open (exit 0) 으로 처리
 
 ## Step 2. spec / change-spec 작성 단계 직전 캡처
 
 1. 명시적 사용자 입력 원문이 있으면: `rd-workflow-workspace/raw-captures/{date}-spec-{short-title}.md` 생성
-   - 디렉토리 0700 보장 + umask 077 subshell 로 캡처 파일 0600 보장:
+   - frontmatter(date/stage/short-title/source)는 CLI가 생성한다. stdin에는 본문만 전달한다:
      ```bash
-     if ! assert_no_symlink_in_path "rd-workflow-workspace/raw-captures"; then
-       echo "경고: raw-captures 경로에 symlink 가 있어 캡처를 건너뜁니다." >&2
-     else
-       mkdir -p rd-workflow-workspace/raw-captures
-       chmod 0700 rd-workflow-workspace/raw-captures
-       ( umask 077 && cat > "$capture_path" <<EOF
-     ---
-     date: YYYY-MM-DD HH:MM
-     stage: spec
-     short-title: {short-title}
-     source: direct | routed
-     ---
-
+     bash rd-workflow/scripts/rd task capture --stage spec --source direct <<'CAPTURE_EOF'
      ## 원본 입력
      {spec 작성 트리거 사용자 입력 원문}
-     EOF
-       )
-     fi
+     CAPTURE_EOF
      ```
-     (`source`: 직접 호출이면 `direct`, 자연어 라우팅이면 `routed`)
-   - 본문: spec 작성 트리거 사용자 입력 원문
+     (`--source`: 직접 호출이면 `--source direct`, 자연어 라우팅이면 `--source routed`. CLI 기본값은 `routed`)
+   - 캡처 실패 시 경고만 (skill 진행 차단 안 함) — CLI 가 fail-open (exit 0) 으로 처리
 2. **명시적 원문 부재 시 (모델 자체 판단으로 진행): 캡처 생략 + 경고** — surrogate(직전 사용자 메시지 등) 저장 금지. spec의 raw-input 계약과 일관성 유지.
 
 ## Step 3. plan 작성 단계 직전 캡처
 
 1. 명시적 사용자 입력 원문이 있으면: `rd-workflow-workspace/raw-captures/{date}-plan-{short-title}.md` 생성
-   - 디렉토리 0700 보장 + umask 077 subshell 로 캡처 파일 0600 보장:
+   - frontmatter(date/stage/short-title/source)는 CLI가 생성한다. stdin에는 본문만 전달한다:
      ```bash
-     if ! assert_no_symlink_in_path "rd-workflow-workspace/raw-captures"; then
-       echo "경고: raw-captures 경로에 symlink 가 있어 캡처를 건너뜁니다." >&2
-     else
-       mkdir -p rd-workflow-workspace/raw-captures
-       chmod 0700 rd-workflow-workspace/raw-captures
-       ( umask 077 && cat > "$capture_path" <<EOF
-     ---
-     date: YYYY-MM-DD HH:MM
-     stage: plan
-     short-title: {short-title}
-     source: direct | routed
-     ---
-
+     bash rd-workflow/scripts/rd task capture --stage plan --source direct <<'CAPTURE_EOF'
      ## 원본 입력
      {plan 작성 트리거 사용자 입력 원문}
-     EOF
-       )
-     fi
+     CAPTURE_EOF
      ```
-     (`source`: 직접 호출이면 `direct`, 자연어 라우팅이면 `routed`)
-   - 본문: plan 작성 트리거 사용자 입력 원문
+     (`--source`: 직접 호출이면 `--source direct`, 자연어 라우팅이면 `--source routed`. CLI 기본값은 `routed`)
+   - 캡처 실패 시 경고만 (skill 진행 차단 안 함) — CLI 가 fail-open (exit 0) 으로 처리
 2. 명시적 원문 부재 시: 캡처 생략 + 경고 (Step 2와 동일 정책)
 
 ## Execution rules

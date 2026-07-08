@@ -65,6 +65,7 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 - 다음 조건을 만족할 때만 inline(`executing-plans`)을 선택한다: Task가 1개이면서 수정 파일이 3개 이하인 plan, 또는 Task가 2개이면서 동일 경로의 파일 1개만 수정하는 plan. Task 수는 plan에 정의된 모든 Task를 센다 (검증 전용 포함).
 - 위 조건에 해당해도 사용자가 subagent를 요청하면 subagent로 한다.
 - 사용자가 inline을 요청하면 inline으로 한다.
+- subagent dispatch 시 `rd-workflow/docs/guides/subagent-git-safety.md`의 git 안전 문구를 prompt에 포함한다 (공유 워킹트리 브랜치 전환 금지).
 
 ## 핵심 절차
 
@@ -92,8 +93,8 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 
 - **구현 완료 후 반드시 `/final-diff-review`를 거친다.** 이 단계를 건너뛰고 merge하거나 작업을 종료하지 않는다.
 - **Superpowers가 사용 가능한 환경에서는 반드시 사용한다.** 사용 불가능할 때만 직접 산출물을 작성한다.
-- **검증**: 구현 후 `bash rd-workflow/scripts/test.sh`, `bash rd-workflow/scripts/lint.sh`, `bash rd-workflow/scripts/typecheck.sh`를 실행한다.
-- **본 프로젝트 자체의 self-test**: `bash rd-workflow/scripts/lifecycle/test_lifecycle.sh` 직접 호출. `rd-workflow/scripts/test.sh`는 generated project용 placeholder (별도 FR `workflow-self-test-entrypoint`가 처리 예정).
+- **검증**: 구현 후 `bash rd-workflow/scripts/test.sh`, `bash rd-workflow/scripts/lint.sh`, `bash rd-workflow/scripts/typecheck.sh`, `bash rd-workflow/scripts/build.sh`를 실행한다(프로젝트에 맞게 교체). typecheck는 정적 타입/컴파일 검사, build는 산출물 생성까지의 전체 빌드다 — build 실패는 검증 실패다. 아직 교체 전(`TEMPLATE_STUB` 마커 존재)이면 이 스크립트들은 **설계상 exit 1을 반환한다** — plan의 검증 Expected에 exit 0으로 서술하지 말고, 실제 명령 교체 후의 기대값 또는 프로젝트가 정의한 실질 검증 명령 기준으로 쓴다.
+- **워크플로 인프라 검증**: rd-workflow 인프라(lifecycle/review 스크립트) 자체를 수정했다면 `bash rd-workflow/scripts/self_test.sh`로 검증한다.
 
 ## Review 규칙
 
@@ -123,6 +124,8 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 ## Task Tracking
 
 ### CURRENT_TASK.md 허용 상태값
+
+- Status/Short Title 변경은 rd task CLI를 경유합니다 (기계 판정 권위: rd-workflow-workspace/.lifecycle/task-state — CURRENT_TASK.md의 해당 필드는 표시용 미러).
 
 Status 필드는 아래 값만 사용합니다 (guard hook이 이 값으로 판정):
 

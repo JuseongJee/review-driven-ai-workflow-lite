@@ -13,49 +13,16 @@
    - **kind**: feature | bug | refactor | tech-debt | tooling | research | test (맥락에서 추론, 불확실하면 feature)
 3. raw capture 파일 생성: `rd-workflow-workspace/raw-captures/{date}-fr-{short-title}.md`
 
-   디렉토리 0700 보장 + umask 077 subshell 로 캡처 파일 0600 보장:
+   frontmatter(date/stage/short-title/source)는 CLI가 생성한다. stdin에는 본문만 전달한다:
    ```bash
-   assert_no_symlink_in_path() {
-     _aslnp_p="$1"
-     case "$_aslnp_p" in
-       /*) ;;
-       *)  _aslnp_p="$PWD/$_aslnp_p" ;;
-     esac
-     _aslnp_d="$_aslnp_p"
-     while [ "$_aslnp_d" != "/" ] && [ -n "$_aslnp_d" ]; do
-       if [ -L "$_aslnp_d" ]; then
-         echo "경고: path component ($_aslnp_d) 가 symlink 입니다. 보안상 중단합니다." >&2
-         unset _aslnp_p _aslnp_d
-         return 1
-       fi
-       _aslnp_d=$(dirname "$_aslnp_d")
-     done
-     unset _aslnp_p _aslnp_d
-     return 0
-   }
-   if ! assert_no_symlink_in_path "rd-workflow-workspace/raw-captures"; then
-     echo "경고: raw-captures 경로에 symlink 가 있어 캡처를 건너뜁니다." >&2
-   else
-     mkdir -p rd-workflow-workspace/raw-captures
-     chmod 0700 rd-workflow-workspace/raw-captures
-     ( umask 077 && cat > "$capture_path" <<EOF
-   ---
-   date: YYYY-MM-DD HH:MM
-   stage: fr
-   short-title: {short-title}
-   source: direct | routed
-   ---
-
+   bash rd-workflow/scripts/rd task capture --stage fr --source direct <<'CAPTURE_EOF'
    ## 원본 입력
    {사용자 원문}
-   EOF
-     )
-   fi
+   CAPTURE_EOF
    ```
-   frontmatter 형식: `date`, `stage`, `short-title`, `source` (`direct` | `routed`) 4개 고정.
-   본문: `## 원본 입력` 섹션 + 사용자 원문 (byte-level 동일, 가공 금지).
+   (`--source`: 직접 호출이면 `--source direct`, 자연어 라우팅이면 `--source routed`. CLI 기본값은 `routed`)
    충돌 시 `-2`, `-3` suffix.
-   캡처 실패 시 경고만 — FR 등록 차단 안 함.
+   캡처 실패 시 경고만 — FR 등록 차단 안 함 — CLI 가 fail-open (exit 0) 으로 처리.
 
 4. 상세 파일 생성: `rd-workflow-workspace/backlog/items/YYYY-MM-DD-{short-title}.md`
 
@@ -75,16 +42,11 @@
 
 5. `CURRENT_TASK.md ## Short Title` 갱신 분기:
 
-   현재 `## Short Title` 값을 read 한다.
+   `bash rd-workflow/scripts/rd task guard --candidate "<short-title>" --mode fr-add` 를 실행하고 출력의 `decision` 에 따라 진행한다:
+   - `write`: `message` 를 사용자에게 알리고 진행 (task-state `short-title` 이 sentinel `-` 인 경우 — LC-18 write 진입점)
+   - `proceed-readonly`: 변경 없이 진행 (진행 중 작업이 있어 Short Title 을 건드리지 않고 FR 등록만 계속)
 
-   - **분기 1 — 필드 자체가 없음 (legacy repo, 구 템플릿):** `CURRENT_TASK.md` 갱신 안 함 (warn-only). FR 등록 절차(인덱스 + items/ + FR 캡처)는 정상 진행. 사용자에게 명시적 안내:
-     > `CURRENT_TASK.md ## Short Title` 섹션이 없습니다 (구 템플릿).
-     > FR 은 등록되었지만 진행 중 작업 추적이 없는 상태입니다.
-     > `sync_template` 마이그레이션 후 `CURRENT_TASK.md` 의 `## Short Title` 을 명시적으로 설정하세요.
-
-   - **분기 2 — 값이 `-`:** start point로서 부여. Step 2의 short-title 로 `## Short Title` 갱신.
-
-   - **분기 3 — 값이 이미 non-`-`:** 진행 중 작업의 short-title이므로 **read-only** (변경 금지). 새 FR 등록은 그대로 진행 — FR 자체와 FR 캡처는 새 short-title 사용, `CURRENT_TASK.md ## Short Title` 만 손대지 않음.
+   fr-add 모드는 차단이 없다 (`block-*` decision 발생 안 함). task-state의 `short-title` 키가 부재이거나 값이 비어있으면 CLI 가 `proceed-readonly` 를 반환하고, FR 등록 절차(인덱스 + items/ + FR 캡처)는 정상 계속한다.
 
 6. `FUTURE_REQUESTS.md`의 `## 인덱스` 테이블 끝에 행 추가:
 

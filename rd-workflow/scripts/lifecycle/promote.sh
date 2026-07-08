@@ -45,6 +45,13 @@ if metadata_exists; then
   EXISTING_SHORT="$(metadata_read_field short-title)"
   EXISTING_BRANCH="$(metadata_read_field fr-branch)"
   STORED_WT="$(metadata_read_field worktree-path)"
+  # stale 감지 — fr-branch가 실재하는 로컬 브랜치가 아니면 진행 불가 (refs/heads 전용 판정: 동명 tag 배제)
+  if ! git rev-parse --verify "refs/heads/$EXISTING_BRANCH" >/dev/null 2>&1; then
+    echo "promote: task-state의 fr-branch($EXISTING_BRANCH)가 실재하지 않는 stale 상태입니다 (short-title=$EXISTING_SHORT)." >&2
+    echo "  원인 후보: 브랜치 수동 삭제, 또는 이전 archive/rollback 비정상 종료." >&2
+    echo "  복구: bash rd-workflow/scripts/lifecycle/promote_rollback.sh (main worktree — task-state fr 필드 reset 포함) 후 promote 재시도." >&2
+    exit 1
+  fi
   if [[ "$EXISTING_SHORT" == "$SLUG" ]]; then
     TARGET_BRANCH="$EXISTING_BRANCH"
     echo "promote: metadata 발견 (idempotent rerun) — fr-branch=$TARGET_BRANCH, stored worktree-path=$STORED_WT"
@@ -69,11 +76,15 @@ fi
 if [[ -z "$TARGET_BRANCH" ]]; then
   TARGET_BRANCH="$(resolve_unique_ref branch "fr/$SLUG")"
   if [[ "$DRY_RUN" -eq 1 ]]; then echo "would create branch $TARGET_BRANCH"; exit 0; fi
+  metadata_write "$TARGET_BRANCH" "$SLUG" "${WORKTREE_PATH:-null}"
+  # 권위 status를 뷰(Step D CURRENT_TASK.md)와 동일 값으로 기록 — 권위-뷰 이원화 방지
+  state_write_fields "status=$STATUS_VAL"
+  # v2 2b: LIFECYCLE_METADATA_PATH 폐지 → TASK_STATE_PATH 사용 (LC-05)
+  git add "$TASK_STATE_PATH"
+  RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit -m "chore(lifecycle): promote $SLUG metadata 기록"
+  # 브랜치를 metadata 커밋 뒤에 생성 — fr 브랜치가 task-state 정합 커밋을 포함해 baseline 회귀 방지
   git branch "$TARGET_BRANCH"
   echo "promote: branch $TARGET_BRANCH 생성"
-  metadata_write "$TARGET_BRANCH" "$SLUG" "${WORKTREE_PATH:-null}"
-  git add "$LIFECYCLE_METADATA_PATH"
-  RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit -m "chore(lifecycle): promote $SLUG metadata 기록"
 fi
 
 [[ "$DRY_RUN" -eq 1 ]] && { echo "would proceed (idempotent rerun)"; exit 0; }

@@ -69,6 +69,35 @@ review kind:
 - 이미 합의된 쟁점은 반복하지 않는다
 - 이전 턴 파일을 전부 읽지 않는다. CHECKPOINT.md와 최신 턴 파일로 맥락을 파악하고, 부족할 때만 특정 턴을 선택적으로 참조한다 (턴 파일 경로: SESSION_DIR/turns/NNN_role.md)
 - CHECKPOINT.md의 Open Issues에는 근거 턴, 해소 조건, 미해결 사유를 포함한다. Agreed Points에는 합의 내용과 근거 턴 번호를 포함한다
+- Open Issues에 미해결 이슈가 없으면 정확히 `- 없음` 또는 `- None` 한 줄로만 표기한다 (후행 마침표 1개 허용). 그 외 산문 표기는 `is_review_session_resolved`가 미해결로 판정한다 (fail-closed)
+
+## 어댑터 대기 계약 (adapter_codex.sh)
+
+Reviewer 턴 생성 시 `adapter_codex.sh`는 다음 계약으로 대기합니다.
+
+- Codex를 background에서 실행한 뒤 **watchdog + `wait`** 방식으로 프로세스 종료를 직접 감지합니다 (폴링 루프 없음).
+- **WAIT_TIMEOUT** (기본 600초, env override 가능): watchdog이 만료 시 **타임아웃 마커 파일**(`.wait_timeout`)을 원자적으로 생성하고 Codex를 kill합니다. `wait` 복귀 후 마커 파일 존재 여부로 타임아웃/비정상 종료를 구분합니다.
+- cleanup 시 watchdog reap과 마커 파일 제거를 수행합니다.
+
+### 턴 완료 판정 계약 (SESSION 단일 권위)
+
+완료 판정 조건은 **세 가지 모두 충족**이어야 합니다.
+
+1. 턴 파일 존재
+2. SESSION `Current Owner` ∈ `{Author, User}` (enum 긍정 조건 — 부정 조건 금지)
+3. SESSION `Status` ∈ `{awaiting-author, awaiting-user}`
+
+**CHECKPOINT.md는 리뷰어 산문 전용**입니다 — Summary / Agreed Points / Open Issues / Questions / Suggested Next Owner 섹션은 리뷰 기록과 종결성 판정(`is_review_session_resolved`의 Open Issues 확인)에 사용되며, 어댑터의 턴 완료 판정에는 소비되지 않습니다. 기계 판정 필드(Status·Current Owner·Turn Limit·Branch Context)는 SESSION.md가 유일 권위입니다.
+
+## diff-review iteration 중 commit (review-gate-iteration-commit)
+
+final-diff-review 진행 중 reviewer 가 코드 수정을 요청하면, author 는 fr branch 에 수정을 **그대로 commit** 한다 (iteration commit). review target 은 `git diff main...HEAD` 이므로, 수정이 HEAD 에 반영되어야 reviewer 가 다음 턴에서 확인할 수 있다.
+
+- author: 수정 commit → 새 author 턴 파일 작성 → `SESSION.md` Status 를 `awaiting-reviewer` 로 전환.
+- reviewer: `run_review_turn.sh` 로 갱신된 `main...HEAD` 를 재검토.
+- `pre_commit_review_gate.sh` 는 미종결 중 **archive/완료 신호 commit**(staged `request-archive/` 파일 추가 또는 `CURRENT_TASK.md` baseline reset)만 차단하고, iteration 수정 commit 은 허용한다. 종결 여부를 파싱할 수 없는 malformed 세션도 동일하게 archive 신호일 때만 차단한다.
+- 미검증 archive/merge 의 최종 차단은 `archive.sh` 의 review 종결 재검증이 담당한다(malformed 세션 포함 fail-closed). iteration commit 허용이 이 안전장치를 약화하지 않는다.
+- archive.sh 의 precheck 는 merge 전에 **fr branch tip** 에 commit 된 diff-review 세션을 검증한다(main 워킹트리 비의존). 따라서 "세션을 fr branch 에 commit → main switch → archive.sh" 표준 흐름이 force-skip 없이 통과한다.
 
 ## 종료 규칙
 

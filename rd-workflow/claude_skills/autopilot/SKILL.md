@@ -21,7 +21,7 @@ digraph autopilot {
     design [label="5. brainstorming → spec → plan"];
     spec_review [label="6. spec/plan review (Reviewer)"];
     implement [label="7. 구현 (TDD + auto-debug)"];
-    verify [label="8. 검증 (test/lint/typecheck)"];
+    verify [label="8. 검증 (test/lint/typecheck/build)"];
     diff_review [label="9. final diff review (Reviewer)"];
     finish [label="10. 마무리 (추천 옵션 자동 선택)"];
     archive [label="11. REQUEST 아카이브"];
@@ -129,7 +129,7 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
   bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug>
   ```
   - `<slug>`는 `CURRENT_TASK.md ## Short Title` 값이다(생략 시 promote.sh가 자동 추출).
-  - promote.sh가 `fr/<slug>` 브랜치 + active-fr metadata(commit) + CURRENT_TASK 갱신을 생성하고 fr 브랜치로 전환한다. 이는 §6 step 7 archive.sh가 요구하는 형식과 일치한다.
+  - promote.sh가 `fr/<slug>` 브랜치 + task-state fr 필드 기록(commit) + CURRENT_TASK 갱신을 생성하고 fr 브랜치로 전환한다. 이는 §6 step 7 archive.sh가 요구하는 형식과 일치한다.
 - 구현 중 커밋은 이 `fr/<slug>` 브랜치에 쌓인다
 - 마무리 단계에서 merge/PR/cleanup 중 추천 옵션을 자동 선택한다
 
@@ -139,6 +139,7 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
 - 테스트 실패, 빌드 에러 발생 시 `superpowers:systematic-debugging`으로 자율 디버깅한다
 - 디버깅 3회 실패 시 현재 상태를 보고하고 사용자에게 넘긴다
 - **model-strategy 적용**: `rd-workflow/config/model-strategy.json`이 존재하면 `subagent` 값을 읽어 subagent dispatch 시 Agent 도구의 `model` 파라미터로 전달한다. 파일 미존재/파싱 실패/키 누락/허용되지 않은 값(`opus`, `sonnet`, `haiku` 외) → 기본값 `"sonnet"`을 사용한다. 설정 형식 상세는 `/model-strategy` skill 참조.
+- **subagent git 안전**: subagent dispatch 시 `rd-workflow/docs/guides/subagent-git-safety.md`의 Subagent Git 안전 문구를 dispatch prompt에 포함한다 (공유 워킹트리에서 git checkout/switch/branch/worktree 전환 금지, read-only git만 허용). read-only 탐색/리뷰 subagent는 `isolation: "worktree"` 격리를 권장한다.
 
 ### 5. 세션 한계 대응
 
@@ -160,79 +161,21 @@ compact 후에도 한계에 가까워지면:
 - `superpowers:finishing-a-development-branch` skill의 옵션 중 추천을 자동 선택한다
 - REQUEST 아카이브 절차 (아래 5단계를 순서대로 실행):
 
-  1. **Short Title 읽기**: `CURRENT_TASK.md`의 `## Short Title` 섹션을 읽어 `SHORT_TITLE` 변수로 저장한다.
-
-  2. **REQUEST.md 백업** (collision-safe — immutable BASE 패턴):
+  1. **Short Title 읽기**: 아래 명령으로 `SHORT_TITLE` 변수를 설정한다.
      ```bash
-     # assert_no_symlink_in_path: POSIX dirname 반복으로 절대경로 component 단위 traverse
-     # bash/sh/zsh/dash 호환 — local 미사용, IFS split 의존 안 함
-     assert_no_symlink_in_path() {
-       _aslnp_p="$1"
-       case "$_aslnp_p" in
-         /*) ;;
-         *)  _aslnp_p="$PWD/$_aslnp_p" ;;
-       esac
-       _aslnp_d="$_aslnp_p"
-       while [ "$_aslnp_d" != "/" ] && [ -n "$_aslnp_d" ]; do
-         if [ -L "$_aslnp_d" ]; then
-           echo "경고: path component ($_aslnp_d) 가 symlink 입니다. 보안상 중단합니다." >&2
-           unset _aslnp_p _aslnp_d
-           return 1
-         fi
-         _aslnp_d=$(dirname "$_aslnp_d")
-       done
-       unset _aslnp_p _aslnp_d
-       return 0
-     }
-
-     # SHORT_TITLE 은 CURRENT_TASK.md ## Short Title 에서 read (canonical 검증된 값)
-     BASE="rd-workflow-workspace/backlog/request-archive/{YYYY-MM-DD-HHMM}-${SHORT_TITLE}.md"
-     DEST="$BASE"
-
-     # 조상 경로 symlink escape 방어 — DEST 의 부모 디렉토리 검증
-     assert_no_symlink_in_path "$(dirname "$DEST")" || exit 1
-
-     N=2
-     while [ -e "$DEST" ] || [ -L "$DEST" ]; do
-       DEST="${BASE%.md}-${N}.md"
-       N=$((N+1))
-     done
-     # DEST 자체가 symlink 면 거부
-     if [ -L "$DEST" ]; then
-       echo "경고: archive 대상 ($DEST) 이 symlink 입니다. 보안상 중단합니다." >&2
-       exit 1
-     fi
-     cp REQUEST.md "$DEST"
+     SHORT_TITLE=$(bash rd-workflow/scripts/rd task title)
      ```
+
+  2. **REQUEST.md 백업**:
+     ```bash
+     bash rd-workflow/scripts/rd task backup-request
+     ```
+     실패(exit 2) 시 출력된 경고를 보고하고 중단한다.
 
   3. **같은 short-title 의 `request`/`spec`/`plan` stage 캡처를 `raw-captures/archive/` 로 이동**
      (`fr` stage 는 이동 안 함 — `/fr archive` 책임):
      ```bash
-     archive_dir="rd-workflow-workspace/raw-captures/archive"
-     parent_dir="rd-workflow-workspace/raw-captures"
-
-     # 조상 경로 symlink escape 방어
-     assert_no_symlink_in_path "$archive_dir" || exit 1
-
-     # 디렉토리 생성 + 권한 hardening (기존 0755 보정 포함)
-     mkdir -p "$archive_dir"
-     chmod 0700 "$parent_dir"
-     chmod 0700 "$archive_dir"
-
-     for STAGE in request spec plan; do
-       find rd-workflow-workspace/raw-captures -maxdepth 1 -type f -name "*-${STAGE}-*.md" 2>/dev/null \
-         | while IFS= read -r f; do
-             if awk -v t="${SHORT_TITLE}" -v s="${STAGE}" '
-                 BEGIN{c=0; st=0; sg=0}
-                 /^---$/{c++; if(c==2)exit}
-                 c==1 && $0=="short-title: " t {st=1}
-                 c==1 && $0=="stage: " s {sg=1}
-                 END{exit !(st && sg)}
-               ' "$f"; then
-               mv "$f" "$archive_dir/"
-             fi
-           done
-     done
+     bash rd-workflow/scripts/rd task archive-captures --stages request,spec,plan
      ```
 
   4. **Source FR 처리**: FUTURE_REQUESTS.md 인덱스에서 해당 항목의 상태를 `done`으로 변경하고, `items/` 상세 파일에서도 status를 `done`으로 표기한다.
@@ -288,5 +231,5 @@ compact 후에도 한계에 가까워지면:
 
 ## Rollback
 - 브랜치: `fr/<slug>` (promote.sh 생성)
-- 되돌리기: `bash rd-workflow/scripts/lifecycle/promote_rollback.sh` (main worktree에서 호출 — worktree 제거 + branch 삭제 + active-fr metadata clear + loop-guard 카운터 + CURRENT_TASK reset 일괄)
+- 되돌리기: `bash rd-workflow/scripts/lifecycle/promote_rollback.sh` (main worktree에서 호출 — worktree 제거 + branch 삭제 + task-state fr 필드 reset + loop-guard 카운터 + CURRENT_TASK reset 일괄)
 ```
