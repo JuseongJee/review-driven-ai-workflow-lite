@@ -4,3 +4,12 @@ rd-workflow-workspace/.lifecycle/migration-backup/
 rd-workflow-workspace/.lifecycle/verify-cache
 # copy 모드 skill 갱신 백업 (로컬 병합용 — 커밋 불필요)
 .claude/skills-backup/
+# OS
+.DS_Store
+Thumbs.db
+# IDE
+.idea/
+.vscode/
+*.swp
+# Superpowers 플러그인
+.superpowers/
