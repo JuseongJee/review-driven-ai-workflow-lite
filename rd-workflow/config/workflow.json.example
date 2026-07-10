@@ -1,5 +1,7 @@
 {
   "auto_completion_report": false,
   "intake_source": "text",
-  "fr_github": false
+  "fr_github": false,
+  "default_execution_mode": "manual",
+  "default_branch": ""
 }

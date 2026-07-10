@@ -26,12 +26,13 @@ pass() { PASS=$((PASS+1)); printf '  PASS: %s\n' "$1"; }
 
 # Common setup helper — temp git repo with lifecycle scripts copied in
 setup_repo() {
+  local branch="${1:-main}"
   local d
   d="$(mktemp -d)"
   # macOS: /var is a symlink to /private/var; resolve to canonical path so git worktree paths match
   d="$(cd "$d" && pwd -P)"
   ( cd "$d" && \
-    git init -q -b main 2>/dev/null || git init -q && git checkout -q -b main; \
+    git init -q -b "$branch" 2>/dev/null || git init -q && git checkout -q -b "$branch"; \
     git config user.email test@example.com; \
     git config user.name test; \
     if [[ -f "$PROJECT_ROOT/_ROOT_FILES/CURRENT_TASK.md" ]]; then \
@@ -340,6 +341,70 @@ out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-ti
 ( cd "$REPO" && grep -q "^fr-branch=null$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "stale-rollback: fr-branch=null" || fail "stale-rollback: metadata 잔존"
 run_promote "$REPO" --short-title test-stale --no-worktree >/dev/null 2>&1 && pass "stale-rollback: promote 재실행 성공" || fail "stale-rollback: promote 재실행 실패"
 
+rm -rf "$REPO"
+
+echo "== scenario 11: master 기본 브랜치 lifecycle =="
+REPO="$(setup_repo master)"
+REPO_PARENT="$(dirname "$REPO")"
+BARE11="$REPO_PARENT/bare-mirror-11-$$"
+git init --bare "$BARE11" -q 2>/dev/null || true
+( cd "$REPO" && git remote add origin "$BARE11" )
+
+# gate: master 직접 commit 차단 — fixture에 복사된 hook을 fixture cwd에서 실행 (scenario 4 패턴)
+out_rc=0
+( cd "$REPO" && echo '{"tool_input":{"command":"git commit -m x"}}' | bash rd-workflow/scripts/hooks/fr_branch_gate.sh >/dev/null 2>&1 ) || out_rc=$?
+[[ "$out_rc" -eq 2 ]] && pass "master-gate: 직접 commit 차단" || fail "master-gate: 통과됨 (rc=$out_rc)"
+
+run_promote "$REPO" --short-title test-master --no-worktree >/dev/null 2>&1 \
+  && pass "master-promote: exit 0" || fail "master-promote: 실패"
+( cd "$REPO" && git show master:rd-workflow-workspace/.lifecycle/task-state 2>/dev/null | grep -q "fr-branch=fr/test-master" ) \
+  && pass "master-promote: metadata 기록" || fail "master-promote: metadata 부재"
+# fr branch 위 작업 commit 후 master로 돌아가 archive (review-check는 fixture라 force-skip)
+( cd "$REPO" && git commit -q --allow-empty -m "work" )
+( cd "$REPO" && git switch master -q && bash rd-workflow/scripts/lifecycle/archive.sh --force-skip-review-check "통합 테스트 fixture" >/dev/null 2>&1 ) \
+  && pass "master-archive: exit 0" || fail "master-archive: 실패"
+_tag11="$(cd "$REPO" && git tag --list "fr/*/test-master" | head -1)"
+( [[ -n "$_tag11" ]] && cd "$REPO" && git merge-base --is-ancestor "$_tag11" master 2>/dev/null ) \
+  && pass "master-archive: merge 완료" || fail "master-archive: merge 안 됨"
+( cd "$REPO" && git ls-remote origin refs/heads/master 2>/dev/null | grep -q . ) \
+  && pass "master-archive: master pushed" || fail "master-archive: master 미push"
+( cd "$REPO" && git tag --list "fr/*/test-master" | grep -q . ) \
+  && pass "master-archive: tag 생성" || fail "master-archive: tag 부재"
+
+# diff review 기본 target 일반화 (prepare_review_pipeline.sh)
+# 전제: setup_repo()가 이미 lifecycle/*.sh(_lifecycle_common.sh 포함)와 _state_common.sh를
+# fixture의 rd-workflow/scripts/ 아래에 복사해 두므로, prepare가 source할 의존성은 충족되어 있다.
+# 여기서는 prepare_review_pipeline.sh 한 파일만 추가 복사하면 된다.
+( cd "$REPO" && mkdir -p rd-workflow/scripts \
+  && cp "$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/prepare_review_pipeline.sh" rd-workflow/scripts/ \
+  && cp "$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/init_review_pipeline.sh" rd-workflow/scripts/ \
+  && bash rd-workflow/scripts/prepare_review_pipeline.sh diff >/dev/null 2>&1 ) || true
+DIFF_SES="$(ls -d "$REPO"/rd-workflow-workspace/handoffs/review_pipeline/*final-diff-review 2>/dev/null | head -1)"
+( [[ -n "$DIFF_SES" ]] && grep -q 'git diff master...HEAD' "$DIFF_SES/SESSION.md" ) \
+  && pass "master-diff: 기본 target master...HEAD" || fail "master-diff: target 오검출 (SESSION=$DIFF_SES)"
+
+rm -rf "$REPO" "$BARE11"
+
+# === Scenario: 기본 브랜치 worktree 밖 호출 거부 — resolved 브랜치명 안내 문구 검증 ===
+echo "== scenario: 비-기본-브랜치 worktree 호출 거부 (trunk fixture) =="
+REPO="$(setup_repo trunk)"
+( cd "$REPO" && mkdir -p rd-workflow/config \
+  && printf '{"default_branch": "trunk"}\n' > rd-workflow/config/workflow.json \
+  && git add -A && git commit -q -m "config" )
+WT="${REPO}-side-wt"
+( cd "$REPO" && git worktree add -q "$WT" -b side )
+for _mm in "promote:promote.sh --short-title test-mm --no-worktree" \
+           "rollback:promote_rollback.sh" \
+           "archive:archive.sh"; do
+  _name="${_mm%%:*}"; _cmd="${_mm#*:}"
+  RC=0; ERR="$( (cd "$WT" && bash rd-workflow/scripts/lifecycle/${_cmd}) 2>&1 )" || RC=$?
+  [[ "$RC" -eq 1 ]] && pass "$_name mismatch: exit 1" || fail "$_name mismatch: exit=$RC"
+  printf '%s' "$ERR" | grep -q "기본 브랜치(trunk) worktree" \
+    && pass "$_name mismatch: resolved 브랜치명 안내" || fail "$_name mismatch: 브랜치명 문구 누락 — $ERR"
+  printf '%s' "$ERR" | grep -q "해당 worktree path:" \
+    && pass "$_name mismatch: path 안내" || fail "$_name mismatch: path 문구 누락 — $ERR"
+done
+( cd "$REPO" && git worktree remove --force "$WT" ) || true
 rm -rf "$REPO"
 
 echo "== 결과: PASS=$PASS FAIL=$FAIL =="

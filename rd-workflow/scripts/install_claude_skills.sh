@@ -100,6 +100,20 @@ mkdir -p "$dest_base"
 
 source_base_real="$(canonical_dir "$skills_source_dir")"
 dest_base_real="$(canonical_dir "$dest_base")"
+dest_root_real="${dest_base_real%/.claude/skills}"
+
+# link 모드 symlink target 계산.
+# project scope에서 source가 프로젝트 안에 있으면 symlink 위치(.claude/skills) 기준
+# 상대 경로를 반환한다 — 절대 경로 symlink은 커밋 후 다른 머신/경로 clone에서 파손된다.
+# personal scope와 프로젝트 밖 source는 기존 절대 경로를 유지한다.
+symlink_target_for() {
+  local skill_name="$1"
+  if [[ "$scope" == "project" && "$source_base_real" == "${dest_root_real}"/* ]]; then
+    printf '../../%s/%s' "${source_base_real#"${dest_root_real}"/}" "$skill_name"
+  else
+    printf '%s/%s' "$source_base_real" "$skill_name"
+  fi
+}
 
 if [[ "$source_base_real" == "$dest_base_real" ]]; then
   echo "source and destination are the same: $source_base_real"
@@ -147,6 +161,16 @@ for skill_name in "${skill_names[@]}"; do
     if [[ -L "$dst" && "$(canonical_dir "$dst")" != "$src_real" ]]; then
       rm "$dst"
     elif [[ -d "$dst" && "$(canonical_dir "$dst")" == "$src_real" ]]; then
+      desired_target="$(symlink_target_for "$skill_name")"
+      if [[ -L "$dst" && "$desired_target" != /* && "$(readlink "$dst")" != "$desired_target" ]]; then
+        # 해석 결과가 이미 동일한 symlink만 literal target을 원하는 상대 형식으로 교체한다.
+        # (기존 설치본 갱신은 이번 실행의 mode 인자와 무관 — copy refresh와 동일 철학)
+        rm "$dst"
+        ln -s "$desired_target" "$dst"
+        echo "refreshed (symlink -> relative): $skill_name -> $dst"
+        refreshed_count=$((refreshed_count + 1))
+        continue
+      fi
       echo "already installed: $skill_name"
       skipped_count=$((skipped_count + 1))
       continue
@@ -208,7 +232,7 @@ for skill_name in "${skill_names[@]}"; do
   fi
 
   if [[ "$mode" == "link" ]]; then
-    ln -s "$src_real" "$dst"
+    ln -s "$(symlink_target_for "$skill_name")" "$dst"
   else
     cp -R "$src" "$dst"
   fi

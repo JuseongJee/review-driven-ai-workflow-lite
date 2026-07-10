@@ -107,5 +107,70 @@ chmod 755 "${SANDBOX}/.claude/skills-backup"
 grep -q 'alpha v1' "${SANDBOX}/.claude/skills/alpha/SKILL.md" \
   && ok "T8-b 기존 설치본 무손상" || fail "T8-b 설치본 손상/소실"
 
+# --- T9: project + link 신규 설치 → 상대 경로 symlink ---
+setup_sandbox
+run_install link
+target="$(readlink "${SANDBOX}/.claude/skills/alpha")"
+[[ "$target" == "../../rd-workflow/claude_skills/alpha" ]] \
+  && ok "T9-a literal target이 상대 경로" || fail "T9-a target: $target"
+grep -q 'alpha v1' "${SANDBOX}/.claude/skills/alpha/SKILL.md" \
+  && ok "T9-b resolve 정상" || fail "T9-b resolve 실패"
+
+# --- T10: repo 이동 후에도 symlink 유효 (clone 이식성) ---
+MOVED="${SANDBOX}-moved"
+mv "$SANDBOX" "$MOVED"
+CLEANUP_DIRS+=("$MOVED")
+grep -q 'alpha v1' "${MOVED}/.claude/skills/alpha/SKILL.md" \
+  && ok "T10 이동 후 resolve 정상" || fail "T10 이동 후 파손"
+
+# --- T11: 기존 절대 경로 symlink → 상대 경로로 refresh ---
+setup_sandbox
+mkdir -p "${SANDBOX}/.claude/skills"
+ln -s "$(cd "${SANDBOX}/rd-workflow/claude_skills/alpha" && pwd -P)" "${SANDBOX}/.claude/skills/alpha"
+run_install link
+echo "$OUT" | grep -q "refreshed (symlink -> relative): alpha" \
+  && ok "T11-a refresh 메시지" || fail "T11-a refresh 없음: $OUT"
+target="$(readlink "${SANDBOX}/.claude/skills/alpha")"
+[[ "$target" == "../../rd-workflow/claude_skills/alpha" ]] \
+  && ok "T11-b 상대 경로로 교체" || fail "T11-b target: $target"
+grep -q 'alpha v1' "${SANDBOX}/.claude/skills/alpha/SKILL.md" \
+  && ok "T11-c resolve 유지" || fail "T11-c resolve 파손"
+
+# --- T12: 상대 symlink 재실행 → skip (idempotent) ---
+run_install link
+echo "$OUT" | grep -q "already installed: alpha" \
+  && ok "T12 상대 symlink 재실행 skip" || fail "T12 skip 아님: $OUT"
+
+# --- T13: personal scope는 절대 경로 유지 ---
+setup_sandbox
+FAKE_HOME="$(mktemp -d)"
+CLEANUP_DIRS+=("$FAKE_HOME")
+OUT="$(cd "$SANDBOX" && HOME="$FAKE_HOME" bash rd-workflow/scripts/install_claude_skills.sh personal link 2>&1)"
+RC=$?
+[[ "$RC" == 0 ]] && ok "T13-a personal 설치 exit 0" || fail "T13-a exit $RC: $OUT"
+target="$(readlink "${FAKE_HOME}/.claude/skills/alpha")"
+[[ "$target" == /* ]] \
+  && ok "T13-b personal은 절대 경로 유지" || fail "T13-b target: $target"
+
+# --- T14: _ROOT_FILES dogfooding 실행 → parent root에 상대 symlink ---
+SANDBOX="$(mktemp -d)"
+CLEANUP_DIRS+=("$SANDBOX")
+mkdir -p "${SANDBOX}/_ROOT_FILES/rd-workflow/scripts" \
+         "${SANDBOX}/_ROOT_FILES/rd-workflow/claude_skills/alpha"
+cp "${SCRIPT_DIR}/install_claude_skills.sh" "${SANDBOX}/_ROOT_FILES/rd-workflow/scripts/"
+printf 'alpha v1\n' > "${SANDBOX}/_ROOT_FILES/rd-workflow/claude_skills/alpha/SKILL.md"
+touch "${SANDBOX}/_ROOT_FILES/CLAUDE.md" "${SANDBOX}/_ROOT_FILES/REQUEST.md"
+OUT="$(cd "${SANDBOX}/_ROOT_FILES" && bash rd-workflow/scripts/install_claude_skills.sh project link 2>&1)"
+RC=$?
+[[ "$RC" == 0 ]] && ok "T14-a _ROOT_FILES 설치 exit 0" || fail "T14-a exit $RC: $OUT"
+target="$(readlink "${SANDBOX}/.claude/skills/alpha")"
+[[ "$target" == "../../_ROOT_FILES/rd-workflow/claude_skills/alpha" ]] \
+  && ok "T14-b _ROOT_FILES 상대 target" || fail "T14-b target: $target"
+MOVED="${SANDBOX}-moved"
+mv "$SANDBOX" "$MOVED"
+CLEANUP_DIRS+=("$MOVED")
+grep -q 'alpha v1' "${MOVED}/.claude/skills/alpha/SKILL.md" \
+  && ok "T14-c 이동 후 resolve 정상" || fail "T14-c 이동 후 파손"
+
 [[ "$FAIL" == 0 ]] && echo "test_install_claude_skills: ALL PASS" || echo "test_install_claude_skills: FAIL"
 exit "$FAIL"

@@ -49,7 +49,7 @@ if metadata_exists; then
   if ! git rev-parse --verify "refs/heads/$EXISTING_BRANCH" >/dev/null 2>&1; then
     echo "promote: task-state의 fr-branch($EXISTING_BRANCH)가 실재하지 않는 stale 상태입니다 (short-title=$EXISTING_SHORT)." >&2
     echo "  원인 후보: 브랜치 수동 삭제, 또는 이전 archive/rollback 비정상 종료." >&2
-    echo "  복구: bash rd-workflow/scripts/lifecycle/promote_rollback.sh (main worktree — task-state fr 필드 reset 포함) 후 promote 재시도." >&2
+    echo "  복구: bash rd-workflow/scripts/lifecycle/promote_rollback.sh (기본 브랜치 worktree — task-state fr 필드 reset 포함) 후 promote 재시도." >&2
     exit 1
   fi
   if [[ "$EXISTING_SHORT" == "$SLUG" ]]; then
@@ -65,11 +65,12 @@ if metadata_exists; then
   fi
 fi
 
-# Step A — main worktree 검증
-MAIN_WT="$(get_main_worktree_path)" || { echo "promote: main worktree 검출 실패 (refs/heads/main worktree 없음)" >&2; exit 1; }
+# Step A — 기본 브랜치 worktree 검증
+MAIN_WT="$(get_main_worktree_path)" || { echo "promote: 기본 브랜치 worktree 검출 실패" >&2; exit 1; }
 CURRENT_WT="$(git rev-parse --show-toplevel)"
 if [[ "$MAIN_WT" != "$CURRENT_WT" ]]; then
-  echo "promote: main worktree에서 호출하세요. main worktree path: $MAIN_WT" >&2; exit 1
+  DB="$(get_default_branch)"
+  echo "promote: 기본 브랜치($DB) worktree에서 호출하세요. 해당 worktree path: $MAIN_WT" >&2; exit 1
 fi
 
 # Step B — metadata 부재 시 신규 결정
@@ -116,7 +117,7 @@ elif [[ "$(git rev-parse --abbrev-ref HEAD)" != "$TARGET_BRANCH" ]]; then
   git switch "$TARGET_BRANCH"
 fi
 
-# Step D — CURRENT_TASK.md 갱신 commit (fr branch 위 = TARGET_WT_PATH 또는 main worktree)
+# Step D — CURRENT_TASK.md 갱신 commit (fr branch 위 = TARGET_WT_PATH 또는 기본 브랜치 worktree)
 TARGET_DIR="${TARGET_WT_PATH:-.}"
 TASK_FILE="$TARGET_DIR/CURRENT_TASK.md"
 [[ -f "$TASK_FILE" ]] || { echo "promote: $TASK_FILE 없음" >&2; exit 1; }

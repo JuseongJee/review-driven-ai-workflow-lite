@@ -5,6 +5,9 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd "${script_dir}/../.." && pwd)"
 cd "${project_root}"
 
+# 기본 브랜치 resolver (diff 기본 target 일반화)
+source "${script_dir}/lifecycle/_lifecycle_common.sh"
+
 turn_limit="${REVIEW_TURN_LIMIT:-20}"
 
 usage() {
@@ -25,6 +28,7 @@ review-kind:
   bash rd-workflow/scripts/prepare_review_pipeline.sh spec-plan rd-workflow-workspace/specs/changes/2026-03-12-image-compression-change-spec.md rd-workflow-workspace/plans/2026-03-12-image-compression-plan.md
   bash rd-workflow/scripts/prepare_review_pipeline.sh diff
   bash rd-workflow/scripts/prepare_review_pipeline.sh diff "git diff main...HEAD"
+  # diff-target 생략 시 기본 브랜치 자동 검출 (workflow.json default_branch → origin/HEAD → main/master)
 EOF
 }
 
@@ -151,7 +155,15 @@ ${plan_path}"
     review_goal="\`rd-workflow/docs/prompts/review/spec_review.md\` 기준으로 과도한 설계, 빠진 엣지 케이스, 더 단순한 대안, 테스트 전략 누락, 플랫폼 리스크를 점검"
     ;;
   diff|diff-review|final-diff)
-    diff_target="${1:-git diff main...HEAD}"
+    if [[ -n "${1:-}" ]]; then
+      diff_target="$1"
+    else
+      _default_branch="$(get_default_branch)" || {
+        echo "diff review: 기본 브랜치 결정 실패 — diff-target 인자를 직접 지정하세요 (예: \"git diff master...HEAD\")" >&2
+        exit 1
+      }
+      diff_target="git diff ${_default_branch}...HEAD"
+    fi
     review_type="diff-review"
     session_slug="final-diff-review"
     review_target="${diff_target}"

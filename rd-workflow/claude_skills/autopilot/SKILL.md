@@ -1,11 +1,11 @@
 ---
 name: autopilot
-description: Use when wanting to pick a task from FUTURE_REQUESTS.md and run the full pipeline autonomously - all reviews included, with rollback points and session-aware completion
+description: Use when wanting to pick a task from FUTURE_REQUESTS.md and run the pipeline autonomously - mode A (full pipeline, all reviews) or user-designated mode B (small-task path), with rollback points and session-aware completion
 ---
 
 # Autopilot
 
-FUTURE_REQUESTS에서 작업을 선택하고, 모든 리뷰를 포함한 전체 파이프라인을 자율 실행한다.
+FUTURE_REQUESTS에서 작업을 선택하고 파이프라인을 자율 실행한다. 실행 모드는 두 가지다 — 모드 A(모든 리뷰를 포함한 정식 절차 전부, 기본값), 모드 B(사용자가 지정한 small-task 경로). 모드 정의와 선택 규칙은 "실행 모드" 섹션을 따른다.
 
 ## Pipeline
 
@@ -15,20 +15,28 @@ digraph autopilot {
     node [shape=box];
 
     select [label="1. FUTURE_REQUESTS 목록 제시\n사용자가 선택"];
-    request [label="2. REQUEST.md 생성"];
-    request_review [label="3. REQUEST review (Reviewer)"];
-    branch [label="4. fr 브랜치 승격 (promote.sh)"];
+    mode [label="2. 실행 모드 선택\n(autopilot 추천 + 사용자 결정)" shape=diamond];
+    request [label="3. REQUEST.md 생성"];
+    request_review [label="4. REQUEST review (Reviewer)"];
     design [label="5. brainstorming → spec → plan"];
     spec_review [label="6. spec/plan review (Reviewer)"];
-    implement [label="7. 구현 (TDD + auto-debug)"];
-    verify [label="8. 검증 (test/lint/typecheck/build)"];
-    diff_review [label="9. final diff review (Reviewer)"];
-    finish [label="10. 마무리 (추천 옵션 자동 선택)"];
-    archive [label="11. REQUEST 아카이브"];
-    report [label="12. 최종 보고"];
+    branch [label="7. fr 브랜치 승격 (promote.sh)"];
+    implement [label="8. 구현 (TDD + auto-debug)"];
+    verify [label="9. 검증 (test/lint/typecheck/build)"];
+    diff_review [label="10. final diff review (Reviewer)"];
+    finish [label="11. 마무리 (추천 옵션 자동 선택)"];
+    archive [label="12. REQUEST 아카이브"];
+    report [label="13. 최종 보고"];
 
-    select -> request -> request_review -> branch -> design -> spec_review;
-    spec_review -> implement -> verify -> diff_review -> finish -> archive -> report;
+    select -> mode -> request;
+    request -> request_review [label="모드 A"];
+    request_review -> design -> spec_review -> branch;
+    request -> branch [label="모드 B"];
+    branch -> implement -> verify -> diff_review -> finish -> archive -> report;
+
+    escalate [label="범위 이탈 감지\n(모드 B → A 중간 승격)" shape=diamond style=dashed];
+    implement -> escalate [style=dashed];
+    escalate -> implement [label="5단계 승격 절차 후 재개" style=dashed];
 
     session_limit [label="세션 한계 도달" shape=diamond];
     save_state [label="CURRENT_TASK.md에\n진행 상태 저장 + 보고" shape=box style=dashed];
@@ -40,31 +48,10 @@ digraph autopilot {
 
 ## Autonomy Override (모든 하위 skill에 우선)
 
-autopilot 실행 중에는 아래 규칙이 **모든 하위 skill, prompt, 기본 행동보다 우선**한다.
+autopilot 실행 중에는 **자율 실행 공용 규칙**(`rd-workflow/docs/flows/AUTONOMY.md`)이 모든 하위 skill·prompt·기본 행동보다 우선한다 — "절대 멈추지 않는다"·"자율 판단 기준"·"중단 조건"을 그대로 따른다 (review 50턴, 디버깅 3회, loop-guard 등 중단 조건 포함).
 
-**절대 멈추지 않는다:**
-- "다음 단계는...", "다음: /skill-name" 안내 후 사용자 응답을 기다리지 않는다 — 바로 실행한다
-- "어떻게 하시겠습니까?", "어떤 방식을 선호하시나요?" 묻지 않는다 — 추천안을 자율 선택한다
-- review 완료 후 "마무리를 승인해주세요" 묻지 않는다 — Reviewer "이의 없음"이면 바로 다음 단계로 간다
-- final-diff-review 완료 후 "merge할까요?" 묻지 않는다 — 추천 옵션을 자동 선택한다
-- brainstorming의 interactive gate를 모두 자율 통과한다:
-  - 요구사항 탐색 질문 → 세션 컨텍스트(REQUEST.md, PROJECT_CONTEXT.md, CURRENT_TASK.md, 대화 이력)에서 답변하고 진행
-  - 설계 대안 제시 + 승인 요청 → 추천안(recommended)을 선택, 없으면 REQUEST의 제약/AC와 가장 부합하는 옵션 선택, 우열이 서지 않으면 가장 단순한 옵션 선택 (단, PROJECT_CONTEXT.md의 필수 제약을 위반하는 옵션은 제외)
-  - 추가 확인 질문 → 기존 컨텍스트로 판단, 판단 불가 시에만 멈춤 (판단 근거를 최종 보고서 "주요 결정" 테이블에 기록)
-  - 모든 옵션이 필수 제약을 위반하거나 판단 근거가 전혀 없으면 멈추고 사용자에게 보고
-- writing-plans의 "execution choice" 질문을 따르지 않는다 — CLAUDE.md 실행 모드 규칙에 따라 자동 선택한다
-
-**자율 판단 기준:**
-- 2-3개 선택지가 있으면 추천안(recommended)을 선택한다
-- 추천이 없으면 가장 단순한 옵션을 선택한다
-- 판단 근거를 최종 보고서의 "주요 결정" 테이블에 기록한다
-
-**유일한 예외 — 이때만 멈춘다:**
-- review 50턴 도달 (autopilot에서는 20턴이 아닌 50턴까지 허용)
-- 디버깅 3회 실패
-- 사람의 우선순위 결정이 반드시 필요한 경우 (기술적 판단이 아닌 비즈니스 판단)
-- 세션 한계 도달
-- brainstorming에서 모든 옵션이 필수 제약을 위반하거나 판단 근거가 전혀 없는 경우
+**autopilot 특화 예외 게이트 (AUTONOMY.md 공용 규칙보다 우선):**
+- §1의 작업 선택과 실행 모드 선택은 AskUserQuestion으로 **사용자가 결정한다**. 특히 모드 B는 사용자 선택 없이는 진행하지 않는다 ("실행 모드" 섹션 참조). 이 두 게이트 이후부터 AUTONOMY.md 규칙이 적용된다.
 
 ## autopilot 적합성 기준
 
@@ -83,6 +70,49 @@ autopilot 실행 중에는 아래 규칙이 **모든 하위 skill, prompt, 기�
 - **조건부 가능**: 일부 항목이 충족 조건(예: seed 보강, 특정 결정에 대한 사람 승인) 하에서만 자율 진행 가능하다. 충족 조건과 사람 결정 필요 여부를 분리해 적는다.
 - **불가**: 본질적 사람 결정이 작업 핵심이거나, 비가역·제약 위반 위험이 자율 진행을 막는다. 차단 사유를 적는다.
 
+## 실행 모드
+
+autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 사용자가 결정한다 (§1).
+
+| 모드 | 파이프라인 | 대상 |
+|------|-----------|------|
+| **모드 A (기본값)** | 정식 절차 전부 — REQUEST review → brainstorming → spec → plan → spec/plan review → 구현 → 검증 → final diff review | 큰 작업 및 판단이 모호한 모든 작업 |
+| **모드 B** | small-task 경로 — REQUEST review·spec/plan 작성·spec/plan review 생략, 나머지 동일 | 사용자가 게이트에서 명시적으로 지정한 small-task |
+
+### 모드 선택 규칙
+
+- 작업 선택 직후 autopilot이 추천 모드와 근거를 표시하고 AskUserQuestion으로 사용자가 선택한다.
+- **사용자가 게이트에서 모드 B를 선택하는 행위가 곧 CLAUDE.md의 "사용자가 명시적으로 small-task로 지정"이다.** autopilot은 어떤 경우에도 모드 B를 자체 선택하지 않는다. 선택 불가 상황의 기본값은 모드 A다.
+- **보수적 추천 규칙**: 대상 FR이 `WORKFLOW.md` "작은 작업의 일반적 특징"(참고용 기준)에 명확히 부합할 때만 모드 B를 추천한다. 다음 중 하나라도 해당하면 모드 A를 추천한다:
+  - (a) 분류가 모호함
+  - (b) AC가 넓거나 불명확함
+  - (c) 영향 범위가 불명확함
+  - (d) WORKFLOW.md의 큰 작업 신호가 하나라도 존재함
+
+### 모드 B 실행 규칙
+
+- **생략**: REQUEST review, brainstorming → spec → plan 설계 단계, spec/plan review
+- **유지**: REQUEST.md 생성(§1), fr 브랜치 승격(§3), 구현·검증(§4), **final diff review(항상 수행 — 생략 불가)**, 마무리·아카이브(§6), 최종 보고(§7)
+- **promote 타이밍**: 모드 B는 spec/plan review가 없으므로 REQUEST.md 생성 직후 promote한다 (§3).
+- **AC 게이트**: REQUEST.md의 Acceptance Criteria가 비어 있거나 모호하면 구현을 시작하지 않는다. request seed로부터 구체적 AC를 생성하는 것이 REQUEST 생성 단계의 책임이며, seed가 빈약해 AC를 만들 수 없으면 `awaiting-user`로 멈춘다.
+- 그 외 공통 규칙(Autonomy Override, §4의 자율 구현 규칙 전체, §5 세션 한계 대응, §2 리뷰 수렴 규칙)은 모드 B에도 전부 동일 적용된다.
+
+### 범위 이탈 시 중간 승격 (모드 B → 모드 A)
+
+구현 중 `WORKFLOW.md`의 "큰 작업" 신호(여러 파일/모듈로 확산, 새 API·데이터 모델·인터페이스 필요, 기존 동작 변경·마이그레이션 필요, 테스트 전략 신규 수립)가 하나라도 실제로 나타나면 **멈추지 않고** 모드 A로 승격한다. 감지 시점은 각 구현 사이클 시작 시와 구현 중 새 요구 발견 시다.
+
+승격 절차 (5단계):
+
+1. 현재까지의 구현을 fr 브랜치에 WIP 커밋한다 (구현 유지).
+2. `CURRENT_TASK.md` Status를 `spec/plan 작성 중`으로 갱신하고 Notes에 승격 사유를 기록한다.
+3. change-spec + plan을 소급 작성한다 — 이미 구현된 부분은 "현재 상태"로 반영하고 남은 작업을 plan Task로 정의한다 (`specs/changes/`, `plans/` 컨벤션 그대로).
+4. spec/plan review를 실행한다 (§2 리뷰 패턴과 동일). Reviewer가 기존 구현의 문제를 지적하면 자율 수정한다.
+5. 리뷰 통과 후 잔여 구현부터 모드 A와 완전히 동일하게 진행한다.
+
+- **REQUEST review는 소급하지 않는다** — 범위 이탈은 규모 추정의 문제이지 REQUEST의 문제가 아니다. REQUEST 자체의 전제가 깨진 경우(요구사항 변화)는 기존 예외("사람의 우선순위 결정이 반드시 필요한 경우")에 따라 멈춘다.
+- 승격은 단방향이다 (모드 A → B 강등 없음).
+- 승격 사실과 사유를 최종 보고서 "주요 결정" 테이블에 기록한다.
+
 ## Execution Rules
 
 ### 1. 작업 선택
@@ -94,12 +124,13 @@ autopilot 실행 중에는 아래 규칙이 **모든 하위 skill, prompt, 기�
 - priority는 후보 자격(status 게이트) 내에서의 정렬에만 사용한다. idea가 P1이라도 validated/ready-for-request 후보가 있으면 그쪽을 먼저 보여준다
 - 각 항목의 priority를 읽으려면 상세 파일(`items/*.md`)의 `priority` 필드를 확인한다. priority 읽기/fallback 규칙은 `/fr list`와 동일: 필드 없음/`-` → unranked, malformed 값 → unranked + 경고, 상세 파일 누락 → 건너뜀 + 경고
 - **AskUserQuestion으로 목록을 보여주고 사용자가 선택한다** — 목록에 priority 컬럼을 포함하여 정렬 이유를 사용자에게 보여준다
+- 항목 선택 직후 실행 모드를 선택한다 — "실행 모드" 섹션의 모드 선택 규칙을 따른다 (autopilot 추천 + 사용자 결정 필수, 기본값 모드 A)
 - 선택된 항목의 `request seed`를 기반으로 `REQUEST.md`를 생성한다
 - REQUEST.md 생성 후 `CURRENT_TASK.md` Notes에 `started_at: YYYY-MM-DD HH:MM` 형식으로 현재 시각을 기록한다. autopilot 재실행 시 이전 값을 덮어쓴다.
 
-### 2. 리뷰 — 3단계 전부 실행
+### 2. 리뷰 — 모드 A는 3단계 전부, 모드 B는 final diff review만
 
-모든 리뷰는 아래 패턴을 따른다:
+모드별 리뷰 범위는 "실행 모드" 섹션을 따른다. 모든 리뷰는 아래 패턴을 따른다:
 
 ```bash
 # 세션 생성 (autopilot에서는 반드시 REVIEW_TURN_LIMIT=50을 넘긴다)
@@ -117,6 +148,8 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
 | Spec/Plan review | `spec-plan [spec] [plan]` | spec + plan 작성 직후 |
 | Final diff review | `diff` | 구현 + 검증 완료 후 |
 
+- **task별 리뷰 생략 (mechanical)**: plan의 review flag가 `mechanical`인 task는 task별 리뷰어 dispatch를 생략하고 final diff review에 위임한다. `needs-review`(또는 flag 부재)인 task만 리뷰어를 dispatch한다. 판정 기준(3조건)과 final diff 불변은 `rd-workflow/docs/guides/plan-parallel-phases.md` 참조. 이 생략은 리뷰에만 적용되며 검증(test/lint/build)과 loop-guard 시그널에는 영향을 주지 않는다.
+
 **수렴 규칙:**
 - 최신 Reviewer 턴이 "이의 없음"을 명시할 때까지 반복한다
 - 50턴 도달 시 `awaiting-user`로 전환하고 사용자에게 보고한다 (일반 review의 20턴 대신 50턴)
@@ -124,7 +157,7 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
 
 ### 3. fr 브랜치 승격 (promote)
 
-- spec/plan review 통과 후, 구현 시작 전에 lifecycle 정규 경로로 fr 브랜치를 만든다. **main worktree에서** 호출한다:
+- 모드 A는 spec/plan review 통과 후, 모드 B는 REQUEST.md 생성 직후 — 구현 시작 전에 lifecycle 정규 경로로 fr 브랜치를 만든다. **기본 브랜치 worktree에서** 호출한다:
   ```bash
   bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug>
   ```
@@ -140,6 +173,7 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
 - 디버깅 3회 실패 시 현재 상태를 보고하고 사용자에게 넘긴다
 - **model-strategy 적용**: `rd-workflow/config/model-strategy.json`이 존재하면 `subagent` 값을 읽어 subagent dispatch 시 Agent 도구의 `model` 파라미터로 전달한다. 파일 미존재/파싱 실패/키 누락/허용되지 않은 값(`opus`, `sonnet`, `haiku` 외) → 기본값 `"sonnet"`을 사용한다. 설정 형식 상세는 `/model-strategy` skill 참조.
 - **subagent git 안전**: subagent dispatch 시 `rd-workflow/docs/guides/subagent-git-safety.md`의 Subagent Git 안전 문구를 dispatch prompt에 포함한다 (공유 워킹트리에서 git checkout/switch/branch/worktree 전환 금지, read-only git만 허용). read-only 탐색/리뷰 subagent는 `isolation: "worktree"` 격리를 권장한다.
+- **phase 병렬 실행**: plan이 phase(파일 비중첩 task 그룹)를 표현하면 phase 내 task 구현자를 병렬 dispatch하고, barrier 후 **orchestrator(실행 세션 본체)가 커밋**한다. 검증은 phase barrier 후 1회 실행한다. 절차 전체는 `rd-workflow/docs/guides/plan-parallel-phases.md`를 따른다. phase 미표현 plan은 순차 실행으로 degrade한다.
 
 ### 5. 세션 한계 대응
 
@@ -184,9 +218,9 @@ compact 후에도 한계에 가까워지면:
 
   6. **fr stage capture archive**: Source FR 의 status 가 `done` 으로 변경되었으므로 `/fr archive` 를 호출하여 같은 short-title 의 `fr` stage 캡처를 `raw-captures/archive/` 로 이동한다. (autopilot REQUEST archive 에서 `request`/`spec`/`plan` 캡처는 3단계에서 이미 이동됨. `fr` stage 는 이 단계에서 `/fr archive` 에 위임)
 
-  7. **lifecycle 일괄 마무리**: 위 1–6단계(archive content commit)가 fr branch에서 완료된 후, main 으로 switch 하고 아래 명령을 실행한다:
+  7. **lifecycle 일괄 마무리**: 위 1–6단계(archive content commit)가 fr branch에서 완료된 후, 기본 브랜치로 switch 하고 아래 명령을 실행한다:
      ```bash
-     git checkout main
+     git checkout main  # 기본 브랜치 (master/trunk 프로젝트는 해당 브랜치 — workflow.json default_branch 참조)
      bash rd-workflow/scripts/lifecycle/archive.sh
      ```
      `archive.sh` 가 merge + tag + push + branch/worktree 정리를 일괄 처리한다. 이 단계 실패 시 현재 상태를 보고하고 사용자에게 넘긴다.
@@ -217,12 +251,14 @@ compact 후에도 한계에 가까워지면:
 ## 주요 결정
 | 분기점 | 선택 | 대안 | 선택 이유 |
 |--------|------|------|----------|
+| 실행 모드 | [모드 A/모드 B] (추천: [모드 A/모드 B] — [일치/불일치]) | [다른 모드] | [사용자 선택. 중간 승격 발생 시 승격 사유 병기] |
 | 마무리 방식 | [merge/PR/...] | [다른 옵션들] | [이유] |
 | ... | ... | ... | ... |
 
 ## 리뷰 요약
-- REQUEST review: [한줄 요약] → `rd-workflow-workspace/reports/reviews/...-request-review.md`
-- Spec/Plan review: [한줄 요약] → `rd-workflow-workspace/reports/reviews/...-spec-plan-review.md`
+<!-- 모드 B에서 생략된 리뷰는 `생략 (모드 B)`로 표기하고 링크 대신 `-`를 적는다. Final diff review는 모든 모드에서 필수 (링크 생략 불가). 중간 승격 시 Spec/Plan review는 수행되므로 링크를 기록한다. -->
+- REQUEST review: [한줄 요약 | 생략 (모드 B)] → [`rd-workflow-workspace/reports/reviews/...-request-review.md` | -]
+- Spec/Plan review: [한줄 요약 | 생략 (모드 B)] → [`rd-workflow-workspace/reports/reviews/...-spec-plan-review.md` | -]
 - Final diff review: [한줄 요약] → `rd-workflow-workspace/reports/reviews/...-diff-review.md`
 
 ## 실행 메트릭
@@ -231,5 +267,5 @@ compact 후에도 한계에 가까워지면:
 
 ## Rollback
 - 브랜치: `fr/<slug>` (promote.sh 생성)
-- 되돌리기: `bash rd-workflow/scripts/lifecycle/promote_rollback.sh` (main worktree에서 호출 — worktree 제거 + branch 삭제 + task-state fr 필드 reset + loop-guard 카운터 + CURRENT_TASK reset 일괄)
+- 되돌리기: `bash rd-workflow/scripts/lifecycle/promote_rollback.sh` (기본 브랜치 worktree에서 호출 — worktree 제거 + branch 삭제 + task-state fr 필드 reset + loop-guard 카운터 + CURRENT_TASK reset 일괄)
 ```

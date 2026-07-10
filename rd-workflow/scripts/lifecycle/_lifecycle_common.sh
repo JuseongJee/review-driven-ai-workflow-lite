@@ -38,15 +38,42 @@ resolve_unique_ref() {
   printf '%s\n' "$candidate"
 }
 
-# main worktree path 검출 — whitespace-safe full-line extraction
+# 전제: 원격 추적은 origin remote 기준 (refs/remotes/origin/HEAD 조회·origin/ strip).
+# origin 외 remote(upstream 등)만 있는 구성은 미지원 — workflow.json "default_branch" 설정으로 우회.
+# 기본 브랜치 결정 — config(default_branch) → origin/HEAD → main/master 유일 매치 → 에러
+# 빈 config 값("")은 미설정으로 간주하고 다음 체인으로 진행한다.
+# stdout: 브랜치명 1줄. 실패/모호 시 stderr 안내 + return 1.
+get_default_branch() {
+  local cfg="${project_root:-$PWD}/rd-workflow/config/workflow.json"
+  local b=""
+  if [[ -f "$cfg" ]]; then
+    b="$(sed -n 's/.*"default_branch"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" | head -1)"
+  fi
+  if [[ -n "$b" ]]; then printf '%s\n' "$b"; return 0; fi
+  b="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  b="${b#origin/}"
+  if [[ -n "$b" ]]; then printf '%s\n' "$b"; return 0; fi
+  local has_main=0 has_master=0
+  if git show-ref --verify --quiet refs/heads/main 2>/dev/null; then has_main=1; fi
+  if git show-ref --verify --quiet refs/heads/master 2>/dev/null; then has_master=1; fi
+  if (( has_main + has_master == 1 )); then
+    if (( has_main )); then printf 'main\n'; else printf 'master\n'; fi
+    return 0
+  fi
+  printf 'get_default_branch: 기본 브랜치를 결정할 수 없습니다 — rd-workflow/config/workflow.json 에 "default_branch" 를 설정하세요\n' >&2
+  return 1
+}
+
+# main(기본 브랜치) worktree path 검출 — whitespace-safe full-line extraction
 get_main_worktree_path() {
-  local p
-  p="$(git worktree list --porcelain | awk '
+  local b p
+  b="$(get_default_branch)" || return 1
+  p="$(git worktree list --porcelain | awk -v ref="branch refs/heads/$b" '
     /^worktree /{p=$0; sub(/^worktree /,"",p); next}
-    $0=="branch refs/heads/main"{print p; exit}
+    $0==ref{print p; exit}
   ')"
   if [[ -z "$p" ]]; then
-    printf 'get_main_worktree_path: no worktree on refs/heads/main\n' >&2
+    printf 'get_main_worktree_path: no worktree on refs/heads/%s\n' "$b" >&2
     return 1
   fi
   printf '%s\n' "$p"

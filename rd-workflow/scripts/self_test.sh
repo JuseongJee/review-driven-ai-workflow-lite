@@ -258,6 +258,19 @@ autopilot_skill_lifecycle_check() {
   return $rc
 }
 
+plan_parallel_phase_check() {
+  local root guide skill
+  root="$(cd "$SCRIPT_DIR/../.." && pwd)"
+  guide="$root/rd-workflow/docs/guides/plan-parallel-phases.md"
+  skill="$root/rd-workflow/claude_skills/autopilot/SKILL.md"
+  [[ -f "$guide" ]] || { echo "  누락: plan-parallel-phases.md"; return 1; }
+  grep -q "phase 비중첩" "$guide" || { echo "  가이드에 phase 비중첩 게이트 누락"; return 1; }
+  grep -q "mechanical" "$guide" || { echo "  가이드에 mechanical 규약 누락"; return 1; }
+  grep -q "phase 병렬 실행" "$skill" || { echo "  autopilot SKILL에 phase 병렬 실행 규칙 누락"; return 1; }
+  grep -q "mechanical" "$skill" || { echo "  autopilot SKILL에 mechanical 리뷰 생략 누락"; return 1; }
+  echo "  OK: phase 병렬 규약 문서 정합"
+}
+
 # adapter 폴링 잔존 회귀 grep: POLL_INTERVAL이 adapter_codex.sh·adapter_claude.sh에 없으면 PASS
 adapter_poll_regression_check() {
   local rc=0
@@ -285,6 +298,7 @@ run_step "install_claude_skills 단위 테스트" bash "${SCRIPT_DIR}/test_insta
 run_step "lifecycle 단위 테스트 (test_lifecycle.sh)" bash "${SCRIPT_DIR}/lifecycle/test_lifecycle.sh"
 run_step "lifecycle 통합 테스트 (test_integration.sh)" bash "${SCRIPT_DIR}/lifecycle/test_integration.sh"
 run_step "review 대기 계약 테스트 (test_review_wait.sh)" bash "${SCRIPT_DIR}/test_review_wait.sh"
+run_step "sync_template 타입 가드 테스트 (test_sync_template.sh)" bash "${SCRIPT_DIR}/test_sync_template.sh"
 pre_commit_verify_test_check() {
   local t="${SCRIPT_DIR}/hooks/test_pre_commit_verify.sh"
   if [[ -f "$t" ]]; then bash "$t"; else echo "  (skip: test_pre_commit_verify.sh 없음 — lite 산출물)"; fi
@@ -293,6 +307,7 @@ run_step "pre_commit_verify 테스트 (test_pre_commit_verify.sh)" pre_commit_ve
 run_step "adapter 폴링 잔존 회귀 (POLL_INTERVAL 없음)" adapter_poll_regression_check
 run_step "스크립트 구문 검사 (bash -n)" syntax_check
 run_step "autopilot SKILL lifecycle 정합 (promote/rollback 일원화)" autopilot_skill_lifecycle_check
+run_step "phase 병렬 규약 문서 정합 (plan_parallel_phase_check)" plan_parallel_phase_check
 
 # 템플릿 dev repo 한정: build 규칙 정합성·루트 drift 검증 (설치본에는 빌더 없음 → skip)
 # self_test.sh 위치는 <root>/rd-workflow/scripts/ 이므로 dev 빌더는 두 단계 위 scripts/

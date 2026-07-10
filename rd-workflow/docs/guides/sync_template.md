@@ -44,6 +44,10 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
   - 사용자에게 "현재 프로젝트의 템플릿이 원격보다 최신입니다. 강제로 다운그레이드하시겠습니까?" 확인
   - 사용자가 동의하면 `--force`를 붙여 재실행
   - 사용자가 거부하면 동기화 중단
+- 스크립트가 템플릿 타입 불일치 또는 타입 미확정으로 중단(exit 1)하면:
+  - 1차 대응: 배포 repo URL이 현재 프로젝트의 템플릿 타입(full/lite)과 맞는지 확인합니다. URL 혼동이면 올바른 URL로 재실행합니다.
+  - 교차 sync 사고로 로컬 VERSION이 오염된 프로젝트의 복구처럼 의도한 교차 적용일 때만, 사용자에게 위험(현재 타입 전용 파일이 삭제 후보로 분류될 수 있음)을 안내하고 동의를 받은 뒤 `--allow-type-mismatch`를 붙여 재실행합니다. 이 플래그는 타입 불일치·미확정 케이스에서만 효력이 있고(해당 시 버전 비교도 생략), 타입이 일치하면 효과 없이 기존 버전 가드가 그대로 적용됩니다.
+  - `--force`는 타입 불일치를 우회하지 못합니다 (같은 타입 내 다운그레이드 승인 전용).
 
 배포 repo URL을 모르면 사용자에게 물어봅니다.
 
@@ -76,6 +80,7 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 - `rd-workflow/config/review-tools.json` (프로젝트별 리뷰 도구 설정, `.example`은 동기화 대상)
 - `rd-workflow/config/verification.json` (프로젝트별 검증 설정, `.example`은 동기화 대상)
 - `rd-workflow/config/extensions.json` (설치된 extension 이력, `.example`은 동기화 대상)
+- extension으로 설치된 스킬 `rd-workflow/claude_skills/<name>/` — `<name>`이 `rd-workflow/extensions/`의 extension 디렉토리 이름 또는 `extensions.json` 기재 항목과 일치하는 경우 (예: verify, design-review). extension 스킬 원본은 템플릿의 `extensions/`에 있고 clone의 `claude_skills/`에는 없어 삭제 후보 정의에 걸리지만, 삭제하면 8단계에서 미설치로 재판정되어 불필요한 재설치 질문이 발생하므로 보존한다 (최신본 갱신은 8단계 자동 재설치가 담당)
 - 프로젝트 고유 설정 파일 (`.gitignore`, `.swiftlint.yml`, `.claude/` 등)
   - 단, `.claude/settings.json`의 hook 등록 목록과 `.gitignore`의 워크플로 관리 라인은 M003 마이그레이션이 **부재 항목만 추가**하고, 템플릿 유래 stale hook 등록(존재하지 않는 스크립트를 가리키는 항목)은 M005 마이그레이션이 제거합니다 (통째 동기화 아님 — 4단계 참조)
 
@@ -488,9 +493,9 @@ capture 본문은 입력 원문이라 token / API key / password 가 포함될 �
    - 협업 repo 라면 모든 collaborator 가 fresh clone 필요 (force push 후 기존 clone 무효화)
 4. **GitHub Secret Scanning** 활성화하여 향후 자동 감지.
 
-4. **legacy capture frontmatter 변환** (예: photos-image-filter 가 프로토타입에서 sync 받는 경우):
+3. **legacy capture frontmatter 변환** (구 형식 `fr-title` frontmatter 의 capture 가 있는 프로젝트):
 
-   **Step 4-a: `fr-title` → `short-title` 자동 변환** (macOS BSD sed 기준):
+   **Step 3-a: `fr-title` → `short-title` 자동 변환** (macOS BSD sed 기준):
    ```bash
    # macOS BSD sed: sed -i ''
    # GNU sed (Linux): sed -i (빈 인수 없이)
@@ -500,9 +505,9 @@ capture 본문은 입력 원문이라 token / API key / password 가 포함될 �
        done
    ```
 
-   **Step 4-b: `stage` 필드 추가** (수동 검토 후 적용 권장):
+   **Step 3-b: `stage` 필드 추가** (수동 검토 후 적용 권장):
 
-   legacy 캡처가 `photos-image-filter` 프로토타입 출처이면 모두 `stage: fr` 이므로 아래 명령으로 일괄 삽입 가능. 다른 출처이거나 여러 stage 가 혼재할 경우 수동 편집 필수.
+   legacy capture 가 모두 FR 등록 시점 생성분이면 (구 형식은 fr stage capture 만 생성) 아래 명령으로 `stage: fr` 일괄 삽입 가능. 여러 stage 가 혼재하거나 출처가 불분명하면 수동 편집 필수.
 
    ```bash
    # stage 필드가 없는 파일에 short-title 라인 직후 stage: fr 삽입 (macOS BSD sed 기준)
@@ -520,7 +525,7 @@ capture 본문은 입력 원문이라 token / API key / password 가 포함될 �
 
    본 변환은 신 형식만 인식하는 runtime 코드와 호환을 맞춘다. runtime 호환 코드는 추가하지 않으므로 변환 누락 시 신 코드가 구 캡처를 인식 못 한다.
 
-5. **`CURRENT_TASK.md` 에 `## Short Title` 섹션 추가** (default 값 `-`).
+4. **`CURRENT_TASK.md` 에 `## Short Title` 섹션 추가** (default 값 `-`).
 
 ### 기존 raw-captures 권한 보정
 

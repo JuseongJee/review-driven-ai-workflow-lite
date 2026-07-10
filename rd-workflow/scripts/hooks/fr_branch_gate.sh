@@ -31,12 +31,18 @@ if [[ "$cmd" =~ (^|[\;\&\|\(\)][[:space:]]*)(env[[:space:]]+)?RD_LIFECYCLE_BYPAS
   exit 0
 fi
 
+# 기본 브랜치 결정 — resolver 실패 시 main fallback (guard는 커밋을 오차단하지 않도록 보수적)
+DEFAULT_BRANCH="main"
+if source "${project_root}/rd-workflow/scripts/lifecycle/_lifecycle_common.sh" 2>/dev/null; then
+  if _db="$(get_default_branch 2>/dev/null)" && [[ -n "$_db" ]]; then DEFAULT_BRANCH="$_db"; fi
+fi
+
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
 
 case "$CURRENT_BRANCH" in
   fr/*) exit 0 ;;
-  main)
-    printf '%s\n' "[fr_branch_gate] main 직접 commit 은 면제 reason 명시 필요." >&2
+  "$DEFAULT_BRANCH")
+    printf '%s\n' "[fr_branch_gate] ${DEFAULT_BRANCH} 직접 commit 은 면제 reason 명시 필요." >&2
     printf '%s\n' "  사용법: RD_LIFECYCLE_BYPASS_REASON=<reason> git commit ..." >&2
     printf '%s\n' "  valid reason: bootstrap | lifecycle | small-task | legacy" >&2
     exit 2

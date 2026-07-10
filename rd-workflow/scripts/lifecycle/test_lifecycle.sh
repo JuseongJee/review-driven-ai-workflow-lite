@@ -674,5 +674,56 @@ if [ ! -f "$SR_INT/CLAUDE_WAS_CALLED" ]; then PASS=$((PASS+1)); echo "  PASS: fa
   else FAIL=$((FAIL+1)); echo "  FAIL: claude adapter 실행됨" >&2; fi
 rm -rf "$SR_INT"
 
+# === get_default_branch resolver (lifecycle-default-branch-generalize) ===
+echo "== get_default_branch resolver =="
+GDB_TMP="$(mktemp -d)"
+make_gdb_repo() {  # <dir> <initial-branch>
+  local d="$1" b="$2"
+  mkdir -p "$d"
+  ( cd "$d" && { git init -q -b "$b" 2>/dev/null || { git init -q; git checkout -q -b "$b"; }; } \
+    && git config user.email t@example.com && git config user.name t \
+    && git commit -q --allow-empty -m init )
+}
+gdb_in() { ( cd "$1" && unset project_root && get_default_branch 2>/dev/null ); }
+
+# case 1: config 최우선 (브랜치 실존 여부와 무관하게 config 값 채택)
+R="$GDB_TMP/c1"; make_gdb_repo "$R" main
+mkdir -p "$R/rd-workflow/config"
+printf '{\n  "default_branch": "trunk"\n}\n' > "$R/rd-workflow/config/workflow.json"
+assert_eq "$(gdb_in "$R")" "trunk" "config default_branch 최우선"
+
+# case 2: 빈 config 값("")은 미설정 — 다음 체인 진행 (master 유일 매치)
+R="$GDB_TMP/c2"; make_gdb_repo "$R" master
+mkdir -p "$R/rd-workflow/config"
+printf '{\n  "default_branch": ""\n}\n' > "$R/rd-workflow/config/workflow.json"
+assert_eq "$(gdb_in "$R")" "master" "빈 config 값 → 자동 검출 fallthrough"
+
+# case 3: origin/HEAD 검출
+R="$GDB_TMP/c3"; make_gdb_repo "$R" main
+( cd "$R" && git update-ref refs/remotes/origin/devel HEAD \
+  && git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/devel )
+assert_eq "$(gdb_in "$R")" "devel" "origin/HEAD 검출"
+
+# case 4: 로컬 유일 매치 (master만 존재)
+R="$GDB_TMP/c4"; make_gdb_repo "$R" master
+assert_eq "$(gdb_in "$R")" "master" "main/master 유일 매치"
+
+# case 5: 모호 (main+master 동시 존재) → 에러
+R="$GDB_TMP/c5"; make_gdb_repo "$R" main
+( cd "$R" && git branch master )
+if gdb_in "$R" >/dev/null; then FAIL=$((FAIL+1)); echo "  FAIL: 모호 케이스에서 성공 반환" >&2; \
+  else PASS=$((PASS+1)); echo "  PASS: main/master 동시 존재 시 에러"; fi
+
+# case 6: 후보 전무 → 에러
+R="$GDB_TMP/c6"; make_gdb_repo "$R" work
+if gdb_in "$R" >/dev/null; then FAIL=$((FAIL+1)); echo "  FAIL: 후보 전무에서 성공 반환" >&2; \
+  else PASS=$((PASS+1)); echo "  PASS: 후보 전무 시 에러"; fi
+
+# get_main_worktree_path 일반화: master 유일 repo에서 해당 worktree path 반환
+R="$GDB_TMP/c7"; make_gdb_repo "$R" master
+assert_eq "$( cd "$R" && get_main_worktree_path )" "$( cd "$R" && pwd -P )" "get_main_worktree_path master 일반화"
+
+rm -rf "$GDB_TMP"
+
 echo "== 결과: PASS=$PASS FAIL=$FAIL =="
 [[ $FAIL -eq 0 ]]

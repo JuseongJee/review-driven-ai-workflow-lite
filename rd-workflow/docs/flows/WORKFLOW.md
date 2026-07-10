@@ -73,6 +73,8 @@ Design Reference가 있으면 추천. 없어도 에러/엣지 케이스 점검 �
 FR 승격 시 `bash rd-workflow/scripts/lifecycle/promote.sh` 호출로 fr branch를 생성한다.
 rollback이 필요하면 `bash rd-workflow/scripts/lifecycle/promote_rollback.sh`로 abandon 가능.
 
+autopilot 실행 시 이 분기는 실행 모드 선택으로 나타난다 — 모드 A(정식 절차 전부) / 모드 B(small-task 경로). 모드는 autopilot이 추천하고 사용자가 결정하며, 사용자의 모드 B 선택이 곧 명시적 small-task 지정이다. 상세는 `rd-workflow/claude_skills/autopilot/SKILL.md`의 "실행 모드" 참조.
+
 ## REQUEST 아카이브
 
 작업이 완료되면 현재 `REQUEST.md`를 `rd-workflow-workspace/backlog/request-archive/`에 보관합니다.

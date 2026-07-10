@@ -94,6 +94,8 @@ t "허용 전이: 대기 중→구현 중 (small-task)" 0 "-" bash "$RD" task se
 mk_task_file "$TMP" "구현 중" "x"
 t "차단 전이: 구현 중→완료" 4 "-" bash "$RD" task set-status "완료"
 t "차단 후 Status 불변" 0 "구현 중" bash "$RD" task status
+mk_task_file "$TMP" "구현 중" "x"
+t "승격 전이: 구현 중→spec/plan 작성 중 허용 (모드 B→A 중간 승격)" 0 "-" bash "$RD" task set-status "spec/plan 작성 중"
 t "force 우회" 0 "-" bash "$RD" task set-status "완료" --force
 mk_task_file "$TMP" "구현 중" "x"
 t "비허용 값 거부" 4 "-" bash "$RD" task set-status "이상한 값"
@@ -109,7 +111,7 @@ mk_task_file "$TMP" "실행 중" "x"
 t "alias 실행 중→완료 차단 (task-state='구현 중')" 4 "-" bash "$RD" task set-status "완료"
 
 # 전이표 전수 (8×8): 허용 목록 외 전부 차단인지 기계 검증
-ALLOWED="대기 중→REQUEST review 대기|대기 중→구현 중|REQUEST review 대기→spec/plan 작성 중|spec/plan 작성 중→spec/plan review 대기|spec/plan review 대기→spec/plan 작성 중|spec/plan review 대기→구현 중|구현 중→검증 중|검증 중→구현 중|검증 중→diff review 대기|diff review 대기→구현 중|diff review 대기→완료"
+ALLOWED="대기 중→REQUEST review 대기|대기 중→구현 중|REQUEST review 대기→spec/plan 작성 중|spec/plan 작성 중→spec/plan review 대기|spec/plan review 대기→spec/plan 작성 중|spec/plan review 대기→구현 중|구현 중→spec/plan 작성 중|구현 중→검증 중|검증 중→구현 중|검증 중→diff review 대기|diff review 대기→구현 중|diff review 대기→완료"
 STATUSES=("대기 중" "REQUEST review 대기" "spec/plan 작성 중" "spec/plan review 대기" "구현 중" "검증 중" "diff review 대기" "완료")
 for from in "${STATUSES[@]}"; do
   for to in "${STATUSES[@]}"; do

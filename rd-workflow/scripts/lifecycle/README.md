@@ -26,7 +26,7 @@ FR 작업의 git 라이프사이클 — branch 생성 → 작업 → main merge 
 | `detect_remote_mode` | `remote` / `local-only` 판정 (`RD_LIFECYCLE_NO_REMOTE` env로 강제 가능) |
 | `ensure_worktree_clean` | 현재 worktree dirty 여부 (return 0/1) |
 | `resolve_unique_ref <branch\|tag> <base>` | 충돌 시 `-N` suffix 자동 부여 |
-| `get_main_worktree_path` | main worktree 절대 경로 (없으면 return 1) |
+| `get_main_worktree_path` | 기본 브랜치 worktree 절대 경로 (없으면 return 1) |
 | `metadata_read_field` | `task-state` 파일(`TASK_STATE_PATH`) 필드 읽기 |
 | `metadata_write` | `task-state` 파일 필드 쓰기 |
 | `metadata_clear` | `task-state` fr 필드 reset (`fr-branch=null` 등 sentinel 복원 — 파일 삭제 아님) |
@@ -48,7 +48,7 @@ bash rd-workflow/scripts/lifecycle/promote.sh \
   [--dry-run]
 ```
 
-**호출 시점:** FR 등록 main commit **직후**. 호출 위치는 main worktree.
+**호출 시점:** FR 등록 기본 브랜치 commit **직후**. 호출 위치는 기본 브랜치 worktree.
 
 ### `archive.sh`
 
@@ -65,7 +65,7 @@ bash rd-workflow/scripts/lifecycle/archive.sh \
   [--dry-run]
 ```
 
-**호출 위치:** main worktree only.
+**호출 위치:** 기본 브랜치 worktree only.
 호출 전에 fr branch에서 archive content commit
 (REQUEST.md 비우기, archive 파일, FR done, CURRENT_TASK.md reset 등) 완료해야 함.
 
@@ -82,7 +82,7 @@ bash rd-workflow/scripts/lifecycle/promote_rollback.sh \
   [--dry-run]
 ```
 
-**호출 위치:** main worktree only.
+**호출 위치:** 기본 브랜치 worktree only.
 
 ---
 

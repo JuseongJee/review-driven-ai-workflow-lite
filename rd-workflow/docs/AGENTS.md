@@ -36,7 +36,7 @@ git merge --no-ff fr/기능명
 review_pipeline 세션의 `SESSION.md`에는 `## Branch Context` 섹션(5필드)을 보존한다:
 
 - `fr-branch`: 현재 작업 중인 fr/{slug} 브랜치 이름 (null 또는 main 가능)
-- `worktree-path`: worktree 절대 경로 (null이면 main worktree)
+- `worktree-path`: worktree 절대 경로 (null이면 기본 브랜치 worktree)
 - `short-title`: fr branch의 slug 식별자 (unknown이면 미확정)
 - `lifecycle-stage`: 현재 lifecycle 단계 (request-review / spec-review / plan-review / implementing / validating / archive-pending / archived)
 - `remote-mode`: remote 또는 local-only

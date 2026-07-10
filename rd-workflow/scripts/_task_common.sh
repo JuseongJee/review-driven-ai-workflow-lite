@@ -48,6 +48,7 @@ assert_no_symlink_in_path() {
 }
 
 # LC-19/21: 상태 전이표 — 단일 출처 (spec §5). 모든 상태→'대기 중'은 중단/rollback 경로(LC-14).
+# '구현 중→spec/plan 작성 중'은 autopilot 모드 B→A 중간 승격 경로 (autopilot SKILL.md "실행 모드" 참조).
 task_transition_allowed() {
   local from="$1" to="$2"
   [[ "$to" == "대기 중" ]] && return 0
@@ -56,6 +57,7 @@ task_transition_allowed() {
     "REQUEST review 대기→spec/plan 작성 중"|\
     "spec/plan 작성 중→spec/plan review 대기"|\
     "spec/plan review 대기→spec/plan 작성 중"|"spec/plan review 대기→구현 중"|\
+    "구현 중→spec/plan 작성 중"|\
     "구현 중→검증 중"|"검증 중→구현 중"|"검증 중→diff review 대기"|\
     "diff review 대기→구현 중"|"diff review 대기→완료") return 0 ;;
   esac

@@ -21,13 +21,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Step 0 — main worktree 검증
-MAIN_WT="$(get_main_worktree_path)" || { printf 'archive: main worktree 검출 실패\n' >&2; exit 1; }
+# Step 0 — 기본 브랜치 worktree 검증
+MAIN_WT="$(get_main_worktree_path)" || { printf 'archive: 기본 브랜치 worktree 검출 실패\n' >&2; exit 1; }
 CURRENT_WT="$(git rev-parse --show-toplevel)" || {
   printf 'archive: git repo 외부에서 실행 불가\n' >&2; exit 1
 }
 if [[ "$MAIN_WT" != "$CURRENT_WT" ]]; then
-  printf 'archive: main worktree에서만 호출 가능. main worktree path: %s\n' "$MAIN_WT" >&2; exit 1
+  DB="$(get_default_branch)"
+  printf 'archive: 기본 브랜치(%s) worktree에서만 호출 가능. 해당 worktree path: %s\n' "$DB" "$MAIN_WT" >&2; exit 1
 fi
 
 # Step 0 — clean state (unless --force-dirty)
@@ -148,7 +149,8 @@ fi
 
 # Step 6 — Remote publish (blocking)
 if [[ "$REMOTE_MODE" == "remote" ]]; then
-  git push origin main || { printf 'archive: main push 실패 — 재실행으로 복구\n' >&2; exit 1; }
+  DEFAULT_BRANCH="$(get_default_branch)" || { printf 'archive: 기본 브랜치 결정 실패 — push 중단\n' >&2; exit 1; }
+  git push origin "$DEFAULT_BRANCH" || { printf 'archive: %s push 실패 — 재실행으로 복구\n' "$DEFAULT_BRANCH" >&2; exit 1; }
   git push origin "$TARGET_TAG" || { printf 'archive: tag push 실패 — 재실행으로 복구\n' >&2; exit 1; }
 fi
 

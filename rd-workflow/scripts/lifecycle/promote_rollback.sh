@@ -14,11 +14,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# main worktree 검증
-MAIN_WT="$(get_main_worktree_path)" || { printf 'rollback: main worktree 검출 실패\n' >&2; exit 1; }
+# 기본 브랜치 worktree 검증
+MAIN_WT="$(get_main_worktree_path)" || { printf 'rollback: 기본 브랜치 worktree 검출 실패\n' >&2; exit 1; }
 CURRENT_WT="$(git rev-parse --show-toplevel)" || { printf 'rollback: git repo 외부에서 실행 불가\n' >&2; exit 1; }
 if [[ "$MAIN_WT" != "$CURRENT_WT" ]]; then
-  printf 'rollback: main worktree에서 호출하세요. main worktree path: %s\n' "$MAIN_WT" >&2; exit 1
+  DB="$(get_default_branch)"
+  printf 'rollback: 기본 브랜치(%s) worktree에서 호출하세요. 해당 worktree path: %s\n' "$DB" "$MAIN_WT" >&2; exit 1
 fi
 
 # FR identity 결정 — --fr-branch > metadata

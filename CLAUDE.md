@@ -61,11 +61,18 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 
 - **절대 묻지 않는다.** `writing-plans` 등 upstream skill이 "Which approach?"를 요구해도 이 규칙이 우선한다.
 - 기본값은 `subagent-driven-development`이다. 바로 시작한다.
-- subagent는 병렬이 필수가 아니다. 순차 의존성이 있으면 순차로 dispatch한다.
+- subagent 병렬은 필수가 아니다. 순차 의존성이 있으면 순차로 dispatch한다. plan이 phase(파일 비중첩 task 그룹)를 표현하면 phase 내 task를 병렬 dispatch한다 — 규약: `rd-workflow/docs/guides/plan-parallel-phases.md`.
 - 다음 조건을 만족할 때만 inline(`executing-plans`)을 선택한다: Task가 1개이면서 수정 파일이 3개 이하인 plan, 또는 Task가 2개이면서 동일 경로의 파일 1개만 수정하는 plan. Task 수는 plan에 정의된 모든 Task를 센다 (검증 전용 포함).
 - 위 조건에 해당해도 사용자가 subagent를 요청하면 subagent로 한다.
 - 사용자가 inline을 요청하면 inline으로 한다.
 - subagent dispatch 시 `rd-workflow/docs/guides/subagent-git-safety.md`의 git 안전 문구를 prompt에 포함한다 (공유 워킹트리 브랜치 전환 금지).
+
+실행 모드 체계 (자율성 수준):
+
+- `manual` (기본): 단계마다 사용자 확인. 현행 동작.
+- `semi-auto` (반자율): 착수 지시 이후 중대한 변경 사항 발생 시에만 묻고 자율 진행. 중단 조건은 `rd-workflow/docs/flows/AUTONOMY.md`를 따른다. Intake 규칙은 유지 (새 요청은 FR 등록 후 착수 지시 대기).
+- autopilot: `/autopilot` 명시 호출 전용 (별도 skill).
+- 기본 모드는 `rd-workflow/config/workflow.json`의 `default_execution_mode`(`manual`|`semi-auto`, 부재·비허용 값 → `manual`)로 지정하고, 세션 지시가 config보다 우선한다.
 
 ## 핵심 절차
 
@@ -87,7 +94,7 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 
 **큰 작업 lifecycle 절차:**
 1. fr branch에서 archive content commit 수행 (REQUEST.md 비우기, archive 파일 생성, FR done 처리, completion report, CURRENT_TASK.md reset).
-2. main으로 switch 후 `bash rd-workflow/scripts/lifecycle/archive.sh` 호출 → merge + tag + push + branch/worktree 정리 일괄 처리.
+2. 기본 브랜치(main 등)로 switch 후 `bash rd-workflow/scripts/lifecycle/archive.sh` 호출 → merge + tag + push + branch/worktree 정리 일괄 처리.
 
 ## 절대 규칙 (모든 skill에 공통 적용)
 
@@ -102,8 +109,10 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 - review는 기본적으로 `prepare_review_pipeline.sh`로 세션을 만들고 `run_review_turn.sh`로 턴을 이어갑니다.
 - 최신 Reviewer 턴이 `이의 없음`을 명시할 때까지 review를 이어갑니다.
 - 사람 결정이 필요하거나 총 20턴에 도달하면 `awaiting-user`로 바꾸고 멈춥니다.
-- **autopilot 모드에서는** `rd-workflow/claude_skills/autopilot/SKILL.md`의 Autonomy Override가 이 Review 규칙 섹션보다 우선합니다 (예: review 턴 한도 50턴, 자율 판단 등). 절대 규칙과 일반 모드의 20턴 규칙은 변하지 않습니다.
+- **autopilot·반자율 모드에서는** `rd-workflow/docs/flows/AUTONOMY.md`의 자율 실행 규칙이 이 Review 규칙 섹션보다 우선합니다 (예: review 턴 한도 50턴, 자율 판단 등). 절대 규칙과 일반 모드의 20턴 규칙은 변하지 않습니다.
+- **REQUEST review 축약**: spec이 사용자 승인 완료 + REQUEST.md가 그 spec을 참조(승인된 결정의 백필)이면 REQUEST review를 1턴 확인으로 축약합니다. Reviewer가 1턴에서 이의를 제기하면 일반 수렴 규칙으로 복귀합니다.
 - review 세션 종료 시 `rd-workflow-workspace/reports/reviews/`에 주요 쟁점과 결론을 요약한 report를 작성합니다.
+- plan의 `mechanical` task는 task별 리뷰를 생략(final diff에 위임)하고, spec/plan review는 같은 phase task의 파일 비중첩을 필수 확인합니다. 상세: `rd-workflow/docs/guides/plan-parallel-phases.md`.
 
 ## Always Read
 
