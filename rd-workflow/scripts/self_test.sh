@@ -258,6 +258,23 @@ autopilot_skill_lifecycle_check() {
   return $rc
 }
 
+# 무인 진입 계약 정합: SKILL.md 무인 섹션 마커 + wrapper 존재.
+autopilot_headless_entry_check() {
+  local rc=0 skill
+  for skill in \
+    "${SCRIPT_DIR}/../claude_skills/autopilot/SKILL.md" \
+    "${SCRIPT_DIR}/../../_ROOT_FILES/rd-workflow/claude_skills/autopilot/SKILL.md"; do
+    [[ -f "$skill" ]] || continue
+    grep -q 'RD_AUTOPILOT_FR' "$skill"           || { echo "  $skill: RD_AUTOPILOT_FR 미참조" >&2; rc=1; }
+    grep -q 'RD_AUTOPILOT_OUTCOME_FILE' "$skill"  || { echo "  $skill: RD_AUTOPILOT_OUTCOME_FILE 미참조" >&2; rc=1; }
+    grep -q 'queue-empty' "$skill"                || { echo "  $skill: queue-empty 미참조" >&2; rc=1; }
+    grep -q 'blocked:' "$skill"                   || { echo "  $skill: blocked:<reason> 미참조" >&2; rc=1; }
+  done
+  local wrapper="${SCRIPT_DIR}/autopilot_headless.sh"
+  [[ -f "$wrapper" ]] || { echo "  autopilot_headless.sh 부재" >&2; rc=1; }
+  return $rc
+}
+
 plan_parallel_phase_check() {
   local root guide skill
   root="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -298,6 +315,10 @@ run_step "install_claude_skills 단위 테스트" bash "${SCRIPT_DIR}/test_insta
 run_step "lifecycle 단위 테스트 (test_lifecycle.sh)" bash "${SCRIPT_DIR}/lifecycle/test_lifecycle.sh"
 run_step "lifecycle 통합 테스트 (test_integration.sh)" bash "${SCRIPT_DIR}/lifecycle/test_integration.sh"
 run_step "review 대기 계약 테스트 (test_review_wait.sh)" bash "${SCRIPT_DIR}/test_review_wait.sh"
+run_step "ralph_drain supervisor 테스트 (test_ralph_drain.sh)" bash "${SCRIPT_DIR}/test_ralph_drain.sh"
+run_step "batch_manifest 헬퍼 테스트 (batch/test_batch_manifest.sh)" bash "${SCRIPT_DIR}/batch/test_batch_manifest.sh"
+run_step "blocked status 어휘 일관성 (test_fr_blocked_status.sh)" bash "${SCRIPT_DIR}/test_fr_blocked_status.sh"
+run_step "autopilot blocked 계약 회귀 (test_autopilot_blocked_contract.sh)" bash "${SCRIPT_DIR}/test_autopilot_blocked_contract.sh"
 run_step "sync_template 타입 가드 테스트 (test_sync_template.sh)" bash "${SCRIPT_DIR}/test_sync_template.sh"
 pre_commit_verify_test_check() {
   local t="${SCRIPT_DIR}/hooks/test_pre_commit_verify.sh"
@@ -307,6 +328,8 @@ run_step "pre_commit_verify 테스트 (test_pre_commit_verify.sh)" pre_commit_ve
 run_step "adapter 폴링 잔존 회귀 (POLL_INTERVAL 없음)" adapter_poll_regression_check
 run_step "스크립트 구문 검사 (bash -n)" syntax_check
 run_step "autopilot SKILL lifecycle 정합 (promote/rollback 일원화)" autopilot_skill_lifecycle_check
+run_step "무인 진입 계약 정합 (autopilot_headless_entry_check)" autopilot_headless_entry_check
+run_step "무인 wrapper 매핑 테스트 (test_autopilot_headless.sh)" bash "${SCRIPT_DIR}/test_autopilot_headless.sh"
 run_step "phase 병렬 규약 문서 정합 (plan_parallel_phase_check)" plan_parallel_phase_check
 
 # 템플릿 dev repo 한정: build 규칙 정합성·루트 drift 검증 (설치본에는 빌더 없음 → skip)

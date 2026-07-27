@@ -66,6 +66,7 @@
 - 입력이 너무 짧아서 summary를 만들 수 없으면 한 줄 질문으로 보충을 요청한다.
 - FUTURE_REQUESTS.md의 기존 형식(테이블 구조, 상태 값)을 변경하지 않는다.
 - 이 subcommand는 FR 등록만 한다. REQUEST.md 작성이나 구현은 하지 않는다.
+- 등록 대상이 rd-workflow 인프라 자체의 결함이면(소비 프로젝트 한정) FR로 등록하지 않고 `rd-workflow/docs/guides/workflow-defect-reporting.md` 규약(보고 파일 생성)을 따른다.
 - GitHub 연동 시 Issue 생성 실패가 로컬 FR 등록을 막지 않는다.
 
 ### GitHub 연동

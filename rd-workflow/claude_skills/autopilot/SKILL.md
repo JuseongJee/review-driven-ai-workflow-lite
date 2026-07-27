@@ -113,6 +113,54 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 �
 - 승격은 단방향이다 (모드 A → B 강등 없음).
 - 승격 사실과 사유를 최종 보고서 "주요 결정" 테이블에 기록한다.
 
+## 무인 진입 (headless / unattended)
+
+`claude -p` 헤드리스에서 사람 개입 없이 autopilot 을 완주시키는 비대화형 진입 경로다. 두 front-end(ralph 무인 큐 드레인 · batch 큐레이션 묶음)가 공통으로 이 경로를 통해 진입하며, 얇은 wrapper `rd-workflow/scripts/autopilot_headless.sh` 가 진입점이다. front-end A(ralph 무인 큐 드레인)의 진입점은 supervisor 스크립트 `rd-workflow/scripts/ralph_drain.sh` 다 — wrapper 를 `RD_AUTOPILOT_FR=auto` 로 반복 호출해 준비된 큐를 소진하고, exit code(0/10/20/30/40)만 보고 계속/중단하며 blocked FR 은 위 status=blocked 처리로 자동 제외된다. 오케스트레이션 지능은 넣지 않는다.
+
+### 활성화 신호
+
+- 환경변수 `RD_AUTOPILOT_FR` 이 설정되어 있으면 무인 분기로 동작한다. unset 이면 기존 대화형 분기(§1 AskUserQuestion)로 동작한다 (기존 동작 불변).
+- 무인 분기에서는 §1 작업선택·모드선택의 `AskUserQuestion` 호출을 전면 금지한다. 헤드리스에는 AskUserQuestion 도구가 존재하지 않으므로, 반드시 환경변수로 대체한다.
+
+### 환경변수 계약
+
+| 변수 | 값 | 역할 |
+|------|-----|------|
+| `RD_AUTOPILOT_FR` | `<slug>` \| `auto` | 존재=무인 활성화. `<slug>`=명시 FR, `auto`=priority 자동선택 |
+| `RD_AUTOPILOT_MODE` | `A` \| `B` | 기본 `A`. 이 변수가 곧 "명시적 모드 지정"(모드 B 조건 충족) |
+| `RD_FINISH_POLICY` | `push` \| `merge` \| `none` | 미지정 시 `push`. `push`=정규 archive.sh 전체, `merge`=로컬 merge+tag(push 생략), `none`=fr branch 커밋만 |
+| `RD_AUTOPILOT_OUTCOME_FILE` | 경로 | outcome 기록 대상. wrapper 가 설정해 주입 (기본 `rd-workflow-workspace/.autopilot-outcome`) |
+
+### 무인 분기 작업 선택 (§1 게이트 대체)
+
+1. **resume 우선**: `CURRENT_TASK.md` 에 미완 작업(Status ≠ `대기 중` 그리고 Short Title ≠ `-`)이 있으면 그 FR 을 재개한다 (§5 재사용). `RD_AUTOPILOT_FR` 이 다른 slug 를 가리켜도 resume 이 우선하며, 불일치는 outcome 요약에 한 줄 남긴다.
+2. else `RD_AUTOPILOT_FR=<slug>` → 그 FR 을 선택한다.
+3. else `RD_AUTOPILOT_FR=auto` → validated / ready-for-request 후보에서 priority 자동선택한다 (§1 정렬 규칙: P1→P2→P3→unranked, 동순위 날짜 오름차순).
+4. else (auto 인데 후보 없음) → outcome `queue-empty` 기록 후 종료한다.
+
+모드는 `RD_AUTOPILOT_MODE`(기본 A)로 정한다. 이 두 게이트 이후부터는 AUTONOMY.md 자율 규칙을 그대로 적용한다.
+
+### outcome 기록 (종료 신호)
+
+무인 분기에서는 종료 시 반드시 `$RD_AUTOPILOT_OUTCOME_FILE`(미설정 시 `rd-workflow-workspace/.autopilot-outcome`) 의 첫 줄에 아래 토큰 하나를 기록한다. wrapper 가 이를 exit code 로 매핑한다.
+
+| outcome 토큰 | 의미 |
+|--------------|------|
+| `completed` | FR 완료 + `RD_FINISH_POLICY` 대로 archive 수행 |
+| `resume` | 세션 한계 도달, CURRENT_TASK 저장, 잔여 작업 있음 |
+| `blocked:<reason>` | AUTONOMY 중단조건 도달. `<reason>` 은 하이픈 식별자(예: `review-50turn`, `debug-3fail`, `loop-guard`, `human-decision`) |
+| `queue-empty` | auto-pick 후보 없음 |
+
+### 중단조건 → blocked 매핑 (무인 특화)
+
+무인 모드에서는 사람을 기다릴 수 없다. AUTONOMY.md 중단조건(review 50턴 / 디버깅 3회 / loop-guard / 본질적 사람 결정 / 판단 근거 없음)에 도달하면, "awaiting-user 로 멈춰 대기" 하는 대신 아래를 수행하고 종료한다:
+
+1. `blocked:<reason>` outcome 을 `$RD_AUTOPILOT_OUTCOME_FILE` 에 기록한다.
+2. 해당 FR 의 status 를 `blocked` 로 기록한다 (FUTURE_REQUESTS.md 인덱스 status 컬럼 + `items/` 상세 파일 status, 상세에 중단 사유 한 줄 병기). auto-pick 화이트리스트(validated/ready-for-request)가 이 FR 을 자동 제외한다.
+3. `CURRENT_TASK.md` 를 초기화한다 — Status `대기 중`, Short Title `-` (rd task set-status 경유). 이로써 다음 iteration 의 resume-우선 규칙이 같은 FR 을 재개하지 않는다.
+
+이 처리로 "보존해야 할 상태"가 CURRENT_TASK 에서 FR 의 blocked 항목(사유 포함)으로 옮겨간다. exit 20 이후 처리(다음 FR 이동 / continue-on-failure)는 front-end 소관이다.
+
 ## Execution Rules
 
 ### 1. 작업 선택

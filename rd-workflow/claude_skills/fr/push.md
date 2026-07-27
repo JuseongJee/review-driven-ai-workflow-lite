@@ -12,7 +12,7 @@
 1. 백엔드 전제조건 검증을 실행한다 (백엔드 결정 §4와 동일).
 2. 대상을 수집한다:
    - **인자 있음**: 인덱스에서 해당 short-title의 GitHub 컬럼을 확인한다. 이미 연결되어 있으면 "이미 GitHub Issue에 연결되어 있습니다: {owner/repo#N}" 출력 후 종료.
-   - **인자 없음**: 인덱스에서 GitHub 컬럼이 `-`인 활성(idea/validated/ready-for-request) FR 목록을 표시하고 사용자 확인을 기다린다.
+   - **인자 없음**: 인덱스에서 GitHub 컬럼이 `-`인 활성(idea/validated/ready-for-request; `blocked` 은 set-aside 상태로 제외) FR 목록을 표시하고 사용자 확인을 기다린다.
 3. 대상 각각에 대해 중복 감지를 수행한다:
    - `gh issue list --search "{short-title} in:title" --state open --json number,title`로 **완전 일치** title issue를 검색한다.
    - 일치 issue 발견 시 사용자에게 질문한다:

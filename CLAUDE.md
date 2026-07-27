@@ -41,6 +41,8 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 - 단순 질문/확인, 워크플로 지시 (진행 중 작업의 다음 단계), 메타 대화
 - 이미 FR 등록된 요청의 후속 대화 (clarification, 수정, 재시도)
 
+**rd-workflow 인프라 결함 라우팅**: 요청·문제가 rd-workflow 인프라 자체(산출물 문서·`rd-workflow/scripts/`·`rd-workflow/claude_skills/`)의 결함이면, 소비 프로젝트 FR로 등록하지 않고 `rd-workflow/docs/guides/workflow-defect-reporting.md` 규약에 따라 `rd-workflow-workspace/reports/workflow-defects/`에 보고 파일만 생성한다. 판별 기준·경계 케이스·형식은 해당 가이드를 따른다.
+
 ## Workflow 우선순위
 
 > Superpowers는 Claude Code의 내장 워크플로 기능으로, 설계 → 계획 → 구현 순서를 구조화합니다.

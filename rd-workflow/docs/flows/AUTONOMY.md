@@ -56,3 +56,7 @@ autopilot 모드와 반자율(semi-auto) 모드가 공통으로 따르는 자율
 4. 세션 한계 도달
 5. brainstorming에서 모든 옵션이 필수 제약을 위반하거나 판단 근거가 전혀 없는 경우
 6. **파괴적·비가역 작업** — 데이터 삭제, 외부 배포·공개 릴리즈 발행, 권한/계정 변경 등은 자율 진행하지 않고 멈춘다. **유일한 예외**: 현재 FR의 정규 archive lifecycle(`archive.sh`)에 진입한 뒤 수행되는 merge·tag·push — 이는 review 게이트가 종결된 승인된 파이프라인의 일부다. lifecycle script 밖의 push·배포·릴리즈·삭제는 착수 지시가 있어도 항상 중단 대상이다.
+
+## 무인(headless) 모드 outcome 매핑
+
+무인 진입(autopilot SKILL.md "무인 진입" 섹션)에서는 위 중단조건에 도달해도 사람을 기다릴 수 없다. 따라서 `awaiting-user` 로 멈춰 대기하는 대신, outcome 토큰 `blocked:<reason>` 을 `$RD_AUTOPILOT_OUTCOME_FILE` 에 기록하고 종료한다(중단조건 도달 시 skill 은 해당 FR status 를 `blocked` 로 기록하고 `CURRENT_TASK.md` 를 `대기 중`/Short Title `-` 로 reset 한다 — 보존 상태는 FR 의 blocked 항목이 든다. 상세는 autopilot SKILL.md "중단조건 → blocked 매핑"). 정상 완주는 `completed`, 세션 한계는 `resume`, 큐 빔은 `queue-empty` 다. wrapper `rd-workflow/scripts/autopilot_headless.sh` 가 이를 exit code(0/10/20/30/40)로 매핑한다. exit code 해석은 front-end(ralph/batch) 소관이다.

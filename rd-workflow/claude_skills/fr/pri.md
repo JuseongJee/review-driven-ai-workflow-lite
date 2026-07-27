@@ -5,7 +5,7 @@
 ### 절차
 
 1. `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` 읽기.
-2. 활성 항목(idea / validated / ready-for-request)의 인덱스 행에서 현재 우선순위를 확인하고, 상세 파일에서 `summary`, `why`, `related context`를 수집.
+2. 활성 항목(idea / validated / ready-for-request — `blocked` 은 set-aside 상태로 제외)의 인덱스 행에서 현재 우선순위를 확인하고, 상세 파일에서 `summary`, `why`, `related context`를 수집.
    - 상세 파일이 없으면 해당 항목을 건너뛰고 경고 출력.
 3. `PROJECT_CONTEXT.md` 읽기 (맥락 기반 판단 기준으로 사용. REQUEST.md 사용 금지 — 이 backlog는 전역 기준).
 4. 다음 기준으로 각 항목에 P1 / P2 / P3 부여 + 한 줄 근거 작성. 기존 우선순위(P1/P2/P3)가 있는 항목도 재평가한다. 전체 평가를 먼저 완료한 뒤 Step 5에서 한 번에 반영한다:

@@ -2,7 +2,7 @@
 name: fr
 description: >
   Manage future requests — add, list, prioritize, lifecycle, sync with GitHub Issues.
-  Subcommands: /fr add, /fr list, /fr pri, /fr inspect, /fr archive, /fr park, /fr status, /fr pull, /fr push, /fr sync.
+  Subcommands: /fr add, /fr list, /fr pri, /fr inspect, /fr archive, /fr park, /fr status, /fr pull, /fr push, /fr sync, /fr batch.
   Use when the user wants to manage backlog items.
 user-invocable: true
 disable-model-invocation: true
@@ -42,9 +42,10 @@ Typical user requests:
 - `pull` → Read `rd-workflow/claude_skills/fr/pull.md` and follow it.
 - `push` → Read `rd-workflow/claude_skills/fr/push.md` and follow it.
 - `sync` → Read `rd-workflow/claude_skills/fr/sync.md` and follow it.
+- `batch` → Read `rd-workflow/claude_skills/fr/batch.md` and follow it.
 - 그 외 / 인자 없음 → 아래 사용법 출력 후 종료 (파일 수정 없음 보장)
 
-**Legacy call 처리**: 첫 번째 단어가 `add`, `list`, `pri`, `inspect`, `archive`, `park`, `status`, `pull`, `push`, `sync` 중 어느 것도 아니면 사용법 help를 출력한다. 파일을 절대 수정하지 않는다.
+**Legacy call 처리**: 첫 번째 단어가 `add`, `list`, `pri`, `inspect`, `archive`, `park`, `status`, `pull`, `push`, `sync`, `batch` 중 어느 것도 아니면 사용법 help를 출력한다. 파일을 절대 수정하지 않는다.
 
 ### 사용법 출력
 
@@ -60,6 +61,7 @@ Typical user requests:
 - `/fr pull` — GitHub Issues → 로컬 FR 가져오기
 - `/fr push [제목]` — 로컬 FR → GitHub Issue 내보내기
 - `/fr sync` — 연결된 항목 status 동기화
+- `/fr batch <slug들>` — FR 묶음을 큐레이션 후 순차 autopilot 완주
 
 예: `/fr add autopilot에서 review gate 자동화`
 ```

@@ -13,3 +13,7 @@ Thumbs.db
 *.swp
 # Superpowers 플러그인
 .superpowers/
+# batch/autopilot 런타임 상태 (휘발성 — 커밋 불필요)
+rd-workflow-workspace/.batch-manifest.json
+rd-workflow-workspace/.batch-outcome-*
+rd-workflow-workspace/.autopilot-outcome

@@ -5,7 +5,7 @@
 ### 절차
 
 1. `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` 읽기.
-2. 인덱스에서 status가 `idea` / `validated` / `ready-for-request` 인 항목만 추린다.
+2. 인덱스에서 status가 `idea` / `validated` / `ready-for-request` 인 항목만 추린다 (`blocked` 은 set-aside 상태로 기본 목록 행에서 제외).
 3. 인덱스의 우선순위 컬럼을 기준으로 정렬: P1 → P2 → P3 → unranked (`-`). 동순위는 날짜 오름차순.
 4. 결과 테이블 출력:
 
@@ -27,3 +27,5 @@
 
 `owner/repo#N` 값이 있으면 그대로 표시, `-`이면 `-` 표시.
 GitHub 컬럼은 항상 표시한다 (활성 항목에 연결이 하나도 없어도 생략하지 않음).
+
+5. 표 아래에 set-aside 요약 한 줄을 덧붙인다: 인덱스에 `blocked` 항목이 있으면 `set-aside(blocked): N건 — 복원은 /fr status <slug> validated` 를 출력하고, 없으면 생략한다.

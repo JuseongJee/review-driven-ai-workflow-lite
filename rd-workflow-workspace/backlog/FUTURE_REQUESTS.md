@@ -8,6 +8,7 @@
 - `validated`: 필요성 확인, 우선순위 아님
 - `ready-for-request`: REQUEST.md로 바로 올릴 수 있음
 - `parked`: 검토 완료, 지금은 안 함, 조건 변화 시 재평가 → `FUTURE_REQUESTS_PARKED.md`로 이동
+- `blocked`: 무인 드레인(ralph)이 중단조건에 걸려 set-aside 한 항목. 활성 인덱스에 잔류하되 auto-pick·`/fr pri`·`/fr push` 대상에서 제외되고 `/fr list` 에는 set-aside 요약(건수)으로만 표기. 원인 해소 후 `validated` 로 복원해 재시도
 - `done` / `dropped`: 인덱스에서 삭제, `items/` 상세 파일의 status로만 추적
 
 ## 종류 값
@@ -24,7 +25,7 @@
 
 ## 파일 분리
 
-- **이 파일**: 활성 항목만 (idea, validated, ready-for-request)
+- **이 파일**: 활성 항목(idea, validated, ready-for-request) + set-aside 된 `blocked` 항목. `blocked` 은 인덱스에 **잔류**하되 auto-pick·`/fr pri`·`/fr push` 대상에서 제외되고 `/fr list` 에는 set-aside 요약으로만 표기된다 (parked 처럼 별도 파일로 이동하지 않음)
 - **`FUTURE_REQUESTS_PARKED.md`**: 보류 항목 (parked) — 재평가 조건 포함
 - **`items/`**: 상세 파일. done/dropped는 여기서 status만 변경하고 인덱스에서 삭제
 
