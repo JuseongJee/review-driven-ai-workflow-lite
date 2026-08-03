@@ -13,7 +13,11 @@ usage() {
   title                                    Short Title 출력 (섹션 부재 exit 3)
   mode                                     autopilot | manual (RD_AUTOPILOT=1 판정)
   set-status <값> [--force]                전이표 검증 후 Status 갱신 (위반 exit 4)
-  guard --candidate <slug> --mode <m>      m: intake|promote|fr-add. decision=... 출력 (차단 exit 2)
+  guard --candidate <slug> --mode <m> [--source-fr <path|->]
+                                           m: intake|promote|fr-add. decision=... 출력 (차단 exit 2)
+                                           --source-fr 는 promote 전용 (생략 시 '-' 리셋)
+  source-fr                                task-state source-fr 출력 (부재 시 '-')
+  set-source-fr <값>                       source-fr 설정 ('-' 또는 items path, 계약 위반 exit 1)
   capture --stage <s> [--title <slug>] [--source <src>]   본문은 stdin (fail-open)
   backup-request [--orphan] [--title <slug>]               REQUEST.md collision-safe 백업
   archive-captures --stages <csv> [--title <slug>]         캡처를 raw-captures/archive/로 이동
@@ -49,18 +53,36 @@ case "$cmd" in
     [[ -z "$to" ]] && { usage; exit 1; }
     task_set_status "$to" "$force"
     ;;
+  source-fr)
+    v="$(state_read_field "source-fr")"
+    printf '%s\n' "${v:--}"
+    ;;
+  set-source-fr)
+    val="${1:-}"; [[ $# -gt 0 ]] && shift
+    [[ -z "$val" ]] && { usage; exit 1; }
+    task_set_source_fr "$val"
+    ;;
   guard)
-    cand="" gmode=""
+    cand="" gmode="" gsrc=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --candidate) cand="${2:-}"; shift 2 ;;
         --mode) gmode="${2:-}"; shift 2 ;;
+        --source-fr) gsrc="${2:-}"; shift 2 ;;
         *) usage; exit 1 ;;
       esac
     done
     case "$gmode" in intake|promote|fr-add) ;; *) usage; exit 1 ;; esac
     [[ -z "$cand" ]] && { usage; exit 1; }
-    task_guard_decide "$cand" "$gmode"
+    if [[ -n "$gsrc" && "$gmode" != "promote" ]]; then
+      echo "guard: --source-fr 는 promote 모드 전용입니다 (mode=${gmode})" >&2
+      exit 1
+    fi
+    if [[ -n "$gsrc" ]] && ! source_fr_validate "$gsrc"; then
+      echo "guard: --source-fr 값 계약 위반 — '-' 또는 rd-workflow-workspace/backlog/items/<파일>.md 만 허용: '${gsrc}'" >&2
+      exit 1
+    fi
+    task_guard_decide "$cand" "$gmode" "$gsrc"
     ;;
   capture)
     stage="" title="" src="routed"

@@ -64,6 +64,107 @@ metadata_clear
 # clear 후: fr-branch=null, worktree-path=null, created-at 제거
 assert_eq "$(metadata_read_field fr-branch)" "null" "metadata_clear 후 fr-branch=null"
 assert_eq "$(metadata_read_field worktree-path)" "null" "metadata_clear 후 worktree-path=null"
+
+echo "== source-fr metadata (promote-source-fr-sync) =="
+SRC_T3="rd-workflow-workspace/backlog/items/2026-01-01-baz.md"
+metadata_write "fr/bar" "bar" "/path"
+assert_eq "$(metadata_read_field source-fr)" "-" "3인자 metadata_write → source-fr=- 기본 (하위 호환)"
+metadata_write "fr/baz" "baz" "/path" "$SRC_T3"
+assert_eq "$(metadata_read_field source-fr)" "$SRC_T3" "4인자 metadata_write → source-fr 기록"
+metadata_clear
+assert_eq "$(metadata_read_field source-fr)" "-" "metadata_clear → source-fr=-"
+
+echo "== promote.sh source-fr 결정 (fixture repo) =="
+# mk_promote_fixture <dir> <request-source-fr-라인>  ("__NONE__" 이면 Source FR 섹션 없음)
+mk_promote_fixture() {
+  local dir="$1" src_line="$2"
+  mkdir -p "$dir"
+  ( cd "$dir" \
+    && { git init -q -b main 2>/dev/null || { git init -q && git checkout -q -b main; }; } \
+    && git config user.email "t@t" && git config user.name "t" \
+    && mkdir -p rd-workflow-workspace/backlog/items \
+    && printf '%s\n' "# Current Task" "" "## Short Title" "-" "" "## Status" "대기 중" "" "## Branch / Worktree" "-" > CURRENT_TASK.md \
+    && if [[ "$src_line" == "__NONE__" ]]; then
+         printf '%s\n' "# Change Request" "" "## Task Type" "change" > REQUEST.md
+       else
+         printf '%s\n' "# Change Request" "" "## Source FR" "$src_line" > REQUEST.md
+       fi \
+    && touch "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" \
+    && git add -A && git commit -qm init )
+}
+read_fix_source_fr() { # read_fix_source_fr <dir>
+  awk -F'=' '$1=="source-fr"{sub(/^[^=]+=/,"");print;exit}' "$1/rd-workflow-workspace/.lifecycle/task-state"
+}
+
+FIX1="$TMPDIR_TEST/fix-infer"
+mk_promote_fixture "$FIX1" '`rd-workflow-workspace/backlog/items/2026-01-01-fix.md`'
+( cd "$FIX1" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-infer --no-worktree >/dev/null 2>&1 )
+assert_eq "$(read_fix_source_fr "$FIX1")" "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" "promote: REQUEST 백틱 path 추론 기록"
+
+FIX2="$TMPDIR_TEST/fix-none"
+mk_promote_fixture "$FIX2" "-"
+( cd "$FIX2" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-none --no-worktree >/dev/null 2>&1 )
+assert_eq "$(read_fix_source_fr "$FIX2")" "-" "promote: REQUEST '-' → source-fr=-"
+
+FIX3="$TMPDIR_TEST/fix-arg"
+mk_promote_fixture "$FIX3" "-"
+( cd "$FIX3" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-arg --no-worktree \
+    --source-fr "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" >/dev/null 2>&1 )
+assert_eq "$(read_fix_source_fr "$FIX3")" "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" "promote: --source-fr 명시 인자 기록"
+
+FIX4="$TMPDIR_TEST/fix-slug"
+mk_promote_fixture "$FIX4" "2026-01-01-fix"
+( cd "$FIX4" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-slug --no-worktree >/dev/null 2>&1 )
+assert_eq "$(read_fix_source_fr "$FIX4")" "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" "promote: legacy slug 추론 → path 정규화 (실존)"
+
+FIX5="$TMPDIR_TEST/fix-badslug"
+mk_promote_fixture "$FIX5" "no-such-item"
+( cd "$FIX5" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-badslug --no-worktree >/dev/null 2>&1 )
+assert_eq "$(read_fix_source_fr "$FIX5")" "-" "promote: 무효 추론값 → 경고 후 '-'"
+
+FIX6="$TMPDIR_TEST/fix-badarg"
+mk_promote_fixture "$FIX6" "-"
+rc6=0
+( cd "$FIX6" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-badarg --no-worktree \
+    --source-fr "/abs/evil.md" >/dev/null 2>&1 ) || rc6=$?
+assert_eq "$rc6" "1" "promote: --source-fr 무효값 hard error exit 1"
+
+# dry-run 무변경 계약: idempotent rerun + --dry-run --source-fr 에서도 상태 불변
+FIX7="$TMPDIR_TEST/fix-dryrun"
+mk_promote_fixture "$FIX7" '`rd-workflow-workspace/backlog/items/2026-01-01-fix.md`'
+( cd "$FIX7" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-dryrun --no-worktree >/dev/null 2>&1 )
+( cd "$FIX7" && git checkout -q main 2>/dev/null || true )
+( cd "$FIX7" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-dryrun --no-worktree --dry-run \
+    --source-fr "rd-workflow-workspace/backlog/items/2026-01-01-other.md" >/dev/null 2>&1 || true )
+assert_eq "$(read_fix_source_fr "$FIX7")" "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" "promote: --dry-run 은 source-fr 를 변경하지 않음 (idempotent rerun)"
+
+# non-dry idempotent rerun: 동일 값 인자 = no-op 허용 (exit 0), dirty task-state 없음
+# Step A(기본 브랜치 worktree 검증) 전제 충족을 위해 첫 promote 후 main 으로 checkout (FIX7과 동일 패턴)
+FIX8="$TMPDIR_TEST/fix-rerun-same"
+mk_promote_fixture "$FIX8" "-"
+( cd "$FIX8" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-rerun-same --no-worktree \
+    --source-fr "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" >/dev/null 2>&1 )
+( cd "$FIX8" && git checkout -q main 2>/dev/null || true )
+rc8=0
+( cd "$FIX8" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-rerun-same --no-worktree \
+    --source-fr "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" >/dev/null 2>&1 ) || rc8=$?
+assert_eq "$rc8" "0" "promote rerun: 동일 --source-fr no-op 허용 (exit 0)"
+assert_eq "$(read_fix_source_fr "$FIX8")" "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" "promote rerun: 동일 값 유지"
+assert_eq "$(cd "$FIX8" && git status --porcelain | grep -c "task-state" || true)" "0" "promote rerun: task-state dirty 없음 (동일 값)"
+
+# non-dry idempotent rerun: 다른 값 인자 = exit 1 거부 + 값 불변 + dirty 없음 (정정은 set-source-fr 일원화)
+FIX9="$TMPDIR_TEST/fix-rerun-diff"
+mk_promote_fixture "$FIX9" "-"
+( cd "$FIX9" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-rerun-diff --no-worktree \
+    --source-fr "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" >/dev/null 2>&1 )
+( cd "$FIX9" && git checkout -q main 2>/dev/null || true )
+rc9=0
+( cd "$FIX9" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-rerun-diff --no-worktree \
+    --source-fr "rd-workflow-workspace/backlog/items/2026-02-02-other.md" >/dev/null 2>&1 ) || rc9=$?
+assert_eq "$rc9" "1" "promote rerun: 다른 --source-fr 거부 (exit 1)"
+assert_eq "$(read_fix_source_fr "$FIX9")" "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" "promote rerun: 거부 후 값 불변"
+assert_eq "$(cd "$FIX9" && git status --porcelain | grep -c "task-state" || true)" "0" "promote rerun: task-state dirty 없음 (거부)"
+
 if grep -q "^created-at=" "$TASK_STATE_PATH" 2>/dev/null; then FAIL=$((FAIL+1)); echo "  FAIL: clear 후 created-at 잔존" >&2; \
   else PASS=$((PASS+1)); echo "  PASS: clear 후 created-at 제거"; fi
 if metadata_exists; then FAIL=$((FAIL+1)); echo "  FAIL: clear 후에도 metadata_exists true" >&2; \

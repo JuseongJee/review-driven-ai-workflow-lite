@@ -95,7 +95,12 @@ task_set_status() {
 # stdout: decision=... / message=...  return: 0 진행, 2 차단
 # v2 2b: Short Title 읽기는 get_current_short_title(task-state 우선), 쓰기는 task-state + 뷰 미러
 task_guard_decide() {
-  local cand="$1" mode="$2" cur status file="${project_root}/CURRENT_TASK.md"
+  local cand="$1" mode="$2" src="${3:-}" cur status file="${project_root}/CURRENT_TASK.md"
+  # promote 모드 write/rebind 시 기록할 source-fr — 인자 없으면 '-' 리셋 (stale 차단).
+  # REQUEST.md 추론을 여기 두지 않는 이유: guard 시점의 REQUEST.md 는 새 작업용으로
+  # 작성 전(빈 템플릿 또는 이전 작업 잔재)이라 추론값이 '-' 또는 오염값이다.
+  # 실제 FR path 추론·기록은 promote.sh 책임 (change-spec §2 접근 A).
+  local src_val="${src:--}"
 
   # Short Title 읽기 — task-state 우선, fallback: CURRENT_TASK.md 산문
   if state_file_exists; then
@@ -130,7 +135,11 @@ task_guard_decide() {
     fi
     # Short Title 쓰기: task-state + 뷰 미러 (결정 3 LC-18)
     if state_file_exists; then
-      state_write_fields "short-title=${cand}"
+      if [[ "$mode" == "promote" ]]; then
+        state_write_fields "short-title=${cand}" "source-fr=${src_val}"
+      else
+        state_write_fields "short-title=${cand}"
+      fi
     fi
     # 뷰에 ## Short Title 섹션이 없으면 append (기존 동작 유지)
     if ! grep -q '^## Short Title' "$file" 2>/dev/null; then
@@ -138,7 +147,11 @@ task_guard_decide() {
     fi
     _task_section_write "Short Title" "$cand"
     echo "decision=write"
-    echo "message=Short Title을 ${cand} 로 기록했습니다."
+    if [[ "$mode" == "promote" ]]; then
+      echo "message=Short Title을 ${cand} 로 기록했습니다 (source-fr=${src_val})."
+    else
+      echo "message=Short Title을 ${cand} 로 기록했습니다."
+    fi
     return 0
   fi
   if [[ "$cur" == "$cand" ]]; then
@@ -160,11 +173,19 @@ task_guard_decide() {
   if [[ "$status" == "대기 중" ]]; then
     # Short Title 쓰기: task-state + 뷰 미러 (결정 3 LC-18)
     if state_file_exists; then
-      state_write_fields "short-title=${cand}"
+      if [[ "$mode" == "promote" ]]; then
+        state_write_fields "short-title=${cand}" "source-fr=${src_val}"
+      else
+        state_write_fields "short-title=${cand}"
+      fi
     fi
     _task_section_write "Short Title" "$cand"
     echo "decision=rebind"
-    echo "message=이전 Short Title (${cur}) 이 Status = 대기 중 인 stale 값이라 ${cand} 로 교체하고 진행합니다."
+    if [[ "$mode" == "promote" ]]; then
+      echo "message=이전 Short Title (${cur}) 이 Status = 대기 중 인 stale 값이라 ${cand} 로 교체하고 진행합니다 (source-fr=${src_val})."
+    else
+      echo "message=이전 Short Title (${cur}) 이 Status = 대기 중 인 stale 값이라 ${cand} 로 교체하고 진행합니다."
+    fi
     return 0
   fi
   echo "decision=block-active"
@@ -275,4 +296,15 @@ _task_section_write() {
     { print }
     END { if (in_s && !replaced) print val }
   ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+# task_set_source_fr <value> — 값 계약 검증 후 task-state source-fr 갱신.
+# 위반 return 1 (stderr 사유), 쓰기 실패 return 1. 검증 규칙: source_fr_validate (_state_common.sh).
+task_set_source_fr() {
+  local v="${1-}"
+  if ! source_fr_validate "$v"; then
+    echo "set-source-fr: 값 계약 위반 — '-' 또는 rd-workflow-workspace/backlog/items/<파일>.md 만 허용 (절대경로/../개행/slug 거부): '${v}'" >&2
+    return 1
+  fi
+  state_write_fields "source-fr=${v}"
 }

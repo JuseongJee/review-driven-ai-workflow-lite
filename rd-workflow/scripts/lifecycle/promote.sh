@@ -4,18 +4,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/slug.sh"
 source "$SCRIPT_DIR/_lifecycle_common.sh"
 
-DRY_RUN=0; SHORT_TITLE=""; WORKTREE_PATH=""; NO_WORKTREE=0; STATUS_VAL="구현 중"
+DRY_RUN=0; SHORT_TITLE=""; WORKTREE_PATH=""; NO_WORKTREE=0; STATUS_VAL="구현 중"; SOURCE_FR_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --short-title) SHORT_TITLE="$2"; shift 2 ;;
     --worktree-path) WORKTREE_PATH="$2"; shift 2 ;;
     --no-worktree) NO_WORKTREE=1; shift ;;
     --status) STATUS_VAL="$2"; shift 2 ;;
+    --source-fr) SOURCE_FR_ARG="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
-    -h|--help) echo "usage: promote.sh --short-title <slug> [--worktree-path <path>] [--no-worktree] [--status <status>] [--dry-run]"; exit 0 ;;
+    -h|--help) echo "usage: promote.sh --short-title <slug> [--worktree-path <path>] [--no-worktree] [--status <status>] [--source-fr <path|->] [--dry-run]"; exit 0 ;;
     *) echo "promote: unknown arg: $1" >&2; exit 1 ;;
   esac
 done
+
+# --source-fr 명시 인자 검증 (사용자 명시 오류는 hard error — 추론 실패와 구분)
+if [[ -n "$SOURCE_FR_ARG" ]] && ! source_fr_validate "$SOURCE_FR_ARG"; then
+  echo "promote: --source-fr 값 계약 위반 — '-' 또는 rd-workflow-workspace/backlog/items/<파일>.md 만 허용: $SOURCE_FR_ARG" >&2
+  exit 1
+fi
 
 # I2 — --no-worktree + --worktree-path 충돌 검출
 if [[ "$NO_WORKTREE" -eq 1 && -n "$WORKTREE_PATH" ]]; then
@@ -28,6 +35,22 @@ if [[ -z "$SHORT_TITLE" && -f CURRENT_TASK.md ]]; then
 fi
 [[ -z "$SHORT_TITLE" || "$SHORT_TITLE" == "-" ]] && { echo "promote: --short-title 필수" >&2; exit 1; }
 SLUG="$(normalize_slug "$SHORT_TITLE")"
+
+# source-fr 값 결정: 인자 > REQUEST.md 추론(legacy slug 는 실존 시 path 정규화) > '-'
+# guard(rd task guard --mode promote)는 '-' 리셋만 담당 — path 추론·기록의 단일 책임은 여기다 (change-spec §2)
+resolve_source_fr() {
+  if [[ -n "$SOURCE_FR_ARG" ]]; then printf '%s\n' "$SOURCE_FR_ARG"; return 0; fi
+  local v
+  v="$(source_fr_from_request)"
+  if [[ -z "$v" ]]; then printf '%s\n' "-"; return 0; fi
+  if source_fr_validate "$v"; then printf '%s\n' "$v"; return 0; fi
+  if [[ "$v" != */* && -f "rd-workflow-workspace/backlog/items/${v}.md" ]]; then
+    printf '%s\n' "rd-workflow-workspace/backlog/items/${v}.md"; return 0
+  fi
+  echo "promote: REQUEST.md Source FR 값('${v}')이 계약 위반 — source-fr='-' 로 기록합니다." >&2
+  printf '%s\n' "-"
+  return 0
+}
 
 # --worktree-path canonicalize (relative→absolute / parent missing hard error)
 if [[ -n "$WORKTREE_PATH" ]]; then
@@ -55,6 +78,18 @@ if metadata_exists; then
   if [[ "$EXISTING_SHORT" == "$SLUG" ]]; then
     TARGET_BRANCH="$EXISTING_BRANCH"
     echo "promote: metadata 발견 (idempotent rerun) — fr-branch=$TARGET_BRANCH, stored worktree-path=$STORED_WT"
+    # idempotent rerun 은 source-fr 를 갱신하지 않는다 — rerun 경로는 커밋을 만들지 않으므로
+    # 갱신하면 uncommitted dirty task-state 가 남는다 (final diff review Finding 1).
+    # 동일 값 인자는 복구 rerun 호환을 위해 no-op 허용, 다른 값은 거부 — 정정 단일 경로는 rd task set-source-fr.
+    if [[ -n "$SOURCE_FR_ARG" ]]; then
+      STORED_SRC="$(metadata_read_field source-fr)"
+      if [[ "$SOURCE_FR_ARG" != "${STORED_SRC:--}" ]]; then
+        echo "promote: idempotent rerun 에서는 source-fr 를 갱신하지 않습니다 (stored=${STORED_SRC:--}, 인자=$SOURCE_FR_ARG)." >&2
+        echo "  정정하려면: bash rd-workflow/scripts/rd task set-source-fr '$SOURCE_FR_ARG' 실행 후 변경을 정규 커밋에 포함하세요." >&2
+        exit 1
+      fi
+      echo "promote: source-fr 동일 값 재지정 (${SOURCE_FR_ARG}) — 변경 없음"
+    fi
     if [[ -n "$WORKTREE_PATH" && "$WORKTREE_PATH" != "$STORED_WT" ]]; then
       echo "promote: 기존 worktree path 와 다름 (metadata=$STORED_WT, 인자=$WORKTREE_PATH)." >&2
       echo "  metadata 갱신 후 재시도 또는 --worktree-path 인자 생략 권장." >&2; exit 1
@@ -77,7 +112,8 @@ fi
 if [[ -z "$TARGET_BRANCH" ]]; then
   TARGET_BRANCH="$(resolve_unique_ref branch "fr/$SLUG")"
   if [[ "$DRY_RUN" -eq 1 ]]; then echo "would create branch $TARGET_BRANCH"; exit 0; fi
-  metadata_write "$TARGET_BRANCH" "$SLUG" "${WORKTREE_PATH:-null}"
+  SOURCE_FR_VAL="$(resolve_source_fr)"
+  metadata_write "$TARGET_BRANCH" "$SLUG" "${WORKTREE_PATH:-null}" "$SOURCE_FR_VAL"
   # 권위 status를 뷰(Step D CURRENT_TASK.md)와 동일 값으로 기록 — 권위-뷰 이원화 방지
   state_write_fields "status=$STATUS_VAL"
   # v2 2b: LIFECYCLE_METADATA_PATH 폐지 → TASK_STATE_PATH 사용 (LC-05)

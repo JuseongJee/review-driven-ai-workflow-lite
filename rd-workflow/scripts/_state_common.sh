@@ -98,6 +98,50 @@ state_write_fields() {
 }
 
 # ---------------------------------------------------------------------------
+# source-fr 값 계약 헬퍼 (task-state-guide.md 'source-fr 계약'의 단일 구현)
+# ---------------------------------------------------------------------------
+
+# source_fr_validate <value> — canonical 쓰기 값 검증 (return 0: 유효, 1: 무효)
+#   허용: "-" 또는 repo-relative backlog item path (rd-workflow-workspace/backlog/items/<파일>.md)
+#   거부: 빈 값, 개행, 절대경로, ".." 세그먼트, items 직하가 아닌 경로, .md 외 확장자
+#   legacy slug 는 쓰기 금지 (읽기 호환은 소비자 책임 — pre_commit_archive_gate.sh)
+source_fr_validate() {
+  local v="${1-}"
+  [[ "$v" == "-" ]] && return 0
+  [[ -z "$v" ]] && return 1
+  case "$v" in
+    *$'\n'*) return 1 ;;
+    /*) return 1 ;;
+    ../*|*/../*|*/..) return 1 ;;
+  esac
+  case "$v" in
+    rd-workflow-workspace/backlog/items/*.md) ;;
+    *) return 1 ;;
+  esac
+  local rest="${v#rd-workflow-workspace/backlog/items/}"
+  [[ "$rest" == */* ]] && return 1
+  return 0
+}
+
+# source_fr_from_request [request_file] — REQUEST.md '## Source FR' 첫 유효행 출력
+#   백틱·양끝 공백 제거. 파일/섹션 부재·값 '-'·빈 값이면 빈 출력.
+#   항상 return 0 (set -e 호출부의 명령 치환 안전 — fail-open)
+source_fr_from_request() {
+  local f="${1:-${project_root:-$PWD}/REQUEST.md}"
+  [[ -f "$f" ]] || return 0
+  local v
+  v="$(awk '
+    /^## Source FR/ { in_s = 1; next }
+    in_s && /^## / { exit }
+    in_s { gsub(/`/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); if (NF) { print; exit } }
+  ' "$f")"
+  if [[ -n "$v" && "$v" != "-" ]]; then
+    printf '%s\n' "$v"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # 마이그레이션 보조 함수 (state_ensure 전용 — _state_common.sh 내부)
 # ---------------------------------------------------------------------------
 

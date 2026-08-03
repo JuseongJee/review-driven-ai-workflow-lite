@@ -505,6 +505,49 @@ else
 fi
 
 # ===========================================================================
+# source-fr 값 계약 헬퍼 (promote-source-fr-sync)
+# ===========================================================================
+reset_sandbox
+
+t "validate: sentinel '-'" 0 source_fr_validate "-"
+t "validate: canonical items path" 0 source_fr_validate "rd-workflow-workspace/backlog/items/2026-08-03-x.md"
+t "validate: 절대경로 거부" 1 source_fr_validate "/etc/passwd"
+t "validate: .. 세그먼트 거부" 1 source_fr_validate "rd-workflow-workspace/backlog/items/../evil.md"
+t "validate: legacy slug 거부" 1 source_fr_validate "some-slug"
+t "validate: items 밖 path 거부" 1 source_fr_validate "rd-workflow-workspace/backlog/other/x.md"
+t "validate: 중간 디렉토리 거부" 1 source_fr_validate "rd-workflow-workspace/backlog/items/sub/x.md"
+t "validate: .md 아닌 확장자 거부" 1 source_fr_validate "rd-workflow-workspace/backlog/items/x.txt"
+t "validate: 개행 거부" 1 source_fr_validate "rd-workflow-workspace/backlog/items/x.md
+y"
+t "validate: 빈 값 거부" 1 source_fr_validate ""
+
+REQ_FIX="${TMP}/REQUEST-fixture.md"
+cat > "$REQ_FIX" <<'REQEOF'
+# Change Request
+
+## Source FR
+`rd-workflow-workspace/backlog/items/2026-08-03-x.md`
+
+## Risks
+-
+REQEOF
+t_out "from_request: 백틱 path 추출" "rd-workflow-workspace/backlog/items/2026-08-03-x.md" source_fr_from_request "$REQ_FIX"
+
+cat > "$REQ_FIX" <<'REQEOF'
+## Source FR
+-
+REQEOF
+t_out "from_request: '-' → 빈 출력" "" source_fr_from_request "$REQ_FIX"
+
+cat > "$REQ_FIX" <<'REQEOF'
+## Task Type
+change
+REQEOF
+t_out "from_request: 섹션 부재 → 빈 출력" "" source_fr_from_request "$REQ_FIX"
+
+t_out "from_request: 파일 부재 → 빈 출력 (return 0)" "" source_fr_from_request "${TMP}/no-such-file.md"
+
+# ===========================================================================
 # 최종 결과
 # ===========================================================================
 if [[ "$FAIL" == "0" ]]; then

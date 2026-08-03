@@ -489,5 +489,54 @@ env project_root="$TMP_FIX2" bash "$RD" task set-status "검증 중" >/dev/null 
 chmod 700 "$_ts_path_fix2"
 [[ "$rc_fix2" == "3" ]] && echo "ok: TC-FIX-2 set-status 쓰기 실패 → exit 3" || { echo "FAIL: TC-FIX-2 set-status 쓰기 실패 → exit ${rc_fix2} (기대: 3)"; FAIL=1; }
 
+# --- source-fr 계약 (promote-source-fr-sync) ---
+SRC_OK="rd-workflow-workspace/backlog/items/2026-01-01-old.md"
+SRC_OK2="rd-workflow-workspace/backlog/items/2026-02-02-new.md"
+
+mk_task_file "$TMP" "대기 중" "-"
+t "set-source-fr 유효 path" 0 - bash "$RD" task set-source-fr "$SRC_OK"
+t "source-fr 조회" 0 "$SRC_OK" bash "$RD" task source-fr
+t "set-source-fr 절대경로 거부" 1 - bash "$RD" task set-source-fr "/etc/passwd"
+t "set-source-fr .. 거부" 1 - bash "$RD" task set-source-fr "rd-workflow-workspace/backlog/items/../evil.md"
+t "set-source-fr slug 거부" 1 - bash "$RD" task set-source-fr "some-slug"
+t "set-source-fr 거부 후 값 불변" 0 "$SRC_OK" bash "$RD" task source-fr
+t "set-source-fr sentinel '-'" 0 - bash "$RD" task set-source-fr "-"
+t "sentinel 후 조회 '-'" 0 "-" bash "$RD" task source-fr
+
+# guard promote write 분기: 인자 없음 → 리셋
+mk_task_file "$TMP" "대기 중" "-"
+bash "$RD" task set-source-fr "$SRC_OK" >/dev/null 2>&1
+t "guard promote(write) 인자 없음" 0 - bash "$RD" task guard --candidate task-a --mode promote
+t "write 후 source-fr 리셋" 0 "-" bash "$RD" task source-fr
+
+# guard promote rebind 분기: stale 값 리셋 (monitoring 실사례 재현)
+mk_task_file "$TMP" "대기 중" "stale-task"
+bash "$RD" task set-source-fr "$SRC_OK" >/dev/null 2>&1
+t "guard promote(rebind) 인자 없음" 0 - bash "$RD" task guard --candidate task-b --mode promote
+t "rebind 후 source-fr 리셋" 0 "-" bash "$RD" task source-fr
+
+# intake rebind 는 source-fr 를 건드리지 않는다 (spec: intake 는 write·rebind 모두 불변)
+mk_task_file "$TMP" "대기 중" "stale-task-2"
+bash "$RD" task set-source-fr "$SRC_OK" >/dev/null 2>&1
+t "guard intake(rebind) 진행" 0 - bash "$RD" task guard --candidate task-g --mode intake
+t "intake rebind 후 source-fr 불변" 0 "$SRC_OK" bash "$RD" task source-fr
+
+# guard promote --source-fr 명시 기록
+mk_task_file "$TMP" "대기 중" "-"
+t "guard promote --source-fr 기록" 0 - bash "$RD" task guard --candidate task-c --mode promote --source-fr "$SRC_OK2"
+t "기록값 조회" 0 "$SRC_OK2" bash "$RD" task source-fr
+t "guard --source-fr 무효값 exit 1" 1 - bash "$RD" task guard --candidate task-d --mode promote --source-fr "/abs/path.md"
+
+# --source-fr 는 promote 전용 — 비promote 모드에서 지정 시 오용 거부 (fail fast)
+mk_task_file "$TMP" "대기 중" "-"
+t "guard intake --source-fr 오용 exit 1" 1 - bash "$RD" task guard --candidate task-e --mode intake --source-fr "$SRC_OK"
+t "guard fr-add --source-fr 오용 exit 1" 1 - bash "$RD" task guard --candidate task-f --mode fr-add --source-fr "$SRC_OK"
+
+# fr-add 모드는 source-fr 를 건드리지 않는다 (proceed-readonly 계약 유지)
+mk_task_file "$TMP" "구현 중" "busy-task"
+bash "$RD" task set-source-fr "$SRC_OK" >/dev/null 2>&1
+t "guard fr-add 진행 중" 0 - bash "$RD" task guard --candidate other --mode fr-add
+t "fr-add 후 source-fr 불변" 0 "$SRC_OK" bash "$RD" task source-fr
+
 [[ "$FAIL" == 0 ]] && echo "test_task_cli: ALL PASS" || echo "test_task_cli: FAIL"
 exit "$FAIL"

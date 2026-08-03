@@ -12,7 +12,7 @@
 | `status` | canonical 8종 (아래 목록) | `rd task set-status` / guard | LC-19: 집합 불변 |
 | `fr-branch` | `fr/<slug>` \| `null` | promote / archive | fr 활성 여부는 `!= null` 로 판정 |
 | `worktree-path` | 절대 경로 \| `null` | promote / archive | worktree 미사용 시 `null` |
-| `source-fr` | repo-relative path \| `-` | promote | FR 출처 경로 |
+| `source-fr` | `rd-workflow-workspace/backlog/items/<파일>.md` \| `-` | promote / `rd task set-source-fr` | FR 출처 경로 — 아래 'source-fr 계약' 참조 |
 | `created-at` | `YYYY-MM-DD-HHMM` 형식 | promote | fr 활성 기간에만 기록; 비활성 시 부재 가능 |
 | `extensions.<ext-name>.<key>` | 자유 문자열 (개행 금지) | extension | 아래 규약 참조 |
 
@@ -40,6 +40,16 @@ worktree-path=/path/to/worktree
 source-fr=rd-workflow-workspace/backlog/items/2026-07-05-my-feature.md
 created-at=2026-07-05-1030
 ```
+
+### source-fr 계약
+
+- **값 형식**: `-`(sentinel) 또는 repo-relative backlog item path (`rd-workflow-workspace/backlog/items/<파일>.md`). 절대경로·`..` 세그먼트·개행·legacy slug는 쓰기 거부 (`source_fr_validate` — `_state_common.sh` 단일 구현).
+- **기록 시점**:
+  - `rd task guard --mode promote`: `--source-fr <path|->` 인자값, 인자 없으면 **`-` 리셋** (이전 작업 stale 값 차단). guard 시점의 REQUEST.md는 작성 전이므로 추론하지 않는다.
+  - `lifecycle/promote.sh`: `--source-fr` 인자 > `REQUEST.md ## Source FR` 추론(백틱 제거, legacy slug는 items 실존 시 path 정규화) > `-`. path 추론·기록의 단일 책임 지점.
+- **리셋 시점**: `metadata_clear` (`lifecycle/archive.sh`·`lifecycle/promote_rollback.sh`) 가 `-`로 복원.
+- **정정 CLI**: `rd task source-fr` (조회), `rd task set-source-fr <값>` (검증 후 설정 — 직접 파일 편집 금지).
+- **소비자 읽기 호환**: `hooks/pre_commit_archive_gate.sh`는 `REQUEST.md ## Source FR`의 path(백틱 관례)·legacy slug 양형식을 해석한다. 신규 기록은 path만 허용.
 
 ---
 

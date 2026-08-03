@@ -188,7 +188,7 @@ stale_metadata_reference_check() {
   [[ "${#search_dirs[@]}" -eq 0 ]] && { echo "  (skip: 검색 경로 없음)"; return 0; }
 
   # 허용 목록 파일 (basename → 경로 매칭)
-  # - 마이그레이션 설명 포함: task-state-guide.md
+  # - 마이그레이션 설명 포함: task-state-guide.md, sync_template.md
   # - legacy 마이그레이션 코드: _state_common.sh, test_state_common.sh
   # - legacy fallback: _guard_common.sh, test_guard_state.sh
   # - lifecycle helpers (변경 이력 주석 등): _lifecycle_common.sh, promote.sh, archive.sh,
@@ -197,6 +197,7 @@ stale_metadata_reference_check() {
   # - 이 검사 자체(grep 패턴 문자열): self_test.sh
   local allowlist=(
     "task-state-guide.md"
+    "sync_template.md"
     "_state_common.sh"
     "test_state_common.sh"
     "_guard_common.sh"
@@ -306,6 +307,7 @@ adapter_poll_regression_check() {
 run_step "stop_task_save_reminder hook" bash "${SCRIPT_DIR}/hooks/test_stop_task_save_reminder.sh"
 run_step "state 단위 테스트 (test_state_common.sh)" bash "${SCRIPT_DIR}/test_state_common.sh"
 run_step "guard state fixture (test_guard_state.sh)" bash "${SCRIPT_DIR}/hooks/test_guard_state.sh"
+run_step "archive gate 테스트 (test_pre_commit_archive_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_pre_commit_archive_gate.sh"
 run_step "비차단 Status drift 검증 (nonblocking_status_drift_check)" nonblocking_status_drift_check
 run_step "LC-19 3자 일치 검증 (TASK/STATE/CLAUDE.md)" canonical_status_triple_drift_check
 run_step "판정 소스 회귀 grep (_extract_task_section Status 직접 호출)" judgment_source_regression_check

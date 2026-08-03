@@ -20,14 +20,11 @@ fi
 request_file="${project_root}/REQUEST.md"
 [[ ! -f "$request_file" ]] && exit 0
 
-source_fr="$(awk '
-  /^## Source FR/ { in_section = 1; next }
-  in_section && /^## / { exit }
-  in_section { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); if (NF) { print; exit } }
-' "$request_file")"
+# Source FR 추출 — source_fr_from_request 가 백틱·공백 제거, '-'/부재는 빈 값 반환 (_state_common.sh 단일 구현)
+source_fr="$(source_fr_from_request "$request_file")"
 
 # Source FR이 없거나 "-"이면 통과 (아카이브 불필요)
-[[ -z "$source_fr" || "$source_fr" == "-" ]] && exit 0
+[[ -z "$source_fr" ]] && exit 0
 
 # diff review가 통과했는지 확인
 review_dir="$(get_latest_diff_review_dir)"
@@ -38,10 +35,21 @@ is_review_session_resolved "$review_dir" || exit 0
 
 # diff review 통과 + Source FR 있음 → FR 상세 파일 status 확인
 items_dir="${project_root}/rd-workflow-workspace/backlog/items"
-fr_file="${items_dir}/${source_fr}.md"
+if [[ "$source_fr" == */* ]]; then
+  # path 형식 (canonical) — repo-relative 만 허용. 절대경로/.. 는 경고 후 통과 (fail-open)
+  case "$source_fr" in
+    /*|../*|*/../*|*/..)
+      echo "[guard] Source FR path 형식 위반('${source_fr}') — 검증을 건너뜁니다." >&2
+      exit 0 ;;
+  esac
+  fr_file="${project_root}/${source_fr}"
+else
+  # legacy slug — items/<slug>.md 해석 (읽기 호환)
+  fr_file="${items_dir}/${source_fr}.md"
+fi
 
 if [[ ! -f "$fr_file" ]]; then
-  # 상세 파일이 없으면 경고만
+  echo "[guard] Source FR 상세 파일(${fr_file})을 찾지 못했습니다 — 검증을 건너뜁니다." >&2
   exit 0
 fi
 

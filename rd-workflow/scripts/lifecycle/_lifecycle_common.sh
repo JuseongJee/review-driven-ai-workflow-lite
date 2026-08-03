@@ -96,24 +96,26 @@ metadata_read_field() {
   fi
 }
 
-# metadata_write <fr-branch> <short-title> <worktree-path>: task-state에 3필드 + created-at 기록
+# metadata_write <fr-branch> <short-title> <worktree-path> [source-fr]: task-state에 4필드 + created-at 기록
+# 4번째 인자는 optional (기본 '-') — 기존 3인자 호출과 호환 (trailing optional 확장만 허용)
 metadata_write() {
-  local fr_branch="$1" short_title="$2" worktree_path="$3"
-  if [[ "$fr_branch" == *$'\n'* || "$short_title" == *$'\n'* || "$worktree_path" == *$'\n'* ]]; then
+  local fr_branch="$1" short_title="$2" worktree_path="$3" source_fr="${4:--}"
+  if [[ "$fr_branch" == *$'\n'* || "$short_title" == *$'\n'* || "$worktree_path" == *$'\n'* || "$source_fr" == *$'\n'* ]]; then
     printf 'metadata_write: values must not contain newlines\n' >&2; return 1
   fi
   state_write_fields \
     "fr-branch=$fr_branch" \
     "short-title=$short_title" \
     "worktree-path=${worktree_path:-null}" \
+    "source-fr=${source_fr:--}" \
     "created-at=$(date +%Y-%m-%d-%H%M)"
 }
 
-# metadata_clear: fr-branch=null, worktree-path=null reset + created-at 줄 제거 (파일 삭제 아님)
+# metadata_clear: fr-branch=null, worktree-path=null, source-fr=- reset + created-at 줄 제거 (파일 삭제 아님)
 # legacy active-fr 파일이 잔존하면 함께 삭제 (merge 후 main에 남는 legacy 잔재 정리).
 metadata_clear() {
   state_file_exists || return 0
-  state_write_fields "fr-branch=null" "worktree-path=null"
+  state_write_fields "fr-branch=null" "worktree-path=null" "source-fr=-"
   # created-at 줄 제거 (fr 비활성 시 부재 계약)
   local tmp
   tmp="$(mktemp "$(dirname "$TASK_STATE_PATH")/.task-state.XXXXXX")"

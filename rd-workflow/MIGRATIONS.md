@@ -168,3 +168,13 @@
 - full 템플릿과 sync하는 경우 스크립트가 clone에 존재해 조건 2가 성립하지 않습니다 — full/lite 산출물 차이에 자동 정합합니다.
 - 대조 기준은 항상 clone된 템플릿 파일입니다.
 - 제거가 수행되면 JSON 재직렬화로 들여쓰기가 2칸으로 정규화될 수 있습니다.
+
+## M006: source-fr 계약 구현 — archive gate enforcement 활성화
+
+**조건**: VERSION 2026-08-03 이후 템플릿으로 동기화하는 모든 프로젝트.
+
+**동작 변화**:
+1. promote가 task-state `source-fr`를 실제로 기록합니다 (`promote.sh`: `--source-fr` 인자 > `REQUEST.md ## Source FR` 추론 > `-`; `rd task guard --mode promote`: 인자 없으면 `-` 리셋).
+2. `pre_commit_archive_gate.sh`가 path 형식(백틱 포함) `Source FR`을 올바르게 해석합니다. **이전에는 path 형식에서 enforcement가 조용히 무력화되어 통과하던 커밋이, 이제 diff review 종결 + FR 미아카이브 상태에서 차단됩니다 (exit 2).**
+
+**대응**: 차단 메시지가 나오면 REQUEST 아카이브(FR status done 처리)를 먼저 실행한 뒤 커밋합니다. stale `source-fr` 정정은 `rd task set-source-fr <path|->`를 사용합니다.
