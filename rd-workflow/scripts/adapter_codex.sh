@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
 # adapter_codex.sh — Codex CLI 어댑터 (background 실행 + watchdog+wait)
 # 환경변수: SESSION_PATH, PROMPT_FILE, EXPECTED_TURN_FILE,
-#           TOOL_BIN, PROJECT_ROOT
+#           TOOL_BIN, PROJECT_ROOT,
+#           TOOL_EFFORT (선택 — reasoning effort. 빈 값이면 전역 설정을 따름)
+#
+# TOOL_MODEL 은 의도적으로 사용하지 않는다. 모델은 전역 ~/.codex/config.toml 을
+# 단일 진실 원천으로 두어 drift 를 없앤다는 결정이며, 부모가 TOOL_MODEL 을 export 하더라도
+# 이 어댑터는 무시한다. 조절 가능한 것은 reasoning effort 뿐이다.
+# 그래서 review-tools.json 의 codex stanza 에도 model 필드를 두지 않는다.
+#
+# effort 값이 현재 모델에서 지원되지 않으면 codex 가 설정을 거부하고 이 어댑터는
+# **즉시 실패한다.** effort 없이 자동 재시도하지 않는다 — codex stderr 는 설정 오류 전용
+# 채널이 아니라 진행 출력 전체이므로, 문자열 매칭으로는 "agent 실행 전 실패"를 증명할 수
+# 없다(빈 last-message 는 agent 미시작이 아니라 최종 메시지 미완성만 뜻한다). 증명되지 않은
+# 재시도는 이미 시작된 agent 뒤에 두 번째 agent 를 붙여 세션·워크스페이스를 조용히 오염시킨다.
+# 무효값은 다음 턴에도 계속 실패하므로 사용자가 결국 고쳐야 하며, 자동 재시도는 문제를
+# 숨기고 지연시킬 뿐이다. 복구 경로는 부모가 출력하는 안내(키 제거 또는
+# RD_REVIEW_EFFORT_OVERRIDE=0)다.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -75,10 +90,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# reasoning effort 전달 — 빈 값이면 -c 를 붙이지 않는다 (전역 설정을 따름 = 도입 전 동작).
+# -c 값은 TOML 로 파싱되므로 문자열을 따옴표로 감싼다.
+# bash 3.2 + set -u 에서 빈 배열 전개가 죽으므로 "${arr[@]+"${arr[@]}"}" 관용구가 필수다.
+extra_args=()
+[ -n "${TOOL_EFFORT:-}" ] && extra_args+=(-c "model_reasoning_effort=\"${TOOL_EFFORT}\"")
+
 "$codex_bin" --ask-for-approval never exec \
   --cd "$PROJECT_ROOT" \
   --sandbox workspace-write \
   --skip-git-repo-check \
+  "${extra_args[@]+"${extra_args[@]}"}" \
   --output-last-message "$last_message_file" \
   - < "$PROMPT_FILE" &
 codex_pid=$!

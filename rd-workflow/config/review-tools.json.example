@@ -6,7 +6,9 @@
       "model": null
     },
     "codex": {
-      "bin": null
+      "bin": null,
+      "reasoning_effort": null,
+      "small_task_reasoning_effort": "medium"
     },
     "claude": {
       "bin": null,
@@ -18,6 +20,13 @@
   "overrides": {
     "diff-review": {
       "priority": ["codex"]
+    },
+    "request-review": {
+      "tools": {
+        "codex": {
+          "reasoning_effort": "medium"
+        }
+      }
     }
   }
 }

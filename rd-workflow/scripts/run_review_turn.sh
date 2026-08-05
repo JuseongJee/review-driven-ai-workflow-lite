@@ -51,13 +51,22 @@ load_review_config_once() {
   #   priority<TAB><공백 구분 우선순위 문자열>
   #   tool.<이름>.<필드><TAB><값 또는 "null">
   # null 필드는 tostring → "null" 문자열, missing 필드는 행 부재 (has($f) 계약과 동일).
+  # codex reasoning effort 3행 — 단계별 별도 키로 낸다 (spec §4.3).
+  # `//` 체인으로 effective value 만 뽑으면 source 근거가 소실되고,
+  # override 와 tool 기본값이 같은 값일 때 구분이 불가능하다. 우선순위 해석은 bash 가 한다.
   if ! kv="$(jq -r --arg rt "$review_type" '
     ( [ "priority",
         (((.overrides // {})[$rt].priority // .default_priority) | join(" ")) ]
       | @tsv ),
     ( (.tools // {}) | to_entries[] | .key as $t | .value | to_entries[]
       | [ "tool.\($t).\(.key)", (.value | tostring) ]
-      | @tsv )
+      | @tsv ),
+    ( [ "tool.codex.effort_override",
+        ( ((.overrides // {})[$rt].tools.codex.reasoning_effort) // "" ) ] | @tsv ),
+    ( [ "tool.codex.effort_default",
+        ( (.tools.codex.reasoning_effort) // "" ) ] | @tsv ),
+    ( [ "tool.codex.small_task_effort",
+        ( (.tools.codex.small_task_reasoning_effort) // "" ) ] | @tsv )
   ' "$CONFIG_FILE" 2>/dev/null)"; then
     echo "⚠️  설정 파일 파싱 실패: $CONFIG_FILE" >&2
     echo "    기본 설정으로 진행합니다: codex → claude" >&2
@@ -103,7 +112,128 @@ get_tool_config() {
   printf '%s' "$default_val"
 }
 
+# === A: codex reasoning effort override (review-turn-latency-reduction) ===
+# 모델은 override 하지 않는다 — 전역 ~/.codex/config.toml 이 단일 진실 원천이다.
+# 허용 하한(medium) 미만으로 거부할 값. 하한 검증은 small-task 자동 판정 경로에만 적용한다.
+# review type override 와 tool 기본값은 사용자가 리뷰 타입을 명시 지정한 것이므로
+# 하한을 강제하지 않는다 (spec §4.2).
+EFFORT_FLOOR_REJECT="low minimal"
+
+# effort 해석 결과 (set -u 방어용 전역 초기화)
+EFFORT_VALUE=""      # 빈 값이면 미전달 = 전역 config 를 따름
+EFFORT_SOURCE="global"
+EFFORT_REJECTED=""
+
+# SESSION.md 의 `## Review Scope` 에서 execution-path 를 읽는다.
+# 섹션·필드 부재(init_review_pipeline.sh 직접 호출로 만든 legacy 세션)나
+# 인식 불가 값은 unknown 으로 흡수되어 effort 가 적용되지 않는다 (AC 8).
+read_execution_path() {
+  local session_file="$1" v=""
+  if [[ -f "$session_file" ]]; then
+    v="$(awk '
+      /^## Review Scope/ { f=1; next }
+      f && /^## / { exit }
+      f && /^- execution-path:/ {
+        sub(/^- execution-path:[ \t]*/, ""); sub(/[ \t]+$/, ""); print; exit
+      }' "$session_file")"
+  fi
+  case "$v" in
+    small-task|other) printf '%s' "$v" ;;
+    *)                printf 'unknown' ;;
+  esac
+}
+
+# 우선순위: kill switch → small-task → review type override → tool 기본 → 미전달 (spec §4.2).
+# 미전달일 때도 EFFORT_SOURCE 에 근거를 남긴다 (global | kill-switch | below-floor) —
+# 가시성 상태 5종이 서로 구분되어야 하기 때문이다 (§4.7).
+resolve_effort_override() {
+  local exec_path="$1"
+  EFFORT_VALUE=""
+  EFFORT_SOURCE="global"
+  EFFORT_REJECTED=""
+
+  # 1) kill switch. override 는 최적화이고 kill 은 안전장치이므로 불확실하면 최적화를 포기한다.
+  if [[ -n "${RD_REVIEW_EFFORT_OVERRIDE+x}" ]]; then
+    if [[ "${RD_REVIEW_EFFORT_OVERRIDE}" != "0" ]]; then
+      echo "⚠️  RD_REVIEW_EFFORT_OVERRIDE 값을 인식할 수 없습니다: ${RD_REVIEW_EFFORT_OVERRIDE} (허용: 미설정 또는 0)" >&2
+      echo "    effort override 를 적용하지 않고 전역 설정을 따릅니다." >&2
+    fi
+    EFFORT_SOURCE="kill-switch"
+    return 0
+  fi
+
+  # 2) small-task. 키가 있을 때만 적용한다 — 키 부재는 자동 medium 이 아니라 다음 단계다 (AC 6).
+  local st
+  st="$(get_tool_config codex small_task_effort "")"
+  if [[ "$exec_path" == "small-task" && -n "$st" ]]; then
+    case " $EFFORT_FLOOR_REJECT " in
+      *" $st "*)
+        echo "⚠️  small_task_reasoning_effort=${st} 은 허용 하한(medium) 미만입니다." >&2
+        echo "    조용한 값 보정을 하지 않고 effort 를 전달하지 않습니다." >&2
+        EFFORT_SOURCE="below-floor"
+        EFFORT_REJECTED="$st"
+        return 0
+        ;;
+    esac
+    EFFORT_VALUE="$st"
+    EFFORT_SOURCE="small-task"
+    return 0
+  fi
+
+  # 3) review type override
+  local ov
+  ov="$(get_tool_config codex effort_override "")"
+  if [[ -n "$ov" ]]; then
+    EFFORT_VALUE="$ov"
+    EFFORT_SOURCE="review-type"
+    return 0
+  fi
+
+  # 4) tool 기본
+  local df
+  df="$(get_tool_config codex effort_default "")"
+  if [[ -n "$df" ]]; then
+    EFFORT_VALUE="$df"
+    EFFORT_SOURCE="tool-default"
+    return 0
+  fi
+
+  # 5) 미전달 — 전역 config 를 따른다 (현행 동작 = 후퇴 없음, AC 2)
+  return 0
+}
+
+# 턴 완료 후 실제 적용 상태 (spec §4.7 상태 5종).
+# 어댑터는 effort 를 받으면 그대로 전달하고, 값이 거부되면 즉시 실패한다(자동 재시도 없음).
+# 따라서 "턴이 성공했고 effort 를 전달했다" = "codex 가 그 값을 수락했다" 이며,
+# 부모가 아는 정보만으로 상태를 결정할 수 있다. 별도 결과 채널이 필요하지 않다.
+# 도구가 codex 가 아니면 effort 개념 자체가 없으므로 그 값을 보고하지 않는다.
+compute_effort_status() {
+  local tool="$1"
+
+  if [[ "$tool" != "codex" ]]; then
+    printf 'not-applicable (tool=%s)' "$tool"
+    return 0
+  fi
+
+  if [[ -z "$EFFORT_VALUE" ]]; then
+    case "$EFFORT_SOURCE" in
+      kill-switch) printf 'disabled-by-kill-switch' ;;
+      below-floor) printf 'rejected-below-floor:%s' "$EFFORT_REJECTED" ;;
+      *)           printf 'none/global' ;;
+    esac
+    return 0
+  fi
+
+  printf 'applied:%s (source: %s)' "$EFFORT_VALUE" "$EFFORT_SOURCE"
+}
+
 # --- 메인 ---
+# 테스트 seam: `source run_review_turn.sh` 로 호출되면 함수 정의만 로드하고 반환한다.
+# production 경로는 항상 `bash run_review_turn.sh <session>` 이므로 동작이 바뀌지 않는다.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  return 0
+fi
+
 case "${1:-}" in
   -h|--help|help)
     usage
@@ -147,6 +277,12 @@ fi
 
 load_review_config "$REVIEW_TYPE"
 compute_next_turn "$TURNS_DIR" "reviewer"
+
+# --- A: effort override 해석 (spec §4.2) ---
+# 판정 원본은 세션 생성 시 SESSION.md 에 고정 기록된 execution-path 다.
+# 턴마다 REQUEST.md 를 재파싱하지 않으므로 REQUEST 아카이브 후에도 안전하다.
+EXECUTION_PATH="$(read_execution_path "$SESSION_FILE")"
+resolve_effort_override "$EXECUTION_PATH"
 
 relative_session_dir="${session_dir#${project_root}/}"
 relative_session_file="${SESSION_FILE#${project_root}/}"
@@ -233,13 +369,38 @@ for tool in $PRIORITY; do
   export PROJECT_ROOT="$project_root"
   export SELF_REVIEW_WARNING="$self_review_warning"
 
+  # effort 는 codex 고유 개념이므로 codex invocation 에만 주입한다 (spec §4.5).
+  # `env -u` 로 먼저 **제거**하는 것이 핵심이다. 호출자 환경에 이 변수들이 남아 있으면
+  # ① kill switch 를 켜도 어댑터가 상속값을 읽어 실제로 effort 를 전달하고
+  # ② claude 어댑터도 상속받아 "codex 전용" 계약이 입력 환경에 따라 깨지며
+  # ③ 부모 표시는 계산값을 보고하므로 표시와 실제가 어긋난다.
+  adapter_env=(env -u TOOL_EFFORT -u EFFORT_SOURCE)
+  if [[ "$tool" == "codex" ]]; then
+    if [[ -n "$EFFORT_VALUE" ]]; then
+      adapter_env+=("TOOL_EFFORT=${EFFORT_VALUE}" "EFFORT_SOURCE=${EFFORT_SOURCE}")
+    fi
+    printf '리뷰 도구: %s / effort 시도: %s (source: %s)\n' \
+      "$tool" "${EFFORT_VALUE:-none}" "$EFFORT_SOURCE" >&2
+  else
+    printf '리뷰 도구: %s / effort 시도: none (source: not-applicable)\n' "$tool" >&2
+  fi
+
   # 어댑터 실행 — 실행 후 실패하면 즉시 중단 (세션 오염 가능)
-  if bash "$adapter"; then
+  if "${adapter_env[@]}" bash "$adapter"; then
     succeeded=true
     used_tool="$tool"
     break
   else
     echo "어댑터 실행 실패: ${tool}. 세션이 오염되었을 수 있으므로 즉시 중단합니다." >&2
+    # effort 를 전달했다면 무효값 가능성을 알리고 복구 경로를 제시한다.
+    # 자동 재시도는 하지 않는다 — 어느 지점에서 실패했는지 증명할 수 없으면
+    # 두 번째 agent 가 부분 수정된 세션을 이어서 고칠 위험이 더 크다.
+    if [[ "$tool" == "codex" && -n "$EFFORT_VALUE" ]]; then
+      echo "    reasoning effort '${EFFORT_VALUE}' (source: ${EFFORT_SOURCE}) 를 전달했습니다." >&2
+      echo "    이 값이 현재 모델에서 지원되지 않으면 codex 가 설정을 거부합니다. 복구 방법:" >&2
+      echo "      - 즉시 무력화: RD_REVIEW_EFFORT_OVERRIDE=0 을 설정하고 다시 실행" >&2
+      echo "      - 영구 해제: rd-workflow/config/review-tools.json 에서 해당 effort 키 제거" >&2
+    fi
     exit 1
   fi
 done
@@ -268,3 +429,4 @@ echo "session: ${relative_session_dir}"
 echo "turn: ${relative_expected_turn_file}"
 echo "status: ${updated_status}"
 echo "owner: ${updated_owner}"
+echo "effort override: $(compute_effort_status "$used_tool")"

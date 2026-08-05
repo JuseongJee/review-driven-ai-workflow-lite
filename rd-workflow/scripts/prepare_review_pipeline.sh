@@ -258,6 +258,32 @@ cat >> "${session_path}/SESSION.md" <<EOF
 - remote-mode: $CTX_REMOTE_MODE
 EOF
 
+# Review Scope section (review-turn-latency-reduction — A)
+# small-task 판정을 세션 생성 시 1회 수행해 고정한다. 턴마다 REQUEST.md 를 재파싱하면
+# diff-review 시점에는 REQUEST 가 아카이브되어 비어 있을 수 있다.
+# Branch Context 밖에 두는 이유: validate_branch_context 가 5필드를 strict 검증하므로
+# 6번째 필드를 넣으면 진행 중인 legacy 세션이 죽는다.
+# 정확히 `small-task` 단독일 때만 small-task 다. 템플릿 기본값(선택지 나열)·빈 값·
+# 섹션 부재·파일 부재는 unknown 이고, unknown 은 effort 미적용으로 흡수된다.
+CTX_EXEC_PATH="unknown"
+if [[ -f "${project_root}/REQUEST.md" ]]; then
+  CTX_EXEC_PATH_RAW="$(awk '
+    /^## Execution Path/ { f=1; next }
+    f && /^## / { exit }
+    f && /^[^[:space:]]/ { sub(/[ \t]+$/, ""); print; exit }' "${project_root}/REQUEST.md")"
+  case "$CTX_EXEC_PATH_RAW" in
+    small-task) CTX_EXEC_PATH="small-task" ;;
+    existing-code-change|new-feature-or-large-task) CTX_EXEC_PATH="other" ;;
+    *) CTX_EXEC_PATH="unknown" ;;
+  esac
+fi
+
+cat >> "${session_path}/SESSION.md" <<EOF
+
+## Review Scope
+- execution-path: $CTX_EXEC_PATH
+EOF
+
 cat <<EOF
 review pipeline prepared
 

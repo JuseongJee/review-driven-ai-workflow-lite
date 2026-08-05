@@ -218,6 +218,11 @@ bash rd-workflow/scripts/typecheck.sh
 
 리뷰 도구 우선순위와 설정. 교차 리뷰를 위해 여러 도구를 등록할 수 있습니다.
 
+codex 의 추론 깊이는 `tools.codex.reasoning_effort`(리뷰 타입별로는 `overrides.{타입}.tools.codex.reasoning_effort`)로
+조절합니다. 키가 없으면 아무것도 전달하지 않고 전역 `~/.codex/config.toml` 설정을 그대로 따릅니다.
+`RD_REVIEW_EFFORT_OVERRIDE=0` 이면 설정을 남긴 채 즉시 무력화하며, 적용 결과는 턴 완료 시
+`effort override: <상태>` 로 표시됩니다. 모델은 전역 설정이 단일 진실 원천이라 codex 에는 `model` 을 두지 않습니다.
+
 ## 디렉토리 구조
 
 ```
