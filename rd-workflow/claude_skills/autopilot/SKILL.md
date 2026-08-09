@@ -122,6 +122,43 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 �
 - 환경변수 `RD_AUTOPILOT_FR` 이 설정되어 있으면 무인 분기로 동작한다. unset 이면 기존 대화형 분기(§1 AskUserQuestion)로 동작한다 (기존 동작 불변).
 - 무인 분기에서는 §1 작업선택·모드선택의 `AskUserQuestion` 호출을 전면 금지한다. 헤드리스에는 AskUserQuestion 도구가 존재하지 않으므로, 반드시 환경변수로 대체한다.
 
+### 결과 대기 규율 (백그라운드 금지)
+
+무인 분기의 필수 제약이다 (위 AskUserQuestion 금지와 같은 층위). 이 규율은 Claude Code headless 실행 환경의 도구 계약(`timeout` 최대치, 장시간 명령의 자동 백그라운드 이관)에 근거하므로, 다른 harness 로 이 템플릿을 운용하는 경우에는 동일 동작이 보장되지 않는다.
+
+**갈림길은 "명령이 오래 걸리는가" 가 아니라 "누가 백그라운드를 시작했는가" 다.**
+
+| 백그라운드 시작 주체 | 결과 |
+|---|---|
+| 세션이 스스로 `run_in_background: true` 로 던짐 | **자멸** — 응답을 내는 순간 프로세스가 종료되어 결과를 수령할 주체가 사라진다. outcome 이 빈 채 남아 wrapper 가 `harness-error`(exit 40) 로 매핑한다 |
+| foreground 명령이 시간 초과로 harness 가 자동 이관 | **정상** — 완료 알림으로 재진입한다 |
+
+1. **결과가 필요한 명령을 `run_in_background: true` 로 시작하지 않는다.** 리뷰 턴 실행, 빌드, 검증 스크립트, subagent dispatch 가 모두 해당한다. 결과를 쓰지 않고 던져두기만 하는 명령에만 백그라운드를 쓴다.
+2. **긴 명령도 foreground 로 건다.** `timeout` 을 최대치인 `600000ms` 로 지정하고, 그보다 오래 걸리면 harness 의 자동 백그라운드 이관에 맡긴다. 스스로 백그라운드를 선택하지 않는다.
+
+   **명령 자체에 watchdog 이 있으면 안쪽을 바깥보다 크게 잡는다.** `run_review_turn.sh` 의 어댑터는 `WAIT_TIMEOUT`(기본 600초) 만료 시 리뷰 도구를 kill 한다 (`rd-workflow/docs/flows/FILE_BASED_REVIEW_PIPELINE.md` 「어댑터 대기 계약」). 바깥 `timeout` 도 600초라 두 타이머가 동률이며, 이때는 harness 가 자동 이관해도 안쪽 watchdog 이 거의 같은 시점에 턴을 죽여 자동 이관의 이득이 사라진다. 리뷰 턴은 안쪽을 명시적으로 늘려 건다 (아래 §2 실행 패턴과 동일).
+
+   ```bash
+   WAIT_TIMEOUT=3600 bash rd-workflow/scripts/run_review_turn.sh <session-path>
+   ```
+3. **소요 시간으로 자기 판단하지 않는다.** 리뷰 종류별 실측 소요는 편차가 크다.
+
+   | 리뷰 종류 | 실측 소요 |
+   |---|---|
+   | REQUEST review (턴당) | 64~89초 |
+   | spec/plan review | 약 26분 |
+   | final diff review | 600초 초과 |
+
+   한 종류의 값을 다른 종류에 적용하면 안 된다. 위 값은 특정 회차의 **관측값이지 보장치가 아니며**, 대상 규모·모델·부하에 따라 달라진다. 이 표의 목적은 값을 신뢰하라는 것이 아니라 종류마다 다르므로 한 값을 일반화하지 말라는 것이다.
+4. **세션 수명이 다하면 백그라운드로 도망가지 않는다.** `CURRENT_TASK.md` 에 진행 상태를 저장한 뒤 outcome 에 `resume` 을 기록하고 정상 종료한다. 재개에 필요한 세 정보 — **중단 이유 / 도달 단계 / 다음 재개 지점** — 를 두 곳에 남긴다.
+   - `CURRENT_TASK.md` — §5 의 기존 항목(완료된 단계, 현재 단계와 남은 작업, 열린 리뷰 세션 경로, 다음 세션에서 이어갈 명령)으로 충족한다.
+   - outcome 파일의 **2줄 이후** 요약. **첫 줄은 토큰 전용이다** — wrapper 가 `head -n1` 로 첫 줄만 읽으므로, 첫 줄에 요약을 섞으면 토큰 판독이 깨져 `harness-error` 로 오분류된다.
+5. **긴 foreground 에 들어가기 전에 무엇을 기다리는지 남긴다.** 최대 600초의 무응답 구간은 겉보기에 정체와 구별되지 않는다. 무인 세션에는 화면을 보는 사람이 없으므로 파일이 유일한 관찰 지점이다. 명령 실행 **직전** `CURRENT_TASK.md` Notes 에 진행 신호 한 줄을 기록하고, 복귀 후 같은 줄을 결과로 갱신한다.
+
+   ```
+   waiting: final diff review 턴 003 / run_review_turn.sh / started 17:42
+   ```
+
 ### 환경변수 계약
 
 | 변수 | 값 | 역할 |
@@ -185,7 +222,9 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 �
 REVIEW_TURN_LIMIT=50 bash rd-workflow/scripts/prepare_review_pipeline.sh <review-kind> [args...]
 
 # Claude 턴 작성 → Reviewer 턴 실행
-bash rd-workflow/scripts/run_review_turn.sh <session-path>
+# WAIT_TIMEOUT: 어댑터 watchdog 기본 600초는 Bash 도구 timeout 최대치와 동률이라 늘려 건다
+#   (「무인 진입」 § 결과 대기 규율 2)
+WAIT_TIMEOUT=3600 bash rd-workflow/scripts/run_review_turn.sh <session-path>
 ```
 
 - self-review(독립 reviewer 부재로 claude fallback) 시, autopilot은 `self_review_policy=block`이어도 차단되지 않고 자동 진행한다(자율성 보존). self-review 사용은 `mode=self-review`로 Tool History에 기록된다.

@@ -69,6 +69,71 @@ bash rd-workflow/scripts/lifecycle/archive.sh \
 호출 전에 fr branch에서 archive content commit
 (REQUEST.md 비우기, archive 파일, FR done, CURRENT_TASK.md reset 등) 완료해야 함.
 
+#### 종료 코드 계약
+
+| 종료 코드 | 의미 |
+|-----------|------|
+| `0` | core archive 성공. post-success cleanup 잔여가 있을 수 있으며, 있으면 stdout `archive: CLEANUP-PENDING` 요약 블록으로 알린다 |
+| non-zero | core 단계 실패 또는 안전 불변식 위반 |
+
+core 실패는 **원 명령의 종료 상태를 그대로 전달한다** — `set -e` 가 전파하는 경우와 명시적 guard 가 잡는 경우 모두 해당한다. guard 에서 실패를 잡을 때도 `rc=$?` 를 즉시 캡처해 그 값으로 종료하며, 특정 값으로 정규화하지 않는다.
+
+예외는 **이 변경 이전부터 존재하던 precheck guard 들**이다 (기본 브랜치 worktree 검증·clean state·fr ref 형식·override 불일치·fetch preflight 등). 이들은 종전 동작을 유지하기 위해 `exit 1` 을 그대로 둔다. 새로 추가되는 core 경로는 원 상태 전달 규칙을 따른다.
+
+#### 단계별 blocking 분류
+
+| 계층 | 단계 | 실패 시 |
+|------|------|---------|
+| **core** | 기본 브랜치·clean state precheck · review precheck · merge · metadata cleanup commit · tag · push | 즉시 non-zero 중단 |
+| **post-success cleanup** | worktree teardown(Step 7) · 로컬 브랜치(Step 8) · 원격 브랜치(Step 9) · loop-state 정리 | 다음 단계 계속, 잔여 기록, `0` 유지 |
+| **safety invariant** | ref 삭제 판정 위반 (아래) | 미삭제 ref 보존 · 뒤따르는 ref 삭제 스킵 · 비파괴 cleanup 계속 · non-zero |
+
+**안전 불변식 위반 조건** (고정 개수로 표현하지 않는다 — 조건은 추가될 수 있다):
+
+- `merge-base --is-ancestor` 가 거짓 — 진짜 미머지
+- 로컬 ref 판정 명령이 비정상 종료하거나 출력이 malformed
+- ref 가 존재하는데 expected-old 삭제가 거부됨 — tip 이동
+- 원격 ref 조회·파싱 실패
+- 원격 tip 이 base 의 ancestor 아님, 또는 원격 tip 객체가 로컬에 없어 판정 불능
+- `--force-with-lease` 미지원·버전 판정 불능으로 보호된 삭제 불가
+- lease 거부 또는 원격 삭제 push 실패
+- **worktree 등록 조회 실패 — 로컬 ref 삭제의 선행 조건을 판정할 수 없음**
+
+worktree **제거 실패**나 **등록 잔존**(locked·prune 만료 등)은 이 목록에 포함되지 않는다. 로컬 브랜치 삭제만 건너뛰는 일반 cleanup 실패이며 `0` 을 유지한다.
+
+#### 브랜치 삭제 판정
+
+- 로컬: `git for-each-ref` 로 tip 을 읽어 **존재 / 정상 부재 / 조회·파싱 실패** 3분류하고, `git merge-base --is-ancestor <fr-tip> <merge 대상 base>` 가 참일 때만 `git update-ref -d refs/heads/<fr> <검증한-tip>` 으로 삭제한다. 종료 상태 하나로 부재와 오류를 뭉뚱그리지 않는다.
+- 원격: `git ls-remote` 로 tip 을 고정해 동일하게 3분류하고, ancestor 확인 후 `git push --force-with-lease=refs/heads/<fr>:<고정한-tip> origin :refs/heads/<fr>` 로 삭제한다.
+- **순서 불변식**: 판정 base 는 **merge 완료 직후**에 캡처한 commit(`MERGE_BASE_COMMIT`)이다. Step 4 의 metadata cleanup commit 이 HEAD 를 전진시키므로 Step 8 시점의 HEAD 를 base 로 쓰면 안 된다.
+- **worktree 선행 조건**: `git update-ref -d` 는 `git branch -d` 와 달리 "다른 worktree 가 체크아웃 중인 브랜치" 보호가 없어, ref 를 지우면 그 worktree 가 broken HEAD 가 된다. 따라서 삭제 허용은 다음 한 문장으로 고정한다 — **정리를 마친 뒤 다시 조회했을 때 해당 브랜치를 체크아웃한 worktree 등록이 0건일 때만 로컬 ref 를 삭제한다.**
+  - 제거 명령이나 `git worktree prune` 의 종료 코드를 정리 완료의 근거로 삼지 않는다. locked worktree 의 경로가 사라진 경우와 prune 만료 미도달 경우는 **exit 0 인데 등록이 남는다**.
+  - 세 층위가 각각 **다른 위험**을 막는다.
+
+    | 층위 | 수단 | 보장 대상 |
+    |------|------|-----------|
+    | (a) 대상 존재 판정 | `branch refs/heads/<fr>` **라인 개수** | 경로 특수문자(개행 포함)와 무관하게 대상 유무를 정확히 판정 — ref 이름에는 개행이 들어갈 수 없다 |
+    | (b) 소유권 검증 | 제거 직전 `rev-parse --show-toplevel` 일치 + `symbolic-ref HEAD` 일치 | **제거 대상의 정확성** — 잘린 경로가 다른 브랜치의 worktree 를 가리켜도 그것을 제거하지 않는다 |
+    | (d) 최종 재조회 | 정리 후 (a) 재실행 | **대상 로컬 ref 의 미삭제** (fail-closed) |
+
+  - (d) 만으로는 부족하다. 재조회는 대상 ref 가 지워지지 않게 할 뿐, 잘린 경로로 **이미 제거해 버린 다른 worktree** 는 되돌리지 못한다. 그래서 (b) 가 별도로 필요하다.
+  - 목록은 `while ... done < <(...)` 의 process substitution 안에서 조회하지 않는다. 그 형태는 조회 실패를 바깥 루프에 전달하지 않아 "실패" 와 "대상 0건" 이 구분되지 않는다.
+  - `--porcelain -z` (NUL-safe)는 git 2.36+ 를 요구해 사실상 하한 2.23 과 충돌한다. 도입하지 않는 이유는 "재조회만으로 충분해서" 가 아니라 **(b) 소유권 검증이 버전 의존 없이 오대상 제거를 막고 (d) 가 대상 ref 를 지키기 때문**이다. `-z` 를 쓰면 2.23–2.35 사용자는 개행 경로가 없는 정상 상황에서도 자동 정리를 잃는다.
+
+#### 정리 잔여 요약 블록
+
+정리 미완 항목이 있으면 종료 직전 stdout 에 `archive: CLEANUP-PENDING` 마커로 시작하는 블록을 출력한다. 항목마다 `사유:` 와 `복구:` 두 줄이 따르며, **`복구:` 는 그대로 복사해 실행할 수 있는 셸 한 줄**이다. 복구 명령의 기본값은 상태 확인 같은 **비파괴 명령**이며, `git worktree remove --force` 나 `git branch -D` 처럼 데이터를 잃을 수 있는 명령은 기본값으로 제시하지 않고 필요 조건과 손실 범위를 `사유:` 에 적는다. 내부 레코드는 `<kind>\t<identifier>\t<reason>\t<command>` 4필드이고, `identifier` 는 `printf '%q'` 로 인코딩해 저장한다 (경로에 따옴표·TAB·개행이 있어도 레코드와 복사 실행이 깨지지 않게 하기 위함).
+
+#### 보존 계약의 범위
+
+"보존" 은 **아직 삭제하지 않았거나 이동이 감지된 ref** 에만 적용된다. 순차 삭제 도중 앞선 ref 가 검증을 통과해 삭제된 뒤 뒤쪽에서 위반이 감지되면 **이미 삭제된 ref 는 복구하지 않는다**. 검증 통과는 그 ref 의 모든 커밋이 merge 대상 base 에 포함됨을 뜻하므로 커밋 손실이 없기 때문이다. 보상 복구(compensating restore)는 구현하지 않는다. 종료 메시지도 이 범위를 그대로 표현한다 — "모든 ref 를 보존했다" 가 아니라 "아직 삭제하지 않은 ref 를 보존했다" 이다.
+
+#### git 버전
+
+lifecycle 스크립트 전체에 명문화된 git 최소 버전 정책은 없다. 다만 기존 코드가 `git switch`(2.23 도입)와 `git worktree`(2.5 도입)를 이미 사용하므로 **사실상 하한은 2.23** 이다.
+
+원격 브랜치 삭제 경로는 추가로 `--force-with-lease`(1.8.5 도입)를 요구한다. **이 1.8.5 는 해당 경로의 기능 하한일 뿐 프로젝트 전체 하한이 아니다.** 실행 전에 `git --version` 을 파싱해 하한 미만이거나 버전 판정이 불가능하면 원격 삭제를 **시도하지 않고** 안전 불변식 위반으로 처리한다. 어느 경우에도 무보호 삭제로 fallback 하지 않는다.
+
 ### `promote_rollback.sh`
 
 승격 후 작업을 abandon하고 fr branch를 폐기할 때 호출.
@@ -130,11 +195,12 @@ destructive — 재실행 안전망 없음. 조심해서 호출.
 ## 검증
 
 ```bash
-bash _ROOT_FILES/rd-workflow/scripts/lifecycle/test_lifecycle.sh
+bash _ROOT_FILES/rd-workflow/scripts/lifecycle/test_lifecycle.sh    # 헬퍼 함수 단위 테스트
+bash _ROOT_FILES/rd-workflow/scripts/lifecycle/test_integration.sh  # temp repo 기반 git state 전이 테스트
 ```
 
-현재 18 case (slug 정규화 11 + lifecycle helpers 7).
-Task 12에서 통합 테스트(`test_integration.sh`) 추가 예정.
+두 스크립트 모두 `bash rd-workflow/scripts/self_test.sh` 가 함께 실행한다.
+`archive.sh` 를 프로세스로 실행하는 시나리오(브랜치 정리·cleanup 잔여·안전 불변식)는 `test_integration.sh` 소관이다.
 
 ---
 

@@ -70,18 +70,68 @@ chmod 600 "$last_message_file"
 
 codex_pid=""
 watchdog_pid=""
+watchdog_dir=""
+watchdog_fd_open=0
+codex_pgid=""
+cleanup_done=0
+
+# 확인된 codex process group 에 살아 있는 프로세스가 있는가.
+# pgid 조회·판정은 반드시 `ps -eo pid,pgid` + awk 로 한다. `ps -o ... -p <pid>` 는
+# busybox ps 가 -p 를 지원하지 않아 빈 값을 돌려주고, 그러면 그룹 종료 경로로 넘어가지
+# 못해 codex 자식이 고아로 남아 호출자 파이프를 계속 붙잡는다(Alpine 실측).
+codex_group_alive() {
+  [ -n "$codex_pgid" ] || return 1
+  local n
+  n="$( { ps -eo pid,pgid 2>/dev/null || true; } | awk -v g="$codex_pgid" '$2==g' | wc -l | tr -d ' ' )"
+  [ "$n" -gt 0 ]
+}
+
+# cleanup 은 멱등이어야 한다: 신호 핸들러와 EXIT trap 이 연달아 호출되고,
+# 부분 초기화 상태(fifo 준비 도중 실패)에서도 호출된다.
 cleanup() {
+  [ "$cleanup_done" -eq 1 ] && return 0
+  cleanup_done=1
   # watchdog 종료 및 reap
   if [ -n "$watchdog_pid" ]; then
     kill "$watchdog_pid" 2>/dev/null || true
     wait "$watchdog_pid" 2>/dev/null || true
     watchdog_pid=""
   fi
-  # codex 프로세스 종료
-  if [ -n "$codex_pid" ] && kill -0 "$codex_pid" 2>/dev/null; then
+  # watchdog 타이머 fd 닫기 (부모가 보유)
+  if [ "$watchdog_fd_open" -eq 1 ]; then
+    exec 9<&- 2>/dev/null || true
+    watchdog_fd_open=0
+  fi
+  # watchdog 타이머 fifo·디렉터리 정리 (부분 생성 상태도 남기지 않는다)
+  if [ -n "$watchdog_dir" ]; then
+    rm -f "${watchdog_dir}/timer" 2>/dev/null || true
+    rmdir "${watchdog_dir}/timer" 2>/dev/null || true
+    rmdir "$watchdog_dir" 2>/dev/null || true
+    watchdog_dir=""
+  fi
+  # codex 프로세스(및 그 자손) 종료
+  # 그룹 종료는 **리더 생존과 독립**이어야 한다. 리더가 이미 죽은 뒤에도(타임아웃으로
+  # watchdog 이 리더를 종료한 경우, codex 가 자손을 남기고 정상 종료한 경우) 자손이
+  # 상속한 호출자 stderr fd 를 계속 보유하면 파이프가 닫히지 않는다 — 원 결함과 같은
+  # 유형이 한 단계 밖에서 재현된다. 그래서 codex_pgid 는 spawn 직후에 조회·검증해
+  # 보존해 두고, 여기서는 리더 생존 여부를 보지 않고 그 그룹을 종료한다.
+  # grace 후 판단도 리더 PID 가 아니라 **그룹 생존**을 기준으로 한다 — TERM 을 무시하는
+  # 자손이 남아 있는데 리더만 죽었다면 리더 기준 판단은 KILL 을 건너뛴다.
+  # 그룹에 살아 있는 프로세스가 있을 때만 종료 시퀀스를 수행한다. 무조건 grace 를 기다리면
+  # 이미 모두 종료된 정상·비정상 경로에서 KILL_GRACE 만큼 불필요하게 지연된다.
+  if [ -n "$codex_pgid" ] && codex_group_alive; then
+    kill -- -"$codex_pgid" 2>/dev/null || true
+    sleep "$KILL_GRACE"
+    if codex_group_alive; then
+      kill -9 -- -"$codex_pgid" 2>/dev/null || true
+    fi
+  elif [ -z "$codex_pgid" ] && [ -n "$codex_pid" ] && kill -0 "$codex_pid" 2>/dev/null; then
+    # 그룹이 확인되지 않은 경우의 폴백 — 단일 프로세스만 종료한다
     kill "$codex_pid" 2>/dev/null || true
     sleep "$KILL_GRACE"
     kill -0 "$codex_pid" 2>/dev/null && kill -9 "$codex_pid" 2>/dev/null || true
+  fi
+  if [ -n "$codex_pid" ]; then
     wait "$codex_pid" 2>/dev/null || true
   fi
   # .wait_timeout 마커 정리 (cleanup 시점 제거)
@@ -89,6 +139,32 @@ cleanup() {
   rm -f "$last_message_file"
 }
 trap cleanup EXIT
+# 신호는 명시적으로 처리한다. EXIT trap 만 두어도 cleanup 자체는 실행되지만,
+# job control 하에서 INT 의 종료 코드가 129 로 잘못 보고된다(명시적 trap 에서만 130).
+# 주의: 어댑터가 background job 으로 시작되면 SIGINT 은 셸 진입 시점에 무시로 설정되어
+# trap 자체가 무효다(POSIX). TERM·HUP 은 background job 에서도 정상 전달된다.
+# SIGKILL 은 트랩 불가이므로 보장 범위 밖이다.
+trap 'cleanup; exit 129' HUP
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+# --- watchdog 타이머 준비 (codex spawn 보다 먼저) ---
+# 순서가 계약이다: 여기서 실패하면 codex 는 아직 시작되지 않았으므로
+# "이미 시작된 codex 를 누가 종료·reap 하는가" 문제가 발생하지 않는다.
+# fd open 도 부모가 한다. 서브셸 안에서 열면 실패 시 fd 없이 read -t 가 즉시 실패해
+# t=0 에 거짓 타임아웃(마커 생성 + codex 종료)을 만든다.
+watchdog_dir="$(mktemp -d "${TMPDIR:-/tmp}/rd-watchdog.XXXXXX")"
+watchdog_fifo="${watchdog_dir}/timer"
+if ! mkfifo "$watchdog_fifo" 2>/dev/null; then
+  echo "watchdog 타이머 fifo 생성 실패: $watchdog_fifo" >&2
+  exit 1
+fi
+# 읽기·쓰기 양방향으로 열어 writer 부재 시 open 이 블록되지 않게 한다.
+if ! exec 9<> "$watchdog_fifo"; then
+  echo "watchdog 타이머 fifo open 실패: $watchdog_fifo" >&2
+  exit 1
+fi
+watchdog_fd_open=1
 
 # reasoning effort 전달 — 빈 값이면 -c 를 붙이지 않는다 (전역 설정을 따름 = 도입 전 동작).
 # -c 값은 TOML 로 파싱되므로 문자열을 따옴표로 감싼다.
@@ -96,6 +172,10 @@ trap cleanup EXIT
 extra_args=()
 [ -n "${TOOL_EFFORT:-}" ] && extra_args+=(-c "model_reasoning_effort=\"${TOOL_EFFORT}\"")
 
+# codex 를 자체 process group 리더로 띄운다 (set -m). cleanup 이 그룹 단위로 종료해
+# codex 가 남긴 자식까지 정리할 수 있게 하기 위함이며, pgid == codex_pid 를 ps 로 확인한
+# 뒤에만 그룹 종료하므로 무관한 그룹을 건드리지 않는다.
+set -m
 "$codex_bin" --ask-for-approval never exec \
   --cd "$PROJECT_ROOT" \
   --sandbox workspace-write \
@@ -104,14 +184,47 @@ extra_args=()
   --output-last-message "$last_message_file" \
   - < "$PROMPT_FILE" &
 codex_pid=$!
+set +m
+
+# pgid 를 spawn 직후에 확정해 보존한다. cleanup 은 리더 생존과 독립적으로 이 그룹을
+# 종료하므로, 타임아웃이나 codex 정상 종료 이후에도 자손이 남지 않는다.
+#
+# 조회는 레이스에 걸릴 수 있다 — spawn 직후 ps 가 아직 그 프로세스를 보여주지 않거나
+# codex 가 즉시 종료하면 리더 행 조회가 빈 값을 돌려준다. 실측(Ubuntu)에서 이 레이스로
+# 그룹 종료 경로를 놓쳤고, codex 자손이 고아로 남아 호출자 파이프를 계속 붙잡았다.
+# 그래서 리더 행만 찾지 않고 **pgid 가 codex_pid 인 구성원이 하나라도 있는지** 조회한다.
+# 이 형태가 소유권 확인이면서 레이스에 견딘다 — 리더가 조회 전에 종료했어도 자손이 남았다면
+# 그 그룹 행으로 확인되고, 그룹 자체가 없으면 종료할 대상도 없다. 오탐도 불가능하다:
+# pgid 는 그 그룹 리더의 pid 이므로 pgid == codex_pid 인 그룹은 codex 의 그룹뿐이다.
+# (리더 행만 조회하면 spawn 직후 레이스로 빈 값이 나와 그룹 종료 경로를 놓친다 — Ubuntu 실측)
+codex_pgid=""
+for _pg_try in 1 2 3 4 5 6 7 8 9 10; do
+  _pg_n="$( { ps -eo pid,pgid 2>/dev/null || true; } | awk -v g="$codex_pid" '$2==g' | wc -l | tr -d ' ' )"
+  if [ "$_pg_n" -gt 0 ]; then
+    codex_pgid="$codex_pid"
+    break
+  fi
+  sleep 0.05
+done
 
 # --- 대기: watchdog + wait (폴링 루프 없음, spec §2 결정 1) ---
 # 타임아웃 판정 = 마커 파일 원자 생성 (정본 계약 — kill -0 생존 추정 금지)
+# watchdog 은 sleep 자식을 두지 않는다: 위에서 부모가 연 fd 9 를 상속받아
+# 서브셸 자신이 read -t 로 타이머가 된다. sleep 을 자식으로 두면 kill 이 서브셸만 종료하고
+# sleep 이 고아로 남아 상속한 stderr fd 를 계속 보유하므로, 호출자가 stderr 를 파이프로 받을 때
+# 턴이 정상 완료된 뒤에도 WAIT_TIMEOUT 만큼 hang 한다.
+# read -t 의 타임아웃 반환값은 bash 3.2 에서 1, 5.x 에서 142 이므로 성공/실패만 판정한다.
 (
-  sleep "$WAIT_TIMEOUT"
+  read -t "$WAIT_TIMEOUT" -u 9 _dummy && exit 0
   # 타임아웃 마커를 tmp+mv로 원자적으로 생성
   tmpm="$(mktemp "${session_dir}/.wait_timeout.XXXXXX")" && mv "$tmpm" "$timeout_marker"
-  kill "$codex_pid" 2>/dev/null || true
+  # 검증된 그룹이 있으면 그룹 단위로 종료해 codex 자손까지 즉시 정리한다.
+  # 그룹이 없으면 리더만 종료하고, 남은 자손은 부모의 cleanup 이 처리한다.
+  if [ -n "$codex_pgid" ]; then
+    kill -- -"$codex_pgid" 2>/dev/null || true
+  else
+    kill "$codex_pid" 2>/dev/null || true
+  fi
 ) &
 watchdog_pid=$!
 
@@ -134,7 +247,8 @@ if [ "$timed_out" -eq 1 ] && ! check_turn_complete; then
     echo "--- codex last message ---" >&2
     cat "$last_message_file" >&2
   fi
-  exit 1
+  # 대기 타임아웃은 exit 124 (GNU timeout 관례) — 부모의 계측 status 매핑(timeout/fail 구분)이 소비.
+  exit 124
 fi
 
 if ! check_turn_complete; then

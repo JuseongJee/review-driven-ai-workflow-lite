@@ -78,6 +78,79 @@ $suggested
 EOF
 }
 
+# 지정 디렉터리 안의 watchdog 임시 디렉터리 개수 (절대 개수)
+# 전역 ${TMPDIR:-/tmp} 의 전후 델타로 판정하면 동시 실행 세션의 정상 정리가 이번 실행의
+# 누수를 상쇄해 위음성이 된다. 그래서 케이스마다 전용 TMPDIR 을 주입하고 그 안에서 0 을 본다.
+# find 는 권한 오류로 non-zero 를 반환할 수 있고 이 파일은 set -euo pipefail 이므로
+# || true 로 격리하지 않으면 호출 지점에서 테스트 전체가 조용히 중단된다(실측).
+leftover_watchdog_in() {
+  local n
+  n="$( { find "$1" -maxdepth 1 -type d -name 'rd-watchdog.*' 2>/dev/null || true; } | wc -l | tr -d ' ' )"
+  echo "$n"
+}
+
+# ps 신뢰성 self-check
+# ps -eo pid,command 는 busybox 에서 실패하고 그 실패가 wc -l 에서 0 으로 집계되어
+# "고아 0개" 라는 거짓 통과를 만든다. 개수 0 을 통과로 해석하기 전에 ps 가
+# 자기 자신을 볼 수 있는지 확인한다. 볼 수 없으면 판정을 신뢰할 수 없다.
+ps_is_trustworthy() {
+  local n
+  n="$( { ps -eo pid 2>/dev/null || true; } | grep -c "^ *$$\$" || true )"
+  [ "$n" -ge 1 ]
+}
+
+# --- 프로세스 소유권 (케이스 14·15 의 고아 검출·정리 근거) ---
+# 고아를 명령행 패턴(`sleep <값>`)으로 식별하지 않는다. 패턴 일치는 소유권 증거가 아니며,
+# 같은 값을 쓰는 다른 사용자·테스트·프로젝트의 프로세스를 종료할 수 있다.
+# 대신 어댑터를 자체 process group 리더로 띄운다. process group 은 자손에게 상속되고
+# 부모가 죽어 고아가 되어도 바뀌지 않으므로, 그 pgid 의 구성원이라는 사실이 곧
+# "이 케이스가 만든 프로세스" 라는 증거다 (macOS 3.2 / Alpine 5.3 / Ubuntu 5.2 실측).
+own_pgid() {  # $1: pid → pgid (관측 불가 시 빈 문자열)
+  { ps -eo pid,pgid 2>/dev/null || true; } | awk -v p="$1" '$1==p {print $2; exit}'
+}
+
+group_size() {  # $1: pgid → 살아 있는 구성원 수
+  local g="${1:-}"
+  [ -n "$g" ] || { echo 0; return; }
+  { ps -eo pid,pgid 2>/dev/null || true; } | awk -v g="$g" '$2==g' | wc -l | tr -d ' '
+}
+
+SELF_PGID="$(own_pgid $$)"
+JOB=""
+GROUP_PGID=""
+
+spawn_group() {  # $1: 로그 경로, 나머지: 실행할 명령 — 자체 process group 리더로 띄운다
+  local log="$1" i; shift
+  set -m
+  "$@" < /dev/null > "$log" 2>&1 &
+  JOB=$!
+  set +m
+  GROUP_PGID=""
+  # "pgid 가 리더 pid 인 구성원이 존재하는가" 로 확정한다. 리더가 즉시 종료해도 자손이
+  # 남았다면 그룹 행으로 확인되고, pgid == 리더 pid 이므로 오탐은 불가능하다.
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if [ "$(group_size "$JOB")" -gt 0 ]; then GROUP_PGID="$JOB"; break; fi
+    sleep 0.05
+  done
+}
+
+reap_group() {  # $1: pgid — 소유권이 확인된 그룹만 종료 (자기 그룹·빈 그룹은 건드리지 않는다)
+  local g="${1:-}"
+  [ -n "$g" ] || return 0
+  if [ -n "$SELF_PGID" ] && [ "$g" = "$SELF_PGID" ]; then return 0; fi
+  [ "$(group_size "$g")" -gt 0 ] || return 0
+  kill -9 -- -"$g" 2>/dev/null || true
+  return 0
+}
+
+# 케이스 전용 WAIT_TIMEOUT salt.
+# **bounded 값이며 유일성을 보장하지 않는다** — $$ 하위 5자리와 RANDOM 하위 3자리가 모두
+# 같으면 두 실행이 같은 값을 갖는다. 절단이 필요한 이유는 상한 때문이다: 밴드(1억 단위)를
+# 더한 뒤에도 2^31 아래여야 busybox sleep 이 파싱한다.
+# 겹쳐도 안전한 이유는 값이 종료 대상 식별에 전혀 쓰이지 않기 때문이다 — 정리는 위의
+# process group 소유권으로만 한다. 이 값의 역할은 로그 판독 편의뿐이다.
+RUN_SALT=$(( ($$ % 100000) * 1000 + (RANDOM % 1000) ))
+
 # mock codex bin을 임시 디렉토리에 생성하고 PATH 앞에 추가하는 함수
 # 사용: setup_mock <sandbox_dir> <script_body>
 setup_mock() {
@@ -211,10 +284,10 @@ run_case3() {
     mock_alive=1
   fi
 
-  if [ "$rc" -ne 0 ] && echo "$output" | grep -q "타임아웃"; then
-    pass "케이스 3: 타임아웃 exit 1 + 메시지 확인"
+  if [ "$rc" -eq 124 ] && echo "$output" | grep -q "타임아웃"; then
+    pass "케이스 3: 타임아웃 exit 124 + 메시지 확인"
   else
-    fail "케이스 3: 타임아웃 기대 — rc=$rc, 메시지=$(echo "$output" | grep -o '타임아웃' || echo '없음')"
+    fail "케이스 3: 타임아웃 기대 rc=124 — rc=$rc, 메시지=$(echo "$output" | grep -o '타임아웃' || echo '없음')"
   fi
 
   # mock 프로세스가 kill됐는지는 비동기 특성상 보조 확인만
@@ -902,6 +975,140 @@ RJSON
 }
 
 # ===========================================================================
+# 케이스 14: 정상 완료 후 watchdog 타이머 자손 생존 금지 + 자원 누수 금지
+#   관측 창 분리가 핵심 — 호출자 파이프 없이 실행해 즉시 반환시킨 뒤 관측한다.
+#   케이스 15(파이프)와 한 케이스로 합치면, 파이프 대기로 WAIT_TIMEOUT 을 소모하는
+#   동안 고아가 제 수명을 다 채우고 사라져 결함 코드에서도 통과하는 위음성이 발생한다(실측).
+# ===========================================================================
+run_case14() {
+  local sandbox turn_file mock_bin uniq_timeout survivors leftover g
+  sandbox="$(make_sandbox)"
+  mkdir -p "$sandbox/tmp"
+  turn_file="$sandbox/turns/turn-001-reviewer.md"
+  uniq_timeout=$(( 100000000 + RUN_SALT ))
+
+  write_session "$sandbox" "Author" "awaiting-author"
+
+  mock_bin="$(setup_mock "$sandbox" "
+touch '$turn_file'
+cat > '$sandbox/SESSION.md' <<'SESS_EOF'
+## Current Owner
+Author
+
+## Status
+awaiting-author
+
+## Turn Limit
+20
+SESS_EOF
+exit 0
+")"
+
+  # 어댑터를 자체 process group 리더로 띄운다 — 종료 후 그 그룹에 남은 구성원이 곧 고아다.
+  spawn_group "$sandbox/out.log" \
+    env TMPDIR="$sandbox/tmp" WAIT_TIMEOUT="$uniq_timeout" TOOL_BIN="$mock_bin/codex" \
+        SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null EXPECTED_TURN_FILE="$turn_file" \
+        PROJECT_ROOT="$sandbox" bash "$ADAPTER"
+  g="$GROUP_PGID"
+  wait "$JOB" 2>/dev/null || true
+
+  sleep 0.5
+
+  if ! ps_is_trustworthy || [ -z "$g" ]; then
+    fail "케이스 14a: ps 가 자기 PID/PGID 를 관측하지 못해 고아 판정을 신뢰할 수 없음 (busybox 등 ps 구현 확인 필요)"
+  else
+    survivors="$(group_size "$g")"
+    if [ "$survivors" -eq 0 ]; then
+      pass "케이스 14a: 정상 완료 후 잔존 타이머 자손 0개"
+    else
+      fail "케이스 14a: 잔존 타이머 자손 ${survivors}개 — watchdog 자손이 호출자 fd 를 계속 보유"
+    fi
+  fi
+  # 소유권이 확인된 그룹만 회수한다 (pkill -f·패턴 종료 금지 — 무관한 프로세스에 닿는다)
+  reap_group "$g"
+
+  # 누수는 이 케이스 전용 TMPDIR 안에서 절대 개수 0 으로 본다 (동시 실행 무관).
+  # 현행 코드에는 fifo 자체가 없어 이 어서션은 결함 코드에서도 통과한다 — 결함 검출용이
+  # 아니라 새 기법이 도입하는 자원의 누수 방지용 가드다 (AC4).
+  leftover="$(leftover_watchdog_in "$sandbox/tmp")"
+  if [ "$leftover" -eq 0 ]; then
+    pass "케이스 14b: 전용 TMPDIR 에 watchdog 임시 자원 잔존 0개"
+  else
+    fail "케이스 14b: 전용 TMPDIR 에 watchdog 임시 자원 ${leftover}개 잔존"
+  fi
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 15: 호출자가 stderr 를 파이프로 받아도 턴 완료와 함께 파이프가 닫힌다
+#   판정에 kill -0 를 쓰지 않는다 — 종료된 자식이 reap 전 좀비로 남으면 kill -0 가
+#   성공해 오판할 수 있다. 파이프라인 뒤에 sentinel 파일을 기록하고 그 존재를 폴링한다.
+#   sentinel 은 cat 이 종료된 뒤에만(= 파이프가 닫힌 뒤에만) 기록되므로 측정 대상과 일치한다.
+#   상한 폴링이라 결함이 있어도 WAIT_TIMEOUT 전체가 아니라 상한만 소모한다.
+# ===========================================================================
+
+# 케이스 15 파이프 본체. spawn_group 이 이 함수를 자체 process group 으로 띄우므로
+# 어댑터·watchdog·cat 이 모두 그 그룹에 들어가고, 회수를 그룹 단위로 할 수 있다.
+# sentinel 은 파이프라인 **뒤에** 기록되므로 cat 종료(= 파이프 EOF)와 시점이 일치한다.
+case15_body() {  # $1=sandbox $2=WAIT_TIMEOUT $3=mock_bin $4=turn_file
+  env TMPDIR="$1/tmp" WAIT_TIMEOUT="$2" TOOL_BIN="$3/codex" SESSION_PATH="$1" \
+      PROMPT_FILE=/dev/null EXPECTED_TURN_FILE="$4" PROJECT_ROOT="$1" \
+      bash "$ADAPTER" 2>&1 | cat > "$1/piped.log" || true
+  echo done > "$1/.piped_done"
+}
+
+run_case15() {
+  local sandbox turn_file mock_bin uniq_timeout cap job waited g
+  sandbox="$(make_sandbox)"
+  mkdir -p "$sandbox/tmp"
+  turn_file="$sandbox/turns/turn-001-reviewer.md"
+  uniq_timeout=$(( 200000000 + RUN_SALT ))
+  cap=6             # 상한(초)
+
+  write_session "$sandbox" "Author" "awaiting-author"
+
+  mock_bin="$(setup_mock "$sandbox" "
+touch '$turn_file'
+cat > '$sandbox/SESSION.md' <<'SESS_EOF'
+## Current Owner
+Author
+
+## Status
+awaiting-author
+
+## Turn Limit
+20
+SESS_EOF
+exit 0
+")"
+
+  spawn_group "$sandbox/wrap.log" case15_body "$sandbox" "$uniq_timeout" "$mock_bin" "$turn_file"
+  job="$JOB"
+  g="$GROUP_PGID"
+
+  waited=0
+  while [ "$waited" -lt "$cap" ] && [ ! -f "$sandbox/.piped_done" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if [ -f "$sandbox/.piped_done" ]; then
+    pass "케이스 15: stderr 파이프 수신 시에도 턴 완료와 함께 파이프 닫힘 (${waited}초, 상한 ${cap}초)"
+  else
+    fail "케이스 15: 턴 완료 후에도 호출자 파이프가 ${cap}초 이상 열린 채 유지 (WAIT_TIMEOUT=${uniq_timeout})"
+  fi
+
+  # fd 보유자를 먼저 회수한 뒤 job 을 reap 한다 — 순서를 바꾸면 cat 이 EOF 를 못 받아
+  # wait 가 무한 대기한다. 회수는 소유권이 확인된 그룹 단위로만 하며, 그 그룹에
+  # 어댑터·watchdog 고아·cat 이 모두 들어 있다 (pkill -f·패턴 종료 금지).
+  # 블록 전체의 stderr 를 버리는 것은 kill -9 후 bash 가 내는 job 상태 알림
+  # (`... Killed: 9 ...`) 이 판정 로그를 가리는 것을 막기 위함이다.
+  { reap_group "$g"; wait "$job" || true; } 2>/dev/null
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
 # 실행
 # ===========================================================================
 echo "=== adapter_codex.sh 대기 계약·판정 단일화 테스트 ==="
@@ -930,6 +1137,13 @@ echo ""
 
 run_case12
 run_case13
+
+echo ""
+echo "=== 회귀 테스트 — watchdog 자손 lifecycle (fix: 고아 sleep 이 호출자 파이프 점유) ==="
+echo ""
+
+run_case14
+run_case15
 
 echo ""
 echo "=== 결과: PASS=$PASS FAIL=$FAIL ==="

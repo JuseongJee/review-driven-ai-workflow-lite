@@ -45,7 +45,17 @@ manifest status가 `running`인 동안 반복합니다:
 4. **실패 처리(exit 10/20/30/40 또는 재확인 실패)**:
    - exit 20/30 또는 재확인 실패 → `set-state <manifest> "$slug" blocked ...`. 이어서 `skip=$(... skip-dependents <manifest> "$slug")`의 각 slug를 `set-state <manifest> <s> skipped "" "선행 $slug blocked"`로 기록합니다. 독립 FR은 계속합니다.
    - exit 10(resume) → item은 `running` 유지(set-state로 바꾸지 않음), manifest `.status`를 `paused`로 저장(tmp+mv 규율 — 호출 형식 참조)하고 재개 안내 후 멈춥니다. 다음 `/fr batch` 실행이 이 paused manifest를 감지해 재개를 확인하고, `.status`를 `running`으로 되돌린 뒤(호출 형식 참조) 국면 2를 재진입하면 `next`가 이 `running` item을 최우선 산출해 같은 FR을 이어갑니다. 잔여 규모 보고가 필요하면 `batch_manifest.sh summary` 의 `pending=`/`running=` 값을 사용합니다(임의 jq 집계 금지).
-   - exit 40(harness-error) → 1회 재시도 후 재발 시 `blocked` 처리(ralph와 동일 정책).
+   - exit 40(harness-error) → 1회 재시도 후 재발 시 `blocked` 처리(ralph와 동일 정책). **재시도 전에 재개 지점을 정리합니다**:
+     1. 열린 리뷰 세션의 최신 Reviewer 턴이 `이의 없음` 이면 그 세션을 `awaiting-user` 로 종결 처리합니다 — 네 가지를 모두 갱신합니다.
+        - `SESSION.md`: `Status=awaiting-user`, `Current Owner=User`
+        - `CHECKPOINT.md`: 현재 결론과 남은 쟁점. 미해결이 없으면 Open Issues 를 정확히 `- 없음` 한 줄로 적습니다 (그 외 산문 표기는 미해결로 판정됩니다)
+        - `USER_ACTION.md`: 사용자가 취할 다음 행동과 질문. **이 갱신을 빠뜨리면 Owner 는 User 인데 안내는 "확인이 필요한 단계가 아닙니다" 라고 말하는 모순 상태가 사용자에게 노출됩니다**
+        - 리뷰 요약 report: `rd-workflow-workspace/reports/reviews/` 에 작성
+        사람이 마무리를 승인하기 전에는 `closed` 로 전환하지 않습니다 (`rd-workflow/docs/flows/FILE_BASED_REVIEW_PIPELINE.md` 종료 규칙).
+     2. `CURRENT_TASK.md` Status 를 실제 진행 단계에 맞게 보정합니다.
+     3. 정리 결과를 `CURRENT_TASK.md` Notes 에 기록합니다.
+
+     매 시도가 서로 다른 지점까지 진도를 냈다면 작업 결함이 아니라 세션 수명 문제입니다. `blocked` 로 버리기 전에 autopilot SKILL.md 「무인 진입」의 「결과 대기 규율」 위반 여부를 확인합니다.
    - 상태전이는 모두 `set-state`로 수행되어 매번 flush됩니다(재개 지점 최신화).
 
 ### 국면 3 — 최종 요약

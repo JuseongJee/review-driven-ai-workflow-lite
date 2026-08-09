@@ -226,7 +226,14 @@ grep -q '재시도' "$TMP/err_rejected"; [ $? -ne 0 ]
 chk $? "어댑터가 재시도를 시도하지 않음"
 
 # 제거된 경로가 코드에 남아 있지 않은지 (재발 방지)
-for pat in 'mkfifo' 'session_manifest' 'can_retry_without_effort' 'EFFORT_RESULT_FILE' 'join_timeout'; do
+#
+# 목록에서 'mkfifo' 를 뺐다. 이 가드의 의도는 "제거된 effort 재시도 기계장치의 재도입 금지"
+# 이고, mkfifo 는 그 기계장치가 결과 전달에 fifo 를 쓴 탓에 대리 표지로 들어가 있었다.
+# adapter-watchdog-orphan-sleep 이후 어댑터는 **무관한 목적**으로 fifo 를 쓴다 — watchdog
+# 타이머가 자식 프로세스를 두지 않도록 fifo + `read -t` 로 자신이 타이머가 되는 구조다.
+# 아래 4개는 그 기계장치의 고유 식별자이므로 실수로 도입될 수 없고, 가드의 실제 의도를
+# 그대로 유지한다. 'mkfifo' 를 남겨 두면 정당한 사용을 막는 위양성이 된다.
+for pat in 'session_manifest' 'can_retry_without_effort' 'EFFORT_RESULT_FILE' 'join_timeout'; do
   grep -q "$pat" "${script_dir}/adapter_codex.sh"; [ $? -ne 0 ]
   chk $? "어댑터에 제거된 재시도 기계장치가 남지 않음: ${pat}"
 done

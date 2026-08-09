@@ -200,8 +200,17 @@ cp rd-workflow/config/review-tools.json.example rd-workflow/config/review-tools.
 | `tools.claude.self_review_warning` | 셀프 리뷰 경고 표시 | `true` |
 | `tools.claude.self_review_policy` | self-review 정책 `block`(기본,차단) / `warn`(경고 후 통과) / `off`(무음 통과) | `block` |
 | `overrides.<type>.priority` | 리뷰 타입별 우선순위 오버라이드 | - |
+| `overrides.<type>.tools.codex.reasoning_effort` | 리뷰 타입별 codex reasoning effort | - |
 
 `REVIEW_TOOLS_CONFIG` 환경변수로 설정 파일 경로를 override할 수 있다.
+
+### 턴 계측 (turn_metrics.tsv)
+
+`run_review_turn.sh` 는 리뷰어 턴마다 세션 디렉토리의 `turn_metrics.tsv` 에
+`turn / review_type / tool / effort / prompt_bytes / target_bytes / start_epoch / end_epoch / wall_seconds / status(ok|timeout|fail)` 를 append 한다.
+`status` 는 어댑터 프로세스 종료 상태(0→ok, 124→timeout, 그 외→fail)이며 턴 최종 유효성과는 별개다.
+기록 실패는 턴 실행을 막지 않는다(fail-open — 시간 원천 실패 포함). 단, 기록 실패는 stderr 에 `⚠️ turn metric ...` 경고로 표시되므로, 파일 부재는 계측 도입 이전 세션이거나 **기록 실패**(실행 stderr 의 경고로 구분)일 수 있다.
+턴 완료 시 stdout `turn time: <N>s` 와 stderr `turn time: <N>s (status: <s>)` 로도 표시된다.
 
 `jq`가 설치되지 않으면 설정 파일을 무시하고 기본값(`codex → claude`)으로 동작한다.
 설정 파일이 없어도 기본값으로 동작한다.

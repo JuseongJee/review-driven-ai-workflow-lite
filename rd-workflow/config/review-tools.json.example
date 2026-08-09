@@ -18,6 +18,7 @@
     }
   },
   "overrides": {
+    "_comment": "spec-plan-review 의 high 는 paired 실험(2026-08-07, 결과 R3 사용자 예외 채택) 기반 잠정 권장값 — 정답표 검출 비열등(6/6 vs 5/6)·latency 12.6% 단축·토큰 절감. 롤백: 이 키 제거(종별) 또는 RD_REVIEW_EFFORT_OVERRIDE=0(전체). 근거: rd-workflow-workspace/reports/2026-08-07-2233-review-effort-tuning-experiment.md",
     "diff-review": {
       "priority": ["codex"]
     },
@@ -25,6 +26,13 @@
       "tools": {
         "codex": {
           "reasoning_effort": "medium"
+        }
+      }
+    },
+    "spec-plan-review": {
+      "tools": {
+        "codex": {
+          "reasoning_effort": "high"
         }
       }
     }

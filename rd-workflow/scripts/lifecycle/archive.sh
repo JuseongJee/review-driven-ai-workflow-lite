@@ -107,6 +107,16 @@ else
   }
 fi
 
+# 순서 불변식: 판정 base 는 반드시 merge 완료 "이후" 에 캡처한다.
+# Step 4 의 metadata cleanup commit 이 HEAD 를 전진시키므로 Step 8 시점의 HEAD 는 base 로 부적합하다
+# (그 HEAD 를 쓰면 merge 가 실제로 수행되지 않은 상황에서도 판정이 참이 될 여지가 생긴다).
+# core 실패이므로 원 명령의 종료 상태를 그대로 전달한다 (특정 값으로 정규화하지 않는다).
+MERGE_BASE_COMMIT="$(git rev-parse HEAD)" || {
+  _mb_rc=$?
+  printf 'archive: merge 대상 commit 결정 실패 (rc=%s) — 중단\n' "$_mb_rc" >&2
+  exit "$_mb_rc"
+}
+
 # Step 4 — metadata cleanup commit on main (publish 전)
 if metadata_exists; then
   metadata_clear
@@ -154,28 +164,307 @@ if [[ "$REMOTE_MODE" == "remote" ]]; then
   git push origin "$TARGET_TAG" || { printf 'archive: tag push 실패 — 재실행으로 복구\n' >&2; exit 1; }
 fi
 
-# Step 7 — Worktree teardown (destructive, publish 후, whitespace-safe)
-FAILED_WT=""
-while IFS= read -r fr_wt; do
-  [[ -z "$fr_wt" ]] && continue
-  [[ -d "$fr_wt" ]] || continue
-  if ! git worktree remove "$fr_wt"; then
-    FAILED_WT="$fr_wt"
-    break
+# ---------------------------------------------------------------------------
+# post-success cleanup 경계
+# core 산출물(merge · metadata cleanup commit · tag · push)이 만들어진 이후 단계는
+# 개별 실패가 스크립트를 중단시키지 않는다. 미완 항목을 모아 종료 직전에 한 번에 요약한다.
+# 잔여 레코드 형식: <kind>\t<identifier>\t<reason>\t<command>
+#   kind    ∈ worktree | local-branch | remote-branch | loop-state
+#             (분리 FR archive-cleanup-visibility 가 이 4필드를 마커 파일로 직렬화한다)
+#   reason  : 사람이 읽는 사유. TAB·개행 없는 고정 문구만 쓴다.
+#   command : 복사해 그대로 실행 가능한 셸 한 줄. 자연어 지시문을 넣지 않는다.
+#             데이터를 지울 수 있는 명령(worktree remove --force / branch -D)은 기본값으로
+#             제시하지 않고, 필요 조건과 손실 범위를 reason 에 적는다.
+# identifier 를 %q 로 인코딩하는 이유: 경로에 작은따옴표·TAB·개행이 들어가도
+#   (1) TAB 구분·개행 구분 레코드가 깨지지 않고 (2) 출력을 셸에 그대로 붙여넣어도 안전하다.
+# ---------------------------------------------------------------------------
+CLEANUP_PENDING=""
+SAFETY_VIOLATION=0
+WORKTREE_PENDING=0
+CLEANUP_TAB="$(printf '\t')"
+
+cleanup_add() {  # cleanup_add <kind> <identifier> <reason> <command>
+  CLEANUP_PENDING="${CLEANUP_PENDING}${1}${CLEANUP_TAB}$(printf '%q' "$2")${CLEANUP_TAB}${3}${CLEANUP_TAB}${4}"$'\n'
+}
+
+safety_violation() {  # safety_violation <kind> <identifier> <reason> <command>
+  SAFETY_VIOLATION=1
+  printf 'archive: 안전 불변식 위반 — %s\n' "$3" >&2
+  cleanup_add "$1" "$2" "$3" "$4"
+}
+
+is_oid() {  # is_oid <string> — sha1(40) 또는 sha256(64) hex 이면 0
+  case "$1" in
+    ''|*[!0-9a-f]*) return 1 ;;
+  esac
+  [[ "${#1}" -eq 40 || "${#1}" -eq 64 ]]
+}
+
+git_supports_lease() {  # git >= 1.8.5 이면 0. 미지원·판정 불능이면 1 (fail-closed)
+  local v major minor patch
+  v="$(git --version 2>/dev/null | awk '{print $3}')" || return 1
+  major="$(printf '%s' "$v" | cut -d. -f1)"
+  minor="$(printf '%s' "$v" | cut -d. -f2)"
+  patch="$(printf '%s' "$v" | cut -d. -f3)"
+  patch="${patch%%[!0-9]*}"          # "0.rc1" 같은 표기에서 선행 숫자만
+  [[ -z "$patch" ]] && patch=0
+  case "$major" in ''|*[!0-9]*) return 1 ;; esac
+  case "$minor" in ''|*[!0-9]*) return 1 ;; esac
+  [[ "$major" -gt 1 ]] && return 0
+  [[ "$major" -lt 1 ]] && return 1
+  [[ "$minor" -gt 8 ]] && return 0
+  [[ "$minor" -lt 8 ]] && return 1
+  [[ "$patch" -ge 5 ]]
+}
+
+# Step 7 — Worktree teardown (post-success cleanup)
+#
+# 안전 불변식: "정리를 마친 뒤 다시 조회했을 때 fr 브랜치를 체크아웃한 worktree 등록이 0건" 일 때만
+# 로컬 ref 삭제를 허용한다. update-ref -d 에는 branch -d 가 갖던 worktree 보호가 없으므로
+# (실측: worktree 가 살아 있어도 ref 가 삭제되고 그 worktree 는 broken HEAD 가 됨)
+# 제거 명령의 성공 여부가 아니라 "최종 상태" 를 근거로 삼는다.
+# 아래 세 경우가 모두 "명령은 성공했는데 등록이 남는" 형태이기 때문이다 (셋 다 실측 확인):
+#   1) locked worktree 의 경로 소실 → prune 이 exit 0 인데 등록 잔존
+#   2) prune 만료 기준 미도달 → 동일
+#   3) 경로에 개행 포함 → --porcelain 출력이 쪼개져 경로 추출값이 잘림 (줄 수는 정상과 같아 개수 비교로 감지 불가)
+#
+# 대상 존재 판정은 경로가 아니라 branch 라인 개수로 한다.
+# ref 이름에는 개행이 들어갈 수 없으므로 이 판정은 경로 특수문자와 무관하게 정확하다.
+# grep -F 로 브랜치명의 정규식 메타문자를 무력화하고 -x 로 접두사 오탐(fr/foo ↔ fr/foobar)을 막는다.
+wt_match_count() {  # stdout: 등록 수. 조회 실패 시 return 1
+  local out
+  out="$(git worktree list --porcelain 2>/dev/null)" || return 1
+  printf '%s\n' "$out" | grep -c -x -F "branch refs/heads/$FR_BRANCH" || true
+}
+
+# 제거 대상의 정확성 게이트.
+# 경로에 개행이 있으면 --porcelain 추출값이 잘리는데, 그 잘린 접두사가 마침 "다른 브랜치의
+# clean worktree" 이면 git worktree remove 가 실패하지 않고 범위 밖 worktree 를 지운다 (실측 확인).
+# 최종 재조회는 대상 ref 의 미삭제만 보장할 뿐 이미 벌어진 오대상 제거를 되돌리지 못하므로,
+# 제거 직전에 "이 경로가 정말 대상 브랜치의 worktree 루트인가" 를 확인한다.
+# --show-toplevel 비교가 필요한 이유: git -C 는 worktree 가 아닌 디렉토리에서도 상위 저장소를
+# 찾아 올라가므로, 경로 자체가 루트인지 확인하지 않으면 상위 repo 의 HEAD 를 보고 오판정한다.
+wt_owns_fr_branch() {  # wt_owns_fr_branch <path> — 0 = 대상 브랜치의 worktree 루트
+  local p="$1" top ref
+  top="$(git -C "$p" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [[ "$top" == "$p" ]] || return 1
+  ref="$(git -C "$p" symbolic-ref --quiet HEAD 2>/dev/null)" || return 1
+  [[ "$ref" == "refs/heads/$FR_BRANCH" ]]
+}
+
+WT_COUNT_BEFORE=""
+if ! WT_COUNT_BEFORE="$(wt_match_count)"; then
+  WORKTREE_PENDING=1
+  safety_violation "worktree" "$FR_BRANCH" \
+    "worktree 등록 조회 실패 — 로컬 ref 삭제의 선행 조건을 판정할 수 없어 삭제하지 않았습니다" \
+    "git worktree list --porcelain"
+elif [[ "$WT_COUNT_BEFORE" -gt 0 ]]; then
+  # (b) 제거 시도. 경로 추출 자체는 개행에 취약하므로, 제거 대상의 정확성은 아래 wt_owns_fr_branch
+  # 소유권 검증이 보증한다 — (d) 재조회는 대상 ref 의 미삭제만 보증할 뿐 이미 벌어진 오대상 제거는 되돌리지 못한다.
+  # break 를 두지 않아 대상이 여럿이면 모두 시도한다.
+  # git worktree add --force 로 동일 브랜치를 여러 worktree 에서 체크아웃할 수 있으므로(실측)
+  # 이 루프는 실제로 다중 대상에 도달한다.
+  WT_TARGETS="$(git worktree list --porcelain 2>/dev/null | awk -v b="$FR_BRANCH" '
+    /^worktree /{p=$0; sub(/^worktree /,"",p); next}
+    $0=="branch refs/heads/"b{print p}
+  ')" || WT_TARGETS=""
+  while IFS= read -r fr_wt; do
+    [[ -z "$fr_wt" ]] && continue
+    if [[ ! -d "$fr_wt" ]]; then
+      # 경로가 사라진 등록. prune 은 "경로가 실재하지 않는 등록" 만 지우는 비파괴 명령이라
+      # 자동 실행이 안전하다. 다만 그 성공을 정리 완료의 근거로 삼지 않는다 (locked entry 는 exit 0 인데 남는다).
+      git worktree prune || true
+      continue
+    fi
+    if ! wt_owns_fr_branch "$fr_wt"; then
+      # 추출값이 잘렸거나 다른 브랜치의 worktree 를 가리킨다 → 건드리지 않는다.
+      # 대상이 실제로 남아 있다면 아래 (d) 재조회가 잡아 pending 으로 만든다.
+      printf 'archive: %s 는 %s 의 worktree 루트가 아님 — 제거 건너뜀\n' "$fr_wt" "$FR_BRANCH" >&2
+      continue
+    fi
+    if ! git worktree remove "$fr_wt"; then
+      printf 'archive: worktree remove %s 실패 — 정리 잔여로 기록\n' "$fr_wt" >&2
+      # 복구 기본값은 비파괴 확인 명령이다. --force 는 미커밋 변경을 잃으므로 사유에만 조건부로 적는다.
+      cleanup_add "worktree" "$fr_wt" \
+        "worktree 제거 실패 — 미커밋 변경 확인 필요. 변경이 없으면 git worktree remove 로 재시도하고, --force 는 미커밋 변경을 삭제합니다" \
+        "git -C $(printf '%q' "$fr_wt") status --short"
+    fi
+  done <<EOF
+$WT_TARGETS
+EOF
+
+  # (d) 최종 재조회 — 권위 판정. 여기서만 WORKTREE_PENDING 을 확정한다.
+  WT_COUNT_AFTER=""
+  if ! WT_COUNT_AFTER="$(wt_match_count)"; then
+    WORKTREE_PENDING=1
+    safety_violation "worktree" "$FR_BRANCH" \
+      "worktree 등록 재조회 실패 — 정리 완료를 확인할 수 없어 로컬 ref 를 삭제하지 않았습니다" \
+      "git worktree list --porcelain"
+  elif [[ "$WT_COUNT_AFTER" -gt 0 ]]; then
+    WORKTREE_PENDING=1
+    cleanup_add "worktree" "$FR_BRANCH" \
+      "정리 후에도 이 브랜치를 체크아웃한 worktree 등록이 ${WT_COUNT_AFTER}건 남아 있습니다 (locked·경로 이상 등). 로컬 브랜치 삭제를 건너뜁니다" \
+      "git worktree list --porcelain"
   fi
-done < <(git worktree list --porcelain | awk -v b="$FR_BRANCH" '
-  /^worktree /{p=$0; sub(/^worktree /,"",p); next}
-  $0=="branch refs/heads/"b{print p}
-')
-[[ -n "$FAILED_WT" ]] && { printf 'archive: worktree remove %s 실패\n' "$FAILED_WT" >&2; exit 1; }
-
-# Step 8 — Local branch 삭제
-git rev-parse --verify "$FR_BRANCH" >/dev/null 2>&1 && git branch -d "$FR_BRANCH"
-
-# Step 9 — Remote branch delete (non-blocking warning)
-if [[ "$REMOTE_MODE" == "remote" ]]; then
-  git push origin --delete "$FR_BRANCH" 2>&1 | sed 's/^/archive: remote-branch-delete: /' || \
-    printf 'archive: WARNING remote branch delete 실패 (non-blocking)\n' >&2
 fi
 
-printf 'archive: 완료. tag=%s\n' "$TARGET_TAG"
+# Step 8 — Local branch 삭제 (검증 → expected-old 삭제)
+# git branch -d 는 upstream 이 설정된 브랜치를 "HEAD 기준" 이 아니라 "upstream 기준" 으로 판정한다.
+# 이 워크플로는 fr 을 매 커밋마다 push 하지 않으므로 local fr tip > origin/fr tip 이 정상 상태이고,
+# 그 정상 상태가 오판정되어 실패했다. 판정을 MERGE_BASE_COMMIT 기준 ancestor 검사로 바꾼다.
+if [[ "$WORKTREE_PENDING" -eq 1 ]]; then
+  # update-ref -d 는 branch -d 와 달리 "다른 worktree 가 체크아웃 중인 브랜치" 보호가 없다.
+  # worktree 가 남았거나 목록 판정이 불가능한 상태에서 ref 를 지우면 그 worktree 가
+  # broken HEAD 가 되므로 시도하지 않는다.
+  # worktree 제거 실패(일반 cleanup 실패)는 exit 0 을 유지하고,
+  # 목록 판정 불능은 Step 7 에서 이미 안전 불변식 위반으로 기록되어 non-zero 가 된다.
+  printf 'archive: worktree 정리 미완 — 로컬 브랜치 삭제 미시도\n' >&2
+  # command 는 비파괴 확인 명령이어야 한다. archive.sh 재실행은 merge/tag/push 까지 다시 진입할 수 있는
+  # 변이 명령이며, "fr 잔존 + tag 존재" 상태의 멱등 continuation 경로는 이번 범위에서 설계·검증하지 않았다.
+  # 따라서 후속 조치 안내는 reason 에만 둔다.
+  cleanup_add "local-branch" "$FR_BRANCH" \
+    "worktree 정리가 끝나지 않아 로컬 브랜치 삭제를 시도하지 않았습니다 (update-ref -d 에는 worktree 보호가 없습니다). 아래로 남은 등록을 확인하고 worktree 를 정리한 뒤 브랜치를 수동으로 정리하십시오" \
+    "git worktree list --porcelain"
+else
+  # for-each-ref 의 패턴은 정확 일치뿐 아니라 slash 경계의 하위 ref 도 매치한다 (실측).
+  # 대상 refs/heads/fr/foo 가 없고 refs/heads/fr/foo/child 하나만 있으면 %(objectname) 만 읽을 때
+  # child 의 유효 OID 한 줄이 나와 "대상 존재" 로 오인되고, 그 OID 로 ancestor 판정·update-ref -d 까지 진행된다.
+  # 따라서 %(refname) 을 함께 읽어 정확 일치 행만 존재 판정에 쓴다 (ref 이름에는 공백이 들어갈 수 없다).
+  LOCAL_REF_RAW=""; LOCAL_REF_RC=0
+  LOCAL_REF_RAW="$(git for-each-ref --format='%(refname) %(objectname)' "refs/heads/$FR_BRANCH" 2>/dev/null)" \
+    || LOCAL_REF_RC=$?
+  # 정확 일치 "행 수" 와 "OID 값" 을 분리해 보존한다.
+  # 둘을 합치면 (정확 행 1건 + OID 필드 누락) 이 빈 문자열이 되어 "정상 부재" 로 오분류되고,
+  # fail-closed 계약이 깨진 채 원격 삭제까지 진행된다.
+  LOCAL_REF_LINES="$(printf '%s\n' "$LOCAL_REF_RAW" | awk -v r="refs/heads/$FR_BRANCH" '$1==r{c++} END{print c+0}')"
+  LOCAL_REF_OUT="$(printf '%s\n' "$LOCAL_REF_RAW" | awk -v r="refs/heads/$FR_BRANCH" '$1==r{print $2}' | head -1)"
+
+  FRQ="$(printf '%q' "$FR_BRANCH")"   # 복구 명령 조립용 shell-quoted 브랜치명
+  if [[ "$LOCAL_REF_RC" -ne 0 ]]; then
+    # 종료 상태 비정상 = 판정 불능. "정상 부재" 로 오분류해 숨기지 않는다.
+    safety_violation "local-branch" "$FR_BRANCH" \
+      "로컬 ref 조회 실패 (rc=$LOCAL_REF_RC) — 판정 불능이므로 삭제하지 않았습니다" \
+      "git for-each-ref --format='%(refname) %(objectname)' refs/heads/$FRQ"
+  elif [[ "$LOCAL_REF_LINES" -eq 0 ]]; then
+    # 정상 부재 — 이미 정리된 멱등 상태. 잔여도 위반도 아닌 성공 no-op.
+    # 하위 ref(refs/heads/<fr>/*)가 있어도 여기로 온다. 그것들은 대상이 아니므로 건드리지 않는다.
+    printf 'archive: 로컬 브랜치 %s 없음 — skip\n' "$FR_BRANCH"
+  elif [[ "$LOCAL_REF_LINES" -ne 1 ]] || ! is_oid "$LOCAL_REF_OUT"; then
+    # 정확 행이 2건 이상이거나, 행은 있는데 OID 가 비었거나 형식이 틀린 경우 — 모두 판정 불능이다.
+    safety_violation "local-branch" "$FR_BRANCH" \
+      "로컬 ref 판정 불능 (정확 일치 행 ${LOCAL_REF_LINES}건 또는 malformed OID)" \
+      "git for-each-ref --format='%(refname) %(objectname)' refs/heads/$FRQ"
+  else
+    LOCAL_ANC_RC=0
+    git merge-base --is-ancestor "$LOCAL_REF_OUT" "$MERGE_BASE_COMMIT" 2>/dev/null || LOCAL_ANC_RC=$?
+    if [[ "$LOCAL_ANC_RC" -eq 0 ]]; then
+      # 검증한 OID 를 expected-old 로 지정 — 검증~삭제 사이 tip 이동(TOCTOU)을 막는다.
+      if git update-ref -d "refs/heads/$FR_BRANCH" "$LOCAL_REF_OUT"; then
+        printf 'archive: 로컬 브랜치 %s 삭제\n' "$FR_BRANCH"
+      else
+        safety_violation "local-branch" "$FR_BRANCH" \
+          "expected-old 삭제 거부 — 검증 후 tip 이동 의심. 아래로 남은 커밋을 확인한 뒤 필요하면 git branch -D 로 삭제하십시오(강제 삭제는 미머지 커밋을 잃습니다)" \
+          "git log --oneline $FRQ --not $MERGE_BASE_COMMIT"
+      fi
+    elif [[ "$LOCAL_ANC_RC" -eq 1 ]]; then
+      safety_violation "local-branch" "$FR_BRANCH" \
+        "미머지 커밋 존재 (merge 대상 base 의 ancestor 아님). 아래로 남은 커밋을 확인하십시오. 버려도 되는 커밋이면 git branch -D 로 삭제합니다" \
+        "git log --oneline $FRQ --not $MERGE_BASE_COMMIT"
+    else
+      # fail-closed: 판정 명령 자체가 실패하면 "정상 부재" 나 "거짓" 과 구분해 삭제를 금지한다.
+      safety_violation "local-branch" "$FR_BRANCH" \
+        "merge 판정 명령 실패 (rc=$LOCAL_ANC_RC) — 판정 불능이므로 삭제하지 않았습니다" \
+        "git merge-base --is-ancestor $FRQ $MERGE_BASE_COMMIT; echo rc=\$?"
+    fi
+  fi
+fi
+
+# Step 9 — Remote branch delete (검증 → lease 삭제)
+if [[ "$REMOTE_MODE" == "remote" ]]; then
+  FRQ="$(printf '%q' "$FR_BRANCH")"
+  if [[ "$SAFETY_VIOLATION" -eq 1 ]]; then
+    # 안전 불변식 위반이 이미 감지되면 뒤따르는 ref 삭제를 건너뛴다.
+    printf 'archive: 안전 불변식 위반 감지 — 원격 브랜치 삭제 건너뜀\n' >&2
+    cleanup_add "remote-branch" "$FR_BRANCH" \
+      "앞선 안전 불변식 위반 때문에 원격 브랜치 삭제를 시도하지 않았습니다. 위반을 해소한 뒤 아래로 원격 상태를 확인하고 수동으로 정리하십시오" \
+      "git ls-remote origin refs/heads/$FRQ"
+  elif ! git_supports_lease; then
+    # 사전 feature detection — 무보호 삭제로 fallback 하지 않는다.
+    safety_violation "remote-branch" "$FR_BRANCH" \
+      "git 1.8.5 미만(--force-with-lease 미지원) 또는 버전 판정 불능 — 보호된 삭제가 불가능해 시도하지 않았습니다" \
+      "git --version"
+  else
+    REMOTE_LS_OUT=""; REMOTE_LS_RC=0
+    REMOTE_LS_OUT="$(git ls-remote origin "refs/heads/$FR_BRANCH" 2>/dev/null)" || REMOTE_LS_RC=$?
+    REMOTE_LS_LINES="$(printf '%s' "$REMOTE_LS_OUT" | grep -c . || true)"
+    REMOTE_OID="$(printf '%s' "$REMOTE_LS_OUT" | head -1 | awk '{print $1}')"
+
+    if [[ "$REMOTE_LS_RC" -ne 0 ]]; then
+      safety_violation "remote-branch" "$FR_BRANCH" \
+        "원격 ref 조회 실패 (rc=$REMOTE_LS_RC) — 판정 불능이므로 삭제하지 않았습니다" \
+        "git ls-remote origin refs/heads/$FRQ"
+    elif [[ -z "$REMOTE_LS_OUT" ]]; then
+      printf 'archive: 원격 브랜치 %s 없음 — skip\n' "$FR_BRANCH"
+    elif [[ "$REMOTE_LS_LINES" -ne 1 ]] || ! is_oid "$REMOTE_OID"; then
+      safety_violation "remote-branch" "$FR_BRANCH" \
+        "원격 ref 판정 불능 (malformed 출력, lines=$REMOTE_LS_LINES)" \
+        "git ls-remote origin refs/heads/$FRQ"
+    elif ! git cat-file -e "${REMOTE_OID}^{commit}" 2>/dev/null; then
+      # 원격 tip 객체가 로컬에 없으면 ancestor 판정 자체가 불가능하다 (오류를 거짓으로 오해하지 않는다).
+      # 재실행 안내를 넣지 않는다 — 이 시점에는 tag·metadata cleanup 이 이미 끝났고 로컬 ref 도 삭제되었을 수 있어,
+      # archive 재실행은 rerun 안전망에서 조기 종료할 수 있다 (Step 9 continuation 이 되지 않는다).
+      safety_violation "remote-branch" "$FR_BRANCH" \
+        "원격 tip 객체($REMOTE_OID)가 로컬에 없어 ancestor 판정이 불가능합니다. 아래로 원격 상태를 확인하고, 객체를 받아 직접 비교하려면 git fetch origin $FRQ 후 git merge-base --is-ancestor $REMOTE_OID $MERGE_BASE_COMMIT 를 실행하십시오" \
+        "git ls-remote origin refs/heads/$FRQ"
+    else
+      REMOTE_ANC_RC=0
+      git merge-base --is-ancestor "$REMOTE_OID" "$MERGE_BASE_COMMIT" 2>/dev/null || REMOTE_ANC_RC=$?
+      if [[ "$REMOTE_ANC_RC" -ne 0 ]]; then
+        safety_violation "remote-branch" "$FR_BRANCH" \
+          "원격 tip 이 merge 대상 base 의 ancestor 아님 (rc=$REMOTE_ANC_RC). 아래로 원격에만 있는 커밋을 확인하십시오" \
+          "git log --oneline $REMOTE_OID --not $MERGE_BASE_COMMIT"
+      else
+        # 고정한 원격 tip 을 lease 로 지정 — 검증~push 사이 원격 이동을 막는다.
+        REMOTE_PUSH_OUT=""; REMOTE_PUSH_RC=0
+        REMOTE_PUSH_OUT="$(git push --force-with-lease="refs/heads/$FR_BRANCH:$REMOTE_OID" \
+          origin ":refs/heads/$FR_BRANCH" 2>&1)" || REMOTE_PUSH_RC=$?
+        printf '%s\n' "$REMOTE_PUSH_OUT" | sed 's/^/archive: remote-branch-delete: /'
+        if [[ "$REMOTE_PUSH_RC" -eq 0 ]]; then
+          printf 'archive: 원격 브랜치 %s 삭제\n' "$FR_BRANCH"
+        else
+          # 이 시점에 로컬 ref 는 이미 삭제되었을 수 있으나 복구하지 않는다.
+          # 로컬 삭제는 ancestor 검증을 통과했으므로 그 ref 의 모든 커밋이 base 에 포함되어 커밋 손실이 없다.
+          safety_violation "remote-branch" "$FR_BRANCH" \
+            "lease 거부 또는 push 실패 (rc=$REMOTE_PUSH_RC) — 원격 tip 이동 의심. 아래로 현재 원격 tip 을 확인한 뒤 필요하면 git push origin --delete 로 삭제하십시오" \
+            "git ls-remote origin refs/heads/$FRQ"
+        fi
+      fi
+    fi
+  fi
+fi
+
+# ---- 정리 잔여 요약 (stdout) ----
+# 종료 코드 0 의 의미가 "완전 정리 완료" 에서 "core 성공(잔여 가능)" 으로 넓어지므로,
+# 잔여가 조용히 지나가지 않도록 종료 직전에 사유와 복구 명령을 함께 출력한다.
+# 복구 줄은 그대로 복사해 실행할 수 있는 한 줄이며, 기본값은 비파괴 확인 명령이다.
+if [[ -n "$CLEANUP_PENDING" ]]; then
+  printf 'archive: CLEANUP-PENDING\n'
+  while IFS="$CLEANUP_TAB" read -r ck cid creason ccmd; do
+    [[ -z "$ck" ]] && continue
+    printf 'archive:   [%s] %s\n' "$ck" "$cid"
+    printf 'archive:     사유: %s\n' "$creason"
+    printf 'archive:     복구: %s\n' "$ccmd"
+  done <<EOF
+$CLEANUP_PENDING
+EOF
+  printf 'archive: core 완료 (정리 잔여 있음). tag=%s\n' "$TARGET_TAG"
+else
+  printf 'archive: 완료. tag=%s\n' "$TARGET_TAG"
+fi
+
+if [[ "$SAFETY_VIOLATION" -eq 1 ]]; then
+  # 보존 범위를 정확히 표현한다 — 이미 검증을 통과해 삭제된 ref 는 복구하지 않는다(AC10).
+  printf 'archive: 안전 불변식 위반으로 종료 — 아직 삭제하지 않은 ref 는 보존했습니다.\n' >&2
+  printf 'archive:   앞서 검증을 통과해 삭제된 ref 는 복구하지 않습니다 (해당 커밋은 merge 대상에 모두 포함되어 손실 없음).\n' >&2
+  exit 1
+fi

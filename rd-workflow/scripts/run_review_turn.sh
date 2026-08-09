@@ -227,6 +227,43 @@ compute_effort_status() {
   printf 'applied:%s (source: %s)' "$EFFORT_VALUE" "$EFFORT_SOURCE"
 }
 
+# === 턴 계측 (review-speedup-2-effort-policy-tuning) ===
+# 세션 디렉토리 turn_metrics.tsv 에 턴당 소요를 append 한다.
+# fail-open 계약: 계측 실패가 리뷰 턴 실행·종료 코드에 영향을 주지 않는다 (부가 기능).
+# 시간 원천은 date +%s 만 사용한다 — macOS bash 3.2 / Linux 공통 (GNU 전용 옵션 금지).
+compute_target_bytes() {
+  # REVIEW_TARGET 은 SESSION 의 Review Target 섹션(줄당 경로 1개)에서 온다.
+  # 줄 단위로 처리해야 공백 포함 경로가 깨지지 않는다 (word splitting 금지).
+  local total=0 found=0 line sz
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n "$line" && -f "$line" ]] || continue
+    sz="$(wc -c < "$line" 2>/dev/null | tr -d ' ')" || continue
+    total=$(( total + sz ))
+    found=1
+  done <<< "$REVIEW_TARGET"
+  if [[ "$found" -eq 1 ]]; then printf '%s' "$total"; else printf '%s' "-"; fi
+}
+
+# 쓰기 성공 여부는 전역 METRIC_WRITE_OK 에 남긴다 (1=기록됨) — 호출부가 실패를
+# stderr 경고로 표시하기 위한 것으로, 함수 자체는 항상 return 0 (fail-open 계약 불변).
+METRIC_WRITE_OK=0
+append_turn_metric() {
+  local turn="$1" rt="$2" tool="$3" effort="$4" pbytes="$5" tbytes="$6" s="$7" e="$8" status="$9"
+  METRIC_WRITE_OK=0
+  {
+    local f="${session_dir}/turn_metrics.tsv"
+    if [[ ! -f "$f" ]]; then
+      printf '# turn\treview_type\ttool\teffort\tprompt_bytes\ttarget_bytes\tstart_epoch\tend_epoch\twall_seconds\tstatus\n' > "$f"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$turn" "$rt" "$tool" "${effort:-none}" "$pbytes" "$tbytes" "$s" "$e" "$(( e - s ))" "$status" >> "$f" \
+      && METRIC_WRITE_OK=1
+  } 2>/dev/null || true
+  return 0
+}
+
 # --- 메인 ---
 # 테스트 seam: `source run_review_turn.sh` 로 호출되면 함수 정의만 로드하고 반환한다.
 # production 경로는 항상 `bash run_review_turn.sh <session>` 이므로 동작이 바뀌지 않는다.
@@ -386,7 +423,37 @@ for tool in $PRIORITY; do
   fi
 
   # 어댑터 실행 — 실행 후 실패하면 즉시 중단 (세션 오염 가능)
-  if "${adapter_env[@]}" bash "$adapter"; then
+  # 계측: 시작/종료 경계는 어댑터 프로세스 전후 (spec §4.2). 후처리(validate)는 비포함.
+  metric_effort=""
+  [[ "$tool" == "codex" ]] && metric_effort="$EFFORT_VALUE"
+  metric_prompt_bytes="$(wc -c < "$prompt_file" 2>/dev/null | tr -d ' ' || printf '-')"
+  metric_target_bytes="$(compute_target_bytes)"
+  # 시간 원천도 fail-open — date 실패가 어댑터 실행·턴 진행·종료 코드에 영향을 주지 않는다.
+  metric_start="$(date +%s 2>/dev/null)" || metric_start=""
+  adapter_rc=0
+  "${adapter_env[@]}" bash "$adapter" || adapter_rc=$?
+  metric_end="$(date +%s 2>/dev/null)" || metric_end=""
+
+  metric_status="ok"
+  if [[ "$adapter_rc" -ne 0 ]]; then
+    metric_status="fail"
+    [[ "$adapter_rc" -eq 124 ]] && metric_status="timeout"
+  fi
+  metric_wall="unavailable"
+  if [[ "$metric_start" =~ ^[0-9]+$ && "$metric_end" =~ ^[0-9]+$ ]]; then
+    metric_wall="$(( metric_end - metric_start ))s"
+    append_turn_metric "$NEXT_TURN_NUMBER" "$REVIEW_TYPE" "$tool" "$metric_effort" \
+      "$metric_prompt_bytes" "$metric_target_bytes" "$metric_start" "$metric_end" "$metric_status" || true
+    if [[ "$METRIC_WRITE_OK" -ne 1 ]]; then
+      echo "⚠️  turn metric 기록 실패 — 이 턴은 turn_metrics.tsv 에 남지 않습니다 (턴 진행에는 영향 없음)" >&2
+    fi
+  else
+    echo "⚠️  turn metric 시간 원천 실패 — 이 턴은 계측되지 않습니다 (턴 진행에는 영향 없음)" >&2
+  fi
+  # 가시성(spec §4.4): 모든 경로에서 stderr 한 줄 — validate 실패로 부모가 죽는 경로도 표시가 남는다.
+  echo "turn time: ${metric_wall} (status: ${metric_status})" >&2
+
+  if [[ "$adapter_rc" -eq 0 ]]; then
     succeeded=true
     used_tool="$tool"
     break
@@ -429,4 +496,5 @@ echo "session: ${relative_session_dir}"
 echo "turn: ${relative_expected_turn_file}"
 echo "status: ${updated_status}"
 echo "owner: ${updated_owner}"
+echo "turn time: ${metric_wall}"
 echo "effort override: $(compute_effort_status "$used_tool")"
