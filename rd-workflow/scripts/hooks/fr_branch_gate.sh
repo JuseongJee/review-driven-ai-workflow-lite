@@ -9,31 +9,38 @@ cmd="$(extract_json_field "command")"
 
 [[ -z "$cmd" ]] && exit 0
 
-# command 안의 어떤 sub-command 라도 실제 git commit invocation 이면 commit 으로 판정.
-# sub-command 시작 boundary: 라인 시작, ;, &&, ||, |, (, )
-# 허용 invocation prefix:
-#   git commit ...
-#   env [VAR=val ...] git commit ...
-#   VAR=val [VAR=val ...] [env ...] git commit ...
-# 차단 예 (substring false positive): echo git commit, cat git commit log, git commitments
-# 차단 예 (spoof): echo RD_LIFECYCLE_BYPASS_REASON=... && git commit ...
-#                 — 두 번째 sub-command 는 RD_LIFECYCLE_BYPASS_REASON prefix 없는 git commit 이므로 commit 으로 판정
-if ! [[ "$cmd" =~ (^|[\;\&\|\(\)][[:space:]]*)((env[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*(env[[:space:]]+)?)?git[[:space:]]+commit([[:space:]]|$) ]]; then
-  exit 0
+# 1단 필터 — 스캐너를 돌릴 가치가 있는지만 본다. **인용·백슬래시를 먼저 걷어낸다**:
+# `git com'mit'` 처럼 인용으로 쪼개면 `commit` 연속 부분 문자열이 사라져 그냥 검사하면
+# AC3b 가 요구하는 차단 대상을 스캐너 도달 전에 놓친다(실측 확인). 여기서의 과탐은
+# 무해하다 — 최종 판정은 스캐너가 하고, 이 필터는 awk 기동 회피만 담당한다.
+# `\<개행>`(line continuation)을 먼저 제거한다 — 백슬래시만 지우면 개행이 남아
+# `com<개행>mit` 이 되고 `commit` 부분 문자열이 만들어지지 않는다(F12 실측).
+# `$'…'` 는 escape 로 문자를 만들 수 있으므로(`$'com\x6dit'`) 있으면 무조건 스캐너로 보낸다.
+_probe="${cmd//\\$'\n'/}"; _probe="${_probe//\'/}"; _probe="${_probe//\"/}"; _probe="${_probe//\\/}"
+[[ "$_probe" != *commit* && "$cmd" != *\$\'* ]] && exit 0
+
+# 2단 — 인용·heredoc·명령 치환을 인식하는 스캐너로 실행 위치의 커밋을 **모두** 집계한다.
+#        판정 생략·불확실 진단은 _gate_from_scan 이 담당하므로 여기서는 참·거짓만 본다.
+if scan_out="$(scan_command_commit "$cmd")"; then
+  _gate_from_scan "$scan_out" "fr_branch_gate" || exit 0
+else
+  # 폴백 — 현행 경계 정규식을 그대로 보존한다. 강도는 오늘과 동일하고 오탐도 오늘과 같이 남는다.
+  # (공통 _legacy_commit_glob 보다 정밀하므로 이 hook 은 자기 정규식을 유지한다.)
+  printf '%s\n' "[fr_branch_gate] 스캐너 폴백(scan-unavailable) — 문자열 판정으로 처리합니다." >&2
+  if ! [[ "$cmd" =~ (^|[\;\&\|\(\)][[:space:]]*)((env[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*(env[[:space:]]+)?)?git[[:space:]]+commit([[:space:]]|$) ]]; then
+    exit 0
+  fi
+  if [[ "$cmd" =~ (^|[\;\&\|\(\)][[:space:]]*)(env[[:space:]]+)?RD_LIFECYCLE_BYPASS_REASON=(bootstrap|lifecycle|small-task|legacy)[[:space:]]+(env[[:space:]]+)?git[[:space:]]+commit ]]; then
+    exit 0
+  fi
 fi
 
-# bypass marker 는 git commit invocation 의 env prefix 로 와야만 인정한다.
-# sub-command 시작 boundary 까지 포함해서 검사 — 첫 sub-command 일 필요는 없지만, 그 sub-command 의 prefix 여야 한다.
-# 허용: [boundary] RD_LIFECYCLE_BYPASS_REASON=<reason> [env ]git commit ...
-#       [boundary] env RD_LIFECYCLE_BYPASS_REASON=<reason> [env ]git commit ...
-# 차단: echo RD_LIFECYCLE_BYPASS_REASON=... && git commit ... — 두 번째 sub-command 가 prefix 없는 git commit
-if [[ "$cmd" =~ (^|[\;\&\|\(\)][[:space:]]*)(env[[:space:]]+)?RD_LIFECYCLE_BYPASS_REASON=(bootstrap|lifecycle|small-task|legacy)[[:space:]]+(env[[:space:]]+)?git[[:space:]]+commit ]]; then
-  exit 0
-fi
-
-# 기본 브랜치 결정 — resolver 실패 시 main fallback (guard는 커밋을 오차단하지 않도록 보수적)
+# 기본 브랜치 결정 — resolver 실패 시 main fallback (현행 유지)
+# AC12: source 는 POSIX 특수 내장이라 파일 부재 시 set -e 아래에서 if 조건문 안이어도
+#       셸을 종료시킨다. 존재 확인을 앞세워야 fixture·부분 설치에서 hook 이 죽지 않는다.
 DEFAULT_BRANCH="main"
-if source "${project_root}/rd-workflow/scripts/lifecycle/_lifecycle_common.sh" 2>/dev/null; then
+_lc="${project_root}/rd-workflow/scripts/lifecycle/_lifecycle_common.sh"
+if [[ -f "$_lc" ]] && source "$_lc" 2>/dev/null; then
   if _db="$(get_default_branch 2>/dev/null)" && [[ -n "$_db" ]]; then DEFAULT_BRANCH="$_db"; fi
 fi
 

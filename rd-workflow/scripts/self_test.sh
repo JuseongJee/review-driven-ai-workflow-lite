@@ -670,6 +670,8 @@ run_step "어댑터 프롬프트 parity (test_review_adapter_parity.sh)" bash "$
 run_step "state 단위 테스트 (test_state_common.sh)" bash "${SCRIPT_DIR}/test_state_common.sh"
 run_step "guard state fixture (test_guard_state.sh)" bash "${SCRIPT_DIR}/hooks/test_guard_state.sh"
 run_step "archive gate 테스트 (test_pre_commit_archive_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_pre_commit_archive_gate.sh"
+run_step "fr_branch_gate 테스트 (test_fr_branch_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_fr_branch_gate.sh"
+run_step "review gate 테스트 (test_pre_commit_review_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_pre_commit_review_gate.sh"
 run_step "비차단 Status drift 검증 (nonblocking_status_drift_check)" nonblocking_status_drift_check
 run_step "LC-19 3자 일치 검증 (TASK/STATE/CLAUDE.md)" canonical_status_triple_drift_check
 run_step "판정 소스 회귀 grep (_extract_task_section Status 직접 호출)" judgment_source_regression_check

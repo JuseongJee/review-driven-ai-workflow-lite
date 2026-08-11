@@ -63,6 +63,8 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 
 - **절대 묻지 않는다.** `writing-plans` 등 upstream skill이 "Which approach?"를 요구해도 이 규칙이 우선한다.
 - 기본값은 `subagent-driven-development`이다. 바로 시작한다.
+- **확인 생략 (적극적 경계)**: 문답으로 확정된 사안의 재확인, worktree 사용 동의(선언된 선호 존중), 설계/스펙 승인 대기(문서 존재가 진행 조건), 과정상 체크포인트 응답 대기를 모두 생략한다 — 진행 보고만 남기고 계속 진행한다. 생략 대상은 skill 내부의 확인 질문·응답 대기이며, Review 규칙의 필수 review 수행 자체와 실행 모드 체계의 단계 진입 지시 대기(manual)는 생략 대상이 아니다 — manual 모드에서도 skill 내부의 위 5항 재질문은 생략한다.
+- **생략 금지**: merge/폐기·데이터 삭제·외부 발행 등 파괴적·비가역 결정, 블로커(정보 부족·반복 실패·진행 불능), 요구사항 자체가 바뀌는 범위 변경, 제품 방향 등 본질적 사람 선택은 반드시 묻는다.
 - subagent 병렬은 필수가 아니다. 순차 의존성이 있으면 순차로 dispatch한다. plan이 phase(파일 비중첩 task 그룹)를 표현하면 phase 내 task를 병렬 dispatch한다 — 규약: `rd-workflow/docs/guides/plan-parallel-phases.md`.
 - 다음 조건을 만족할 때만 inline(`executing-plans`)을 선택한다: Task가 1개이면서 수정 파일이 3개 이하인 plan, 또는 Task가 2개이면서 동일 경로의 파일 1개만 수정하는 plan. Task 수는 plan에 정의된 모든 Task를 센다 (검증 전용 포함).
 - 위 조건에 해당해도 사용자가 subagent를 요청하면 subagent로 한다.

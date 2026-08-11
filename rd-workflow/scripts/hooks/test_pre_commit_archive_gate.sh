@@ -31,6 +31,8 @@ make_fixture() {
   cp "$HOOK_SOURCE" "$fixture/rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"
   cp "$GUARD_COMMON" "$fixture/rd-workflow/scripts/hooks/_guard_common.sh"
   cp "$STATE_COMMON" "$fixture/rd-workflow/scripts/_state_common.sh"
+  # 스캐너를 함께 복사한다. 누락하면 폴백 경로로 테스트되어 새 판정을 검사하지 못한다.
+  [[ -f "$HOOK_DIR/_commit_scan.awk" ]] && cp "$HOOK_DIR/_commit_scan.awk" "$fixture/rd-workflow/scripts/hooks/"
   mkdir -p "$fixture/rd-workflow-workspace/.lifecycle"
   cat > "$fixture/rd-workflow-workspace/.lifecycle/task-state" <<'TSEOF'
 schema=1
@@ -59,20 +61,20 @@ TSEOF
 _hook_last_exit=0
 _hook_last_err=""
 run_hook() {
-  local fixture="$1"
+  local fixture="$1" cmd="${2:-git commit -m test}"   # 인자 없으면 현행 동작
   _hook_last_exit=0
-  _hook_last_err="$(printf '%s' '{"tool_input":{"command":"git commit -m test"}}' | \
+  _hook_last_err="$(printf '{"tool_input":{"command":"%s"}}' "$cmd" | \
     bash "$fixture/rd-workflow/scripts/hooks/pre_commit_archive_gate.sh" 2>&1 >/dev/null)" \
     || _hook_last_exit=$?
 }
 
-# run_scenario <num> <name> <source-fr값> <fr상세상대경로> <fr-status> <expected_exit> <expected_err_substr(-=검사안함)>
+# run_scenario <num> <name> <source-fr값> <fr상세상대경로> <fr-status> <expected_exit> <expected_err_substr(-=검사안함)> [cmd]
 run_scenario() {
-  local num="$1" name="$2" src="$3" fr_rel="$4" fr_status="$5" expected="$6" err_sub="$7"
+  local num="$1" name="$2" src="$3" fr_rel="$4" fr_status="$5" expected="$6" err_sub="$7" cmd="${8:-}"
   local fixture
   fixture="$(make_fixture "$src" "$fr_rel" "$fr_status")"
   _current_fixture="$fixture"
-  run_hook "$fixture"
+  if [[ -n "$cmd" ]]; then run_hook "$fixture" "$cmd"; else run_hook "$fixture"; fi
   local ok=1
   [[ "$_hook_last_exit" == "$expected" ]] || ok=0
   if [[ "$err_sub" != "-" ]]; then
@@ -108,6 +110,17 @@ run_scenario 8 "절대경로 → 경고 + 통과" \
   "/etc/passwd" "__NONE__" "-" 0 "형식 위반"
 run_scenario 9 ".. 세그먼트 → 경고 + 통과" \
   "rd-workflow-workspace/backlog/items/../../evil.md" "__NONE__" "-" 0 "형식 위반"
+
+# A1: 아카이브 신호 재료 충족 + 데이터 구간(홑따옴표)의 커밋 문자열 → 오탐 해소
+run_scenario A1 "데이터 구간 커밋 문자열 → 통과(오탐 해소)" \
+  '`'"$ITEM"'`' "$ITEM" "idea" 0 "-" \
+  "echo '"'"'git commit -m x'"'"'"
+
+# A2: 같은 fixture + 실제 커밋(-C 형태) → 기존 차단 동작 유지
+#     현행 글롭은 git -C … commit 을 미탐으로 통과시켰다. 새 판정은 차단한다.
+run_scenario A2 "git -C . 실제 커밋 → 차단 유지" \
+  '`'"$ITEM"'`' "$ITEM" "idea" 2 "done/dropped 필요" \
+  "git -C . commit -m x"
 
 echo ""
 echo "pre_commit_archive_gate: PASS=$PASS FAIL=$FAIL"

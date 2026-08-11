@@ -305,3 +305,100 @@ extract_json_field() {
 
   printf '%s' "$value"
 }
+
+# --- commit scan 계약 (guard-hook-commit-target-scope) ---
+# 이 아래는 커밋 판정 스캐너의 bash 계약이다. 위쪽 기존 함수와 독립적이며,
+# 성능 테스트가 이 마커를 경계로 변경 전 상태를 재구성한다. 마커를 지우지 말 것.
+
+_commit_scan_awk() { printf '%s/_commit_scan.awk' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; }
+
+# 실행 위치의 git commit 호출을 **모두** 집계한다.
+# 인자 : $1=명령 문자열, $2=시작 디렉토리(생략 시 project_root)
+# stdout: 1행  gate=<0|1> uncertain=<0|1> ncand=<N>
+#         2..N+1행  차단 후보 커밋의 실행 위치 절대경로
+# 반환  : 0 판정 성공 / 2 판정 불가(호출측이 현행 문자열 판정으로 폴백)
+#
+# 명령 하나에 커밋이 여러 개일 수 있다. 첫 커밋만 보면
+# `git -C <밖> commit; git commit` 의 두 번째 커밋이 통과해버리므로 끝까지 집계한다.
+scan_command_commit() {
+  local cmd="$1" start="${2:-${project_root}}" awkf out rc head
+  awkf="$(_commit_scan_awk)"
+  [[ -f "$awkf" ]] || return 2
+  command -v awk >/dev/null 2>&1 || return 2
+  out="$(printf '%s' "$cmd" | awk -v start_dir="$start" -f "$awkf" 2>/dev/null)"; rc=$?
+  [[ $rc -eq 0 ]] || return 2
+  # 계약 형식 검증 — malformed 출력은 판정 불가로 취급
+  head="${out%%$'\n'*}"
+  [[ "$head" =~ ^gate=[01][[:space:]]uncertain=[01][[:space:]]ncand=[0-9]+$ ]] || return 2
+  printf '%s\n' "$out"
+}
+
+# 현행(폴백) 문자열 판정 — 스캐너를 쓸 수 없을 때만 사용한다.
+# fr_branch_gate 는 자기 경계 정규식을 폴백으로 쓰므로 이 함수를 쓰지 않는다.
+_legacy_commit_glob() {
+  local cmd="$1"
+  [[ "$cmd" == *git\ *commit* || "$cmd" == *git$'\t'*commit* || "$cmd" == git\ commit* ]]
+}
+
+# target 이 세션 프로젝트 밖임이 **보장**되는가 (0 = 밖 확정 → 그 커밋은 판정 생략 가능)
+# 조건: 리터럴 확정 + 실재하는 디렉토리 + 물리 경로 해석 후에도 프로젝트 밖
+commit_target_is_outside() {
+  local t="$1" phys pr
+  [[ -n "$t" && "$t" != "?" && "$t" != "-" ]] || return 1
+  [[ -d "$t" ]] || return 1
+  phys="$(cd -P "$t" 2>/dev/null && pwd -P)" || return 1
+  pr="$(cd -P "${project_root}" 2>/dev/null && pwd -P)" || return 1
+  [[ "${phys}/" == "${pr}/"* ]] && return 1
+  return 0
+}
+
+# 스캔 결과를 보수적으로 해석한다. 0 = 이 프로젝트의 gate 로 판정해야 함.
+# 인자 : $1=스캐너 출력(여러 줄), $2=hook 이름(진단용)
+# 정책 : ① 차단 후보가 없으면(커밋 없음 또는 전부 유효 bypass) 판정 불필요
+#        ② 후보 중 위치 불확실이 있으면 무조건 판정 (fail-closed)
+#        ③ 위치가 확정된 후보는 **전부 밖일 때만** 생략. 하나라도 안이면 판정
+_gate_from_scan() {
+  local out="$1" hook="$2" head gate unc ncand t inside=0 seen=0
+  head="${out%%$'\n'*}"
+  gate="${head#gate=}";      gate="${gate%% *}"
+  unc="${head#*uncertain=}"; unc="${unc%% *}"
+  ncand="${head##*ncand=}"
+  [[ "$gate" == 1 ]] || return 1
+  if [[ "$unc" == 1 ]]; then
+    printf '[%s] 대상 디렉토리를 확정할 수 없어 세션 프로젝트 기준으로 판정합니다.\n' "$hook" >&2
+    return 0
+  fi
+  [[ "$ncand" -gt 0 ]] || return 0     # gate=1 인데 후보 목록이 비면 fail-closed
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    seen=$((seen + 1))
+    commit_target_is_outside "$t" || { inside=1; break; }
+  done <<< "${out#*$'\n'}"
+  if [[ $inside -eq 0 && $seen -eq "$ncand" ]]; then
+    printf '[%s] 판정 생략 — 커밋 %d건 모두 세션 프로젝트 밖입니다. 이 커밋들은 이 프로젝트의 gate 로 검사되지 않습니다.\n' \
+      "$hook" "$ncand" >&2
+    return 1
+  fi
+  return 0
+}
+
+# 이 명령이 "우리 프로젝트를 대상으로" 실제 커밋을 하는가 (0 = 그렇다)
+# 두 gate(review·archive)가 소비한다. 집계·대상 판정을 흡수하므로 호출측은 참·거짓만 본다.
+command_targets_our_commit() {
+  local cmd="$1" hook="${2:-guard}" out probe
+  # 1단 필터 — 인용·백슬래시를 걷어낸 뒤 검사한다. `git com'mit'` 처럼 쪼개면
+  # `commit` 연속 부분 문자열이 사라지므로 그냥 검사하면 차단 대상을 놓친다.
+  # 과탐은 무해하다 (최종 판정은 스캐너가 한다).
+  # `\<개행>`(line continuation)을 먼저 제거한다 — 백슬래시만 지우면 개행이 남아
+  # `com<개행>mit` 이 되고 `commit` 부분 문자열이 만들어지지 않는다(F12 실측).
+  # `$'…'`(ANSI-C 인용)는 escape 로 문자를 만들 수 있어(`$'com\x6dit'`) 문자열 제거만으로는
+  # `commit` 을 복원하지 못한다. 있으면 무조건 스캐너로 보낸다 — 여기서의 과탐은 무해하다.
+  probe="${cmd//\\$'\n'/}"; probe="${probe//\'/}"; probe="${probe//\"/}"; probe="${probe//\\/}"
+  [[ "$probe" == *commit* || "$cmd" == *\$\'* ]] || return 1
+  if ! out="$(scan_command_commit "$cmd")"; then
+    printf '[%s] 스캐너 폴백(scan-unavailable) — 문자열 판정으로 처리합니다.\n' "$hook" >&2
+    _legacy_commit_glob "$cmd" && return 0
+    return 1
+  fi
+  _gate_from_scan "$out" "$hook"
+}

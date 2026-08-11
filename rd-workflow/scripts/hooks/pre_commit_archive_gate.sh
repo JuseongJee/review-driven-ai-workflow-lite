@@ -11,10 +11,9 @@ cmd="$(extract_json_field "command")"
 # command가 비어있으면 통과
 [[ -z "$cmd" ]] && exit 0
 
-# git commit 패턴이 아니면 통과
-if ! [[ "$cmd" == *git\ *commit* || "$cmd" == *git$'\t'*commit* || "$cmd" == git\ commit* ]]; then
-  exit 0
-fi
+# 실행 위치의 커밋이 아니면 통과 (인용·heredoc·명령 치환 인식 — _guard_common.sh)
+# 1단 필터는 command_targets_our_commit 이 단일 소유자로 갖는다.
+command_targets_our_commit "$cmd" "archive_gate" || exit 0
 
 # REQUEST.md에서 Source FR 추출
 request_file="${project_root}/REQUEST.md"
