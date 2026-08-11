@@ -709,12 +709,18 @@ test_build_template_check() {
   local t="${SCRIPT_DIR}/../../scripts/test_build_template.sh"
   if [[ -f "$t" ]]; then bash "$t"; else echo "  (skip: dev repo 아님)"; fi
 }
+# 배포 미러 계약(체크섬 미러 + VERSION 검증). publish.sh 도 dev repo 전용이라 설치본에서는 skip.
+test_publish_mirror_check() {
+  local t="${SCRIPT_DIR}/../../scripts/test_publish_mirror.sh"
+  if [[ -f "$t" ]]; then bash "$t"; else echo "  (skip: dev repo 아님)"; fi
+}
 run_step "self_test 계약 (checker whitelist·root resolver)" hook_selftest_contract_check
 run_step "hook 경로 도달 증명 (hook_path_reachability_check)" hook_path_reachability_check
 run_step "hook 대상 실재 (hook_target_existence_check)" hook_target_existence_check
 run_step "hook 표기 회귀 방지 (hook_path_notation_regression_check)" hook_path_notation_regression_check
 run_step "템플릿 build 검증 (build_template.sh verify)" build_verify_check
 run_step "템플릿 빌더 단위 테스트 (test_build_template.sh)" test_build_template_check
+run_step "배포 미러 계약 (test_publish_mirror.sh)" test_publish_mirror_check
 claudemd_size_check() {
   local checker="${SCRIPT_DIR}/check_claudemd_size.sh"
   if [[ -f "$checker" ]]; then bash "$checker"; else echo "  (skip: check_claudemd_size.sh 없음 — lite 산출물)"; fi
