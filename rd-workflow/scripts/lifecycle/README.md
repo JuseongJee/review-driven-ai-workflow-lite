@@ -67,7 +67,8 @@ bash rd-workflow/scripts/lifecycle/archive.sh \
 
 **호출 위치:** 기본 브랜치 worktree only.
 호출 전에 fr branch에서 archive content commit
-(REQUEST.md 비우기, archive 파일, FR done, CURRENT_TASK.md reset 등) 완료해야 함.
+(REQUEST.md 비우기, archive 파일, FR done 등) 완료해야 함.
+CURRENT_TASK.md 미러는 archive.sh 가 baseline 으로 되돌리므로 호출 전 준비 대상이 아님.
 
 #### 종료 코드 계약
 
@@ -171,6 +172,49 @@ bash rd-workflow/scripts/lifecycle/promote_rollback.sh \
 | `RD_LIFECYCLE_BYPASS_REASON=<reason>` | `fr_branch_gate.sh` hook 우회용. command string에 노출되어 hook이 grep 검출. valid reason: `bootstrap` / `lifecycle` / `small-task` / `legacy` |
 | `RD_LIFECYCLE_NO_REMOTE=1` | `detect_remote_mode`를 강제로 `local-only`로 판정 |
 | `TASK_STATE_PATH` | task-state 파일 경로 override (기본 `rd-workflow-workspace/.lifecycle/task-state`) |
+
+---
+
+## pre-commit·commit-msg hook 우회
+
+기본 브랜치를 대상으로 하는 lifecycle 커밋 3곳 — `promote` 의 metadata 기록,
+`promote_rollback` 의 완료 기록, `archive` 의 metadata 정리 — 은 **현재 브랜치명이
+`main` 또는 `master` 일 때만** `git commit --no-verify` 로 실행됩니다.
+
+**이유:** Claude Code 가 설치하는 `.git/hooks/pre-commit` 은 `main`/`master` 직접 커밋을
+무조건 차단하며 `--no-verify` 로만 우회를 허용합니다. 이 hook 은 브랜치명만 검사하고
+`RD_LIFECYCLE_BYPASS_REASON` 을 참조하지 않으므로, 이 플래그가 없으면 lifecycle 이 커밋
+단계에서 멈추고 사람이 hook 을 임시로 꺼야 합니다.
+
+**조건부인 이유:** `workflow.json` 의 `default_branch` 로 `trunk` 같은 커스텀 기본 브랜치를
+쓰는 프로젝트에서는 이 hook 이 애초에 커밋을 막지 않습니다. 그런 브랜치에까지 `--no-verify`
+를 붙이면 필요 없이 소비 프로젝트의 `pre-commit`·`commit-msg` 검증만 건너뛰게 되므로,
+차단 대상 브랜치에서만 붙입니다. 우회 안내 메시지도 실제로 우회한 실행에서만 출력됩니다.
+반면 `RD_LIFECYCLE_BYPASS_REASON=lifecycle` 은 `fr_branch_gate.sh` 라는 별개 hook 계층을
+상대하므로 브랜치와 무관하게 세 지점 모두에서 항상 유지됩니다.
+
+**건너뛰는 범위:** `--no-verify` 는 `pre-commit` 과 `commit-msg` 두 hook 을 모두 건너뜁니다.
+즉 프로젝트 자체의 lint·포맷 검사뿐 아니라 **커밋 메시지 정책 검사도 실행되지 않습니다.**
+lifecycle 커밋 메시지는 스크립트가 `chore(lifecycle): …` 고정 형식으로 생성하므로 규약 위반
+가능성은 낮지만, 프로젝트 규약이 그 형식과 다르면 검출되지 않습니다. 각 실행 시 이 사실이
+안내 메시지로 출력됩니다.
+
+**적용 범위:** 위 3곳뿐입니다. `promote` 의 fr 브랜치 승격 커밋은 fr 브랜치에서 실행되어
+차단 대상이 아니므로 `--no-verify` 를 붙이지 않습니다.
+
+**staged 보존:** lifecycle 이 만드는 커밋은 모두 경로를 한정해(`git commit … -- <paths>`)
+실행되므로, 사용자가 미리 stage 해 둔 무관한 변경은 그 커밋에 포함되지 않고 index 에 그대로
+남습니다. `promote` 의 fr 브랜치 승격 커밋(`chore(lifecycle): … fr 브랜치 승격 — CURRENT_TASK
+갱신`)도 `CURRENT_TASK.md` 로 한정되므로, `promote` 는 실행 전 구간에서 무관한 staged 를
+보존합니다.
+
+단 `archive` 는 **merge 를 실제로 수행하는 경로**에서 사전에 worktree clean 상태를
+요구해(`--force-dirty` 없으면 Step 0, 붙여도 뒤따르는 `git merge --no-ff` 에서) 무관한 staged
+가 있으면 metadata 커밋 자체에 도달하지 못하고 중단됩니다 — `promote`/`promote_rollback` 처럼
+커밋을 완주하면서 무관 파일만 제외하는 것과는 다릅니다. 반면 **이미 merge 된 fr 을 archive 하는
+경우**(재실행, 또는 사람이 먼저 수동 merge 한 경우)에는 merge 단계를 건너뛰므로 다른 두
+스크립트와 똑같이 동작합니다 — 커밋을 완주하면서 무관한 staged 는 경로 한정으로 제외되고 index
+에 그대로 남습니다.
 
 ---
 

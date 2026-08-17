@@ -20,11 +20,13 @@ cleanup_fixture() {
 }
 trap 'cleanup_fixture' EXIT INT TERM
 
-# make_fixture <source-fr-값(__NONE__=섹션 없음)> <fr상세파일 상대경로(__NONE__=생성 안 함)> <fr-status>
+# make_fixture <source-fr-값(__NONE__=섹션 없음)> <fr상세파일 상대경로(__NONE__=생성 안 함)> <fr-status> [세션모드]
 # hook 은 script_dir/../../.. 를 project_root 로 계산 → fixture/rd-workflow/scripts/hooks 에 배치.
-# 종결된 final-diff-review 세션(short-title=t1)을 함께 구성해 enforcement 경로에 도달시킨다.
+# 세션모드 (기본 resolved): resolved=종결 세션 / open=미종결 세션 / none=세션 없음.
+#   종결 세션이 기본인 이유는 대부분의 시나리오가 enforcement 경로 도달을 전제하기 때문이다.
+#   open·none 은 "이 커밋이 archive 단계인가" 를 가르는 경계를 고정하는 데 쓴다.
 make_fixture() {
-  local src_val="$1" fr_rel="$2" fr_status="$3"
+  local src_val="$1" fr_rel="$2" fr_status="$3" sess_mode="${4:-resolved}"
   local fixture
   fixture="$(mktemp -d)"
   mkdir -p "$fixture/rd-workflow/scripts/hooks"
@@ -43,9 +45,17 @@ worktree-path=null
 source-fr=-
 TSEOF
   local sess="$fixture/rd-workflow-workspace/handoffs/review_pipeline/20260101_000000_final-diff-review"
-  mkdir -p "$sess"
-  printf '%s\n' "# Review Session" "" "## Status" "awaiting-user" "" "## Branch Context" "- short-title: t1" > "$sess/SESSION.md"
-  printf '%s\n' "# Review Checkpoint" "" "## Open Issues" "- 없음" > "$sess/CHECKPOINT.md"
+  if [[ "$sess_mode" != "none" ]]; then
+    mkdir -p "$sess"
+    if [[ "$sess_mode" == "open" ]]; then
+      # 미종결 — Status 가 awaiting-user/closed 가 아니면 is_review_session_resolved 가 거부한다.
+      printf '%s\n' "# Review Session" "" "## Status" "awaiting-reviewer" "" "## Branch Context" "- short-title: t1" > "$sess/SESSION.md"
+      printf '%s\n' "# Review Checkpoint" "" "## Open Issues" "- 미해결 이슈가 있습니다" > "$sess/CHECKPOINT.md"
+    else
+      printf '%s\n' "# Review Session" "" "## Status" "awaiting-user" "" "## Branch Context" "- short-title: t1" > "$sess/SESSION.md"
+      printf '%s\n' "# Review Checkpoint" "" "## Open Issues" "- 없음" > "$sess/CHECKPOINT.md"
+    fi
+  fi
   if [[ "$src_val" == "__NONE__" ]]; then
     printf '%s\n' "# Change Request" "" "## Task Type" "change" > "$fixture/REQUEST.md"
   else
@@ -68,11 +78,11 @@ run_hook() {
     || _hook_last_exit=$?
 }
 
-# run_scenario <num> <name> <source-fr값> <fr상세상대경로> <fr-status> <expected_exit> <expected_err_substr(-=검사안함)> [cmd]
+# run_scenario <num> <name> <source-fr값> <fr상세상대경로> <fr-status> <expected_exit> <expected_err_substr(-=검사안함)> [cmd] [세션모드]
 run_scenario() {
-  local num="$1" name="$2" src="$3" fr_rel="$4" fr_status="$5" expected="$6" err_sub="$7" cmd="${8:-}"
+  local num="$1" name="$2" src="$3" fr_rel="$4" fr_status="$5" expected="$6" err_sub="$7" cmd="${8:-}" sess_mode="${9:-resolved}"
   local fixture
-  fixture="$(make_fixture "$src" "$fr_rel" "$fr_status")"
+  fixture="$(make_fixture "$src" "$fr_rel" "$fr_status" "$sess_mode")"
   _current_fixture="$fixture"
   if [[ -n "$cmd" ]]; then run_hook "$fixture" "$cmd"; else run_hook "$fixture"; fi
   local ok=1
@@ -104,12 +114,29 @@ run_scenario 5 "Source FR '-' → 통과" \
   "-" "__NONE__" "-" 0 "-"
 run_scenario 6 "Source FR 섹션 없음 → 통과" \
   "__NONE__" "__NONE__" "-" 0 "-"
-run_scenario 7 "path + FR 파일 미존재 → 경고 + 통과" \
-  '`rd-workflow-workspace/backlog/items/2026-01-01-none.md`' "__NONE__" "-" 0 "찾지 못했습니다"
-run_scenario 8 "절대경로 → 경고 + 통과" \
-  "/etc/passwd" "__NONE__" "-" 0 "형식 위반"
-run_scenario 9 ".. 세그먼트 → 경고 + 통과" \
-  "rd-workflow-workspace/backlog/items/../../evil.md" "__NONE__" "-" 0 "형식 위반"
+run_scenario 7 "path + FR 파일 미존재 → 차단" \
+  '`rd-workflow-workspace/backlog/items/2026-01-01-none.md`' "__NONE__" "-" 2 "2026-01-01-none.md"
+run_scenario 8 "절대경로 → 차단" \
+  "/etc/passwd" "__NONE__" "-" 2 "/etc/passwd"
+run_scenario 9 ".. 세그먼트 → 차단" \
+  "rd-workflow-workspace/backlog/items/../../evil.md" "__NONE__" "-" 2 "evil.md"
+
+# --- Source FR 표기 해석 (promote-source-fr-format-contract) ---
+run_scenario 10 "markdown 링크 + status idea → 차단" \
+  "[t1](${ITEM})" "$ITEM" "idea" 2 "done/dropped 필요"
+run_scenario 11 "markdown 링크 + status done → 통과" \
+  "[t1](${ITEM})" "$ITEM" "done" 0 "-"
+run_scenario 12 "종결 세션 + 해석 불가 값 → 차단(fail-closed)" \
+  "없는-항목-입니다" "__NONE__" "-" 2 "없는-항목-입니다"
+
+# --- fail-closed 적용 범위 (final diff review Finding 1) ---
+# 해석 실패 차단은 archive 커밋에만 적용되어야 한다. review 세션이 없거나 미종결이면
+# 그 커밋은 아직 archive 단계가 아니므로(구현 중 iteration commit 등) 통과시킨다.
+# 이 경계가 없으면 Source FR 표기가 어긋난 REQUEST 에서 모든 git commit 이 막힌다.
+run_scenario 13 "세션 없음 + 해석 불가 값 → 통과(iteration commit 보호)" \
+  "없는-항목-입니다" "__NONE__" "-" 0 "-" "" "none"
+run_scenario 14 "미종결 세션 + 해석 불가 값 → 통과(iteration commit 보호)" \
+  "없는-항목-입니다" "__NONE__" "-" 0 "-" "" "open"
 
 # A1: 아카이브 신호 재료 충족 + 데이터 구간(홑따옴표)의 커밋 문자열 → 오탐 해소
 run_scenario A1 "데이터 구간 커밋 문자열 → 통과(오탐 해소)" \

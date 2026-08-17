@@ -547,6 +547,143 @@ t_out "from_request: 섹션 부재 → 빈 출력" "" source_fr_from_request "$R
 
 t_out "from_request: 파일 부재 → 빈 출력 (return 0)" "" source_fr_from_request "${TMP}/no-such-file.md"
 
+# ---------------------------------------------------------------------------
+# source_fr_resolve — 표기 정규화 (promote-source-fr-format-contract)
+# ---------------------------------------------------------------------------
+RES_ROOT="${TMP}/resolve-root"
+RES_ITEMS="${RES_ROOT}/rd-workflow-workspace/backlog/items"
+mkdir -p "$RES_ITEMS"
+: > "${RES_ITEMS}/2026-08-12-alpha.md"
+: > "${RES_ITEMS}/2026-01-01-dup.md"
+: > "${RES_ITEMS}/2026-02-02-dup.md"
+mkdir -p "${RES_ITEMS}/2026-03-03-dir.md"
+: > "${RES_ITEMS}/2026-04-04-paren(x).md"
+
+CANON="rd-workflow-workspace/backlog/items/2026-08-12-alpha.md"
+PAREN="rd-workflow-workspace/backlog/items/2026-04-04-paren(x).md"
+
+# --- 지원 표기 8종 (AC2) ---
+t_out "resolve: canonical 그대로" "$CANON" \
+  source_fr_resolve "$CANON" "$RES_ROOT"
+t_out "resolve: markdown 링크" "$CANON" \
+  source_fr_resolve "[alpha](${CANON})" "$RES_ROOT"
+t_out "resolve: 괄호 병기" "$CANON" \
+  source_fr_resolve "alpha (${CANON})" "$RES_ROOT"
+t_out "resolve: em dash + 상세 링크" "$CANON" \
+  source_fr_resolve "alpha — [상세](${CANON})" "$RES_ROOT"
+t_out "resolve: 중첩 괄호" "$CANON" \
+  source_fr_resolve "alpha ([상세](${CANON}))" "$RES_ROOT"
+t_out "resolve: 리스트 접두" "$CANON" \
+  source_fr_resolve "- [alpha](${CANON})" "$RES_ROOT"
+t_out "resolve: items/ 축약" "$CANON" \
+  source_fr_resolve "items/2026-08-12-alpha.md" "$RES_ROOT"
+t_out "resolve: 날짜+공백+slug" "$CANON" \
+  source_fr_resolve "2026-08-12 alpha" "$RES_ROOT"
+t_out "resolve: slug 단독 (glob)" "$CANON" \
+  source_fr_resolve "alpha" "$RES_ROOT"
+t_out "resolve: slug 정확 일치 우선" "$CANON" \
+  source_fr_resolve "2026-08-12-alpha" "$RES_ROOT"
+
+# --- 레이블은 문법을 제한하지 않는다 (spec §3.3 단계 1) ---
+t_out "resolve: 임의 레이블 허용" "$CANON" \
+  source_fr_resolve "아무 설명이나 (${CANON})" "$RES_ROOT"
+
+# --- 괄호를 포함한 유효 canonical 파일명 (spec §3.3 단계 0.5 fast path) ---
+#     저장 계약(source_fr_validate)이 허용하는 값이므로 해석도 거부하면 안 된다.
+t_out "resolve: 괄호 파일명 canonical" "$PAREN" \
+  source_fr_resolve "$PAREN" "$RES_ROOT"
+t_out "resolve: 괄호 파일명 items/ 축약" "$PAREN" \
+  source_fr_resolve "items/2026-04-04-paren(x).md" "$RES_ROOT"
+# 단계 0(접두 제거) 다음에 단계 0.5(fast path)가 적용되는지 — 순서 고정
+t_out "resolve: 리스트 접두 + 괄호 파일명" "$PAREN" \
+  source_fr_resolve "- items/2026-04-04-paren(x).md" "$RES_ROOT"
+# 괄호 안 target 의 괄호는 지원하지 않는다 — 명시적 계약이다.
+t "resolve: 괄호 안 target 의 괄호 거부" 1 \
+  source_fr_resolve "[p](${PAREN})" "$RES_ROOT"
+# 거부로 끝나면 안 되고, 우회 방법(경로 직접 표기)이 사용자에게 보여야 한다.
+_paren_err="$(source_fr_resolve "[p](${PAREN})" "$RES_ROOT" 2>&1 >/dev/null)"
+case "$_paren_err" in
+  *"경로를 직접"*) echo "ok: 괄호 파일명 거부 시 우회 안내 노출" ;;
+  *) echo "FAIL: 괄호 파일명 거부에 우회 안내 없음 (got: $_paren_err)"; FAIL=1 ;;
+esac
+_paren_out="$(source_fr_resolve "[p](${PAREN})" "$RES_ROOT" 2>/dev/null)"
+if [[ -z "$_paren_out" ]]; then
+  echo "ok: 괄호 파일명 거부 시 stdout 비어 있음"
+else
+  echo "FAIL: 괄호 파일명 거부인데 stdout 출력 있음 ($_paren_out)"; FAIL=1
+fi
+
+# --- 값 없음 (AC7) ---
+t_out "resolve: 빈 값 → 빈 출력" "" source_fr_resolve "" "$RES_ROOT"
+t_out "resolve: sentinel '-' → 빈 출력" "" source_fr_resolve "-" "$RES_ROOT"
+t_out "resolve: 공백만 → 빈 출력" "" source_fr_resolve "   " "$RES_ROOT"
+
+# --- 해석 실패: slug 계열 (AC3·AC4·AC5) ---
+t "resolve: 다중 매칭 거부" 1 source_fr_resolve "dup" "$RES_ROOT"
+t "resolve: 미실존 slug 거부" 1 source_fr_resolve "nosuch" "$RES_ROOT"
+t "resolve: 디렉토리 거부" 1 source_fr_resolve "2026-03-03-dir" "$RES_ROOT"
+t "resolve: glob 메타문자 '*' 거부" 1 source_fr_resolve "*" "$RES_ROOT"
+t "resolve: glob 메타문자 'a*b' 거부" 1 source_fr_resolve "a*b" "$RES_ROOT"
+t "resolve: glob 메타문자 'a?b' 거부" 1 source_fr_resolve "a?b" "$RES_ROOT"
+t "resolve: glob 메타문자 'a[b]c' 거부" 1 source_fr_resolve "a[b]c" "$RES_ROOT"
+t "resolve: 경로 구분자 포함 slug 거부" 1 source_fr_resolve "sub/alpha" "$RES_ROOT"
+t "resolve: 대문자 slug 거부" 1 source_fr_resolve "Alpha" "$RES_ROOT"
+
+# --- 해석 실패: 괄호 계열 (spec §3.3 단계 1) ---
+t "resolve: 괄호 뒤 잔여 거부" 1 source_fr_resolve "[a](${CANON}) 추가설명" "$RES_ROOT"
+t "resolve: 빈 레이블 거부" 1 source_fr_resolve "(${CANON})" "$RES_ROOT"
+t "resolve: 닫는 괄호 없는 링크 거부" 1 source_fr_resolve "[a](${CANON}" "$RES_ROOT"
+t "resolve: 괄호 안 미지원 형식 거부" 1 source_fr_resolve "[a](not-a-path)" "$RES_ROOT"
+
+# --- 해석 실패: 기타 ---
+t "resolve: 리스트 접두 반복 거부" 1 source_fr_resolve "- - alpha" "$RES_ROOT"
+t "resolve: 미실존 canonical path 거부" 1 \
+  source_fr_resolve "rd-workflow-workspace/backlog/items/2026-09-09-gone.md" "$RES_ROOT"
+t "resolve: items 밖 path 거부" 1 \
+  source_fr_resolve "rd-workflow-workspace/backlog/other/x.md" "$RES_ROOT"
+
+# --- 실패 시 stderr 에 원문과 canonical 예시가 있어야 한다 ---
+_sfr_err="$(source_fr_resolve "없는-항목-입니다" "$RES_ROOT" 2>&1 >/dev/null)"
+case "$_sfr_err" in
+  *"없는-항목-입니다"*) echo "ok: resolve stderr 에 원문 값 포함" ;;
+  *) echo "FAIL: resolve stderr 에 원문 값 없음 (got: $_sfr_err)"; FAIL=1 ;;
+esac
+case "$_sfr_err" in
+  *"rd-workflow-workspace/backlog/items/"*) echo "ok: resolve stderr 에 canonical 예시 포함" ;;
+  *) echo "FAIL: resolve stderr 에 canonical 예시 없음"; FAIL=1 ;;
+esac
+_sfr_out="$(source_fr_resolve "없는-항목-입니다" "$RES_ROOT" 2>/dev/null)"
+if [[ -z "$_sfr_out" ]]; then
+  echo "ok: resolve 실패 시 stdout 은 비어 있음"
+else
+  echo "FAIL: resolve 실패인데 stdout 출력 있음 ($_sfr_out)"; FAIL=1
+fi
+
+# --- 주석 처리 (AC6) ---
+cat > "$REQ_FIX" <<'REQEOF'
+## Source FR
+<!-- 형식: rd-workflow-workspace/backlog/items/<파일>.md -->
+-
+REQEOF
+t_out "from_request: 한 줄 주석 건너뜀" "" source_fr_from_request "$REQ_FIX"
+
+cat > "$REQ_FIX" <<'REQEOF'
+## Source FR
+<!--
+여러 줄 주석
+-->
+-
+REQEOF
+t_out "from_request: 여러 줄 주석 건너뜀" "" source_fr_from_request "$REQ_FIX"
+
+cat > "$REQ_FIX" <<'REQEOF'
+## Source FR
+<!-- 형식 안내 -->
+rd-workflow-workspace/backlog/items/2026-08-03-x.md
+REQEOF
+t_out "from_request: 주석 뒤 값 추출" "rd-workflow-workspace/backlog/items/2026-08-03-x.md" \
+  source_fr_from_request "$REQ_FIX"
+
 # ===========================================================================
 # 최종 결과
 # ===========================================================================

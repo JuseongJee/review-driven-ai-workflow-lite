@@ -97,7 +97,7 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 - **작업 완전 마감 후 `/clear` 안내 (필수)**: 작업이 완전히 마감되면(REQUEST 아카이브 완료 + 모든 산출물 손실 없음 확인 — remote-mode는 push까지, local-only는 commit·merge까지) 마지막 응답에서 컨텍스트 `/clear` 가능 여부를 사용자에게 반드시 한 줄 명시합니다. 단 사용자가 추가 FR 등록 의사를 보이면 FR 등록을 먼저 처리한 뒤 안내합니다.
 
 **큰 작업 lifecycle 절차:**
-1. fr branch에서 archive content commit 수행 (REQUEST.md 비우기, archive 파일 생성, FR done 처리, completion report, CURRENT_TASK.md reset).
+1. fr branch에서 archive content commit 수행 (REQUEST.md 비우기, archive 파일 생성, FR done 처리, completion report). `CURRENT_TASK.md` 미러는 `archive.sh`가 baseline으로 되돌리므로 사람이 하지 않습니다.
 2. 기본 브랜치(main 등)로 switch 후 `bash rd-workflow/scripts/lifecycle/archive.sh` 호출 → merge + tag + push + branch/worktree 정리 일괄 처리.
 
 ## 절대 규칙 (모든 skill에 공통 적용)
@@ -151,7 +151,7 @@ Status 필드는 아래 값만 사용합니다 (guard hook이 이 값으로 판�
 - `diff review 대기`
 - `완료`
 
-`CURRENT_TASK.md`는 아래 시점마다 다시 씁니다.
+`CURRENT_TASK.md`는 orchestrator(메인 세션)가 아래 시점마다 다시 씁니다. 병렬 구현자 subagent는 이 파일을 쓰지 않습니다 (guard hook이 차단하며, 진행 상황은 결과로 반환합니다).
 
 - REQUEST 정리 후
 - spec 생성 후

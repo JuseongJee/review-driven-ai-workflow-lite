@@ -20,9 +20,24 @@ if [[ -z "$PROJECT_ROOT" ]]; then
   exit 0
 fi
 
+# 전역·시스템 git 설정 간섭 차단. fixture 의 .git/hooks 가 전역 core.hooksPath 로
+# 무력화되면 hook 기반 테스트가 조용히 거짓 통과한다.
+# git 2.32+ 에서 유효하고 그 이하 버전에서는 무시되므로 부작용이 없다.
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+
 PASS=0; FAIL=0
 fail() { FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1" >&2; }
 pass() { PASS=$((PASS+1)); printf '  PASS: %s\n' "$1"; }
+
+# pipefail 하에서 `cmd | grep -q needle` 은 매치 성공 시 오히려 실패한다 —
+# grep 이 첫 매치에서 종료하면 상류 cmd 가 SIGPIPE(141) 로 죽고 pipefail 이 이를
+# 파이프라인 실패로 전파하기 때문이다. stdin 을 끝까지 읽어 substring 으로 판정한다.
+out_has() {  # out_has <needle> — stdin 을 읽어 needle 포함 여부 반환
+  local needle="$1" out
+  out="$(cat)"
+  [[ "$out" == *"$needle"* ]]
+}
 
 # Common setup helper — temp git repo with lifecycle scripts copied in
 setup_repo() {
@@ -35,6 +50,7 @@ setup_repo() {
     git init -q -b "$branch" 2>/dev/null || git init -q && git checkout -q -b "$branch"; \
     git config user.email test@example.com; \
     git config user.name test; \
+    git config core.hooksPath "$d/.git/hooks"; \
     if [[ -f "$PROJECT_ROOT/_ROOT_FILES/CURRENT_TASK.md" ]]; then \
       cp "$PROJECT_ROOT/_ROOT_FILES/CURRENT_TASK.md" CURRENT_TASK.md; \
     else \
@@ -62,6 +78,75 @@ mk_bare() {  # mk_bare <tag> → bare repo 절대경로
   b="$(dirname "$(mktemp -d)")/bare-mirror-$1-$$"
   git init --bare "$b" -q
   echo "$b"
+}
+
+# 실제 Claude Code 설치 pre-commit hook 과 같은 판정 — main|master 직접 커밋 차단.
+# --no-verify 로만 우회 가능하며 RD_LIFECYCLE_BYPASS_REASON 은 참조하지 않는다.
+#
+# marker 파일과 고유 문구를 남기는 이유: 통제군에서 rc != 0 만 보면 "커밋할 내용 없음"
+# 같은 다른 git 오류도 통과해 hook 이 실행되지 않는데도 활성으로 오판할 수 있다.
+# 실행 흔적을 남겨야 hook 이 실제로 돌았다는 것을 직접 증명할 수 있다.
+install_blocking_pre_commit() {  # install_blocking_pre_commit <repo>
+  cat > "$1/.git/hooks/pre-commit" <<'HOOK'
+#!/bin/sh
+gd="$(git rev-parse --git-dir)"
+: > "$gd/.pre-commit-ran"
+branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+case "$branch" in
+  main|master)
+    echo "RD-TEST-HOOK-BLOCKED: $branch" >&2
+    exit 1
+    ;;
+esac
+exit 0
+HOOK
+  chmod +x "$1/.git/hooks/pre-commit"
+  rm -f "$1/.git/.pre-commit-ran"
+}
+
+# marker 만 남기고 통과시키는(exit 0) pre-commit hook.
+# install_blocking_pre_commit 과 별도로 두는 이유: 그 hook 은 main|master 커밋을 실패시키므로
+# "우회하지 않아도 lifecycle 이 완주한다" 는 시나리오(커스텀 기본 브랜치)를 만들 수 없다.
+#
+# 실행 브랜치명을 marker 에 한 줄씩 append 한다. 파일 존재 여부만으로는 판정할 수 없기
+# 때문이다: promote 는 기본 브랜치의 metadata 커밋 다음에 fr 브랜치 승격 커밋을 한 번 더
+# 만들고, 그 커밋은 우회 대상이 아니라 언제나 hook 을 실행한다. 어느 브랜치에서 hook 이
+# 돌았는지를 기록해야 우회 여부를 정확히 읽을 수 있다.
+install_marker_pre_commit() {  # install_marker_pre_commit <repo>
+  cat > "$1/.git/hooks/pre-commit" <<'HOOK'
+#!/bin/sh
+gd="$(git rev-parse --git-dir)"
+branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+echo "ran:$branch" >> "$gd/.pre-commit-ran"
+exit 0
+HOOK
+  chmod +x "$1/.git/hooks/pre-commit"
+  rm -f "$1/.git/.pre-commit-ran"
+}
+
+marker_has() {  # marker_has <repo> <needle> — marker 파일에 needle 이 있으면 0
+  [[ -f "$1/.git/.pre-commit-ran" ]] || return 1
+  out_has "$2" < "$1/.git/.pre-commit-ran"
+}
+
+# 특정 경로에 대한 `git add` 만 실패시키는 wrapper. PATH 앞에 두고 쓴다.
+# 실제 git 경로를 생성 시점에 박아 넣어 재귀 호출을 막는다.
+mk_failing_git_wrapper() {  # mk_failing_git_wrapper <bindir> <실패시킬 경로 조각>
+  local bindir="$1" needle="$2" real
+  real="$(command -v git)"
+  mkdir -p "$bindir"
+  cat > "$bindir/git" <<WRAP
+#!/bin/sh
+if [ "\$1" = "add" ]; then
+  for a in "\$@"; do
+    case "\$a" in
+      *${needle}*) echo "fake-git: add failed for \$a" >&2; exit 1 ;;
+    esac
+  done
+fi
+exec "${real}" "\$@"
+WRAP
+  chmod +x "$bindir/git"
 }
 
 # git shim — PATH 앞단에서 특정 호출만 가로채고 나머지는 실제 git 에 위임한다.
@@ -221,6 +306,26 @@ run_promote "$REPO" --short-title test-foo --no-worktree >/dev/null
 # LC-14 대칭: archive 후 short-title/status baseline reset (stale 방지)
 ( cd "$REPO" && grep -q "^short-title=-$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "archive: short-title=- baseline reset" || fail "archive: short-title stale 잔존"
 ( cd "$REPO" && grep -q "^status=대기 중$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "archive: status=대기 중 baseline reset" || fail "archive: status stale 잔존"
+# 미러 정합 (AC1·AC2): archive 후 CURRENT_TASK.md 가 baseline 전문과 바이트 단위로 일치해야 한다.
+#   권위(task-state)만 reset 하고 미러를 두면 완료된 작업 내용이 진입점 문서에 남는다.
+if ( cd "$REPO" && source rd-workflow/scripts/lifecycle/_lifecycle_common.sh >/dev/null 2>&1; \
+     emit_current_task_baseline | diff -q - CURRENT_TASK.md >/dev/null 2>&1 ); then
+  pass "archive: CURRENT_TASK.md 미러 baseline reset (전문 일치)"
+else
+  fail "archive: CURRENT_TASK.md 미러 stale 잔존"
+fi
+# 커밋 포함 (AC3 staging 보장): 워킹트리만 고치고 커밋을 빠뜨리면 다음 세션이 stale 을 다시 본다.
+if ( cd "$REPO" && git status --porcelain CURRENT_TASK.md | grep -q . ); then
+  fail "archive: CURRENT_TASK.md 변경이 커밋되지 않음"
+else
+  pass "archive: CURRENT_TASK.md 변경이 커밋에 포함됨"
+fi
+# 임시 파일 잔존 금지: 원자적 교체에 쓴 임시 파일이 남으면 다음 커밋에 섞여 들어간다.
+if ( cd "$REPO" && ls CURRENT_TASK.md.baseline.* >/dev/null 2>&1 ); then
+  fail "archive: baseline 임시 파일 잔존"
+else
+  pass "archive: baseline 임시 파일 정리됨"
+fi
 
 # archive 재실행 — fr branch 부재 + tag 존재 → success exit
 # review-skip-audit.log가 untracked으로 생성될 수 있으므로 clean 트리를 보장하여 LC-20(멱등) 커버리지 복원
@@ -229,8 +334,209 @@ out="$(cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch f
 [[ "$out" == *"이미 archive 완료"* ]] && pass "archive rerun: success exit (이미 완료)" || fail "archive rerun: $out"
 # rerun(이미 완료)은 task-state를 건드리지 않는다 — baseline 유지 확인
 ( cd "$REPO" && grep -q "^short-title=-$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null && grep -q "^status=대기 중$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "archive rerun: task-state 불변 (baseline 유지)" || fail "archive rerun: task-state 변경됨"
+# 재실행 시 미러도 baseline 을 유지해야 한다 (metadata_exists 거짓이라 블록을 건너뛰지만
+# 첫 실행에서 이미 baseline 이 커밋됐으므로 결과가 달라지지 않는다).
+if ( cd "$REPO" && source rd-workflow/scripts/lifecycle/_lifecycle_common.sh >/dev/null 2>&1; \
+     emit_current_task_baseline | diff -q - CURRENT_TASK.md >/dev/null 2>&1 ); then
+  pass "archive rerun: CURRENT_TASK.md baseline 유지"
+else
+  fail "archive rerun: CURRENT_TASK.md 변경됨"
+fi
 
 rm -rf "$REPO"
+
+# === Scenario 1b: fr branch 가 이미 미러 baseline 을 커밋한 경우에도 archive 가 완료된다 ===
+# 변경 전 절차는 archive content commit 에서 수동 reset 을 요구했으므로, 그 절차를 따른 FR·
+# 재실행·복구 흐름에서는 merge 시점에 미러가 이미 baseline 이다. archive 가 다시 baseline 을
+# 써도 HEAD 와 동일해 staged 변경이 없는데, 이를 실패로 판정하면 정상 경로가 막히고
+# merge 가 끝난 뒤라 사용자가 수동 복구를 해야 한다 (final diff review turn 002 Finding 1).
+echo "== scenario 1b: 이미 baseline 인 미러로 archive =="
+REPO="$(setup_repo)"
+run_promote "$REPO" --short-title test-pre --no-worktree --status "구현 중" >/dev/null
+( cd "$REPO" && git switch fr/test-pre -q )
+( cd "$REPO" && echo "# archived" > REQUEST.md )
+( cd "$REPO" && source rd-workflow/scripts/lifecycle/_lifecycle_common.sh >/dev/null 2>&1; \
+  emit_current_task_baseline > CURRENT_TASK.md )
+( cd "$REPO" && git add REQUEST.md CURRENT_TASK.md && git commit -q -m "archive content (미러 baseline 포함)" )
+if out="$( cd "$REPO" && git switch main -q && \
+     bash rd-workflow/scripts/lifecycle/archive.sh --no-remote --force-skip-review-check "통합 테스트 fixture" 2>&1 )"; then
+  pass "scenario 1b: 이미 baseline 인 미러에서 archive 성공"
+else
+  fail "scenario 1b: archive 실패 — $out"
+fi
+( cd "$REPO" && ! git rev-parse --verify fr/test-pre >/dev/null 2>&1 ) && pass "scenario 1b: branch 삭제" || fail "scenario 1b: branch 잔존"
+if ( cd "$REPO" && source rd-workflow/scripts/lifecycle/_lifecycle_common.sh >/dev/null 2>&1; \
+     emit_current_task_baseline | diff -q - CURRENT_TASK.md >/dev/null 2>&1 ); then
+  pass "scenario 1b: 미러가 baseline 유지"
+else
+  fail "scenario 1b: 미러 baseline 아님"
+fi
+
+rm -rf "$REPO"
+
+# === Scenario 1c: promote source-fr 해석 계약 ===
+echo "== scenario 1c: promote source-fr 해석 계약 =="
+
+# (1) 링크 표기 → canonical path 로 기록된다
+REPO="$(setup_repo)"
+mkdir -p "$REPO/rd-workflow-workspace/backlog/items"
+: > "$REPO/rd-workflow-workspace/backlog/items/2026-08-12-alpha.md"
+cat > "$REPO/REQUEST.md" <<'REQEOF'
+# Change Request
+
+## Source FR
+[alpha](rd-workflow-workspace/backlog/items/2026-08-12-alpha.md)
+REQEOF
+( cd "$REPO" && git add -A && git commit -qm "test: sfr fixture" )
+run_promote "$REPO" --short-title sfr-ok --no-worktree --status "구현 중" >/dev/null
+( cd "$REPO" && git show main:rd-workflow-workspace/.lifecycle/task-state \
+    | grep -q "source-fr=rd-workflow-workspace/backlog/items/2026-08-12-alpha.md" ) \
+  && pass "promote sfr: 링크 표기 → canonical 기록" \
+  || fail "promote sfr: 링크 표기 정규화 실패"
+
+# (2) 해석 실패 → non-zero + 상태 완전 무변경
+#     HEAD 만 비교하면 working tree 오염을 놓치므로 네 대상을 모두 비교한다.
+#     파일 비교는 cmp -s 로 한다 — "$(cat f)" 문자열 비교는 명령 치환이
+#     trailing newline 을 지워 줄바꿈만 달라진 변조를 놓친다.
+REPO="$(setup_repo)"
+mkdir -p "$REPO/rd-workflow-workspace/backlog/items"
+cat > "$REPO/REQUEST.md" <<'REQEOF'
+# Change Request
+
+## Source FR
+없는-항목-입니다
+REQEOF
+# CURRENT_TASK.md 를 실제 내용으로 둔다 — 부재 상태의 absent→absent 비교는
+# "생성되지 않았다" 만 보이고 "기존 파일이 보존됐다" 는 못 본다.
+cat > "$REPO/CURRENT_TASK.md" <<'CTEOF'
+# Current Task
+
+## Short Title
+-
+
+## Status
+대기 중
+CTEOF
+( cd "$REPO" && git add -A && git commit -qm "test: sfr bad fixture" )
+
+SFR_STATE="$REPO/rd-workflow-workspace/.lifecycle/task-state"
+SFR_SNAP="$(mktemp -d)"    # repo 밖에 snapshot 을 둔다
+before_head="$( cd "$REPO" && git rev-parse HEAD )"
+before_status="$( cd "$REPO" && git status --porcelain )"
+cp "$REPO/CURRENT_TASK.md" "$SFR_SNAP/CURRENT_TASK.md"
+before_state_exists=0
+if [[ -f "$SFR_STATE" ]]; then
+  before_state_exists=1
+  cp "$SFR_STATE" "$SFR_SNAP/task-state"
+fi
+
+# stdout 과 stderr 를 분리 캡처한다 — 교정 안내가 stderr 로 나가는지 검증해야 한다.
+sfr_out="$(mktemp)"; sfr_err="$(mktemp)"
+set +e
+run_promote "$REPO" --short-title sfr-bad --no-worktree --status "구현 중" \
+  >"$sfr_out" 2>"$sfr_err"
+sfr_rc=$?
+set -e
+
+[[ "$sfr_rc" -ne 0 ]] && pass "promote sfr: 해석 실패 → non-zero" \
+  || fail "promote sfr: 해석 실패인데 exit 0"
+grep -q "없는-항목-입니다" "$sfr_err" \
+  && pass "promote sfr: stderr 에 원문 값 포함" \
+  || fail "promote sfr: stderr 에 원문 값 없음"
+grep -q "rd-workflow-workspace/backlog/items/" "$sfr_err" \
+  && pass "promote sfr: stderr 에 canonical 예시 포함" \
+  || fail "promote sfr: stderr 에 canonical 예시 없음"
+[[ ! -s "$sfr_out" ]] \
+  && pass "promote sfr: 실패 시 stdout 비어 있음" \
+  || fail "promote sfr: 실패인데 stdout 출력 있음"
+
+( cd "$REPO" && [[ "$(git rev-parse HEAD)" == "$before_head" ]] ) \
+  && pass "promote sfr: 실패 시 HEAD 불변" || fail "promote sfr: HEAD 이동함"
+( cd "$REPO" && [[ "$(git status --porcelain)" == "$before_status" ]] ) \
+  && pass "promote sfr: 실패 시 working tree 불변" || fail "promote sfr: working tree 오염"
+cmp -s "$SFR_SNAP/CURRENT_TASK.md" "$REPO/CURRENT_TASK.md" \
+  && pass "promote sfr: 실패 시 CURRENT_TASK.md byte 불변" \
+  || fail "promote sfr: CURRENT_TASK.md 변경됨"
+if [[ "$before_state_exists" -eq 1 ]]; then
+  cmp -s "$SFR_SNAP/task-state" "$SFR_STATE" \
+    && pass "promote sfr: 실패 시 task-state byte 불변" \
+    || fail "promote sfr: task-state 변경됨"
+else
+  [[ ! -e "$SFR_STATE" ]] \
+    && pass "promote sfr: 실패 시 task-state 미생성" \
+    || fail "promote sfr: task-state 새로 생김"
+fi
+( cd "$REPO" && ! git rev-parse --verify fr/sfr-bad >/dev/null 2>&1 ) \
+  && pass "promote sfr: 실패 시 브랜치 미생성" || fail "promote sfr: 브랜치 생김"
+rm -rf "$sfr_out" "$sfr_err" "$SFR_SNAP"
+
+# (2b) --dry-run 도 같은 판정을 낸다.
+#      사전 점검이 성공을 알리고 실제 실행이 실패하면 신호가 반대가 되어 쓸모가 없다.
+#      해석은 read-only 이므로 dry-run 조기 종료보다 먼저 수행할 수 있다.
+DRY_SNAP="$(mktemp -d)"
+cp "$REPO/CURRENT_TASK.md" "$DRY_SNAP/CURRENT_TASK.md"
+dry_before_status="$( cd "$REPO" && git status --porcelain )"
+dry_out="$(mktemp)"; dry_err="$(mktemp)"
+set +e
+run_promote "$REPO" --short-title sfr-dry --no-worktree --status "구현 중" --dry-run \
+  >"$dry_out" 2>"$dry_err"
+dry_rc=$?
+set -e
+
+[[ "$dry_rc" -ne 0 ]] && pass "promote sfr: dry-run 도 해석 실패 → non-zero" \
+  || fail "promote sfr: dry-run 이 해석 실패를 통과시킴 (실제 실행과 반대 신호)"
+grep -q "없는-항목-입니다" "$dry_err" \
+  && pass "promote sfr: dry-run stderr 에 원문 값 포함" \
+  || fail "promote sfr: dry-run stderr 에 원문 값 없음"
+( cd "$REPO" && [[ "$(git status --porcelain)" == "$dry_before_status" ]] ) \
+  && pass "promote sfr: dry-run 실패 시 working tree 불변" \
+  || fail "promote sfr: dry-run 이 working tree 오염"
+cmp -s "$DRY_SNAP/CURRENT_TASK.md" "$REPO/CURRENT_TASK.md" \
+  && pass "promote sfr: dry-run 실패 시 CURRENT_TASK.md byte 불변" \
+  || fail "promote sfr: dry-run 이 CURRENT_TASK.md 변경"
+[[ ! -e "$SFR_STATE" ]] \
+  && pass "promote sfr: dry-run 실패 시 task-state 미생성" \
+  || fail "promote sfr: dry-run 이 task-state 생성"
+( cd "$REPO" && ! git rev-parse --verify fr/sfr-dry >/dev/null 2>&1 ) \
+  && pass "promote sfr: dry-run 실패 시 브랜치 미생성" \
+  || fail "promote sfr: dry-run 이 브랜치 생성"
+rm -rf "$dry_out" "$dry_err" "$DRY_SNAP"
+
+# (3) REQUEST 를 고치면 재실행으로 정상 진행한다
+: > "$REPO/rd-workflow-workspace/backlog/items/2026-08-12-beta.md"
+cat > "$REPO/REQUEST.md" <<'REQEOF'
+# Change Request
+
+## Source FR
+rd-workflow-workspace/backlog/items/2026-08-12-beta.md
+REQEOF
+( cd "$REPO" && git add -A && git commit -qm "test: sfr 교정" )
+# 해석을 dry-run 앞으로 옮긴 뒤에도 정상 값의 dry-run 은 그대로 통과해야 한다.
+run_promote "$REPO" --short-title sfr-bad --no-worktree --status "구현 중" --dry-run >/dev/null \
+  && pass "promote sfr: 정상 값 dry-run 통과" || fail "promote sfr: 정상 값인데 dry-run 실패"
+( cd "$REPO" && ! git rev-parse --verify fr/sfr-bad >/dev/null 2>&1 ) \
+  && pass "promote sfr: 정상 값 dry-run 은 브랜치를 만들지 않음" \
+  || fail "promote sfr: dry-run 이 브랜치 생성"
+run_promote "$REPO" --short-title sfr-bad --no-worktree --status "구현 중" >/dev/null \
+  && pass "promote sfr: 교정 후 재실행 성공" || fail "promote sfr: 교정 후에도 실패"
+
+# (4) 명시 인자가 REQUEST 추론보다 우선한다
+REPO="$(setup_repo)"
+mkdir -p "$REPO/rd-workflow-workspace/backlog/items"
+: > "$REPO/rd-workflow-workspace/backlog/items/2026-08-12-alpha.md"
+: > "$REPO/rd-workflow-workspace/backlog/items/2026-08-12-gamma.md"
+cat > "$REPO/REQUEST.md" <<'REQEOF'
+# Change Request
+
+## Source FR
+[alpha](rd-workflow-workspace/backlog/items/2026-08-12-alpha.md)
+REQEOF
+( cd "$REPO" && git add -A && git commit -qm "test: sfr 우선순위 fixture" )
+run_promote "$REPO" --short-title sfr-pri --no-worktree --status "구현 중" \
+  --source-fr "rd-workflow-workspace/backlog/items/2026-08-12-gamma.md" >/dev/null
+( cd "$REPO" && git show main:rd-workflow-workspace/.lifecycle/task-state \
+    | grep -q "source-fr=rd-workflow-workspace/backlog/items/2026-08-12-gamma.md" ) \
+  && pass "promote sfr: 명시 인자 우선" || fail "promote sfr: 우선순위 역전"
 
 # === Scenario 2: promote → rollback ===
 echo "== scenario 2: promote → rollback =="
@@ -986,6 +1292,356 @@ for _mm in "promote:promote.sh --short-title test-mm --no-worktree" \
 done
 ( cd "$REPO" && git worktree remove --force "$WT" ) || true
 rm -rf "$REPO"
+
+# ---- 차단 pre-commit hook 하에서 lifecycle 이 커밋까지 완료하는가 ----
+# 통제군(--no-verify 없는 커밋이 실제로 차단되는지)을 먼저 증명한다.
+# 이 단계가 없으면 hook 이 실행되지 않는 환경에서도 본 검증이 통과해 회귀 고정 능력을 잃는다.
+for _br in main master; do
+  # (a) 브랜치별 통제군 1회 — fixture 의 hook 이 실제로 실행되는지 직접 증명한다.
+  #     rc != 0 만 보면 다른 git 오류와 구분되지 않으므로 marker 파일과 고유 문구를 함께 본다.
+  REPO="$(setup_repo "$_br")"
+  install_blocking_pre_commit "$REPO"
+  ctl_rc=0
+  ctl_err="$( cd "$REPO" && echo ctl > ctl.txt && git add ctl.txt \
+      && git commit -q -m "control" 2>&1 )" || ctl_rc=$?
+  [[ "$ctl_rc" -ne 0 ]] \
+    && pass "hook-block/$_br 통제군: 커밋 차단 (rc=$ctl_rc)" \
+    || fail "hook-block/$_br 통제군: 차단되지 않음 — hook 미실행 의심"
+  [[ -f "$REPO/.git/.pre-commit-ran" ]] \
+    && pass "hook-block/$_br 통제군: hook 실행 marker 확인" \
+    || fail "hook-block/$_br 통제군: hook 이 실행되지 않음 (marker 부재)"
+  printf '%s' "$ctl_err" | out_has "RD-TEST-HOOK-BLOCKED" \
+    && pass "hook-block/$_br 통제군: 차단 사유가 hook 임을 확인" \
+    || fail "hook-block/$_br 통제군: 실패 원인이 hook 이 아님 — $ctl_err"
+  ( cd "$REPO" && git reset -q )
+
+  # (b) promote
+  prc=0
+  run_promote "$REPO" --short-title test-hb --no-worktree >/dev/null 2>&1 || prc=$?
+  [[ "$prc" -eq 0 ]] \
+    && pass "hook-block/$_br promote: exit 0" || fail "hook-block/$_br promote: exit=$prc"
+  ( cd "$REPO" && git log "$_br" --oneline -20 | out_has "promote test-hb metadata 기록" ) \
+    && pass "hook-block/$_br promote: metadata 커밋이 HEAD 이력에 반영" \
+    || fail "hook-block/$_br promote: metadata 커밋 부재"
+  rm -rf "$REPO"
+
+  # (c) promote_rollback
+  REPO="$(setup_repo "$_br")"
+  run_promote "$REPO" --short-title test-hbr --no-worktree >/dev/null 2>&1
+  install_blocking_pre_commit "$REPO"
+  ( cd "$REPO" && git switch "$_br" -q )
+  rrc=0
+  ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh ) >/dev/null 2>&1 || rrc=$?
+  [[ "$rrc" -eq 0 ]] \
+    && pass "hook-block/$_br rollback: exit 0" || fail "hook-block/$_br rollback: exit=$rrc"
+  ( cd "$REPO" && git log "$_br" --oneline -20 | out_has "rollback 완료" ) \
+    && pass "hook-block/$_br rollback: 커밋이 HEAD 이력에 반영" \
+    || fail "hook-block/$_br rollback: 커밋 부재"
+  rm -rf "$REPO"
+
+  # (d) archive
+  REPO="$(setup_repo "$_br")"
+  BAREHB="$(mk_bare "hb-$_br")"
+  ( cd "$REPO" && git remote add origin "$BAREHB" && git push -q origin "$_br" )
+  run_promote "$REPO" --short-title test-hba --no-worktree >/dev/null 2>&1
+  ( cd "$REPO" && echo "ar" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" )
+  ( cd "$REPO" && git switch "$_br" -q )
+  install_blocking_pre_commit "$REPO"
+  arc=0
+  ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh \
+      --force-skip-review-check "통합 테스트 fixture" ) >/dev/null 2>&1 || arc=$?
+  [[ "$arc" -eq 0 ]] \
+    && pass "hook-block/$_br archive: exit 0" || fail "hook-block/$_br archive: exit=$arc"
+  # AC5 직접 oracle — 기대 커밋이 기본 브랜치 이력에 실제로 존재하는지 본다.
+  # tag 생성은 커밋 이후 단계 도달을 보는 간접 신호일 뿐이라 이것을 대체하지 못한다.
+  ( cd "$REPO" && git log "$_br" --oneline -20 | out_has "archive test-hba metadata 정리" ) \
+    && pass "hook-block/$_br archive: metadata 정리 커밋이 기본 브랜치 이력에 반영" \
+    || fail "hook-block/$_br archive: metadata 정리 커밋 부재"
+  [[ -n "$( cd "$REPO" && git tag --list "fr/*/test-hba" )" ]] \
+    && pass "hook-block/$_br archive: tag 생성 (후속 단계 oracle)" \
+    || fail "hook-block/$_br archive: tag 부재 — 커밋 이후 단계 미도달"
+  rm -rf "$REPO" "$BAREHB"
+done
+
+# ---- hook 우회는 hook 이 실제로 차단하는 브랜치에서만 일어나는가 ----
+# Claude Code 설치 hook 은 브랜치명이 main|master 일 때만 커밋을 막는다. workflow.json 의
+# default_branch 로 trunk 같은 커스텀 기본 브랜치를 쓰는 프로젝트에서는 막히지 않으므로
+# --no-verify 를 붙일 이유가 없고, 붙이면 소비 프로젝트의 pre-commit·commit-msg 검증만
+# 불필요하게 줄어든다.
+#
+# promote 한 경로로만 검증한다 — 세 지점(promote·promote_rollback·archive)이 모두 같은
+# lifecycle_needs_hook_bypass 판정을 쓰므로 브랜치 조건은 공통이고, promote 가 fixture
+# 준비(bare remote·archive content 불필요)가 가장 단순해 조건 자체를 가장 좁게 고정한다.
+#
+# trunk 와 main 을 짝으로 둔다. 한쪽만 보면 "우회 안내가 없다" 가 우회를 안 해서인지
+# 안내 지점에 도달하지 못해서인지 구분되지 않아 판정이 성립하지 않는다.
+
+# (a) trunk — 우회하지 않는다
+REPO="$(setup_repo trunk)"
+( cd "$REPO" && mkdir -p rd-workflow/config \
+  && printf '{"default_branch": "trunk"}\n' > rd-workflow/config/workflow.json \
+  && git add -A && git commit -q -m "config" )
+install_marker_pre_commit "$REPO"
+nbt_rc=0
+nbt_out="$( run_promote "$REPO" --short-title test-nbt --no-worktree 2>&1 )" || nbt_rc=$?
+[[ "$nbt_rc" -eq 0 ]] \
+  && pass "hook-cond/trunk: promote rc=0" || fail "hook-cond/trunk: rc=$nbt_rc — $nbt_out"
+marker_has "$REPO" "ran:trunk" \
+  && pass "hook-cond/trunk: 기본 브랜치 커밋에서 hook 실행됨 (우회 안 함)" \
+  || fail "hook-cond/trunk: hook 미실행 — 차단 대상이 아닌 브랜치를 우회함"
+printf '%s' "$nbt_out" | out_has "hook 을 건너뛰고 커밋했습니다" \
+  && fail "hook-cond/trunk: 우회하지 않았는데 우회 안내가 출력됨" \
+  || pass "hook-cond/trunk: 우회 안내 없음"
+rm -rf "$REPO"
+
+# (b) main — 우회한다 (대조군)
+REPO="$(setup_repo main)"
+install_marker_pre_commit "$REPO"
+nbm_rc=0
+nbm_out="$( run_promote "$REPO" --short-title test-nbm --no-worktree 2>&1 )" || nbm_rc=$?
+[[ "$nbm_rc" -eq 0 ]] \
+  && pass "hook-cond/main: promote rc=0" || fail "hook-cond/main: rc=$nbm_rc — $nbm_out"
+marker_has "$REPO" "ran:main" \
+  && fail "hook-cond/main: 차단 대상 브랜치인데 hook 이 실행됨 (우회 실패)" \
+  || pass "hook-cond/main: 기본 브랜치 커밋에서 hook 미실행 (우회함)"
+# hook 이 애초에 설치·동작하지 않아서 marker 가 비었을 가능성을 같은 실행 안에서 배제한다.
+# fr 브랜치 승격 커밋은 우회 대상이 아니므로 반드시 hook 을 실행한다.
+marker_has "$REPO" "ran:fr/test-nbm" \
+  && pass "hook-cond/main: 비우회 커밋에서는 hook 실행됨 (hook 동작 확인)" \
+  || fail "hook-cond/main: hook 자체가 동작하지 않음 — 위 판정이 무의미"
+printf '%s' "$nbm_out" | out_has "hook 을 건너뛰고 커밋했습니다" \
+  && pass "hook-cond/main: 우회 안내 출력" || fail "hook-cond/main: 우회 안내 누락 — $nbm_out"
+rm -rf "$REPO"
+
+# ---- 사용자의 무관한 staged 변경이 lifecycle 우회 커밋에 딸려가지 않는가 ----
+# 각 케이스는 rc·기대 커밋 생성·사용자 파일 제외·index 보존·안내를 동일 실행에서 확인한다.
+
+# (a) promote
+REPO="$(setup_repo)"
+install_blocking_pre_commit "$REPO"
+( cd "$REPO" && mkdir -p src && echo "user work" > src/app.js && git add src/app.js )
+sp_rc=0
+sp_out="$( run_promote "$REPO" --short-title test-stgp --no-worktree 2>&1 )" || sp_rc=$?
+[[ "$sp_rc" -eq 0 ]] \
+  && pass "staged/promote: rc=0" || fail "staged/promote: rc=$sp_rc — $sp_out"
+( cd "$REPO" && git log main --oneline -10 | out_has "promote test-stgp metadata 기록" ) \
+  && pass "staged/promote: lifecycle 커밋 생성" || fail "staged/promote: lifecycle 커밋 부재"
+( cd "$REPO" && git log main -1 --name-only --format= | out_has "src/app.js" ) \
+  && fail "staged/promote: 사용자 파일이 lifecycle 커밋에 포함됨" \
+  || pass "staged/promote: 사용자 파일이 커밋에서 제외됨"
+# index 보존은 promote 실행 "전체" 기준이다 — metadata 우회 커밋만이 아니라 그 뒤에 이어지는
+# fr 브랜치 승격 커밋(CURRENT_TASK.md 갱신)까지 경로 한정이라야 참이 된다. 둘 중 하나라도
+# pathspec 을 잃으면 남아 있던 staged src/app.js 가 흡수되어 이 assertion 이 실패한다.
+( cd "$REPO" && git diff --cached --name-only | out_has "src/app.js" ) \
+  && pass "staged/promote: 사용자 staged 상태 보존" || fail "staged/promote: 사용자 staged 소실"
+printf '%s' "$sp_out" | out_has "commit-msg" \
+  && pass "staged/promote: 우회 범위 특정 안내" || fail "staged/promote: 안내 누락 — $sp_out"
+rm -rf "$REPO"
+
+# (b) promote_rollback
+REPO="$(setup_repo)"
+run_promote "$REPO" --short-title test-stgr --no-worktree >/dev/null 2>&1
+( cd "$REPO" && git switch main -q )
+install_blocking_pre_commit "$REPO"
+( cd "$REPO" && mkdir -p src && echo "user work" > src/app.js && git add src/app.js )
+sr_rc=0
+sr_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh 2>&1 )" || sr_rc=$?
+[[ "$sr_rc" -eq 0 ]] \
+  && pass "staged/rollback: rc=0" || fail "staged/rollback: rc=$sr_rc — $sr_out"
+( cd "$REPO" && git log main --oneline -10 | out_has "rollback 완료" ) \
+  && pass "staged/rollback: lifecycle 커밋 생성" || fail "staged/rollback: lifecycle 커밋 부재"
+( cd "$REPO" && git log main -1 --name-only --format= | out_has "src/app.js" ) \
+  && fail "staged/rollback: 사용자 파일이 lifecycle 커밋에 포함됨" \
+  || pass "staged/rollback: 사용자 파일이 커밋에서 제외됨"
+( cd "$REPO" && git diff --cached --name-only | out_has "src/app.js" ) \
+  && pass "staged/rollback: 사용자 staged 상태 보존" || fail "staged/rollback: 사용자 staged 소실"
+printf '%s' "$sr_out" | out_has "commit-msg" \
+  && pass "staged/rollback: 우회 범위 특정 안내" || fail "staged/rollback: 안내 누락 — $sr_out"
+rm -rf "$REPO"
+
+# (c) archive
+REPO="$(setup_repo)"
+BARESA="$(mk_bare stga)"
+( cd "$REPO" && git remote add origin "$BARESA" && git push -q origin main )
+run_promote "$REPO" --short-title test-stga --no-worktree >/dev/null 2>&1
+( cd "$REPO" && echo "ar" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" )
+( cd "$REPO" && git switch main -q )
+install_blocking_pre_commit "$REPO"
+( cd "$REPO" && mkdir -p src && echo "user work" > src/app.js && git add src/app.js )
+sa_rc=0
+# archive.sh Step 0 의 ensure_worktree_clean 은 무관 staged 만 있어도 기본 경로에서
+# rc=1 로 막는다(REQUEST.md 41행이 지목하는 위험 경로). --force-dirty 로 그 gate 는
+# 우회할 수 있지만, archive 는 세 경로(promote/promote_rollback/archive) 중 유일하게
+# metadata cleanup 커밋보다 먼저 `git merge --no-ff "$FR_BRANCH"`(archive.sh:105)를
+# 실행한다. git merge 는 index 가 dirty 하면 거부하므로(실측 오류: "Your local changes
+# to the following files would be overwritten by merge"), --force-dirty 를 줘도
+# archive 는 metadata cleanup 커밋에 도달하지 못하고 merge 단계에서 중단된다.
+#
+# 이 "도달 불가" 는 merge 를 실제로 수행하는 경로에 한정된 사실이다. archive.sh:102-104 은
+# fr 브랜치가 이미 HEAD 의 ancestor 이면 merge 를 통째로 건너뛰므로, 그 경로에서는 dirty
+# index 로도 metadata cleanup 커밋에 정상 도달한다 — 거기서는 경로 한정 커밋(_lc_paths)이
+# 실제로 무관 staged 를 배제하는 보호로 동작한다. 그 경로는 바로 아래 (d) merge-skip
+# 케이스가 덮으며, _lc_paths 의 경로 한정 효과를 고정하는 것도 그 케이스다.
+# ensure_worktree_clean·merge 순서 둘 다 사용자를 보호하는 기존 동작이므로 완화하지 않는다.
+# LC_ALL=C 고정: 아래 oracle 이 git 의 영문 오류 메시지를 판정에 쓰므로,
+# 번역 locale 환경에서 거짓 실패하지 않도록 실행 locale 을 못박는다.
+sa_out="$( cd "$REPO" && LC_ALL=C bash rd-workflow/scripts/lifecycle/archive.sh \
+    --force-dirty --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || sa_rc=$?
+# 중단 사유까지 확인한다 — rc != 0 만 보면 archive 가 다른 이유로 실패해도 통과해
+# 통제군보다 약한 oracle 이 된다.
+[[ "$sa_rc" -ne 0 ]] && printf '%s' "$sa_out" | out_has "would be overwritten by merge" \
+  && pass "staged/archive: 무관 staged 상태에서 merge 단계 중단 (rc=$sa_rc)" \
+  || fail "staged/archive: merge 단계 중단이 아님 (rc=$sa_rc) — $sa_out"
+( cd "$REPO" && git log --all --oneline | out_has "archive test-stga metadata 정리" ) \
+  && fail "staged/archive: 중단됐는데 metadata 정리 커밋이 생성됨" \
+  || pass "staged/archive: lifecycle 커밋 미생성"
+( cd "$REPO" && git log --all --name-only --format= | out_has "src/app.js" ) \
+  && fail "staged/archive: 사용자 파일이 lifecycle 커밋에 포함됨" \
+  || pass "staged/archive: 사용자 파일이 커밋에서 제외됨"
+( cd "$REPO" && git diff --cached --name-only | out_has "src/app.js" ) \
+  && pass "staged/archive: 사용자 staged 상태 보존" || fail "staged/archive: 사용자 staged 소실"
+rm -rf "$REPO" "$BARESA"
+
+# (d) archive — merge skip 경로 (archive.sh:102-104)
+# (c) 는 merge 가 무관 staged 를 막는 경로를, 이 케이스는 merge 를 건너뛰어 metadata
+# cleanup 커밋에 실제로 도달하는 경로를 고정한다. 두 케이스는 서로 다른 사실을 지킨다.
+# 재현 조건: 사용자가 fr 을 먼저 수동 merge 했거나, 이전 archive 실행이 merge 직후
+# 실패해 재실행하는 상황 — 그때 fr 은 이미 HEAD 의 ancestor 라 merge 가 skip 된다.
+REPO="$(setup_repo)"
+BAREMS="$(mk_bare mskip)"
+( cd "$REPO" && git remote add origin "$BAREMS" && git push -q origin main )
+run_promote "$REPO" --short-title test-mskip --no-worktree >/dev/null 2>&1
+( cd "$REPO" && echo "ar" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" )
+( cd "$REPO" && git switch main -q )
+# 선행 수동 merge — 이것이 archive.sh 의 merge skip 분기를 트리거한다.
+( cd "$REPO" && git merge --no-ff fr/test-mskip -m "manual merge" -q )
+install_blocking_pre_commit "$REPO"
+( cd "$REPO" && mkdir -p src && echo "user work" > src/app.js && git add src/app.js )
+ms_rc=0
+ms_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh \
+    --force-dirty --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || ms_rc=$?
+[[ "$ms_rc" -eq 0 ]] \
+  && pass "staged/archive-mergeskip: rc=0" || fail "staged/archive-mergeskip: rc=$ms_rc — $ms_out"
+( cd "$REPO" && git log main --oneline -10 | out_has "archive test-mskip metadata 정리" ) \
+  && pass "staged/archive-mergeskip: lifecycle 커밋 생성" \
+  || fail "staged/archive-mergeskip: lifecycle 커밋 부재 — $ms_out"
+( cd "$REPO" && git log main -1 --name-only --format= | out_has "src/app.js" ) \
+  && fail "staged/archive-mergeskip: 사용자 파일이 lifecycle 커밋에 포함됨" \
+  || pass "staged/archive-mergeskip: 사용자 파일이 커밋에서 제외됨"
+( cd "$REPO" && git diff --cached --name-only | out_has "src/app.js" ) \
+  && pass "staged/archive-mergeskip: 사용자 staged 상태 보존" \
+  || fail "staged/archive-mergeskip: 사용자 staged 소실"
+printf '%s' "$ms_out" | out_has "commit-msg" \
+  && pass "staged/archive-mergeskip: 우회 범위 특정 안내" \
+  || fail "staged/archive-mergeskip: 안내 누락 — $ms_out"
+rm -rf "$REPO" "$BAREMS"
+
+# ---- lifecycle 대상 변경이 없고 무관 staged 만 있을 때 lifecycle 커밋이 생기지 않는가 ----
+REPO="$(setup_repo)"
+run_promote "$REPO" --short-title test-neg --no-worktree >/dev/null 2>&1
+( cd "$REPO" && git switch main -q )
+# 준비 실행 — rc 를 반드시 확인한다. 여기서 실패하면 이후 assertion 이 무의미하다.
+prep_rc=0
+prep_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh 2>&1 )" || prep_rc=$?
+[[ "$prep_rc" -eq 0 ]] \
+  && pass "negative: 준비 rollback rc=0" || fail "negative: 준비 rollback rc=$prep_rc — $prep_out"
+neg_before="$( cd "$REPO" && git rev-parse main )"
+install_blocking_pre_commit "$REPO"
+( cd "$REPO" && mkdir -p src && echo "user work" > src/app.js && git add src/app.js )
+# 2회차는 --fr-branch 명시가 필수다 (metadata 는 1회차에서 정리되었다).
+neg_rc=0
+neg_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh \
+    --fr-branch fr/test-neg 2>&1 )" || neg_rc=$?
+neg_after="$( cd "$REPO" && git rev-parse main )"
+[[ "$neg_rc" -eq 0 ]] \
+  && pass "negative: 2회차 rollback rc=0 (판정 지점 도달)" \
+  || fail "negative: 2회차 rollback rc=$neg_rc — 판정 이전 종료 의심: $neg_out"
+[[ "$neg_before" == "$neg_after" ]] \
+  && pass "negative: 대상 변경 없음 → lifecycle 커밋 미생성" \
+  || fail "negative: 무관 staged 만으로 lifecycle 커밋이 생김 (판정 범위 축소 누락)"
+( cd "$REPO" && git diff --cached --name-only | out_has "src/app.js" ) \
+  && pass "negative: 사용자 staged 보존" || fail "negative: 사용자 staged 소실"
+rm -rf "$REPO"
+
+# ---- tracked legacy active-fr 의 삭제가 경로 한정 커밋으로 기록되는가 ----
+REPO="$(setup_repo)"
+BARELG="$(mk_bare legacy)"
+( cd "$REPO" && git remote add origin "$BARELG" && git push -q origin main )
+run_promote "$REPO" --short-title test-legacy --no-worktree >/dev/null 2>&1
+# promote 직후 현재 브랜치는 fr 이다 — 여기서 legacy 파일을 tracked 로 만든다
+( cd "$REPO" && mkdir -p rd-workflow-workspace/.lifecycle \
+    && echo "test-legacy" > rd-workflow-workspace/.lifecycle/active-fr \
+    && git add rd-workflow-workspace/.lifecycle/active-fr \
+    && git commit -q -m "legacy active-fr fixture" )
+( cd "$REPO" && echo "ar" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" )
+( cd "$REPO" && git switch main -q )
+install_blocking_pre_commit "$REPO"
+lg_rc=0
+lg_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh \
+    --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || lg_rc=$?
+[[ "$lg_rc" -eq 0 ]] \
+  && pass "legacy: archive rc=0" || fail "legacy: archive rc=$lg_rc — $lg_out"
+( cd "$REPO" && git log main -1 --diff-filter=D --name-only --format= | out_has "active-fr" ) \
+  && pass "legacy: active-fr 삭제가 lifecycle 커밋에 기록됨" \
+  || fail "legacy: 삭제 미기록 — partial commit 의 삭제분 전제 위반"
+rm -rf "$REPO" "$BARELG"
+
+# ---- 필수 경로의 git add 실패 시 lifecycle 이 중단되는가 ----
+# (a) rollback 필수 경로
+REPO="$(setup_repo)"
+run_promote "$REPO" --short-title test-addfail --no-worktree >/dev/null 2>&1
+( cd "$REPO" && git switch main -q )
+WRAPBIN="$(mktemp -d)"
+mk_failing_git_wrapper "$WRAPBIN" "CURRENT_TASK.md"
+af_rc=0
+af_out="$( cd "$REPO" && PATH="$WRAPBIN:$PATH" \
+    bash rd-workflow/scripts/lifecycle/promote_rollback.sh 2>&1 )" || af_rc=$?
+[[ "$af_rc" -ne 0 ]] \
+  && pass "add-fail/rollback: staging 실패 시 중단 (rc=$af_rc)" \
+  || fail "add-fail/rollback: staging 실패를 무시하고 계속 진행함"
+printf '%s' "$af_out" | out_has "staging 실패" \
+  && pass "add-fail/rollback: 중단 사유 안내" || fail "add-fail/rollback: 사유 안내 누락 — $af_out"
+( cd "$REPO" && git log main --oneline -5 | out_has "rollback 완료" ) \
+  && fail "add-fail/rollback: 중단됐는데 lifecycle 커밋이 생성됨" \
+  || pass "add-fail/rollback: lifecycle 커밋 미생성"
+rm -rf "$REPO" "$WRAPBIN"
+
+# (b) archive 의 tracked legacy 경로
+REPO="$(setup_repo)"
+BAREAF="$(mk_bare addfail)"
+( cd "$REPO" && git remote add origin "$BAREAF" && git push -q origin main )
+run_promote "$REPO" --short-title test-addfail2 --no-worktree >/dev/null 2>&1
+( cd "$REPO" && mkdir -p rd-workflow-workspace/.lifecycle \
+    && echo "test-addfail2" > rd-workflow-workspace/.lifecycle/active-fr \
+    && git add rd-workflow-workspace/.lifecycle/active-fr \
+    && git commit -q -m "legacy active-fr fixture" )
+( cd "$REPO" && echo "ar" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" )
+( cd "$REPO" && git switch main -q )
+WRAPBIN2="$(mktemp -d)"
+mk_failing_git_wrapper "$WRAPBIN2" "active-fr"
+# archive 는 중단 전에 merge 를 수행할 수 있으므로 "local HEAD 불변" 으로 판정하면 안 된다.
+# 금지 대상은 cleanup 커밋 생성과 remote 부수효과 두 가지다 — 각각 따로 본다.
+remote_before="$( git --git-dir="$BAREAF" rev-parse main 2>/dev/null || echo none )"
+af2_rc=0
+af2_out="$( cd "$REPO" && PATH="$WRAPBIN2:$PATH" \
+    bash rd-workflow/scripts/lifecycle/archive.sh \
+    --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || af2_rc=$?
+[[ "$af2_rc" -ne 0 ]] \
+  && pass "add-fail/archive: legacy staging 실패 시 중단 (rc=$af2_rc)" \
+  || fail "add-fail/archive: legacy staging 실패를 무시하고 계속 진행함"
+printf '%s' "$af2_out" | out_has "staging 실패" \
+  && pass "add-fail/archive: 중단 사유 안내" || fail "add-fail/archive: 사유 안내 누락 — $af2_out"
+( cd "$REPO" && git log --all --oneline | out_has "archive test-addfail2 metadata 정리" ) \
+  && fail "add-fail/archive: 중단됐는데 metadata cleanup 커밋이 생성됨" \
+  || pass "add-fail/archive: cleanup 커밋 미생성"
+[[ -n "$( cd "$REPO" && git tag --list "fr/*/test-addfail2" )" ]] \
+  && fail "add-fail/archive: 중단됐는데 tag 가 생성됨 (후속 단계 실행)" \
+  || pass "add-fail/archive: 후속 tag 단계 미실행"
+remote_after="$( git --git-dir="$BAREAF" rev-parse main 2>/dev/null || echo none )"
+[[ "$remote_before" == "$remote_after" ]] \
+  && pass "add-fail/archive: remote ref 불변 (push 부수효과 없음)" \
+  || fail "add-fail/archive: 중단됐는데 remote 가 갱신됨 ($remote_before → $remote_after)"
+rm -rf "$REPO" "$BAREAF" "$WRAPBIN2"
 
 echo "== 결과: PASS=$PASS FAIL=$FAIL =="
 [[ $FAIL -eq 0 ]]

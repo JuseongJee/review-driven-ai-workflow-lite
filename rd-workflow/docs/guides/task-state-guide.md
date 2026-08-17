@@ -43,13 +43,23 @@ created-at=2026-07-05-1030
 
 ### source-fr 계약
 
-- **값 형식**: `-`(sentinel) 또는 repo-relative backlog item path (`rd-workflow-workspace/backlog/items/<파일>.md`). 절대경로·`..` 세그먼트·개행·legacy slug는 쓰기 거부 (`source_fr_validate` — `_state_common.sh` 단일 구현).
+- **저장 값 형식**: `-`(sentinel) 또는 repo-relative backlog item path (`rd-workflow-workspace/backlog/items/<파일>.md`). 절대경로·`..` 세그먼트·개행·legacy slug는 쓰기 거부 (`source_fr_validate` — `_state_common.sh` 단일 구현). **이 계약은 해석 계층이 넓어져도 바뀌지 않는다.**
+- **읽기 해석**: `REQUEST.md ## Source FR` 의 원문은 `source_fr_resolve`(`_state_common.sh` 단일 구현)가 canonical path 로 정규화한다. 지원 표기는 canonical path · markdown 링크 `[텍스트](path)` · 괄호 병기 `slug (path)` · `slug — [상세](path)` 계열 · 위 형식 앞의 `- ` 리스트 접두 · `items/<파일>.md` 축약 · `YYYY-MM-DD slug` · `slug` 단독이다.
+  - 괄호 계열에서 **레이블(괄호 앞부분)의 문법은 제한하지 않되 비어 있으면 거부**한다. 정확성은 괄호 안 target 의 형식·실존 검증이 보장하며, 레이블 문법을 고정하면 새 서술 변형마다 다시 실패하기 때문이다. 괄호 뒤에 `)` 와 공백 외의 문자가 남으면 거부한다.
+  - **파일명 자체에 괄호가 있으면 링크·괄호 병기 표기를 쓰지 않는다.** `[텍스트](.../2026-04-04-a(b).md)` 는 마지막 괄호를 target 경계로 보는 규칙 때문에 해석되지 않는다. 이런 파일은 `rd-workflow-workspace/backlog/items/2026-04-04-a(b).md` 또는 `items/2026-04-04-a(b).md` 처럼 **경로를 그대로** 적는다 — 이 두 형식은 괄호 해석보다 먼저 판정되므로 파일명의 괄호가 문제되지 않는다.
+  - slug 는 소문자 영숫자와 `-` 만 허용한다. `items/<slug>.md` 정확 일치를 먼저 보고, 없으면 `items/*-<slug>.md` 가 **유일하게** 매칭될 때만 채택한다. 0건·복수건은 거부한다.
+  - 정규화 결과는 실존하는 **일반 파일**이어야 한다. 디렉토리·깨진 심링크는 거부한다.
+- **`## Source FR` 절의 HTML 주석**(`<!-- ... -->`)은 값으로 채택하지 않는다. 템플릿이 형식 예시를 주석으로 담기 때문이다.
+- **해석 실패 시**: 값이 있는데 정규화할 수 없으면 **조용히 `-` 로 기록하지 않는다.**
+  - `lifecycle/promote.sh`: non-zero 로 중단한다. 이 지점은 `metadata_write` 직전이라 어떤 상태도 바뀌지 않으며, REQUEST 를 고쳐 재실행하면 된다.
+  - `lifecycle/promote.sh` 의 `--dry-run` 도 같은 판정을 낸다. 해석은 read-only 라 dry-run 조기 종료보다 먼저 수행하며, 사전 점검이 성공을 알리고 실제 실행만 실패하는 반대 신호를 만들지 않는다.
+  - `hooks/pre_commit_archive_gate.sh`: archive 커밋을 차단한다(exit 2). 표기가 어긋났다는 이유로 게이트를 건너뛰지 않는다. 단 이 차단은 **diff review 세션이 종결된 뒤(= archive 커밋 경로)에만** 적용한다 — 세션이 없거나 미종결이면 그 커밋은 아직 archive 단계가 아니므로(구현 중 iteration commit 등) 통과시킨다.
+- **직접 주는 값은 엄격하다**: `rd task set-source-fr` · `rd task guard --source-fr` · `promote.sh --source-fr` 는 canonical path 또는 `-` 만 받으며 **해석을 적용하지 않는다.** 비대칭인 이유는 — REQUEST 본문은 사람·AI 가 자유 서술로 쓰는 문서의 일부라 표기가 발산하지만, 직접 주는 값은 호출자가 형식을 아는 인터페이스이므로 관대화가 오히려 오류를 감춘다.
 - **기록 시점**:
   - `rd task guard --mode promote`: `--source-fr <path|->` 인자값, 인자 없으면 **`-` 리셋** (이전 작업 stale 값 차단). guard 시점의 REQUEST.md는 작성 전이므로 추론하지 않는다.
-  - `lifecycle/promote.sh`: `--source-fr` 인자 > `REQUEST.md ## Source FR` 추론(백틱 제거, legacy slug는 items 실존 시 path 정규화) > `-`. path 추론·기록의 단일 책임 지점.
+  - `lifecycle/promote.sh`: `--source-fr` 인자 > `REQUEST.md ## Source FR` 해석 > `-`. 명시 인자가 있으면 REQUEST 를 읽지도 해석하지도 않는다.
 - **리셋 시점**: `metadata_clear` (`lifecycle/archive.sh`·`lifecycle/promote_rollback.sh`) 가 `-`로 복원.
 - **정정 CLI**: `rd task source-fr` (조회), `rd task set-source-fr <값>` (검증 후 설정 — 직접 파일 편집 금지).
-- **소비자 읽기 호환**: `hooks/pre_commit_archive_gate.sh`는 `REQUEST.md ## Source FR`의 path(백틱 관례)·legacy slug 양형식을 해석한다. 신규 기록은 path만 허용.
 
 ---
 

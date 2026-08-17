@@ -15,11 +15,12 @@
 
    frontmatter(date/stage/short-title/source)는 CLI가 생성한다. stdin에는 본문만 전달한다:
    ```bash
-   bash rd-workflow/scripts/rd task capture --stage fr --source direct <<'CAPTURE_EOF'
+   bash rd-workflow/scripts/rd task capture --stage fr --title {short-title} --source direct <<'CAPTURE_EOF'
    ## 원본 입력
    {사용자 원문}
    CAPTURE_EOF
    ```
+   `--title` 은 반드시 넘긴다 — Step 2 에서 확정한 short-title 을 그대로 쓴다. 생략하면 진행 중 작업의 Short Title(5단계에서 건드리지 않기로 한 값)이 아니라 `untitled` 로 저장되어 사후 정정이 필요하다.
    (`--source`: 직접 호출이면 `--source direct`, 자연어 라우팅이면 `--source routed`. CLI 기본값은 `routed`)
    충돌 시 `-2`, `-3` suffix.
    캡처 실패 시 경고만 — FR 등록 차단 안 함 — CLI 가 fail-open (exit 0) 으로 처리.

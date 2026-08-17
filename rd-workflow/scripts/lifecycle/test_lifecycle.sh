@@ -119,8 +119,15 @@ assert_eq "$(read_fix_source_fr "$FIX4")" "rd-workflow-workspace/backlog/items/2
 
 FIX5="$TMPDIR_TEST/fix-badslug"
 mk_promote_fixture "$FIX5" "no-such-item"
-( cd "$FIX5" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-badslug --no-worktree >/dev/null 2>&1 )
-assert_eq "$(read_fix_source_fr "$FIX5")" "-" "promote: 무효 추론값 → 경고 후 '-'"
+rc5=0
+( cd "$FIX5" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-badslug --no-worktree >/dev/null 2>&1 ) || rc5=$?
+assert_eq "$rc5" "1" "promote: 해석 실패(no-such-item) → hard error exit 1"
+if [[ -f "$FIX5/rd-workflow-workspace/.lifecycle/task-state" ]]; then
+  FAIL=$((FAIL+1)); echo "  FAIL: promote: 해석 실패인데 task-state 생성됨" >&2
+else PASS=$((PASS+1)); echo "  PASS: promote: 해석 실패 시 task-state 미생성 (상태 무변경)"; fi
+if ( cd "$FIX5" && git rev-parse --verify fr/fix-badslug >/dev/null 2>&1 ); then
+  FAIL=$((FAIL+1)); echo "  FAIL: promote: 해석 실패인데 fr 브랜치 생성됨" >&2
+else PASS=$((PASS+1)); echo "  PASS: promote: 해석 실패 시 fr 브랜치 미생성"; fi
 
 FIX6="$TMPDIR_TEST/fix-badarg"
 mk_promote_fixture "$FIX6" "-"
@@ -164,6 +171,56 @@ rc9=0
 assert_eq "$rc9" "1" "promote rerun: 다른 --source-fr 거부 (exit 1)"
 assert_eq "$(read_fix_source_fr "$FIX9")" "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" "promote rerun: 거부 후 값 불변"
 assert_eq "$(cd "$FIX9" && git status --porcelain | grep -c "task-state" || true)" "0" "promote rerun: task-state dirty 없음 (거부)"
+
+# === 미러 초기화: 이전 작업 잔여 제거 (AC4) ===
+FIX10="$TMPDIR_TEST/fix-mirror-reset"
+mk_promote_fixture "$FIX10" "-"
+# 직전 작업 잔여를 재현한다 — baseline 에 없는 서술이 Task·Next Step 에 들어 있는 상태
+printf '%s\n' \
+  "# Current Task" "" \
+  "## Task" "이전 작업 설명 — 남아 있으면 안 된다" "" \
+  "## Short Title" "old-task" "" \
+  "## Status" "완료" "" \
+  "## Spec" "specs/changes/old-spec.md" "" \
+  "## Branch / Worktree" "-" "" \
+  "## Next Step" "이전 작업의 다음 단계 — 남아 있으면 안 된다" "" \
+  "## Notes" "이전 작업 메모" > "$FIX10/CURRENT_TASK.md"
+( cd "$FIX10" && git add -A && git commit -qm "stale mirror" )
+( cd "$FIX10" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-mirror-reset --no-worktree >/dev/null 2>&1 )
+assert_eq "$(awk '$0=="## Task"{getline; print; exit}' "$FIX10/CURRENT_TASK.md")" "-" "promote 초기화: Task 가 baseline 으로 리셋"
+assert_eq "$(awk '$0=="## Next Step"{getline; print; exit}' "$FIX10/CURRENT_TASK.md")" "-" "promote 초기화: Next Step 이 baseline 으로 리셋"
+assert_eq "$(awk '$0=="## Spec"{getline; print; exit}' "$FIX10/CURRENT_TASK.md")" "-" "promote 초기화: Spec 이 baseline 으로 리셋"
+assert_eq "$(awk '$0=="## Short Title"{getline; print; exit}' "$FIX10/CURRENT_TASK.md")" "fix-mirror-reset" "promote 초기화: Short Title 은 승격 값"
+assert_eq "$(awk '$0=="## Status"{getline; print; exit}' "$FIX10/CURRENT_TASK.md")" "구현 중" "promote 초기화: Status 는 승격 값"
+assert_eq "$(cd "$FIX10" && ls CURRENT_TASK.md.baseline.* 2>/dev/null | wc -l | tr -d ' ')" "0" "promote 초기화: 임시 파일 정리됨"
+
+# === 미러 보존: 같은 slug 재실행 (AC5) ===
+FIX11="$TMPDIR_TEST/fix-mirror-keep"
+mk_promote_fixture "$FIX11" "-"
+( cd "$FIX11" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-mirror-keep --no-worktree >/dev/null 2>&1 )
+# 승격 후 사용자가 작업 설명을 적었다고 가정한다
+( cd "$FIX11" && awk '$0=="## Task"{print; getline; print "작업 중 적어 둔 설명"; next} {print}' CURRENT_TASK.md > .ct.tmp && mv .ct.tmp CURRENT_TASK.md )
+( cd "$FIX11" && git add -A && git commit -qm "author note" )
+( cd "$FIX11" && git checkout -q main 2>/dev/null || true )
+( cd "$FIX11" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-mirror-keep --no-worktree >/dev/null 2>&1 )
+assert_eq "$(awk '$0=="## Task"{getline; print; exit}' "$FIX11/CURRENT_TASK.md")" "작업 중 적어 둔 설명" "promote 보존: 같은 slug 재실행 시 작성 내용 유지"
+
+# === worktree 승격: 대상 worktree 만 초기화 (AC4 경로 변형) ===
+# TASK_FILE 은 ${TARGET_WT_PATH:-.}/CURRENT_TASK.md 이므로 기본 worktree 의 미러는 불변이어야 한다.
+FIX12="$TMPDIR_TEST/fix-mirror-wt"
+mk_promote_fixture "$FIX12" "-"
+printf '%s\n' \
+  "# Current Task" "" \
+  "## Task" "기본 worktree 내용 — 유지되어야 한다" "" \
+  "## Short Title" "old-wt-task" "" \
+  "## Status" "완료" "" \
+  "## Branch / Worktree" "-" > "$FIX12/CURRENT_TASK.md"
+( cd "$FIX12" && git add -A && git commit -qm "base mirror" )
+FIX12_WT="$TMPDIR_TEST/fix-mirror-wt-tree"
+( cd "$FIX12" && bash "$SCRIPT_DIR/promote.sh" --short-title fix-mirror-wt --worktree-path "$FIX12_WT" >/dev/null 2>&1 )
+assert_eq "$(awk '$0=="## Task"{getline; print; exit}' "$FIX12_WT/CURRENT_TASK.md")" "-" "promote worktree: 대상 worktree 미러가 초기화됨"
+assert_eq "$(awk '$0=="## Short Title"{getline; print; exit}' "$FIX12_WT/CURRENT_TASK.md")" "fix-mirror-wt" "promote worktree: 대상 worktree Short Title 이 승격 값"
+assert_eq "$(awk '$0=="## Task"{getline; print; exit}' "$FIX12/CURRENT_TASK.md")" "기본 worktree 내용 — 유지되어야 한다" "promote worktree: 기본 worktree 미러는 불변"
 
 if grep -q "^created-at=" "$TASK_STATE_PATH" 2>/dev/null; then FAIL=$((FAIL+1)); echo "  FAIL: clear 후 created-at 잔존" >&2; \
   else PASS=$((PASS+1)); echo "  PASS: clear 후 created-at 제거"; fi
@@ -686,6 +743,17 @@ if printf '%s' "$pc_wire" | grep -q '"\$AUDIT_LOG" "\$FR_BRANCH"'; then
   PASS=$((PASS+1)); echo "  PASS: archive.sh precheck 호출이 \$FR_BRANCH 를 5번째 인자로 전달"
 else
   FAIL=$((FAIL+1)); echo "  FAIL: archive.sh precheck 호출에 \$FR_BRANCH(5번째 인자) 누락 — [$pc_wire]" >&2
+fi
+# 순서 불변식 (미러 확정 → metadata 정리): 실패 주입 테스트가 어려운 대신 배선으로 고정한다.
+#   외부 도구 없이 "baseline 생성 실패" 를 fixture 에서 재현하려면 워킹트리를 쓰기 불가로
+#   만들어야 하는데, 그러면 Step 4 이전의 merge 부터 실패해 이 경로에 도달하지 못한다.
+#   따라서 순서 자체를 소스에서 검증한다 — 이 순서가 뒤집히면 미러 실패가 복구 불가가 된다.
+_ord_mirror="$(grep -n '_ct_tmp' "$ARCHIVE_SH" | head -1 | cut -d: -f1)"
+_ord_clear="$(grep -n '^  metadata_clear$' "$ARCHIVE_SH" | head -1 | cut -d: -f1)"
+if [[ -n "$_ord_mirror" && -n "$_ord_clear" && "$_ord_mirror" -lt "$_ord_clear" ]]; then
+  PASS=$((PASS+1)); echo "  PASS: archive.sh 미러 확정이 metadata_clear 보다 앞선다 (순서 불변식)"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: archive.sh 순서 불변식 위반 — mirror=$_ord_mirror clear=$_ord_clear" >&2
 fi
 
 rm -rf "$GUARD_ROOT"

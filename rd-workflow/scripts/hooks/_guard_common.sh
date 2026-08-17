@@ -8,6 +8,70 @@
 # _state_common.sh는 project_root 검증 직후 source — $PWD fallback 불사용, project_root 보장 후 진입
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_state_common.sh"
 
+# --- 편집 출처(edit provenance) 헬퍼 ---
+# **부재·손상(구문 오류)·부분 정의를 모두 "provenance 기능 없음" 한 갈래로 수렴시킵니다**
+# — 부분 install 내성(AC5(f)). 그 상태에서 아래 current_task_is_stale() 은 레코드 0건으로
+# 동작해 종전 mtime 판정과 완전히 같아집니다.
+#
+# **source 를 쓰지 않는 이유**: 이 파일을 source 하는 hook 은 전부 set -euo pipefail 인데,
+# source 대상에 **구문 오류**가 있으면 파서가 셸 자체를 종료시킵니다(macOS /bin/bash 3.2
+# 실측 exit 2). `source x || true` 로도 막지 못합니다 — 파스 오류는 명령 실패가 아니라 셸
+# 종료라서 반환값이 생기지 않기 때문입니다. 그러면 Stop hook 이 current_task_is_stale()
+# 에 닿지 못해 block JSON 을 내지 못하고, 세션 한계 대응 넛지가 **통째로 사라집니다**.
+# eval 은 같은 구문 오류에서 non-zero 를 반환하고 셸을 살려 둡니다(실측).
+# 파일 읽기는 fork 없는 `$(< file)` 을 씁니다 — `read -r -d ''` 는 bash 3.2 가 바이트 단위로
+# 읽어 오히려 느립니다(13KB 실측: read+eval 6.9ms / $(<)+eval 2.4ms / source 0.6ms).
+#
+# **`bash -n` 사전검사를 여기서는 쓰지 않습니다.** 같은 결함을 `archive.sh` 는 그 수단으로
+# 막지만(그쪽 주석 참조), 두 파일의 맥락이 다릅니다 — 이 파일은 producer(PostToolUse)가
+# **편집마다** source 하는 hot path 라 fork 1회(실측 8.3ms)가 그대로 편집 지연이 됩니다.
+# archive.sh 는 작업당 1회라 같은 fork 가 무해합니다. 수단이 갈린 이유가 이것뿐이며,
+# 두 곳 모두 "구문 오류가 셸을 죽이지 못하게 한다" 는 같은 목적을 만족합니다.
+# 그룹 `{ }` 으로 묶어 리다이렉트가 확장 단계까지 걸리게 합니다 — 대입문에 직접 붙인
+# `2>/dev/null` 은 확장보다 늦게 설정되어 읽기 실패 메시지를 막지 못합니다(실측).
+#
+# 비용: 넛지 소실을 막는 대가로 헬퍼 로딩에 약 1.9ms 를 더 씁니다. **이 값을 "상한 안" 이라고
+# 적지 않습니다** — 이 경로는 AC10 측정에서 이미 상한 20ms 를 넘겼고(2026-08-14 producer
+# 오버헤드 보고: 계산 비용 49~54ms), _guard_common.sh 체인 source 비용은 별도 FR
+# guard-hook-handler-startup-cost 소관입니다. 즉 이 증분은 이미 초과한 항목에 얹히는 값이며,
+# 그 대가로 "손상된 헬퍼가 넛지를 통째로 없앤다" 는 정확성 결함을 닫습니다.
+# 로딩 비용 최적화는 그 FR 에서 이 지점까지 함께 봐야 합니다.
+_ep_common="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_edit_provenance_common.sh"
+if [[ -f "$_ep_common" ]]; then
+  _ep_src=""
+  { _ep_src="$(< "$_ep_common")"; } 2>/dev/null || _ep_src=""
+  # 구문 오류의 non-zero 와 진단 메시지를 함께 흡수합니다 (hook 무출력 계약).
+  eval "$_ep_src" 2>/dev/null || true
+  unset _ep_src
+fi
+unset _ep_common
+
+# 판정이 실제로 쓰는 함수 집합입니다. current_task_is_stale() 과 그것이 부르는
+# _stale_edit_is_explained() 의 호출을 **전이 호출까지** 따라가 확정했습니다.
+#   직접  : ep_current_gen · ep_gen_has_sentinel · ep_gen_valid · ep_record_file_exists
+#   6단계 : ep_orc_exists · ep_read_record · ep_state_id
+#   전이  : ep_root · ep_pathkey (레코드 조회 3종) / _ep_fmt_cksum (ep_state_id · ep_pathkey)
+#           / _ep_read_record_file (ep_read_record) / _ep_read_exact (앞 둘 + ep_current_gen)
+# `_ep_read_whole` 은 ep_current_gen 이 _ep_read_exact 로 옮겨가면서 **판정 경로에서 빠졌습니다**
+# (턴 006 P1). CLI 의 .bump-failed 표시 경로에는 남아 있어 그쪽 집합에서 검증합니다.
+# 하나라도 없으면 **집합을 통째로 unset** 합니다. 구문 오류로 eval 이 중간에서 끊기면 파일
+# 앞부분 함수만 정의된 상태가 되는데, 그대로 두면 판정이 앞부분을 쓰다가 뒤쪽 호출에서
+# command-not-found 를 stderr 로 흘립니다(무출력 계약 위반). 통째로 지우면 판정이
+# "헬퍼 없음" 경로 하나로 수렴해 종전 mtime 판정과 완전히 같아집니다.
+# ep_purge_root 등 판정 밖 함수는 이 집합에 넣지 않습니다 — 이 경계는 **판정용**이며,
+# 소비자(archive.sh)가 각자 declare -f 로 확인합니다.
+_ep_fnset='ep_current_gen ep_gen_has_sentinel ep_gen_valid ep_record_file_exists ep_orc_exists ep_read_record ep_state_id ep_root ep_pathkey _ep_read_exact _ep_read_record_file _ep_fmt_cksum'
+_ep_fnset_ok=1
+for _ep_fn in $_ep_fnset; do
+  declare -f "$_ep_fn" >/dev/null 2>&1 || { _ep_fnset_ok=0; break; }
+done
+if [[ "$_ep_fnset_ok" -eq 0 ]]; then
+  for _ep_fn in $_ep_fnset; do
+    unset -f "$_ep_fn" 2>/dev/null || true
+  done
+fi
+unset _ep_fnset _ep_fnset_ok _ep_fn
+
 # --- autopilot ---
 
 is_autopilot_active() {
@@ -186,14 +250,154 @@ commit_has_archive_signal() {
 # --- 워크플로 파일 판정 ---
 
 is_workflow_file() {
-  local filepath="$1"
-  local rel="${filepath#"${project_root}/"}"
+  local norm rel root_norm
+  norm="$(normalize_lexical_path "$1")"
+
+  case "$norm" in
+    /*)
+      root_norm="$(normalize_lexical_path "$project_root")"
+      if [[ "$norm" == "${root_norm}/"* ]]; then
+        rel="${norm#"${root_norm}/"}"
+      else
+        # 프로젝트 밖 절대 경로는 이 화이트리스트의 대상이 아니다.
+        # 밖 경로의 통과 판정은 implementation_gate.sh 의 전용 분기가 먼저 처리하므로
+        # 정상 경로에서는 여기 도달하지 않는다. 화이트리스트에서 '모름' 은 차단 쪽이어야
+        # 하므로 return 1 이다.
+        return 1
+      fi
+      ;;
+    *)
+      # 상대 경로. 소진하지 못한 선두 '..' 가 보존되어 아래 case 에 매칭되지 않는다.
+      rel="$norm"
+      ;;
+  esac
 
   case "$rel" in
     CURRENT_TASK.md|REQUEST.md|PROJECT_CONTEXT.md|SESSION.md|CHECKPOINT.md) return 0 ;;
     */turns/*.md) return 0 ;;
     rd-workflow-workspace/*) return 0 ;;
+    # superpowers 워크스페이스 — 도구별로 명시한다. 부모 '.superpowers/' 를 통째로 열면
+    # 앞으로 생길 미지의 하위 디렉토리까지 선허용하게 된다 (change spec §2.1).
+    .superpowers/sdd/*|.superpowers/brainstorm/*) return 0 ;;
   esac
+  return 1
+}
+
+# normalize_lexical_path <path>
+# 경로를 lexical 규칙으로 정규화해 출력한다. 이 함수 자체는 파일시스템에 접근하지 않으므로
+# symlink 를 해석하지 않는다. 실파일 동일성 판정은 호출측 is_shared_state_file 이 -ef 로
+# 별도 수행한다 (change spec §4.2).
+#
+# 왜 세그먼트 스택인가: 단계별 문자열 처리(중복 '/' 압축 → 선두 './' 제거 → 'x/..' 축약)는
+# 단계 간 순서에 의존하고, 한 단계가 만든 새 별칭을 앞 단계로 되돌리지 못한다. 실제로
+# 'docs/./..' 는 '.' 제거와 '..' 축약이 서로를 만들어 내서 한 방향 주행으로는 잡히지 않고,
+# 연속 선두 '../..' 는 일반 세그먼트처럼 지워져 프로젝트 밖 경로를 오탐 차단한다.
+# '/'·'.'·'..' 를 한 번의 주행에서 함께 처리하면 이 계열의 누락이 구조적으로 생기지 않는다.
+#
+# 절대/상대 처리가 다르다:
+#   절대 경로 — 루트 위로 올라갈 수 없다 ('/..' == '/'). 남는 '..' 는 버린다.
+#   상대 경로 — 소진할 수 없는 선두 '..' 는 보존한다. 지우면 프로젝트 밖을 가리키는 표현이
+#              프로젝트 안 경로로 바뀌어 오탐이 된다.
+#
+# bash 3.2 제약: 배열 push/pop 대신 '/' 로 join 한 문자열을 스택으로 쓴다.
+normalize_lexical_path() {
+  local path="$1"
+  local abs=0
+  case "$path" in /*) abs=1 ;; esac
+  local stack="" lead="" seg rest="$path"
+  while [[ -n "$rest" ]]; do
+    seg="${rest%%/*}"
+    if [[ "$seg" == "$rest" ]]; then rest=""; else rest="${rest#*/}"; fi
+    case "$seg" in
+      ''|.)
+        # 빈 세그먼트(중복 '/')와 '.' 는 버린다
+        ;;
+      ..)
+        if [[ -n "$stack" ]]; then
+          if [[ "$stack" == */* ]]; then stack="${stack%/*}"; else stack=""; fi
+        elif [[ $abs -eq 1 ]]; then
+          : # 루트 위로는 올라갈 수 없다
+        else
+          if [[ -n "$lead" ]]; then lead="${lead}/.."; else lead=".."; fi
+        fi
+        ;;
+      *)
+        if [[ -n "$stack" ]]; then stack="${stack}/${seg}"; else stack="$seg"; fi
+        ;;
+    esac
+  done
+  if [[ $abs -eq 1 ]]; then
+    printf '/%s' "$stack"
+  elif [[ -n "$lead" && -n "$stack" ]]; then
+    printf '%s/%s' "$lead" "$stack"
+  elif [[ -n "$lead" ]]; then
+    printf '%s' "$lead"
+  else
+    printf '%s' "$stack"
+  fi
+}
+
+# is_shared_state_file <filepath>
+# orchestrator(메인 세션) 전용 공유 진행 상태 파일인지 판정합니다. return 0 = 그렇습니다.
+# is_workflow_file 과 의미가 다릅니다 — 그쪽은 "단계 게이트에서 통과시킬 파일",
+# 이쪽은 "주체 게이트에서 막을 파일" 입니다. 두 집합을 한 함수로 합치면 한쪽 수정이
+# 다른 쪽을 깨뜨립니다.
+# 집합을 진행 상태 3종으로 좁게 유지합니다. spec/plan/report 는 단일 작성자 산출물이라
+# 경합 대상이 아니고, SESSION.md/CHECKPOINT.md/turns 는 외부 CLI 프로세스가 작성해
+# 최상위 판별 필드(agent_type, 없으면 agent_id)가 없으므로 넣어도 무효입니다.
+#
+# 왜 정규화가 필요한가: 원시 문자열 매칭은 '<root>/../<basename>/x' 처럼 벗어난 뒤
+# 되돌아오는 경로를 놓친다. is_workflow_file 도 같은 이유로 정규화를 쓴다(2026-08-17).
+# 다만 판정 후 처리는 다르다 — 그쪽은 화이트리스트라 미매칭이 "차단", 이쪽은
+# 블랙리스트라 미매칭이 "통과" 다. 실패 방향이 반대이므로 아래 ② 의 -ef 보조 판정은
+# 그 함수로 복제할 수 없다 (화이트리스트에서 -ef 는 방어가 아니라 확대가 된다).
+# 대상 경로와 project_root 를 **둘 다** 정규화한다 — project_root 쪽만 원시 문자열로 두면
+# '<root>/../<basename>/x' 처럼 벗어난 뒤 되돌아오는 경로를 놓친다.
+# 판정 대상은 이름이 아니라 파일이다 — 정규화 문자열 일치(①)와 실파일 동일성(②) 둘 다
+# return 0 이다. 비지원으로 남는 것은 ② 의 대상이 아직 존재하지 않는 경우다.
+is_shared_state_file() {
+  local rel norm root_norm cand
+  norm="$(normalize_lexical_path "$1")"
+  case "$norm" in
+    /*)
+      root_norm="$(normalize_lexical_path "$project_root")"
+      if [[ "$norm" == "${root_norm}/"* ]]; then
+        rel="${norm#"${root_norm}/"}"
+      else
+        # 프로젝트 밖 절대 경로 — 이 게이트의 대상이 아니다
+        return 1
+      fi
+      ;;
+    *)
+      # 상대 경로. 선두 '..' 가 보존되어 있으면 아래 case 에 매칭되지 않아 통과한다.
+      rel="$norm"
+      ;;
+  esac
+
+  # ① lexical 정확 일치. 파일이 아직 없어도(생성 전) 판정된다.
+  case "$rel" in
+    CURRENT_TASK.md|REQUEST.md) return 0 ;;
+    rd-workflow-workspace/.lifecycle/task-state) return 0 ;;
+  esac
+
+  # ② 실파일 동일성 보조 판정.
+  # macOS 기본 볼륨은 대소문자를 구분하지 않으므로 'current_task.md' 가 정본과 **같은 실파일**
+  # 을 가리킨다(실측 확인). ① 의 정확 문자열 비교로는 통과하므로 여기서 잡는다.
+  # -ef 는 device+inode 비교이며 bash builtin 이라 외부 명령이 늘지 않는다.
+  # "그 볼륨에서 실제로 같은 파일일 때만" 차단하므로 case-sensitive 볼륨에서는
+  # 소문자 파일이 별개이거나 부재여서 오탐이 생기지 않는다 — 모든 플랫폼에서 세 이름을
+  # case-insensitive 예약하는 방식보다 오탐이 없다(change spec §4.2).
+  # 부수 효과: 차단 집합 3종을 가리키는 symlink·hardlink 도 함께 잡힌다.
+  # 한계: 양쪽 경로가 실제로 존재할 때만 참이다. task-state 가 아직 없는 마이그레이션 전
+  #       상태에서는 그 파일의 case alias 를 잡지 못한다(정본 이름은 ① 이 계속 잡는다).
+  #       또 절대 경로가 project_root 접두와 불일치하면 ② 에 도달하기 전에 return 1 이므로,
+  #       루트를 심링크 경유 절대 경로로 지칭하면(예: /tmp/proj-link/CURRENT_TASK.md)
+  #       같은 실파일이어도 차단되지 않는다. 기존 :33 의 밖 경로 통과와 같은 경계다.
+  for cand in CURRENT_TASK.md REQUEST.md rd-workflow-workspace/.lifecycle/task-state; do
+    if [[ "${project_root}/${rel}" -ef "${project_root}/${cand}" ]]; then
+      return 0
+    fi
+  done
   return 1
 }
 
@@ -239,14 +443,147 @@ read_stop_hook_active() {
   printf '%s' "$val"
 }
 
+# read_hook_agent_id
+# _hook_input(read_hook_input이 채운 전역)에서 subagent 판별 마커를 읽어 출력합니다.
+# 값이 비어 있지 않으면 subagent 안에서 발동한 hook 입니다.
+#
+# 두 필드 중 **먼저 비어 있지 않은 값**을 씁니다 (agent_type 우선, agent_id 폴백).
+#   agent_type — 이 버전(Claude Code 2.1.228)이 실제로 보내는 필드입니다. subagent 입력에만
+#                존재하고(예: "general-purpose") 메인 세션 입력에는 없음을 hook 입력 덤프로
+#                실측했습니다. 메인 세션에는 대신 prompt_id·effort 가 옵니다.
+#   agent_id   — 공식 문서가 기술하는 필드입니다. 실측한 버전의 입력에는 없었으나 upstream 이
+#                추가하거나 다른 배포 형태에서 보낼 수 있으므로 함께 봅니다.
+# "먼저 비어 있지 않은 값" 이 계약인 이유: agent_type 이 빈 문자열이고 agent_id 만 값을 가진
+# 입력에서 한쪽 경로만 빈 값을 반환하면 같은 입력이 모드에 따라 다르게 판정된다.
+# jq 필터와 awk 폴백이 이 규칙을 똑같이 구현해야 한다.
+#
+# **반드시 최상위만 봅니다.** tool_input 하위에 같은 이름의 필드가 있어도 판별에 쓰면
+# 메인 세션이 subagent 로 오인되어 자기 진행 상태를 쓸 수 없게 됩니다(과잉 차단).
+# 부재 시 빈 문자열 — 호출측은 메인 스레드로 간주합니다 (fail-open).
+# extract_json_field 는 .tool_input. 하위만 보므로 이 필드들에 쓸 수 없습니다.
+read_hook_agent_id() {
+  local val=""
+  if command -v jq &>/dev/null; then
+    # jq 실행이 성공하면 그 결과가 곧 답이다. 최상위에 없으면 빈 값이 정답이므로
+    # 여기서 폴백으로 넘어가면 안 된다 — 넘어가면 중첩 필드를 최상위로 오인한다.
+    if val="$(printf '%s' "$_hook_input" | jq -r \
+        '[.agent_type?, .agent_id?] | map(select(type == "string" and . != "")) | (.[0] // "")' \
+        2>/dev/null)"; then
+      printf '%s' "$val"
+      return 0
+    fi
+    val=""
+  fi
+  # awk 폴백 — jq 부재 또는 jq 실행 실패 시에만 온다.
+  #
+  # 왜 awk 인가: 앞선 구현은 bash 로 문자 하나씩 훑었는데, bash 3.2 의 ${s:i:1} 은 호출마다
+  # 문자열 전체를 다시 훑으므로 사실상 제곱 시간이다. 판별 필드가 없는 메인 세션 입력은
+  # 끝까지 순회하므로 tool_input.content 가 큰 평범한 Write 마다 지연이 사용자에게 보였다
+  # (실측: 10KB 1.2초, 20KB 4.8초). awk 는 같은 입력을 선형으로 처리한다 (1MB 0.09초).
+  #
+  # 파싱 전략: RS 를 큰따옴표로 두어 입력을 "문자열 밖 / 문자열 안" 레코드로 번갈아 자른다.
+  # 큰 content 는 통째로 한 레코드가 되어 문자 단위 검사를 아예 받지 않는다. 문자열 밖
+  # 레코드만 짧게 검사해 중괄호/대괄호 개수로 깊이를 세고(gsub 반환값 = 치환 횟수),
+  # 첫 비공백 문자가 ':' 인지로 직전 문자열이 키였는지 값이었는지를 가른다 —
+  # 이 판정이 space·tab·CR·LF 를 모두 공백으로 처리하므로 pretty-printed 입력도 같다.
+  # 닫는 따옴표가 escape 된 것인지는 레코드 끝 역슬래시 개수의 홀짝으로 판정한다.
+  printf '%s\n' "$_hook_input" | awk '
+    BEGIN { RS = "\""; depth = 0; instr = 0; cur = ""; have = 0; last = ""; key = ""; vt = ""; vi = "" }
+    {
+      r = $0
+      if (instr) {
+        if (depth == 1) cur = cur r
+        esc = 0
+        i = length(r)
+        while (i > 0 && substr(r, i, 1) == "\\") { esc = 1 - esc; i-- }
+        if (esc) {
+          if (depth == 1) cur = cur "\""
+        } else {
+          instr = 0
+          if (depth == 1) { last = cur; have = 1 }
+        }
+        next
+      }
+      s = r
+      sub(/^[ \t\r\n]+/, "", s)
+      first = substr(s, 1, 1)
+      if (have) {
+        if (first == ":") key = last
+        else {
+          if (last != "") {
+            if (key == "agent_type" && vt == "") vt = last
+            else if (key == "agent_id" && vi == "") vi = last
+          }
+          key = ""
+        }
+        have = 0
+      } else if (first != ":") key = ""
+      depth += gsub(/[{[]/, "", s)
+      depth -= gsub(/[}\]]/, "", s)
+      instr = 1
+      cur = ""
+    }
+    END { printf "%s", (vt != "" ? vt : vi) }
+  '
+}
+
+# _stale_edit_is_explained <gendir> <gen_invalid 0|1> <relpath> <abspath>
+# change spec §2.5 6단계. return 0 = 설명됨(정규 subagent 편집), 1 = 미설명.
+#
+# 판정 순서를 그대로 지킵니다 — 세대 무효 → .orc 원시 존재 → .sub 부재 → malformed →
+# relpath 불일치 → state_id 불일치. 어느 항목이든 어긋나면 미설명(block 방향)입니다.
+#
+# ③ **.orc 를 내용 불문 미설명으로 보는 이유**: malformed .orc 와 유효한 .sub 가 공존할 때
+#    .orc 를 무시하면 설명됨으로 통과합니다. orchestrator 편집의 흔적이 있으면 그 자체로
+#    저장이 필요하므로(그 편집은 CURRENT_TASK.md 저장으로 설명되어야 함) 보수적으로 봅니다.
+#    행위자별 별개 파일이라 편집 순서·최종 writer 와 무관하게 이 성질이 성립합니다.
+_stale_edit_is_explained() {
+  local gen="${1-}" gen_invalid="${2-}" rel="${3-}" abs="${4-}" sid cur
+  # 세대가 없거나 무효하면 그 세대의 레코드는 어떤 것도 근거가 되지 않습니다.
+  [[ -n "$gen" && "$gen_invalid" -eq 0 ]] || return 1
+  if ep_orc_exists "$gen" "$rel"; then
+    return 1
+  fi
+  # .sub 부재 · 필드 수 ≠ 2 · relpath 불일치는 ep_read_record 가 전부 return 1 로 흡수합니다.
+  sid="$(ep_read_record "$gen" sub "$rel" 2>/dev/null)" || return 1
+  [[ -n "$sid" ]] || return 1
+  cur="$(ep_state_id "$abs" 2>/dev/null)" || return 1
+  [[ "$sid" == "$cur" ]] || return 1
+  return 0
+}
+
 # current_task_is_stale
 # return 0 = stale (CURRENT_TASK.md 갱신 필요), return 1 = not stale 또는 판정 불가 (fail-open).
-# 판정 기준: git 추적 파일(rd-workflow-workspace/ 및 CURRENT_TASK.md 제외) 중
-# mtime > CURRENT_TASK.md mtime인 파일이 하나라도 있으면 stale.
+#
+# 판정 기준 (change spec §2.5): git 추적 파일(rd-workflow-workspace/ 및 CURRENT_TASK.md 제외)
+# 중 mtime 이 CURRENT_TASK.md 보다 늦은 파일, 그리고 **같은 초에 편집 흔적이 있는 파일**을
+# 후보로 모아, 각 후보가 현재 세대의 subagent 정규 편집으로 설명되는지 봅니다.
+# 하나라도 설명되지 않으면 stale 입니다.
+#
+# ① **mtime == baseline 을 조건부로만 후보화하는 이유** — T16·T17·T18·AC5(f)를 동시에
+#    만족시키는 유일한 형태입니다. 같은 초 안에서는 mtime 만으로 `편집 → 저장`(T16, 통과해야
+#    함)과 `저장 → 편집`(T17·T18, 판정 대상)을 구별할 수 없습니다. 편집 흔적(현재 세대의
+#    레코드 또는 센티널)이 있을 때만 후보로 올리면 T16 은 이전 세대에만 흔적이 있어 후보에서
+#    빠지고, T17·T18 은 현재 세대 흔적으로 후보가 되어 각자 .orc/.sub 로 갈립니다.
+#    무조건 후보화(mtime >= baseline)로 바꾸면 T16 이 block 되고, 후보화를 아예 안 하면
+#    T17 이 통과합니다. 레코드가 하나도 없는 환경(헬퍼 미설치·producer 미설치)에서는 이
+#    분기가 항상 거짓이라 종전 동작(`-gt` 집합만 판정)과 바이트 단위로 같습니다 — AC5(f).
+# ② **후보화가 '원시 존재'를 쓰는 이유** — 유효한 레코드만 후보 조건으로 삼으면
+#    mtime == baseline 상태에서 레코드가 malformed 이거나 pathkey 충돌일 때 후보에서 빠져
+#    **통과**해, "손상은 block 방향" 이라는 전제가 깨집니다. 원시 존재로 후보화하고 손상
+#    판정은 6단계(_stale_edit_is_explained)에 맡기면 손상이 후보 안에서 미설명으로 귀결됩니다.
+#    증거가 소실될 수 있는 센티널(.overflow) 세대는 같은 이유로 무조건 후보화합니다.
+#
+# **판정 경로에 정리(prune) 호출이 없습니다** (§2.9) — 판정 프로세스가 남의 세대를 지우는
+# 성질이 포인터 후진·writer 장시간 정지 반례를 반복 생산했습니다. 세대 목록을 순회하지 않고
+# 포인터 세대 하나만 읽으므로 판정 비용은 잔존 세대 수와 무관합니다.
+# **.bump-failed 를 읽지 않습니다** (§2.12) — 그 파일은 진단 전용이며 어떤 판정 분기에도
+# 등장하지 않습니다. block reason 문구 보강은 판정이 끝난 뒤 Stop hook 이 담당합니다.
 current_task_is_stale() {
   local ct="${project_root}/CURRENT_TASK.md"
   [[ -f "$ct" ]] || return 1
 
+  # 1·2단계 — fail-open 유지 + baseline = CURRENT_TASK.md mtime
   # mtime 취득 헬퍼 (BSD stat → GNU stat 폴백)
   local ct_mtime
   ct_mtime="$(stat -f %m "$ct" 2>/dev/null || stat -c %Y "$ct" 2>/dev/null || true)"
@@ -256,6 +593,20 @@ current_task_is_stale() {
   local tracked_files
   tracked_files="$(git -C "$project_root" ls-files 2>/dev/null)" || return 1
   [[ -z "$tracked_files" ]] && return 1
+
+  # 3단계 — 현재 세대 G. **.current 포인터가 유일한 권위**이며 최대 번호를 고르지 않습니다.
+  # 헬퍼 미설치(source 실패) 시 G="" 이고 gen_sentinel=0 이라 아래 조건부 후보화가 항상
+  # 거짓이 되어 종전 동작으로 수렴합니다.
+  local gen="" gen_invalid=0 gen_sentinel=0 want_title=""
+  if declare -f ep_current_gen >/dev/null 2>&1; then
+    gen="$(ep_current_gen 2>/dev/null || true)"
+    if [[ -n "$gen" ]]; then
+      want_title="$(get_current_short_title)"
+      ep_gen_has_sentinel "$gen" && gen_sentinel=1
+      # 센티널·short-title 불일치·부재는 모두 ep_gen_valid 가 흡수합니다.
+      ep_gen_valid "$gen" "$want_title" || gen_invalid=1
+    fi
+  fi
 
   local f abs_path f_mtime
   while IFS= read -r f; do
@@ -269,12 +620,29 @@ current_task_is_stale() {
     [[ -f "$abs_path" ]] || continue
     f_mtime="$(stat -f %m "$abs_path" 2>/dev/null || stat -c %Y "$abs_path" 2>/dev/null || true)"
     [[ -z "$f_mtime" ]] && continue
+
+    # 4단계 — 후보 구성. 비교는 기존 -gt 를 유지합니다 (-ge 로 바꾸면 T16 이 깨집니다).
     if [[ "$f_mtime" -gt "$ct_mtime" ]]; then
-      return 0  # stale 발견 — 즉시 반환
+      : # 무조건 후보
+    elif [[ "$f_mtime" -eq "$ct_mtime" ]]; then
+      if [[ $gen_sentinel -eq 1 ]]; then
+        : # (b) 증거 소실 대비 보수적 후보화
+      elif [[ -n "$gen" ]] && ep_record_file_exists "$gen" "$f"; then
+        : # (a) 원시 존재
+      else
+        continue
+      fi
+    else
+      continue
     fi
+
+    # 6·7단계 — 미설명 후보가 하나라도 나오면 즉시 stale 입니다.
+    _stale_edit_is_explained "$gen" "$gen_invalid" "$f" "$abs_path" && continue
+    return 0
   done <<< "$tracked_files"
 
-  return 1  # stale 없음
+  # 5단계(후보 없음)와 7단계(전부 설명됨)는 모두 통과입니다.
+  return 1
 }
 
 # --- JSON 파싱 ---

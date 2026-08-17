@@ -105,6 +105,67 @@ expect "same-type 다운그레이드는 --allow-type-mismatch 비우회" 1 "오�
 run_sync "$WORK/p_lite" "$WORK/r_lite_old"
 expect "lite 같은 타입 다운그레이드 차단" 1 "오래되었습니다"
 
+# --print-upstream ----------------------------------------------------------
+# 순수 변환 경로 — 기존 run_sync/expect 픽스처와 무관하게 SCRIPT_UNDER_TEST 를 직접 호출한다.
+SCRIPT_UNDER_TEST="$SCRIPT_DIR/sync_template.sh"
+ok()    { printf '  ok   %s\n' "$1"; }
+nok()   { FAIL=1; printf '  FAIL %s\n' "$1"; }
+check() { if [[ "$2" == "$3" ]]; then ok "$1"; else nok "$1 (기대='$3' 실제='$2')"; fi; }
+
+echo "== --print-upstream: URL 유도 행렬 =="
+PU() { bash "$SCRIPT_UNDER_TEST" --print-upstream "$1" 2>/dev/null; }
+
+check "https 기본"        "$(PU 'https://github.com/JuseongJee/review-driven-ai-workflow')"      "JuseongJee/review-driven-ai-workflow"
+check "https .git"        "$(PU 'https://github.com/JuseongJee/review-driven-ai-workflow.git')"  "JuseongJee/review-driven-ai-workflow"
+check "https trailing /"  "$(PU 'https://github.com/JuseongJee/review-driven-ai-workflow/')"     "JuseongJee/review-driven-ai-workflow"
+check "https .git 및 /"   "$(PU 'https://github.com/JuseongJee/review-driven-ai-workflow.git/')" "JuseongJee/review-driven-ai-workflow"
+check "ssh scp .git"      "$(PU 'git@github.com:JuseongJee/review-driven-ai-workflow.git')"      "JuseongJee/review-driven-ai-workflow"
+check "ssh scp bare"      "$(PU 'git@github.com:JuseongJee/review-driven-ai-workflow')"          "JuseongJee/review-driven-ai-workflow"
+check "lite https"        "$(PU 'https://github.com/JuseongJee/review-driven-ai-workflow-lite.git')" "JuseongJee/review-driven-ai-workflow-lite"
+check "GHE https"         "$(PU 'https://oss.navercorp.com/jay-jee/review-driven-ai-workflow.git')"  "oss.navercorp.com/jay-jee/review-driven-ai-workflow"
+check "GHE ssh"           "$(PU 'git@oss.navercorp.com:jay-jee/review-driven-ai-workflow.git')"      "oss.navercorp.com/jay-jee/review-driven-ai-workflow"
+check "GHE lite ssh"      "$(PU 'git@oss.navercorp.com:jay-jee/review-driven-ai-workflow-lite.git')" "oss.navercorp.com/jay-jee/review-driven-ai-workflow-lite"
+
+echo "== --print-upstream: credential 제거 =="
+out="$(PU 'https://someuser:ghp_secrettoken@github.com/O/R.git')"
+check "credential 제거"   "$out" "O/R"
+case "$out" in *ghp_secret*) nok "토큰 유출";; *) ok "토큰 미유출";; esac
+
+echo "== --print-upstream: 미지원 입력은 보류 =="
+for bad in \
+  'http://github.com/O/R' \
+  'ftp://github.com/O/R' \
+  'git://github.com/O/R' \
+  'not-a-url' \
+  '' \
+  'https://github.com/OnlyOne' \
+  'https://github.com/a/b/c' \
+  'https://github.com/O/R?tab=readme' \
+  'https://github.com/O/R#frag' \
+  'https://github.com/O /R'
+do
+  out="$(PU "$bad")"; rc=$?
+  if [[ -z "$out" && "$rc" -ne 0 ]]; then ok "미지원 보류: '${bad:-<빈값>}'"
+  else nok "미지원 보류: '${bad:-<빈값>}' (출력='$out' rc=$rc)"; fi
+done
+
+echo "== --print-upstream: 부작용 없음 (격리 디렉토리 내용 fingerprint 비교) =="
+ISO="$(mktemp -d)"; ( cd "$ISO" && mkdir -p sub && echo seed > sub/seed.txt )
+# 크기만 비교하면 같은 길이로 내용이 바뀌는 부작용을 놓친다 (Turn 006 Finding 3).
+# cksum 은 macOS/Linux 공통이며 파일명 없이 "체크섬 크기" 를 낸다.
+snap() { (cd "$1" && find . -type f | LC_ALL=C sort | while read -r f; do
+           printf '%s %s\n' "$f" "$(cksum < "$f")"; done); }
+before="$(snap "$ISO")"
+( cd "$ISO" && PU 'https://github.com/O/R.git' >/dev/null )
+after="$(snap "$ISO")"
+check "작업 디렉토리 불변 (목록+내용)" "$after" "$before"
+
+# 검사 자체가 변화를 잡는지 확인한다 — 같은 크기로 내용만 바꿔 본다.
+printf 'SEED\n' > "$ISO/sub/seed.txt"
+[[ "$(snap "$ISO")" != "$before" ]] && ok "fingerprint 가 동일 크기 변경을 잡음" \
+                                    || nok "fingerprint 가 동일 크기 변경을 놓침"
+rm -rf "$ISO"
+
 if [[ "$FAIL" == "0" ]]; then
   echo "test_sync_template: 전체 통과"
 else

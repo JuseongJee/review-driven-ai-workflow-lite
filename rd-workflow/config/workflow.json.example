@@ -3,5 +3,6 @@
   "intake_source": "text",
   "fr_github": false,
   "default_execution_mode": "manual",
+  "defect_report_upstream": "",
   "default_branch": ""
 }

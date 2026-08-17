@@ -2,6 +2,11 @@
 rd-workflow-workspace/.lifecycle/migration-backup/
 # pre_commit_verify staged hash 캐시 (휘발성 런타임 상태 — 커밋 불필요)
 rd-workflow-workspace/.lifecycle/verify-cache
+# 편집 출처(edit provenance) 기록 — 런타임 상태 (커밋 불필요).
+# ignore 하지 않으면 `rd task set-status` 한 번만으로 워킹트리가 dirty 가 되어
+# archive.sh Step 0 의 ensure_worktree_clean 이 작업을 차단합니다.
+# 누적 회수는 archive.sh 의 post-success cleanup 이 담당합니다 (change spec §2.9).
+rd-workflow-workspace/.lifecycle/edit-provenance.d/
 # copy 모드 skill 갱신 백업 (로컬 병합용 — 커밋 불필요)
 .claude/skills-backup/
 # OS

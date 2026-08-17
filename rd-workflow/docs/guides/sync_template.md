@@ -281,6 +281,21 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 - 신규 파일을 추가합니다
 - 확인받은 삭제 후보를 제거합니다
 
+### 5.1 defect_report_upstream 자동 채우기
+
+결함 보고서를 보낼 대상 저장소를 배포 repo URL 에서 유도해 채웁니다.
+**이미 값이 있으면 건드리지 않습니다** — 사용자가 의도적으로 지정한 값(예: 개인 저장소)이
+업그레이드 때마다 덮어써지면 안 되기 때문입니다.
+
+```bash
+bash rd-workflow/scripts/defect_reports.sh set-upstream "<배포 repo URL>"
+```
+
+- 값이 비어 있으면 canonical 값(`owner/repo` 또는 `host/owner/repo`)을 기록합니다.
+- 이미 값이 있으면 "이미 설정됨" 을 출력하고 원본을 유지합니다.
+- URL 문법을 지원하지 않으면 아무것도 쓰지 않고 보류합니다. 잘못된 대상에 추측 발행하지
+  않기 위함이며, 이 경우 결함 보고 전달은 미전달 목록에 남습니다.
+
 ### 6. 검증 및 버전 갱신
 
 동기화 후 임시 clone의 템플릿 파일과 프로젝트 파일이 일치하는지 확인합니다. (보존 대상 제외)

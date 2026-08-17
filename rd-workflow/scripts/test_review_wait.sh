@@ -263,8 +263,11 @@ run_case3() {
   write_checkpoint "$sandbox" "Author"
 
   # mock: sleep 30 (아무것도 쓰지 않음)
-  local mock_bin
-  mock_bin="$(setup_mock "$sandbox" "sleep 30")"
+  # 자기 PID 를 파일에 남긴다 — 뒤의 생존 확인이 이 PID 만 보게 하기 위해서다.
+  # `exec` 로 sleep 이 되어 PID 가 유지되므로, 기록한 PID = 실제 잠자는 프로세스다.
+  local mock_bin mock_pid_file
+  mock_pid_file="$sandbox/mock_bin/codex.pid"
+  mock_bin="$(setup_mock "$sandbox" "echo \$\$ > \"$mock_pid_file\"; exec sleep 30")"
 
   local rc=0
   local output
@@ -278,9 +281,13 @@ run_case3() {
       bash "$ADAPTER" 2>&1
   )" || rc=$?
 
-  # mock 프로세스가 종료됐는지 확인 (kill 됐으면 sleep 30이 남지 않음)
-  local mock_alive=0
-  if pgrep -f "sleep 30" >/dev/null 2>&1; then
+  # mock 프로세스가 종료됐는지 확인 — 이 sandbox 가 띄운 PID 하나만 본다.
+  #   `pgrep -f "sleep 30"` 은 시스템 전역을 뒤지므로, 같은 머신의 다른 세션이 돌리는
+  #   폴링 루프(`while ...; do sleep 30; done`)까지 우리 mock 으로 오인해 오탐한다.
+  #   테스트가 자기 sandbox 밖의 프로세스 상태에 의존하면 결과가 재현되지 않는다.
+  local mock_alive=0 mock_pid=""
+  [ -f "$mock_pid_file" ] && mock_pid="$(cat "$mock_pid_file" 2>/dev/null)"
+  if [ -n "$mock_pid" ] && kill -0 "$mock_pid" 2>/dev/null; then
     mock_alive=1
   fi
 
@@ -290,9 +297,14 @@ run_case3() {
     fail "케이스 3: 타임아웃 기대 rc=124 — rc=$rc, 메시지=$(echo "$output" | grep -o '타임아웃' || echo '없음')"
   fi
 
+  # PID 파일이 없으면 위 생존 확인이 항상 통과한다. 그 조용한 무력화를 먼저 막는다.
+  if [ -z "$mock_pid" ]; then
+    fail "케이스 3(보조): mock PID 미기록 — 생존 확인이 무력화됨"
   # mock 프로세스가 kill됐는지는 비동기 특성상 보조 확인만
-  if [ "$mock_alive" -eq 1 ]; then
-    fail "케이스 3(보조): mock sleep 30 프로세스가 아직 살아있음 — kill 실패 의심"
+  elif [ "$mock_alive" -eq 1 ]; then
+    fail "케이스 3(보조): mock 프로세스(PID $mock_pid)가 아직 살아있음 — kill 실패 의심"
+  else
+    pass "케이스 3(보조): mock 프로세스(PID $mock_pid) 정리 확인"
   fi
 
   rm -rf "$sandbox"

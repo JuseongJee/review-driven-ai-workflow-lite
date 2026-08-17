@@ -88,9 +88,24 @@ state_write_fields "short-title=-" "status=대기 중"
 
 # Commit (CURRENT_TASK.md + task-state 변경)
 # v2 2b: LIFECYCLE_METADATA_PATH 폐지 → TASK_STATE_PATH 사용
-git add CURRENT_TASK.md "$TASK_STATE_PATH" 2>/dev/null || true
-if ! git diff --cached --quiet 2>/dev/null; then
-  RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit -m "chore(lifecycle): rollback 완료 — $TARGET"
+# add 실패를 삼키면 안 된다 — 경로 한정 커밋은 워킹트리 내용을 취하므로
+# "직전 add 로 index 와 워킹트리가 같다" 는 전제가 add 성공에 달려 있다.
+# 두 경로 모두 필수이며 존재가 보장된다: 직전의 emit_current_task_baseline 이
+# CURRENT_TASK.md 를, state_write_fields 가 task-state 를 각각 반드시 생성한다.
+# archive.sh 가 같은 상황에서 이미 fail-fast 하며 그 이유를 주석에 남겼다 — 같은 패턴을 따른다.
+if ! git add CURRENT_TASK.md "$TASK_STATE_PATH"; then
+  printf 'promote_rollback: CURRENT_TASK.md·task-state staging 실패 — 중단\n' >&2
+  exit 1
+fi
+if ! git diff --cached --quiet -- CURRENT_TASK.md "$TASK_STATE_PATH" 2>/dev/null; then
+  # --no-verify + RD_LIFECYCLE_BYPASS_REASON 병기 (서로 다른 hook 계층), pathspec 으로 staged 오염 차단.
+  # --no-verify 는 hook 이 실제로 차단하는 브랜치(main|master)에서만 붙인다 —
+  # RD_LIFECYCLE_BYPASS_REASON 은 별개 계층이라 브랜치와 무관하게 항상 유지한다.
+  _nv=""
+  if lifecycle_needs_hook_bypass; then _nv="--no-verify"; fi
+  RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit ${_nv:+"$_nv"} \
+    -m "chore(lifecycle): rollback 완료 — $TARGET" -- CURRENT_TASK.md "$TASK_STATE_PATH"
+  if [[ -n "$_nv" ]]; then lifecycle_notify_hook_bypass promote_rollback; fi
 fi
 
 printf 'rollback: 완료. removed=%s\n' "$TARGET"

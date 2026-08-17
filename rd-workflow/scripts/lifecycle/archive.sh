@@ -119,18 +119,85 @@ MERGE_BASE_COMMIT="$(git rev-parse HEAD)" || {
 
 # Step 4 — metadata cleanup commit on main (publish 전)
 if metadata_exists; then
+  # LC-14 대칭: archive 완료 시 미러(CURRENT_TASK.md)와 권위(task-state)를 함께 baseline 으로
+  # 되돌린다 (promote_rollback.sh:82,98 과 동일 패턴). 권위만 되돌리면 완료된 작업 내용이
+  # 진입점 문서에 남아 다음 세션이 끝난 일을 남은 일로 안내받는다.
+  #
+  # 순서 불변식: 미러를 먼저 확정하고 metadata 를 나중에 정리한다.
+  #   metadata_clear 를 먼저 하면 미러 단계 실패 시 metadata_exists 가 거짓이 되어
+  #   재실행이 이 블록을 통째로 건너뛰고 손상된 미러가 영구히 남는다.
+  #
+  # 쓰기 방식: 임시 파일 → 검증 → mv 교체. `> CURRENT_TASK.md` 로 직접 쓰면 리다이렉션이
+  #   대상을 먼저 비우므로 생성 실패 시 빈 미러가 남는다.
+  #
+  # 실패 처리는 즉시 중단이다. cleanup_add 는 쓰지 않는다 — 정의가 이 지점보다 뒤(186행)라
+  #   호출하면 command not found 다. core 실패 전달 방식은 111-118행 선례를 따른다.
+  _ct_path="$CURRENT_WT/CURRENT_TASK.md"
+  _ct_tmp="${_ct_path}.baseline.tmp"
+  if ! emit_current_task_baseline > "$_ct_tmp" 2>/dev/null; then
+    rm -f "$_ct_tmp"
+    printf 'archive: CURRENT_TASK.md baseline 생성 실패 — 중단 (기존 미러 보존)\n' >&2
+    exit 1
+  fi
+  if ! grep -q '^대기 중$' "$_ct_tmp"; then
+    rm -f "$_ct_tmp"
+    printf 'archive: CURRENT_TASK.md baseline 검증 실패 — 중단 (기존 미러 보존)\n' >&2
+    exit 1
+  fi
+  if ! mv "$_ct_tmp" "$_ct_path"; then
+    rm -f "$_ct_tmp"
+    printf 'archive: CURRENT_TASK.md 교체 실패 — 중단 (기존 미러 보존)\n' >&2
+    exit 1
+  fi
+
+  # 미러가 확정된 뒤에 권위를 정리한다 (위 순서 불변식).
   metadata_clear
-  # LC-14 대칭: archive 완료 시 short-title/status baseline reset (stale 방지 — promote_rollback.sh와 동일 패턴)
   state_write_fields "short-title=-" "status=대기 중"
+
+  # 이 커밋에 포함할 경로 — 판정과 커밋 양쪽에 같은 목록을 쓴다
+  _lc_paths=( "$TASK_STATE_PATH" "$_ct_path" )
+  # staging 은 두 파일 모두 성공해야 한다. CURRENT_TASK.md staging 이 실패해도 task-state
+  # 변경 때문에 아래 git diff --cached --quiet 가 non-quiet 이 되어 커밋이 진행되고,
+  # 미러가 빠진 채 tag·push 로 이어진다.
   # v2 2b: LIFECYCLE_METADATA_PATH 폐지 → TASK_STATE_PATH 사용
-  git add "$TASK_STATE_PATH" 2>/dev/null || true
+  if ! git add "$TASK_STATE_PATH" "$_ct_path"; then
+    printf 'archive: task-state·CURRENT_TASK.md staging 실패 — 중단\n' >&2
+    exit 1
+  fi
+  # index 에 올라간 CURRENT_TASK.md 의 "내용" 이 방금 만든 baseline 과 같은지 확인한다.
+  #   staged diff 에 경로가 나타나는지로 판정하면 안 된다 — fr branch 의 archive content
+  #   commit 이 이미 미러를 baseline 으로 만들어 둔 경우 merge 후 다시 써도 HEAD 와 동일해
+  #   staged 변경이 없고, 정상 상태가 실패로 오판된다(그때 merge 는 이미 끝나 있어 사용자가
+  #   수동 복구를 해야 한다). 확인해야 하는 것은 변경 여부가 아니라
+  #   "커밋될 내용이 올바른 baseline 인가" 다.
+  if ! git show ":CURRENT_TASK.md" 2>/dev/null | diff -q - "$_ct_path" >/dev/null 2>&1; then
+    printf 'archive: index 의 CURRENT_TASK.md 가 baseline 과 불일치 — 중단\n' >&2
+    exit 1
+  fi
   # legacy active-fr 잔재가 tracked 파일로 존재하면 삭제분도 staged (metadata_clear가 rm -f 처리)
   _legacy_afr_path="$CURRENT_WT/rd-workflow-workspace/.lifecycle/active-fr"
+  # "선택" 은 경로의 존재 여부에만 적용된다. tracked 임이 확인된 경로는 metadata_clear 가
+  # 이미 삭제한 cleanup 대상이므로, 그 add 실패는 선택 사항이 아니라 중단 사유다.
+  # 경고 후 진행하면 archive 가 tag·push 까지 성공한 것처럼 보이면서 워킹트리에 삭제가
+  # 남고 metadata 커밋이 불완전해진다 (rollback 필수 경로·기존 archive 선례와 같은 원칙).
   if git ls-files --error-unmatch "$_legacy_afr_path" >/dev/null 2>&1; then
-    git add "$_legacy_afr_path" 2>/dev/null || true
+    if ! git add "$_legacy_afr_path"; then
+      printf 'archive: legacy active-fr staging 실패 — 중단\n' >&2
+      exit 1
+    fi
+    _lc_paths+=( "$_legacy_afr_path" )
   fi
-  if ! git diff --cached --quiet 2>/dev/null; then
-    RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit -m "chore(lifecycle): archive $SLUG metadata 정리"
+  # 판정을 경로로 좁힌다 — index 전체를 보면 사용자의 무관한 staged 변경만으로도
+  # 커밋이 진행되어 lifecycle 커밋에 제품 코드가 담긴다
+  if ! git diff --cached --quiet -- "${_lc_paths[@]}" 2>/dev/null; then
+    # --no-verify + RD_LIFECYCLE_BYPASS_REASON 병기 (서로 다른 hook 계층).
+    # --no-verify 는 hook 이 실제로 차단하는 브랜치(main|master)에서만 붙인다 —
+    # RD_LIFECYCLE_BYPASS_REASON 은 별개 계층이라 브랜치와 무관하게 항상 유지한다.
+    _nv=""
+    if lifecycle_needs_hook_bypass; then _nv="--no-verify"; fi
+    RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit ${_nv:+"$_nv"} \
+      -m "chore(lifecycle): archive $SLUG metadata 정리" -- "${_lc_paths[@]}"
+    if [[ -n "$_nv" ]]; then lifecycle_notify_hook_bypass archive; fi
     printf 'archive: metadata cleanup commit 완료\n'
   fi
 fi
@@ -442,6 +509,47 @@ if [[ "$REMOTE_MODE" == "remote" ]]; then
     fi
   fi
 fi
+
+# 편집 출처(edit provenance) 기록 회수 (change spec §2.9)
+#
+# 런타임(hook·producer·CLI)은 세대를 삭제하지 않으므로 누적 회수 지점이 여기 하나뿐입니다.
+# 이 시점은 구현·검증·리뷰가 모두 끝난 뒤여서 병렬 subagent 도 hook 도 돌지 않습니다 —
+# 동시성이 없으므로 세대별 판단 없이 루트 전체를 지웁니다.
+# worktree 로 작업한 경우 Step 7 의 worktree 제거가 그 안의 루트를 함께 없애므로
+# 이 삭제는 main 워킹트리만 담당합니다.
+#
+# 삭제 자체는 공용 헬퍼 ep_purge_root 가 수행하고 이 스크립트는 호출·표시만 합니다.
+# archive.sh 는 별도 프로세스라 셸 함수 override 가 전파되지 않으므로, 삭제 로직을
+# source 전용 헬퍼에 두어야 실패 경로를 함수 단위로 결정적으로 재현할 수 있습니다.
+#
+# **삭제 대상은 이 스크립트가 리터럴로 고정합니다** (final diff review 턴 002 P1).
+# ep_root() 는 테스트 격리용 RD_EDIT_PROVENANCE_DIR 을 무조건 우선하므로, 그 변수가 환경에
+# 남아 있으면 정상 성공 경로의 마지막 단계에서 프로젝트 밖 임의 경로가 재귀 삭제됩니다.
+# 경고 문구의 경로도 같은 리터럴을 씁니다 — ep_root() 출력을 쓰면 "무엇을 지우려 했는가" 와
+# "무엇이라고 보고하는가" 가 갈라져, 잘못된 대상을 지운 경우를 로그로 구별할 수 없습니다.
+#
+# 조건부 source + 함수 guard 를 쓰는 이유: 무조건 호출하면 부분 install 환경에서
+# command-not-found 가 stderr 로 새어 정상 경로의 무출력 계약이 깨집니다.
+# (헬퍼는 위 _guard_common.sh 가 이미 조건부로 불러왔을 수 있으나, 그 경로에 의존하지 않고
+#  여기서 다시 확인합니다. 같은 파일의 재 source 는 함수 재정의뿐이라 부작용이 없습니다.)
+# **bash -n 사전 검사**: 구문 오류가 있는 헬퍼를 source 하면 파서가 셸 자체를 종료시킵니다
+# (이 스크립트는 set -euo pipefail). 이 지점은 merge·tag·push 가 끝난 뒤라 여기서 죽으면
+# 정리 잔여 요약이 통째로 유실됩니다. archive 는 hot path 가 아니므로 fork 한 번으로 막습니다.
+_ep_root_target="${project_root}/rd-workflow-workspace/.lifecycle/edit-provenance.d"
+_ep_helper="${project_root}/rd-workflow/scripts/_edit_provenance_common.sh"
+if [[ -f "$_ep_helper" ]] && bash -n "$_ep_helper" 2>/dev/null; then
+  # shellcheck source=/dev/null
+  . "$_ep_helper"
+fi
+if declare -f ep_purge_root >/dev/null 2>&1; then
+  # 삭제 실패는 stderr 경고 한 줄로 끝냅니다. cleanup_add 잔여 레코드로 승격하지 않습니다 —
+  # kind 4종은 분리 FR archive-cleanup-visibility 의 마커 직렬화 계약이고, provenance 루트
+  # 잔존은 lifecycle 정확성과 무관한 위생 실패입니다 (다음 self_test 의 D6 이 계속 관찰합니다).
+  if ! ep_purge_root "$_ep_root_target"; then
+    printf '⚠️  provenance 기록 정리 실패: %s (판정에 영향 없음, 다음 archive 에서 재시도)\n' "$_ep_root_target" >&2
+  fi
+fi
+# 헬퍼 부재·함수 미정의 → 무경고 skip (경고도 출력하지 않습니다)
 
 # ---- 정리 잔여 요약 (stdout) ----
 # 종료 코드 0 의 의미가 "완전 정리 완료" 에서 "core 성공(잔여 가능)" 으로 넓어지므로,

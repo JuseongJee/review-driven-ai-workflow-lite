@@ -124,7 +124,8 @@ source_fr_validate() {
 }
 
 # source_fr_from_request [request_file] — REQUEST.md '## Source FR' 첫 유효행 출력
-#   백틱·양끝 공백 제거. 파일/섹션 부재·값 '-'·빈 값이면 빈 출력.
+#   백틱·양끝 공백 제거. HTML 주석 행(<!-- ... -->)은 건너뛴다 — 템플릿이 형식 예시를
+#   주석으로 담기 때문이다. 파일/섹션 부재·값 '-'·빈 값이면 빈 출력.
 #   항상 return 0 (set -e 호출부의 명령 치환 안전 — fail-open)
 source_fr_from_request() {
   local f="${1:-${project_root:-$PWD}/REQUEST.md}"
@@ -133,11 +134,155 @@ source_fr_from_request() {
   v="$(awk '
     /^## Source FR/ { in_s = 1; next }
     in_s && /^## / { exit }
+    in_s && incomment { if (/-->/) incomment = 0; next }
+    in_s && /^[[:space:]]*<!--/ { if ($0 !~ /-->/) incomment = 1; next }
     in_s { gsub(/`/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); if (NF) { print; exit } }
   ' "$f")"
   if [[ -n "$v" && "$v" != "-" ]]; then
     printf '%s\n' "$v"
   fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# source_fr_resolve — REQUEST 원문 표기를 canonical path 로 정규화
+# ---------------------------------------------------------------------------
+# 사용: source_fr_resolve <raw> [project_root]
+#   stdout : canonical repo-relative path, 또는 빈 문자열(값 없음)
+#   return : 0 = 성공 또는 값 없음 / 1 = 해석 실패
+#   stderr : 실패 시 원문 값과 허용 형식
+#
+# 판정 순서 자체가 계약이다 (change-spec §3.3). 첫 매칭에서 확정하며, 특히
+# 'YYYY-MM-DD slug'(공백 포함) 검사는 slug 문법 검사보다 앞에 와야 한다 —
+# 순서를 바꾸면 그 표기가 공백 때문에 slug 문법에서 떨어진다.
+#
+# 괄호 계열에서 레이블(마지막 '(' 앞부분)의 문법은 제한하지 않는다. 결과의
+# 정확성은 레이블이 아니라 target 쪽 검증(단계 2~4)이 보장하며, 레이블 문법을
+# 고정하면 새 서술 변형마다 다시 실패한다 — 그것이 canonical-only 파서가
+# 이력 48% 를 버린 원인이다. 다만 빈 레이블은 거부한다.
+#
+# project_root 는 실존 확인의 base 로만 쓰고, 출력은 언제나 repo-relative 다.
+# bash 3.2 호환: 연관배열·mapfile·globstar·extglob 을 쓰지 않는다.
+
+_SFR_ITEMS_PREFIX="rd-workflow-workspace/backlog/items"
+
+# _sfr_trim <str> — 앞뒤 공백 제거 (외부 프로세스 없이)
+_sfr_trim() {
+  if [[ "${1-}" =~ ^[[:space:]]*(.*[^[:space:]])?[[:space:]]*$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  else
+    printf '%s' ""
+  fi
+}
+
+# _sfr_reject <raw> <reason> — 해석 실패를 사람이 고칠 수 있는 형태로 알린다
+_sfr_reject() {
+  echo "source-fr: '${1}' 를 해석할 수 없습니다 — ${2}." >&2
+  echo "  허용 형식: ${_SFR_ITEMS_PREFIX}/<파일>.md" >&2
+  echo "  예: ${_SFR_ITEMS_PREFIX}/2026-08-12-example.md" >&2
+}
+
+source_fr_resolve() {
+  local raw="${1-}" root="${2:-.}"
+  local v label target rest cand slug hit count f fast
+
+  # 단계 0 — 전처리: trim → 리스트 접두 1회 제거 → 재trim
+  v="$(_sfr_trim "$raw")"
+  if [[ "$v" == "- "* ]]; then v="$(_sfr_trim "${v#- }")"; fi
+  if [[ -z "$v" || "$v" == "-" ]]; then printf ''; return 0; fi
+
+  # 단계 0.5 — canonical / items 축약 fast path (괄호 해석보다 먼저)
+  #   저장 계약은 basename 에 '(' 를 허용한다. 이 경로가 없으면
+  #   items/2026-04-04-paren(x).md 처럼 유효하고 실존하는 canonical path 가
+  #   괄호 표기로 오해석되어 거부된다.
+  #   괄호 안 target 의 괄호는 지원하지 않는다 — 그런 파일은 canonical 직접 표기로 쓴다.
+  fast=0
+  case "$v" in
+    "$_SFR_ITEMS_PREFIX"/*.md|items/*.md) fast=1 ;;
+  esac
+
+  # 단계 1 — 괄호 target 추출: 마지막 '(' 이후 ~ 그 뒤 첫 ')' 까지
+  if [[ "$fast" -eq 1 ]]; then
+    target="$v"
+  elif [[ "$v" == *"("* ]]; then
+    label="${v%(*}"            # 마지막 '(' 앞부분
+    target="${v##*(}"
+    rest="${target#*)}"
+    target="${target%%)*}"
+    # 레이블이 비면 거부한다. '(아무거나)' 를 입구로 열어 두지 않기 위함이다.
+    if [[ -z "$(_sfr_trim "$label")" ]]; then
+      _sfr_reject "$raw" "괄호 앞 레이블이 비어 있습니다"
+      return 1
+    fi
+    # 꼬리에는 ')' 와 공백만 남아야 한다. 그 외가 남으면 뒤에 다른 내용이 붙은
+    # 입력이므로 거부한다. 닫는 괄호가 아예 없는 깨진 링크도 여기서 걸린다.
+    while [[ "$rest" == ")"* || "$rest" == [[:space:]]* ]]; do rest="${rest#?}"; done
+    if [[ -n "$rest" ]]; then
+      # 이 사유는 두 경우에 나온다 — 괄호 뒤에 설명이 붙은 표기, 그리고 파일명에
+      # 괄호가 있는데 링크 표기로 감싼 경우. 둘 다 교정 방향이 같으므로 함께 안내한다.
+      _sfr_reject "$raw" \
+        "괄호 뒤에 해석할 수 없는 내용이 남습니다 (파일명에 괄호가 있으면 링크 표기 대신 경로를 직접 쓰세요)"
+      return 1
+    fi
+  else
+    target="$v"
+  fi
+  target="$(_sfr_trim "$target")"
+  if [[ -z "$target" ]]; then
+    _sfr_reject "$raw" "값이 비어 있습니다"
+    return 1
+  fi
+
+  # 단계 2 — 분류 (첫 매칭 확정)
+  cand=""; slug=""
+  if [[ "$target" == "$_SFR_ITEMS_PREFIX"/* ]]; then
+    cand="$target"
+  elif [[ "$target" == items/* ]]; then
+    cand="$_SFR_ITEMS_PREFIX/${target#items/}"
+  elif [[ "$target" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})[[:space:]]+([a-z0-9][a-z0-9-]*)$ ]]; then
+    cand="$_SFR_ITEMS_PREFIX/${BASH_REMATCH[1]}-${BASH_REMATCH[2]}.md"
+  elif [[ "$target" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    slug="$target"
+  else
+    _sfr_reject "$raw" "지원하지 않는 표기입니다"
+    return 1
+  fi
+
+  # 단계 3 — slug glob 해석 (정확 일치 우선 → 유일 매칭)
+  if [[ -n "$slug" ]]; then
+    if [[ -f "$root/$_SFR_ITEMS_PREFIX/$slug.md" ]]; then
+      cand="$_SFR_ITEMS_PREFIX/$slug.md"
+    else
+      count=0; hit=""
+      # nullglob 을 쓰지 않는다 — 미매칭 시 glob 이 리터럴로 남지만 -f 에서 걸러진다.
+      # 셸 옵션을 건드리지 않아 호출자 환경에 영향이 없다.
+      for f in "$root/$_SFR_ITEMS_PREFIX"/*-"$slug".md; do
+        [[ -f "$f" ]] || continue
+        count=$((count + 1)); hit="$f"
+      done
+      if [[ "$count" -eq 1 ]]; then
+        cand="$_SFR_ITEMS_PREFIX/${hit##*/}"
+      elif [[ "$count" -gt 1 ]]; then
+        _sfr_reject "$raw" "slug '$slug' 가 items 파일 ${count}건에 매칭됩니다 — 파일명을 직접 쓰세요"
+        return 1
+      else
+        _sfr_reject "$raw" "slug '$slug' 에 해당하는 items 파일이 없습니다"
+        return 1
+      fi
+    fi
+  fi
+
+  # 단계 4 — 최종 검증: 계약 형식 + 실존 일반 파일
+  if ! source_fr_validate "$cand"; then
+    _sfr_reject "$raw" "정규화 결과가 계약 형식이 아닙니다 ($cand)"
+    return 1
+  fi
+  if [[ ! -f "$root/$cand" ]]; then
+    _sfr_reject "$raw" "파일이 존재하지 않습니다 ($cand)"
+    return 1
+  fi
+
+  printf '%s\n' "$cand"
   return 0
 }
 

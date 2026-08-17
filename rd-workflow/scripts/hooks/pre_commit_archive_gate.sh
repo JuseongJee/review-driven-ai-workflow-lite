@@ -19,11 +19,12 @@ command_targets_our_commit "$cmd" "archive_gate" || exit 0
 request_file="${project_root}/REQUEST.md"
 [[ ! -f "$request_file" ]] && exit 0
 
-# Source FR 추출 — source_fr_from_request 가 백틱·공백 제거, '-'/부재는 빈 값 반환 (_state_common.sh 단일 구현)
-source_fr="$(source_fr_from_request "$request_file")"
+# Source FR 추출·해석 — _state_common.sh 단일 구현에 위임한다.
+#   from_request 가 원문 한 줄을, resolve 가 canonical path 로의 정규화를 담당한다.
+raw_source_fr="$(source_fr_from_request "$request_file")"
 
-# Source FR이 없거나 "-"이면 통과 (아카이브 불필요)
-[[ -z "$source_fr" ]] && exit 0
+# 값이 없거나 '-' 이면 아카이브 불필요 → 통과
+[[ -z "$raw_source_fr" ]] && exit 0
 
 # diff review가 통과했는지 확인
 review_dir="$(get_latest_diff_review_dir)"
@@ -32,25 +33,25 @@ review_dir="$(get_latest_diff_review_dir)"
 # diff review가 아직 미종결이면 통과 (review_gate가 처리). 종결성 판정은 헬퍼로 통일.
 is_review_session_resolved "$review_dir" || exit 0
 
-# diff review 통과 + Source FR 있음 → FR 상세 파일 status 확인
-items_dir="${project_root}/rd-workflow-workspace/backlog/items"
-if [[ "$source_fr" == */* ]]; then
-  # path 형식 (canonical) — repo-relative 만 허용. 절대경로/.. 는 경고 후 통과 (fail-open)
-  case "$source_fr" in
-    /*|../*|*/../*|*/..)
-      echo "[guard] Source FR path 형식 위반('${source_fr}') — 검증을 건너뜁니다." >&2
-      exit 0 ;;
-  esac
-  fr_file="${project_root}/${source_fr}"
-else
-  # legacy slug — items/<slug>.md 해석 (읽기 호환)
-  fr_file="${items_dir}/${source_fr}.md"
+# --- 여기서부터가 archive 커밋 경로다 ---
+# 값이 있는데 해석에 실패하면 차단한다 (fail-closed).
+#   종전에는 파일을 못 찾으면 검증을 건너뛰고 통과시켰다. 그 결과 표기가 어긋난
+#   REQUEST 에서는 이 게이트가 통째로 꺼져, promote 의 '-' 기록과 함께 안전장치가
+#   둘 다 무력화됐다.
+#   이 판정을 review 종결 확인보다 **뒤**에 두는 것이 계약이다. 앞에 두면 세션이
+#   없거나 미종결인 상태의 커밋(구현 중 iteration commit 등)까지 막혀, 게이트가
+#   'archive 커밋 차단' 이라는 적용 범위를 벗어난다.
+if ! source_fr="$(source_fr_resolve "$raw_source_fr" "$project_root")"; then
+  echo "[guard] Source FR '${raw_source_fr}' 를 해석할 수 없어 아카이브 커밋을 막습니다." >&2
+  echo "[guard] REQUEST.md 의 ## Source FR 을 다음 형식으로 고치세요:" >&2
+  echo "[guard]   rd-workflow-workspace/backlog/items/<파일>.md" >&2
+  exit 2
 fi
+[[ -z "$source_fr" ]] && exit 0
 
-if [[ ! -f "$fr_file" ]]; then
-  echo "[guard] Source FR 상세 파일(${fr_file})을 찾지 못했습니다 — 검증을 건너뜁니다." >&2
-  exit 0
-fi
+# Source FR 있음 → FR 상세 파일 status 확인
+# 실존은 source_fr_resolve 가 이미 보장하므로 여기서 다시 확인하지 않는다.
+fr_file="${project_root}/${source_fr}"
 
 fr_status="$(awk '
   /^- status:/ { gsub(/^- status:[[:space:]]*/, ""); print; exit }

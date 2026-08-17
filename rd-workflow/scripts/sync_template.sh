@@ -12,6 +12,29 @@ REPO_URL=""
 FORCE=""
 ALLOW_TYPE_MISMATCH=""
 
+# --print-upstream <url>: URL → defect_report_upstream canonical 값 (부작용 없음)
+# github.com 이면 owner/repo, 그 외 host 면 host/owner/repo. 미지원 문법은 빈 출력 + exit 1.
+if [[ "${1:-}" == "--print-upstream" ]]; then
+  raw="${2:-}"
+  [[ -z "$raw" ]] && exit 1
+  host=""; path=""
+  if [[ "$raw" =~ ^[A-Za-z0-9._-]+@([A-Za-z0-9][A-Za-z0-9.-]*):(.+)$ ]]; then   # scp 형식
+    host="${BASH_REMATCH[1]}"; path="${BASH_REMATCH[2]}"
+  elif [[ "$raw" =~ ^https://([^/]+)/(.+)$ ]]; then                            # https 만 허용
+    host="${BASH_REMATCH[1]}"; path="${BASH_REMATCH[2]}"
+    host="${host##*@}"                                                         # credential 제거
+    [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || exit 1
+  else
+    exit 1
+  fi
+  path="${path%/}"; path="${path%.git}"; path="${path%/}"                      # / → .git → / 순으로 제거
+  # owner/repo 정확히 2세그먼트, 안전한 문자만 (공백·? ·# ·제어문자 거부)
+  [[ "$path" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || exit 1
+  if [[ "$host" == "github.com" ]]; then printf '%s\n' "$path"
+  else printf '%s/%s\n' "$host" "$path"; fi
+  exit 0
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --force) FORCE="1"; shift ;;

@@ -82,7 +82,8 @@ Typical user requests:
    - `gh auth status` 통과 여부 — 미인증: "gh auth login으로 인증이 필요합니다" 출력 후 종료
    - `gh repo view` 성공 여부 — 실패: "git remote가 설정되지 않았거나 Issues가 비활성화되어 있습니다" 출력 후 종료
 5. 검증 실패 시 로컬 fallback 없이 종료한다.
-6. `pull`, `push`, `sync` 서브커맨드는 `fr_github` 설정과 무관하게 항상 전제조건 검증을 실행한다.
+6. **예외 — 결함 보고 전달 경로**: `workflow-defect-reporting.md` 규약에 따른 결함 보고 발행은 전제조건 실패 시 **종료하지 않습니다.** 보고 파일을 그대로 두고 미전달로 표시한 뒤, 사유·미전달 목록·재시도 명령을 안내합니다. 여기서 종료하면 보고서가 다시 조용히 쌓여 규약이 해결하려는 문제로 되돌아갑니다. 이 예외는 결함 보고 경로에만 적용되며 `add`/`push`/`pull`/`sync` 의 FR 경로는 위 5번 그대로입니다.
+7. `pull`, `push`, `sync` 서브커맨드는 `fr_github` 설정과 무관하게 항상 전제조건 검증을 실행한다.
 
 이후 각 서브커맨드는 결정된 연동 여부에 따라 동작한다.
 
@@ -126,3 +127,4 @@ Typical user requests:
 - 서브커맨드가 없거나 알 수 없으면 사용법만 출력하고 종료한다. 파일 수정 없음.
 - `github-issue`는 인덱스(GitHub 컬럼)와 상세 파일 양쪽에서 관리한다. 연결/해제 시 양쪽 모두 갱신한다.
 - pull/push/sync는 `fr_github` 설정과 무관하게 `--github` 플래그 없이도 실행 가능하다 (항상 전제조건 검증 실행).
+- 결함 보고 전달은 FR 경로와 분리됩니다 — 라벨은 `defect-report`, 도구는 `defect_reports.sh`, 실패는 종료가 아니라 미전달 표시입니다.

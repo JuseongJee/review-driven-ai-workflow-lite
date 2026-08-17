@@ -28,7 +28,7 @@
 
 `/fr archive` 는 FR 인덱스 정리와 `fr` stage raw capture 이동까지만 담당한다. REQUEST archive 전체 흐름 (큰 작업) 에서는 다음 순서로 진행한다:
 
-1. fr branch 에서 archive content commit 수행 (REQUEST.md 비우기, archive 파일 생성, FR done 처리, completion report, CURRENT_TASK.md reset).
+1. fr branch 에서 archive content commit 수행 (REQUEST.md 비우기, archive 파일 생성, FR done 처리, completion report). `CURRENT_TASK.md` 미러는 `archive.sh` 가 baseline 으로 되돌리므로 사람이 하지 않습니다.
 2. main 으로 switch 후 `bash rd-workflow/scripts/lifecycle/archive.sh` 호출 → merge + tag + push + branch/worktree 정리 일괄 처리.
 
 즉, **사용자가 수동으로 REQUEST archive 를 진행할 때**:

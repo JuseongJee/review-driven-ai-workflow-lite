@@ -83,14 +83,14 @@ cat <<EOF > "${session_dir}/CHECKPOINT.md"
 -
 
 ## Agreed Points
-- 
+-
 
 ## Open Issues
 <!-- 미해결 이슈가 없으면 정확히 \`- 없음\` 또는 \`- None\` 한 줄로만 표기한다 (후행 마침표 1개 허용). 그 외 표기는 미해결로 판정된다. -->
-- 
+-
 
 ## Questions For Next Agent
-- 
+-
 
 ## Suggested Next Owner
 Author
@@ -103,7 +103,7 @@ cat <<EOF > "${session_dir}/USER_ACTION.md"
 -
 
 ## Why
-- 
+-
 
 ## Question For User
 아직 사용자 확인이 필요한 단계가 아닙니다.

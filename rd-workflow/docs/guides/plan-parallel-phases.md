@@ -20,7 +20,7 @@ plan이 phase를 표현하면 autopilot/subagent-driven 실행이 phase 내 task
 
 phase 단위 순차 루프:
 
-1. phase 내 task들의 구현자 subagent를 **병렬 dispatch**. 구현자는 파일 Edit/Write만 하고 git 조작을 하지 않는다 (subagent-git-safety.md).
+1. phase 내 task들의 구현자 subagent를 **병렬 dispatch** 합니다. 구현자는 자기 task 파일의 Edit/Write만 하고 git 조작을 하지 않습니다 (subagent-git-safety.md). 공유 진행 상태(`CURRENT_TASK.md`·`REQUEST.md`·`task-state`)는 그 disjoint 집합에서 **제외**됩니다 — 구현자는 진행 상황을 결과 텍스트로 반환하고, `implementation_gate.sh` 가 `Edit`·`Write` 경유 쓰기를 hook 수준에서 차단합니다.
 2. barrier: phase 내 모든 구현자 완료 대기.
 3. **orchestrator(실행 세션 본체)가 커밋**한다 (동시 커밋 경합 회피).
 4. 검증(test/lint/build 또는 프로젝트 실질 검증)을 **phase barrier 후 1회** 실행. loop-guard `verify-fail` 기록도 이 검증 기준으로 1회 (키 포맷 불변). 실패 시 systematic-debugging으로 phase 단위 수정 후 재검증.
@@ -40,9 +40,9 @@ phase 내 task가 1개면 병렬의 의미가 없어 순차와 동일하게 동�
 - phase를 하나도 표현하지 않은 plan(legacy 포함)은 **전체를 순차 실행**으로 degrade한다.
 - review flag가 없는 task는 `needs-review`로 간주한다 (안전 기본값).
 
-## 안전망 — spec/plan review의 phase 비중첩 검증 (유일 게이트)
+## 안전망 — spec/plan review의 phase 비중첩 검증 (주 게이트)
 
-병렬 실행은 config 플래그 없이 plan에 phase가 있으면 자동 발동한다. 따라서 **spec/plan review가 조용한 덮어쓰기를 막는 유일한 게이트**다. 리뷰어는 다음을 필수로 확인한다:
+병렬 실행은 config 플래그 없이 plan에 phase가 있으면 자동 발동합니다. 공유 진행 상태 3종은 `implementation_gate.sh` 가 `Edit`·`Write` 경유에 한해 구조적으로 차단하지만, **그 밖의 task 간 파일 중첩을 막는 것은 spec/plan review가 유일**합니다. 리뷰어는 다음을 필수로 확인합니다:
 
 - 같은 phase에 속한 task들의 `Files:` 목록이 실제로 서로 **disjoint**한가.
 - **실효 쓰기 집합 기준**: disjoint 판정은 직접 편집뿐 아니라 그 편집이 유발하는 **생성·전파 산출물까지 포함**한다. 정본(`_ROOT_FILES/`) 편집과 그 산출물(빌드/전파로 생성되는 루트 `rd-workflow/`)은 같은 실효 대상이다.

@@ -169,3 +169,28 @@ main
 -
 EOF
 }
+
+# Claude Code 가 설치하는 .git/hooks/pre-commit 은 브랜치명이 main|master 일 때만 커밋을
+# 차단합니다. trunk 등 커스텀 기본 브랜치에서는 차단되지 않으므로 --no-verify 를 붙일 이유가
+# 없고, 붙이면 소비 프로젝트의 pre-commit·commit-msg 검증만 불필요하게 줄어듭니다.
+lifecycle_needs_hook_bypass() {
+  local b
+  b="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [[ "$b" == "main" || "$b" == "master" ]]
+}
+
+# lifecycle 커밋은 git pre-commit·commit-msg hook 을 --no-verify 로 건너뛴다.
+# 우회 사실과 그 범위를 사용자에게 알린다 — "pre-commit 우회" 같은 축약은 금지다.
+# 사용자가 무엇이 실행되지 않았는지 읽어서 알 수 있어야 한다 (change spec 결정 4).
+# 반드시 커밋 직후에 호출한다 — staged 잔여 건수가 커밋 후 index 기준이어야 정확하다.
+# 실제로 우회한 경우에만 호출한다 — 우회하지 않았는데 이 안내를 내보내면 거짓이다.
+# $1: 호출 스크립트 이름 (promote | promote_rollback | archive)
+lifecycle_notify_hook_bypass() {
+  local script="$1"
+  printf '%s: pre-commit·commit-msg hook 을 건너뛰고 커밋했습니다 — 프로젝트 자체 lint·포맷 검사와 커밋 메시지 정책 검사가 실행되지 않았습니다.\n' "$script"
+  local leftover
+  leftover="$(git diff --cached --name-only 2>/dev/null | grep -c . || true)"
+  if [[ "$leftover" -gt 0 ]]; then
+    printf '  (staged 변경 %s건은 lifecycle 커밋에 포함하지 않았습니다 — 그대로 남아 있습니다.)\n' "$leftover"
+  fi
+}
