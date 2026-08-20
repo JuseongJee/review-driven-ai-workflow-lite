@@ -280,20 +280,33 @@ smoke_step_relevant() {
   return 1
 }
 
-# self_test.sh 본문에서 **최상위** run_step 호출을 `<desc>\t<나머지 인자>` 로 추출합니다.
+# self_test.sh 본문에서 **최상위** run_step 호출을
+# `<audience>\t<desc>\t<나머지 인자>` 로 추출합니다.
 # 들여쓰기된 호출(함수 안·문자열 안)은 실제 스텝이 아니므로 제외합니다.
 # 추출 결과가 0건이면 구조가 바뀐 것이므로 실패로 봅니다 (호출자는 full 폴백).
+#
+# **청중을 설명 앞에서 별도 필드로 뽑습니다.** 청중을 설명 뒤에 두면 그 토큰이 "나머지 인자"
+# 에 섞여 `bash <경로>` 형태 판별(`smoke_cmd_target`)을 깨뜨립니다 — 모든 스텝이 inline
+# checker 로 오분류되어 감축이 사라집니다. 그래서 시그니처를 앞에 두고 이 추출식이 청중을
+# 구조적으로 분리합니다.
+#
+# `[a-z-]*` 는 BSD·GNU sed 공통 BRE 입니다. `\+`·`\|`·`\?` 같은 GNU 확장을 쓰면 macOS 기본
+# `/usr/bin/sed` 에서 매치가 통째로 실패해 추출 0건 → full 폴백이 됩니다 (조용한 감축 소실).
 smoke_extract_steps() {
   local self="$1" n
   [[ -f "$self" ]] || return 1
   n="$(grep -c '^run_step ' "$self" 2>/dev/null || true)"
   [[ -n "$n" && "$n" -gt 0 ]] || return 1
-  sed -n 's/^run_step "\([^"]*\)" \(.*\)$/\1\t\2/p' "$self"
+  sed -n 's/^run_step \([a-z-]*\) "\([^"]*\)" \(.*\)$/\1\t\2\t\3/p' "$self"
 }
 
 SMOKE_SKIP_IDX=""
 SMOKE_SKIP_DESCS=()
 SMOKE_STEP_DESCS=()
+# 순번 → 청중 대응표 (0-based). 설명 대응표와 나란히 채워집니다.
+# 정적 검사(청중 미선언 0건 · exact dev-only 집합)의 입력이기도 합니다 — 등록부를 실행하지
+# 않고도 청중 분류를 검증할 수 있어야 하기 때문입니다.
+SMOKE_STEP_AUDIENCES=()
 SMOKE_UNMAPPED=""
 
 # 모든 스텝을 미리 판정합니다 (spec §5.3 preflight).
@@ -321,17 +334,18 @@ SMOKE_UNMAPPED=""
 # 끝냅니다. 두 가지를 따로 돌면 폐포 계산이 스텝 수만큼 중복됩니다.
 smoke_preflight() {
   local scripts_dir="$1" self="$2"
-  SMOKE_SKIP_IDX=""; SMOKE_SKIP_DESCS=(); SMOKE_STEP_DESCS=(); SMOKE_UNMAPPED=""
+  SMOKE_SKIP_IDX=""; SMOKE_SKIP_DESCS=(); SMOKE_STEP_DESCS=(); SMOKE_STEP_AUDIENCES=(); SMOKE_UNMAPPED=""
 
-  local steps idx=0 desc cmd target j relevant
+  local steps idx=0 aud desc cmd target j relevant
   steps="$(smoke_extract_steps "$self")" || return 1
   [[ -n "$steps" ]] || return 1
 
   # 대응표는 관련성 판정보다 **먼저** 채웁니다. 아래 조기 반환(변경 0건)에서도 호출자가
   # 순번↔설명을 대조할 수 있어야 하기 때문입니다 — 표가 비면 모든 스텝이 어긋난 것으로
   # 보여 경고가 도배되고, 그 소음이 진짜 어긋남을 덮습니다.
-  while IFS=$'\t' read -r desc cmd; do
+  while IFS=$'\t' read -r aud desc cmd; do
     SMOKE_STEP_DESCS+=("$desc")
+    SMOKE_STEP_AUDIENCES+=("$aud")
   done <<< "$steps"
 
   # 변경 파일이 없으면 관련성 판정이 무의미하므로 스킵을 하나도 만들지 않고 반환합니다
@@ -351,7 +365,7 @@ smoke_preflight() {
     esac
   done
 
-  while IFS=$'\t' read -r desc cmd; do
+  while IFS=$'\t' read -r aud desc cmd; do
     idx=$((idx + 1))
     # `bash "${SCRIPT_DIR}/x.sh"` / `env V=1 bash "..."` → 실제 경로로 복원합니다.
     # ${SCRIPT_DIR} 를 문자열 치환한 뒤 eval 로 따옴표만 벗깁니다. eval 을 쓰는 이유는
@@ -449,6 +463,8 @@ smoke_proof_exclude() {
 :(exclude)rd-workflow-workspace/.lifecycle/verify-cache
 :(exclude)rd-workflow-workspace/.lifecycle/selftest-full-cache
 :(exclude)rd-workflow-workspace/.lifecycle/selftest-full-cache.*
+:(exclude)rd-workflow-workspace/.lifecycle/selftest-consumer-cache
+:(exclude)rd-workflow-workspace/.lifecycle/selftest-consumer-cache.*
 :(exclude)rd-workflow-workspace/.lifecycle/*-audit.log
 :(exclude)rd-workflow-workspace/.lifecycle/*.log
 SPEC
@@ -605,28 +621,51 @@ smoke_untracked_state() {
 # 캐시 내용과 무관하게 항상 무효가 나와 인프라 커밋이 100% 차단되고, 우회 밸브가 유일한
 # 통로가 됩니다. 그때의 실질 동작은 "검증 강제" 가 아니라 "커밋마다 사유 한 줄을 받는
 # 로깅 장치" 이며, 형식적으로 반복되는 우회 사유는 경보 가치를 잃습니다.
+# `full-only 판정` — full 증명만 인정합니다 (의미 불변).
+# **전수 통과를 요구하는 코드는 반드시 이 함수를 호출합니다.** consumer 캐시를 읽지 않는
+# 것이 "약한 증명을 강한 증명으로 오인" 을 막는 구조적 보장입니다.
 smoke_cache_valid() {
+  _smoke_cache_valid_at "$1" "$2" "$1/rd-workflow-workspace/.lifecycle/selftest-full-cache" full
+}
+
+# consumer 증명 판정 — 같은 규칙, 다른 캐시 파일.
+smoke_consumer_cache_valid() {
+  _smoke_cache_valid_at "$1" "$2" "$1/rd-workflow-workspace/.lifecycle/selftest-consumer-cache" consumer
+}
+
+# `archive-gate 판정` (spec §7) — full 증명 **또는** consumer 증명 중 현재 지문과 일치하는
+# 것이 있으면 유효합니다. `full` 이 `consumer` 의 상위 집합이므로 인정합니다.
+# 아카이브 게이트 전용이며, 이 함수를 full 요구 지점에서 호출해서는 안 됩니다.
+smoke_archive_gate_valid() {
   local root="$1" mode="$2"
-  local cache="$root/rd-workflow-workspace/.lifecycle/selftest-full-cache" cached now
+  if smoke_cache_valid "$root" "$mode" 2>/dev/null; then return 0; fi
+  smoke_consumer_cache_valid "$root" "$mode"
+}
+
+# 공통 본체. $4 는 사용자에게 보이는 증명 이름(full|consumer)입니다 — 메시지에 하드코딩하면
+# consumer 실패가 "full 증명 없음" 으로 보고되어 사용자가 엉뚱한 명령을 다시 돌립니다.
+_smoke_cache_valid_at() {
+  local root="$1" mode="$2" cache="$3" label="$4"
+  local cached now
   local untracked="" ustate=0
   if [[ "$mode" != "index" ]]; then
     untracked="$(smoke_untracked_state "$root")" || ustate=$?
     if [[ "$ustate" -eq 2 ]]; then
-      printf 'self_test full 증명 무효: untracked 목록 조회 실패 (git 오류)\n' >&2
+      printf 'self_test %s 증명 무효: untracked 목록 조회 실패 (git 오류)\n' "$label" >&2
       return 1
     fi
     if [[ "$ustate" -eq 1 ]]; then
-      printf 'self_test full 증명 무효: proof 에 담기지 않는 untracked 파일이 있습니다\n' >&2
+      printf 'self_test %s 증명 무효: proof 에 담기지 않는 untracked 파일이 있습니다\n' "$label" >&2
       printf '%s\n' "$untracked" | sed 's/^/  /' >&2
-      printf '  git add 후 self_test.sh full 을 다시 실행하세요\n' >&2
+      printf '  git add 후 self_test.sh %s 을 다시 실행하세요\n' "$label" >&2
       return 1
     fi
   fi
-  [[ -f "$cache" ]] || { printf 'self_test full 증명 없음: 캐시 파일이 없습니다\n' >&2; return 1; }
+  [[ -f "$cache" ]] || { printf 'self_test %s 증명 없음: 캐시 파일이 없습니다\n' "$label" >&2; return 1; }
   cached="$(head -1 "$cache" 2>/dev/null || true)"
   now="$(smoke_proof_fingerprint "$root" "$mode" 2>/dev/null || true)"
   if [[ -z "$now" || -z "$cached" || "$now" != "$cached" ]]; then
-    printf 'self_test full 증명 무효: 현재 내용으로 full 을 통과한 기록이 없습니다\n' >&2
+    printf 'self_test %s 증명 무효: 현재 내용으로 %s 를 통과한 기록이 없습니다\n' "$label" "$label" >&2
     return 1
   fi
   return 0
@@ -644,8 +683,19 @@ smoke_cache_valid() {
 # 있어 이것이 추가 위험이 아니지만, **우회 불가가 존재 이유인 소비처**(아카이브 전 강제 등)를
 # 새로 붙일 때는 이 성질이 그 가치를 그대로 무력화한다는 점을 전제로 설계해야 합니다.
 smoke_record_full_pass() {
-  local root="$1" start_fp="$2" start_ustate="${3-}"
-  local cache="$root/rd-workflow-workspace/.lifecycle/selftest-full-cache" now tmp
+  _smoke_record_pass_at "$1" "$2" "${3-}" "$1/rd-workflow-workspace/.lifecycle/selftest-full-cache" full
+}
+
+# consumer 증명 기록 — 기록 조건은 full 과 동일하고 대상 파일만 다릅니다.
+# **full 캐시를 읽지도 쓰지도 않습니다** (spec §7). 부분 실행이 전수 통과로 위장되면
+# 아카이브 게이트가 검증되지 않은 내용을 통과로 읽습니다.
+smoke_record_consumer_pass() {
+  _smoke_record_pass_at "$1" "$2" "${3-}" "$1/rd-workflow-workspace/.lifecycle/selftest-consumer-cache" consumer
+}
+
+_smoke_record_pass_at() {
+  local root="$1" start_fp="$2" start_ustate="${3-}" cache="$4" label="$5"
+  local now tmp
   local untracked="" ustate=0
   # **시작 시점의 untracked 상태도 함께 봅니다** — 종료 시점만 보면, 실행 중에 생겼다가
   # 끝나기 전에 사라진 파일이 아무 흔적을 남기지 않습니다. 그 파일이 checker 의 입력이었다면
@@ -653,26 +703,26 @@ smoke_record_full_pass() {
   # untracked 검사 없이 그대로 소비합니다(그 생략의 근거가 바로 이 기록 조건입니다).
   # 지문 축의 `start_fp` 와 완전히 같은 모양이며, 값을 받지 못하면(빈 값) 기록하지 않습니다.
   if [[ "$start_ustate" != "0" ]]; then
-    printf '  경고: 실행 시작 시점의 untracked 상태가 0건이 아니거나 확인되지 않아 full PASS 기록을 남기지 않았습니다 (시작·종료 양쪽이 0건일 때만 증명이 성립합니다).\n' >&2
+    printf '  경고: 실행 시작 시점의 untracked 상태가 0건이 아니거나 확인되지 않아 PASS 기록을 남기지 않았습니다 (시작·종료 양쪽이 0건일 때만 증명이 성립합니다).\n' >&2
     return 1
   fi
   untracked="$(smoke_untracked_state "$root")" || ustate=$?
   if [[ "$ustate" -eq 2 ]]; then
-    printf '  경고: untracked 조회에 실패해 full PASS 기록을 남기지 않았습니다 (git 오류)\n' >&2
+    printf '  경고: untracked 조회에 실패해 %s PASS 기록을 남기지 않았습니다 (git 오류)\n' "$label" >&2
     return 1
   fi
   if [[ "$ustate" -eq 1 ]]; then
-    printf '  경고: untracked 파일이 있어 full PASS 기록을 남기지 않았습니다 — 이 파일들은 proof 에 담기지 않아 검증 상태를 증명할 수 없습니다.\n' >&2
+    printf '  경고: untracked 파일이 있어 PASS 기록을 남기지 않았습니다 — 이 파일들은 proof 에 담기지 않아 검증 상태를 증명할 수 없습니다.\n' >&2
     printf '%s\n' "$untracked" | sed 's/^/    /' >&2
-    printf '  git add 후 full 을 다시 실행하세요 (index 에 올린 상태가 곧 커밋될 상태입니다).\n' >&2
+    printf '  git add 후 %s 를 다시 실행하세요 (index 에 올린 상태가 곧 커밋될 상태입니다).\n' "$label" >&2
     return 1
   fi
   now="$(smoke_proof_fingerprint "$root" worktree)" || {
-    printf '  경고: 지문을 계산하지 못해 full PASS 기록을 남기지 못했습니다\n' >&2
+    printf '  경고: 지문을 계산하지 못해 %s PASS 기록을 남기지 못했습니다\n' "$label" >&2
     return 1
   }
   if [[ -z "$start_fp" || "$start_fp" != "$now" ]]; then
-    printf '  경고: 실행 중 인프라 파일이 바뀌어 full PASS 기록을 남기지 않았습니다 (검증하지 않은 내용을 통과로 증명할 수 없습니다)\n' >&2
+    printf '  경고: 실행 중 인프라 파일이 바뀌어 PASS 기록을 남기지 않았습니다 (검증하지 않은 내용을 통과로 증명할 수 없습니다)\n' >&2
     return 1
   fi
   mkdir -p "$(dirname "$cache")" 2>/dev/null || {
@@ -685,7 +735,7 @@ smoke_record_full_pass() {
   }
   if ! printf '%s\n' "$now" > "$tmp" || ! mv -f "$tmp" "$cache"; then
     rm -f "$tmp"
-    printf '  경고: full PASS 기록을 저장하지 못했습니다: %s\n' "$cache" >&2
+    printf '  경고: %s PASS 기록을 저장하지 못했습니다: %s\n' "$label" "$cache" >&2
     return 1
   fi
   return 0

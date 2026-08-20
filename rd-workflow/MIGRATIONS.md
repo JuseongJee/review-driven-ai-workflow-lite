@@ -15,7 +15,7 @@
 1. `<임시 clone 경로>/rd-workflow/docs/guides/sync_template.md`를 읽습니다.
 2. 이 시점 이후의 **모든 동기화 절차(0단계 시점 확인부터 완료 보고까지)를 clone된 sync_template.md를 권위 문서로** 실행합니다. 프로젝트 로컬 절차 문서와 로컬 skill의 절차 요약은 이번 동기화에서 따르지 않습니다.
 3. 로컬 절차 문서 기준으로 이미 수행한 단계(예: 파일 분류, 사용자 확인)가 있으면 clone 문서 기준으로 다시 수행합니다.
-4. 나머지 마이그레이션 항목의 실행 순서·적용 시점 규칙(M005는 M003보다 먼저, M004는 동기화 후 등)은 이 항목 이후에도 clone된 `MIGRATIONS.md` 기준으로 유지됩니다.
+4. 나머지 마이그레이션 항목의 실행 순서·적용 시점 규칙(**M005 → M008 → M003** 순, M004는 동기화 후 등)은 이 항목 이후에도 clone된 `MIGRATIONS.md` 기준으로 유지됩니다.
 
 **주의**:
 - 이 항목은 파일을 변경하지 않는 **절차 지시**입니다. 프로젝트의 sync_template.md 파일 자체는 이후 동기화 단계에서 clone 내용으로 갱신됩니다.
@@ -71,6 +71,7 @@
 **주의**:
 - 프로젝트 고유 hook·permissions 등 **기존 항목은 수정·삭제하지 않습니다.** 대조는 추가 방향으로만 동작합니다.
 - 대조 기준은 항상 clone된 템플릿 파일입니다 (full/lite 산출물 차이에 자동 정합).
+- **이 "추가 방향으로만" 규약은 "표기 차이는 앞선 항목이 먼저 정규화한다" 는 전제 위에 있습니다.** 동일성 판정이 command 문자열 **정확 일치**이므로, 같은 스크립트를 가리키는 표기가 프로젝트와 템플릿에서 다르면 이 항목은 그것을 "부재" 로 읽어 **같은 hook 을 이중 등록**합니다. 그래서 표기 정규화는 **M008 이 M003 보다 먼저** 처리합니다. 앞으로 hook command 표기를 바꿀 때는 M003 을 고치는 대신 **정규화 항목을 하나 추가**하십시오 — 그러지 않으면 같은 사고가 반복됩니다 (실제 발생: 2026-08-21, 구 상대경로 표기 프로젝트에서 hook 4건이 8건으로).
 
 ## M004: task-state 마이그레이션 트리거
 
@@ -202,12 +203,12 @@
 
 **새로 강제되는 것** — 이것은 "제거" 만 하는 마이그레이션이 아닙니다:
 
-- `lifecycle/archive.sh` 의 **`archive_selftest_gate` 는 이번 버전이 신설**했습니다(이전 템플릿에 없습니다). 아카이브할 때마다 **`self_test.sh full` 통과가 강제**됩니다.
-- 통과 증명이 없거나 낡았으면 게이트가 **그 자리에서 전수 검증을 실행합니다**(이 저장소 실측 약 6분, 프로젝트 규모에 따라 다릅니다). 막고 끝내지 않고 돌려 주므로 같은 명령을 두 번 칠 필요는 없습니다.
+- `lifecycle/archive.sh` 의 **`archive_selftest_gate` 는 이번 버전이 신설**했습니다(이전 템플릿에 없습니다). 아카이브할 때마다 **`self_test.sh consumer` 통과가 강제**됩니다 — `consumer` 는 소비 프로젝트에서 뜻이 있는 스텝만 도는 청중 필터이고, rd-workflow 정본 저작 규칙(`dev-only`)은 강제 대상이 아닙니다. **유효한 `full` 증명이 있으면 그것으로도 충족**됩니다(상위 집합). 즉 게이트가 요구하는 것은 실행 모드 이름이 아니라 `consumer` 청중 전량이 통과했다는 검증 범위입니다.
+- 통과 증명이 없거나 낡았으면 게이트가 **그 자리에서 검증을 실행합니다**(프로젝트 규모에 따라 다릅니다). 막고 끝내지 않고 돌려 주므로 같은 명령을 두 번 칠 필요는 없습니다. 실행 예정 스텝 수와 청중 제외 내역은 시작 배너에 표시됩니다.
 - **우회 밸브가 없습니다.** 커밋 전 게이트에 있던 `RD_SELFTEST_FULL_BYPASS_REASON` 류의 탈출구는 여기에 두지 않았습니다 — 그 우회가 상시 사용돼 커밋 게이트를 형해화시킨 것이 제거의 직접 원인이기 때문입니다.
-- **커밋되지 않은 변경이나 untracked 파일이 있으면 전수 검증을 돌리지도 않고 막습니다.** 증명 대상(워킹트리)과 발행 대상(HEAD)이 달라 검증이 성립하지 않기 때문입니다. `archive.sh --force-dirty` 는 clean 검사만 넘길 뿐 이 게이트는 넘지 못합니다.
-- **실패 지점이 merge 이후·tag/push 이전**입니다. 즉 전수 검증이 실패하면 merge 는 이미 반영된 채로 중단되고, 원인을 고친 뒤 `archive.sh` 를 다시 실행하면 그 지점부터 이어집니다.
-- **동기화 직후 첫 아카이브 전에 `bash rd-workflow/scripts/self_test.sh full` 을 한 번 돌려 보십시오.** 여기서 실패하는 프로젝트는 아카이브를 완료할 수 없습니다. 실패가 나오면 아카이브를 시도하기 전에 원인을 해소하는 편이 쌉니다(merge 이후에 발견하는 것보다 되돌리기 쉽습니다).
+- **커밋되지 않은 변경이나 untracked 파일이 있으면 검증을 돌리지도 않고 막습니다.** 증명 대상(워킹트리)과 발행 대상(HEAD)이 달라 검증이 성립하지 않기 때문입니다. `archive.sh --force-dirty` 는 clean 검사만 넘길 뿐 이 게이트는 넘지 못합니다.
+- **실패 지점이 merge 이후·tag/push 이전**입니다. 즉 검증이 실패하면 merge 는 이미 반영된 채로 중단되고, 원인을 고친 뒤 `archive.sh` 를 다시 실행하면 그 지점부터 이어집니다.
+- **동기화 직후 첫 아카이브 전에 `bash rd-workflow/scripts/self_test.sh consumer` 를 한 번 돌려 보십시오.** 여기서 실패하는 프로젝트는 아카이브를 완료할 수 없습니다. (`full` 은 정본 위생 검사까지 포함하므로 소비 프로젝트에서는 아카이브 조건이 아닙니다 — 참고용으로만 씁니다.) 실패가 나오면 아카이브를 시도하기 전에 원인을 해소하는 편이 쌉니다(merge 이후에 발견하는 것보다 되돌리기 쉽습니다).
 
 **실행 절차**:
 1. `.claude/settings.json` 의 stale hook 등록 제거는 **M005 가 그대로 처리합니다.** 제거된 5개 스크립트는 clone 에 존재하지 않고 템플릿 `.claude/settings.json` 에도 등록이 없으므로 M005 의 3중 조건에 걸립니다. M007 을 위해 따로 스니펫을 돌릴 필요가 없습니다.
@@ -220,3 +221,124 @@
 **주의**:
 - **`RD_LIFECYCLE_BYPASS_REASON=<reason>` 접두는 lifecycle 스크립트에 그대로 남아 있습니다.** 읽는 hook 이 사라져 템플릿 안에서는 무의미하지만, 아직 동기화하지 않은 다른 프로젝트·worktree 에 hook 사본이 남아 있을 수 있어 제거하지 않았습니다.
 - 단계 게이트가 사라졌으므로 "리뷰 대기 중에는 구현 파일을 못 고친다" 는 **더 이상 기계가 강제하지 않습니다.** `CLAUDE.md` 의 Review 규칙을 사람과 AI 가 지킵니다.
+
+## M008: hook command 경로 표기 정규화 (`.claude/settings.json`)
+
+**조건**: 프로젝트 `.claude/settings.json` 의 `hooks` 아래 어느 `command` 든 접두가 정확히 `bash rd-workflow/scripts/hooks/` 인 항목이 하나 이상 있을 때.
+
+**실행 순서**: **M005 → M008 → M003** 입니다. M005(제거) 다음, **M003 보다 먼저** 실행합니다 — "정규화 후 대조" 순서입니다.
+
+**왜 필요한가**: hook command 표기가 `bash rd-workflow/scripts/hooks/X` 에서 `bash "${CLAUDE_PROJECT_DIR:-.}"/rd-workflow/scripts/hooks/X` 로 바뀌었습니다. 구 표기는 **cwd 의존**이라 프로젝트 루트가 아닌 곳에서 hook 이 조용히 실패합니다. 그리고 M003 의 동일성 판정이 command 문자열 **정확 일치**이므로, 정규화 없이 M003 을 돌리면 같은 스크립트를 가리키는 템플릿 항목을 "부재" 로 읽어 **같은 hook 을 이중 등록**합니다 (실측: hook 4건 → 8건).
+
+**계약**:
+- **대상**: `hooks` 아래 모든 event/group 의 `command` 중 접두가 정확히 `bash rd-workflow/scripts/hooks/` 인 것만. **`command` 가 없거나 문자열이 아닌 item**(프로젝트 고유 prompt·agent 형태 등)은 정규화도 중복 판정도 하지 않고 내용·순서를 그대로 보존합니다.
+- **치환**: `bash rd-workflow/scripts/hooks/X` → `bash "${CLAUDE_PROJECT_DIR:-.}"/rd-workflow/scripts/hooks/X`
+- **보존**: 그 밖의 command(프로젝트 고유 hook), event 순서, group 순서, `matcher`·`timeout` 등 다른 필드는 그대로 둡니다.
+- **접기(first-wins)**: 정규화 후 **같은 group 안에서** command 가 같은 항목이 둘 이상이면 **등장 순서상 처음 항목 전체를 남기고 나머지 항목을 버립니다.** 부가 필드가 서로 다르면 살아남은 항목의 필드가 결과이며, 버려진 항목의 필드는 유지되지 않습니다 ("다른 필드 보존" 은 접히지 않은 항목에 적용되는 규칙입니다).
+- **group 경계**: 같은 matcher 를 가진 group 이 여럿이면 **각 group 을 독립으로 처리**하고 group 을 합치지 않습니다. group 을 합치면 matcher 그룹핑 의미가 바뀌고 무관한 hook 순서가 흐트러지기 때문입니다. 다른 event·다른 matcher 는 접지 않습니다. 여러 group 에 같은 command 가 걸쳐 있으면 접지 않고 **알림만** 냅니다.
+- **멱등**: 신 표기만 있는 입력에 다시 실행하면 무변경이며 **파일을 재작성하지 않습니다**(mtime 도 그대로).
+- **안전**: parse 또는 schema 오류는 **원본 byte 를 바꾸지 않고 실패**합니다. 변경이 있을 때만 같은 디렉터리 임시 파일에 쓴 뒤 `os.replace` 로 **원자 교체**합니다.
+
+**실행 절차**:
+1. 선행 검증: 프로젝트에 `.claude/settings.json` 이 없으면 M008 은 해당 없음입니다.
+2. 아래 스니펫을 프로젝트 루트에서 실행합니다.
+   ```bash
+   python3 - <<'PY'
+   import json, os, sys, tempfile
+
+   OLD = "bash rd-workflow/scripts/hooks/"
+   NEW = 'bash "${CLAUDE_PROJECT_DIR:-.}"/rd-workflow/scripts/hooks/'
+   path = ".claude/settings.json"
+
+   if not os.path.exists(path):
+       print("M008: .claude/settings.json 없음 — 해당 없음"); sys.exit(0)
+
+   with open(path, "rb") as f:
+       original = f.read()
+   try:
+       cfg = json.loads(original.decode("utf-8"))
+   except Exception as e:
+       print("M008 실패: JSON parse 오류 — 원본을 바꾸지 않았습니다: %s" % e, file=sys.stderr)
+       sys.exit(1)
+
+   # schema 검증을 먼저 통과시킨 뒤에만 손댑니다 (write-before-validate 방지).
+   if not isinstance(cfg, dict):
+       print("M008 실패: 최상위가 객체가 아닙니다 — 원본을 바꾸지 않았습니다", file=sys.stderr); sys.exit(1)
+   hooks = cfg.get("hooks")
+   if hooks is None:
+       print("M008: hooks 키 없음 — 무변경"); sys.exit(0)
+   if not isinstance(hooks, dict):
+       print("M008 실패: hooks 가 객체가 아닙니다 — 원본을 바꾸지 않았습니다", file=sys.stderr); sys.exit(1)
+   for ev, groups in hooks.items():
+       if not isinstance(groups, list):
+           print("M008 실패: hooks[%s] 가 배열이 아닙니다 — 원본을 바꾸지 않았습니다" % ev, file=sys.stderr); sys.exit(1)
+       for g in groups:
+           if not isinstance(g, dict) or not isinstance(g.get("hooks", []), list):
+               print("M008 실패: hooks[%s] 의 group 구조가 예상과 다릅니다 — 원본을 바꾸지 않았습니다" % ev, file=sys.stderr); sys.exit(1)
+           for it in g.get("hooks", []):
+               if not isinstance(it, dict):
+                   print("M008 실패: hooks[%s] 의 item 이 객체가 아닙니다 — 원본을 바꾸지 않았습니다" % ev, file=sys.stderr); sys.exit(1)
+
+   normalized = folded = 0
+   seen_across = {}
+   for ev, groups in hooks.items():
+       for g in groups:
+           items = g.get("hooks", [])
+           kept, seen = [], set()
+           for it in items:
+               cmd = it.get("command")
+               if isinstance(cmd, str) and cmd.startswith(OLD):
+                   it["command"] = NEW + cmd[len(OLD):]
+                   normalized += 1
+                   cmd = it["command"]
+               # **command 가 문자열이 아닌 item 은 중복 판정 대상이 아닙니다.**
+               # `command` 키가 없는 프로젝트 고유 item(예: prompt·agent 형태)은 모두
+               # key=null 로 접혀 같은 group 의 두 번째부터 조용히 삭제됩니다 — 사용자
+               # hook 이 사라지는 데이터 손실입니다. 내용·순서를 그대로 보존합니다.
+               if not isinstance(cmd, str):
+                   kept.append(it)
+                   continue
+               key = json.dumps(cmd, ensure_ascii=False)
+               if key in seen:      # first-wins: 처음 항목 전체를 남기고 나머지를 버립니다
+                   folded += 1
+                   continue
+               seen.add(key)
+               # **알림 키에 matcher 를 포함합니다.** matcher 가 다른 group 에 같은 command 가
+               # 있는 것은 정상 구성입니다(예: Edit·Write 둘 다 implementation_gate.sh).
+               # matcher 를 빼면 그 정상 구성마다 경고가 나와 진짜 신호를 덮습니다.
+               mk = (ev, json.dumps(g.get("matcher"), ensure_ascii=False), key)
+               seen_across[mk] = seen_across.get(mk, 0) + 1
+               kept.append(it)
+           if "hooks" in g:
+               g["hooks"] = kept
+
+   for (ev, matcher, key), n in seen_across.items():
+       if n > 1:
+           print("M008 알림: event %s / matcher %s 에서 같은 command 가 %d 개 group 에 걸쳐 있습니다 (group 경계는 합치지 않습니다): %s" % (ev, matcher, n, key))
+
+   if normalized == 0 and folded == 0:
+       print("M008: 변경 없음 (이미 정규화됨) — 파일을 재작성하지 않았습니다"); sys.exit(0)
+
+   rendered = (json.dumps(cfg, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+   # 임시 파일 생성까지 try 안에 둡니다 — 디렉터리 쓰기 권한이 없는 경우가 실제로 있고,
+   # 밖에 두면 그 실패가 traceback 으로 터져 "원본은 유지된다" 는 보장이 사용자에게 보이지 않습니다.
+   d = os.path.dirname(os.path.abspath(path)) or "."
+   tmp = None
+   try:
+       fd, tmp = tempfile.mkstemp(dir=d, prefix=".settings.json.m008.")
+       with os.fdopen(fd, "wb") as f:
+           f.write(rendered)
+       os.replace(tmp, path)          # 원자 교체
+   except Exception as e:
+       if tmp is not None:
+           try: os.unlink(tmp)
+           except OSError: pass
+       print("M008 실패: 교체 중 오류 — 원본이 유지됩니다: %s" % e, file=sys.stderr)
+       sys.exit(1)
+   print("M008: 표기 정규화 %d건, 중복 접기 %d건" % (normalized, folded))
+   PY
+   ```
+3. 사후 JSON 유효성 검증: `python3 -m json.tool .claude/settings.json > /dev/null`
+4. M008 이 끝난 뒤 M003 을 실행합니다. 이 순서를 지키면 M003 의 정확 일치 대조가 정상 동작합니다.
+
+**주의**: 이 항목이 만든 변경은 자동 커밋하지 않고 다음 정규 커밋에 편승시킵니다 (M004 와 같은 계약).

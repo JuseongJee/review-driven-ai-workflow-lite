@@ -909,7 +909,7 @@ ast_mv() {  # $1 = 원본, $2 = 대상
 }
 
 # 격리 fixture: 최소 인프라 트리 + 전수 검증 대역(stub).
-# 실제 전수 검증은 이 저장소에서 13분이 걸려 회귀로 쓸 수 없습니다. 대역을 두면
+# 실제 검증은 분 단위로 걸려 회귀로 쓸 수 없습니다. 대역을 두면
 # "정말 실행되는가 / 어떤 인자·환경으로 떨어지는가 / 그 rc 가 판정에 반영되는가" 를
 # 초 단위로 관측할 수 있고, 그것이 이 Task 에서 고정해야 할 성질 전부입니다.
 ast_make_fx() {  # stdout: fixture root
@@ -944,6 +944,12 @@ _ast_record() {
   . "$_r/rd-workflow/scripts/_smoke_common.sh"
   _fp="$(smoke_proof_fingerprint "$_r" worktree)" || exit 1
   _us=0; smoke_untracked_state "$_r" >/dev/null 2>&1 || _us=$?
+  # 실제 `consumer` 실행을 흉내내는 변형입니다 — 게이트가 consumer 증명으로 사후 대조를
+  # 통과하는지(= 부분 실행이 자기 증명을 무효화하지 않는지) 실측하는 데 씁니다.
+  if [[ -n "${AST_STUB_RECORD_CONSUMER:-}" ]]; then
+    smoke_record_consumer_pass "$_r" "$_fp" "$_us" 2>/dev/null || true
+    return 0
+  fi
   smoke_record_full_pass "$_r" "$_fp" "$_us" 2>/dev/null || true
 }
 if [[ -n "${AST_STUB_RECORD_THEN_FAIL:-}" ]]; then _ast_record; exit 1; fi
@@ -1024,7 +1030,7 @@ else FAIL=$((FAIL+1)); echo "  FAIL: gate — 유효 증명인데 전수 검증�
 rm -f "$AST_CACHE"; ast_reset_marks
 ( archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
 assert_eq "$rc" "0" "gate — 증명 없음 → 전수 검증 실행 후 통과"
-assert_eq "$(cat "$AST_MK/invoked" 2>/dev/null || true)" "mode=full" "gate — 전수 검증을 full 인자로 1회 실행"
+assert_eq "$(cat "$AST_MK/invoked" 2>/dev/null || true)" "mode=consumer" "gate — 검증을 consumer 인자로 1회 실행 (정본 위생 검사는 강제 대상이 아님)"
 if [[ -s "$AST_CACHE" ]]; then PASS=$((PASS+1)); echo "  PASS: gate — 실행 결과가 증명으로 기록됨";
 else FAIL=$((FAIL+1)); echo "  FAIL: gate — 통과했는데 증명이 기록되지 않았다" >&2; fi
 
@@ -1067,10 +1073,16 @@ assert_eq "$ast_err" "" "gate — 정상 진행 경로는 stderr 무출력"
 rm -f "$AST_CACHE"; ast_reset_marks
 # 기대 사유는 판정 함수에서 직접 받아옵니다 — 문구를 테스트에 복사하면 판정이 바뀌어도
 # 테스트만 통과하는 상태가 생깁니다.
-ast_why="$(smoke_cache_valid "$AST_FX" worktree 2>&1 >/dev/null | head -1)" || true
+# **게이트가 실제로 쓰는 경계**에서 받아옵니다. 게이트는 `archive-gate 판정`(full 또는
+# consumer)을 쓰므로 `full-only 판정` 으로 사유를 뽑으면 문구가 달라 이 단언이 거짓 실패합니다.
+if declare -F smoke_archive_gate_valid >/dev/null 2>&1; then
+  ast_why="$(smoke_archive_gate_valid "$AST_FX" worktree 2>&1 >/dev/null | head -1)" || true
+else
+  ast_why="$(smoke_cache_valid "$AST_FX" worktree 2>&1 >/dev/null | head -1)" || true
+fi
 ast_out="$( ( archive_selftest_gate "$AST_FX" ) 2>/dev/null )" && rc=0 || rc=1
-if printf '%s' "$ast_out" | grep -qF '지금 실행합니다'; then PASS=$((PASS+1)); echo "  PASS: gate — 소요 시간 안내를 stdout 으로 표시 (13분 무반응 방지)";
-else FAIL=$((FAIL+1)); echo "  FAIL: gate — 실행 안내가 stdout 에 없음 (13분 무반응)" >&2; fi
+if printf '%s' "$ast_out" | grep -qF '지금 실행합니다'; then PASS=$((PASS+1)); echo "  PASS: gate — 실행 안내를 stdout 으로 표시 (장시간 무반응 방지)";
+else FAIL=$((FAIL+1)); echo "  FAIL: gate — 실행 안내가 stdout 에 없음 (장시간 무반응)" >&2; fi
 if [[ -n "$ast_why" ]] && printf '%s' "$ast_out" | grep -qF -- "$ast_why"; then
   PASS=$((PASS+1)); echo "  PASS: gate — 왜 지금 도는지 사유를 stdout 에 함께 표시"
 else
@@ -1106,8 +1118,109 @@ rm -f "$AST_CACHE"; ast_reset_marks
 ( export RD_LIFECYCLE_BYPASS_REASON=lifecycle RD_SELFTEST_FULL_BYPASS_REASON="사유"
   archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
 assert_eq "$rc" "0" "gate — 우회 사유가 있어도 정상 경로는 그대로 통과 (오탐 없음)"
-assert_eq "$(cat "$AST_MK/invoked" 2>/dev/null || true)" "mode=full" \
-  "gate — 우회 사유가 있어도 전수 검증을 건너뛰지 않는다"
+assert_eq "$(cat "$AST_MK/invoked" 2>/dev/null || true)" "mode=consumer" \
+  "gate — 우회 사유가 있어도 검증을 건너뛰지 않는다"
+
+# --- 헬퍼 오류 경로의 범위 표시 (final diff review Turn 004 Finding 1) -------
+# 헬퍼 부재·구문 오류는 **복구가 필요한 경로**입니다. 여기서 "전수 검증" 이라고 말하면
+# 사용자는 dev-only 까지 강제되는 것으로 오인하고 엉뚱한 명령을 돌립니다. 기존 회귀는
+# stderr 를 버리고 rc 만 봐서 이 오표시를 잡지 못했습니다.
+_ast_helper="$AST_FX/rd-workflow/scripts/_smoke_common.sh"
+ast_mv "$_ast_helper" "${_ast_helper}.hidden"
+_ast_out="$( ( archive_selftest_gate "$AST_FX" ) 2>&1 )" && rc=0 || rc=1
+assert_eq "$rc" "1" "gate — 증명 헬퍼 부재 → 차단"
+if printf '%s' "$_ast_out" | grep -qF '전수 검증'; then
+  FAIL=$((FAIL+1)); echo "  FAIL: gate — 헬퍼 부재 오류가 '전수 검증' 이라고 표시합니다 (강제 범위는 consumer)" >&2
+else PASS=$((PASS+1)); echo "  PASS: gate — 헬퍼 부재 오류에 '전수 검증' 오표시 없음"; fi
+if printf '%s' "$_ast_out" | grep -qF '증명 헬퍼가 없습니다'; then
+  PASS=$((PASS+1)); echo "  PASS: gate — 헬퍼 부재 사유를 표시 (단언이 공허하지 않음)"
+else FAIL=$((FAIL+1)); echo "  FAIL: gate — 헬퍼 부재 사유가 표시되지 않아 위 단언이 공허합니다" >&2; fi
+ast_mv "${_ast_helper}.hidden" "$_ast_helper"
+
+# 구문 오류 변형 — 같은 경로의 다른 분기입니다.
+cp "$_ast_helper" "${_ast_helper}.bak"
+printf 'if then fi(\n' >> "$_ast_helper"
+_ast_out="$( ( archive_selftest_gate "$AST_FX" ) 2>&1 )" && rc=0 || rc=1
+assert_eq "$rc" "1" "gate — 증명 헬퍼 구문 오류 → 차단"
+if printf '%s' "$_ast_out" | grep -qF '전수 검증'; then
+  FAIL=$((FAIL+1)); echo "  FAIL: gate — 헬퍼 구문 오류가 '전수 검증' 이라고 표시합니다" >&2
+else PASS=$((PASS+1)); echo "  PASS: gate — 헬퍼 구문 오류에 '전수 검증' 오표시 없음"; fi
+ast_mv "${_ast_helper}.bak" "$_ast_helper"
+
+# --- 증명 판정 경계 행렬 (AC 6) ----------------------------------------------
+# 청중별 증명을 파일로 나눴으므로 **두 판정 경계**가 서로를 오인하지 않아야 합니다.
+#   full-only 판정   = smoke_cache_valid          — full 증명만 인정 (전수 요구 지점 전용)
+#   archive-gate 판정 = smoke_archive_gate_valid  — full 또는 consumer 인정
+#
+# 파일을 나눈 것만으로는 미래의 reader 를 보장하지 못하므로 **경계 자체를 관측**합니다.
+AST_CONC="$AST_FX/rd-workflow-workspace/.lifecycle/selftest-consumer-cache"
+
+ast_matrix() { # ast_matrix <라벨> <full-only 기대rc> <archive-gate 기대rc>
+  local label="$1" want_full="$2" want_gate="$3" rc
+  smoke_cache_valid "$AST_FX" worktree >/dev/null 2>&1 && rc=0 || rc=1
+  assert_eq "$rc" "$want_full" "proof 행렬 — ${label}: full-only 판정"
+  smoke_archive_gate_valid "$AST_FX" worktree >/dev/null 2>&1 && rc=0 || rc=1
+  assert_eq "$rc" "$want_gate" "proof 행렬 — ${label}: archive-gate 판정"
+}
+
+rm -f "$AST_CACHE" "$AST_CONC"
+ast_matrix "둘 다 없음" 1 1
+
+ast_fp "$AST_CONC"
+ast_matrix "consumer 증명만 유효" 1 0
+
+ast_fp "$AST_CACHE"
+ast_matrix "둘 다 유효" 0 0
+
+rm -f "$AST_CONC"
+ast_matrix "full 증명만 유효" 0 0
+
+# 지문 불일치는 양쪽 모두 무효입니다 (무효화 규칙은 기존 지문 방식 그대로).
+printf 'bogus
+' > "$AST_CACHE"; printf 'bogus
+' > "$AST_CONC"
+ast_matrix "지문 불일치" 1 1
+rm -f "$AST_CACHE" "$AST_CONC"
+
+# **Blocker 회귀**: consumer 캐시가 proof 제외 목록에 없으면, 방금 기록한 증명이 다음
+# 판정에서 untracked 로 잡혀 **자기 자신을 무효화**합니다. 그러면 게이트가 영구히 실패합니다.
+ast_fp "$AST_CONC"
+_ast_us=0; smoke_untracked_state "$AST_FX" >/dev/null 2>&1 || _ast_us=$?
+assert_eq "$_ast_us" "0" "proof 제외 — consumer 캐시가 untracked 판정에 잡히지 않음"
+smoke_archive_gate_valid "$AST_FX" worktree >/dev/null 2>&1 && _ast_rc=0 || _ast_rc=1
+assert_eq "$_ast_rc" "0" "proof 제외 — consumer 증명이 스스로를 무효화하지 않음"
+# 중단으로 남은 원자 기록 임시 파일도 같은 취급이어야 합니다.
+printf 'partial
+' > "${AST_CONC}.tmp123"
+_ast_us=0; smoke_untracked_state "$AST_FX" >/dev/null 2>&1 || _ast_us=$?
+assert_eq "$_ast_us" "0" "proof 제외 — consumer 캐시 임시 파일도 판정을 바꾸지 않음"
+rm -f "${AST_CONC}.tmp123"
+# 반대 방향 — `.lifecycle` **밖**의 비슷한 이름은 계속 차단돼야 합니다. 제외 패턴을
+# 넓게 잡으면 정작 막아야 할 신규 파일이 조용히 통과합니다.
+printf 'x
+' > "$AST_FX/selftest-consumer-cache"
+_ast_us=0; smoke_untracked_state "$AST_FX" >/dev/null 2>&1 || _ast_us=$?
+assert_eq "$_ast_us" "1" "proof 제외 — .lifecycle 밖 동명 파일은 계속 차단"
+rm -f "$AST_FX/selftest-consumer-cache"
+
+# 게이트 사후 대조 — 실제 `consumer` 실행이 남기는 증명으로 통과해야 합니다.
+# 이것이 성립하지 않으면 게이트는 "돌렸는데 증명이 없다" 며 영구히 막습니다.
+rm -f "$AST_CACHE" "$AST_CONC"; ast_reset_marks
+( export AST_STUB_RECORD_CONSUMER=1; archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "0" "gate — consumer 증명만 남겨도 사후 대조를 통과"
+assert_eq "$(cat "$AST_MK/invoked" 2>/dev/null || true)" "mode=consumer" "gate — 그 경로에서도 consumer 인자로 실행"
+if [[ -s "$AST_CONC" ]]; then PASS=$((PASS+1)); echo "  PASS: gate — consumer 증명이 실제로 기록됨 (단언이 공허하지 않음)";
+else FAIL=$((FAIL+1)); echo "  FAIL: gate — consumer 증명이 기록되지 않아 위 단언이 공허합니다" >&2; fi
+if [[ -e "$AST_CACHE" ]]; then FAIL=$((FAIL+1)); echo "  FAIL: gate — consumer 실행이 full 증명 파일을 만들었습니다 (부분 실행이 전수 통과로 위장)" >&2;
+else PASS=$((PASS+1)); echo "  PASS: gate — consumer 실행이 full 증명 파일을 건드리지 않음"; fi
+
+# 유효한 consumer 증명이 있으면 게이트는 **돌리지 않고** 통과합니다 (빠른 경로).
+ast_reset_marks
+( archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "0" "gate — 유효한 consumer 증명으로 통과"
+if [[ ! -f "$AST_MK/invoked" ]]; then PASS=$((PASS+1)); echo "  PASS: gate — 유효한 consumer 증명이 있으면 검증을 다시 돌리지 않음";
+else FAIL=$((FAIL+1)); echo "  FAIL: gate — 유효한 증명이 있는데 검증을 다시 실행했습니다" >&2; fi
+rm -f "$AST_CACHE" "$AST_CONC"
 
 # 게이트가 증명하는 것은 **워킹트리**이고 tag·push 로 발행되는 것은 **HEAD** 입니다.
 # 둘이 갈라진 채 통과하면 "검증됐다" 는 말과 실제 발행물이 다릅니다 — untracked 축만
@@ -1188,7 +1301,7 @@ _ast_tag_ln="$(grep -n '^# Step 5 — Tag' "$AST_ARCHIVE_SH" | head -1 | cut -d:
 if [[ -n "$_ast_gate_ln" && -n "$_ast_dry_ln" && "$_ast_gate_ln" -gt "$_ast_dry_ln" ]]; then
   PASS=$((PASS+1)); echo "  PASS: 게이트($_ast_gate_ln)가 dry-run exit($_ast_dry_ln) 뒤 — dry-run 비파괴"
 else
-  FAIL=$((FAIL+1)); echo "  FAIL: 게이트($_ast_gate_ln)가 dry-run($_ast_dry_ln) 앞 — dry-run 이 13분을 소비" >&2; fi
+  FAIL=$((FAIL+1)); echo "  FAIL: 게이트($_ast_gate_ln)가 dry-run($_ast_dry_ln) 앞 — dry-run 이 검증 시간을 소비" >&2; fi
 if [[ -n "$_ast_gate_ln" && -n "$_ast_merge_ln" && "$_ast_gate_ln" -gt "$_ast_merge_ln" ]]; then
   PASS=$((PASS+1)); echo "  PASS: 게이트($_ast_gate_ln)가 merge($_ast_merge_ln) 뒤 — 아카이브될 내용으로 대조"
 else

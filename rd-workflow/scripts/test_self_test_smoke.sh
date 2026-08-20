@@ -183,7 +183,7 @@ git -C "$FX" checkout -- . >/dev/null 2>&1
 #
 # 스텝 판정은 **호출 순번**을 키로 씁니다. 그래서 추출이 실제 호출과 한 건이라도
 # 어긋나면 순번이 밀려 **관련 있는 스텝이 무관한 스텝의 판정을 물려받습니다** — 거짓
-# 통과의 직행 경로입니다. `run_step "설명" ...` 형식을 벗어난 호출(설명을 변수로 넘기는
+# 통과의 직행 경로입니다. `run_step consumer "설명" ...` 형식을 벗어난 호출(설명을 변수로 넘기는
 # 등)이 그 상황을 만들므로, 그런 줄을 하나 심어 폴백이 실제로 걸리는지 봅니다.
 #
 # 어긋난 self_test.sh 를 **커밋해** 워킹트리 변경에서 빼는 것이 요점입니다. 그러지 않으면
@@ -266,8 +266,8 @@ printf '#!/usr/bin/env bash\necho unrelated\n' > "$FX/rd-workflow/scripts/dup_un
 dup_at="$(grep -n '^run_step ' "$fx_self" | head -1 | cut -d: -f1)"
 {
   head -n "$dup_at" "$fx_self"
-  printf 'run_step "중복 설명 스텝" bash "${SCRIPT_DIR}/dup_related_zzfx.sh"\n'
-  printf 'run_step "중복 설명 스텝" bash "${SCRIPT_DIR}/dup_unrelated_zzfx.sh"\n'
+  printf 'run_step consumer "중복 설명 스텝" bash "${SCRIPT_DIR}/dup_related_zzfx.sh"\n'
+  printf 'run_step consumer "중복 설명 스텝" bash "${SCRIPT_DIR}/dup_unrelated_zzfx.sh"\n'
   tail -n "+$((dup_at + 1))" "$fx_self"
 } > "$TMP/self_test_dup_zzfx.sh"
 mv "$TMP/self_test_dup_zzfx.sh" "$fx_self"
@@ -339,9 +339,9 @@ mini_at="$(grep -n '^run_step ' "$fx_self" | head -1 | cut -d: -f1)"
 {
   head -n "$((mini_at - 1))" "$fx_self"
   printf 'mini_inline_zzfx() { echo "zzfx-inline-ran"; }\n'
-  printf 'run_step "미니 A" bash "${SCRIPT_DIR}/mini_a_zzfx.sh"\n'
-  printf 'run_step "미니 B" bash "${SCRIPT_DIR}/mini_b_zzfx.sh"\n'
-  printf 'run_step "미니 인라인" mini_inline_zzfx\n'
+  printf 'run_step consumer "미니 A" bash "${SCRIPT_DIR}/mini_a_zzfx.sh"\n'
+  printf 'run_step consumer "미니 B" bash "${SCRIPT_DIR}/mini_b_zzfx.sh"\n'
+  printf 'run_step consumer "미니 인라인" mini_inline_zzfx\n'
   # 남은 본문에서 최상위 run_step 줄만 걷어냅니다 — 스킵 요약·스텝 요약·최종 판정은
   # 그대로 남아야 이 케이스가 정본의 출력 계약을 검사할 수 있습니다.
   tail -n "+$mini_at" "$fx_self" | sed '/^run_step /d'
@@ -472,7 +472,7 @@ rm -f "$mini_cache"
 # 이 경고는 **스킵 기록 누락(R2)을 런타임에 자기 신고**하게 만드는 이중 효과가 있으므로,
 # 조건 반전·stdout 오염·rc 변경 세 방향을 모두 못박습니다.
 printf '#!/usr/bin/env bash\necho "zzfx-ghost-ran"\n' > "$FX/rd-workflow/scripts/mini_ghost_zzfx.sh"
-printf 'run_step "미니 유령" bash "${SCRIPT_DIR}/mini_ghost_zzfx.sh"\n' >> "$fx_self"
+printf 'run_step consumer "미니 유령" bash "${SCRIPT_DIR}/mini_ghost_zzfx.sh"\n' >> "$fx_self"
 git -C "$FX" add -A >/dev/null 2>&1
 git -C "$FX" commit -qm ghost >/dev/null 2>&1
 printf '\n# 변경 2\n' >> "$FX/rd-workflow/scripts/mini_a_zzfx.sh"
@@ -553,8 +553,8 @@ printf '#!/usr/bin/env bash\nif true; then\n  echo dangling batch\n' \
 syn_at="$(grep -n '^run_step ' "$fx_self" | head -1 | cut -d: -f1)"
 {
   head -n "$((syn_at - 1))" "$fx_self"
-  printf 'run_step "미니 구문 A" bash "${SCRIPT_DIR}/syn_a_zzfx.sh"\n'
-  printf 'run_step "스크립트 구문 검사 (bash -n)" syntax_check\n'
+  printf 'run_step consumer "미니 구문 A" bash "${SCRIPT_DIR}/syn_a_zzfx.sh"\n'
+  printf 'run_step consumer "스크립트 구문 검사 (bash -n)" syntax_check\n'
   tail -n "+$syn_at" "$fx_self" | sed '/^run_step /d'
 } > "$TMP/syn_self_test_zzfx.sh"
 mv "$TMP/syn_self_test_zzfx.sh" "$fx_self"
@@ -670,11 +670,11 @@ nest_at="$(grep -n '^run_step ' "$fx_self" | head -1 | cut -d: -f1)"
   head -n "$((nest_at - 1))" "$fx_self"
   # 들여쓰기된 호출이라 정적 추출에 잡히지 않습니다 — 이것이 이 케이스의 전제입니다.
   printf 'nest_hidden_zzfx() {\n'
-  printf '  run_step "미니 X" bash "${SCRIPT_DIR}/nest_x_zzfx.sh"\n'
+  printf '  run_step consumer "미니 X" bash "${SCRIPT_DIR}/nest_x_zzfx.sh"\n'
   printf '}\n'
-  printf 'run_step "미니 A" bash "${SCRIPT_DIR}/nest_a_zzfx.sh"\n'
+  printf 'run_step consumer "미니 A" bash "${SCRIPT_DIR}/nest_a_zzfx.sh"\n'
   printf 'nest_hidden_zzfx\n'
-  printf 'run_step "미니 B" bash "${SCRIPT_DIR}/nest_b_zzfx.sh"\n'
+  printf 'run_step consumer "미니 B" bash "${SCRIPT_DIR}/nest_b_zzfx.sh"\n'
   tail -n "+$nest_at" "$fx_self" | sed '/^run_step /d'
 } > "$TMP/nest_self_test_zzfx.sh"
 mv "$TMP/nest_self_test_zzfx.sh" "$fx_self"
@@ -760,8 +760,8 @@ printf '#!/usr/bin/env bash\necho "zzfx-ob-ran"\n' > "$FX/rd-workflow/scripts/ov
 ov_at="$(grep -n '^run_step ' "$fx_self" | head -1 | cut -d: -f1)"
 {
   head -n "$((ov_at - 1))" "$fx_self"
-  printf 'run_step "미니 A" bash "${SCRIPT_DIR}/ov_a_zzfx.sh"\n'
-  printf 'run_step "미니 B" bash "${SCRIPT_DIR}/ov_b_zzfx.sh"\n'
+  printf 'run_step consumer "미니 A" bash "${SCRIPT_DIR}/ov_a_zzfx.sh"\n'
+  printf 'run_step consumer "미니 B" bash "${SCRIPT_DIR}/ov_b_zzfx.sh"\n'
   printf 'if [[ -n "${ZZFX_EXTRA_SKIP:-}" ]]; then SKIPPED_STEPS+=("$ZZFX_EXTRA_SKIP"); fi\n'
   printf 'if [[ -n "${ZZFX_SWAP_SKIP:-}" ]]; then SKIPPED_STEPS=("$ZZFX_SWAP_SKIP"); fi\n'
   # 순서만 다른 두 목록을 만드는 주입입니다. 두 목록의 **기록 순서 자체는 계약이 아니므로**
@@ -863,8 +863,8 @@ printf '#!/usr/bin/env bash\necho "zzfx-sub-ran"\n' > "$SUBFX/sub/rd-workflow/sc
 sub_at="$(grep -n '^run_step ' "$sub_self" | head -1 | cut -d: -f1)"
 {
   head -n "$((sub_at - 1))" "$sub_self"
-  printf 'run_step "미니 서브 A" bash "${SCRIPT_DIR}/sub_a_zzfx.sh"\n'
-  printf 'run_step "스크립트 구문 검사 (bash -n)" syntax_check\n'
+  printf 'run_step consumer "미니 서브 A" bash "${SCRIPT_DIR}/sub_a_zzfx.sh"\n'
+  printf 'run_step consumer "스크립트 구문 검사 (bash -n)" syntax_check\n'
   tail -n "+$sub_at" "$sub_self" | sed '/^run_step /d'
 } > "$TMP/sub_self_test_zzfx.sh"
 mv "$TMP/sub_self_test_zzfx.sh" "$sub_self"
@@ -901,7 +901,7 @@ fi
 # 먼저 **정본이 그 조건에 들어가 있지 않은지**부터 봅니다. 지금은 스텝 설명이 전부 고유해
 # 사고가 나지 않는데, 그 유일성을 지키는 장치가 없으면 설명 하나를 복사해 붙이는 편집이
 # 위 상태를 조용히 만들어 냅니다.
-dup_desc_all="$(sed -n 's/^run_step "\([^"]*\)".*/\1/p' "$SELF")"
+dup_desc_all="$(sed -n 's/^run_step [a-z-]* "\([^"]*\)".*/\1/p' "$SELF")"
 # 양성 대조 — 추출이 0건이거나 일부만 걸리면 "중복 없음" 이 **공허하게** 통과합니다. 건수를
 # 이미 출력하면서 단언하지 않으면 그 줄을 고치는 편집이 조용히 지나갑니다. 기대값은 정본에서
 # 동적으로 읽으므로 스텝이 늘어도 낡지 않습니다.
@@ -944,13 +944,13 @@ dupx_at="$(grep -n '^run_step ' "$fx_self" | head -1 | cut -d: -f1)"
   head -n "$((dupx_at - 1))" "$fx_self"
   # 들여쓰기된 호출이라 정적 추출에 잡히지 않습니다 — 순번을 밀어내는 장치입니다.
   printf 'dupx_hidden_zzfx() {\n'
-  printf '  run_step "미니 D" bash "${SCRIPT_DIR}/dupx_x_zzfx.sh"\n'
+  printf '  run_step consumer "미니 D" bash "${SCRIPT_DIR}/dupx_x_zzfx.sh"\n'
   printf '}\n'
-  printf 'run_step "미니 A" bash "${SCRIPT_DIR}/dupx_a_zzfx.sh"\n'
+  printf 'run_step consumer "미니 A" bash "${SCRIPT_DIR}/dupx_a_zzfx.sh"\n'
   printf 'dupx_hidden_zzfx\n'
-  printf 'run_step "미니 D" bash "${SCRIPT_DIR}/dupx_b_zzfx.sh"\n'
-  printf 'run_step "미니 E" bash "${SCRIPT_DIR}/dupx_e_zzfx.sh"\n'
-  printf 'run_step "미니 D" bash "${SCRIPT_DIR}/dupx_c_zzfx.sh"\n'
+  printf 'run_step consumer "미니 D" bash "${SCRIPT_DIR}/dupx_b_zzfx.sh"\n'
+  printf 'run_step consumer "미니 E" bash "${SCRIPT_DIR}/dupx_e_zzfx.sh"\n'
+  printf 'run_step consumer "미니 D" bash "${SCRIPT_DIR}/dupx_c_zzfx.sh"\n'
   tail -n "+$dupx_at" "$fx_self" | sed '/^run_step /d'
 } > "$TMP/dupx_self_test_zzfx.sh"
 mv "$TMP/dupx_self_test_zzfx.sh" "$fx_self"
@@ -1037,12 +1037,12 @@ trip_at="$(grep -n '^run_step ' "$fx_self" | head -1 | cut -d: -f1)"
   head -n "$((trip_at - 1))" "$fx_self"
   # 들여쓰기된 호출이라 정적 추출에 잡히지 않습니다 — 순번을 밀어내는 장치입니다.
   printf 'trip_hidden_zzfx() {\n'
-  printf '  run_step "미니 X" bash "${SCRIPT_DIR}/trip_x_zzfx.sh"\n'
+  printf '  run_step consumer "미니 X" bash "${SCRIPT_DIR}/trip_x_zzfx.sh"\n'
   printf '}\n'
-  printf 'run_step "미니 A" bash "${SCRIPT_DIR}/trip_a_zzfx.sh"\n'
+  printf 'run_step consumer "미니 A" bash "${SCRIPT_DIR}/trip_a_zzfx.sh"\n'
   printf 'trip_hidden_zzfx\n'
-  printf 'run_step "미니 D" bash "${SCRIPT_DIR}/trip_b_zzfx.sh"\n'
-  printf 'run_step "미니 D" bash "${SCRIPT_DIR}/trip_c_zzfx.sh"\n'
+  printf 'run_step consumer "미니 D" bash "${SCRIPT_DIR}/trip_b_zzfx.sh"\n'
+  printf 'run_step consumer "미니 D" bash "${SCRIPT_DIR}/trip_c_zzfx.sh"\n'
   tail -n "+$trip_at" "$fx_self" | sed '/^run_step /d'
 } > "$TMP/trip_self_test_zzfx.sh"
 mv "$TMP/trip_self_test_zzfx.sh" "$fx_self"
@@ -1149,10 +1149,10 @@ tail_at="$(grep -n '^run_step ' "$fx_self" | head -1 | cut -d: -f1)"
 {
   head -n "$((tail_at - 1))" "$fx_self"
   printf 'tail_hidden_zzfx() {\n'
-  printf '  run_step "미니 T" bash "${SCRIPT_DIR}/tail_t_zzfx.sh"\n'
+  printf '  run_step consumer "미니 T" bash "${SCRIPT_DIR}/tail_t_zzfx.sh"\n'
   printf '}\n'
-  printf 'run_step "미니 P" bash "${SCRIPT_DIR}/tail_a_zzfx.sh"\n'
-  printf 'run_step "미니 Q" bash "${SCRIPT_DIR}/tail_b_zzfx.sh"\n'
+  printf 'run_step consumer "미니 P" bash "${SCRIPT_DIR}/tail_a_zzfx.sh"\n'
+  printf 'run_step consumer "미니 Q" bash "${SCRIPT_DIR}/tail_b_zzfx.sh"\n'
   printf 'tail_hidden_zzfx\n'
   tail -n "+$tail_at" "$fx_self" | sed '/^run_step /d'
 } > "$TMP/tail_self_test_zzfx.sh"
@@ -1293,6 +1293,278 @@ if [[ "$fx_final_steps" == "$canon_steps" ]]; then
   ok "스위트 종료 시 fixture self_test.sh 의 스텝 수가 정본과 동일 (${canon_steps}개)"
 else
   no "스위트 종료 시 fixture 스텝 수 ${fx_final_steps} 가 정본 ${canon_steps} 와 다릅니다 (최소 fixture 가 남았습니다)"
+fi
+
+# =============================================================================
+# 청중(audience) 계약 — AC 1·2·3·4·5·9 · spec §6.2·§6.3
+# =============================================================================
+# 정본 등록부를 **실행하지 않고** 정적으로 봅니다 (AC 2·3).
+aud_raw="$(grep -c '^run_step ' "$SELF")"
+aud_declared="$(sed -n 's/^run_step \([a-z-]*\) "\([^"]*\)".*/\1/p' "$SELF" | grep -c .)"
+aud_dev="$(sed -n 's/^run_step \([a-z-]*\) "\([^"]*\)".*/\1/p' "$SELF" | grep -c '^dev-only$')"
+aud_con="$(sed -n 's/^run_step \([a-z-]*\) "\([^"]*\)".*/\1/p' "$SELF" | grep -c '^consumer$')"
+
+# AC 2 — 청중 미선언 스텝이 0건. 미선언 호출은 추출식에 매치되지 않으므로 두 수의 차이가
+# 곧 미선언 건수입니다. 사람이 눈으로 세는 것으로 갈음하지 않습니다.
+if [[ "$aud_raw" == "$aud_declared" ]]; then
+  ok "청중 미선언 스텝 0건 (등록 ${aud_raw}건 전부 선언)"
+else
+  no "청중 미선언 스텝이 $((aud_raw - aud_declared))건 있습니다 (등록 ${aud_raw} / 선언 ${aud_declared})"
+fi
+# 허용값 밖의 청중이 등록부에 없어야 합니다 (추출식의 `[a-z-]*` 는 임의 소문자를 받습니다).
+aud_bad="$(sed -n 's/^run_step \([a-z-]*\) "\([^"]*\)".*/\1/p' "$SELF" | grep -vc '^\(consumer\|dev-only\)$' || true)"
+if [[ "$aud_bad" == "0" ]]; then ok "등록부의 청중 값이 모두 consumer|dev-only"; else no "허용값 밖의 청중이 ${aud_bad}건 있습니다"; fi
+
+# AC 3 — **exact `dev-only` 집합**을 고정합니다. `consumer` 는 여집합으로 계산합니다
+# (이진 enum + 총건수 + 미선언 0 검사와 합치면 42쌍 전량 대조와 동치).
+#
+# 이것은 의도된 트립와이어입니다. 청중 오분류는 **rc 를 바꾸지 않는 방향으로** 위험합니다 —
+# consumer 를 dev-only 로 잘못 옮기면 소비처 검증이 조용히 약해지고 아무 신호도 나지 않습니다.
+# **스크립트 이름의 `.sh` 를 떼어 적습니다.** 실재하지 않는 이름(`build_template` 등은
+# 이 트리가 아니라 dev 저장소 `scripts/` 에 있습니다)을 `*.sh` 리터럴로 박으면 참조 폐포
+# 판정이 그것을 "이미 커버됨" 으로 읽어 그 이름의 신규 파일에 대한 무매핑 fail-safe 를
+# 무력화합니다 (fixture 이름 규약이 막는 바로 그 오염입니다). 비교할 때 실제 설명에서도
+# 같은 방식으로 떼어 냅니다.
+AUD_DEVONLY_EXPECTED="smoke 판정 단위 테스트 (test_smoke_common)
+smoke fixture 이름 규약 (check_fixture_name_convention)
+판정 소스 회귀 grep (_extract_task_section Status 직접 호출)
+stale active-fr/LIFECYCLE_METADATA_PATH 참조 회귀
+adapter 폴링 잔존 회귀 (POLL_INTERVAL 없음)
+autopilot SKILL lifecycle 정합 (promote/rollback 일원화)
+무인 진입 계약 정합 (autopilot_headless_entry_check)
+phase 병렬 규약 문서 정합 (plan_parallel_phase_check)
+hook 표기 회귀 방지 (hook_path_notation_regression_check)
+템플릿 build 검증 (build_template verify)
+템플릿 빌더 단위 테스트 (test_build_template)
+배포 미러 계약 (test_publish_mirror)
+생성 full 트리 결함 보고 회귀 (generated_tree_defect_reports_check)"
+aud_devonly_actual="$(sed -n 's/^run_step dev-only "\([^"]*\)".*/\1/p' "$SELF" | sed 's/\.sh//g')"
+if [[ "$aud_devonly_actual" == "$AUD_DEVONLY_EXPECTED" ]]; then
+  ok "dev-only exact 집합 일치 (${aud_dev}건)"
+else
+  no "dev-only 집합이 기대와 다릅니다 — 청중 분류가 바뀌었다면 spec §3 정본 표와 이 목록을 함께 고치십시오"
+  diff <(printf '%s\n' "$AUD_DEVONLY_EXPECTED") <(printf '%s\n' "$aud_devonly_actual") | sed 's/^/    /' >&2 || true
+fi
+eq "consumer 는 dev-only 의 여집합" "$aud_con" "$((aud_raw - aud_dev))"
+
+# AC 4 — 상태표: 모드별 실행 예정 건수. AC 9 — 배너에 청중·실행·제외·이유 표시.
+out="$(RD_SELFTEST_SMOKE_DRYRUN=1 bash "$SELF" consumer 2>&1)"; rc=$?
+if [[ "$rc" == "0" ]]; then ok "dry-run consumer exit 0"; else no "dry-run consumer exit $rc"; fi
+has "배너: consumer 모드 표시" "$out" "모드: consumer"
+has "배너: 실행 예정/청중 제외 건수" "$out" "실행 예정: ${aud_con}스텝 / 청중 제외: ${aud_dev}스텝"
+has "배너: 제외 이유 표시" "$out" "제외 이유: dev-only"
+has "배너: 전수 검증이 아님을 명시" "$out" "전수 검증이 아닙니다"
+has "요약: 청중 제외 목록" "$out" "청중 제외된 스텝 (${aud_dev}개)"
+eq "consumer 실행 예정 스텝 수" "$(printf '%s' "$out" | sed -n 's/^== 실행 예정 스텝 (\([0-9]*\)개) ==$/\1/p')" "$aud_con"
+# `consumer` 는 smoke preflight 에 들어가지 않아야 합니다 (spec §6.1).
+if printf '%s' "$out" | grep -qE "폴백|스킵 요약"; then no "consumer 실행에 smoke 폴백/스킵 문구가 나옵니다 (preflight 에 들어갔습니다)"; else ok "consumer 는 smoke preflight 에 들어가지 않음"; fi
+
+out="$(RD_SELFTEST_SMOKE_DRYRUN=1 bash "$SELF" full 2>&1)"
+eq "full 실행 예정 스텝 수" "$(printf '%s' "$out" | sed -n 's/^== 실행 예정 스텝 (\([0-9]*\)개) ==$/\1/p')" "$aud_raw"
+has "배너: full 은 두 청중 모두" "$out" "청중 두 종류 모두"
+if printf '%s' "$out" | grep -qF "청중 제외 요약"; then no "full 인데 청중 제외 요약이 나옵니다"; else ok "full 은 청중 제외 요약 없음"; fi
+
+# --- 청중 fixture (AC 1 · 5 · 6.2 · 6.3) -------------------------------------
+# 합성 스텝 2개만 남긴 최소 fixture 를 별 저장소에 만듭니다. 정본 FX 를 건드리지 않아
+# 스위트 종료 시의 "fixture 스텝 수 == 정본" 불변이 유지됩니다.
+AUDFX="$TMP/audfx"
+mkdir -p "$AUDFX/rd-workflow"
+cp -R "${SCRIPT_DIR}" "$AUDFX/rd-workflow/scripts"
+git -C "$AUDFX" init -q .
+git -C "$AUDFX" config user.email zzfx@example.com
+git -C "$AUDFX" config user.name zzfx
+aud_self="$AUDFX/rd-workflow/scripts/self_test.sh"
+printf '#!/usr/bin/env bash\necho zzfx-aud-a-ran\nexit 0\n' > "$AUDFX/rd-workflow/scripts/aud_a_zzfx.sh"
+# **실패하는 dev-only 스텝**입니다. marker 를 먼저 찍고 실패하므로 "실행 가능한 상태였다" 가
+# 증명됩니다 — marker 없이 rc 만 보면 "실행되지 않아서 실패도 없었다" 와 구분되지 않습니다.
+printf '#!/usr/bin/env bash\necho zzfx-aud-d-ran\nexit 1\n' > "$AUDFX/rd-workflow/scripts/aud_d_zzfx.sh"
+aud_at="$(grep -n '^run_step ' "$aud_self" | head -1 | cut -d: -f1)"
+{
+  head -n "$((aud_at - 1))" "$aud_self"
+  printf 'run_step consumer "청중 A" bash "${SCRIPT_DIR}/aud_a_zzfx.sh"\n'
+  printf 'run_step dev-only "청중 D" bash "${SCRIPT_DIR}/aud_d_zzfx.sh"\n'
+  tail -n "+$aud_at" "$aud_self" | sed '/^run_step /d'
+} > "$aud_self.new" && mv "$aud_self.new" "$aud_self"
+git -C "$AUDFX" add -A >/dev/null 2>&1
+git -C "$AUDFX" commit -q -m "aud fixture" >/dev/null 2>&1
+eq "청중 fixture 의 최상위 run_step 이 2건" "$(grep -c '^run_step ' "$aud_self")" "2"
+
+AUD_FULLC="$AUDFX/rd-workflow-workspace/.lifecycle/selftest-full-cache"
+AUD_CONC="$AUDFX/rd-workflow-workspace/.lifecycle/selftest-consumer-cache"
+
+# AC 5(c)(d) — **같은 fixture·같은 스텝을 두 모드로 대조**합니다.
+out="$(bash "$aud_self" full 2>&1)"; rc=$?
+has "(full) dev-only 스텝이 실행됨 (marker)" "$out" "zzfx-aud-d-ran"
+has "(full) consumer 스텝도 실행됨 (marker)" "$out" "zzfx-aud-a-ran"
+if [[ "$rc" != "0" ]]; then ok "(full) dev-only 실패가 rc 에 반영됨 (rc=$rc)"; else no "(full) dev-only 가 실패했는데 rc=0 입니다"; fi
+
+out="$(bash "$aud_self" consumer 2>&1)"; rc=$?
+has "(consumer) consumer 스텝이 실제로 실행됨 (marker)" "$out" "zzfx-aud-a-ran"
+if printf '%s' "$out" | grep -qF "zzfx-aud-d-ran"; then
+  no "(consumer) dev-only 스텝이 실행되었습니다 (청중 필터가 동작하지 않았습니다)"
+else
+  ok "(consumer) dev-only 스텝은 실행되지 않음 (marker 없음)"
+fi
+if [[ "$rc" == "0" ]]; then ok "(consumer) dev-only 실패가 rc 를 오염시키지 않음 (rc=0)"; else no "(consumer) rc=$rc — dev-only 실패가 새어 들어왔습니다"; fi
+if [[ -s "$AUD_CONC" ]]; then ok "(consumer) consumer 증명을 기록"; else no "(consumer) consumer 증명이 기록되지 않았습니다"; fi
+if [[ -e "$AUD_FULLC" ]]; then no "(consumer) full 증명 파일이 생겼습니다 (부분 실행이 전수 통과로 위장)"; else ok "(consumer) full 증명 파일은 건드리지 않음"; fi
+# consumer 캐시가 **자기 증명을 무효화하지 않아야** 합니다.
+# **두 축을 따로 봅니다** — (a) proof 제외 목록(`smoke_proof_exclude`)과 (b) git 의
+# `.gitignore`. 어느 하나만 있어도 사용자는 막힙니다: (a) 가 없으면 증명이 스스로를
+# 무효화하고, (b) 가 없으면 archive 의 선행 clean 검사에서 걸립니다.
+#
+# `git status --porcelain` 은 새 untracked **디렉터리를 `?? rd-workflow-workspace/` 로 축약**
+# 하므로, 그 출력에서 파일명을 grep 하는 단언은 캐시가 전혀 ignore 되지 않아도 통과합니다
+# (구현 중 실제로 공허했습니다). 그래서 정확한 경로로 관측합니다.
+aud_cache_rel="rd-workflow-workspace/.lifecycle/selftest-consumer-cache"
+# (a) proof 제외 축
+aud_us=0; ( cd "$AUDFX" && . rd-workflow/scripts/_smoke_common.sh && smoke_untracked_state "$AUDFX" >/dev/null 2>&1 ) || aud_us=$?
+if [[ "$aud_us" == "0" ]]; then ok "(proof 제외 축) consumer 캐시가 untracked 판정에 잡히지 않음"; else no "(proof 제외 축) consumer 캐시가 untracked 로 잡힙니다 — 증명이 자기를 무효화"; fi
+# (b) .gitignore 축 — 배포될 `.gitignore` 를 fixture 에 설치한 뒤 `git check-ignore` 로 직접 봅니다.
+aud_gi_src="${SCRIPT_DIR}/../../.gitignore"
+if [[ -f "$aud_gi_src" ]]; then
+  cp "$aud_gi_src" "$AUDFX/.gitignore"
+  if git -C "$AUDFX" check-ignore -q "$aud_cache_rel"; then
+    ok "(.gitignore 축) consumer 캐시 본체가 ignore 됨"
+  else
+    no "(.gitignore 축) consumer 캐시 본체가 ignore 되지 않습니다 (archive 의 clean 검사에서 막힙니다)"
+  fi
+  if git -C "$AUDFX" check-ignore -q "${aud_cache_rel}.tmpXYZ"; then
+    ok "(.gitignore 축) 원자 기록 임시 파일도 ignore 됨"
+  else
+    no "(.gitignore 축) 원자 기록 임시 파일이 ignore 되지 않습니다"
+  fi
+  # 반대 방향 — `.lifecycle` 밖의 같은 이름은 ignore 되면 안 됩니다 (패턴 과다 확장 방지).
+  if git -C "$AUDFX" check-ignore -q "selftest-consumer-cache"; then
+    no "(.gitignore 축) .lifecycle 밖 동명 파일까지 ignore 됩니다 (패턴이 과하게 넓습니다)"
+  else
+    ok "(.gitignore 축) .lifecycle 밖 동명 파일은 ignore 되지 않음"
+  fi
+  rm -f "$AUDFX/.gitignore"
+else
+  ok "배포 .gitignore 를 찾을 수 없어 .gitignore 축 검증 건너뜀 (설치본)"
+fi
+
+# AC 1 — 청중 누락·허용값 밖은 **FAIL** 입니다 (조용한 skip 이 아닙니다).
+#
+# **원인을 격리한 fixture 를 씁니다.** 파일 끝에 잘못된 호출을 붙이면 최종 판정 `exit` 뒤라
+# 실행되지 않고, rc≠0 은 다른 스텝의 실패에서 옵니다 — 단언이 공허해집니다(구현 중 실측).
+# 그래서 통과하는 스텝 하나 + 잘못된 호출 하나만 남긴 별 fixture 를 만들어, rc≠0 의 원인이
+# 청중 오류일 수밖에 없게 만듭니다.
+aud_mk_bad() { # aud_mk_bad <fixture 경로> <잘못된 run_step 줄>
+  local dst="$1" bad="$2" at
+  cp -R "$AUDFX" "$dst"
+  local dself="$dst/rd-workflow/scripts/self_test.sh"
+  at="$(grep -n '^run_step ' "$dself" | head -1 | cut -d: -f1)"
+  {
+    head -n "$((at - 1))" "$dself"
+    printf 'run_step consumer "정상 스텝" bash "${SCRIPT_DIR}/aud_a_zzfx.sh"\n'
+    printf '%s\n' "$bad"
+    tail -n "+$at" "$dself" | sed '/^run_step /d'
+  } > "$dself.new" && mv "$dself.new" "$dself"
+  printf '%s\n' "$dself"
+}
+
+bad1_self="$(aud_mk_bad "$TMP/audbad1" 'run_step "청중 없음" true')"
+eq "청중 누락 fixture 의 최상위 run_step 이 2건" "$(grep -c '^run_step ' "$bad1_self")" "2"
+out="$(bash "$bad1_self" full 2>&1)"; rc=$?
+if [[ "$rc" != "0" ]]; then ok "청중 누락 → rc≠0"; else no "청중 누락인데 rc=0 입니다 (조용히 통과)"; fi
+has "청중 누락 사유 표시" "$out" "청중이 없거나 허용값이 아닙니다"
+# 정상 스텝은 실행돼야 합니다 — rc≠0 이 "아무것도 안 돌았다" 가 아님을 못박습니다.
+has "청중 누락 케이스에서도 정상 스텝은 실행됨" "$out" "zzfx-aud-a-ran"
+
+bad2_self="$(aud_mk_bad "$TMP/audbad2" 'run_step bogus "허용값 밖" true')"
+out="$(bash "$bad2_self" full 2>&1)"; rc=$?
+if [[ "$rc" != "0" ]]; then ok "허용값 밖 청중 → rc≠0"; else no "허용값 밖인데 rc=0 입니다"; fi
+has "허용값 밖 사유 표시" "$out" "청중이 없거나 허용값이 아닙니다"
+
+# 대조군 — 같은 fixture 형태에서 청중이 올바르면 rc=0 이어야 합니다. 이것이 없으면 위 두
+# 단언이 "이 fixture 는 무슨 이유로든 실패한다" 와 구분되지 않습니다.
+good_self="$(aud_mk_bad "$TMP/audgood" 'run_step consumer "또 하나의 정상 스텝" true')"
+out="$(bash "$good_self" full 2>&1)"; rc=$?
+if [[ "$rc" == "0" ]]; then ok "대조군: 청중이 올바르면 rc=0 (위 단언이 공허하지 않음)"; else no "대조군 fixture 가 rc=$rc 로 실패합니다 — 위 두 단언의 원인 격리가 깨졌습니다"; fi
+
+# Finding 2 회귀 — 시작 경고가 **실행 모드에 맞는 증명 이름**을 말해야 합니다.
+# `consumer` 실행인데 "full PASS 기록" 이라고 하면, 이 변경의 핵심(dev-only 는 강제하지
+# 않는다)이 가시성이 가장 필요한 순간에 깨집니다.
+aud_untracked_probe="$AUDFX/untracked_probe_zzfx.sh"
+printf 'echo probe\n' > "$aud_untracked_probe"
+out="$(bash "$aud_self" consumer 2>&1)" || true
+has "(consumer) untracked 경고가 consumer 증명을 가리킴" "$out" "consumer PASS 기록이 남지 않습니다"
+if printf '%s' "$out" | grep -qF "full PASS 기록이 남지 않습니다"; then
+  no "(consumer) untracked 경고가 여전히 full 이라고 말합니다"
+else
+  ok "(consumer) untracked 경고에 full 표현이 남지 않음"
+fi
+out="$(bash "$aud_self" full 2>&1)" || true
+has "(full) untracked 경고가 full 증명을 가리킴" "$out" "full PASS 기록이 남지 않습니다"
+rm -f "$aud_untracked_probe"
+
+# spec §6.3 — dry-run 은 **어떤 모드에서도 증명을 만들지 않습니다.**
+# 현행은 dry-run 블록의 exit 0 이 기록 지점보다 앞이라 구조적으로 성립하지만, 기록 지점을
+# 앞으로 옮기는 변경이 조용히 깨뜨릴 수 있으므로 계약으로 고정합니다.
+rm -f "$AUD_CONC" "$AUD_FULLC"
+RD_SELFTEST_SMOKE_DRYRUN=1 bash "$aud_self" consumer >/dev/null 2>&1 || true
+if [[ -e "$AUD_CONC" ]]; then no "dry-run consumer 가 증명을 만들었습니다"; else ok "dry-run consumer 는 증명을 만들지 않음"; fi
+RD_SELFTEST_SMOKE_DRYRUN=1 bash "$aud_self" full >/dev/null 2>&1 || true
+if [[ -e "$AUD_FULLC" ]]; then no "dry-run full 이 증명을 만들었습니다"; else ok "dry-run full 은 증명을 만들지 않음"; fi
+
+# spec §6.2 — `_smoke_common.sh` 부재 시 `consumer` 는 **즉시 실패**합니다.
+# 기존 동작이 full 폴백이라 가장 쉽게 되살아나는 경계입니다.
+mv "$AUDFX/rd-workflow/scripts/_smoke_common.sh" "$AUDFX/_smoke_common.sh.hidden"
+out="$(bash "$aud_self" consumer 2>&1)"; rc=$?
+if [[ "$rc" != "0" ]]; then ok "(헬퍼 부재) consumer → rc≠0"; else no "(헬퍼 부재) consumer 가 rc=0 으로 끝났습니다 (조용한 full 확대)"; fi
+has "(헬퍼 부재) 사유 표시" "$out" "증명"
+has "(헬퍼 부재) full 대안 안내" "$out" "self_test.sh full"
+if printf '%s' "$out" | grep -qF "zzfx-aud-d-ran"; then no "(헬퍼 부재) consumer 가 dev-only 까지 실행했습니다 (full 로 확대)"; else ok "(헬퍼 부재) 스텝을 실행하지 않고 중단"; fi
+if [[ -e "$AUD_CONC" || -e "$AUD_FULLC" ]]; then no "(헬퍼 부재) 증명 파일이 생겼습니다"; else ok "(헬퍼 부재) 증명 파일 무변경"; fi
+mv "$AUDFX/_smoke_common.sh.hidden" "$AUDFX/rd-workflow/scripts/_smoke_common.sh"
+
+# =============================================================================
+# CLAUDE.md 크기 검사 — 판정 행렬 (AC 8)
+# =============================================================================
+# 검사기를 **직접** 호출합니다 (`self_test.sh` 의 `claudemd_size_check` 래퍼를 거치지 않음).
+#
+# 이 검사기는 원래 `<root>/CLAUDE.md` 만 봤습니다. 배포되는 것은 `_ROOT_FILES/CLAUDE.md` 이므로
+# 정본이 제한을 넘겨도 dev self_test 는 통과하고 **소비 프로젝트에서만** 터졌습니다.
+# 그래서 "통과함" 확인만으로는 불충분하고, **초과 시 실제로 실패하는지**를 봐야 합니다.
+CMD_CHECKER="${SCRIPT_DIR}/check_claudemd_size.sh"
+if [[ ! -f "$CMD_CHECKER" ]]; then
+  ok "check_claudemd_size.sh 없음 — 크기 검사 행렬 건너뜀 (lite 산출물)"
+else
+  cmd_case() { # cmd_case <라벨> <프로젝트 줄수|-> <정본 줄수|-> <기대rc>
+    local label="$1" proj="$2" tpl="$3" want="$4" d rc
+    d="$TMP/cmdsz_$RANDOM"
+    mkdir -p "$d/rd-workflow/scripts"
+    cp "$CMD_CHECKER" "$d/rd-workflow/scripts/"
+    [[ "$proj" == "-" ]] || seq "$proj" > "$d/CLAUDE.md"
+    if [[ "$tpl" != "-" ]]; then mkdir -p "$d/_ROOT_FILES"; seq "$tpl" > "$d/_ROOT_FILES/CLAUDE.md"; fi
+    bash "$d/rd-workflow/scripts/check_claudemd_size.sh" >/dev/null 2>&1 && rc=0 || rc=1
+    if [[ "$rc" == "$want" ]]; then ok "크기 검사 — ${label}"; else no "크기 검사 — ${label} (rc=$rc, 기대 $want)"; fi
+    rm -rf "$d"
+  }
+  # REQUIRED 부재는 rc=1 입니다. 예전에는 안내만 하고 exit 0 이었는데, 그것은 이름만 필수이고
+  # 동작은 fail-open 이라 "검사했다" 는 신호를 거짓으로 만듭니다.
+  cmd_case "REQUIRED 부재 → 실패"            -   -   1
+  cmd_case "정상 / OPTIONAL 부재 → 통과"     10  -   0
+  cmd_case "정상 / 정본 초과 → 실패"         10  201 1
+  cmd_case "프로젝트 초과 / 정본 정상 → 실패" 201 10  1
+  cmd_case "둘 다 정상 → 통과"               10  20  0
+  cmd_case "둘 다 초과 → 실패"               201 201 1
+  # 경계값 — 제한과 같은 줄 수는 통과입니다 (`-gt` 판정).
+  cmd_case "정본이 제한과 동률 → 통과"        10  200 0
+
+  # 실패 이유가 **어느 파일 때문인지** 사용자에게 보여야 합니다. 파일이 둘이라 이유 없이
+  # 실패하면 어디를 줄여야 할지 알 수 없습니다.
+  cmd_d="$TMP/cmdsz_reason"
+  mkdir -p "$cmd_d/rd-workflow/scripts" "$cmd_d/_ROOT_FILES"
+  cp "$CMD_CHECKER" "$cmd_d/rd-workflow/scripts/"
+  seq 10 > "$cmd_d/CLAUDE.md"; seq 201 > "$cmd_d/_ROOT_FILES/CLAUDE.md"
+  out="$(bash "$cmd_d/rd-workflow/scripts/check_claudemd_size.sh" 2>&1 || true)"
+  has "크기 검사 — 실패 이유에 배포 정본 표시" "$out" "배포 정본"
+  has "크기 검사 — 파일별 줄 수 표시" "$out" "201줄"
+  has "크기 검사 — 실패 이유 블록" "$out" "실패 이유"
+  rm -rf "$cmd_d"
 fi
 
 echo ""

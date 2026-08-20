@@ -15,9 +15,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 생각으로 친 명령이 수 분을 돌았습니다). 조용한 오작동보다 즉시 실패가 낫습니다.
 SELFTEST_MODE="smoke"
 selftest_usage_exit() {
-  echo "  사용법: bash rd-workflow/scripts/self_test.sh [smoke|full]" >&2
-  echo "    smoke (기본) — 변경 파일과 관련된 스텝만 실행합니다" >&2
-  echo "    full         — 전체 스텝을 실행합니다 (아카이브 전 필수 — archive.sh 가 강제합니다)" >&2
+  echo "  사용법: bash rd-workflow/scripts/self_test.sh [smoke|full|consumer]" >&2
+  echo "    smoke (기본) — 변경 파일과 관련된 스텝만 실행합니다 (증명을 남기지 않습니다)" >&2
+  echo "    full         — 전체 스텝을 실행합니다 (두 청중 모두). full 증명을 남깁니다" >&2
+  echo "    consumer     — 소비 프로젝트에서 뜻이 있는 스텝만 실행합니다 (아카이브 게이트가 쓰는 모드)" >&2
   echo "  dry-run 은 인자가 아니라 환경변수입니다: RD_SELFTEST_SMOKE_DRYRUN=1" >&2
   exit 1
 }
@@ -28,6 +29,7 @@ fi
 case "${1:-}" in
   ""|smoke) SELFTEST_MODE="smoke" ;;
   full)     SELFTEST_MODE="full" ;;
+  consumer) SELFTEST_MODE="consumer" ;;
   *)
     echo "[self_test] 알 수 없는 인자입니다: $1" >&2
     selftest_usage_exit
@@ -46,9 +48,18 @@ SMOKE_ALIGN_LOST=0
 SMOKE_ALIGN_LOST_IDX=0
 SMOKE_ALIGN_FORCED=0
 # 헬퍼가 없으면(예상치 못한 배포 형태) 조용히 약해지지 않도록 전수 실행으로 되돌립니다.
+#
+# **`consumer` 는 예외로 즉시 실패합니다.** 증명 기록 함수가 이 헬퍼에 있어 `consumer` 의
+# 목적(아카이브 증명 생성) 자체가 불가능하기 때문입니다. 같은 full 폴백을 적용하면 실행
+# 범위는 조용히 넓어지는데 증명은 남지 않아, 게이트가 사유 없이 실패하는 상태가 됩니다.
 if [[ -f "${SCRIPT_DIR}/_smoke_common.sh" ]]; then
   # shellcheck source=/dev/null
   . "${SCRIPT_DIR}/_smoke_common.sh"
+elif [[ "$SELFTEST_MODE" == "consumer" ]]; then
+  echo "[self_test] consumer 모드를 실행할 수 없습니다 — _smoke_common.sh 가 없습니다" >&2
+  echo "  이 헬퍼에 증명 기록 함수가 있어 consumer 증명을 남길 수 없습니다." >&2
+  echo "  대안: bash rd-workflow/scripts/self_test.sh full (전수 실행)" >&2
+  exit 1
 else
   SELFTEST_MODE="full"
 fi
@@ -56,9 +67,36 @@ fi
 FAIL=0
 STEP_NAMES=()
 STEP_DURATIONS=()
+AUDIENCE_EXCLUDED=()
+
+# 사용법: run_step <consumer|dev-only> "<설명>" <명령...>
+#
+# **청중은 필수 인자입니다.** 기본값을 두지 않는 이유 — `consumer` 기본값은 현상 유지라
+# 다음에 추가되는 정본 위생 검사가 또 소비처의 아카이브를 막고, `dev-only` 기본값은 새
+# 검사가 조용히 소비처 검증에서 빠집니다. 필수 인자는 두 실패를 동시에 피합니다.
 run_step() {
-  local desc="$1"; shift
+  local audience="${1-}" desc
+  case "$audience" in
+    consumer|dev-only) shift ;;
+    *)
+      # 조용한 skip 이 아니라 FAIL 입니다. skip 하면 청중을 빠뜨린 스텝이 검증에서
+      # 사라지면서 rc 는 0 이 되어, 필수화 자체가 무력해집니다.
+      STEP_INDEX=$((STEP_INDEX + 1))
+      echo ""
+      echo "== 스텝 ${STEP_INDEX}: 청중 선언 오류 =="
+      echo "  -> FAIL: 청중이 없거나 허용값이 아닙니다: '${audience}' (consumer|dev-only 중 하나여야 합니다)" >&2
+      FAIL=1
+      return 0
+      ;;
+  esac
+  desc="${1-}"; shift
   STEP_INDEX=$((STEP_INDEX + 1))
+  # 청중 필터 — `consumer` 모드는 정본 위생 검사(dev-only)를 실행하지 않습니다.
+  # 이것이 "정본 규칙 하나가 소비 프로젝트의 아카이브를 막는" 경로를 닫는 지점입니다.
+  if [[ "$SELFTEST_MODE" == "consumer" && "$audience" == "dev-only" ]]; then
+    AUDIENCE_EXCLUDED+=("${STEP_INDEX}. ${desc}")
+    return 0
+  fi
   # smoke 이고 폴백이 아니면 preflight 판정 결과를 **호출 순번**으로 조회합니다 (spec §5.3).
   # 폐포를 여기서 다시 계산하지 않는 이유: preflight 가 이미 전량 판정했고,
   # 실행 중 재계산하면 시작 시 보여준 목록과 실제 실행이 어긋날 수 있습니다.
@@ -1007,7 +1045,10 @@ fi
 STEP_INDEX=0
 
 smoke_init() {
-  if [[ "$SELFTEST_MODE" == "full" ]]; then
+  # **smoke 에서만 본체를 실행합니다.** `full`·`consumer` 는 실행 집합이 변경 파일과 무관하게
+  # 정해지므로 preflight 가 필요 없고, 들어가면 변경 파일 수집·git 오류 폴백·자기변경 감지·
+  # 무매핑 폴백까지 전부 타면서 "full 폴백" 문구가 나와 사용자가 범위를 오인합니다.
+  if [[ "$SELFTEST_MODE" != "smoke" ]]; then
     return 0
   fi
   if ! smoke_collect_changed_files "$SELFTEST_ROOT"; then
@@ -1066,6 +1107,58 @@ smoke_init() {
 }
 smoke_init
 
+# 등록부를 **실행하지 않고** 청중 분포를 셉니다. 배너와 정적 검사(청중 미선언 0건)가 함께
+# 씁니다. 미선언 스텝은 추출식(`^run_step <청중> "설명"`)에 매치되지 않으므로,
+# `grep -c '^run_step '` 과 추출 행수의 차이가 곧 미선언 건수입니다.
+SELFTEST_AUD_TOTAL=0
+SELFTEST_AUD_CONSUMER=0
+SELFTEST_AUD_DEVONLY=0
+SELFTEST_AUD_UNDECLARED=0
+selftest_count_audiences() {
+  local self="$1" steps aud rest declared=0 raw
+  declare -F smoke_extract_steps >/dev/null 2>&1 || return 1
+  raw="$(grep -c '^run_step ' "$self" 2>/dev/null || true)"
+  [[ -n "$raw" ]] || raw=0
+  steps="$(smoke_extract_steps "$self" 2>/dev/null)" || steps=""
+  if [[ -n "$steps" ]]; then
+    while IFS=$'\t' read -r aud rest; do
+      [[ -n "$aud" ]] || continue
+      declared=$((declared + 1))
+      case "$aud" in
+        consumer) SELFTEST_AUD_CONSUMER=$((SELFTEST_AUD_CONSUMER + 1)) ;;
+        dev-only) SELFTEST_AUD_DEVONLY=$((SELFTEST_AUD_DEVONLY + 1)) ;;
+      esac
+    done <<< "$steps"
+  fi
+  SELFTEST_AUD_TOTAL="$raw"
+  SELFTEST_AUD_UNDECLARED=$((raw - declared))
+  (( SELFTEST_AUD_UNDECLARED < 0 )) && SELFTEST_AUD_UNDECLARED=0
+  return 0
+}
+selftest_count_audiences "${BASH_SOURCE[0]}" || true
+
+# 시작 배너 — **강제 범위가 좁아진 사실이 사용자에게 보여야 합니다.** 게이트가 예전처럼
+# "전수 검증" 이라고만 말하면 사용자는 dev 검증까지 끝났다고 오인합니다.
+echo "== self_test 실행 범위 =="
+case "$SELFTEST_MODE" in
+  full)
+    echo "  모드: full — 청중 두 종류 모두 (consumer + dev-only)"
+    echo "  실행 예정: ${SELFTEST_AUD_TOTAL}스텝 / 청중 제외: 0"
+    ;;
+  consumer)
+    echo "  모드: consumer — 소비 프로젝트에서 뜻이 있는 스텝만"
+    echo "  실행 예정: ${SELFTEST_AUD_CONSUMER}스텝 / 청중 제외: ${SELFTEST_AUD_DEVONLY}스텝"
+    echo "  제외 이유: dev-only (rd-workflow 정본 저작 규칙 — 소비 프로젝트에서 판정할 대상이 아닙니다)"
+    echo "  주의: 이것은 전수 검증이 아닙니다. 정본 위생 검사까지 보려면 full 로 실행하십시오"
+    ;;
+  smoke)
+    echo "  모드: smoke — 변경 파일과 연결된 스텝만 (청중 무관, 증명을 남기지 않습니다)"
+    ;;
+esac
+if (( SELFTEST_AUD_UNDECLARED > 0 )); then
+  echo "  경고: 청중을 선언하지 않은 스텝이 ${SELFTEST_AUD_UNDECLARED}건 있습니다 — 해당 스텝은 FAIL 로 보고됩니다" >&2
+fi
+
 # dry-run 은 스텝을 하나도 실행하지 않고 "실행 예정" 목록만 내고 exit 0 합니다. 환경변수가
 # 셸에 export 된 채 남거나 외부에서 잘못 주입되면 `full` 조차 즉시 rc 0 으로 끝나므로,
 # 사용자가 전체 검증이 통과한 것으로 오인할 수 있습니다. `RD_SELFTEST_CHECKER_ONLY` 와 같은
@@ -1102,7 +1195,10 @@ SELFTEST_START_FP=""
 # 중에 생겼다 사라진 파일이 흔적을 남기지 않고, 그 상태를 가린 채 PASS 가 기록됩니다.
 # 빈 값은 "확인하지 못함" 이며 기록 쪽에서 거부합니다 (지문의 빈 값과 같은 취급입니다).
 SELFTEST_START_USTATE=""
-if [[ "$SELFTEST_MODE" == "full" ]]; then
+# **증명을 남기는 두 모드(`full`·`consumer`) 모두**에서 시작 지문을 잡습니다.
+# `full` 만 보면 `consumer` 가 기록 조건(시작·종료 지문 일치)을 갖추지 못해 증명이 남지 않고,
+# 게이트의 사후 대조가 영구히 실패합니다.
+if [[ "$SELFTEST_MODE" == "full" || "$SELFTEST_MODE" == "consumer" ]]; then
   SELFTEST_START_FP="$(smoke_proof_fingerprint "$SELFTEST_ROOT" worktree 2>/dev/null || true)"
   # 기록 거부 사유(untracked 존재)는 **지금 이미 확정**입니다. 종료 시점에만 알리면
   # 사용자는 수 분을 쓰고 나서야 증명이 남지 않는다는 것을 알고, git add 후 같은 시간을
@@ -1112,42 +1208,42 @@ if [[ "$SELFTEST_MODE" == "full" ]]; then
     SELFTEST_START_USTATE=0
     SELFTEST_START_UNTRACKED="$(smoke_untracked_state "$SELFTEST_ROOT")" || SELFTEST_START_USTATE=$?
     if [[ "$SELFTEST_START_USTATE" -eq 1 ]]; then
-      echo "  경고: untracked 파일이 있어 이대로는 full PASS 기록이 남지 않습니다 — 지금 git add 하지 않으면 실행이 끝난 뒤 다시 돌려야 합니다." >&2
+      echo "  경고: untracked 파일이 있어 이대로는 ${SELFTEST_MODE} PASS 기록이 남지 않습니다 — 지금 git add 하지 않으면 실행이 끝난 뒤 다시 돌려야 합니다." >&2
       printf '%s\n' "$SELFTEST_START_UNTRACKED" | sed 's/^/    /' >&2
     elif [[ "$SELFTEST_START_USTATE" -eq 2 ]]; then
       # 조회 실패도 기록 거부 사유입니다. 여기서 침묵하면 사용자는 수 분을 쓰고 나서야
       # 증명이 남지 않는다는 것을 압니다 — 이 경고가 없애려던 손실이 이 경로에만 남습니다.
-      echo "  경고: untracked 조회에 실패해(git 오류) 이대로는 full PASS 기록이 남지 않습니다." >&2
+      echo "  경고: untracked 조회에 실패해(git 오류) 이대로는 ${SELFTEST_MODE} PASS 기록이 남지 않습니다." >&2
     fi
   fi
 fi
 
-run_step "implementation_gate hook (test_implementation_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_implementation_gate.sh"
-run_step "리뷰 프롬프트 인라인 계약 (test_review_prompt_inline.sh)" bash "${SCRIPT_DIR}/test_review_prompt_inline.sh"
-run_step "reasoning effort override (test_review_effort_override.sh)" bash "${SCRIPT_DIR}/test_review_effort_override.sh"
-run_step "리뷰 턴 계측 계약 (test_review_metrics.sh)" bash "${SCRIPT_DIR}/test_review_metrics.sh"
-run_step "어댑터 프롬프트 parity (test_review_adapter_parity.sh)" bash "${SCRIPT_DIR}/test_review_adapter_parity.sh"
-run_step "state 단위 테스트 (test_state_common.sh)" bash "${SCRIPT_DIR}/test_state_common.sh"
-run_step "smoke 판정 단위 테스트 (test_smoke_common.sh)" bash "${SCRIPT_DIR}/test_smoke_common.sh"
-run_step "smoke 진입점 계약 (test_self_test_smoke.sh)" bash "${SCRIPT_DIR}/test_self_test_smoke.sh"
-run_step "smoke fixture 이름 규약 (check_fixture_name_convention.sh)" bash "${SCRIPT_DIR}/check_fixture_name_convention.sh"
-run_step "guard state fixture (test_guard_state.sh)" bash "${SCRIPT_DIR}/hooks/test_guard_state.sh"
-run_step "archive gate 테스트 (test_pre_commit_archive_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_pre_commit_archive_gate.sh"
-run_step "비차단 Status drift 검증 (nonblocking_status_drift_check)" nonblocking_status_drift_check
-run_step "LC-19 3자 일치 검증 (TASK/STATE/CLAUDE.md)" canonical_status_triple_drift_check
-run_step "판정 소스 회귀 grep (_extract_task_section Status 직접 호출)" judgment_source_regression_check
-run_step "stale active-fr/LIFECYCLE_METADATA_PATH 참조 회귀" stale_metadata_reference_check
-run_step "task CLI 단위 테스트" bash "${SCRIPT_DIR}/test_task_cli.sh"
-run_step "install_claude_skills 단위 테스트" bash "${SCRIPT_DIR}/test_install_claude_skills.sh"
-run_step "lifecycle 단위 테스트 (test_lifecycle.sh)" bash "${SCRIPT_DIR}/lifecycle/test_lifecycle.sh"
-run_step "lifecycle 통합 테스트 (test_integration.sh)" bash "${SCRIPT_DIR}/lifecycle/test_integration.sh"
-run_step "review 대기 계약 테스트 (test_review_wait.sh)" bash "${SCRIPT_DIR}/test_review_wait.sh"
-run_step "watchdog 계약·이식성 probe (test_watchdog_portability.sh)" bash "${SCRIPT_DIR}/test_watchdog_portability.sh"
-run_step "ralph_drain supervisor 테스트 (test_ralph_drain.sh)" bash "${SCRIPT_DIR}/test_ralph_drain.sh"
-run_step "batch_manifest 헬퍼 테스트 (batch/test_batch_manifest.sh)" bash "${SCRIPT_DIR}/batch/test_batch_manifest.sh"
-run_step "blocked status 어휘 일관성 (test_fr_blocked_status.sh)" bash "${SCRIPT_DIR}/test_fr_blocked_status.sh"
-run_step "autopilot blocked 계약 회귀 (test_autopilot_blocked_contract.sh)" bash "${SCRIPT_DIR}/test_autopilot_blocked_contract.sh"
-run_step "sync_template 타입 가드 테스트 (test_sync_template.sh)" bash "${SCRIPT_DIR}/test_sync_template.sh"
+run_step consumer "implementation_gate hook (test_implementation_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_implementation_gate.sh"
+run_step consumer "리뷰 프롬프트 인라인 계약 (test_review_prompt_inline.sh)" bash "${SCRIPT_DIR}/test_review_prompt_inline.sh"
+run_step consumer "reasoning effort override (test_review_effort_override.sh)" bash "${SCRIPT_DIR}/test_review_effort_override.sh"
+run_step consumer "리뷰 턴 계측 계약 (test_review_metrics.sh)" bash "${SCRIPT_DIR}/test_review_metrics.sh"
+run_step consumer "어댑터 프롬프트 parity (test_review_adapter_parity.sh)" bash "${SCRIPT_DIR}/test_review_adapter_parity.sh"
+run_step consumer "state 단위 테스트 (test_state_common.sh)" bash "${SCRIPT_DIR}/test_state_common.sh"
+run_step dev-only "smoke 판정 단위 테스트 (test_smoke_common.sh)" bash "${SCRIPT_DIR}/test_smoke_common.sh"
+run_step consumer "smoke 진입점 계약 (test_self_test_smoke.sh)" bash "${SCRIPT_DIR}/test_self_test_smoke.sh"
+run_step dev-only "smoke fixture 이름 규약 (check_fixture_name_convention.sh)" bash "${SCRIPT_DIR}/check_fixture_name_convention.sh"
+run_step consumer "guard state fixture (test_guard_state.sh)" bash "${SCRIPT_DIR}/hooks/test_guard_state.sh"
+run_step consumer "archive gate 테스트 (test_pre_commit_archive_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_pre_commit_archive_gate.sh"
+run_step consumer "비차단 Status drift 검증 (nonblocking_status_drift_check)" nonblocking_status_drift_check
+run_step consumer "LC-19 3자 일치 검증 (TASK/STATE/CLAUDE.md)" canonical_status_triple_drift_check
+run_step dev-only "판정 소스 회귀 grep (_extract_task_section Status 직접 호출)" judgment_source_regression_check
+run_step dev-only "stale active-fr/LIFECYCLE_METADATA_PATH 참조 회귀" stale_metadata_reference_check
+run_step consumer "task CLI 단위 테스트" bash "${SCRIPT_DIR}/test_task_cli.sh"
+run_step consumer "install_claude_skills 단위 테스트" bash "${SCRIPT_DIR}/test_install_claude_skills.sh"
+run_step consumer "lifecycle 단위 테스트 (test_lifecycle.sh)" bash "${SCRIPT_DIR}/lifecycle/test_lifecycle.sh"
+run_step consumer "lifecycle 통합 테스트 (test_integration.sh)" bash "${SCRIPT_DIR}/lifecycle/test_integration.sh"
+run_step consumer "review 대기 계약 테스트 (test_review_wait.sh)" bash "${SCRIPT_DIR}/test_review_wait.sh"
+run_step consumer "watchdog 계약·이식성 probe (test_watchdog_portability.sh)" bash "${SCRIPT_DIR}/test_watchdog_portability.sh"
+run_step consumer "ralph_drain supervisor 테스트 (test_ralph_drain.sh)" bash "${SCRIPT_DIR}/test_ralph_drain.sh"
+run_step consumer "batch_manifest 헬퍼 테스트 (batch/test_batch_manifest.sh)" bash "${SCRIPT_DIR}/batch/test_batch_manifest.sh"
+run_step consumer "blocked status 어휘 일관성 (test_fr_blocked_status.sh)" bash "${SCRIPT_DIR}/test_fr_blocked_status.sh"
+run_step consumer "autopilot blocked 계약 회귀 (test_autopilot_blocked_contract.sh)" bash "${SCRIPT_DIR}/test_autopilot_blocked_contract.sh"
+run_step consumer "sync_template 타입 가드 테스트 (test_sync_template.sh)" bash "${SCRIPT_DIR}/test_sync_template.sh"
 # 결함 보고 로컬 조작부. 다른 배포 테스트와 같은 관례로 **배포 사본**을 실행한다 —
 # 테스트가 형제 `defect_reports.sh` 를 대상으로 잡으므로 이 한 줄이 곧 설치본 구현 검증이다.
 # 정본/배포본 drift 는 dev repo 전용 `build_verify_check`(build_template.sh verify)가 이미
@@ -1173,13 +1269,13 @@ defect_reports_test_check() {
   fi
   return $rc
 }
-run_step "결함 보고 로컬 조작부 테스트 (test_defect_reports.sh)" defect_reports_test_check
-run_step "adapter 폴링 잔존 회귀 (POLL_INTERVAL 없음)" adapter_poll_regression_check
-run_step "스크립트 구문 검사 (bash -n)" syntax_check
-run_step "autopilot SKILL lifecycle 정합 (promote/rollback 일원화)" autopilot_skill_lifecycle_check
-run_step "무인 진입 계약 정합 (autopilot_headless_entry_check)" autopilot_headless_entry_check
-run_step "무인 wrapper 매핑 테스트 (test_autopilot_headless.sh)" bash "${SCRIPT_DIR}/test_autopilot_headless.sh"
-run_step "phase 병렬 규약 문서 정합 (plan_parallel_phase_check)" plan_parallel_phase_check
+run_step consumer "결함 보고 로컬 조작부 테스트 (test_defect_reports.sh)" defect_reports_test_check
+run_step dev-only "adapter 폴링 잔존 회귀 (POLL_INTERVAL 없음)" adapter_poll_regression_check
+run_step consumer "스크립트 구문 검사 (bash -n)" syntax_check
+run_step dev-only "autopilot SKILL lifecycle 정합 (promote/rollback 일원화)" autopilot_skill_lifecycle_check
+run_step dev-only "무인 진입 계약 정합 (autopilot_headless_entry_check)" autopilot_headless_entry_check
+run_step consumer "무인 wrapper 매핑 테스트 (test_autopilot_headless.sh)" bash "${SCRIPT_DIR}/test_autopilot_headless.sh"
+run_step dev-only "phase 병렬 규약 문서 정합 (plan_parallel_phase_check)" plan_parallel_phase_check
 
 # 템플릿 dev repo 한정: build 규칙 정합성·루트 drift 검증 (설치본에는 빌더 없음 → skip)
 # self_test.sh 위치는 <root>/rd-workflow/scripts/ 이므로 dev 빌더는 두 단계 위 scripts/
@@ -1253,19 +1349,19 @@ _generated_tree_probe() {  # $1=builder $2=산출물 경로
   fi
   return $rc
 }
-run_step "self_test 계약 (checker whitelist·root resolver)" hook_selftest_contract_check
-run_step "hook 경로 도달 증명 (hook_path_reachability_check)" hook_path_reachability_check
-run_step "hook 대상 실재 (hook_target_existence_check)" hook_target_existence_check
-run_step "hook 표기 회귀 방지 (hook_path_notation_regression_check)" hook_path_notation_regression_check
-run_step "템플릿 build 검증 (build_template.sh verify)" build_verify_check
-run_step "템플릿 빌더 단위 테스트 (test_build_template.sh)" test_build_template_check
-run_step "배포 미러 계약 (test_publish_mirror.sh)" test_publish_mirror_check
-run_step "생성 full 트리 결함 보고 회귀 (generated_tree_defect_reports_check)" generated_tree_defect_reports_check
+run_step consumer "self_test 계약 (checker whitelist·root resolver)" hook_selftest_contract_check
+run_step consumer "hook 경로 도달 증명 (hook_path_reachability_check)" hook_path_reachability_check
+run_step consumer "hook 대상 실재 (hook_target_existence_check)" hook_target_existence_check
+run_step dev-only "hook 표기 회귀 방지 (hook_path_notation_regression_check)" hook_path_notation_regression_check
+run_step dev-only "템플릿 build 검증 (build_template.sh verify)" build_verify_check
+run_step dev-only "템플릿 빌더 단위 테스트 (test_build_template.sh)" test_build_template_check
+run_step dev-only "배포 미러 계약 (test_publish_mirror.sh)" test_publish_mirror_check
+run_step dev-only "생성 full 트리 결함 보고 회귀 (generated_tree_defect_reports_check)" generated_tree_defect_reports_check
 claudemd_size_check() {
   local checker="${SCRIPT_DIR}/check_claudemd_size.sh"
   if [[ -f "$checker" ]]; then bash "$checker"; else echo "  (skip: check_claudemd_size.sh 없음 — lite 산출물)"; fi
 }
-run_step "CLAUDE.md 크기 제한 (check_claudemd_size.sh)" claudemd_size_check
+run_step consumer "CLAUDE.md 크기 제한 (check_claudemd_size.sh)" claudemd_size_check
 
 print_skip_summary() {
   echo ""
@@ -1317,6 +1413,26 @@ print_skip_summary() {
   fi
 }
 
+# 청중 제외 요약 — `consumer` 모드에서 무엇이 빠졌는지 사용자에게 보입니다.
+# 스킵 요약(smoke)과 **다른 축**이라 별 함수로 둡니다: smoke 는 "변경과 무관해서" 건너뛰고,
+# 이쪽은 "이 프로젝트에서 판정할 대상이 아니라서" 제외합니다. 한 문구로 합치면 사용자가
+# 감축 사유를 오해합니다.
+print_audience_summary() {
+  echo ""
+  echo "== 청중 제외 요약 (consumer 모드) =="
+  echo "청중 제외된 스텝 (${#AUDIENCE_EXCLUDED[@]}개) — 사유: dev-only (rd-workflow 정본 저작 규칙)"
+  if (( ${#AUDIENCE_EXCLUDED[@]} > 0 )); then
+    printf '  - %s\n' "${AUDIENCE_EXCLUDED[@]}"
+  fi
+  echo "이 실행은 전수 검증이 아닙니다. 정본 위생 검사까지: bash rd-workflow/scripts/self_test.sh full"
+  # 예정(정적 집계)과 실제 제외가 어긋나면 배너가 사용자에게 거짓을 말한 것이므로 신고합니다.
+  # rc 는 바꾸지 않습니다 — 신고이지 판정이 아닙니다.
+  if [[ "${#AUDIENCE_EXCLUDED[@]}" -ne "$SELFTEST_AUD_DEVONLY" ]]; then
+    echo "== 경고: 청중 제외 예정(${SELFTEST_AUD_DEVONLY}개)과 실제 제외(${#AUDIENCE_EXCLUDED[@]}개)가 다릅니다 ==" >&2
+    echo "   배너가 표시한 범위와 실제 실행 범위가 어긋났습니다. full 로 전수 실행해 확인하십시오." >&2
+  fi
+}
+
 # dry-run: 스텝을 실행하지 않고 실행/스킵 예정만 보고합니다 (무엇이 빠지는지 미리 확인하는 용도).
 if [[ -n "${RD_SELFTEST_SMOKE_DRYRUN:-}" ]]; then
   # 스킵 요약은 smoke 모드에서만 의미가 있습니다. 모드 가드가 없으면 full 실행인데도
@@ -1325,6 +1441,9 @@ if [[ -n "${RD_SELFTEST_SMOKE_DRYRUN:-}" ]]; then
   # `set -e` 하에서 스크립트가 죽으므로 반드시 if 문으로 씁니다.
   if [[ "$SELFTEST_MODE" == "smoke" ]]; then
     print_skip_summary
+  fi
+  if [[ "$SELFTEST_MODE" == "consumer" ]]; then
+    print_audience_summary
   fi
   echo ""
   echo "== 실행 예정 스텝 (${#STEP_NAMES[@]}개) =="
@@ -1340,6 +1459,9 @@ fi
 # 블록의 마지막 명령이 되어 rc 1 이 되고, `set -e` 에 걸려 스크립트가 그 자리에서 죽습니다.
 if [[ "$SELFTEST_MODE" == "smoke" ]]; then
   print_skip_summary
+fi
+if [[ "$SELFTEST_MODE" == "consumer" ]]; then
+  print_audience_summary
 fi
 
 echo ""
@@ -1362,6 +1484,15 @@ if [[ "$FAIL" -eq 0 ]]; then
       echo "  full PASS 지문을 기록했습니다 (아카이브 시점 대조에 사용됩니다)"
     else
       echo "  full PASS 지문을 기록하지 못했습니다 — 아카이브 시 full 재실행을 요구받습니다" >&2
+    fi
+  fi
+  # consumer 증명은 **별 파일**에 남깁니다 (spec §7). full 증명 자리에 쓰면 부분 실행이
+  # 전수 통과로 위장되고, 아무것도 남기지 않으면 게이트의 사후 대조가 항상 실패합니다.
+  if [[ "$SELFTEST_MODE" == "consumer" ]] && declare -F smoke_record_consumer_pass >/dev/null 2>&1; then
+    if smoke_record_consumer_pass "$SELFTEST_ROOT" "$SELFTEST_START_FP" "$SELFTEST_START_USTATE"; then
+      echo "  consumer PASS 지문을 기록했습니다 (아카이브 시점 대조에 사용됩니다)"
+    else
+      echo "  consumer PASS 지문을 기록하지 못했습니다 — 아카이브 시 재실행을 요구받습니다" >&2
     fi
   fi
   exit 0

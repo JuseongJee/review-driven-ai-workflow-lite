@@ -160,10 +160,10 @@ archive_review_precheck() {
   return 0
 }
 
-# --- 아카이브 전 전수 검증 강제 (change spec §5.5) ---------------------------------
+# --- 아카이브 전 검증 강제 (change spec §5.5 / 청중 경계: consumer 집합) -----------
 #
 # 축소 실행(smoke)이 구문 검사를 변경 파일로 좁히면서 **미변경 스크립트의 구문 오류를 놓치게**
-# 됐고, 그 대가를 통합 직전에 상환하는 것이 전수 검증입니다. 커밋 전 게이트에는 사용자 승인
+# 됐고, 그 대가를 통합 직전에 상환하는 것이 이 검증입니다 (강제 범위는 consumer 청중). 커밋 전 게이트에는 사용자 승인
 # 우회 밸브가 있고 이 저장소는 인프라 커밋이 대부분이라 그 밸브가 상시 쓰입니다 —
 # **여기에는 우회 밸브를 두지 않습니다.** 편의를 위한 예외를 하나라도 만드는 순간 축소 실행의
 # 검출력 손실이 상환되지 않고 순손실로 남습니다.
@@ -185,11 +185,11 @@ _archive_selftest_helper_load() {
   local root="$1" quiet="${2:-}" fn
   local helper="$root/rd-workflow/scripts/_smoke_common.sh"
   if [[ ! -f "$helper" ]]; then
-    [[ -n "$quiet" ]] || printf 'archive: 전수 검증 증명 헬퍼가 없습니다: %s\n' "$helper" >&2
+    [[ -n "$quiet" ]] || printf 'archive: 검증 증명 헬퍼가 없습니다: %s\n' "$helper" >&2
     return 1
   fi
   if ! bash -n "$helper" 2>/dev/null; then
-    [[ -n "$quiet" ]] || printf 'archive: 전수 검증 증명 헬퍼에 구문 오류가 있습니다: %s\n' "$helper" >&2
+    [[ -n "$quiet" ]] || printf 'archive: 검증 증명 헬퍼에 구문 오류가 있습니다: %s\n' "$helper" >&2
     return 1
   fi
   # shellcheck source=/dev/null
@@ -203,7 +203,7 @@ _archive_selftest_helper_load() {
   return 0
 }
 
-# 지금 워킹트리 내용으로 전수 검증을 통과한 기록이 있는지 확인합니다.
+# 지금 워킹트리 내용으로 검증을 통과한 기록이 있는지 확인합니다 (full 또는 consumer 증명).
 # 사용: archive_selftest_precheck <project_root>. return 0=진행, 1=차단.
 #
 # 판정은 커밋 전 게이트와 **같은 함수**에 위임합니다. 지문 대조와 untracked 검사를 여기서
@@ -213,17 +213,28 @@ _archive_selftest_helper_load() {
 archive_selftest_precheck() {
   local root="$1"
   if ! _archive_selftest_helper_load "$root"; then
-    printf 'archive: 전수 검증 통과 기록을 확인할 수 없어 차단합니다\n' >&2
+    printf 'archive: 검증 통과 기록을 확인할 수 없어 차단합니다\n' >&2
     return 1
   fi
-  if ! smoke_cache_valid "$root" worktree; then
-    printf 'archive: 전수 검증 증명이 유효하지 않습니다 (위 사유 참조)\n' >&2
+  # **`archive-gate 판정`** — full 증명 **또는** consumer 증명 중 현재 지문과 일치하는 것을
+  # 인정합니다. `full` 은 `consumer` 의 상위 집합이므로 인정하고, 반대는 인정하지 않습니다.
+  # 전수 통과를 요구하는 코드는 `smoke_cache_valid`(= `full-only 판정`)를 직접 호출해야 합니다.
+  #
+  # 헬퍼가 옛 버전이면 이 함수가 없을 수 있으므로 `full-only 판정` 으로 되돌립니다 —
+  # 더 좁은 쪽(= 더 엄격한 쪽)이므로 폴백이 게이트를 약화시키지 않습니다.
+  if declare -F smoke_archive_gate_valid >/dev/null 2>&1; then
+    if ! smoke_archive_gate_valid "$root" worktree; then
+      printf 'archive: 검증 증명이 유효하지 않습니다 (위 사유 참조)\n' >&2
+      return 1
+    fi
+  elif ! smoke_cache_valid "$root" worktree; then
+    printf 'archive: 검증 증명이 유효하지 않습니다 (위 사유 참조)\n' >&2
     return 1
   fi
   return 0
 }
 
-# 전수 검증을 돌리기 전에 환경에서 떨어뜨릴 변수 이름을 한 줄씩 냅니다.
+# 검증을 돌리기 전에 환경에서 떨어뜨릴 변수 이름을 한 줄씩 냅니다.
 #
 # **이름 목록이 아니라 계열로 산출합니다.** 하나씩 적어 두면 같은 성질의 변수를 새로
 # 만들 때마다 구멍이 하나씩 조용히 늘어나고, 그 구멍은 "통과 기록이 정상으로 남는"
@@ -245,8 +256,8 @@ archive_selftest_env_denylist() {
 # return 0 = 성립, 1 = 불성립(사유는 stderr).
 #
 # 두 항목 모두 묻는 것은 하나입니다 — **증명 대상과 발행 대상이 같은가.**
-#   - untracked 가 있으면 전수 검증이 통과해도 증명이 기록되지 않습니다(기록 조건은
-#     시작·종료 양쪽 0건). 돌려 봐야 같은 자리에서 다시 13분을 쓰게 됩니다.
+#   - untracked 가 있으면 검증이 통과해도 증명이 기록되지 않습니다(기록 조건은
+#     시작·종료 양쪽 0건). 돌려 봐야 같은 자리에서 그 시간을 다시 쓰게 됩니다.
 #   - 워킹트리가 HEAD 와 다르면, 게이트가 증명하는 것은 **워킹트리**인데 tag·push 로
 #     발행되는 것은 **HEAD** 입니다. 갈라진 채 통과하면 게이트는 "검증됐다" 고 말하는데
 #     실제 발행물은 검증 대상이 아니었습니다. 강제 플래그의 주 용도가 바로 이 tracked
@@ -270,16 +281,16 @@ archive_selftest_preconditions() {
     local ustate=0 ulist=""
     ulist="$(smoke_untracked_state "$root")" || ustate=$?
     if [[ "$ustate" -eq 2 ]]; then
-      printf 'archive: untracked 목록 조회에 실패해(git 오류) 전수 검증을 실행하지 않았습니다\n' >&2
+      printf 'archive: untracked 목록 조회에 실패해(git 오류) 검증을 실행하지 않았습니다\n' >&2
       printf 'archive:   지금 실행해도 증명이 기록되지 않아 같은 자리에서 반복됩니다\n' >&2
       exit 1
     fi
     if [[ "$ustate" -eq 1 ]]; then
-      printf 'archive: 증명에 담기지 않는 untracked 파일이 있어 전수 검증을 실행하지 않았습니다\n' >&2
+      printf 'archive: 증명에 담기지 않는 untracked 파일이 있어 검증을 실행하지 않았습니다\n' >&2
       printf '%s\n' "$ulist" | sed 's/^/  /' >&2
       printf 'archive:   지금 실행하면 통과해도 증명이 남지 않아 재실행마다 같은 시간을 다시 씁니다\n' >&2
       printf 'archive:   무관한 파일이면 git add 또는 정리 후 다시 실행하십시오 (--force-dirty 로 clean 검사를 넘긴 경우입니다)\n' >&2
-      printf 'archive:   **이것이 전수 검증 실패를 고치는 내용이라면 main 이 아니라 fr 브랜치에서 고치고 diff review 를 거치십시오**\n' >&2
+      printf 'archive:   **이것이 검증 실패를 고치는 내용이라면 main 이 아니라 fr 브랜치에서 고치고 diff review 를 거치십시오**\n' >&2
       printf 'archive:   (main 에서 커밋하면 그 수정은 리뷰를 거치지 않은 채 발행됩니다)\n' >&2
       exit 1
     fi
@@ -288,16 +299,16 @@ archive_selftest_preconditions() {
     while IFS= read -r sp; do [[ -n "$sp" ]] && pspec+=("$sp"); done < <(smoke_proof_exclude)
     git -C "$root" diff --quiet HEAD -- ${pspec[@]+"${pspec[@]}"} 2>/dev/null || dstate=$?
     if [[ "$dstate" -ge 2 ]]; then
-      printf 'archive: 워킹트리와 HEAD 의 대조에 실패해(git 오류) 전수 검증을 실행하지 않았습니다\n' >&2
+      printf 'archive: 워킹트리와 HEAD 의 대조에 실패해(git 오류) 검증을 실행하지 않았습니다\n' >&2
       printf 'archive:   무엇이 발행될지 알 수 없는 상태라 진행할 수 없습니다\n' >&2
       exit 1
     fi
     if [[ "$dstate" -ne 0 ]]; then
-      printf 'archive: 커밋되지 않은 변경이 있어 전수 검증을 실행하지 않았습니다\n' >&2
+      printf 'archive: 커밋되지 않은 변경이 있어 검증을 실행하지 않았습니다\n' >&2
       printf 'archive:   증명 대상(워킹트리)과 발행 대상(HEAD)이 달라 검증이 성립하지 않습니다\n' >&2
       git -C "$root" diff --name-only HEAD -- ${pspec[@]+"${pspec[@]}"} 2>/dev/null | sed 's/^/  /' >&2
       printf 'archive:   무관한 변경이면 commit 또는 stash 후 다시 실행하십시오 (--force-dirty 로 clean 검사를 넘긴 경우입니다)\n' >&2
-      printf 'archive:   **이것이 전수 검증 실패를 고치는 내용이라면 main 이 아니라 fr 브랜치에서 고치고 diff review 를 거치십시오**\n' >&2
+      printf 'archive:   **이것이 검증 실패를 고치는 내용이라면 main 이 아니라 fr 브랜치에서 고치고 diff review 를 거치십시오**\n' >&2
       printf 'archive:   (main 에서 커밋하면 그 수정은 리뷰를 거치지 않은 채 발행됩니다)\n' >&2
       exit 1
     fi
@@ -305,7 +316,7 @@ archive_selftest_preconditions() {
   )
 }
 
-# 증명이 없거나 stale 하면 **그 자리에서 전수 검증을 실행**하고 다시 대조합니다.
+# 증명이 없거나 stale 하면 **그 자리에서 consumer 검증을 실행**하고 다시 대조합니다.
 # 사용: archive_selftest_gate <project_root>. return 0=진행, 1=중단.
 #
 # 아카이브는 hook 이 아니라 사용자가 직접 실행하는 스크립트라 시간 제약이 없어, 막고 끝내는
@@ -315,7 +326,7 @@ archive_selftest_gate() {
   # 전제 확인이 **증명 대조보다 먼저**입니다 (근거는 위 함수 주석).
   archive_selftest_preconditions "$root" || return 1
 
-  # 첫 대조의 사유는 아직 "문제" 가 아닙니다 — 바로 아래에서 전수 검증을 돌려 해소하기
+  # 첫 대조의 사유는 아직 "문제" 가 아닙니다 — 바로 아래에서 검증을 돌려 해소하기
   # 때문입니다. 그래서 붙잡아 두었다가 **실제로 막을 때만** stderr 로 내고, 정상 진행
   # 경로에서는 "왜 지금 도는가" 의 설명으로 stdout 에 붙입니다.
   # 정상 진행이 stderr 를 쓰면 무출력 계약을 검사하는 소비처가 정상 상태를 결함으로 봅니다.
@@ -326,11 +337,16 @@ archive_selftest_gate() {
 
   # 진행 안내는 stdout 입니다 — 이 스크립트의 관례가 "진행은 stdout · 문제는 stderr" 이고,
   # 정상 진행 경로가 stderr 를 쓰면 무출력 계약을 검사하는 소비처가 정상 상태를 결함으로 봅니다.
-  printf 'archive: 이 내용으로 전수 검증을 통과한 기록이 없어 지금 실행합니다\n'
+  printf 'archive: 이 내용으로 검증을 통과한 기록이 없어 지금 실행합니다\n'
   [[ -z "$why" ]] || printf '%s\n' "$why" | sed 's/^/archive:   /'
-  printf 'archive:   이 저장소 실측 기준 약 6분이 걸립니다. 진행 상황은 아래 스텝 출력으로 확인하십시오\n'
+  # **범위를 정직하게 말합니다.** 예전 문구는 "전수 검증" 이었는데, 게이트가 실제로 강제하는
+  # 것은 `consumer` 청중 집합입니다. 전수라고 말하면 사용자는 정본 위생 검사까지 끝났다고
+  # 오인하고, 그 오인이 곧 "발행 전에 확인했다" 는 잘못된 안심이 됩니다.
+  printf 'archive:   범위: consumer 청중 (이 프로젝트에서 뜻이 있는 검사). 전수 검증이 아닙니다\n'
+  printf 'archive:   정본 위생 검사까지 보려면 따로 bash rd-workflow/scripts/self_test.sh full 을 실행하십시오\n'
+  printf 'archive:   실행 예정 스텝 수와 제외 내역은 아래 시작 배너에 표시됩니다\n'
   printf 'archive:   중단해도 merge 는 이미 반영돼 있어, 다시 실행하면 이 지점부터 이어집니다\n'
-  # 전수 검증은 **위생적인 환경**에서 돌려야 합니다. 셸에 export 된 채 남은 변수 하나가
+  # 검증은 **위생적인 환경**에서 돌려야 합니다. 셸에 export 된 채 남은 변수 하나가
   # 검사를 통째로 건너뛰게 하거나(dry-run 은 0.1초에 rc 0, checker-only 는 아무것도 실행
   # 않고 rc 0) 검출력을 조용히 낮추면(스트레스 회차·크기 제한은 허용 범위 안이라 경고조차
   # 나지 않습니다), 통과 기록만 정상으로 남아 안전망이 거짓말을 합니다.
@@ -341,12 +357,12 @@ archive_selftest_gate() {
   # 산출하지 않으므로 현행 코드에서 도달 불가이나, 계열을 넓힐 때 이 구분이 필요합니다.
   local _envu=() _dv
   while IFS= read -r _dv; do [[ -n "$_dv" ]] && _envu+=( -u "$_dv" ); done < <(archive_selftest_env_denylist)
-  if ! env ${_envu[@]+"${_envu[@]}"} bash "$root/rd-workflow/scripts/self_test.sh" full; then
-    printf 'archive: 전수 검증 실패 — 원인을 해결한 뒤 다시 실행하십시오\n' >&2
+  if ! env ${_envu[@]+"${_envu[@]}"} bash "$root/rd-workflow/scripts/self_test.sh" consumer; then
+    printf 'archive: 검증 실패 — 원인을 해결한 뒤 다시 실행하십시오\n' >&2
     return 1
   fi
   if ! archive_selftest_precheck "$root"; then
-    printf 'archive: 전수 검증은 통과했으나 증명 대조가 여전히 불일치합니다\n' >&2
+    printf 'archive: 검증은 통과했으나 증명 대조가 여전히 불일치합니다\n' >&2
     printf 'archive:   실행 중 파일이 바뀌었거나 증명이 기록되지 않았습니다 (위 사유 참조)\n' >&2
     return 1
   fi

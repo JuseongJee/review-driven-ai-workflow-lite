@@ -237,12 +237,12 @@ eq "정본 경로만 변경돼도 관련 스텝을 찾음" "$rc" "0"
 # --- run_step 정적 추출 ------------------------------------------------------
 cat > "$S/fake_self_test_zzfx.sh" <<'EOF'
 #!/usr/bin/env bash
-run_step "alpha 테스트" bash "${SCRIPT_DIR}/test_alpha_zzfx.sh"
-run_step "beta 테스트" bash "${SCRIPT_DIR}/test_beta_zzfx.sh"
-run_step "inline 검사" some_checker
-  run_step "들여쓰기된 호출은 최상위가 아님" bash "${SCRIPT_DIR}/test_beta_zzfx.sh"
-run_step "미정의 변수 스텝" env "X=${UNDEFINED_FOR_TEST}" bash "${SCRIPT_DIR}/test_alpha_zzfx.sh"
-run_step "깨진 인용" bash "unbalanced
+run_step consumer "alpha 테스트" bash "${SCRIPT_DIR}/test_alpha_zzfx.sh"
+run_step consumer "beta 테스트" bash "${SCRIPT_DIR}/test_beta_zzfx.sh"
+run_step consumer "inline 검사" some_checker
+  run_step consumer "들여쓰기된 호출은 최상위가 아님" bash "${SCRIPT_DIR}/test_beta_zzfx.sh"
+run_step consumer "미정의 변수 스텝" env "X=${UNDEFINED_FOR_TEST}" bash "${SCRIPT_DIR}/test_alpha_zzfx.sh"
+run_step consumer "깨진 인용" bash "unbalanced
 EOF
 reset_scripts_index
 # 뒤의 두 스텝은 preflight 의 eval 이 밟는 지뢰 두 개(미정의 변수·인용 파손)를 재현합니다.
@@ -331,8 +331,8 @@ eq "스텝 추출 0건이면 rc=1 (full 폴백)" "$rc" "1"
 # 무관한 파일까지 모든 스텝에 매치되어 관련성 판정이 무력화됩니다.
 cat > "$S/self_test.sh" <<'EOF'
 #!/usr/bin/env bash
-run_step "gamma 테스트" bash "${SCRIPT_DIR}/test_gamma_zzfx.sh"
-run_step "무관한 스텝" bash "${SCRIPT_DIR}/unrelated_target_zzfx.sh"
+run_step consumer "gamma 테스트" bash "${SCRIPT_DIR}/test_gamma_zzfx.sh"
+run_step consumer "무관한 스텝" bash "${SCRIPT_DIR}/unrelated_target_zzfx.sh"
 EOF
 cat > "$S/test_gamma_zzfx.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -358,9 +358,11 @@ eq "실제로 참조하는 대상이 바뀌면 실행" "$rc" "0"
 # --- preflight ↔ smoke_step_relevant 교차 검증 --------------------------------
 # 두 경로가 갈라지면 preflight 가 보여준 스킵 목록과 실제 실행이 어긋납니다.
 cross_check() {
-  local label="$1" desc cmd idx=0 expect="" _u_on=0
+  local label="$1" aud desc cmd idx=0 expect="" _u_on=0
   smoke_preflight "$S" "$S/fake_self_test_zzfx.sh" || { no "$label (preflight rc=1)"; return 0; }
-  while IFS=$'\t' read -r desc cmd; do
+  # 추출은 `<청중>\t<설명>\t<명령>` 3필드입니다. 2필드로 읽으면 명령 자리에 설명이 섞여
+  # eval 이 실패하고 모든 스텝이 "항상 실행" 으로 접혀, 이 교차 검증이 조용히 공허해집니다.
+  while IFS=$'\t' read -r aud desc cmd; do
     idx=$((idx + 1))
     cmd="${cmd//\$\{SCRIPT_DIR\}/$S}"
     # preflight 와 같은 이유로 이 구간에서만 -u 를 내립니다 (미정의 변수 확장 = 셸 종료).
@@ -902,6 +904,55 @@ eq "index 모드: 지문이 다르면 여전히 무효" "$rc" "1"
 git -C "$FR2" reset -q >/dev/null 2>&1
 git -C "$FR2" checkout -- . >/dev/null 2>&1
 rm -f "$FR2/mode_split_note_zzfx.sh"
+
+# --- 추출식의 sed 구현 독립성 (AC 11) ---------------------------------------
+# 추출식은 BSD·GNU sed 양쪽에서 같은 결과를 내야 합니다. GNU 확장(`\+`·`\|`·`\?`)을 쓰면
+# macOS 기본 `/usr/bin/sed` 에서 매치가 통째로 실패해 **추출 0건 → full 폴백** 이 되고,
+# 감축이 조용히 사라집니다 (rc 는 0 이라 아무도 모릅니다).
+#
+# **`sed --version` 으로 실제 구현을 먼저 확인**합니다. 다른 머신에서는 PATH `sed` 가 BSD 일
+# 수 있는데, 그때 "GNU 실측" 이라고 보고하면 검증하지 않은 것을 검증했다고 말하는 셈입니다.
+_ext_pat='s/^run_step \([a-z-]*\) "\([^"]*\)" \(.*\)$/\1\t\2\t\3/p'
+_ext_fx="$S/sed_parity_zzfx.sh"
+{
+  printf 'run_step consumer "설명 하나" bash "${SCRIPT_DIR}/x_zzfx.sh"\n'
+  printf 'run_step dev-only "설명 둘" inline_checker\n'
+  printf '  run_step consumer "들여쓰기" true\n'
+} > "$_ext_fx"
+
+_gnu_out=""; _bsd_out=""
+if sed --version >/dev/null 2>&1 && sed --version 2>/dev/null | head -1 | grep -qi 'gnu'; then
+  _gnu_out="$(sed -n "$_ext_pat" "$_ext_fx")"
+  ok "PATH sed 가 GNU 임을 확인 (GNU 경로를 실측함)"
+else
+  ok "PATH sed 가 GNU 가 아님 — GNU 경로는 이 머신에서 미실측 (BSD 경로만 검증)"
+fi
+if [[ -x /usr/bin/sed ]] && ! /usr/bin/sed --version >/dev/null 2>&1; then
+  _bsd_out="$(/usr/bin/sed -n "$_ext_pat" "$_ext_fx")"
+  ok "/usr/bin/sed 가 BSD 임을 확인 (BSD 경로를 실측함)"
+else
+  ok "/usr/bin/sed 가 BSD 가 아님 — BSD 경로는 이 머신에서 미실측"
+fi
+
+# 어느 한쪽이라도 실측했으면 최상위 2건만 뽑히는지 확인합니다 (들여쓰기 호출 제외).
+for _which in gnu bsd; do
+  case "$_which" in
+    gnu) _o="$_gnu_out" ;;
+    bsd) _o="$_bsd_out" ;;
+  esac
+  [[ -n "$_o" ]] || continue
+  eq "추출식(${_which}): 최상위 2건만" "$(printf '%s\n' "$_o" | wc -l | tr -d ' ')" "2"
+  eq "추출식(${_which}): 첫 필드가 청중" "$(printf '%s\n' "$_o" | head -1 | cut -f1)" "consumer"
+  eq "추출식(${_which}): 둘째 필드가 설명" "$(printf '%s\n' "$_o" | head -1 | cut -f2)" "설명 하나"
+  eq "추출식(${_which}): dev-only 도 추출" "$(printf '%s\n' "$_o" | sed -n 2p | cut -f1)" "dev-only"
+done
+# 둘 다 실측했으면 **결과가 같아야** 합니다 — 이것이 이 케이스의 본 단언입니다.
+if [[ -n "$_gnu_out" && -n "$_bsd_out" ]]; then
+  eq "추출식: BSD 와 GNU 결과 동일" "$_bsd_out" "$_gnu_out"
+else
+  ok "두 sed 를 동시에 실측할 수 없어 동일성 대조는 건너뜀 (한쪽만 검증됨)"
+fi
+rm -f "$_ext_fx"
 
 echo ""
 if [[ "$FAIL" -eq 0 ]]; then echo "test_smoke_common: PASS"; exit 0; else echo "test_smoke_common: FAIL" >&2; exit 1; fi
