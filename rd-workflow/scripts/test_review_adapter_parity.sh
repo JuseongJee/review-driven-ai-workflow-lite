@@ -17,6 +17,56 @@ TMP="$(mktemp -d)"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
+# --- 실 CLI 차단 (FR parity-test-stall) ---
+# 이 스위트는 전부 stub 기반이므로 실제 codex·claude CLI 에 **절대 닿으면 안 됩니다.**
+# 그런데 도구 경로 해석에 이름 폴백이 두 겹 있습니다.
+#   run_review_turn.sh — config 의 bin 이 비면 `check_bin="${tool_bin:-$tool}"` 로 도구 이름 폴백
+#   adapter_codex.sh   — 그 뒤 다시 `codex_bin="${TOOL_BIN:-codex}"` 로 이름 폴백
+# 그래서 fixture 가 쓴 config 가 무시되는 조건이 하나라도 성립하면 PATH 의 **실물** CLI 가 뜹니다.
+# 실측으로 두 조건을 재현했습니다.
+#   ① 환경에 REVIEW_TOOLS_CONFIG 가 상속돼 있으면 fixture config 파일 자체가 읽히지 않습니다
+#      (run_review_turn.sh 의 CONFIG_FILE 이 그 환경변수를 우선합니다).
+#   ② jq 부재·파싱 실패로 설정 파싱이 무너지면 모든 bin 조회가 빈 값이 됩니다.
+# 실물 CLI 가 뜨면 워치독(WAIT_TIMEOUT, production 기본 600초) 이 만료될 때까지 **조용히 대기**해
+# 호출 1회당 10분이 얹힙니다. codex 가 설치된 머신에서만 발생해 오래 원인 불명이었습니다.
+#
+# 처방은 타임아웃 단축이 아니라 **경로를 끊는 것**입니다.
+#   (1) fixture 를 우회시키는 환경변수를 제거합니다.
+#   (2) PATH 최상단에 즉시 실패하는 tripwire 를 놓아 이름 폴백이 실물에 닿지 못하게 합니다.
+#       tripwire 는 대기 없이 죽고 호출 사실을 로그로 남기므로, "stub 이 걷혔다" 가
+#       조용한 10분이 아니라 명시적 실패로 드러납니다 (케이스 5·6 이 이를 단언합니다).
+unset REVIEW_TOOLS_CONFIG RD_REVIEW_EFFORT_OVERRIDE RD_AUTOPILOT RD_SELF_REVIEW_APPROVE \
+      REVIEW_PROMPT_INLINE_MAX_BYTES TOOL_EFFORT EFFORT_SOURCE TOOL_BIN TOOL_MODEL \
+      POLL_TIMEOUT SESSION_PATH PROMPT_FILE EXPECTED_TURN_FILE PROJECT_ROOT
+
+TRIPWIRE_LOG="$TMP/real_cli_calls.log"
+: > "$TRIPWIRE_LOG"
+mkdir -p "$TMP/pathguard"
+for _real in codex claude; do
+  cat > "$TMP/pathguard/$_real" <<TRIPEOF
+#!/usr/bin/env bash
+printf '%s\n' "$_real" >> "$TRIPWIRE_LOG"
+echo "test_review_adapter_parity: 실제 $_real CLI 호출을 차단했습니다 (stub 이 걷혔습니다)" >&2
+exit 97
+TRIPEOF
+  chmod +x "$TMP/pathguard/$_real"
+done
+export PATH="$TMP/pathguard:$PATH"
+
+# 워치독 상한도 테스트 안에서만 좁힙니다. 이것은 처방이 아니라 위생입니다 — stub 은 즉시
+# 끝나므로 정상 경로 동작은 그대로이고, tripwire 를 우회한 미지의 경로가 생기더라도 10분이
+# 아니라 수십 초 안에 드러납니다. production 기본값(600초)은 건드리지 않습니다.
+export WAIT_TIMEOUT=30
+
+# tripwire 발동 여부 단언. 로그가 비어 있어야 "stub 만 사용됐다" 가 성립합니다.
+assert_no_real_cli() { # assert_no_real_cli <라벨>
+  if [ -s "$TRIPWIRE_LOG" ]; then
+    fail "$1 (호출된 실 CLI: $(tr '\n' ' ' < "$TRIPWIRE_LOG"))"
+  else
+    pass "$1"
+  fi
+}
+
 # --- 격리 트리 구성 ---
 # run_review_turn.sh 는 자기 위치에서 project_root 를 계산하므로, 스크립트를 임시 트리로
 # 복사해 정본 트리를 건드리지 않고 실행한다.
@@ -188,6 +238,42 @@ eq "$(grep '^TOOL_EFFORT=' "$TMP/cap/codex.env")" "TOOL_EFFORT=" \
    "AC2 설정 부재 시 사전 export 된 값이 codex 로 새지 않음 (후퇴 없음)"
 grep -q 'effort override: none/global' "$TMP/out_c4_codex"
 chk $? "AC23 설정 부재 시 none/global 로 보고 (상속값에 오염되지 않음)"
+
+echo "=== 케이스 5: stub 고정 — 실 CLI 에 닿지 않았는가 ==="
+# 위 네 케이스는 stub 이 걷히면 결국 실패하지만, 실패하기까지 호출당 워치독 만료(600초)를
+# 기다립니다. 그 대기 자체가 결함이므로 "실 CLI 를 부르려 했다" 를 별도로 단언합니다.
+assert_no_real_cli "케이스 1~4 전 구간에서 실제 codex·claude CLI 가 호출되지 않음 (stub 만 사용)"
+
+echo "=== 케이스 6: 가드 자체가 살아 있는가 ==="
+# 이 결함의 본질은 "stub 이 걷혔는데도 테스트가 조용히 기다린 것" 입니다. 그래서 가드가
+# 실제로 발동하는지, 그리고 **대기 없이** 실패하는지를 고정합니다. bin 키가 없는 config 는
+# production 의 실제 형태이자 fixture 가 우회당했을 때 만들어지는 상태와 같습니다.
+cat > "$TMP/rd-workflow/config/review-tools.json" <<'EOF'
+{
+  "default_priority": ["codex"],
+  "tools": { "codex": {} }
+}
+EOF
+reset_session
+: > "$TRIPWIRE_LOG"
+guard_start="$(date +%s)"
+(
+  cd "$TMP"
+  REVIEW_PROMPT_INLINE_MAX_BYTES=200000 \
+    bash "$TMP/rd-workflow/scripts/run_review_turn.sh" sess >"$TMP/out_c6" 2>"$TMP/err_c6"
+)
+guard_rc=$?
+guard_elapsed=$(( $(date +%s) - guard_start ))
+
+[ "$guard_rc" -ne 0 ]
+chk $? "bin 미지정이면 턴이 실패한다 (실 CLI 로 조용히 넘어가지 않음)"
+grep -q '^codex$' "$TRIPWIRE_LOG"
+chk $? "이름 폴백이 tripwire 에 걸린다 — 가드가 죽어 있지 않음"
+# 상한은 WAIT_TIMEOUT(30초)보다 작아야 의미가 있습니다. 워치독을 한 번이라도 끝까지
+# 기다렸다면 이 단언이 깨집니다. tripwire 경로의 실측은 수 초입니다.
+[ "$guard_elapsed" -lt 20 ]
+chk $? "대기 없이 즉시 실패한다 — 워치독 만료를 기다리지 않음 (실측 ${guard_elapsed}초)"
+: > "$TRIPWIRE_LOG"
 
 echo
 if [ "$FAIL" -eq 0 ]; then

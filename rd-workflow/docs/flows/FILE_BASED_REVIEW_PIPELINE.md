@@ -95,7 +95,6 @@ final-diff-review 진행 중 reviewer 가 코드 수정을 요청하면, author 
 
 - author: 수정 commit → 새 author 턴 파일 작성 → `SESSION.md` Status 를 `awaiting-reviewer` 로 전환.
 - reviewer: `run_review_turn.sh` 로 갱신된 `<기본 브랜치>...HEAD` 를 재검토.
-- `pre_commit_review_gate.sh` 는 미종결 중 **archive/완료 신호 commit**(staged `request-archive/` 파일 추가 또는 `CURRENT_TASK.md` baseline reset)만 차단하고, iteration 수정 commit 은 허용한다. 종결 여부를 파싱할 수 없는 malformed 세션도 동일하게 archive 신호일 때만 차단한다.
 - 미검증 archive/merge 의 최종 차단은 `archive.sh` 의 review 종결 재검증이 담당한다(malformed 세션 포함 fail-closed). iteration commit 허용이 이 안전장치를 약화하지 않는다.
 - archive.sh 의 precheck 는 merge 전에 **fr branch tip** 에 commit 된 diff-review 세션을 검증한다(main 워킹트리 비의존). 따라서 "세션을 fr branch 에 commit → main switch → archive.sh" 표준 흐름이 force-skip 없이 통과한다.
 

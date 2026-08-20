@@ -169,7 +169,7 @@ bash rd-workflow/scripts/lifecycle/promote_rollback.sh \
 
 | 변수 | 설명 |
 |------|------|
-| `RD_LIFECYCLE_BYPASS_REASON=<reason>` | `fr_branch_gate.sh` hook 우회용. command string에 노출되어 hook이 grep 검출. valid reason: `bootstrap` / `lifecycle` / `small-task` / `legacy` |
+| `RD_LIFECYCLE_BYPASS_REASON=<reason>` | 과거 `fr_branch_gate.sh` hook 우회용이었습니다. 그 hook 은 제거됐고 템플릿에는 이 값을 읽는 곳이 없습니다. 아직 동기화하지 않은 소비 프로젝트에 hook 이 남아 있을 수 있어 lifecycle 스크립트는 접두를 그대로 유지합니다. valid reason: `bootstrap` / `lifecycle` / `small-task` / `legacy` |
 | `RD_LIFECYCLE_NO_REMOTE=1` | `detect_remote_mode`를 강제로 `local-only`로 판정 |
 | `TASK_STATE_PATH` | task-state 파일 경로 override (기본 `rd-workflow-workspace/.lifecycle/task-state`) |
 
@@ -190,8 +190,9 @@ bash rd-workflow/scripts/lifecycle/promote_rollback.sh \
 쓰는 프로젝트에서는 이 hook 이 애초에 커밋을 막지 않습니다. 그런 브랜치에까지 `--no-verify`
 를 붙이면 필요 없이 소비 프로젝트의 `pre-commit`·`commit-msg` 검증만 건너뛰게 되므로,
 차단 대상 브랜치에서만 붙입니다. 우회 안내 메시지도 실제로 우회한 실행에서만 출력됩니다.
-반면 `RD_LIFECYCLE_BYPASS_REASON=lifecycle` 은 `fr_branch_gate.sh` 라는 별개 hook 계층을
-상대하므로 브랜치와 무관하게 세 지점 모두에서 항상 유지됩니다.
+반면 `RD_LIFECYCLE_BYPASS_REASON=lifecycle` 은 별개 hook 계층(제거된 `fr_branch_gate.sh`,
+또는 아직 동기화하지 않은 소비 프로젝트에 남은 그 사본)을 상대하므로 브랜치와 무관하게
+세 지점 모두에서 항상 유지됩니다.
 
 **건너뛰는 범위:** `--no-verify` 는 `pre-commit` 과 `commit-msg` 두 hook 을 모두 건너뜁니다.
 즉 프로젝트 자체의 lint·포맷 검사뿐 아니라 **커밋 메시지 정책 검사도 실행되지 않습니다.**

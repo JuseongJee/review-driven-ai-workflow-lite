@@ -253,7 +253,8 @@ gh_run() {
 
 visibility_of() {
   local host="$1" repo="$2" out
-  out="$(gh_run "$host" repo view --repo "$repo" --json visibility 2>/dev/null)" || return 1
+  # gh repo view 는 저장소를 위치 인자로 받는다 (--repo 플래그는 존재하지 않는다).
+  out="$(gh_run "$host" repo view "$repo" --json visibility 2>/dev/null)" || return 1
   printf '%s\n' "$out" | sed -n 's/.*"visibility"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
 }
 

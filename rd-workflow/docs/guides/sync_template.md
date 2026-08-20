@@ -266,13 +266,46 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 3. 사후 JSON 유효성 검증: `python3 -m json.tool .claude/settings.json > /dev/null`
 4. 스니펫이 출력한 제거 내역(event / matcher / command)을 사용자에게 보고합니다. `removed: 없음`이면 파일은 변경되지 않은 것입니다.
 
-**예시 (대표 사례)**: 배포 lite(VERSION 2026-06-09)로 부트스트랩한 프로젝트에는 PreToolUse/Bash에 `bash rd-workflow/scripts/hooks/pre_commit_verify.sh` 등록이 남아 있으나, 그 스크립트는 lite 산출물에 존재하지 않고 v2 lite의 `.claude/settings.json`에도 등록이 없습니다. 3중 조건에 걸려 이 항목만 제거되고, 스크립트가 존재하는 나머지 hook 등록은 보존됩니다.
+**예시 (대표 사례)**: 2026-08-20 게이트 정리 이전 템플릿으로 부트스트랩한 프로젝트에는 PreToolUse/Bash에 `bash rd-workflow/scripts/hooks/pre_commit_verify.sh` 등록이 남아 있으나, 그 스크립트는 지금 산출물에 존재하지 않고 템플릿 `.claude/settings.json`에도 등록이 없습니다. 3중 조건에 걸려 이 항목만 제거되고, 스크립트가 존재하는 나머지 hook 등록은 보존됩니다.
 
 **주의**:
 - 프로젝트 고유 hook(command가 `rd-workflow/scripts/hooks/` 하위를 가리키지 않는 항목)은 검사 대상이 아니며 절대 제거되지 않습니다.
-- full 템플릿과 sync하는 경우 스크립트가 clone에 존재해 조건 2가 성립하지 않습니다 — full/lite 산출물 차이에 자동 정합합니다.
+- 스크립트가 clone에 존재하면 조건 2가 성립하지 않습니다 — full/lite 산출물 차이와 게이트 제거 여부에 자동 정합합니다.
 - 대조 기준은 항상 clone된 템플릿 파일입니다.
 - 제거가 수행되면 JSON 재직렬화로 들여쓰기가 2칸으로 정규화될 수 있습니다.
+
+#### M007: 게이트 정리 — 값어치를 증명하지 못한 hook 제거
+
+**조건**: VERSION 2026-08-20 이후 템플릿으로 동기화하는 모든 프로젝트.
+
+**동작 변화**: 아래 hook 스크립트가 템플릿에서 사라집니다.
+
+| 제거된 hook | 사라진 동작 |
+|---|---|
+| `hooks/pre_commit_verify.sh` | 커밋 전 staged 경로 기반 검증 실행·전수 검증 증명 대조 |
+| `hooks/pre_commit_review_gate.sh` | diff review 미종결 중 archive 신호 커밋 차단 |
+| `hooks/fr_branch_gate.sh` | 기본 브랜치 직접 커밋 차단 (`RD_LIFECYCLE_BYPASS_REASON` 우회) |
+| `hooks/stop_task_save_reminder.sh` | 세션 종료 시 진행 상태 저장 넛지 |
+| `hooks/edit_provenance_record.sh` + `_edit_provenance_common.sh` | 편집 출처 기록 (위 넛지의 판정 근거) |
+| `hooks/implementation_gate.sh` 의 **단계 게이트** | 리뷰 대기 단계에서 구현 파일 수정 차단 |
+
+**유지되는 것** (혼동 주의):
+- `hooks/pre_commit_archive_gate.sh` — FR 미아카이브 커밋 차단. 그대로 동작합니다.
+- `hooks/implementation_gate.sh` 의 **subagent 주체 게이트** — 병렬 구현자가 `CURRENT_TASK.md`·`REQUEST.md`·`task-state` 를 쓰는 것을 계속 차단합니다. hook 파일 자체는 남으므로 등록을 지우지 마십시오.
+- `hooks/session_start.sh` — 그대로 동작합니다.
+- `lifecycle/archive.sh` 의 `archive_review_precheck` · `archive_selftest_gate` — 아카이브 시점의 무우회 안전망이며 강화도 완화도 하지 않았습니다.
+
+**실행 절차**:
+1. `.claude/settings.json` 의 stale hook 등록 제거는 **M005 가 그대로 처리합니다.** 제거된 5개 스크립트는 clone 에 존재하지 않고 템플릿 `.claude/settings.json` 에도 등록이 없으므로 M005 의 3중 조건에 걸립니다. M007 을 위해 따로 스니펫을 돌릴 필요가 없습니다.
+2. M005 실행 후 `.claude/settings.json` 의 `Stop` · `PostToolUse` 이벤트가 비어 남을 수 있습니다. M005 스니펫이 빈 event 를 지우므로 추가 조치는 불필요합니다.
+3. 런타임 잔여물 정리 (선택, 판정에 영향 없음):
+   - `rd-workflow-workspace/.lifecycle/verify-cache`
+   - `rd-workflow-workspace/.lifecycle/edit-provenance.d/`
+   두 항목은 `.gitignore` 에 그대로 남겨 두었습니다 — 지우지 않고 두어도 아카이브 게이트를 막지 않습니다.
+
+**주의**:
+- **`RD_LIFECYCLE_BYPASS_REASON=<reason>` 접두는 lifecycle 스크립트에 그대로 남아 있습니다.** 읽는 hook 이 사라져 템플릿 안에서는 무의미하지만, 아직 동기화하지 않은 다른 프로젝트·worktree 에 hook 사본이 남아 있을 수 있어 제거하지 않았습니다.
+- 단계 게이트가 사라졌으므로 "리뷰 대기 중에는 구현 파일을 못 고친다" 는 **더 이상 기계가 강제하지 않습니다.** `CLAUDE.md` 의 Review 규칙을 사람과 AI 가 지킵니다.
 
 ### 5. 동기화 실행
 

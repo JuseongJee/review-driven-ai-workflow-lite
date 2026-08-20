@@ -105,7 +105,8 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 - **구현 완료 후 반드시 `/final-diff-review`를 거친다.** 이 단계를 건너뛰고 merge하거나 작업을 종료하지 않는다.
 - **Superpowers가 사용 가능한 환경에서는 반드시 사용한다.** 사용 불가능할 때만 직접 산출물을 작성한다.
 - **검증**: 구현 후 `bash rd-workflow/scripts/test.sh`, `bash rd-workflow/scripts/lint.sh`, `bash rd-workflow/scripts/typecheck.sh`, `bash rd-workflow/scripts/build.sh`를 실행한다(프로젝트에 맞게 교체). typecheck는 정적 타입/컴파일 검사, build는 산출물 생성까지의 전체 빌드다 — build 실패는 검증 실패다. 아직 교체 전(`TEMPLATE_STUB` 마커 존재)이면 이 스크립트들은 **설계상 exit 1을 반환한다** — plan의 검증 Expected에 exit 0으로 서술하지 말고, 실제 명령 교체 후의 기대값 또는 프로젝트가 정의한 실질 검증 명령 기준으로 쓴다.
-- **워크플로 인프라 검증**: rd-workflow 인프라(lifecycle/review 스크립트) 자체를 수정했다면 `bash rd-workflow/scripts/self_test.sh`로 검증한다.
+- **워크플로 인프라 검증**: rd-workflow 인프라(lifecycle/review 스크립트) 자체를 수정했다면 `bash rd-workflow/scripts/self_test.sh`로 검증한다. **인자 없이 부르면 `smoke`다**(`full`은 명시해야 한다) — 변경 파일과 참조 관계로 연결된 스텝만 돌고 나머지는 건너뛰며, 어떤 스텝과도 연결되지 않으면 자동으로 full로 되돌아간다. 미리 보려면 `RD_SELFTEST_SMOKE_DRYRUN=1`을 붙인다(실행하지 않으므로 검증 결과가 아니다). **`CURRENT_TASK.md`·`REQUEST.md`가 dirty하면 감축이 거의 사라지므로** 진행 상태를 먼저 커밋하고 돌린다.
+  - `full`은 전수 실행이며 **아카이브 시 `archive.sh`가 우회 없이 강제**하므로 평소에 손으로 돌릴 필요는 없다. `--force-dirty`는 clean 검사만 넘길 뿐 이 게이트는 넘지 못한다 — 증명 대상(워킹트리)과 발행 대상(HEAD)이 달라지기 때문이니, 무관한 변경은 commit이나 stash 후 아카이브한다.
 
 ## Review 규칙
 
@@ -140,7 +141,7 @@ Source FR은 이 시점에 채우지 않는다. 해당 FR을 현재 작업으로
 
 - Status/Short Title 변경은 rd task CLI를 경유합니다 (기계 판정 권위: rd-workflow-workspace/.lifecycle/task-state — CURRENT_TASK.md의 해당 필드는 표시용 미러).
 
-Status 필드는 아래 값만 사용합니다 (guard hook이 이 값으로 판정):
+Status 필드는 아래 값만 사용합니다 (`rd task` CLI 의 전이표가 이 값으로 판정합니다 — hook 이 강제하지 않으므로 사람과 AI 가 지킵니다):
 
 - `대기 중`
 - `REQUEST review 대기`
@@ -151,7 +152,7 @@ Status 필드는 아래 값만 사용합니다 (guard hook이 이 값으로 판�
 - `diff review 대기`
 - `완료`
 
-`CURRENT_TASK.md`는 orchestrator(메인 세션)가 아래 시점마다 다시 씁니다. 병렬 구현자 subagent는 이 파일을 쓰지 않습니다 (guard hook이 차단하며, 진행 상황은 결과로 반환합니다).
+`CURRENT_TASK.md`는 orchestrator(메인 세션)가 아래 시점마다 다시 씁니다. 병렬 구현자 subagent는 이 파일을 쓰지 않습니다 (`implementation_gate.sh` 의 subagent 주체 게이트가 `Edit`·`Write` 경유 쓰기를 차단하며, 진행 상황은 결과로 반환합니다).
 
 - REQUEST 정리 후
 - spec 생성 후

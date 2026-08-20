@@ -6,21 +6,170 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# --- 실행 모드 (spec §5.1) -------------------------------------------------
+# 인자 없음 또는 smoke → smoke(기본), full → 전수 실행, 그 외 → 사용법 후 exit 1.
+#
+# **인자는 정확히 하나까지만 받습니다.** dry-run 이 환경변수 전용이라
+# `self_test.sh smoke --dry-run` 은 치기 쉬운 형태인데, 남는 인자를 무시하면 그것이 경고
+# 없이 전수 실행으로 떨어집니다 (이 저장소에서 사람이 실제로 겪었습니다 — 목록만 볼
+# 생각으로 친 명령이 수 분을 돌았습니다). 조용한 오작동보다 즉시 실패가 낫습니다.
+SELFTEST_MODE="smoke"
+selftest_usage_exit() {
+  echo "  사용법: bash rd-workflow/scripts/self_test.sh [smoke|full]" >&2
+  echo "    smoke (기본) — 변경 파일과 관련된 스텝만 실행합니다" >&2
+  echo "    full         — 전체 스텝을 실행합니다 (아카이브 전 필수 — archive.sh 가 강제합니다)" >&2
+  echo "  dry-run 은 인자가 아니라 환경변수입니다: RD_SELFTEST_SMOKE_DRYRUN=1" >&2
+  exit 1
+}
+if [[ $# -gt 1 ]]; then
+  echo "[self_test] 인자는 하나만 받습니다: $*" >&2
+  selftest_usage_exit
+fi
+case "${1:-}" in
+  ""|smoke) SELFTEST_MODE="smoke" ;;
+  full)     SELFTEST_MODE="full" ;;
+  *)
+    echo "[self_test] 알 수 없는 인자입니다: $1" >&2
+    selftest_usage_exit
+    ;;
+esac
+
+SELFTEST_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+SMOKE_FALLBACK_FULL=0
+SMOKE_FALLBACK_REASON=""
+SKIPPED_STEPS=()
+SMOKE_SKIP_DESCS=()
+SMOKE_STEP_DESCS=()
+# 순번↔설명 대조가 한 번이라도 어긋나면 그 이후 순번은 전부 남의 판정을 물려받은 상태이므로
+# 스킵 판정을 조회할 근거가 사라집니다 (= 정렬 불명). 그 시점 이후는 전부 실행합니다.
+SMOKE_ALIGN_LOST=0
+SMOKE_ALIGN_LOST_IDX=0
+SMOKE_ALIGN_FORCED=0
+# 헬퍼가 없으면(예상치 못한 배포 형태) 조용히 약해지지 않도록 전수 실행으로 되돌립니다.
+if [[ -f "${SCRIPT_DIR}/_smoke_common.sh" ]]; then
+  # shellcheck source=/dev/null
+  . "${SCRIPT_DIR}/_smoke_common.sh"
+else
+  SELFTEST_MODE="full"
+fi
+
 FAIL=0
+STEP_NAMES=()
+STEP_DURATIONS=()
 run_step() {
   local desc="$1"; shift
+  STEP_INDEX=$((STEP_INDEX + 1))
+  # smoke 이고 폴백이 아니면 preflight 판정 결과를 **호출 순번**으로 조회합니다 (spec §5.3).
+  # 폐포를 여기서 다시 계산하지 않는 이유: preflight 가 이미 전량 판정했고,
+  # 실행 중 재계산하면 시작 시 보여준 목록과 실제 실행이 어긋날 수 있습니다.
+  # 설명 문자열이 아니라 순번으로 조회하는 이유: 설명이 같은 두 스텝 중 하나만 무관해도
+  # 관련 있는 쪽까지 함께 스킵되기 때문입니다.
+  #
+  # `SMOKE_FALLBACK_FULL -eq 0` 가드는 **현재 코드에서는 이중 방어**입니다 — 모든 폴백 경로가
+  # preflight 호출 **전에** 반환하거나(수집 실패·변경 0건·자기 변경·추출 불일치), 무매핑은
+  # preflight 가 스킵 산출을 비워서 내므로 `SMOKE_SKIP_IDX` 가 항상 빈 문자열입니다.
+  # **그래도 지우지 마십시오**: preflight **이후에** 새 폴백 사유를 추가하면서 산출을 비우지
+  # 않으면 그 순간부터 폴백 상태에서 스킵이 조용히 새어 나갑니다.
+  if [[ "$SELFTEST_MODE" == "smoke" && "$SMOKE_FALLBACK_FULL" -eq 0 ]]; then
+    # 순번 조회 **전에** preflight 의 순번→설명 대응표와 대조합니다 (spec §5.3 역할 3).
+    #
+    # 정적 추출은 **최상위** run_step 만 봅니다. 그래서 함수 안에서 부른 run_step 은
+    # 추출 수를 바꾸지 않아 추출 fail-safe 를 통과하면서 런타임 순번만 밀어냅니다.
+    # 그러면 밀려난 순번이 남의 판정을 물려받아, **preflight 가 알지도 못하는 스텝이
+    # 오히려 스킵**됩니다 — spec 이 요구한 "스킵하지 않고 실행" 의 정반대입니다.
+    # 건수 대조로는 잡히지 않습니다(스킵 1건이 다른 1건으로 바뀔 뿐입니다).
+    #
+    # 어긋나면 **그 스텝과 이후 모든 스텝을** 스킵하지 않고 실행하고 경고를 남깁니다
+    # (= 정렬 불명). 어긋남은 순번을 밀어내는 사건이라 밀린 뒤의 순번은 전부 남의 판정을
+    # 물려받은 상태이고, 그 중 하나가 우연히 자기 자리 설명과 맞아떨어지면 대조가 통과해
+    # **변경된 파일 자신의 스텝이 rc=0 · 요약 완전 일치 · 무경고로 조용히 스킵**됩니다
+    # (실측: 그 조합에서 관련 스텝이 실제로 사라졌습니다). "그 스텝만 살린다" 로는
+    # 이 경로를 막지 못하므로 어긋남 이후에는 조회 자체를 하지 않습니다.
+    #
+    # 되돌릴 수 없는 것은 되돌린 척하지 않습니다 — 어긋남 **이전에** 이미 스킵한 스텝은
+    # 그대로 남으므로 이것을 "full 폴백" 으로 표기하지 않고 정렬 불명으로 신고합니다.
+    # rc 는 바꾸지 않습니다 (경고는 신고이지 판정이 아닙니다).
+    if (( SMOKE_ALIGN_LOST )); then
+      # 손실 규모를 요약에서 1줄로 보고하기 위한 계수입니다. 이 보고가 유일한 완화
+      # 장치이므로(rc 가 0 이라 감축 손실은 보고 없이는 보이지 않습니다) 빼지 마십시오.
+      SMOKE_ALIGN_FORCED=$((SMOKE_ALIGN_FORCED + 1))
+    else
+      local _expected_desc="${SMOKE_STEP_DESCS[$((STEP_INDEX - 1))]+${SMOKE_STEP_DESCS[$((STEP_INDEX - 1))]}}"
+      if [[ "$_expected_desc" != "$desc" ]]; then
+        # 경고는 **첫 어긋남에서 1회만** 냅니다. 스텝마다 반복하면 남은 스텝 수만큼 같은
+        # 4줄이 쌓여 소음이 진짜 신호를 덮습니다 (실측: 4스텝 fixture 에서 16줄).
+        SMOKE_ALIGN_LOST=1
+        SMOKE_ALIGN_LOST_IDX="$STEP_INDEX"
+        SMOKE_ALIGN_FORCED=1
+        echo "== 경고: 스텝 순번 ${STEP_INDEX} 의 preflight 대응이 어긋났습니다 ==" >&2
+        echo "   preflight: '${_expected_desc:-(없음)}' / 실제: '${desc}'" >&2
+        echo "   preflight 가 알지 못하는 스텝이 끼어들어 순번이 밀렸을 수 있습니다. 이 스텝은 스킵하지 않고 실행합니다." >&2
+        echo "   순번 정렬을 신뢰할 수 없으므로 이후 스텝도 스킵 판정을 조회하지 않고 전부 실행합니다." >&2
+        echo "   이 결과를 검증 통과로 쓰지 말고 bash rd-workflow/scripts/self_test.sh full 로 전수 실행하십시오." >&2
+      else
+        case "$SMOKE_SKIP_IDX" in
+          *"|${STEP_INDEX}|"*)
+            # 스킵은 반드시 기록과 함께 합니다. 기록 없이 return 하면 사용자에게는
+            # "스킵 0건" 으로 보이면서 실제로는 검증이 축소됩니다.
+            SKIPPED_STEPS+=("${STEP_INDEX}. ${desc}")
+            return 0
+            ;;
+        esac
+      fi
+    fi
+  fi
+  # dry-run 은 실행하지 않고 실행 예정으로만 기록합니다.
+  if [[ -n "${RD_SELFTEST_SMOKE_DRYRUN:-}" ]]; then
+    STEP_NAMES+=("$desc")
+    STEP_DURATIONS+=(0)
+    return 0
+  fi
+  local _t0=$SECONDS elapsed
   echo ""
   echo "== ${desc} =="
   if "$@"; then
-    echo "  -> PASS: ${desc}"
+    elapsed=$((SECONDS - _t0))
+    echo "  -> PASS: ${desc} (${elapsed}s)"
   else
-    echo "  -> FAIL: ${desc}" >&2
+    elapsed=$((SECONDS - _t0))
+    echo "  -> FAIL: ${desc} (${elapsed}s)" >&2
     FAIL=1
   fi
+  STEP_NAMES+=("$desc")
+  STEP_DURATIONS+=("$elapsed")
+}
+
+print_step_summary() {
+  local i
+  # self_test.sh 최상단 `set -euo pipefail`을 상속하지만, sort 등 중간 단계 실패가
+  # 마지막 명령(while read)의 종료 코드에 가려지지 않도록 이 함수 안에서 명시적으로
+  # 재확인한다. 전역에 이미 켜진 옵션을 다시 켜는 것이라 부작용은 없다.
+  set -o pipefail
+  for ((i = 0; i < ${#STEP_NAMES[@]}; i++)); do
+    printf '%s\t%s\n' "${STEP_DURATIONS[i]}" "${STEP_NAMES[i]}"
+  done | sort -t$'\t' -k1 -rn | while IFS=$'\t' read -r dur name; do
+    printf '  %ss  %s\n' "$dur" "$name"
+  done
 }
 
 syntax_check() {
   local rc=0 f
+  # smoke(폴백 아님) 에서는 변경된 *.sh 만 검사합니다 (spec §5.4 (c)).
+  # 속도가 목적이 아니라 "smoke 가 무엇을 검사하지 않는지" 원칙을 일관 적용하는 것이
+  # 목적입니다. 대가는 명확합니다 — **변경되지 않은 스크립트의 구문 오류를 smoke 는
+  # 놓칩니다.** 그것을 잡는 것은 full 이고, 그래서 폴백 상태에서는 반드시 전수로
+  # 돌아가야 합니다 (폴백이 "전수 실행" 을 뜻하는데 이 스텝만 축소된 채면 폴백 계약이
+  # 반쯤 거짓이 됩니다).
+  if [[ "$SELFTEST_MODE" == "smoke" && "$SMOKE_FALLBACK_FULL" -eq 0 ]]; then
+    smoke_changed_shell_files "$SELFTEST_ROOT"
+    for f in ${SMOKE_SYNTAX_TARGETS[@]+"${SMOKE_SYNTAX_TARGETS[@]}"}; do
+      if ! bash -n "$f" 2>/dev/null; then
+        echo "  구문 오류: $f" >&2
+        rc=1
+      fi
+    done
+    return $rc
+  fi
   while IFS= read -r f; do
     if ! bash -n "$f" 2>/dev/null; then
       echo "  구문 오류: $f" >&2
@@ -844,18 +993,146 @@ if [[ -n "${RD_SELFTEST_CHECKER_ONLY:-}" ]]; then
   exit $?
 fi
 
-run_step "stop_task_save_reminder hook" bash "${SCRIPT_DIR}/hooks/test_stop_task_save_reminder.sh"
+# --- smoke 초기화 + preflight (spec §5.2·§5.3·§5.6) ------------------------
+#
+# preflight 는 첫 스텝을 돌리기 전에 **모든 스텝을 미리 판정**합니다. 세 가지를 함께 해결합니다.
+#   (1) 무매핑 fail-safe — 어떤 폐포에도 없는 인프라 코드 변경이 있으면 full 폴백
+#   (2) 시작 시 가시성 — 실행/스킵 목록을 첫 스텝 전에 출력
+#   (3) 추출 fail-safe — run_step 정적 추출이 실패하거나 실제 호출 수와 어긋나면 full 폴백
+# 스텝 식별은 **호출 순번**입니다. 설명 문자열을 키로 쓰면 설명이 같은 두 스텝 중 하나만
+# 무관해도 관련 있는 쪽까지 스킵되고, 설명에 구분자가 들어가면 집합 표현 자체가 깨집니다.
+#
+# `SMOKE_SKIP_IDX`(`|N|` 집합) · `SMOKE_SKIP_DESCS`(`"<순번>. <설명>"`) · `SMOKE_UNMAPPED` 는
+# `_smoke_common.sh` 의 `smoke_preflight` 가 채웁니다 — 여기서 다시 초기화하지 마십시오.
+STEP_INDEX=0
+
+smoke_init() {
+  if [[ "$SELFTEST_MODE" == "full" ]]; then
+    return 0
+  fi
+  if ! smoke_collect_changed_files "$SELFTEST_ROOT"; then
+    SMOKE_FALLBACK_FULL=1
+    SMOKE_FALLBACK_REASON="변경 파일 수집에 실패했습니다 (git 실패 또는 인식할 수 없는 상태)"
+    return 0
+  fi
+  if (( ${#SMOKE_CHANGED_FILES[@]} == 0 )); then
+    SMOKE_FALLBACK_FULL=1
+    SMOKE_FALLBACK_REASON="변경 파일이 없습니다 (워킹트리 clean)"
+    return 0
+  fi
+  # 판정 엔진 자신이 바뀐 실행은 무조건 전수로 돕니다. self_test.sh 는 폐포에서 잘려 나가
+  # 어떤 스텝과도 연결되지 않고, _smoke_common.sh 는 반대로 거의 모든 스텝의 폐포에 들어가
+  # 스킵을 줄이기는 하지만 **감축 결정 자체를 자기가 내립니다** — 깨졌을지 모르는 엔진이
+  # 자기 실행의 축소 범위를 정하는 구조라, 실측상 스킵 24 / 실행 26 으로 축소된 채 통과합니다.
+  # 두 파일은 같은 특례로 묶습니다.
+  local m b
+  for m in ${SMOKE_CHANGED_FILES[@]+"${SMOKE_CHANGED_FILES[@]}"}; do
+    b="$(basename "$(smoke_normalize_path "$m")")"
+    if [[ "$b" == "self_test.sh" || "$b" == "_smoke_common.sh" ]]; then
+      SMOKE_FALLBACK_FULL=1
+      SMOKE_FALLBACK_REASON="${b} 자신이 변경되었습니다"
+      return 0
+    fi
+  done
+
+  local self="${SCRIPT_DIR}/self_test.sh" extracted actual
+  extracted="$(smoke_extract_steps "$self" | wc -l | tr -d ' ')" || extracted=0
+  actual="$(grep -c '^run_step ' "$self" 2>/dev/null || echo 0)"
+  if [[ "$extracted" -eq 0 || "$extracted" != "$actual" ]]; then
+    SMOKE_FALLBACK_FULL=1
+    SMOKE_FALLBACK_REASON="run_step 정적 추출 결과(${extracted})가 실제 호출 수(${actual})와 다릅니다"
+    return 0
+  fi
+
+  # preflight 를 **1회** 호출해 모든 스텝을 미리 판정합니다. 스텝마다 폐포를 한 번만
+  # 계산해 관련성 판정과 커버 기록을 함께 끝내며, run_step 은 그 산출(순번 집합)만
+  # 조회합니다 — 폐포를 두 번 계산하지 않고, 시작 시 보여준 목록과 실제 실행이 어긋나지
+  # 않습니다. **실행 중에 smoke_step_relevant 를 재호출하지 마십시오** — preflight 안의
+  # 캐시(스크립트 인덱스·참조 memo)가 "실행 초반 1회 호출" 을 전제로 하고 있습니다.
+  if ! smoke_preflight "$SCRIPT_DIR" "$self"; then
+    SMOKE_FALLBACK_FULL=1
+    SMOKE_FALLBACK_REASON="스텝 정적 추출에 실패했습니다 (preflight)"
+    return 0
+  fi
+  # 어떤 스텝의 폐포에도 걸리지 않는 인프라 변경은 full 폴백입니다. 이때 preflight 는
+  # 스킵 산출을 이미 비워 두므로(Task 2c C1), 이 검사를 빠뜨려도 "전부 스킵" 으로는
+  # 새지 않습니다 — 그래도 사유를 사용자에게 보여야 하므로 여기서 명시적으로 다룹니다.
+  if [[ -n "$SMOKE_UNMAPPED" ]]; then
+    SMOKE_FALLBACK_FULL=1
+    SMOKE_FALLBACK_REASON="어떤 스텝과도 연결되지 않는 인프라 변경이 있습니다: $(printf '%s' "$SMOKE_UNMAPPED" | tr '\n' ' ')"
+    return 0
+  fi
+  return 0
+}
+smoke_init
+
+# dry-run 은 스텝을 하나도 실행하지 않고 "실행 예정" 목록만 내고 exit 0 합니다. 환경변수가
+# 셸에 export 된 채 남거나 외부에서 잘못 주입되면 `full` 조차 즉시 rc 0 으로 끝나므로,
+# 사용자가 전체 검증이 통과한 것으로 오인할 수 있습니다. `RD_SELFTEST_CHECKER_ONLY` 와 같은
+# 취지로 **stderr 에** 경고를 냅니다 (stdout 을 파싱하는 테스트에는 영향이 없습니다).
+if [[ -n "${RD_SELFTEST_SMOKE_DRYRUN:-}" ]]; then
+  echo "== self_test: dry-run 모드 — 스텝을 하나도 실행하지 않습니다 (검증 결과 아님) ==" >&2
+fi
+
+# --- 시작 시 가시성 (첫 스텝 실행 전) --------------------------------------
+echo "mode: ${SELFTEST_MODE}"
+if [[ "$SELFTEST_MODE" == "smoke" ]]; then
+  if [[ "$SMOKE_FALLBACK_FULL" -eq 1 ]]; then
+    echo "  full 폴백 — 사유: ${SMOKE_FALLBACK_REASON}"
+    echo "  전체 스텝을 실행합니다."
+  else
+    echo "  변경 파일 (${#SMOKE_CHANGED_FILES[@]}개):"
+    printf '    %s\n' ${SMOKE_CHANGED_FILES[@]+"${SMOKE_CHANGED_FILES[@]}"}
+    echo "  스킵 예정 스텝 (${#SMOKE_SKIP_DESCS[@]}개) — 사유: 변경 파일이 이 스텝의 참조 폐포에 없습니다"
+    # 빈 배열에 그대로 printf 를 걸면 인자 없이 포맷이 한 번 적용되어 `    - ` 만 있는
+    # 빈 항목이 찍힙니다 — 스킵 0건이 1건처럼 보이므로 건수가 있을 때만 출력합니다.
+    if (( ${#SMOKE_SKIP_DESCS[@]} > 0 )); then
+      printf '    - %s\n' "${SMOKE_SKIP_DESCS[@]}"
+    fi
+  fi
+  echo "  전체 검증: bash rd-workflow/scripts/self_test.sh full"
+fi
+
+# full 시작 시점의 proof 지문입니다. 최종 PASS 에서 같은 지문이 다시 나올 때만 기록합니다 —
+# 실행 도중 내용이 바뀌었다면 검증하지 않은 내용을 통과로 증명하게 되기 때문입니다.
+# smoke 에서는 계산하지 않습니다. 기록도 smoke 에서는 하지 않으므로 "smoke 만 통과한 상태"
+# 와 "full 통과 상태" 가 캐시로 구별됩니다.
+SELFTEST_START_FP=""
+# 시작 시점의 untracked 상태입니다. **기록 판정에 함께 넘깁니다** — 종료 시점만 보면 실행
+# 중에 생겼다 사라진 파일이 흔적을 남기지 않고, 그 상태를 가린 채 PASS 가 기록됩니다.
+# 빈 값은 "확인하지 못함" 이며 기록 쪽에서 거부합니다 (지문의 빈 값과 같은 취급입니다).
+SELFTEST_START_USTATE=""
+if [[ "$SELFTEST_MODE" == "full" ]]; then
+  SELFTEST_START_FP="$(smoke_proof_fingerprint "$SELFTEST_ROOT" worktree 2>/dev/null || true)"
+  # 기록 거부 사유(untracked 존재)는 **지금 이미 확정**입니다. 종료 시점에만 알리면
+  # 사용자는 수 분을 쓰고 나서야 증명이 남지 않는다는 것을 알고, git add 후 같은 시간을
+  # 다시 써야 합니다. 시작 직후에 알리면 그 손실이 사라집니다.
+  # stdout 형식을 오염시키지 않도록 stderr 로만 냅니다.
+  if declare -F smoke_untracked_state >/dev/null 2>&1; then
+    SELFTEST_START_USTATE=0
+    SELFTEST_START_UNTRACKED="$(smoke_untracked_state "$SELFTEST_ROOT")" || SELFTEST_START_USTATE=$?
+    if [[ "$SELFTEST_START_USTATE" -eq 1 ]]; then
+      echo "  경고: untracked 파일이 있어 이대로는 full PASS 기록이 남지 않습니다 — 지금 git add 하지 않으면 실행이 끝난 뒤 다시 돌려야 합니다." >&2
+      printf '%s\n' "$SELFTEST_START_UNTRACKED" | sed 's/^/    /' >&2
+    elif [[ "$SELFTEST_START_USTATE" -eq 2 ]]; then
+      # 조회 실패도 기록 거부 사유입니다. 여기서 침묵하면 사용자는 수 분을 쓰고 나서야
+      # 증명이 남지 않는다는 것을 압니다 — 이 경고가 없애려던 손실이 이 경로에만 남습니다.
+      echo "  경고: untracked 조회에 실패해(git 오류) 이대로는 full PASS 기록이 남지 않습니다." >&2
+    fi
+  fi
+fi
+
 run_step "implementation_gate hook (test_implementation_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_implementation_gate.sh"
-run_step "edit_provenance producer hook" bash "${SCRIPT_DIR}/hooks/test_edit_provenance_record.sh"
 run_step "리뷰 프롬프트 인라인 계약 (test_review_prompt_inline.sh)" bash "${SCRIPT_DIR}/test_review_prompt_inline.sh"
 run_step "reasoning effort override (test_review_effort_override.sh)" bash "${SCRIPT_DIR}/test_review_effort_override.sh"
 run_step "리뷰 턴 계측 계약 (test_review_metrics.sh)" bash "${SCRIPT_DIR}/test_review_metrics.sh"
 run_step "어댑터 프롬프트 parity (test_review_adapter_parity.sh)" bash "${SCRIPT_DIR}/test_review_adapter_parity.sh"
 run_step "state 단위 테스트 (test_state_common.sh)" bash "${SCRIPT_DIR}/test_state_common.sh"
+run_step "smoke 판정 단위 테스트 (test_smoke_common.sh)" bash "${SCRIPT_DIR}/test_smoke_common.sh"
+run_step "smoke 진입점 계약 (test_self_test_smoke.sh)" bash "${SCRIPT_DIR}/test_self_test_smoke.sh"
+run_step "smoke fixture 이름 규약 (check_fixture_name_convention.sh)" bash "${SCRIPT_DIR}/check_fixture_name_convention.sh"
 run_step "guard state fixture (test_guard_state.sh)" bash "${SCRIPT_DIR}/hooks/test_guard_state.sh"
 run_step "archive gate 테스트 (test_pre_commit_archive_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_pre_commit_archive_gate.sh"
-run_step "fr_branch_gate 테스트 (test_fr_branch_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_fr_branch_gate.sh"
-run_step "review gate 테스트 (test_pre_commit_review_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_pre_commit_review_gate.sh"
 run_step "비차단 Status drift 검증 (nonblocking_status_drift_check)" nonblocking_status_drift_check
 run_step "LC-19 3자 일치 검증 (TASK/STATE/CLAUDE.md)" canonical_status_triple_drift_check
 run_step "판정 소스 회귀 grep (_extract_task_section Status 직접 호출)" judgment_source_regression_check
@@ -897,768 +1174,12 @@ defect_reports_test_check() {
   return $rc
 }
 run_step "결함 보고 로컬 조작부 테스트 (test_defect_reports.sh)" defect_reports_test_check
-pre_commit_verify_test_check() {
-  local t="${SCRIPT_DIR}/hooks/test_pre_commit_verify.sh"
-  if [[ -f "$t" ]]; then bash "$t"; else echo "  (skip: test_pre_commit_verify.sh 없음 — lite 산출물)"; fi
-}
-run_step "pre_commit_verify 테스트 (test_pre_commit_verify.sh)" pre_commit_verify_test_check
 run_step "adapter 폴링 잔존 회귀 (POLL_INTERVAL 없음)" adapter_poll_regression_check
 run_step "스크립트 구문 검사 (bash -n)" syntax_check
 run_step "autopilot SKILL lifecycle 정합 (promote/rollback 일원화)" autopilot_skill_lifecycle_check
 run_step "무인 진입 계약 정합 (autopilot_headless_entry_check)" autopilot_headless_entry_check
 run_step "무인 wrapper 매핑 테스트 (test_autopilot_headless.sh)" bash "${SCRIPT_DIR}/test_autopilot_headless.sh"
 run_step "phase 병렬 규약 문서 정합 (plan_parallel_phase_check)" plan_parallel_phase_check
-
-# =============================================================================
-# 편집 출처(edit provenance) 진단 — change spec §2.10 의 D1~D7
-#
-# producer hook 은 "항상 exit 0 · 무출력" 계약이라, 배경 동작이 조용히 종전 넛지로
-# 강등돼도 사용자가 알 방법이 없습니다. 그 이유를 확인할 수 있는 유일한 창구가 이 진단입니다.
-#
-# 심각도 규약 (spec §2.10 과 번호·명칭·문구·skip 규칙이 정확히 일치해야 합니다):
-#   D1        → **실패(FAIL)**. 검사 항목 수가 0이어도 실패입니다
-#                (활성 FR self-test-required-copy-check-consistency 의 거짓 통과 패턴 금지).
-#   D2~D5·D7  → 경고(warn). self-test 를 실패시키지 않습니다.
-#   D6        → **경고하지 않습니다.** 런타임 무삭제가 계약이므로 세대 누적은 정상 상태이고
-#               개수는 정리 실패 신호가 아닙니다. 개수만 정보로 표시합니다.
-#   provenance 디렉토리 부재는 정상 상태이므로 D3·D4·D6·D7 은 skip 입니다 (경고 아님).
-# =============================================================================
-
-_ep_diag_ok()   { printf '  ok   %s\n' "$1"; }
-_ep_diag_warn() { printf '  warn %s\n' "$1"; }
-_ep_diag_skip() { printf '  skip %s\n' "$1"; }
-_ep_diag_fail() { printf '  FAIL %s\n' "$1" >&2; }
-
-# 공용 헬퍼 적재. ep_* 함수와 short-title 조회(state_read_field)를 이 셸에 들입니다.
-# project_root 는 ep_root 가 기본 루트를 조립할 때 씁니다 (RD_EDIT_PROVENANCE_DIR 이 우선).
-_ep_diag_load() {
-  [[ -f "${SCRIPT_DIR}/_edit_provenance_common.sh" ]] || return 1
-  project_root="$(_hook_repo_root)"
-  # shellcheck source=/dev/null
-  . "${SCRIPT_DIR}/_edit_provenance_common.sh"
-  if [[ -f "${SCRIPT_DIR}/_state_common.sh" ]]; then
-    # shellcheck source=/dev/null
-    . "${SCRIPT_DIR}/_state_common.sh"
-  fi
-  return 0
-}
-
-_ep_diag_short_title() {
-  if declare -f state_read_field >/dev/null 2>&1; then
-    state_read_field "short-title"
-  fi
-}
-
-# --- D1: 공용 헬퍼·producer hook 이 정본·배포 사본 양쪽에 존재 ------------------
-# 배포 사본은 무조건 필수입니다. 정본(_ROOT_FILES/)은 설치본에 없는 것이 정상이므로
-# 정본 트리가 있을 때만 목록에 넣되, 넣었으면 그때는 필수로 다룹니다.
-# `[[ -f ]] || continue` 로 대상을 흘려보내면 대상이 통째로 사라져도 0건 검사로 통과합니다.
-_ep_d1_targets() {
-  local root; root="$(_hook_repo_root)"
-  printf '%s\n' "${root}/rd-workflow/scripts/_edit_provenance_common.sh"
-  printf '%s\n' "${root}/rd-workflow/scripts/hooks/edit_provenance_record.sh"
-  if [[ -d "${root}/_ROOT_FILES/rd-workflow/scripts" ]]; then
-    printf '%s\n' "${root}/_ROOT_FILES/rd-workflow/scripts/_edit_provenance_common.sh"
-    printf '%s\n' "${root}/_ROOT_FILES/rd-workflow/scripts/hooks/edit_provenance_record.sh"
-  fi
-}
-
-_ep_diag_d1() {  # $1=대상 목록 함수 이름 (기본 _ep_d1_targets — 분기 테스트가 교체한다)
-  local fn="${1:-_ep_d1_targets}" rc=0 n=0 p
-  while IFS= read -r p; do
-    [[ -z "$p" ]] && continue
-    n=$((n + 1))
-    [[ -f "$p" ]] || { _ep_diag_fail "D1 파일 부재: $p"; rc=1; }
-  done < <("$fn")
-  if [[ "$n" -eq 0 ]]; then
-    _ep_diag_fail "D1 검사 항목 0건 — 대상 목록이 비었습니다 (0건 검사는 거짓 통과입니다)"
-    return 1
-  fi
-  [[ "$rc" -eq 0 ]] && _ep_diag_ok "D1 공용 헬퍼·producer hook 정본·배포 사본 존재 (${n}건)"
-  return $rc
-}
-
-# --- D2: provenance 루트 생성·쓰기 가능 (실제 probe 후 정리) -------------------
-# 우리가 만든 것만 되돌립니다 — 이미 있던 루트는 지우지 않습니다.
-_ep_diag_d2() {
-  local root probe created=0
-  root="$(ep_root)"
-  if [[ ! -d "$root" ]]; then
-    if ! mkdir -p "$root" 2>/dev/null; then
-      _ep_diag_warn "D2 provenance 루트를 만들 수 없습니다: ${root} (사유: mkdir 실패 — 편집 기록이 남지 않아 넛지가 기존 동작으로 동작합니다)"
-      return 0
-    fi
-    created=1
-  fi
-  probe="${root}/.d2-probe.$$"
-  if ! printf 'probe\n' > "$probe" 2>/dev/null; then
-    _ep_diag_warn "D2 provenance 루트에 쓸 수 없습니다: ${root} (사유: 쓰기 실패 — 편집 기록이 남지 않아 넛지가 기존 동작으로 동작합니다)"
-    rm -f "$probe" 2>/dev/null || true
-    [[ "$created" -eq 1 ]] && { rmdir "$root" 2>/dev/null || true; }
-    return 0
-  fi
-  rm -f "$probe" 2>/dev/null || true
-  [[ "$created" -eq 1 ]] && { rmdir "$root" 2>/dev/null || true; }
-  _ep_diag_ok "D2 provenance 루트 생성·쓰기 가능 (${root})"
-  return 0
-}
-
-# --- D3: .current 포인터 — 존재·형식·지정 디렉토리 존재 -----------------------
-# 통과 판정의 권위는 ep_current_gen 이고, 아래 raw 조회는 사유 문구 조립에만 씁니다.
-_ep_diag_d3() {
-  local root ptr first reason
-  root="$(ep_root)"
-  [[ -d "$root" ]] || { _ep_diag_skip "D3 provenance 디렉토리 없음 — 정상 상태입니다"; return 0; }
-  ptr="${root}/.current"
-  if ep_current_gen >/dev/null 2>&1; then
-    _ep_diag_ok "D3 현재 세대 포인터 유효 ($(ep_current_gen))"
-    return 0
-  fi
-  if [[ ! -f "$ptr" ]]; then
-    reason=".current 부재"
-  else
-    first=""
-    IFS= read -r first < "$ptr" 2>/dev/null || true
-    if [[ -z "$first" ]]; then
-      reason=".current 가 비었습니다"
-    elif [[ ! -d "${root}/${first}" ]]; then
-      reason="지정 세대 디렉토리 부재 (${first})"
-    else
-      reason=".current 내용 형식 불일치"
-    fi
-  fi
-  _ep_diag_warn "D3 현재 세대 포인터가 유효하지 않아 판정이 기존 동작으로 동작합니다. 다음 진행 상태 저장에서 복구됩니다 (사유: ${reason})"
-  return 0
-}
-
-# --- D4: 현재 세대 메타 — short-title 일치·센티널 부재·레코드 malformed 없음 ----
-_ep_diag_d4() {
-  local root gen title f n_rec=0 bad=0
-  root="$(ep_root)"
-  [[ -d "$root" ]] || { _ep_diag_skip "D4 provenance 디렉토리 없음 — 정상 상태입니다"; return 0; }
-  if ! gen="$(ep_current_gen 2>/dev/null)"; then
-    _ep_diag_skip "D4 현재 세대 없음 — D3 사유를 참조하십시오"
-    return 0
-  fi
-  if ep_gen_has_sentinel "$gen"; then
-    _ep_diag_warn "D4 이 세대는 기록을 중단했고 판정은 기존 동작으로 동작합니다. 다음 진행 상태 저장에서 복구됩니다"
-    return 0
-  fi
-  title="$(_ep_diag_short_title)"
-  if ! ep_gen_valid "$gen" "$title"; then
-    _ep_diag_warn "D4 현재 세대의 short-title 이 진행 상태(${title:--})와 달라 세대가 무효입니다. 판정이 기존 동작으로 동작합니다. 다음 진행 상태 저장에서 복구됩니다"
-    return 0
-  fi
-  # 형식 판정은 판정 경로(ep_read_record)와 **같은 함수**를 씁니다 — 규칙이 갈리면 진단이
-  # "정상" 이라고 말하는 레코드를 판정은 malformed 로 보거나 그 반대가 됩니다 (턴 004 P1).
-  for f in "${gen}"/*.orc "${gen}"/*.sub; do
-    [[ -f "$f" ]] || continue
-    n_rec=$((n_rec + 1))
-    _ep_read_record_file "$f" || bad=$((bad + 1))
-  done
-  if [[ "$bad" -gt 0 ]]; then
-    _ep_diag_warn "D4 현재 세대 레코드 ${n_rec}건 중 ${bad}건이 malformed 입니다 — 그 경로는 미설명으로 판정되어 넛지가 계속 뜹니다. 다음 진행 상태 저장에서 복구됩니다"
-    return 0
-  fi
-  _ep_diag_ok "D4 현재 세대 메타 정상 (레코드 ${n_rec}건)"
-  return 0
-}
-
-# --- D5: 검증 capability (jq 유무와 그때의 T23 범위) --------------------------
-# jq 가 없어도 행위자 판별(read_hook_agent_id)과 상태 식별자(cksum)는 동작합니다.
-# 즉 기록과 넛지 억제는 정상이고, 잃는 것은 T23 귀속 교차 검증뿐입니다.
-_ep_diag_d5() {
-  if command -v jq >/dev/null 2>&1; then
-    _ep_diag_ok "D5 jq 가용 — T23 귀속 교차 검증 동작"
-  else
-    _ep_diag_warn "D5 jq 부재 — T23 귀속 교차 검증만 생략됩니다. 기록 기반 넛지 억제는 계속 동작합니다"
-  fi
-  return 0
-}
-
-# --- D6: 잔존 세대 수 (정보 표시 전용 — 경고하지 않습니다) --------------------
-_ep_diag_d6() {
-  local root d n=0 msg
-  root="$(ep_root)"
-  [[ -d "$root" ]] || { _ep_diag_skip "D6 provenance 디렉토리 없음 — 정상 상태입니다"; return 0; }
-  for d in "${root}"/gen-*; do
-    [[ -d "$d" ]] && n=$((n + 1))
-  done
-  msg="$(printf 'D6 세대 %s개 (작업 종료 시 `archive.sh` 가 일괄 회수합니다)' "$n")"
-  _ep_diag_ok "$msg"
-  return 0
-}
-
-# --- D7: 직전 bump 실패 흔적 (.bump-failed, spec §2.12 ③) ---------------------
-_ep_diag_d7() {
-  local root mark stage="" msg
-  root="$(ep_root)"
-  [[ -d "$root" ]] || { _ep_diag_skip "D7 provenance 디렉토리 없음 — 정상 상태입니다"; return 0; }
-  mark="${root}/.bump-failed"
-  if [[ ! -f "$mark" ]]; then
-    _ep_diag_ok "D7 직전 bump 실패 흔적 없음"
-    return 0
-  fi
-  IFS= read -r stage < "$mark" 2>/dev/null || true
-  msg="$(printf 'D7 직전 진행 상태 저장에서 편집 기록 세대 갱신이 실패했습니다(지점: `%s`). 저장 자체는 반영됐지만 다음 저장까지 넛지가 계속 뜰 수 있습니다. 다음 진행 상태 저장에서 복구됩니다' "$stage")"
-  _ep_diag_warn "$msg"
-  return 0
-}
-
-edit_provenance_diagnostics_check() {
-  local rc=0
-  if ! _ep_diag_load; then
-    _ep_diag_fail "편집 출처 공용 헬퍼를 불러올 수 없습니다: ${SCRIPT_DIR}/_edit_provenance_common.sh"
-    return 1
-  fi
-  _ep_diag_d1 || rc=1
-  _ep_diag_d2
-  _ep_diag_d3
-  _ep_diag_d4
-  _ep_diag_d5
-  _ep_diag_d6
-  _ep_diag_d7
-  return $rc
-}
-
-# ---- D1~D7 분기 테스트 ------------------------------------------------------
-# 각 항목의 정상·이상 분기를 fixture 로 결정적으로 재현합니다.
-# 격리는 RD_EDIT_PROVENANCE_DIR(헬퍼가 문서화한 테스트 훅) · TASK_STATE_PATH · PATH 로만 하고,
-# 권한 조작(chmod)은 쓰지 않습니다 — root·elevated 환경에서 비결정적입니다.
-
-_ep_t_pass() { printf '  ok   %s\n' "$1"; }
-_ep_t_fail() { printf '  FAIL %s\n' "$1" >&2; }
-_ep_t_has() {  # <label> <출력> <기대 문구>
-  case "$2" in
-    *"$3"*) _ep_t_pass "$1"; return 0 ;;
-  esac
-  _ep_t_fail "$1 — 기대 문구 없음: [$3]"
-  printf '    실제: %s\n' "$2" >&2
-  return 1
-}
-_ep_t_hasnt() {  # <label> <출력> <있으면 안 되는 문구>
-  case "$2" in
-    *"$3"*)
-      _ep_t_fail "$1 — 있으면 안 되는 문구: [$3]"
-      printf '    실제: %s\n' "$2" >&2
-      return 1 ;;
-  esac
-  _ep_t_pass "$1"
-  return 0
-}
-
-# D1 분기 테스트용 대상 목록입니다 (dynamic scope 로 _EP_T_BASE 를 봅니다).
-_ep_d1_t_empty()   { :; }
-_ep_d1_t_ok()      { printf '%s\n' "${_EP_T_BASE:-}/a.sh" "${_EP_T_BASE:-}/b.sh"; }
-_ep_d1_t_missing() { printf '%s\n' "${_EP_T_BASE:-}/a.sh" "${_EP_T_BASE:-}/gone.sh"; }
-
-# 정본 spec 이 있으면 D3·D4·D5·D6·D7 문구를 spec 원문과 대조합니다.
-# spec·plan·테스트 세 곳이 같은 문구를 공유해야 하므로, 문구 drift 를 여기서 잡습니다.
-# 배포본에는 spec 이 없으므로 그때는 skip 합니다 (필수로 두면 설치본에서 항상 실패합니다).
-_ep_t_spec_phrases() {
-  local rc=0 root spec p
-  root="$(_hook_repo_root)"
-  spec=""
-  for p in "${root}/rd-workflow-workspace/specs/changes/"*stop-hook-stale-nudge-during-parallel-phase-change-spec.md; do
-    [[ -f "$p" ]] && spec="$p"
-  done
-  if [[ -z "$spec" ]]; then
-    printf '  skip spec 문구 대조 (change spec 없음 — 배포본)\n'
-    return 0
-  fi
-  while IFS= read -r p; do
-    [[ -z "$p" ]] && continue
-    grep -qF -- "$p" "$spec" || { _ep_t_fail "spec §2.10 문구 불일치: [$p]"; rc=1; }
-  done <<'EOF'
-현재 세대 포인터가 유효하지 않아 판정이 기존 동작으로 동작합니다. 다음 진행 상태 저장에서 복구됩니다
-이 세대는 기록을 중단했고 판정은 기존 동작으로 동작합니다. 다음 진행 상태 저장에서 복구됩니다
-T23 귀속 교차 검증만 생략됩니다. 기록 기반 넛지 억제는 계속 동작합니다
-(작업 종료 시 `archive.sh` 가 일괄 회수합니다)
-직전 진행 상태 저장에서 편집 기록 세대 갱신이 실패했습니다(지점:
-저장 자체는 반영됐지만 다음 저장까지 넛지가 계속 뜰 수 있습니다. 다음 진행 상태 저장에서 복구됩니다
-EOF
-  [[ "$rc" -eq 0 ]] && _ep_t_pass "spec §2.10 문구 대조 (D3·D4·D5·D6·D7)"
-  return $rc
-}
-
-edit_provenance_diagnostics_selftest() {
-  local rc=0 base out r _EP_T_BASE
-  if ! _ep_diag_load; then
-    _ep_diag_fail "편집 출처 공용 헬퍼 부재 — 진단 분기 테스트를 실행할 수 없습니다"
-    return 1
-  fi
-  if ! base="$(_mktemp_dir_or_empty)"; then
-    _ep_diag_fail "진단 분기 테스트 임시 디렉터리 생성 실패 — 아무것도 만들지 않았습니다"
-    return 1
-  fi
-
-  _ep_t_spec_phrases || rc=1
-
-  # ---- D1 ----
-  _EP_T_BASE="${base}/d1"
-  mkdir -p "$_EP_T_BASE"
-  : > "${_EP_T_BASE}/a.sh"; : > "${_EP_T_BASE}/b.sh"
-  out="$(_ep_diag_d1 _ep_d1_t_ok 2>&1)" && : || rc=1
-  _ep_t_has "D1 정상: 양쪽 존재 → 통과" "$out" "D1 공용 헬퍼·producer hook 정본·배포 사본 존재 (2건)" || rc=1
-  if out="$(_ep_diag_d1 _ep_d1_t_missing 2>&1)"; then
-    _ep_t_fail "D1 이상1: 배포 사본 삭제인데 통과함 (rc=0)"; rc=1
-  else
-    _ep_t_has "D1 이상1: 사본 부재 → 실패" "$out" "D1 파일 부재" || rc=1
-  fi
-  if out="$(_ep_diag_d1 _ep_d1_t_empty 2>&1)"; then
-    _ep_t_fail "D1 이상2: 검사 0건인데 통과함 (rc=0) — 거짓 통과 패턴"; rc=1
-  else
-    _ep_t_has "D1 이상2: 검사 0건 → 실패" "$out" "D1 검사 항목 0건" || rc=1
-  fi
-
-  # ---- D2 ----
-  r="${base}/d2-ok/edit-provenance.d"
-  mkdir -p "${base}/d2-ok"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; _ep_diag_d2 2>&1)"
-  _ep_t_has "D2 정상: 쓰기 가능 → 통과" "$out" "D2 provenance 루트 생성·쓰기 가능" || rc=1
-  [[ ! -e "$r" ]] && _ep_t_pass "D2 정상: probe 후 정리 (만든 루트를 되돌림)" \
-    || { _ep_t_fail "D2 정상: probe 흔적 잔존 — $r"; rc=1; }
-  # 이상: 루트 경로 자리에 일반 파일을 놓아 mkdir 을 ENOTDIR 로 실패시킵니다 (권한 비의존).
-  r="${base}/d2-bad/edit-provenance.d"
-  mkdir -p "${base}/d2-bad"; : > "$r"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; _ep_diag_d2 2>&1)"
-  _ep_t_has "D2 이상: ENOTDIR → 경고 + 사유" "$out" "D2 provenance 루트를 만들 수 없습니다" || rc=1
-  _ep_t_has "D2 이상: 사유 표시" "$out" "사유: mkdir 실패" || rc=1
-
-  # ---- D3 ----
-  r="${base}/d3-ok"; mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; _ep_diag_d3 2>&1)"
-  _ep_t_has "D3 정상: 실재 세대 지시 → 통과" "$out" "D3 현재 세대 포인터 유효" || rc=1
-  r="${base}/d3-none"; mkdir -p "${r}/gen-1"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; _ep_diag_d3 2>&1)"
-  _ep_t_has "D3 이상1: 포인터 부재 → 경고" "$out" "D3 현재 세대 포인터가 유효하지 않아 판정이 기존 동작으로 동작합니다. 다음 진행 상태 저장에서 복구됩니다" || rc=1
-  _ep_t_has "D3 이상1: 사유 표시" "$out" "사유: .current 부재" || rc=1
-  r="${base}/d3-dangling"; mkdir -p "$r"; printf 'gen-9\n' > "${r}/.current"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; _ep_diag_d3 2>&1)"
-  _ep_t_has "D3 이상2: dangling → 경고" "$out" "사유: 지정 세대 디렉토리 부재 (gen-9)" || rc=1
-  r="${base}/d3-malformed"; mkdir -p "${r}/gen-1"; printf 'gen-1\n추가 줄\n' > "${r}/.current"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; _ep_diag_d3 2>&1)"
-  _ep_t_has "D3 이상3: malformed → 경고" "$out" "사유: .current 내용 형식 불일치" || rc=1
-  # 이상4 (final diff review 턴 006 P1) — 추가 **빈 줄**. 종전에는 command substitution 이
-  # 종단 LF 를 전부 지워 유효 포인터로 통과했고, D3 도 판정과 같이 "정상" 이라 보고했습니다.
-  r="${base}/d3-extra-lf"; mkdir -p "${r}/gen-1"; printf 'gen-1\n\n' > "${r}/.current"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; _ep_diag_d3 2>&1)"
-  _ep_t_has "D3 이상4: 추가 LF → 경고" "$out" "사유: .current 내용 형식 불일치" || rc=1
-  # 정상 경계 — 종단 LF 가 없는 포인터는 손상이 아니므로 통과해야 합니다.
-  r="${base}/d3-no-lf"; mkdir -p "${r}/gen-1"; printf 'gen-1' > "${r}/.current"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; _ep_diag_d3 2>&1)"
-  _ep_t_has "D3 정상2: 종단 LF 없는 포인터 → 통과" "$out" "D3 현재 세대 포인터 유효" || rc=1
-  # provenance 디렉토리 부재는 정상이므로 skip 이어야 합니다 (경고 아님).
-  out="$(RD_EDIT_PROVENANCE_DIR="${base}/no-such-root"; _ep_diag_d3 2>&1)"
-  _ep_t_has "D3 디렉토리 부재 → skip" "$out" "skip D3 provenance 디렉토리 없음" || rc=1
-
-  # ---- D4 ----
-  printf 'schema=1\nshort-title=demo\nstatus=구현 중\n' > "${base}/task-state"
-  r="${base}/d4-ok"; mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-  printf 'demo\n' > "${r}/gen-1/.short-title"
-  printf '111-2\tsrc/a.txt\n' > "${r}/gen-1/9-9.sub"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; TASK_STATE_PATH="${base}/task-state"; _ep_diag_d4 2>&1)"
-  _ep_t_has "D4 정상: 유효 세대 → 통과" "$out" "D4 현재 세대 메타 정상 (레코드 1건)" || rc=1
-  r="${base}/d4-overflow"; mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-  printf 'demo\n' > "${r}/gen-1/.short-title"; : > "${r}/gen-1/.overflow"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; TASK_STATE_PATH="${base}/task-state"; _ep_diag_d4 2>&1)"
-  _ep_t_has "D4 이상1: .overflow → 경고" "$out" "D4 이 세대는 기록을 중단했고 판정은 기존 동작으로 동작합니다. 다음 진행 상태 저장에서 복구됩니다" || rc=1
-  r="${base}/d4-malformed"; mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-  printf 'demo\n' > "${r}/gen-1/.short-title"
-  printf '111-2\tsrc/a.txt\t군더더기\n' > "${r}/gen-1/9-9.sub"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; TASK_STATE_PATH="${base}/task-state"; _ep_diag_d4 2>&1)"
-  _ep_t_has "D4 이상2: 3필드 레코드 → 경고" "$out" "D4 현재 세대 레코드 1건 중 1건이 malformed" || rc=1
-  # 이상2b~2c (final diff review 턴 008 P1) — `.short-title` 자체가 손상된 세대.
-  # 값은 맞고 바이트만 어긋나 종전에는 "일치" 로 판정됐고, 판정·진단 모두 정상으로 봤습니다.
-  # 여기서는 short-title 불일치 경로로 수렴해야 합니다.
-  r="${base}/d4-title-extra-lf"; mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-  printf 'demo\n\n' > "${r}/gen-1/.short-title"
-  printf '111-2\tsrc/a.txt\n' > "${r}/gen-1/9-9.sub"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; TASK_STATE_PATH="${base}/task-state"; _ep_diag_d4 2>&1)"
-  _ep_t_has "D4 이상2b: .short-title 추가 LF → 경고" "$out" "D4 현재 세대의 short-title 이 진행 상태" || rc=1
-  r="${base}/d4-title-nul"; mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-  printf 'demo\0\n' > "${r}/gen-1/.short-title"
-  printf '111-2\tsrc/a.txt\n' > "${r}/gen-1/9-9.sub"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; TASK_STATE_PATH="${base}/task-state"; _ep_diag_d4 2>&1)"
-  _ep_t_has "D4 이상2c: .short-title 에 NUL → 경고" "$out" "D4 현재 세대의 short-title 이 진행 상태" || rc=1
-  # 정상 경계 — 종단 LF 가 없는 short-title 은 손상이 아닙니다.
-  r="${base}/d4-title-no-lf"; mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-  printf 'demo' > "${r}/gen-1/.short-title"
-  printf '111-2\tsrc/a.txt\n' > "${r}/gen-1/9-9.sub"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; TASK_STATE_PATH="${base}/task-state"; _ep_diag_d4 2>&1)"
-  _ep_t_has "D4 정상3: .short-title 종단 LF 없음 → 통과" "$out" "D4 현재 세대 메타 정상 (레코드 1건)" || rc=1
-  # 이상3~4 (final diff review 턴 004 P1) — **첫 줄이 정상인** 손상 레코드입니다. 종전에는
-  # 진단도 판정도 첫 줄만 읽어 이 둘을 정상으로 보고했고, 판정 쪽에서는 넛지가 사라졌습니다.
-  # 진단과 판정이 같은 함수를 쓰는지 확인하는 케이스이기도 합니다.
-  r="${base}/d4-extra-line"; mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-  printf 'demo\n' > "${r}/gen-1/.short-title"
-  printf '111-2\tsrc/a.txt\n군더더기 줄\n' > "${r}/gen-1/9-9.sub"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; TASK_STATE_PATH="${base}/task-state"; _ep_diag_d4 2>&1)"
-  _ep_t_has "D4 이상3: 정상 첫 줄 뒤 추가 줄 → 경고" "$out" "D4 현재 세대 레코드 1건 중 1건이 malformed" || rc=1
-  r="${base}/d4-extra-lf"; mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-  printf 'demo\n' > "${r}/gen-1/.short-title"
-  printf '111-2\tsrc/a.txt\n\n' > "${r}/gen-1/9-9.sub"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; TASK_STATE_PATH="${base}/task-state"; _ep_diag_d4 2>&1)"
-  _ep_t_has "D4 이상4: 추가 LF → 경고" "$out" "D4 현재 세대 레코드 1건 중 1건이 malformed" || rc=1
-  # 이상5~6 (턴 006 P1) — 필드 구조가 어긋난 손상. 종전 파서는 빈 추가 TAB 필드를 세지
-  # 못했고(TAB 이 IFS whitespace) `read` 가 NUL 을 버려 둘 다 정상 2필드로 축약했습니다.
-  r="${base}/d4-trailing-tab"; mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-  printf 'demo\n' > "${r}/gen-1/.short-title"
-  printf '111-2\tsrc/a.txt\t\n' > "${r}/gen-1/9-9.sub"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; TASK_STATE_PATH="${base}/task-state"; _ep_diag_d4 2>&1)"
-  _ep_t_has "D4 이상5: trailing TAB → 경고" "$out" "D4 현재 세대 레코드 1건 중 1건이 malformed" || rc=1
-  r="${base}/d4-nul"; mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-  printf 'demo\n' > "${r}/gen-1/.short-title"
-  printf '111-2\tsrc/a.txt\0\n' > "${r}/gen-1/9-9.sub"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; TASK_STATE_PATH="${base}/task-state"; _ep_diag_d4 2>&1)"
-  _ep_t_has "D4 이상6: NUL → 경고" "$out" "D4 현재 세대 레코드 1건 중 1건이 malformed" || rc=1
-  # 정상 형식의 경계 — 종단 LF 가 없는 레코드는 손상이 아니므로 통과해야 합니다.
-  r="${base}/d4-no-trailing-lf"; mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-  printf 'demo\n' > "${r}/gen-1/.short-title"
-  printf '111-2\tsrc/a.txt' > "${r}/gen-1/9-9.sub"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; TASK_STATE_PATH="${base}/task-state"; _ep_diag_d4 2>&1)"
-  _ep_t_has "D4 정상2: 종단 LF 없는 레코드 → 통과" "$out" "D4 현재 세대 메타 정상 (레코드 1건)" || rc=1
-
-  # ---- D5 ----
-  mkdir -p "${base}/jqbin" "${base}/nobin"
-  printf '#!/bin/sh\nexit 0\n' > "${base}/jqbin/jq"; chmod +x "${base}/jqbin/jq"
-  out="$(PATH="${base}/jqbin:$PATH"; _ep_diag_d5 2>&1)"
-  _ep_t_has "D5 정상: jq 있음 → 통과" "$out" "D5 jq 가용 — T23 귀속 교차 검증 동작" || rc=1
-  out="$(PATH="${base}/nobin"; _ep_diag_d5 2>&1)"
-  _ep_t_has "D5 이상: jq 부재 → 정정 문구" "$out" "D5 jq 부재 — T23 귀속 교차 검증만 생략됩니다. 기록 기반 넛지 억제는 계속 동작합니다" || rc=1
-  _ep_t_hasnt "D5 이상: 넛지 강등이라는 거짓 서술 없음" "$out" "넛지가 기존 동작으로" || rc=1
-
-  # ---- D6 ---- 세대 누적은 정상입니다. 나이는 더 이상 판단 기준이 아닙니다.
-  r="${base}/d6"; mkdir -p "${r}/gen-1" "${r}/gen-2" "${r}/gen-3"; printf 'gen-3\n' > "${r}/.current"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; _ep_diag_d6 2>&1)"
-  _ep_t_has "D6 세대 3개 → 통과 + 개수 표시" "$out" '세대 3개 (작업 종료 시 `archive.sh` 가 일괄 회수합니다)' || rc=1
-  _ep_t_hasnt "D6 경고하지 않음" "$out" "warn" || rc=1
-  touch -t 202601010000 "${r}/gen-1" "${r}/gen-2"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; _ep_diag_d6 2>&1)"
-  _ep_t_has "D6 오래된 세대 2개여도 여전히 통과" "$out" '세대 3개 (작업 종료 시 `archive.sh` 가 일괄 회수합니다)' || rc=1
-  _ep_t_hasnt "D6 오래된 세대에도 경고 없음" "$out" "warn" || rc=1
-
-  # ---- D7 ----
-  r="${base}/d7"; mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; _ep_diag_d7 2>&1)"
-  _ep_t_has "D7 정상: 흔적 없음 → 통과" "$out" "D7 직전 bump 실패 흔적 없음" || rc=1
-  printf 'pointer-swap\n' > "${r}/.bump-failed"
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; _ep_diag_d7 2>&1)"
-  _ep_t_has "D7 이상: 흔적 존재 → 경고" "$out" '직전 진행 상태 저장에서 편집 기록 세대 갱신이 실패했습니다(지점: `pointer-swap`)' || rc=1
-  _ep_t_has "D7 이상: 복구 안내 문구" "$out" "저장 자체는 반영됐지만 다음 저장까지 넛지가 계속 뜰 수 있습니다. 다음 진행 상태 저장에서 복구됩니다" || rc=1
-  # 복구: bump 성공이 흔적을 지우면 다시 통과여야 합니다 (헬퍼의 실제 정리 경로를 씁니다).
-  ( RD_EDIT_PROVENANCE_DIR="$r"; ep_clear_bump_failed ) >/dev/null 2>&1 || true
-  out="$(RD_EDIT_PROVENANCE_DIR="$r"; _ep_diag_d7 2>&1)"
-  _ep_t_has "D7 복구: bump 성공 후 → 통과" "$out" "D7 직전 bump 실패 흔적 없음" || rc=1
-
-  if ! rm -rf "$base" || [[ -e "$base" ]]; then
-    _ep_t_fail "진단 분기 테스트 임시 트리 정리 실패 — 수동으로 지워야 합니다: $base"
-    rc=1
-  fi
-  return $rc
-}
-
-# =============================================================================
-# archive.sh provenance 루트 회수 (change spec §2.9) — (a)~(i) 9케이스
-#
-# 테스트를 프로세스 경계로 나눕니다. 셸 함수 override 는 `bash archive.sh` 로 실행되는
-# 자식 프로세스에 전파되지 않으므로, 삭제 실패 주입은 **헬퍼 단위**로만 하고
-# archive 의 경고 분기는 **stub 헬퍼 seam 하나**로 고정합니다.
-# stub 은 fixture 경로를 리터럴로 박아 만듭니다 — 환경변수 참조를 남기면 자식 프로세스가
-# 그 값을 보지 못하거나 harness 의 우연한 환경에 좌우됩니다.
-# =============================================================================
-
-_EP_GITIGNORE_ENTRY='rd-workflow-workspace/.lifecycle/edit-provenance.d/'
-
-# archive fixture 저장소입니다. lifecycle/hooks 스크립트를 이 트리에서 복사해 세웁니다.
-# 종결된 final-diff-review 세션을 fr tip 에 심어 review precheck 를 조용히 통과시킵니다
-# (--force-skip-review-check 는 stderr 경고를 내므로 "무출력" 케이스를 잴 수 없습니다).
-#
-# 헬퍼 변종은 **초기 커밋 전에** 설치합니다 — 커밋 뒤에 파일을 놓으면 untracked 가 되어
-# archive.sh Step 0 의 ensure_worktree_clean 이 dirty 로 차단합니다.
-# stub 은 fixture 경로를 리터럴로 박아 만듭니다 (자식 프로세스는 우리 환경변수를 보지 못합니다).
-_ep_arch_setup() {  # <repo> <slug> <헬퍼: none|real|stub|empty> [worktree-path]
-  local d="$1" slug="$2" helper="$3" wt="${4:-}" src="${SCRIPT_DIR}" work eproot
-  eproot="${d}/rd-workflow-workspace/.lifecycle/edit-provenance.d"
-  mkdir -p "$d" || return 1
-  (
-    set -e
-    cd "$d"
-    git init -q -b main >/dev/null 2>&1 || { git init -q; git checkout -q -b main; }
-    git config user.email test@example.com
-    git config user.name test
-    printf '# Current Task\n\n## Short Title\n-\n\n## Branch / Worktree\nmain\n\n## Status\n대기 중\n' > CURRENT_TASK.md
-    mkdir -p rd-workflow/scripts/lifecycle rd-workflow/scripts/hooks rd-workflow-workspace/.lifecycle
-    printf '%s\n' \
-      'rd-workflow-workspace/.lifecycle/loop-state' \
-      'rd-workflow-workspace/.lifecycle/.loop-state.*' \
-      'rd-workflow-workspace/.lifecycle/review-skip-audit.log' \
-      "$_EP_GITIGNORE_ENTRY" > .gitignore
-    cp "$src"/lifecycle/*.sh rd-workflow/scripts/lifecycle/
-    cp "$src"/hooks/*.sh rd-workflow/scripts/hooks/
-    cp "$src"/_state_common.sh rd-workflow/scripts/
-    case "$helper" in
-      real)  cp "$src/_edit_provenance_common.sh" rd-workflow/scripts/ ;;
-      empty) : > rd-workflow/scripts/_edit_provenance_common.sh ;;
-      stub)  printf 'ep_root() { printf "%%s\\n" %q; }\nep_purge_root() { return 1; }\n' "$eproot" \
-               > rd-workflow/scripts/_edit_provenance_common.sh ;;
-      none)  : ;;
-      *)     exit 1 ;;
-    esac
-    git add -A
-    git commit -q -m init
-  ) || return 1
-  if [[ -n "$wt" ]]; then
-    ( cd "$d" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title "$slug" --worktree-path "$wt" ) >/dev/null 2>&1 || return 1
-    work="$wt"
-  else
-    ( cd "$d" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title "$slug" --no-worktree ) >/dev/null 2>&1 || return 1
-    work="$d"
-  fi
-  (
-    set -e
-    cd "$work"
-    local sdir="rd-workflow-workspace/handoffs/review_pipeline/0001_final-diff-review"
-    mkdir -p "$sdir"
-    printf '# Session\n\n## Branch Context\n- fr-branch: fr/%s\n\n## Status\nclosed\n' "$slug" > "$sdir/SESSION.md"
-    printf '# Checkpoint\n\n## Open Issues\n- 없음\n' > "$sdir/CHECKPOINT.md"
-    printf '# archived\n' > REQUEST.md
-    git add -A
-    git commit -q -m "archive content"
-  ) || return 1
-  # 기본 브랜치 워킹트리를 main 으로 되돌립니다 (archive.sh 는 main 워킹트리에서만 동작합니다).
-  ( cd "$d" && git switch main -q ) >/dev/null 2>&1 || true
-  return 0
-}
-
-_ep_arch_run() {  # <repo> <stdout 파일> <stderr 파일> [archive 인자...]
-  local repo="$1" o="$2" e="$3"; shift 3
-  ( cd "$repo" && bash rd-workflow/scripts/lifecycle/archive.sh "$@" ) >"$o" 2>"$e"
-}
-
-# _ep_arch_run_env — RD_EDIT_PROVENANCE_DIR 을 **자식 프로세스 환경에** 실어 archive 를 돌립니다.
-# "사용자가 테스트 변수를 export 한 채 잊었거나 외부 실행 환경이 주입한" 상황을 그대로 모사합니다.
-_ep_arch_run_env() {  # <repo> <stdout 파일> <stderr 파일> <RD_EDIT_PROVENANCE_DIR> [archive 인자...]
-  local repo="$1" o="$2" e="$3" epdir="$4"; shift 4
-  ( cd "$repo" && RD_EDIT_PROVENANCE_DIR="$epdir" \
-      bash rd-workflow/scripts/lifecycle/archive.sh "$@" ) >"$o" 2>"$e"
-}
-
-# CLEANUP-PENDING 잔여 레코드 목록만 잘라냅니다 (바이트 불변 대조용).
-_ep_arch_cleanup_section() { sed -n '/^archive: CLEANUP-PENDING$/,$p' "$1"; }
-
-edit_provenance_archive_check() {
-  local rc=0 base repo r code out err gi base_pending stub_pending wt outside
-  local src="${SCRIPT_DIR}"
-
-  # (pre) .gitignore 항목 — 없으면 ensure_worktree_clean 이 provenance 루트를 dirty 로 보고
-  #       archive 를 Step 0 에서 차단합니다. 이 트리의 .gitignore 를 대상으로 확인합니다.
-  gi="$(cd "${src}/../.." && pwd)/.gitignore"
-  if [[ ! -f "$gi" ]]; then
-    printf '  skip .gitignore 없음 (%s)\n' "$gi"
-  elif grep -qxF -- "$_EP_GITIGNORE_ENTRY" "$gi"; then
-    _ep_t_pass ".gitignore 에 provenance 루트 ignore 항목 존재"
-  else
-    _ep_t_fail ".gitignore 에 ${_EP_GITIGNORE_ENTRY} 없음 — archive.sh Step 0 이 dirty 로 차단합니다: $gi"
-    rc=1
-  fi
-
-  if ! base="$(_mktemp_dir_or_empty)"; then
-    _ep_t_fail "archive 회수 테스트 임시 디렉터리 생성 실패 — 아무것도 만들지 않았습니다"
-    return 1
-  fi
-
-  # ---- (a) 함수 단위: 삭제 실패 주입 ----
-  r="${base}/a-root"; mkdir -p "${r}/gen-1"
-  (
-    RD_EDIT_PROVENANCE_DIR="$r"
-    # shellcheck source=/dev/null
-    . "${src}/_edit_provenance_common.sh"
-    rm() { return 1; }
-    ep_purge_root
-  ) >/dev/null 2>&1
-  code=$?
-  [[ "$code" -ne 0 ]] && _ep_t_pass "(a) rm 실패 주입 → ep_purge_root non-zero" \
-    || { _ep_t_fail "(a) rm 실패인데 ep_purge_root 가 0 을 반환"; rc=1; }
-  [[ -d "$r" ]] && _ep_t_pass "(a) 루트 잔존" || { _ep_t_fail "(a) 루트가 사라짐"; rc=1; }
-
-  # ---- (b) 함수 단위: 정상 삭제 ----
-  r="${base}/b-root"; mkdir -p "${r}/gen-1"
-  (
-    RD_EDIT_PROVENANCE_DIR="$r"
-    # shellcheck source=/dev/null
-    . "${src}/_edit_provenance_common.sh"
-    ep_purge_root
-  ) >/dev/null 2>&1
-  code=$?
-  [[ "$code" -eq 0 ]] && _ep_t_pass "(b) 정상 상태 → ep_purge_root 0" \
-    || { _ep_t_fail "(b) ep_purge_root 가 non-zero (rc=$code)"; rc=1; }
-  [[ ! -e "$r" ]] && _ep_t_pass "(b) 루트 삭제" || { _ep_t_fail "(b) 루트 잔존"; rc=1; }
-
-  # ---- (c) 프로세스 단위: 정상 회수 ----
-  repo="${base}/c-repo"
-  if _ep_arch_setup "$repo" "ep-c" real; then
-    r="${repo}/rd-workflow-workspace/.lifecycle/edit-provenance.d"
-    mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-    _ep_arch_run "$repo" "${base}/c.out" "${base}/c.err" --no-remote
-    code=$?
-    [[ "$code" -eq 0 ]] && _ep_t_pass "(c) archive exit 0" \
-      || { _ep_t_fail "(c) archive rc=$code"; sed 's/^/    /' "${base}/c.err" >&2; rc=1; }
-    [[ ! -e "$r" ]] && _ep_t_pass "(c) provenance 루트 삭제" || { _ep_t_fail "(c) 루트 잔존: $r"; rc=1; }
-    if [[ -s "${base}/c.err" ]]; then
-      _ep_t_fail "(c) stderr 무출력 위반"; sed 's/^/    /' "${base}/c.err" >&2; rc=1
-    else
-      _ep_t_pass "(c) stderr 무출력"
-    fi
-  else
-    _ep_t_fail "(c) fixture 준비 실패"; rc=1
-  fi
-
-  # ---- (d) 프로세스 단위: dry-run 비파괴 ----
-  repo="${base}/d-repo"
-  if _ep_arch_setup "$repo" "ep-d" real; then
-    r="${repo}/rd-workflow-workspace/.lifecycle/edit-provenance.d"
-    mkdir -p "${r}/gen-1"
-    _ep_arch_run "$repo" "${base}/d.out" "${base}/d.err" --no-remote --dry-run
-    code=$?
-    [[ "$code" -eq 0 ]] && _ep_t_pass "(d) dry-run exit 0" || { _ep_t_fail "(d) dry-run rc=$code"; rc=1; }
-    [[ -d "${r}/gen-1" ]] && _ep_t_pass "(d) dry-run 루트 보존" || { _ep_t_fail "(d) dry-run 이 루트를 지움"; rc=1; }
-    if [[ -s "${base}/d.err" ]]; then
-      _ep_t_fail "(d) dry-run 경고 출력"; sed 's/^/    /' "${base}/d.err" >&2; rc=1
-    else
-      _ep_t_pass "(d) dry-run 경고 없음"
-    fi
-  else
-    _ep_t_fail "(d) fixture 준비 실패"; rc=1
-  fi
-
-  # ---- (e) 프로세스 단위: worktree 경로 ----
-  repo="${base}/e-repo"; wt="${base}/e-wt"
-  if _ep_arch_setup "$repo" "ep-e" real "$wt"; then
-    mkdir -p "${wt}/rd-workflow-workspace/.lifecycle/edit-provenance.d/gen-1"
-    _ep_arch_run "$repo" "${base}/e.out" "${base}/e.err" --no-remote
-    code=$?
-    [[ "$code" -eq 0 ]] && _ep_t_pass "(e) worktree 경로 archive exit 0" \
-      || { _ep_t_fail "(e) archive rc=$code"; sed 's/^/    /' "${base}/e.err" >&2; rc=1; }
-    [[ ! -e "${wt}/rd-workflow-workspace/.lifecycle/edit-provenance.d" ]] \
-      && _ep_t_pass "(e) worktree 제거로 그 안의 루트가 함께 사라짐 (잔존 0)" \
-      || { _ep_t_fail "(e) worktree 안 루트 잔존: ${wt}"; rc=1; }
-  else
-    _ep_t_fail "(e) fixture 준비 실패"; rc=1
-  fi
-
-  # ---- (f) 프로세스 단위: 헬퍼 미설치 ----
-  repo="${base}/f-repo"
-  if _ep_arch_setup "$repo" "ep-f" none; then
-    r="${repo}/rd-workflow-workspace/.lifecycle/edit-provenance.d"
-    mkdir -p "${r}/gen-1"
-    _ep_arch_run "$repo" "${base}/f.out" "${base}/f.err" --no-remote
-    code=$?
-    [[ "$code" -eq 0 ]] && _ep_t_pass "(f) 헬퍼 미설치 archive exit 0" \
-      || { _ep_t_fail "(f) archive rc=$code"; sed 's/^/    /' "${base}/f.err" >&2; rc=1; }
-    [[ -d "${r}/gen-1" ]] && _ep_t_pass "(f) 정리 skip (루트 보존)" || { _ep_t_fail "(f) 헬퍼 없이 루트가 사라짐"; rc=1; }
-    if [[ -s "${base}/f.err" ]]; then
-      _ep_t_fail "(f) stderr 무출력 위반 (command-not-found 누출 의심)"; sed 's/^/    /' "${base}/f.err" >&2; rc=1
-    else
-      _ep_t_pass "(f) stderr 무출력 (command-not-found 없음)"
-    fi
-    base_pending="$(_ep_arch_cleanup_section "${base}/f.out")"
-  else
-    _ep_t_fail "(f) fixture 준비 실패"; rc=1; base_pending=""
-  fi
-
-  # ---- (g) 프로세스 단위: stub 헬퍼 (삭제 실패) ----
-  repo="${base}/g-repo"
-  if _ep_arch_setup "$repo" "ep-g" stub; then
-    r="${repo}/rd-workflow-workspace/.lifecycle/edit-provenance.d"
-    mkdir -p "${r}/gen-1"
-    _ep_arch_run "$repo" "${base}/g.out" "${base}/g.err" --no-remote
-    code=$?
-    [[ "$code" -eq 0 ]] && _ep_t_pass "(g) ③ archive exit 0" \
-      || { _ep_t_fail "(g) archive rc=$code"; sed 's/^/    /' "${base}/g.err" >&2; rc=1; }
-    out="$(wc -l < "${base}/g.err" | tr -d '[:space:]')"
-    [[ "$out" == "1" ]] && _ep_t_pass "(g) ① stderr 정확히 1줄" \
-      || { _ep_t_fail "(g) ① stderr ${out}줄"; sed 's/^/    /' "${base}/g.err" >&2; rc=1; }
-    err="$(cat "${base}/g.err")"
-    _ep_t_has "(g) 경고 문구" "$err" "provenance 기록 정리 실패" || rc=1
-    # ② 경로를 정확히 대조합니다 — 문구만 보면 잘못된 대상을 지운 경우와 구별되지 않습니다.
-    _ep_t_has "(g) ② 경고에 담긴 경로가 fixture 루트와 일치" "$err" "$r" || rc=1
-    [[ -d "${r}/gen-1" ]] && _ep_t_pass "(g) ⑤ 루트 잔존" || { _ep_t_fail "(g) ⑤ 루트가 사라짐"; rc=1; }
-    stub_pending="$(_ep_arch_cleanup_section "${base}/g.out")"
-    if [[ "$stub_pending" == "$base_pending" ]]; then
-      _ep_t_pass "(g) ④ cleanup_add 잔여 레코드 목록 바이트 불변"
-    else
-      _ep_t_fail "(g) ④ 잔여 레코드 목록이 달라짐 — 경고를 cleanup_add 로 승격했는지 확인"
-      printf '    기대: [%s]\n    실제: [%s]\n' "$base_pending" "$stub_pending" >&2
-      rc=1
-    fi
-    _ep_t_hasnt "(g) ④ CLEANUP-PENDING 미출력" "$(cat "${base}/g.out")" "CLEANUP-PENDING" || rc=1
-  else
-    _ep_t_fail "(g) fixture 준비 실패"; rc=1
-  fi
-
-  # ---- (h) 프로세스 단위: 헬퍼 파일은 있으나 함수 미정의 ----
-  repo="${base}/h-repo"
-  if _ep_arch_setup "$repo" "ep-h" empty; then
-    r="${repo}/rd-workflow-workspace/.lifecycle/edit-provenance.d"
-    mkdir -p "${r}/gen-1"
-    _ep_arch_run "$repo" "${base}/h.out" "${base}/h.err" --no-remote
-    code=$?
-    [[ "$code" -eq 0 ]] && _ep_t_pass "(h) 빈 헬퍼 archive exit 0" \
-      || { _ep_t_fail "(h) archive rc=$code"; sed 's/^/    /' "${base}/h.err" >&2; rc=1; }
-    [[ -d "${r}/gen-1" ]] && _ep_t_pass "(h) 함수 미정의 → 정리 skip" || { _ep_t_fail "(h) 루트가 사라짐"; rc=1; }
-    if [[ -s "${base}/h.err" ]]; then
-      _ep_t_fail "(h) stderr 무출력 위반"; sed 's/^/    /' "${base}/h.err" >&2; rc=1
-    else
-      _ep_t_pass "(h) stderr 무출력"
-    fi
-  else
-    _ep_t_fail "(h) fixture 준비 실패"; rc=1
-  fi
-
-  # ---- (i) RD_EDIT_PROVENANCE_DIR 이 운영 삭제 대상을 바꾸지 못함 ----
-  # final diff review 턴 002 P1. 종전에는 ep_root() 가 이 변수를 무조건 우선했고 archive 는
-  # 인자 없이 ep_purge_root 를 불렀으므로, 변수가 환경에 남은 채 archive 를 돌리면
-  # **정상 성공 경로의 마지막 단계에서 그 임의 경로가 통째로 재귀 삭제**됐습니다.
-  # 프로젝트 **밖** 경로를 지목한 뒤 ① 그 경로와 그 안의 마커가 보존되고
-  # ② 프로젝트 안 provenance 루트는 정상 삭제되며 ③ exit 0 + stderr 무출력인지 봅니다.
-  repo="${base}/i-repo"
-  if _ep_arch_setup "$repo" "ep-i" real; then
-    r="${repo}/rd-workflow-workspace/.lifecycle/edit-provenance.d"
-    mkdir -p "${r}/gen-1"; printf 'gen-1\n' > "${r}/.current"
-    outside="${base}/i-outside"
-    mkdir -p "${outside}/precious"
-    printf 'do not delete\n' > "${outside}/precious/keep.txt"
-    _ep_arch_run_env "$repo" "${base}/i.out" "${base}/i.err" "$outside" --no-remote
-    code=$?
-    [[ "$code" -eq 0 ]] && _ep_t_pass "(i) 환경변수 override 상태에서 archive exit 0" \
-      || { _ep_t_fail "(i) archive rc=$code"; sed 's/^/    /' "${base}/i.err" >&2; rc=1; }
-    [[ -f "${outside}/precious/keep.txt" ]] \
-      && _ep_t_pass "(i) 프로젝트 밖 override 경로 보존 (재귀 삭제 없음)" \
-      || { _ep_t_fail "(i) override 경로가 삭제됨 — 운영 삭제 대상이 환경변수에 좌우됩니다: $outside"; rc=1; }
-    [[ ! -e "$r" ]] && _ep_t_pass "(i) 프로젝트 안 provenance 루트만 삭제" \
-      || { _ep_t_fail "(i) 프로젝트 루트가 남음: $r"; rc=1; }
-    if [[ -s "${base}/i.err" ]]; then
-      _ep_t_fail "(i) stderr 무출력 위반"; sed 's/^/    /' "${base}/i.err" >&2; rc=1
-    else
-      _ep_t_pass "(i) stderr 무출력"
-    fi
-  else
-    _ep_t_fail "(i) fixture 준비 실패"; rc=1
-  fi
-
-  # worktree 등록이 남으면 이후 실행을 오염시키므로 fixture 저장소마다 prune 합니다.
-  ( cd "${base}/e-repo" 2>/dev/null && git worktree prune ) >/dev/null 2>&1 || true
-  if ! rm -rf "$base" || [[ -e "$base" ]]; then
-    _ep_t_fail "archive 회수 테스트 임시 트리 정리 실패 — 수동으로 지워야 합니다: $base"
-    rc=1
-  fi
-  return $rc
-}
-
-run_step "편집 출처 진단 분기 테스트 (D1~D7)" edit_provenance_diagnostics_selftest
-run_step "편집 출처 archive 회수 (archive.sh §2.9)" edit_provenance_archive_check
-run_step "편집 출처 진단 (edit provenance D1~D7)" edit_provenance_diagnostics_check
 
 # 템플릿 dev repo 한정: build 규칙 정합성·루트 drift 검증 (설치본에는 빌더 없음 → skip)
 # self_test.sh 위치는 <root>/rd-workflow/scripts/ 이므로 dev 빌더는 두 단계 위 scripts/
@@ -1746,9 +1267,103 @@ claudemd_size_check() {
 }
 run_step "CLAUDE.md 크기 제한 (check_claudemd_size.sh)" claudemd_size_check
 
+print_skip_summary() {
+  echo ""
+  echo "== smoke 스킵 요약 =="
+  echo "실제 스킵된 스텝 (${#SKIPPED_STEPS[@]}개) — 사유: 변경 파일이 이 스텝의 참조 폐포에 없습니다"
+  # 빈 배열에 printf 를 그대로 걸면 빈 항목 한 줄이 찍히므로 건수가 있을 때만 출력합니다.
+  if (( ${#SKIPPED_STEPS[@]} > 0 )); then
+    printf '  - %s\n' "${SKIPPED_STEPS[@]}"
+  fi
+  echo "전체 검증: bash rd-workflow/scripts/self_test.sh full"
+  # spec §5.3 preflight 역할 3 의 "경고를 남긴다" 절반입니다 — preflight 결과에 없는 스텝이
+  # 실행되면(예: 최종 판정 exit 뒤에 붙은 run_step) 예정과 실제가 어긋나는데, 사용자가 두
+  # 숫자를 직접 대조하지 않으면 알 수 없습니다.
+  #
+  # 이 대조는 **스킵 기록 누락도 런타임에 자기 신고**하게 만드는 이중 효과가 있습니다 —
+  # 실제로 건너뛰면서 `SKIPPED_STEPS+=` 만 빠지면 `0 ≠ 25` 로 즉시 드러납니다.
+  #
+  # **stdout 이 아니라 stderr** 로 냅니다. 기존 케이스들이 stdout 의 `  - ` 줄과 건수 표기를
+  # 파싱하므로 stdout 을 오염시키면 다른 단언이 깨집니다.
+  # **rc 는 바꾸지 않습니다.** 이것은 fail-safe 신고이지 판정이 아니며, 판정까지 바꾸면
+  # 커밋 전·아카이브 전 full 강제 설계와 얽힙니다.
+  #
+  # 대조는 **건수가 아니라 내용**으로 합니다. 건수만 보면 예정한 스텝 대신 다른 스텝이
+  # 스킵된 상태(`1 == 1`)에서 침묵하고, "예정보다 더 많이 건너뛰는" 더 위험한 방향도
+  # 조건을 `<` 로 바꾸는 것만으로 조용해집니다. 목록을 정렬해 비교하면 건수 불일치는
+  # 자동으로 포함되고, 양쪽 방향과 내용 어긋남이 한 번에 잡힙니다.
+  # 순서 비의존 비교인 이유: 두 목록 모두 `"<순번>. <설명>"` 이라 순번이 내용에 들어 있고,
+  # 기록 순서 자체는 계약이 아니기 때문입니다.
+  local _plan_n=${#SMOKE_SKIP_DESCS[@]} _done_n=${#SKIPPED_STEPS[@]} _plan_s _done_s
+  _plan_s="$(printf '%s\n' ${SMOKE_SKIP_DESCS[@]+"${SMOKE_SKIP_DESCS[@]}"} | sort)"
+  _done_s="$(printf '%s\n' ${SKIPPED_STEPS[@]+"${SKIPPED_STEPS[@]}"} | sort)"
+  #
+  # 정렬 불명이면 원인이 하나(순번 밀림)이므로 신고도 하나로 합칩니다 — 같은 사건을 두 문구로
+  # 신고하면 사용자가 원인을 오판합니다. 침묵시키지도 않습니다: 정렬 불명은 rc 를 바꾸지 않아
+  # **감축 효과만 조용히 사라지는** 상태이고, 이 1줄이 그것을 사용자에게 알리는 유일한
+  # 장치입니다. 예정과 실제가 우연히 같은 경우에도(어긋남이 꼬리에서만 났을 때) 반드시 냅니다.
+  if (( SMOKE_ALIGN_LOST )); then
+    echo "== 경고: smoke 순번 정렬 불명 — 그 시점부터 스텝 감축이 사라졌습니다 ==" >&2
+    echo "   순번 ${SMOKE_ALIGN_LOST_IDX} 이후 ${SMOKE_ALIGN_FORCED}개 스텝을 스킵 판정 없이 전부 실행했습니다 (스킵 예정 ${_plan_n}개 중 실제 ${_done_n}개만 스킵)." >&2
+    echo "   이 결과를 검증 통과로 쓰지 말고 bash rd-workflow/scripts/self_test.sh full 로 전수 실행하십시오." >&2
+  elif [[ "$_plan_s" != "$_done_s" ]]; then
+    if (( _done_n != _plan_n )); then
+      echo "== 경고: smoke 스킵 예정(${_plan_n}개)과 실제 스킵(${_done_n}개)이 다릅니다 ==" >&2
+    else
+      echo "== 경고: smoke 스킵 예정과 실제 스킵의 내용이 다릅니다 (건수는 ${_plan_n}개로 같습니다) ==" >&2
+    fi
+    echo "   preflight 가 알지 못하는 스텝이 실행됐거나 스킵 기록이 누락됐습니다." >&2
+    echo "   이 결과를 검증 통과로 쓰지 말고 bash rd-workflow/scripts/self_test.sh full 로 전수 실행하십시오." >&2
+  fi
+}
+
+# dry-run: 스텝을 실행하지 않고 실행/스킵 예정만 보고합니다 (무엇이 빠지는지 미리 확인하는 용도).
+if [[ -n "${RD_SELFTEST_SMOKE_DRYRUN:-}" ]]; then
+  # 스킵 요약은 smoke 모드에서만 의미가 있습니다. 모드 가드가 없으면 full 실행인데도
+  # "smoke 스킵 요약" 이 나와 사용자가 축소 실행으로 오인합니다.
+  # `[[ ... ]] && print_skip_summary` 로 쓰면 조건 거짓일 때 종료 상태 1이 되어
+  # `set -e` 하에서 스크립트가 죽으므로 반드시 if 문으로 씁니다.
+  if [[ "$SELFTEST_MODE" == "smoke" ]]; then
+    print_skip_summary
+  fi
+  echo ""
+  echo "== 실행 예정 스텝 (${#STEP_NAMES[@]}개) =="
+  if (( ${#STEP_NAMES[@]} > 0 )); then
+    printf '  - %s\n' "${STEP_NAMES[@]}"
+  fi
+  exit 0
+fi
+
+# 실제 실행 경로의 스킵 요약입니다. 위 dry-run 블록은 `exit 0` 으로 끝나므로 두 번
+# 출력되지 않습니다. 가드 형태를 dry-run 쪽과 같게 유지합니다 —
+# `[[ ... ]] && print_skip_summary` 로 쓰면 full 모드에서 조건이 거짓일 때 그 문장이
+# 블록의 마지막 명령이 되어 rc 1 이 되고, `set -e` 에 걸려 스크립트가 그 자리에서 죽습니다.
+if [[ "$SELFTEST_MODE" == "smoke" ]]; then
+  print_skip_summary
+fi
+
+echo ""
+echo "== 스텝별 소요 시간 (느린 순) =="
+if ! print_step_summary; then
+  echo "  (요약 출력 실패 — 최종 판정과 무관하게 계속 진행합니다)" >&2
+fi
+
 echo ""
 if [[ "$FAIL" -eq 0 ]]; then
   echo "== self_test 결과: PASS =="
+  # full 통과 지문을 남깁니다 — **소비처는 아카이브 게이트 하나뿐입니다.**
+  # (커밋 전 대조 게이트는 2026-08-20 에 제거됐습니다. 그때 이 안내를 함께 고치지 않아
+  #  "다음 커밋이 막힌다" 는 있지도 않은 일을 예고했습니다 — 증명의 사용 시점을 잘못
+  #  보여 주면 사용자가 대비할 지점을 놓칩니다.)
+  # 기록 실패를 조용히 성공으로 표시하지 않습니다. 그러면 사용자는 아카이브가 막힐 때까지
+  # 자기 상태가 증명되지 않았다는 사실을 모릅니다.
+  if [[ "$SELFTEST_MODE" == "full" ]] && declare -F smoke_record_full_pass >/dev/null 2>&1; then
+    if smoke_record_full_pass "$SELFTEST_ROOT" "$SELFTEST_START_FP" "$SELFTEST_START_USTATE"; then
+      echo "  full PASS 지문을 기록했습니다 (아카이브 시점 대조에 사용됩니다)"
+    else
+      echo "  full PASS 지문을 기록하지 못했습니다 — 아카이브 시 full 재실행을 요구받습니다" >&2
+    fi
+  fi
   exit 0
 else
   echo "== self_test 결과: FAIL ==" >&2

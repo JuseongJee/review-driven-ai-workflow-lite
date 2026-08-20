@@ -296,36 +296,6 @@ run_watchdog_scenario() {
 }
 
 run_all_scenarios() {
-# project_root 밖 경로는 워크플로 단계와 무관하게 통과해야 한다 (FR 핵심)
-run_scenario 1 "project_root 밖(plan) + 진행중 → 통과" \
-  "검증 중" "no" "/outside/.claude/plans/x.md" 0
-run_scenario 9 "project_root 밖(메모리) + 진행중 → 통과" \
-  "diff review 대기" "no" "/Users/x/.claude/projects/p/memory/m.md" 0
-
-# project_root 안 소스(화이트리스트 밖) + 진행중 → 차단 (회귀 방지)
-run_scenario 2 "project_root 안 소스 + 진행중 → 차단" \
-  "검증 중" "no" "{F}/rd-workflow/scripts/foo.sh" 2
-
-# 대기 중 / 완료 / 빈 값 → 자유 수정 허용 (cfd356f drift fix)
-run_scenario 3 "대기 중 + 소스 → 통과 (drift fix)" \
-  "대기 중" "no" "{F}/rd-workflow/scripts/foo.sh" 0
-run_scenario 4 "완료 + 소스 → 통과 (drift fix)" \
-  "완료" "no" "{F}/rd-workflow/scripts/foo.sh" 0
-run_scenario 10 "빈 Status + 소스 → 통과 (drift fix)" \
-  "__NONE__" "no" "{F}/rd-workflow/scripts/foo.sh" 0
-
-# 구현 중 / 실행 중 → 통과
-run_scenario 5 "구현 중 + 소스 → 통과" \
-  "구현 중" "no" "{F}/rd-workflow/scripts/foo.sh" 0
-
-# 워크플로 화이트리스트 파일 + 진행중 → 통과
-run_scenario 6 "워크플로 화이트리스트(CURRENT_TASK.md) + 진행중 → 통과" \
-  "검증 중" "no" "{F}/CURRENT_TASK.md" 0
-
-# autopilot 활성 → 진행중 + 소스라도 통과
-run_scenario 7 "autopilot + 진행중 + 소스 → 통과" \
-  "검증 중" "yes" "{F}/rd-workflow/scripts/foo.sh" 0
-
 # 빈 file_path → 통과
 run_scenario 8 "빈 file_path → 통과" \
   "검증 중" "no" "" 0
@@ -346,7 +316,7 @@ run_scenario 15 "subagent + task-state → 차단" \
 # 차단 집합은 진행 상태 3종으로 좁다 — spec/plan/report 는 단일 작성자 산출물이라 제외한다.
 run_scenario 16 "subagent + spec 파일 → 통과 (좁은 집합 경계)" \
   "구현 중" "no" "{F}/rd-workflow-workspace/specs/changes/x.md" 0 "agent_abc123"
-run_scenario 17 "subagent + 구현 소스 + 구현 중 → 통과 (기존 Status 판정 불변)" \
+run_scenario 17 "subagent + 구현 소스 → 통과 (차단 집합 밖)" \
   "구현 중" "no" "{F}/rd-workflow/scripts/foo.sh" 0 "agent_abc123"
 # --- 경로 매칭 계약 (change spec §4.2) ---
 # 블랙리스트는 과소 매칭이 우회로 실패하므로 lexical alias 를 전부 정규화한다.
@@ -398,12 +368,10 @@ run_scenario 33 "subagent + CURRENT_TASK.md 를 가리키는 symlink → 차단 
   "구현 중" "no" "{F}/ct_link.md" 2 "agent_abc123" "link"
 run_scenario 34 "subagent + CURRENT_TASK.md 의 hardlink → 차단 (양 볼륨 공통)" \
   "구현 중" "no" "{F}/ct_hardlink.md" 2 "agent_abc123" "hardlink"
-# 35 는 차단 판정을 기존 통과 분기 전부보다 앞으로 옮긴 데 대한 안전 확인이다.
+# 35 는 프로젝트 밖 절대 경로가 그대로 통과하는지 확인한다.
 # is_shared_state_file 이 프로젝트 밖 절대 경로에 스스로 return 1 을 반환하므로
-# 밖 경로 동작이 바뀌지 않아야 한다.
-# 판별 필드가 있는 상태로 새 블록을 프로젝트 밖 경로로 구동하는 유일한 시나리오다
-# (기존 1·9 는 판별 필드를 넘기지 않아 새 블록에 진입하지 않는다). 게이트 조건에서
-# is_shared_state_file 판정이 빠지는 종류의 변경을 검출한다 — 복사본 실측으로 확인했다.
+# 밖 경로 동작이 바뀌지 않아야 한다. 게이트 조건에서 is_shared_state_file 판정이 빠지는
+# 종류의 변경을 검출한다 — 복사본 실측으로 확인했다.
 # 한계: 프로젝트 밖에 둔 정본 hardlink 로 쓰는 경로는 이 시나리오가 잡지 못하며,
 #       그 우회는 spec 이 확정한 비목표(경로의 물리적 해석)에 해당한다.
 run_scenario 35 "subagent + project_root 밖 절대 경로 → 통과 (판정 위치 이동 부작용 없음)" \
@@ -430,42 +398,6 @@ run_scenario 40 "subagent + pretty-printed 최상위 agent_type → 차단 (JSON
 # "먼저 비어 있지 않은 값" 이 계약이므로 agent_type 이 빈 값이면 agent_id 를 쓴다.
 run_scenario 41 "subagent + agent_type 빈 값 + agent_id 값 있음 → 차단 (두 모드 판정 일치)" \
   "구현 중" "no" "{F}/CURRENT_TASK.md" 2 "__MIXED__"
-# --- SDD·brainstorm 워크스페이스 편입 + lexical 정규화 ---
-# (implementation-gate-sdd-workspace-block)
-# 두 경로는 superpowers 플러그인의 워크스페이스이며 정본·루트 .gitignore 양쪽에 등재된
-# 상위 '.superpowers/' 아래 있다. 리뷰 대상 diff 를 오염시키지 않으므로 단계 게이트에서
-# 통과시킨다. 부모 '.superpowers/' 를 통째로 열지 않는 이유는 change spec §2.1 참조.
-run_scenario 44 "orchestrator + SDD progress 기록 + diff review 대기 → 통과" \
-  "diff review 대기" "no" "{F}/.superpowers/sdd/p/progress.md" 0
-run_scenario 45 "subagent + SDD task report + diff review 대기 → 통과" \
-  "diff review 대기" "no" "{F}/.superpowers/sdd/p/task-1-report.md" 0 "agent_abc123"
-run_scenario 46 "brainstorm 워크스페이스 + diff review 대기 → 통과" \
-  "diff review 대기" "no" "{F}/.superpowers/brainstorm/s/content/m.html" 0
-# 음성 짝 — 이 케이스 없이 44~46 만 고정하면 gate 무력화와 구별되지 않는다.
-run_scenario 47 "구현 파일 직접 경로 + diff review 대기 → 차단" \
-  "diff review 대기" "no" "{F}/rd-workflow/scripts/foo.sh" 2
-# 허용 접두로 시작해 '..' 로 디렉토리 밖 구현 파일을 가리키는 경로.
-# x → sdd → .superpowers → project_root 로 세 단계를 거슬러야 실제 구현 파일에 닿는다.
-# 이 케이스는 패턴 추가 전에도 통과한다(매칭 대상이 없어 차단). 존재 이유는
-# '정규화 없이 case 두 줄만 추가하는' 불완전 구현을 잡는 것이다 — 그 구현에서만 뒤집힌다.
-run_scenario 48 "SDD 접두 + '..' 탈출 → 차단 (패턴만 추가한 구현을 잡는 안전 회귀)" \
-  "diff review 대기" "no" "{F}/.superpowers/sdd/x/../../../rd-workflow/scripts/foo.sh" 2
-# 기존 화이트리스트 패턴도 같은 탈출을 허용해 왔다 — 정규화로 함께 닫는다 (의도된 동작 변경).
-run_scenario 49 "기존 패턴(rd-workflow-workspace) + '..' 탈출 → 차단 (동작 변경)" \
-  "diff review 대기" "no" "{F}/rd-workflow-workspace/../rd-workflow/scripts/foo.sh" 2
-# 허용 디렉토리 안에 머무는 '..' 별칭은 통과가 의도다 (과소 매칭 해소).
-run_scenario 50 "SDD 안에 머무는 '..' 별칭 → 통과" \
-  "diff review 대기" "no" "{F}/.superpowers/sdd/x/../progress.md" 0
-# 기존 화이트리스트 두 갈래의 정상 경로가 '차단 상태' 에서 실제로 통과하는지 고정한다.
-# 정확 일치 5종은 시나리오 6 이 이미 차단 상태로 검증하지만, 아래 두 패턴에는 그 짝이
-# 없었다 — 기존 시나리오 16 의 workspace 경로는 Status 가 '구현 중' 이라 화이트리스트가
-# 깨져도 Status 분기에서 통과해 이 회귀를 검출하지 못한다 (final diff review Finding 2).
-# 51 의 경로는 rd-workflow-workspace/ 밖에 둔다 — 안에 두면 'rd-workflow-workspace/*'
-# 패턴에 먼저 걸려 '*/turns/*.md' 가 죽어도 통과해, 그 패턴을 독립 검증하지 못한다.
-run_scenario 51 "기존 패턴(*/turns/*.md) 정상 경로 + diff review 대기 → 통과" \
-  "diff review 대기" "no" "{F}/handoffs/review_pipeline/s/turns/001_author.md" 0
-run_scenario 52 "기존 패턴(rd-workflow-workspace) 정상 경로 + diff review 대기 → 통과" \
-  "diff review 대기" "no" "{F}/rd-workflow-workspace/specs/changes/x.md" 0
 # 42 는 성능 회귀와 오인 차단을 한 payload 로 건다 (run_perf_scenario 주석 참조).
 run_perf_scenario 42 "메인 세션 + 200KB content(내부에 판별 필드 문자열) → 통과 + 선형 시간"
 # 43 은 42 의 상한을 실효화하는 기구를 검증한다 (run_watchdog_scenario 주석 참조).
@@ -474,7 +406,7 @@ run_watchdog_scenario 43 "watchdog 상한 초과 → 명령 치환 자손까지 
 
 # --- jq 경로와 bash 폴백을 둘 다 결정적으로 실행한다 ---
 # 실패하는 jq shim 을 PATH 앞에 두면 command -v jq 는 성공하고 jq 호출은 실패하므로
-# 세 파서 함수(read_hook_agent_id / extract_json_field / read_stop_hook_active)의
+# 두 파서 함수(read_hook_agent_id / extract_json_field)의
 # bash 폴백 분기가 환경과 무관하게 반드시 실행된다.
 NOJQ_DIR="$(mktemp -d)"
 printf '%s\n' '#!/bin/bash' 'exit 1' > "$NOJQ_DIR/jq"

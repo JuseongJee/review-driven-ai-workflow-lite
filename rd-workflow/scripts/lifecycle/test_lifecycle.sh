@@ -1,5 +1,46 @@
 #!/usr/bin/env bash
+# 이 스위트가 **FAIL 한 줄 없이 rc 1 로 조용히 죽는** 사건이 관측됐는데(1/5 회), 사후에
+# 지점을 특정할 방법이 없어 원인 확정이 불가능했습니다. 아래 두 trap 은 다음 재발을
+# "판정 불능" 이 아니라 "즉시 인지 + 가능하면 지점 확정" 으로 바꿉니다.
+# 기대값을 맞추려고 이 trap 들을 약화시키지 마십시오 — 약화시키는 순간 같은 사건이
+# 다시 익명이 됩니다.
+#
+# **`-E` 는 의도적으로 켜지 않습니다** (실측 근거). `-E` 를 켜면 trap 이 함수·서브셸·명령
+# 치환까지 물려받는데, bash 는 errexit 의 "판정 문맥 유예" 를 그 안쪽으로 물려주지
+# 않습니다. 그래서 `x="$(cmd)" || true` · `( f ) && rc=0 || rc=1` 처럼 **이미 처리된
+# 실패**에서 trap 이 전부 울립니다 (실측: 무관한 지점 9곳 + `stderr 무출력` 단언 1건 파괴).
+# 그 실패들은 판정 문맥 안이라 애초에 스위트를 죽이지 못하므로 진단 대상이 아닙니다.
+#
+# **ERR trap 하나로는 부족합니다** (전수 매트릭스 실측 — task-8b-review §4). 조용한 죽음은
+# 세 형태이고 `-E` 없는 ERR trap 은 그중 하나만 잡습니다.
+#   - 최상위 단순 명령       → ERR **잡음** (줄번호까지)
+#   - 최상위에서 부른 함수 안 → ERR **놓침**
+#   - 최상위 서브셸 `( … )` 안 → ERR **놓침**
+# 이 스위트는 `ast_reset_marks` 같은 자기 헬퍼 함수와 `( … )` 를 전반에서 쓰므로 놓치는
+# 범위가 예외가 아닙니다. 그래서 **EXIT 센티넬**을 함께 겁니다 — 결과줄을 찍고 `DONE=1`
+# 을 세우기 전에 셸이 끝나면 무조건 FAIL 을 냅니다. 세 형태를 모두 덮고, 판정 문맥은
+# bash 가 부모의 EXIT trap 을 `( … )`·명령 치환 안에서 실행하지 않으므로 오탐이 없습니다.
+# 둘의 조합이 "항상 알려 주고, 가능하면 지점까지 짚는" 형태입니다.
 set -euo pipefail
+trap 'ec=$?; echo "  FAIL: 스위트가 line ${LINENO} 에서 rc=${ec} 로 중단됐습니다 (조용한 중단)" >&2' ERR
+# **EXIT trap 은 하나뿐입니다 — 두 번째를 걸면 첫 번째가 조용히 사라집니다.** 그래서
+# 임시 디렉터리 정리도 이 핸들러가 함께 합니다 (실측: 센티넬만 따로 걸었더니 아래
+# `TMPDIR_TEST` 정리 trap 이 그것을 덮어써 세 형태 모두 검출되지 않았습니다).
+# 서브셸 `( … )` 안의 `trap … EXIT` 는 그 서브셸에만 걸리므로 여기와 충돌하지 않습니다.
+# 최상위에 EXIT trap 을 새로 걸지 마십시오 — 정리 대상은 `_ast_cleanup` 에 append 하고,
+# 그 규칙이 지켜졌는지는 스위트 끝의 `trap -p EXIT` 단언이 실행 시점에 확인합니다.
+#
+# `local _ec=$?` 를 **첫 줄**에서 붙잡습니다. `[[ … ]] || echo "…$?"` 로 쓰면 `$?` 가
+# `[[ ]]` 의 rc(=1)로 전개돼 실제 중단 rc(127·2 …)를 감춥니다 — 메시지가 사실과 다른
+# 말을 하게 되고, 이 스위트가 반복해서 고쳐 온 결함이 바로 그것입니다.
+DONE=0
+_ast_cleanup=()
+_suite_on_exit() {
+  local _ec=$? _d
+  for _d in ${_ast_cleanup[@]+"${_ast_cleanup[@]}"}; do [[ -z "$_d" ]] || rm -rf "$_d"; done
+  [[ "$DONE" == 1 ]] || echo "  FAIL: 스위트가 결과줄 없이 rc=${_ec} 로 중단됐습니다 (조용한 중단 — 마지막 PASS 줄 다음을 보십시오)" >&2
+}
+trap _suite_on_exit EXIT
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/slug.sh"
 
@@ -46,7 +87,7 @@ assert_in_set "$rc" "0,1" "ensure_worktree_clean exit code"
 
 echo "== metadata I/O =="
 TMPDIR_TEST="$(mktemp -d)"
-trap "rm -rf '$TMPDIR_TEST'" EXIT
+_ast_cleanup+=("$TMPDIR_TEST")   # 최상위 EXIT trap 은 `_suite_on_exit` 하나뿐입니다 (상단 주석)
 # v2 2b: task-state 경로로 격리 (LIFECYCLE_METADATA_PATH 폐지 — TASK_STATE_PATH 사용)
 TASK_STATE_PATH="$TMPDIR_TEST/task-state"
 if metadata_exists; then FAIL=$((FAIL+1)); echo "  FAIL: empty metadata 인데 exists 반환" >&2; \
@@ -638,69 +679,6 @@ printf 'schema=1\nshort-title=-\nstatus=대기 중\nfr-branch=null\nworktree-pat
 assert_eq "$rc" "0" "archive_signal — AS2 task-state baseline → 0(차단)"
 rm -rf "$SIG_REPO"
 
-echo "== review_gate hook exit code (iteration-commit 허용) =="
-HOOK_REPO="$(mktemp -d)"
-mkdir -p "$HOOK_REPO/rd-workflow/scripts/hooks"
-mkdir -p "$HOOK_REPO/rd-workflow/scripts"
-mkdir -p "$HOOK_REPO/rd-workflow-workspace/handoffs/review_pipeline"
-mkdir -p "$HOOK_REPO/rd-workflow-workspace/backlog/request-archive"
-mkdir -p "$HOOK_REPO/rd-workflow-workspace/.lifecycle"
-cp "$LITE_HOOKS_DIR/_guard_common.sh" "$HOOK_REPO/rd-workflow/scripts/hooks/"
-cp "$LITE_HOOKS_DIR/pre_commit_review_gate.sh" "$HOOK_REPO/rd-workflow/scripts/hooks/"
-cp "$LITE_HOOKS_DIR/../_state_common.sh" "$HOOK_REPO/rd-workflow/scripts/"
-git -C "$HOOK_REPO" init -q
-git -C "$HOOK_REPO" config user.email t@t && git -C "$HOOK_REPO" config user.name t
-printf '# Current Task\n\n## Status\ndiff review 대기\n\n## Short Title\nhooktask\n' > "$HOOK_REPO/CURRENT_TASK.md"
-hook_mk_session() {
-  local d="$HOOK_REPO/rd-workflow-workspace/handoffs/review_pipeline/$1"
-  mkdir -p "$d"
-  printf '## Status\n%s\n\n## Branch Context\n- short-title: %s\n' "$2" "$4" > "$d/SESSION.md"
-  printf '## Open Issues\n%s\n' "$3" > "$d/CHECKPOINT.md"
-}
-run_review_gate() {
-  printf '%s' '{"tool_input":{"command":"git commit -m x"}}' \
-    | bash "$HOOK_REPO/rd-workflow/scripts/hooks/pre_commit_review_gate.sh" >/dev/null 2>&1; echo $?
-}
-HARCH="rd-workflow-workspace/backlog/request-archive/2026-05-24-0000-hooktask.md"
-# 세션 없음 → 통과
-assert_eq "$(run_review_gate)" "0" "review_gate — 세션 없음 → 통과 (exit 0)"
-# 종결(awaiting-user+없음) → 통과
-hook_mk_session "20260201_000000_final-diff-review" "awaiting-user" "- 없음" "hooktask"
-assert_eq "$(run_review_gate)" "0" "review_gate — awaiting-user+없음(종결) → 통과"
-# A1: 미종결 + iteration(staged archive 없음) → 허용 (신 동작)
-hook_mk_session "20260202_000000_final-diff-review" "awaiting-reviewer" "- 없음" "hooktask"
-assert_eq "$(run_review_gate)" "0" "review_gate — A1 미종결 + iteration commit → 허용 (exit 0)"
-# A1-edge: 미종결 + untracked stale archive(add 안 함) → 허용 (false-positive 방지)
-printf 'x\n' > "$HOOK_REPO/$HARCH"
-assert_eq "$(run_review_gate)" "0" "review_gate — A1 미종결 + untracked stale archive → 허용"
-# B1-AS1: 미종결 + staged request-archive 추가 → 차단
-git -C "$HOOK_REPO" add "$HARCH"
-assert_eq "$(run_review_gate)" "2" "review_gate — B1(AS1) 미종결 + staged archive 추가 → 차단 (exit 2)"
-git -C "$HOOK_REPO" reset -q; rm -f "$HOOK_REPO/$HARCH"
-# B1-AS2: 미종결 + task-state baseline(status=대기 중, short-title=-) → 차단 (v2: task-state 우선)
-printf 'schema=1\nshort-title=-\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' \
-  > "$HOOK_REPO/rd-workflow-workspace/.lifecycle/task-state"
-printf '# Current Task\n\n## Status\n대기 중\n\n## Short Title\n-\n' > "$HOOK_REPO/CURRENT_TASK.md"
-assert_eq "$(run_review_gate)" "2" "review_gate — B1(AS2) 미종결 + task-state baseline → 차단 (exit 2)"
-printf '# Current Task\n\n## Status\ndiff review 대기\n\n## Short Title\nhooktask\n' > "$HOOK_REPO/CURRENT_TASK.md"
-printf 'schema=1\nshort-title=hooktask\nstatus=diff review 대기\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' \
-  > "$HOOK_REPO/rd-workflow-workspace/.lifecycle/task-state"
-# autopilot 활성 + 미종결 + iteration → 허용 (3a 우회 제거 후에도 iteration 은 신호 아님)
-touch "$HOOK_REPO/.autopilot_active"
-assert_eq "$(run_review_gate)" "0" "review_gate — autopilot + 미종결 + iteration → 허용"
-rm -f "$HOOK_REPO/.autopilot_active"
-# malformed(Open Issues 섹션 부재) = 미종결 + iteration → 허용 (archive 신호일 때만 fail-closed)
-mkdir -p "$HOOK_REPO/rd-workflow-workspace/handoffs/review_pipeline/20260203_000000_final-diff-review"
-printf '## Status\nclosed\n\n## Branch Context\n- short-title: hooktask\n' > "$HOOK_REPO/rd-workflow-workspace/handoffs/review_pipeline/20260203_000000_final-diff-review/SESSION.md"
-printf '# Review Checkpoint\n\n## Current Summary\n-\n' > "$HOOK_REPO/rd-workflow-workspace/handoffs/review_pipeline/20260203_000000_final-diff-review/CHECKPOINT.md"
-assert_eq "$(run_review_gate)" "0" "review_gate — malformed + iteration → 허용"
-# malformed + staged archive 추가 → 차단 (archive 경로 fail-closed 유지)
-printf 'x\n' > "$HOOK_REPO/$HARCH"
-git -C "$HOOK_REPO" add "$HARCH"
-assert_eq "$(run_review_gate)" "2" "review_gate — malformed + staged archive → 차단 (fail-closed)"
-git -C "$HOOK_REPO" reset -q
-rm -rf "$HOOK_REPO"
-
 echo "== archive_gate hook exit code =="
 AG_REPO="$(mktemp -d)"
 mkdir -p "$AG_REPO/rd-workflow/scripts/hooks" "$AG_REPO/rd-workflow/scripts" "$AG_REPO/rd-workflow-workspace/handoffs/review_pipeline" "$AG_REPO/rd-workflow-workspace/backlog/items"
@@ -894,5 +872,465 @@ assert_eq "$( cd "$R" && get_main_worktree_path )" "$( cd "$R" && pwd -P )" "get
 
 rm -rf "$GDB_TMP"
 
+# === 아카이브 전 전수 검증 강제 (self-test-runtime-reduction Task 8) =====================
+#
+# 이 게이트는 축소 실행(smoke)이 미변경 스크립트의 구문 오류를 놓치게 된 대가를 통합 직전에
+# 상환하는 **유일한 무우회 지점**입니다. 그래서 아래 단언은 차단 방향뿐 아니라
+# **오탐 방향**(정당한 아카이브가 막히지 않는가)도 함께 고정합니다 — 과잉 차단은 사용자가
+# 게이트 자체를 들어내게 만들어 결국 같은 손실로 돌아옵니다.
+echo "== archive 전수 검증 게이트 =="
+AST_GUARD_SH="$SCRIPT_DIR/../hooks/_guard_common.sh"
+AST_ARCHIVE_SH="$SCRIPT_DIR/archive.sh"
+AST_SMOKE_SH="$SCRIPT_DIR/../_smoke_common.sh"
+# 판정 함수는 게이트가 소비하는 것과 **같은 파일**에서 가져옵니다. 테스트가 자체 판정을
+# 따로 짜면 두 판정이 갈리는 순간 이 회귀가 거짓 안심을 줍니다.
+# shellcheck source=/dev/null
+. "$AST_SMOKE_SH"
+
+# 마커 디렉터리는 fixture **밖**에 둡니다 — 안에 두면 그 자체가 untracked 가 되어
+# 증명 기록 조건을 깨고, 관측 장치가 관측 대상을 바꿔 버립니다.
+AST_MK="$(mktemp -d)"
+export AST_MK
+ast_reset_marks() { rm -f "$AST_MK/invoked" "$AST_MK/env"; }
+
+# fixture 준비 명령은 감싸서 씁니다. `smoke_proof_fingerprint` 는 `mktemp`·`git` 실패에서
+# `return 1` 하는데(부하에 민감합니다), 최상위에서 맨몸으로 두면 `set -e` 가 스위트를
+# **FAIL 한 줄 없이** 죽입니다 — 위 ERR trap 이 지점은 짚어 주지만, 죽는 대신 그 단언만
+# 실패하게 두는 편이 나머지 단언을 살립니다.
+ast_fp() {  # $1 = 기록할 캐시 경로
+  if ! smoke_proof_fingerprint "$AST_FX" worktree > "$1"; then
+    FAIL=$((FAIL+1)); echo "  FAIL: fixture 증명 지문 생성 실패 — 이후 단언의 전제가 깨졌습니다" >&2
+  fi
+}
+ast_mv() {  # $1 = 원본, $2 = 대상
+  if ! mv "$1" "$2"; then
+    FAIL=$((FAIL+1)); echo "  FAIL: fixture 파일 이동 실패 ($1 → $2) — 해당 케이스를 만들지 못했습니다" >&2
+  fi
+}
+
+# 격리 fixture: 최소 인프라 트리 + 전수 검증 대역(stub).
+# 실제 전수 검증은 이 저장소에서 13분이 걸려 회귀로 쓸 수 없습니다. 대역을 두면
+# "정말 실행되는가 / 어떤 인자·환경으로 떨어지는가 / 그 rc 가 판정에 반영되는가" 를
+# 초 단위로 관측할 수 있고, 그것이 이 Task 에서 고정해야 할 성질 전부입니다.
+ast_make_fx() {  # stdout: fixture root
+  local d; d="$(mktemp -d)"
+  mkdir -p "$d/rd-workflow/scripts" "$d/rd-workflow-workspace/.lifecycle"
+  cp "$AST_SMOKE_SH" "$d/rd-workflow/scripts/_smoke_common.sh"
+  printf 'echo a\n' > "$d/rd-workflow/scripts/a_zzfx.sh"
+  # tracked 이면서 **증명 집합 밖**(transient)인 파일입니다. "워킹트리 = HEAD" 확인이
+  # 증명 범위와 같은 pathspec 을 쓰는지 오탐 방향으로 고정하는 데 씁니다 — 범위를
+  # 넓게 잡으면 감사 로그 한 줄에 정당한 아카이브가 막힙니다.
+  printf 'v1\n' > "$d/rd-workflow-workspace/.lifecycle/verify-cache"
+  cat > "$d/rd-workflow/scripts/self_test.sh" <<'ASTSTUB'
+#!/usr/bin/env bash
+# 격리 fixture 전용 대역입니다 (실제 전수 검증 아님).
+# AST_STUB_RC 로 실패를, AST_STUB_NORECORD 로 "실행은 했는데 증명을 남기지 않는" 형태를,
+# AST_STUB_RECORD_THEN_FAIL 로 "증명은 남기면서 rc 는 실패" 형태를 재현합니다.
+# 마지막 변형이 있어야 "전수 검증 rc 가 판정에 반영되는가" 를 재대조와 분리해 고정할 수
+# 있습니다 (rc 를 무시해도 증명이 없으면 재대조가 대신 막아 단언이 공허해집니다).
+# 정상 경로는 실제 기록 함수를 그대로 호출해 기록 조건까지 같게 둡니다.
+set -uo pipefail
+_r="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+printf 'mode=%s\n' "${1-}" >> "$AST_MK/invoked"
+# 전수 검증의 범위·검출력을 낮추거나 실행을 건너뛰게 하는 변수를 **전부** 찍습니다.
+# 마지막 ZZFX 는 실재하지 않는 이름입니다 — 게이트가 이름 목록이 아니라 **계열**로
+# 떨어뜨리는지(=새 변수가 생겨도 자동으로 닫히는지)를 고정하기 위한 것입니다.
+printf 'dryrun=[%s] checkeronly=[%s] stressiter=[%s] mdlimit=[%s] zzfx=[%s]\n' \
+  "${RD_SELFTEST_SMOKE_DRYRUN:-}" "${RD_SELFTEST_CHECKER_ONLY:-}" \
+  "${RD_EDIT_PROVENANCE_STRESS_ITER:-}" "${CLAUDEMD_LINE_LIMIT:-}" \
+  "${RD_SELFTEST_ZZFX:-}" >> "$AST_MK/env"
+_ast_record() {
+  # shellcheck source=/dev/null
+  . "$_r/rd-workflow/scripts/_smoke_common.sh"
+  _fp="$(smoke_proof_fingerprint "$_r" worktree)" || exit 1
+  _us=0; smoke_untracked_state "$_r" >/dev/null 2>&1 || _us=$?
+  smoke_record_full_pass "$_r" "$_fp" "$_us" 2>/dev/null || true
+}
+if [[ -n "${AST_STUB_RECORD_THEN_FAIL:-}" ]]; then _ast_record; exit 1; fi
+if [[ "${AST_STUB_RC:-0}" != "0" ]]; then exit "${AST_STUB_RC}"; fi
+if [[ -n "${AST_STUB_NORECORD:-}" ]]; then exit 0; fi
+_ast_record
+exit 0
+ASTSTUB
+  git -C "$d" init -q .
+  git -C "$d" config user.email t@example.com
+  git -C "$d" config user.name t
+  git -C "$d" add -A >/dev/null 2>&1
+  git -C "$d" commit -qm init >/dev/null 2>&1
+  printf '%s\n' "$d"
+}
+
+AST_FX="$(ast_make_fx)"
+AST_CACHE="$AST_FX/rd-workflow-workspace/.lifecycle/selftest-full-cache"
+
+# --- precheck 단위 ---------------------------------------------------------------
+# 증명 헬퍼가 없으면 "확인할 수 없음" 이지 "통과" 가 아닙니다 (fail-closed).
+AST_NOH="$(mktemp -d)"; mkdir -p "$AST_NOH/rd-workflow/scripts"
+archive_selftest_precheck "$AST_NOH" >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "1" "precheck — 증명 헬퍼 부재 → 차단"
+rm -rf "$AST_NOH"
+
+archive_selftest_precheck "$AST_FX" >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "1" "precheck — full 기록 없음 → 차단"
+
+# 이 케이스는 호출부의 mode 리터럴을 **행동으로** 못박습니다. `worktree` 가 아닌 값을 넘기면
+# 지문 계산이 실패해(모드 검증) 유효한 기록도 무효가 되므로 여기서 바로 깨집니다.
+ast_fp "$AST_CACHE"
+archive_selftest_precheck "$AST_FX" >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "0" "precheck — 일치하는 full 기록 → 통과"
+
+# trigger 집합 **밖**의 입력(문서)이 바뀌어도 stale 로 봐야 합니다 —
+# "인프라는 그대로인데 문서 변경으로 전수 검증이 깨질 상태" 가 통과하면 안 됩니다.
+printf 'note\n' > "$AST_FX/some_doc.md"
+git -C "$AST_FX" add -A >/dev/null 2>&1
+git -C "$AST_FX" commit -qm doc >/dev/null 2>&1
+archive_selftest_precheck "$AST_FX" >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "1" "precheck — trigger 밖 문서 변경 → 차단"
+ast_fp "$AST_CACHE"
+
+printf 'stray\n' > "$AST_FX/stray_zzfx.sh"
+archive_selftest_precheck "$AST_FX" >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "1" "precheck — 유효 캐시 이후 untracked 추가 → 차단"
+rm -f "$AST_FX/stray_zzfx.sh"
+
+# 오탐 방향: transient 산출물(감사 로그)은 증명 범위 밖이므로 통과를 막으면 안 됩니다.
+printf 'x\n' > "$AST_FX/rd-workflow-workspace/.lifecycle/gate-audit.log"
+archive_selftest_precheck "$AST_FX" >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "0" "precheck — transient 산출물만 생김 → 통과 (오탐 없음)"
+rm -f "$AST_FX/rd-workflow-workspace/.lifecycle/gate-audit.log"
+
+# 오탐 방향: 판정 자체가 워킹트리를 바꾸지 않아야 연속 호출이 계속 통과합니다.
+archive_selftest_precheck "$AST_FX" >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "0" "precheck — 상태 불변 시 연속 호출도 통과 (자기 부작용으로 무효화되지 않음)"
+
+printf 'echo b\n' >> "$AST_FX/rd-workflow/scripts/a_zzfx.sh"
+archive_selftest_precheck "$AST_FX" >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "1" "precheck — stale 기록 → 차단"
+
+# 우회 밸브 부재: 다른 계층의 우회 사유가 환경에 있어도 이 게이트는 열리지 않습니다.
+( export RD_LIFECYCLE_BYPASS_REASON=lifecycle RD_SELFTEST_FULL_BYPASS_REASON="사유"
+  archive_selftest_precheck "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "1" "precheck — 우회 사유 환경변수로도 열리지 않음"
+git -C "$AST_FX" checkout -- rd-workflow/scripts/a_zzfx.sh
+ast_fp "$AST_CACHE"
+
+# --- 게이트(증명 없으면 그 자리에서 전수 검증) -------------------------------------
+ast_reset_marks
+( archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "0" "gate — 유효 증명 → 통과"
+if [[ ! -f "$AST_MK/invoked" ]]; then PASS=$((PASS+1)); echo "  PASS: gate — 유효 증명이면 전수 검증을 돌리지 않는다 (오탐 없음)";
+else FAIL=$((FAIL+1)); echo "  FAIL: gate — 유효 증명인데 전수 검증을 실행했다" >&2; fi
+
+rm -f "$AST_CACHE"; ast_reset_marks
+( archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "0" "gate — 증명 없음 → 전수 검증 실행 후 통과"
+assert_eq "$(cat "$AST_MK/invoked" 2>/dev/null || true)" "mode=full" "gate — 전수 검증을 full 인자로 1회 실행"
+if [[ -s "$AST_CACHE" ]]; then PASS=$((PASS+1)); echo "  PASS: gate — 실행 결과가 증명으로 기록됨";
+else FAIL=$((FAIL+1)); echo "  FAIL: gate — 통과했는데 증명이 기록되지 않았다" >&2; fi
+
+# 전수 검증은 **위생적인 환경**에서 돌아야 합니다. 셸에 남은 변수 하나가 검사를 건너뛰거나
+# (dry-run·checker-only) 검출력을 조용히 낮추면(스트레스 회차·크기 제한), 통과 기록만
+# 정상으로 남아 안전망이 거짓말을 합니다. 특히 낮은 스트레스 회차·높은 크기 제한은
+# 허용 범위 안이라 경고조차 나지 않습니다.
+# `RD_SELFTEST_ZZFX` 는 실재하지 않는 이름입니다 — 이름을 하나씩 적는 방식이면 새 변수가
+# 생길 때마다 조용히 구멍이 늘어나므로, **계열로 떨어뜨리는지**를 여기서 못박습니다.
+rm -f "$AST_CACHE"; ast_reset_marks
+( export RD_SELFTEST_SMOKE_DRYRUN=1 RD_SELFTEST_CHECKER_ONLY=_hook_repo_root \
+         RD_EDIT_PROVENANCE_STRESS_ITER=1 CLAUDEMD_LINE_LIMIT=999999 RD_SELFTEST_ZZFX=1
+  archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "0" "gate — 검증 약화 환경변수가 있어도 통과(실제 실행)"
+assert_eq "$(cat "$AST_MK/env" 2>/dev/null || true)" \
+  "dryrun=[] checkeronly=[] stressiter=[] mdlimit=[] zzfx=[]" \
+  "gate — 검증 약화 환경변수를 계열째 떨어뜨리고 실행"
+
+# untracked 가 있으면 전수 검증이 통과해도 증명이 기록되지 않아, 실행해 봐야 같은 자리에서
+# 무한히 다시 돌게 됩니다. 정상 경로는 clean 검사가 먼저 막으므로 여기에 도달하는 것은
+# clean 검사를 강제로 넘긴 경우입니다 — 돌리기 전에 알리고 중단하는 것이 옳습니다.
+rm -f "$AST_CACHE"; ast_reset_marks
+printf 'stray\n' > "$AST_FX/stray_zzfx.sh"
+ast_out="$( ( archive_selftest_gate "$AST_FX" ) 2>&1 )" && rc=0 || rc=1
+assert_eq "$rc" "1" "gate — untracked 존재 → 차단"
+if [[ ! -f "$AST_MK/invoked" ]]; then PASS=$((PASS+1)); echo "  PASS: gate — untracked 존재 시 전수 검증을 돌리지 않는다 (무한 재실행 방지)";
+else FAIL=$((FAIL+1)); echo "  FAIL: gate — untracked 인데 전수 검증을 실행했다 (기록되지 않아 무한 재실행)" >&2; fi
+if printf '%s' "$ast_out" | grep -qF 'stray_zzfx.sh'; then PASS=$((PASS+1)); echo "  PASS: gate — 차단 사유에 해당 파일 표시";
+else FAIL=$((FAIL+1)); echo "  FAIL: gate — 차단 사유에 파일 목록 없음" >&2; fi
+if printf '%s' "$ast_out" | grep -qF 'force-dirty'; then PASS=$((PASS+1)); echo "  PASS: gate — clean 검사를 넘긴 경로임을 안내";
+else FAIL=$((FAIL+1)); echo "  FAIL: gate — --force-dirty 경로 안내 없음" >&2; fi
+rm -f "$AST_FX/stray_zzfx.sh"
+
+# 정상 진행 경로는 stderr 를 쓰지 않아야 합니다. 여기서 사유를 stderr 로 흘리면 아카이브의
+# "무출력 계약" 을 검사하는 소비처들이 정상 상태를 결함으로 보고 줄줄이 실패합니다 (실측).
+rm -f "$AST_CACHE"; ast_reset_marks
+ast_err="$( ( archive_selftest_gate "$AST_FX" ) 2>&1 >/dev/null )" && rc=0 || rc=1
+assert_eq "$rc" "0" "gate — 전수 검증 실행 경로도 통과"
+assert_eq "$ast_err" "" "gate — 정상 진행 경로는 stderr 무출력"
+rm -f "$AST_CACHE"; ast_reset_marks
+# 기대 사유는 판정 함수에서 직접 받아옵니다 — 문구를 테스트에 복사하면 판정이 바뀌어도
+# 테스트만 통과하는 상태가 생깁니다.
+ast_why="$(smoke_cache_valid "$AST_FX" worktree 2>&1 >/dev/null | head -1)" || true
+ast_out="$( ( archive_selftest_gate "$AST_FX" ) 2>/dev/null )" && rc=0 || rc=1
+if printf '%s' "$ast_out" | grep -qF '지금 실행합니다'; then PASS=$((PASS+1)); echo "  PASS: gate — 소요 시간 안내를 stdout 으로 표시 (13분 무반응 방지)";
+else FAIL=$((FAIL+1)); echo "  FAIL: gate — 실행 안내가 stdout 에 없음 (13분 무반응)" >&2; fi
+if [[ -n "$ast_why" ]] && printf '%s' "$ast_out" | grep -qF -- "$ast_why"; then
+  PASS=$((PASS+1)); echo "  PASS: gate — 왜 지금 도는지 사유를 stdout 에 함께 표시"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: gate — 실행 사유가 stdout 에 없음 — [$ast_why]" >&2; fi
+
+rm -f "$AST_CACHE"; ast_reset_marks
+( export AST_STUB_RC=1; archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "1" "gate — 전수 검증 실패 → 차단"
+
+# 위 케이스는 이름이 주장하는 성질(rc 반영)을 고정하지 못합니다 — 실패한 대역이 증명도
+# 남기지 않아 **재대조가 대신 막기** 때문입니다 (rc 를 통째로 무시해도 초록입니다).
+# 증명은 남기면서 rc 만 실패하는 변형으로 그 성질을 분리해 못박습니다.
+rm -f "$AST_CACHE"; ast_reset_marks
+( export AST_STUB_RECORD_THEN_FAIL=1; archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "1" "gate — 증명이 남아도 전수 검증 rc 가 실패면 차단 (rc 가 판정에 반영)"
+if [[ -s "$AST_CACHE" ]]; then PASS=$((PASS+1)); echo "  PASS: gate — 위 케이스가 실제로 '증명 있음 + rc 실패' 였음 (단언이 공허하지 않음)";
+else FAIL=$((FAIL+1)); echo "  FAIL: gate — 증명이 남지 않아 rc 반영을 분리 검증하지 못했다" >&2; fi
+
+# **우회 밸브 부재는 이 게이트의 유일한 존재 이유입니다.** 아래 행동 회귀가 고정하는
+# 범위는 **알려진 이름 2개**(`RD_LIFECYCLE_BYPASS_REASON`·`RD_SELFTEST_FULL_BYPASS_REASON`)
+# 뿐입니다 — 이름을 열거하는 점에서 소스 문자열 검사와 사각의 크기가 같습니다.
+# 세 번째 이름을 쓰는 밸브는 배선 회귀의 **구조 불변식**(게이트 계열 함수 본문의
+# 환경변수 읽기 = 0건)이 이름과 무관하게 잡습니다. 두 축이 함께여야 닫힙니다.
+# (a) 다른 계층의 우회 사유가 환경에 있어도 전수 검증 실패를 통과로 바꾸지 못합니다.
+rm -f "$AST_CACHE"; ast_reset_marks
+( export RD_LIFECYCLE_BYPASS_REASON=lifecycle RD_SELFTEST_FULL_BYPASS_REASON="사유" AST_STUB_RC=1
+  archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "1" "gate — 우회 사유 환경변수로도 열리지 않음"
+# (b) 우회 사유가 있어도 전수 검증을 **실제로 돌립니다**. 밸브가 함수 앞쪽에 놓여
+#     조용히 return 0 하면 rc 는 0 이라 (a) 로는 잡히지만, "돌지 않았다" 는 사실 자체를
+#     여기서 별도로 못박습니다 (rc 만 보는 단언은 밸브 위치에 따라 새어 나갑니다).
+rm -f "$AST_CACHE"; ast_reset_marks
+( export RD_LIFECYCLE_BYPASS_REASON=lifecycle RD_SELFTEST_FULL_BYPASS_REASON="사유"
+  archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "0" "gate — 우회 사유가 있어도 정상 경로는 그대로 통과 (오탐 없음)"
+assert_eq "$(cat "$AST_MK/invoked" 2>/dev/null || true)" "mode=full" \
+  "gate — 우회 사유가 있어도 전수 검증을 건너뛰지 않는다"
+
+# 게이트가 증명하는 것은 **워킹트리**이고 tag·push 로 발행되는 것은 **HEAD** 입니다.
+# 둘이 갈라진 채 통과하면 "검증됐다" 는 말과 실제 발행물이 다릅니다 — untracked 축만
+# 보면 `--force-dirty` 의 주 용도인 **tracked dirty** 가 통째로 새어 나갑니다.
+rm -f "$AST_CACHE"; ast_reset_marks
+printf 'echo dirty\n' >> "$AST_FX/rd-workflow/scripts/a_zzfx.sh"
+ast_out="$( ( archive_selftest_gate "$AST_FX" ) 2>&1 )" && rc=0 || rc=1
+assert_eq "$rc" "1" "gate — tracked 파일이 커밋되지 않은 채 dirty → 차단"
+if [[ ! -f "$AST_MK/invoked" ]]; then PASS=$((PASS+1)); echo "  PASS: gate — 워킹트리≠HEAD 면 전수 검증을 돌리지 않는다";
+else FAIL=$((FAIL+1)); echo "  FAIL: gate — 워킹트리≠HEAD 인데 전수 검증을 실행했다 (미검증 HEAD 발행)" >&2; fi
+if printf '%s' "$ast_out" | grep -qF '발행 대상'; then PASS=$((PASS+1)); echo "  PASS: gate — 증명 대상과 발행 대상이 다르다는 사유를 안내";
+else FAIL=$((FAIL+1)); echo "  FAIL: gate — 왜 성립하지 않는지 안내가 없음 — [$ast_out]" >&2; fi
+git -C "$AST_FX" checkout -- rd-workflow/scripts/a_zzfx.sh
+
+# **유효한 증명이 이미 있어도** 막아야 합니다. 증명은 "이 워킹트리가 통과했다" 는 말이고
+# 발행되는 것은 HEAD 이므로, 둘이 갈라진 상태에서는 증명이 발행물을 증명하지 못합니다.
+# 이 확인이 증명 대조보다 **뒤**에 있으면 빠른 경로가 통째로 건너뛰어, 가장 흔한 경우
+# (증명이 유효한 상태로 아카이브)에서 그대로 새어 나갑니다.
+ast_reset_marks
+printf 'echo dirty2\n' >> "$AST_FX/rd-workflow/scripts/a_zzfx.sh"
+ast_fp "$AST_CACHE"   # 지금(dirty) 워킹트리로 유효 증명을 만듭니다
+( archive_selftest_precheck "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "0" "gate — (전제) dirty 워킹트리에 대한 증명은 그 자체로는 유효"
+( archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "1" "gate — 유효 증명이 있어도 워킹트리≠HEAD 면 차단 (빠른 경로도 확인)"
+git -C "$AST_FX" checkout -- rd-workflow/scripts/a_zzfx.sh
+rm -f "$AST_CACHE"
+
+# staged 만 해도 발행 대상(HEAD)과는 여전히 다릅니다 — `git add` 로 untracked 만 지우고
+# 통과하면 커밋되지 않은 내용이 검증된 것으로 기록됩니다.
+rm -f "$AST_CACHE"; ast_reset_marks
+printf 'echo staged\n' > "$AST_FX/rd-workflow/scripts/b_zzfx.sh"
+git -C "$AST_FX" add rd-workflow/scripts/b_zzfx.sh >/dev/null 2>&1
+( archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "1" "gate — staged 이지만 커밋 안 됨 → 차단 (untracked 만 없앤 상태)"
+git -C "$AST_FX" rm -q --cached rd-workflow/scripts/b_zzfx.sh >/dev/null 2>&1
+rm -f "$AST_FX/rd-workflow/scripts/b_zzfx.sh"
+
+# 오탐 방향 1 — 증명 집합 **밖**(transient)의 tracked 파일이 dirty 인 것으로는 막지
+# 않아야 합니다. 범위를 증명 집합보다 넓게 잡으면 감사 로그 한 줄에 정당한 아카이브가
+# 막히고, 우회 밸브가 없으므로 사용자는 게이트 자체를 들어내게 됩니다.
+rm -f "$AST_CACHE"; ast_reset_marks
+printf 'v2\n' > "$AST_FX/rd-workflow-workspace/.lifecycle/verify-cache"
+( archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "0" "gate — 증명 범위 밖 transient 만 dirty → 통과 (오탐 없음)"
+git -C "$AST_FX" checkout -- rd-workflow-workspace/.lifecycle/verify-cache
+
+# 오탐 방향 2 — 강제 플래그로 clean 검사를 넘겼더라도 **실제로 clean 이면** 통과해야
+# 합니다. 판정 근거는 플래그가 아니라 실제 상태입니다.
+rm -f "$AST_CACHE"; ast_reset_marks
+( archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "0" "gate — 워킹트리가 실제로 clean 이면 통과 (강제 플래그 무관)"
+
+rm -f "$AST_CACHE"; ast_reset_marks
+( export AST_STUB_NORECORD=1; archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "1" "gate — 실행만 하고 증명이 남지 않으면 차단"
+
+rm -f "$AST_CACHE"; ast_reset_marks
+ast_mv "$AST_FX/rd-workflow/scripts/self_test.sh" "$AST_MK/stub.bak"
+( archive_selftest_gate "$AST_FX" ) >/dev/null 2>&1 && rc=0 || rc=1
+assert_eq "$rc" "1" "gate — 전수 검증 스크립트 부재 → 차단"
+ast_mv "$AST_MK/stub.bak" "$AST_FX/rd-workflow/scripts/self_test.sh"
+
+rm -rf "$AST_FX" "$AST_MK"
+
+# --- 배선 회귀 (소스 순서·우회 밸브 부재) -------------------------------------------
+# 실제 아카이브는 merge·tag·push·브랜치 삭제를 수행해 회귀로 돌릴 수 없습니다. 그래서
+# "게이트가 어느 구간에 놓였는가" 는 소스 순서로 고정합니다 — 위쪽 순서 불변식 단언과 같은 방식.
+# 주석 줄은 걸러냅니다. 이 저장소는 주석 리터럴이 판정을 오염시킨 전례가 여러 번 있고
+# (backlog/items/2026-08-19-closure-comment-literal-pollution.md), 게이트 위치를 설명하는
+# 주석에 같은 문자열이 들어가는 것은 충분히 있을 법한 일입니다. `grep -n` 이 먼저라
+# 걸러도 원래 줄번호가 보존됩니다.
+_ast_gate_ln="$(grep -n 'archive_selftest_gate "' "$AST_ARCHIVE_SH" | grep -vE '^[0-9]+:[[:space:]]*#' | head -1 | cut -d: -f1)" || true
+_ast_dry_ln="$(grep -n 'DRY_RUN.*-eq 1' "$AST_ARCHIVE_SH" | head -1 | cut -d: -f1)" || true
+_ast_merge_ln="$(grep -n '^# Step 3 — merge' "$AST_ARCHIVE_SH" | head -1 | cut -d: -f1)" || true
+_ast_step4_ln="$(grep -n '^# Step 4 — metadata cleanup' "$AST_ARCHIVE_SH" | head -1 | cut -d: -f1)" || true
+_ast_tag_ln="$(grep -n '^# Step 5 — Tag' "$AST_ARCHIVE_SH" | head -1 | cut -d: -f1)" || true
+if [[ -n "$_ast_gate_ln" && -n "$_ast_dry_ln" && "$_ast_gate_ln" -gt "$_ast_dry_ln" ]]; then
+  PASS=$((PASS+1)); echo "  PASS: 게이트($_ast_gate_ln)가 dry-run exit($_ast_dry_ln) 뒤 — dry-run 비파괴"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: 게이트($_ast_gate_ln)가 dry-run($_ast_dry_ln) 앞 — dry-run 이 13분을 소비" >&2; fi
+if [[ -n "$_ast_gate_ln" && -n "$_ast_merge_ln" && "$_ast_gate_ln" -gt "$_ast_merge_ln" ]]; then
+  PASS=$((PASS+1)); echo "  PASS: 게이트($_ast_gate_ln)가 merge($_ast_merge_ln) 뒤 — 아카이브될 내용으로 대조"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: 게이트가 merge 앞 — 캐시가 구조적으로 항상 불일치 (gate=$_ast_gate_ln merge=$_ast_merge_ln)" >&2; fi
+if [[ -n "$_ast_gate_ln" && -n "$_ast_step4_ln" && "$_ast_gate_ln" -lt "$_ast_step4_ln" ]]; then
+  PASS=$((PASS+1)); echo "  PASS: 게이트($_ast_gate_ln)가 metadata cleanup($_ast_step4_ln) 앞 — 미러 재작성이 지문을 흔들기 전"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: 게이트가 metadata cleanup 뒤 — 지문이 구조적으로 항상 불일치 (gate=$_ast_gate_ln step4=$_ast_step4_ln)" >&2; fi
+if [[ -n "$_ast_gate_ln" && -n "$_ast_tag_ln" && "$_ast_gate_ln" -lt "$_ast_tag_ln" ]]; then
+  PASS=$((PASS+1)); echo "  PASS: 게이트($_ast_gate_ln)가 tag($_ast_tag_ln) 앞 — 미검증 내용이 발행되지 않음"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: 게이트가 tag 뒤 — 미검증 내용이 발행될 수 있음 (gate=$_ast_gate_ln tag=$_ast_tag_ln)" >&2; fi
+
+# --- 전수 검증 실패 시 merge 되돌리기 (final diff review 2026-08-20 Finding 2) ----------
+# 닫으려는 경로: merge 성공 → 전수 검증 실패 → 사용자가 **main 워킹트리에서** 고쳐 커밋 →
+# 재실행 시 review precheck 는 예전 fr tip 만 보고 통과하고 fr 이 이미 조상이라 merge 는
+# skip → **리뷰된 적 없는 main 커밋이 발행**됩니다. 공격적 우회가 아니라 정상 복구 행동이며,
+# 이 브랜치가 fr_branch_gate(main 직접 커밋 차단)를 제거해 기계적으로 허용됩니다.
+# main 을 merge 이전으로 되돌리면 고칠 곳이 fr branch 밖에 남지 않아 경로가 끊깁니다.
+#
+# 위 배선 단언과 같은 이유로 소스 검사입니다 (실제 merge·tag·push 를 회귀로 돌릴 수 없음).
+# 주석 줄은 전부 걸러냅니다 — 이 처방을 설명하는 주석에 같은 리터럴이 들어가므로
+# 걸러내지 않으면 **코드를 지우고 주석만 남겨도 초록**이 됩니다.
+# 주석 제외는 `^[^#]*` 로 패턴에 직접 넣습니다. `grep -v | grep` 파이프라인은 이 스위트
+# 안에서 같은 입력에 다른 결과를 냈습니다(격리 실행은 통과, 스위트 실행은 실패) — 판정이
+# 셸 환경에 의존하면 그 판정 자체를 믿을 수 없으므로 파이프라인을 걷어냈습니다.
+# `[^#]*` 는 `#` 를 건너뛰지 못하므로 주석 뒤에 있는 같은 리터럴은 매치되지 않습니다.
+if grep -qE '^[^#]*PRE_MERGE_HEAD="\$\(git rev-parse HEAD' "$AST_ARCHIVE_SH"; then
+  PASS=$((PASS+1)); echo "  PASS: archive.sh 가 merge 이전 HEAD 를 기록한다 (되돌림 기준점)"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: merge 이전 HEAD 기록 없음 — 전수 검증 실패 시 되돌릴 기준점이 없다" >&2; fi
+if grep -qE '^[^#]*git reset --hard "\$PRE_MERGE_HEAD"' "$AST_ARCHIVE_SH"; then
+  PASS=$((PASS+1)); echo "  PASS: 전수 검증 실패 시 merge 를 되돌린다"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: 전수 검증 실패 후 merge 가 main 에 남는다 — main 직접 수정이 리뷰를 우회한다" >&2; fi
+# 되돌림은 **이 실행이 만든 merge 가 손대지 않은 채 HEAD 일 때만** 해야 합니다. 이 가드가
+# 없으면 사람이 얹은 커밋이나 작업 내용을 지웁니다 — 안전망이 파괴 도구가 됩니다.
+# 세 번째 토큰은 clean 판정의 **결과 변수**(`_rb_dirty`)를 봅니다. 판정 명령의 형태
+# (`git status …` / `git -C … status …`)를 리터럴로 박으면 그 형태를 고칠 때마다 이 단언이
+# 깨집니다 — 실제로 `git -C "$CURRENT_WT"` 를 붙이는 수정에서 깨져 main 에 FAIL 이 발행됐습니다.
+# 명령 형태(저장소 루트 기준인지)는 `test_integration.sh` 의 배선 단언이 따로 봅니다.
+_ast_rb_guarded=1
+for _ast_g in 'MERGE_CREATED_HERE' 'MERGE_BASE_COMMIT' '_rb_dirty'; do
+  grep -qE "^[^#]*${_ast_g}" "$AST_ARCHIVE_SH" || _ast_rb_guarded=0
+done
+if [[ "$_ast_rb_guarded" -eq 1 ]]; then
+  PASS=$((PASS+1)); echo "  PASS: 되돌림이 3중 가드(이 실행이 만듦·HEAD 불변·워킹트리 clean) 아래 있다"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: 되돌림 가드 누락 — 사람이 얹은 커밋·변경을 지울 수 있다" >&2; fi
+# 되돌림이 Step 4 앞에 있어야 합니다. 뒤에 있으면 metadata cleanup 이 이미 HEAD 를
+# 전진시킨 뒤라 위 "HEAD 불변" 가드가 항상 거짓이 되어 되돌림이 죽은 코드가 됩니다.
+_ast_rb_ln="$(grep -nE '^[^#]*git reset --hard "\$PRE_MERGE_HEAD"' "$AST_ARCHIVE_SH" | head -1 | cut -d: -f1)" || true
+if [[ -n "$_ast_rb_ln" && -n "$_ast_step4_ln" && "$_ast_rb_ln" -lt "$_ast_step4_ln" ]]; then
+  PASS=$((PASS+1)); echo "  PASS: 되돌림($_ast_rb_ln)이 metadata cleanup($_ast_step4_ln) 앞 — 가드가 살아 있다"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: 되돌림이 metadata cleanup 뒤 — HEAD 불변 가드가 항상 거짓이라 죽은 코드 (rb=$_ast_rb_ln step4=$_ast_step4_ln)" >&2; fi
+# 우회 밸브 부재는 **두 파일을 함께** 봅니다. 게이트 본문은 `_guard_common.sh` 에 있고
+# 밸브를 넣기 가장 자연스러운 자리가 정확히 거기인데, 호출 한 줄만 남은 `archive.sh` 만
+# 보면 그 자리가 통째로 사각이 됩니다 (실측: 그 자리에 밸브 6줄을 넣어도 220/220 초록).
+# 주석 줄은 제외합니다 — 밸브는 주석에 있을 수 없고, 설명 주석이 판정을 오염시키면
+# 다음 사람이 판정을 피해 주석을 고치게 됩니다.
+for _ast_f in "$AST_ARCHIVE_SH" "$AST_GUARD_SH"; do
+  if grep -vE '^[[:space:]]*#' "$_ast_f" | grep -qF 'RD_SELFTEST_FULL_BYPASS_REASON'; then
+    FAIL=$((FAIL+1)); echo "  FAIL: 아카이브 경로($(basename "$_ast_f"))에 전수 검증 우회 밸브가 생겼다 — 이 게이트의 존재 이유가 사라진다" >&2
+  else
+    PASS=$((PASS+1)); echo "  PASS: 아카이브 경로($(basename "$_ast_f"))에 전수 검증 우회 밸브 없음"; fi
+done
+# 위 소스 검사와 행동 회귀는 **둘 다 이름을 열거**합니다. 세 번째 이름을 쓰는 밸브는
+# 양쪽을 그대로 통과합니다 (실측: `RD_ARCHIVE_FULL_SKIP` 밸브 5줄을 세 함수 각각에 넣어도
+# 전부 `PASS=234 FAIL=0` rc 0 — 완전히 초록이었습니다).
+# 이름 대신 밸브의 **구조적 필요조건**을 봅니다 — 밸브는 반드시 환경을 읽고, 게이트 계열
+# 함수 본문은 지금 환경변수를 **하나도** 읽지 않습니다. 그래서 "본문의 대문자 변수 읽기
+# = 0" 이 성립하고, 이 불변식은 이름을 몰라도 모든 밸브를 잡습니다.
+#
+# 대상은 **return 0 이 곧 '진행' 으로 귀결되는 함수**들입니다. `archive_selftest_env_denylist`
+# 는 제외합니다 — env 자체가 그 함수의 주제이고, 그 함수의 return 0 은 통과가 아니라
+# 목록 산출입니다 (그쪽은 계열 산출 단언이 따로 고정합니다).
+#
+# **이 불변식은 정당한 환경변수 읽기도 막습니다. 그것이 의도입니다.** 이 함수들이 판정에
+# 쓰는 입력은 인자로 받은 root 하나여야 하고, 환경에서 무엇이든 읽는 순간 그 판정은
+# 호출자의 환경이 흔들 수 있게 됩니다 — 그것이 정확히 이 게이트가 없애려는 성질입니다.
+# 앞으로 정말 환경을 읽어야 하면 이 단언을 지우지 말고, (1) 그 읽기가 통과/차단 판정을
+# 바꿀 수 없음을 별도 단언으로 못박은 뒤 (2) 그 이름만 좁게 예외로 빼십시오.
+#
+# 검출 형태는 `$NAME`·`${NAME…}` 직접 확장 + `${!x}` 간접 확장 + `printenv` 입니다.
+# **남는 구멍 둘을 적어 둡니다** (닫지 않은 이유도 함께):
+#   - `env | grep …` 로 읽는 형태. `env` 는 이 게이트가 **위생적 실행**에 정당하게 쓰는
+#     명령이라(`env -u … bash self_test.sh`) 리터럴로 막으면 정상 코드가 막힙니다.
+#   - 소문자 이름(`$rd_skip`). 관례상 환경변수가 아니고, 소문자 기본값 전개
+#     (`${x:-…}`)는 지역변수에서 흔해 막으면 오탐이 큽니다.
+# 둘 다 "이름을 새로 짓는" 것보다 훨씬 노골적인 회피라 diff 에서 눈에 띕니다.
+for _ast_fn in archive_selftest_gate archive_selftest_preconditions \
+               archive_selftest_precheck _archive_selftest_helper_load; do
+  _ast_envread="$(awk "/^${_ast_fn}\(\)/,/^}/" "$AST_GUARD_SH" \
+                   | grep -vE '^[[:space:]]*#' | grep -cE '\$\{?[A-Z][A-Z0-9_]{2,}|\$\{!|printenv' || true)"
+  # 함수가 사라지거나 이름이 바뀌면 awk 범위가 비어 읽기 0건이 되어 **공허하게 통과**합니다.
+  # 이 저장소에서 반복된 "0건 검사로 조용히 초록" 부류라 존재부터 확인합니다.
+  if ! grep -qE "^${_ast_fn}\(\)" "$AST_GUARD_SH"; then
+    FAIL=$((FAIL+1)); echo "  FAIL: $_ast_fn 정의를 찾지 못해 밸브 불변식이 공허하게 통과한다 — 이름이 바뀌었다면 이 목록도 함께 고치십시오" >&2
+  elif [[ "$_ast_envread" -eq 0 ]]; then
+    PASS=$((PASS+1)); echo "  PASS: $_ast_fn 본문이 환경변수를 읽지 않음 (이름 무관 밸브 부재)"
+  else
+    FAIL=$((FAIL+1)); echo "  FAIL: $_ast_fn 본문이 환경변수를 ${_ast_envread}건 읽는다 — 이름이 무엇이든 우회 밸브가 될 수 있다. 판정 입력은 인자 root 하나여야 한다" >&2; fi
+done
+# `--force-dirty` 는 **Step 0 의 clean 검사만** 넘깁니다. 게이트의 워킹트리≠HEAD 확인은
+# 플래그가 아니라 실제 상태로 판정하므로 그대로 막습니다. 첫 줄이 "강제 진행" 이라고만
+# 알리면 사용자는 같은 화면 네 줄 아래의 중단을 모순으로 읽고 게이트를 의심하게 됩니다.
+# 안내 문구는 장식이 아니라 계약이므로 여기서 고정합니다.
+if grep -vE '^[[:space:]]*#' "$AST_ARCHIVE_SH" | grep -F -- '--force-dirty' | grep -q 'clean 검사만'; then
+  PASS=$((PASS+1)); echo "  PASS: --force-dirty 경고가 효과 범위(clean 검사만)를 한정해 알림"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: --force-dirty 경고가 '강제 진행' 으로만 알린다 — 아래 게이트 중단과 한 화면에서 모순돼 보인다" >&2; fi
+if grep -qF 'smoke_cache_valid "$root" worktree' "$AST_GUARD_SH"; then
+  PASS=$((PASS+1)); echo "  PASS: 캐시 대조 mode 가 리터럴 worktree"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: 캐시 대조 mode 리터럴이 worktree 가 아니다 — 오타는 '항상 차단' 으로 조용히 굳는다" >&2; fi
+# 떨어뜨릴 변수 목록은 **계열**로 산출돼야 합니다. 이름을 하나씩 적어 두면 같은 계열의
+# 변수를 새로 만들 때마다 구멍이 하나씩 조용히 늘어납니다 (이 저장소에서 반복된 결함
+# 부류입니다). 실재하지 않는 이름 두 개로 계열 산출을 못박습니다.
+_ast_deny="$( ( export RD_SELFTEST_ZZFX=1 RD_EDIT_PROVENANCE_ZZFX=1
+                archive_selftest_env_denylist ) | tr '\n' ' ' )" || true
+_ast_deny_ok=1
+for _ast_v in RD_SELFTEST_ZZFX RD_EDIT_PROVENANCE_ZZFX CLAUDEMD_LINE_LIMIT; do
+  printf '%s' "$_ast_deny" | grep -qF "$_ast_v" || _ast_deny_ok=0
+done
+if [[ "$_ast_deny_ok" -eq 1 ]]; then
+  PASS=$((PASS+1)); echo "  PASS: 전수 검증 실행 환경에서 떨어뜨릴 변수를 계열로 산출"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: 떨어뜨릴 변수 산출이 계열을 덮지 못한다 — 새 변수가 생길 때마다 구멍이 난다 — [$_ast_deny]" >&2; fi
+
+# 조용한 중단 센티넬이 **끝까지 살아 있었는지**를 실행 시점에 확인합니다. bash 는 EXIT trap
+# 을 하나만 갖고, 나중에 건 것이 앞의 것을 말없이 지웁니다 — 실제로 그 사고가 있었고
+# (임시 디렉터리 정리 trap 이 센티넬을 덮어써 조용한 죽음 3형태가 전부 통과), 소스만 봐서는
+# 드러나지 않았습니다. 이 단언이 실패하면 센티넬은 이미 없는 상태입니다.
+if [[ "$(trap -p EXIT)" == *_suite_on_exit* ]]; then
+  PASS=$((PASS+1)); echo "  PASS: 조용한 중단 센티넬(EXIT trap)이 스위트 끝까지 유지됨"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: 최상위 EXIT trap 이 센티넬을 덮어썼다 — 조용한 중단이 다시 익명이 된다. 정리 대상은 _ast_cleanup 에 append 하십시오 — [$(trap -p EXIT)]" >&2; fi
+
 echo "== 결과: PASS=$PASS FAIL=$FAIL =="
+# `DONE=1` 은 결과줄 **직후**이고 `[[ $FAIL -eq 0 ]]` **앞**입니다. 뒤에 두면 정상적으로
+# FAIL 로 끝나는 실행(rc 1)에서 센티넬이 "조용한 중단" 을 오탐합니다 — 센티넬이 묻는 것은
+# "결과를 보고했는가" 이지 "통과했는가" 가 아닙니다.
+DONE=1
 [[ $FAIL -eq 0 ]]

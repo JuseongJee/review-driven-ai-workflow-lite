@@ -35,7 +35,9 @@ fi
 if [[ "$FORCE_DIRTY" -eq 0 ]]; then
   ensure_worktree_clean || { printf 'archive: worktree dirty — git status 확인 후 commit/stash 후 재실행\n' >&2; exit 1; }
 elif ! ensure_worktree_clean; then
-  printf 'archive: WARNING — dirty state 강제 진행 (--force-dirty)\n' >&2
+  # 문구를 "강제 진행" 으로만 쓰면 네 줄 아래 전수 검증 게이트의 중단(워킹트리≠HEAD)과
+  # 한 화면에서 모순돼 보입니다. 이 플래그의 실제 효과는 **이 clean 검사 하나**입니다.
+  printf 'archive: WARNING — dirty state 로 진행 (--force-dirty 는 이 clean 검사만 넘깁니다. 전수 검증 게이트는 워킹트리=HEAD 를 그대로 요구합니다)\n' >&2
 fi
 
 # FR identity source-of-truth
@@ -98,13 +100,35 @@ if ! grep -qE '(^|/)(REQUEST\.md|CURRENT_TASK\.md|FUTURE_REQUESTS\.md|request-ar
   printf 'archive: WARNING — fr branch 마지막 commit 에 archive content 미감지\n' >&2
 fi
 
+# Step 2.5 — 증명 전제를 **merge 전에** 확인 (final diff review 2026-08-20 turn 004 Finding 1)
+#
+# Step 3.5 의 게이트도 같은 확인을 하지만, 거기서 실패하면 **main 은 이미 merge 된 뒤**입니다.
+# 그리고 그 실패 사유가 dirty 이면 아래 rollback 이 clean 을 요구하므로 발동하지 못해
+# merge 가 그대로 남습니다. 특히 `--force-dirty` 는 이 상태를 **정상 호출로 만들어** 줍니다.
+# 그 뒤 사용자가 안내대로 main 에서 commit 하고 재실행하면 fr 이 이미 조상이라 merge 가
+# skip 되고, **예전 fr tip 리뷰만으로 그 main commit 이 발행**됩니다.
+#
+# 여기서 먼저 막으면 main 이 아예 움직이지 않아 그 경로가 생기지 않습니다. 어차피 Step 3.5
+# 에서 같은 사유로 막힐 것이므로 **차단 결과는 같고 부작용만 없앱니다** — `--force-dirty` 가
+# 전수 검증 게이트를 넘지 못한다는 것은 이미 문서화된 계약입니다.
+archive_selftest_preconditions "$CURRENT_WT" || {
+  printf 'archive: merge 전에 중단했습니다 — main 은 움직이지 않았습니다\n' >&2
+  exit 1
+}
+
 # Step 3 — merge (idempotent)
+#
+# **이 지점의 HEAD 를 기억해 둡니다** — Step 3.5 의 전수 검증이 실패하면 여기로 되돌립니다.
+# 이유는 아래 rollback 블록 주석에 있습니다.
+PRE_MERGE_HEAD="$(git rev-parse HEAD 2>/dev/null || true)"
+MERGE_CREATED_HERE=0
 if git merge-base --is-ancestor "$FR_BRANCH" HEAD 2>/dev/null; then
   printf 'archive: %s 이미 merge 됨 — skip\n' "$FR_BRANCH"
 else
   git merge --no-ff "$FR_BRANCH" -m "merge: $SLUG (autopilot 완료)" || {
     printf 'archive: merge 실패 — conflict resolve 후 재실행\n' >&2; exit 1
   }
+  MERGE_CREATED_HERE=1
 fi
 
 # 순서 불변식: 판정 base 는 반드시 merge 완료 "이후" 에 캡처한다.
@@ -116,6 +140,92 @@ MERGE_BASE_COMMIT="$(git rev-parse HEAD)" || {
   printf 'archive: merge 대상 commit 결정 실패 (rc=%s) — 중단\n' "$_mb_rc" >&2
   exit "$_mb_rc"
 }
+
+# Step 3.5 — 전수 검증(self_test full) 통과 강제 (change spec §5.5)
+#
+# 위치가 계약의 일부입니다. 이 게이트는 "지금 워킹트리 내용" 의 지문을 증명과 대조하므로:
+#   - merge **뒤**여야 합니다. 머지 전 기본 브랜치 워킹트리에는 fr 내용이 없어 증명이
+#     구조적으로 항상 불일치하고, 게이트가 매번 무의미한 전수 검증을 강요합니다.
+#   - Step 4 **앞**이어야 합니다. Step 4 는 CURRENT_TASK.md 와 task-state 를 baseline 으로
+#     덮어쓰는데 둘 다 tracked = 증명 대상이라, 뒤에 두면 지문이 다시 구조적으로
+#     불일치합니다.
+#   - tag·push **앞**이어야 합니다. 게이트 뒤에 오는 변경이 적을수록 발행물과 검증
+#     대상이 가까워집니다.
+# 이 세 조건을 동시에 만족하는 구간은 여기뿐입니다 (lifecycle 테스트가 이 순서를
+# 단언합니다).
+#
+# **게이트 이후 변경은 Step 4 의 metadata baseline 복원 2파일(CURRENT_TASK.md·task-state)
+# 뿐입니다.** 둘 다 증명 집합에 속하므로 tag 가 가리키는 트리는 전수 검증이 본 트리와
+# 정확히 같지는 않습니다 — "미검증 내용이 전혀 발행되지 않는다" 고 읽지 마십시오.
+# 배치 제약상 불가피하고 delta 가 결정적인 baseline 복원으로 한정되어 실질 위험은
+# 낮습니다. 이 두 파일 밖의 변경을 게이트 뒤로 옮기면 그 순간 이 서술이 거짓이 됩니다.
+#
+# 우회 밸브를 두지 않습니다. 커밋 전 게이트에는 사용자 승인 우회가 있고 이 저장소는
+# 인프라 커밋이 대부분이라 상시 우회됩니다 — 통합 직전인 이 지점이 축소 실행(smoke)이
+# 놓친 것을 반드시 잡는 유일한 지점입니다. 판정·실행·재대조는 전부 헬퍼가 하고 여기서는
+# 호출만 합니다 (그래야 실행 여부와 rc 반영을 격리 fixture 로 회귀 고정할 수 있습니다).
+if ! archive_selftest_gate "$CURRENT_WT"; then
+  # **실패하면 이 실행이 만든 merge 를 되돌립니다.**
+  #
+  # 되돌리지 않으면 이런 경로가 생깁니다 (final diff review 2026-08-20 Finding 2):
+  #   merge 성공 → 전수 검증 실패 → 사용자가 **지금 보고 있는 main 워킹트리**에서 고쳐 커밋
+  #   → 재실행 → review precheck 는 여전히 **예전 fr tip** 만 보고 통과하고, fr 이 이미
+  #   조상이라 merge 는 skip → 리뷰된 적 없는 main 커밋이 tag·push 됩니다.
+  # 공격적 우회가 아니라 **정상적인 복구 행동**에서 발생합니다. 실패 안내가 수정 위치를
+  # 제한하지 않고, 이 브랜치에서 main 직접 커밋을 막던 fr_branch_gate 도 제거됐기 때문입니다.
+  #
+  # main 을 merge 이전으로 되돌리면 고칠 곳이 fr branch 밖에 남지 않아 경로가 끊깁니다.
+  # 잃는 것은 없습니다 — fr branch 가 내용을 그대로 들고 있고, 재실행하면 다시 merge 합니다.
+  #
+  # **완전한 처방은 아닙니다.** 사용자가 전수 검증 도중 중단하면 여기에 닿지 못해 merge 가
+  # 남습니다. 그 구간까지 닫으려면 archive 시작 시점의 main 을 lifecycle 상태로 남기고
+  # 재실행 때 대조해야 하며, 새 상태 파일과 계약이 필요해 FR
+  # `archive-retry-unreviewed-main-commit` 로 분리했습니다.
+  #
+  # 되돌리기는 **이 실행이 만든 merge 가 HEAD 그대로일 때만** 합니다. 그 뒤에 무엇이든
+  # 얹혔거나 워킹트리가 더러우면 사람의 것을 지울 수 있으므로 손대지 않고 알리기만 합니다.
+  #
+  # clean 판정은 **증명과 같은 제외 규칙**을 써야 합니다. raw `git status --porcelain` 은
+  # `.lifecycle/*.log` 같은 일시 산출물까지 더럽다고 보는데, 그것들은 증명 대상이 아니라
+  # 아카이브가 스스로 만드는 파일입니다. 더 엄격하게 잡으면 **정당한 되돌리기가 스스로
+  # 막혀** 되돌림이 죽은 코드가 됩니다 (통합 테스트가 실제로 이 상태를 잡았습니다 —
+  # `--force-skip-review-check` 가 쓰는 audit log 하나 때문에 발동하지 않았습니다).
+  # 헬퍼를 못 읽으면 raw 판정으로 내려갑니다 — 그쪽이 더 엄격해 되돌리지 않을 뿐이라 안전합니다.
+  _rb_specs=(".") _rb_sp=""
+  # 게이트는 헬퍼를 서브셸에서 읽으므로 이 스코프에는 남지 않습니다. 여기서 한 번 더 읽습니다
+  # (quiet — 실패해도 아래 raw 판정으로 내려가면 되고, 사유는 게이트가 이미 냈습니다).
+  if ! declare -F smoke_proof_exclude >/dev/null 2>&1; then
+    _archive_selftest_helper_load "$CURRENT_WT" quiet || true
+  fi
+  if declare -F smoke_proof_exclude >/dev/null 2>&1; then
+    while IFS= read -r _rb_sp; do [[ -n "$_rb_sp" ]] && _rb_specs+=("$_rb_sp"); done < <(smoke_proof_exclude)
+  fi
+  # **`git -C "$CURRENT_WT"` 가 필수입니다.** `.` pathspec 은 **호출 위치 기준**이라, 저장소
+  # 하위 디렉터리에서 archive 를 부르면(Step 0 은 main worktree 안이기만 하면 통과하므로
+  # 지원되는 형태입니다) 그 prefix 밖의 변경이 판정에서 통째로 빠집니다. clean 으로 오판하면
+  # 바로 아래 `git reset --hard` 가 **저장소 전체를 되돌려 사용자 변경을 지웁니다** —
+  # "사람의 것을 지우지 않는다" 는 이 가드의 존재 이유가 정확히 뒤집힙니다.
+  # (실측: 같은 시점에 하위 디렉터리 `status -- .` 은 0건, 저장소 루트는 5건이었습니다.)
+  _rb_dirty="$(git -C "$CURRENT_WT" status --porcelain -- ${_rb_specs[@]+"${_rb_specs[@]}"} 2>/dev/null || echo dirty)"
+  if [[ "$MERGE_CREATED_HERE" -eq 1 && -n "$PRE_MERGE_HEAD" ]] \
+     && [[ "$(git rev-parse HEAD 2>/dev/null || true)" == "$MERGE_BASE_COMMIT" ]] \
+     && [[ -z "$_rb_dirty" ]]; then
+    if git reset --hard "$PRE_MERGE_HEAD" >/dev/null 2>&1; then
+      printf 'archive: 전수 검증이 실패해 이 실행이 만든 merge 를 되돌렸습니다 (main = %s)\n' \
+        "$(git rev-parse --short "$PRE_MERGE_HEAD")" >&2
+      printf 'archive:   원인은 **%s 브랜치에서** 고치고 diff review 를 거친 뒤 다시 실행하십시오\n' \
+        "$FR_BRANCH" >&2
+      printf 'archive:   main 에서 직접 고치면 그 수정은 리뷰를 거치지 않은 채 발행됩니다\n' >&2
+    else
+      printf 'archive: 전수 검증 실패 후 merge 되돌리기에 실패했습니다 — main 이 merge 된 상태로 남았습니다\n' >&2
+      printf 'archive:   **main 에서 직접 고치지 마십시오.** %s 브랜치에서 고쳐야 리뷰를 거칩니다\n' "$FR_BRANCH" >&2
+    fi
+  else
+    printf 'archive: merge 는 이 실행이 만들지 않았거나 이후 변경이 있어 그대로 둡니다\n' >&2
+    printf 'archive:   **main 에서 직접 고치지 마십시오.** %s 브랜치에서 고쳐야 리뷰를 거칩니다\n' "$FR_BRANCH" >&2
+  fi
+  exit 1
+fi
 
 # Step 4 — metadata cleanup commit on main (publish 전)
 if metadata_exists; then
@@ -509,47 +619,6 @@ if [[ "$REMOTE_MODE" == "remote" ]]; then
     fi
   fi
 fi
-
-# 편집 출처(edit provenance) 기록 회수 (change spec §2.9)
-#
-# 런타임(hook·producer·CLI)은 세대를 삭제하지 않으므로 누적 회수 지점이 여기 하나뿐입니다.
-# 이 시점은 구현·검증·리뷰가 모두 끝난 뒤여서 병렬 subagent 도 hook 도 돌지 않습니다 —
-# 동시성이 없으므로 세대별 판단 없이 루트 전체를 지웁니다.
-# worktree 로 작업한 경우 Step 7 의 worktree 제거가 그 안의 루트를 함께 없애므로
-# 이 삭제는 main 워킹트리만 담당합니다.
-#
-# 삭제 자체는 공용 헬퍼 ep_purge_root 가 수행하고 이 스크립트는 호출·표시만 합니다.
-# archive.sh 는 별도 프로세스라 셸 함수 override 가 전파되지 않으므로, 삭제 로직을
-# source 전용 헬퍼에 두어야 실패 경로를 함수 단위로 결정적으로 재현할 수 있습니다.
-#
-# **삭제 대상은 이 스크립트가 리터럴로 고정합니다** (final diff review 턴 002 P1).
-# ep_root() 는 테스트 격리용 RD_EDIT_PROVENANCE_DIR 을 무조건 우선하므로, 그 변수가 환경에
-# 남아 있으면 정상 성공 경로의 마지막 단계에서 프로젝트 밖 임의 경로가 재귀 삭제됩니다.
-# 경고 문구의 경로도 같은 리터럴을 씁니다 — ep_root() 출력을 쓰면 "무엇을 지우려 했는가" 와
-# "무엇이라고 보고하는가" 가 갈라져, 잘못된 대상을 지운 경우를 로그로 구별할 수 없습니다.
-#
-# 조건부 source + 함수 guard 를 쓰는 이유: 무조건 호출하면 부분 install 환경에서
-# command-not-found 가 stderr 로 새어 정상 경로의 무출력 계약이 깨집니다.
-# (헬퍼는 위 _guard_common.sh 가 이미 조건부로 불러왔을 수 있으나, 그 경로에 의존하지 않고
-#  여기서 다시 확인합니다. 같은 파일의 재 source 는 함수 재정의뿐이라 부작용이 없습니다.)
-# **bash -n 사전 검사**: 구문 오류가 있는 헬퍼를 source 하면 파서가 셸 자체를 종료시킵니다
-# (이 스크립트는 set -euo pipefail). 이 지점은 merge·tag·push 가 끝난 뒤라 여기서 죽으면
-# 정리 잔여 요약이 통째로 유실됩니다. archive 는 hot path 가 아니므로 fork 한 번으로 막습니다.
-_ep_root_target="${project_root}/rd-workflow-workspace/.lifecycle/edit-provenance.d"
-_ep_helper="${project_root}/rd-workflow/scripts/_edit_provenance_common.sh"
-if [[ -f "$_ep_helper" ]] && bash -n "$_ep_helper" 2>/dev/null; then
-  # shellcheck source=/dev/null
-  . "$_ep_helper"
-fi
-if declare -f ep_purge_root >/dev/null 2>&1; then
-  # 삭제 실패는 stderr 경고 한 줄로 끝냅니다. cleanup_add 잔여 레코드로 승격하지 않습니다 —
-  # kind 4종은 분리 FR archive-cleanup-visibility 의 마커 직렬화 계약이고, provenance 루트
-  # 잔존은 lifecycle 정확성과 무관한 위생 실패입니다 (다음 self_test 의 D6 이 계속 관찰합니다).
-  if ! ep_purge_root "$_ep_root_target"; then
-    printf '⚠️  provenance 기록 정리 실패: %s (판정에 영향 없음, 다음 archive 에서 재시도)\n' "$_ep_root_target" >&2
-  fi
-fi
-# 헬퍼 부재·함수 미정의 → 무경고 skip (경고도 출력하지 않습니다)
 
 # ---- 정리 잔여 요약 (stdout) ----
 # 종료 코드 0 의 의미가 "완전 정리 완료" 에서 "core 성공(잔여 가능)" 으로 넓어지므로,

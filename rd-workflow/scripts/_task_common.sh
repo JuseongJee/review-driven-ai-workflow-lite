@@ -8,40 +8,6 @@ _TC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 파서 단일화: hooks 공통 파서 재사용 (제3 구현 금지 — spec §3)
 source "${_TC_DIR}/hooks/_guard_common.sh"
 
-# --- 편집 출처(edit provenance) 헬퍼 ---
-# status 전이를 "진행 상태 저장" 기준선으로 기록하기 위해 필요합니다 (change spec §2.4.1).
-# **부재·손상·부분 정의를 모두 "미설치" 한 갈래로 수렴시킵니다** — 미설치는 실패가 아니므로
-# 경고하지 않고 조용히 skip 합니다(부분 install 내성).
-#
-# **여기서 헬퍼를 다시 source 하지 않습니다** (final diff review 턴 004 P2). 위 _guard_common.sh
-# 가 이미 같은 파일을 안전 경계(eval)로 읽어 이 셸에 함수를 올려 두었습니다. 종전에는 "CLI 가
-# 헬퍼에 직접 의존한다는 사실을 문법으로 못박는다"는 이유로 한 번 더 source 했는데, 그 재source
-# 가 **구문 오류를 그대로 되살려** `rd task` 의 모든 호출이 stderr 로 `syntax error` 를 흘렸습니다
-# (격리 fixture 실측: stdout·exit 0 은 정상이나 stderr 157바이트). Stop/archive 에서 닫은 경계가
-# CLI 에만 남아 있던 셈이라, 의존 관계는 주석과 아래 함수 집합 검증으로 표현합니다.
-#
-# writer 집합을 **따로** 검증하는 이유: _guard_common.sh 의 검증은 판정(reader)용 집합이라
-# ep_bump 계열이 빠져 있습니다. 구문 오류로 eval 이 중간에서 끊기면 reader 집합은 온전한데
-# writer 집합만 부분 정의인 상태가 나올 수 있고, 그대로 두면 ep_bump 가 도중에
-# command-not-found 로 실패해 **세대만 만들어진 채 포인터가 안 바뀌는** 상태를 남깁니다.
-# 집합은 _task_ep_bump_baseline 과 _task_ep_failed_stage 의 호출을 전이까지 따라가 확정했습니다.
-#   직접 : ep_bump · ep_root · _ep_read_exact (_task_ep_failed_stage)
-#   전이 : ep_next_gen_name · ep_set_current · ep_mark_bump_failed · ep_clear_bump_failed
-#          · _ep_write_atomic (ep_bump)
-# 하나라도 없으면 집합을 통째로 unset 해 _task_ep_bump_baseline 의 `declare -f ep_bump` 게이트가
-# 미설치와 같은 조용한 skip 으로 떨어지게 합니다.
-_TC_EP_FNSET='ep_bump ep_root ep_next_gen_name ep_set_current ep_mark_bump_failed ep_clear_bump_failed _ep_write_atomic _ep_read_exact'
-_TC_EP_OK=1
-for _tc_ep_fn in $_TC_EP_FNSET; do
-  declare -f "$_tc_ep_fn" >/dev/null 2>&1 || { _TC_EP_OK=0; break; }
-done
-if [[ "$_TC_EP_OK" -eq 0 ]]; then
-  for _tc_ep_fn in $_TC_EP_FNSET; do
-    unset -f "$_tc_ep_fn" 2>/dev/null || true
-  done
-fi
-unset _TC_EP_FNSET _TC_EP_OK _tc_ep_fn
-
 TASK_CANONICAL_STATUSES=("대기 중" "REQUEST review 대기" "spec/plan 작성 중" "spec/plan review 대기" "구현 중" "검증 중" "diff review 대기" "완료")
 
 task_status_canonical() {
@@ -98,54 +64,6 @@ task_transition_allowed() {
   return 1
 }
 
-# --- 편집 출처 기준선 (change spec §2.4.1 · §2.12 ①) -------------------------
-
-# _task_ep_failed_stage — 직전 bump 의 실패 지점 토큰을 구합니다 (고정 4토큰).
-# 흔적(.bump-failed)의 **파일 전체**가 허용 토큰과 일치할 때만 그 값을 씁니다 — 첫 줄만
-# 보면 'pointer-swap\n<임의 내용>' 같은 다중행 값이 통과해 터미널에 임의 문자열이 섞입니다.
-# 흔적이 없고 루트가 디렉토리도 아니면 mkdir 단계에서 좌초한 것이 확정입니다
-# (ep_mark_bump_failed 는 루트가 디렉토리일 때만 흔적을 남깁니다 — 그 경우 흔적 자체를
-# 남길 자리가 없습니다). 그 밖의 경우는 단정하지 않고 unknown 으로 표시합니다.
-#
-# **`$( )` 로 받지 않는 이유** (final diff review 턴 008 P2): command substitution 이 종단
-# 개행을 전부 지워 `pointer-swap\n\n` 이 `pointer-swap` 으로 축약됐습니다. 판정에는 영향이
-# 없지만 **손상된 흔적을 실제 실패 지점으로 단정해 표시**하게 됩니다 — 이 함수의 존재 이유가
-# "단정할 수 있을 때만 단정하고 나머지는 unknown" 이므로 그 계약을 정면으로 어깁니다.
-# `_ep_read_exact` 를 직접 불러 종단 LF 정보를 보존합니다(NUL 도 여기서 걸러집니다).
-_task_ep_failed_stage() {
-  local root content=""
-  root="$(ep_root)"
-  if _ep_read_exact "${root}/.bump-failed"; then
-    content="${_EP_RAW%$'\n'}"
-    # 종단 LF 를 하나 떼고도 개행이 남으면 허용 토큰이 아닙니다 → 아래 case 를 그냥 통과시켜
-    # unknown 으로 수렴시킵니다.
-    case "$content" in *$'\n'*) content="" ;; esac
-  fi
-  case "$content" in
-    mkdir|short-title|recheck|pointer-swap) printf '%s' "$content"; return 0 ;;
-  esac
-  [[ -d "$root" ]] || { printf 'mkdir'; return 0; }
-  printf 'unknown'
-}
-
-# _task_ep_bump_baseline — "진행 상태 저장" 을 편집 출처 기준선으로 올립니다.
-# 호출 조건은 호출측 책임입니다 — status 전이가 **실제로 저장된 뒤에만** 부릅니다.
-# 헬퍼 미설치(함수 부재)는 실패가 아니라 미설치이므로 조용히 skip 합니다(경고 없음).
-# bump 실패는 전이를 실패로 만들지 않습니다 (§2.4 반환 계약 — fail-open, 항상 return 0).
-# 대신 사용자가 "저장이 안 먹는다" 로 오해하지 않도록 stderr 로 사유를 알립니다 (§2.12 ①).
-_task_ep_bump_baseline() {
-  declare -f ep_bump >/dev/null 2>&1 || return 0
-  local title stage
-  # 세대 유효성 비교의 반대편(_guard_common.sh current_task_is_stale)이 쓰는 값과
-  # **같은 함수**에서 읽습니다 — 출처가 갈리면 세대가 조용히 무효로 판정됩니다.
-  title="$(get_current_short_title)"
-  ep_bump "$title" && return 0
-  stage="$(_task_ep_failed_stage)"
-  printf '⚠️  진행 상태는 저장됐지만 편집 기록 갱신에 실패했습니다 (지점: %s).\n' "$stage" >&2
-  printf '    저장 알림이 다음 저장까지 계속 뜰 수 있습니다.\n' >&2
-  return 0
-}
-
 task_set_status() {
   local to="$1" force="${2:-0}" from rc=0
   if ! task_status_canonical "$to"; then
@@ -171,13 +89,6 @@ task_set_status() {
     state_write_fields "status=${to}" || return 3
   fi
   _task_section_write "Status" "$to" || rc=$?
-  # 편집 출처 기준선은 전이가 **실제로 저장된 뒤에만** 올립니다 (§2.4.1).
-  # - 값 검증 실패(return 4)·전이표 위반(return 4)·권위 쓰기 실패(return 3)는 위에서 이미
-  #   반환되므로 여기 도달하지 않습니다 — 실패한 전이가 기준선을 만들 수 없습니다.
-  # - 뷰 미러(CURRENT_TASK.md) 쓰기가 실패하면 판정 baseline 이 갱신되지 않은 것이므로
-  #   기준선도 올리지 않습니다 (올리면 이전 세대 레코드만 잃고 넛지가 계속 뜹니다).
-  # 종료 코드는 bump 성공 여부와 무관하게 _task_section_write 결과 그대로입니다.
-  [[ "$rc" -eq 0 ]] && _task_ep_bump_baseline
   return "$rc"
 }
 

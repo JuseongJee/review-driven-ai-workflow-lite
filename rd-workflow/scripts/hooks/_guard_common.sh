@@ -8,70 +8,6 @@
 # _state_common.sh는 project_root 검증 직후 source — $PWD fallback 불사용, project_root 보장 후 진입
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_state_common.sh"
 
-# --- 편집 출처(edit provenance) 헬퍼 ---
-# **부재·손상(구문 오류)·부분 정의를 모두 "provenance 기능 없음" 한 갈래로 수렴시킵니다**
-# — 부분 install 내성(AC5(f)). 그 상태에서 아래 current_task_is_stale() 은 레코드 0건으로
-# 동작해 종전 mtime 판정과 완전히 같아집니다.
-#
-# **source 를 쓰지 않는 이유**: 이 파일을 source 하는 hook 은 전부 set -euo pipefail 인데,
-# source 대상에 **구문 오류**가 있으면 파서가 셸 자체를 종료시킵니다(macOS /bin/bash 3.2
-# 실측 exit 2). `source x || true` 로도 막지 못합니다 — 파스 오류는 명령 실패가 아니라 셸
-# 종료라서 반환값이 생기지 않기 때문입니다. 그러면 Stop hook 이 current_task_is_stale()
-# 에 닿지 못해 block JSON 을 내지 못하고, 세션 한계 대응 넛지가 **통째로 사라집니다**.
-# eval 은 같은 구문 오류에서 non-zero 를 반환하고 셸을 살려 둡니다(실측).
-# 파일 읽기는 fork 없는 `$(< file)` 을 씁니다 — `read -r -d ''` 는 bash 3.2 가 바이트 단위로
-# 읽어 오히려 느립니다(13KB 실측: read+eval 6.9ms / $(<)+eval 2.4ms / source 0.6ms).
-#
-# **`bash -n` 사전검사를 여기서는 쓰지 않습니다.** 같은 결함을 `archive.sh` 는 그 수단으로
-# 막지만(그쪽 주석 참조), 두 파일의 맥락이 다릅니다 — 이 파일은 producer(PostToolUse)가
-# **편집마다** source 하는 hot path 라 fork 1회(실측 8.3ms)가 그대로 편집 지연이 됩니다.
-# archive.sh 는 작업당 1회라 같은 fork 가 무해합니다. 수단이 갈린 이유가 이것뿐이며,
-# 두 곳 모두 "구문 오류가 셸을 죽이지 못하게 한다" 는 같은 목적을 만족합니다.
-# 그룹 `{ }` 으로 묶어 리다이렉트가 확장 단계까지 걸리게 합니다 — 대입문에 직접 붙인
-# `2>/dev/null` 은 확장보다 늦게 설정되어 읽기 실패 메시지를 막지 못합니다(실측).
-#
-# 비용: 넛지 소실을 막는 대가로 헬퍼 로딩에 약 1.9ms 를 더 씁니다. **이 값을 "상한 안" 이라고
-# 적지 않습니다** — 이 경로는 AC10 측정에서 이미 상한 20ms 를 넘겼고(2026-08-14 producer
-# 오버헤드 보고: 계산 비용 49~54ms), _guard_common.sh 체인 source 비용은 별도 FR
-# guard-hook-handler-startup-cost 소관입니다. 즉 이 증분은 이미 초과한 항목에 얹히는 값이며,
-# 그 대가로 "손상된 헬퍼가 넛지를 통째로 없앤다" 는 정확성 결함을 닫습니다.
-# 로딩 비용 최적화는 그 FR 에서 이 지점까지 함께 봐야 합니다.
-_ep_common="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_edit_provenance_common.sh"
-if [[ -f "$_ep_common" ]]; then
-  _ep_src=""
-  { _ep_src="$(< "$_ep_common")"; } 2>/dev/null || _ep_src=""
-  # 구문 오류의 non-zero 와 진단 메시지를 함께 흡수합니다 (hook 무출력 계약).
-  eval "$_ep_src" 2>/dev/null || true
-  unset _ep_src
-fi
-unset _ep_common
-
-# 판정이 실제로 쓰는 함수 집합입니다. current_task_is_stale() 과 그것이 부르는
-# _stale_edit_is_explained() 의 호출을 **전이 호출까지** 따라가 확정했습니다.
-#   직접  : ep_current_gen · ep_gen_has_sentinel · ep_gen_valid · ep_record_file_exists
-#   6단계 : ep_orc_exists · ep_read_record · ep_state_id
-#   전이  : ep_root · ep_pathkey (레코드 조회 3종) / _ep_fmt_cksum (ep_state_id · ep_pathkey)
-#           / _ep_read_record_file (ep_read_record) / _ep_read_exact (앞 둘 + ep_current_gen)
-# `_ep_read_whole` 은 ep_current_gen 이 _ep_read_exact 로 옮겨가면서 **판정 경로에서 빠졌습니다**
-# (턴 006 P1). CLI 의 .bump-failed 표시 경로에는 남아 있어 그쪽 집합에서 검증합니다.
-# 하나라도 없으면 **집합을 통째로 unset** 합니다. 구문 오류로 eval 이 중간에서 끊기면 파일
-# 앞부분 함수만 정의된 상태가 되는데, 그대로 두면 판정이 앞부분을 쓰다가 뒤쪽 호출에서
-# command-not-found 를 stderr 로 흘립니다(무출력 계약 위반). 통째로 지우면 판정이
-# "헬퍼 없음" 경로 하나로 수렴해 종전 mtime 판정과 완전히 같아집니다.
-# ep_purge_root 등 판정 밖 함수는 이 집합에 넣지 않습니다 — 이 경계는 **판정용**이며,
-# 소비자(archive.sh)가 각자 declare -f 로 확인합니다.
-_ep_fnset='ep_current_gen ep_gen_has_sentinel ep_gen_valid ep_record_file_exists ep_orc_exists ep_read_record ep_state_id ep_root ep_pathkey _ep_read_exact _ep_read_record_file _ep_fmt_cksum'
-_ep_fnset_ok=1
-for _ep_fn in $_ep_fnset; do
-  declare -f "$_ep_fn" >/dev/null 2>&1 || { _ep_fnset_ok=0; break; }
-done
-if [[ "$_ep_fnset_ok" -eq 0 ]]; then
-  for _ep_fn in $_ep_fnset; do
-    unset -f "$_ep_fn" 2>/dev/null || true
-  done
-fi
-unset _ep_fnset _ep_fnset_ok _ep_fn
-
 # --- autopilot ---
 
 is_autopilot_active() {
@@ -224,6 +160,199 @@ archive_review_precheck() {
   return 0
 }
 
+# --- 아카이브 전 전수 검증 강제 (change spec §5.5) ---------------------------------
+#
+# 축소 실행(smoke)이 구문 검사를 변경 파일로 좁히면서 **미변경 스크립트의 구문 오류를 놓치게**
+# 됐고, 그 대가를 통합 직전에 상환하는 것이 전수 검증입니다. 커밋 전 게이트에는 사용자 승인
+# 우회 밸브가 있고 이 저장소는 인프라 커밋이 대부분이라 그 밸브가 상시 쓰입니다 —
+# **여기에는 우회 밸브를 두지 않습니다.** 편의를 위한 예외를 하나라도 만드는 순간 축소 실행의
+# 검출력 손실이 상환되지 않고 순손실로 남습니다.
+#
+# **신뢰 모델**: 이 장치는 정직한 실수를 막습니다. 증명 파일은 서명 없는 로컬 평문이라 직접
+# 조작하면 통과시킬 수 있고, 그것은 범위 밖입니다(사용자 결정, change spec §5.5).
+# "우회가 없다" 는 **사유 한 줄로 여는 밸브를 제공하지 않는다**는 뜻입니다.
+
+# 증명 헬퍼 로더 — 부재·손상·부분 정의를 "확인 불가" 한 갈래로 수렴시킵니다. return 0 = 사용 가능.
+# 사용: _archive_selftest_helper_load <root> [quiet]. quiet 이면 사유를 내지 않습니다
+# (한 흐름에서 두 번 읽을 때 같은 사유가 두 번 찍히는 것을 막습니다).
+#
+# 대상 root 에서 **매번 다시 읽습니다.** 이미 정의돼 있으면 넘어가는 방식은 다른 root 에서
+# 들어온 정의를 그대로 쓰게 되어, 이 게이트가 막으려는 "두 판정이 갈리는" 상황을 스스로 만듭니다.
+# 구문 오류가 있는 파일을 source 하면 파서가 셸 자체를 종료시킵니다(호출자는 set -euo pipefail).
+# 그 지점은 merge 직후라 여기서 죽으면 사용자는 아무 안내 없이 반쯤 진행된 상태를 받습니다.
+# 아카이브는 작업당 1회라 fork 한 번으로 막습니다 (같은 판단의 선례가 아카이브 스크립트 안에 있습니다).
+_archive_selftest_helper_load() {
+  local root="$1" quiet="${2:-}" fn
+  local helper="$root/rd-workflow/scripts/_smoke_common.sh"
+  if [[ ! -f "$helper" ]]; then
+    [[ -n "$quiet" ]] || printf 'archive: 전수 검증 증명 헬퍼가 없습니다: %s\n' "$helper" >&2
+    return 1
+  fi
+  if ! bash -n "$helper" 2>/dev/null; then
+    [[ -n "$quiet" ]] || printf 'archive: 전수 검증 증명 헬퍼에 구문 오류가 있습니다: %s\n' "$helper" >&2
+    return 1
+  fi
+  # shellcheck source=/dev/null
+  . "$helper"
+  for fn in smoke_cache_valid smoke_untracked_state smoke_proof_exclude; do
+    if ! declare -f "$fn" >/dev/null 2>&1; then
+      [[ -n "$quiet" ]] || printf 'archive: 증명 판정 함수(%s)가 정의되지 않았습니다 — 헬퍼 손상 의심\n' "$fn" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
+# 지금 워킹트리 내용으로 전수 검증을 통과한 기록이 있는지 확인합니다.
+# 사용: archive_selftest_precheck <project_root>. return 0=진행, 1=차단.
+#
+# 판정은 커밋 전 게이트와 **같은 함수**에 위임합니다. 지문 대조와 untracked 검사를 여기서
+# 다시 짜면 두 판정이 갈리는 순간 한쪽만 막는 구멍이 생기고, 안전망이 거짓말을 하게 됩니다.
+# mode 는 리터럴 `worktree` 입니다 — 아카이브 대상은 index 가 아니라 워킹트리 자체이므로
+# 지문과 untracked 를 함께 봐야 합니다.
+archive_selftest_precheck() {
+  local root="$1"
+  if ! _archive_selftest_helper_load "$root"; then
+    printf 'archive: 전수 검증 통과 기록을 확인할 수 없어 차단합니다\n' >&2
+    return 1
+  fi
+  if ! smoke_cache_valid "$root" worktree; then
+    printf 'archive: 전수 검증 증명이 유효하지 않습니다 (위 사유 참조)\n' >&2
+    return 1
+  fi
+  return 0
+}
+
+# 전수 검증을 돌리기 전에 환경에서 떨어뜨릴 변수 이름을 한 줄씩 냅니다.
+#
+# **이름 목록이 아니라 계열로 산출합니다.** 하나씩 적어 두면 같은 성질의 변수를 새로
+# 만들 때마다 구멍이 하나씩 조용히 늘어나고, 그 구멍은 "통과 기록이 정상으로 남는"
+# 형태라 사람 눈에 띄지 않습니다 (이 저장소에서 이미 3개 중 2개를 놓쳤습니다).
+#   - `RD_SELFTEST_*`        실행 범위·모드 제어 (dry-run, checker-only, 우회 사유 …)
+#   - `RD_EDIT_PROVENANCE_*` 검출력 제어 (스트레스 회차, 기록 위치 …)
+#   - `CLAUDEMD_LINE_LIMIT`  계열이 없는 단독 변수. 제한을 올리면 크기 검사 스텝이
+#                            아무것도 검사하지 않고 통과합니다.
+# 실제로 없는 이름을 `env -u` 에 넘겨도 무해하므로, 과다 산출은 위험이 아닙니다
+# (반대로 과소 산출은 그대로 구멍입니다). 계열은 이름만 보고 판단하므로 대상 스크립트를
+# 읽지 않아도 새 변수가 자동으로 닫힙니다.
+archive_selftest_env_denylist() {
+  { env 2>/dev/null | grep -oE '^(RD_SELFTEST|RD_EDIT_PROVENANCE)_[A-Za-z0-9_]+' || true
+    printf 'CLAUDEMD_LINE_LIMIT\n'
+  } | sort -u
+}
+
+# 증명이 **성립할 수 있는 상태**인지 확인합니다. 사용: archive_selftest_preconditions <root>.
+# return 0 = 성립, 1 = 불성립(사유는 stderr).
+#
+# 두 항목 모두 묻는 것은 하나입니다 — **증명 대상과 발행 대상이 같은가.**
+#   - untracked 가 있으면 전수 검증이 통과해도 증명이 기록되지 않습니다(기록 조건은
+#     시작·종료 양쪽 0건). 돌려 봐야 같은 자리에서 다시 13분을 쓰게 됩니다.
+#   - 워킹트리가 HEAD 와 다르면, 게이트가 증명하는 것은 **워킹트리**인데 tag·push 로
+#     발행되는 것은 **HEAD** 입니다. 갈라진 채 통과하면 게이트는 "검증됐다" 고 말하는데
+#     실제 발행물은 검증 대상이 아니었습니다. 강제 플래그의 주 용도가 바로 이 tracked
+#     dirty 이므로, untracked 만 보면 더 흔한 절반을 그대로 놓칩니다.
+#
+# **이 확인은 증명 대조보다 앞이어야 합니다.** 뒤에 두면 유효한 증명이 있는 빠른 경로가
+# 통째로 건너뛰어, 가장 흔한 경우(증명이 유효한 상태로 아카이브)에서 그대로 새어 나갑니다.
+# 정상 경로는 아카이브 시작 시점의 clean 검사가 두 상태를 모두 먼저 막으므로, 여기에
+# 도달하는 것은 그 검사를 강제로 넘긴 경우입니다.
+#
+# **판정 근거는 플래그가 아니라 실제 상태입니다** — 강제 플래그를 줬지만 실제로는 clean 인
+# 정당한 아카이브까지 막으면 사용자는 우회 밸브가 없는 이 게이트를 아예 들어냅니다.
+# 대조 범위는 증명 집합과 **같은 pathspec** 입니다. 넓게 잡으면 증명 대상도 아닌 감사 로그
+# 한 줄에 정당한 아카이브가 막힙니다. git 오류는 "모름" 이므로 차단 쪽입니다.
+# 헬퍼는 서브셸 안에서 읽어 함수 정의가 호출 셸에 남지 않게 합니다.
+archive_selftest_preconditions() {
+  local root="$1"
+  (
+    _archive_selftest_helper_load "$root" || exit 1
+
+    local ustate=0 ulist=""
+    ulist="$(smoke_untracked_state "$root")" || ustate=$?
+    if [[ "$ustate" -eq 2 ]]; then
+      printf 'archive: untracked 목록 조회에 실패해(git 오류) 전수 검증을 실행하지 않았습니다\n' >&2
+      printf 'archive:   지금 실행해도 증명이 기록되지 않아 같은 자리에서 반복됩니다\n' >&2
+      exit 1
+    fi
+    if [[ "$ustate" -eq 1 ]]; then
+      printf 'archive: 증명에 담기지 않는 untracked 파일이 있어 전수 검증을 실행하지 않았습니다\n' >&2
+      printf '%s\n' "$ulist" | sed 's/^/  /' >&2
+      printf 'archive:   지금 실행하면 통과해도 증명이 남지 않아 재실행마다 같은 시간을 다시 씁니다\n' >&2
+      printf 'archive:   무관한 파일이면 git add 또는 정리 후 다시 실행하십시오 (--force-dirty 로 clean 검사를 넘긴 경우입니다)\n' >&2
+      printf 'archive:   **이것이 전수 검증 실패를 고치는 내용이라면 main 이 아니라 fr 브랜치에서 고치고 diff review 를 거치십시오**\n' >&2
+      printf 'archive:   (main 에서 커밋하면 그 수정은 리뷰를 거치지 않은 채 발행됩니다)\n' >&2
+      exit 1
+    fi
+
+    local pspec=(".") sp dstate=0
+    while IFS= read -r sp; do [[ -n "$sp" ]] && pspec+=("$sp"); done < <(smoke_proof_exclude)
+    git -C "$root" diff --quiet HEAD -- ${pspec[@]+"${pspec[@]}"} 2>/dev/null || dstate=$?
+    if [[ "$dstate" -ge 2 ]]; then
+      printf 'archive: 워킹트리와 HEAD 의 대조에 실패해(git 오류) 전수 검증을 실행하지 않았습니다\n' >&2
+      printf 'archive:   무엇이 발행될지 알 수 없는 상태라 진행할 수 없습니다\n' >&2
+      exit 1
+    fi
+    if [[ "$dstate" -ne 0 ]]; then
+      printf 'archive: 커밋되지 않은 변경이 있어 전수 검증을 실행하지 않았습니다\n' >&2
+      printf 'archive:   증명 대상(워킹트리)과 발행 대상(HEAD)이 달라 검증이 성립하지 않습니다\n' >&2
+      git -C "$root" diff --name-only HEAD -- ${pspec[@]+"${pspec[@]}"} 2>/dev/null | sed 's/^/  /' >&2
+      printf 'archive:   무관한 변경이면 commit 또는 stash 후 다시 실행하십시오 (--force-dirty 로 clean 검사를 넘긴 경우입니다)\n' >&2
+      printf 'archive:   **이것이 전수 검증 실패를 고치는 내용이라면 main 이 아니라 fr 브랜치에서 고치고 diff review 를 거치십시오**\n' >&2
+      printf 'archive:   (main 에서 커밋하면 그 수정은 리뷰를 거치지 않은 채 발행됩니다)\n' >&2
+      exit 1
+    fi
+    exit 0
+  )
+}
+
+# 증명이 없거나 stale 하면 **그 자리에서 전수 검증을 실행**하고 다시 대조합니다.
+# 사용: archive_selftest_gate <project_root>. return 0=진행, 1=중단.
+#
+# 아카이브는 hook 이 아니라 사용자가 직접 실행하는 스크립트라 시간 제약이 없어, 막고 끝내는
+# 대신 여기서 돌려 줍니다 (막기만 하면 사용자가 같은 명령을 두 번 치게 됩니다).
+archive_selftest_gate() {
+  local root="$1" why=""
+  # 전제 확인이 **증명 대조보다 먼저**입니다 (근거는 위 함수 주석).
+  archive_selftest_preconditions "$root" || return 1
+
+  # 첫 대조의 사유는 아직 "문제" 가 아닙니다 — 바로 아래에서 전수 검증을 돌려 해소하기
+  # 때문입니다. 그래서 붙잡아 두었다가 **실제로 막을 때만** stderr 로 내고, 정상 진행
+  # 경로에서는 "왜 지금 도는가" 의 설명으로 stdout 에 붙입니다.
+  # 정상 진행이 stderr 를 쓰면 무출력 계약을 검사하는 소비처가 정상 상태를 결함으로 봅니다.
+  # 명령 치환 안에서 돌아 함수 정의가 이 셸에 남지 않습니다.
+  if why="$(archive_selftest_precheck "$root" 2>&1 1>/dev/null)"; then
+    return 0
+  fi
+
+  # 진행 안내는 stdout 입니다 — 이 스크립트의 관례가 "진행은 stdout · 문제는 stderr" 이고,
+  # 정상 진행 경로가 stderr 를 쓰면 무출력 계약을 검사하는 소비처가 정상 상태를 결함으로 봅니다.
+  printf 'archive: 이 내용으로 전수 검증을 통과한 기록이 없어 지금 실행합니다\n'
+  [[ -z "$why" ]] || printf '%s\n' "$why" | sed 's/^/archive:   /'
+  printf 'archive:   이 저장소 실측 기준 약 6분이 걸립니다. 진행 상황은 아래 스텝 출력으로 확인하십시오\n'
+  printf 'archive:   중단해도 merge 는 이미 반영돼 있어, 다시 실행하면 이 지점부터 이어집니다\n'
+  # 전수 검증은 **위생적인 환경**에서 돌려야 합니다. 셸에 export 된 채 남은 변수 하나가
+  # 검사를 통째로 건너뛰게 하거나(dry-run 은 0.1초에 rc 0, checker-only 는 아무것도 실행
+  # 않고 rc 0) 검출력을 조용히 낮추면(스트레스 회차·크기 제한은 허용 범위 안이라 경고조차
+  # 나지 않습니다), 통과 기록만 정상으로 남아 안전망이 거짓말을 합니다.
+  # **계열 정규식이 산출하는 이름에 한해** 떨어뜨리는 것은 기본값 복원이라 과잉 차단이
+  # 되지 않습니다 — 그 이름들은 모두 부재 시 기본 동작으로 돌아가도록 읽히기 때문입니다.
+  # 이것은 임의의 환경변수에 대한 진술이 아닙니다. 예컨대 `HOME` 을 떨어뜨리면 git 의
+  # global config 해석이 달라져 "기본값 복원" 이 아닙니다. 계열 정규식은 그런 이름을
+  # 산출하지 않으므로 현행 코드에서 도달 불가이나, 계열을 넓힐 때 이 구분이 필요합니다.
+  local _envu=() _dv
+  while IFS= read -r _dv; do [[ -n "$_dv" ]] && _envu+=( -u "$_dv" ); done < <(archive_selftest_env_denylist)
+  if ! env ${_envu[@]+"${_envu[@]}"} bash "$root/rd-workflow/scripts/self_test.sh" full; then
+    printf 'archive: 전수 검증 실패 — 원인을 해결한 뒤 다시 실행하십시오\n' >&2
+    return 1
+  fi
+  if ! archive_selftest_precheck "$root"; then
+    printf 'archive: 전수 검증은 통과했으나 증명 대조가 여전히 불일치합니다\n' >&2
+    printf 'archive:   실행 중 파일이 바뀌었거나 증명이 기록되지 않았습니다 (위 사유 참조)\n' >&2
+    return 1
+  fi
+  return 0
+}
+
 # archive/종결 신호 검출 (review-gate-iteration-commit).
 # review 미종결 분기에서 사용 — 신호 있으면 차단(B1), 없으면 iteration commit 허용(A1).
 # return 0 = archive 신호 있음(차단), 1 = 없음(허용).
@@ -244,42 +373,6 @@ commit_has_archive_signal() {
   if [[ "$_status" == "대기 중" && "$_short" == "-" ]]; then
     return 0
   fi
-  return 1
-}
-
-# --- 워크플로 파일 판정 ---
-
-is_workflow_file() {
-  local norm rel root_norm
-  norm="$(normalize_lexical_path "$1")"
-
-  case "$norm" in
-    /*)
-      root_norm="$(normalize_lexical_path "$project_root")"
-      if [[ "$norm" == "${root_norm}/"* ]]; then
-        rel="${norm#"${root_norm}/"}"
-      else
-        # 프로젝트 밖 절대 경로는 이 화이트리스트의 대상이 아니다.
-        # 밖 경로의 통과 판정은 implementation_gate.sh 의 전용 분기가 먼저 처리하므로
-        # 정상 경로에서는 여기 도달하지 않는다. 화이트리스트에서 '모름' 은 차단 쪽이어야
-        # 하므로 return 1 이다.
-        return 1
-      fi
-      ;;
-    *)
-      # 상대 경로. 소진하지 못한 선두 '..' 가 보존되어 아래 case 에 매칭되지 않는다.
-      rel="$norm"
-      ;;
-  esac
-
-  case "$rel" in
-    CURRENT_TASK.md|REQUEST.md|PROJECT_CONTEXT.md|SESSION.md|CHECKPOINT.md) return 0 ;;
-    */turns/*.md) return 0 ;;
-    rd-workflow-workspace/*) return 0 ;;
-    # superpowers 워크스페이스 — 도구별로 명시한다. 부모 '.superpowers/' 를 통째로 열면
-    # 앞으로 생길 미지의 하위 디렉토리까지 선허용하게 된다 (change spec §2.1).
-    .superpowers/sdd/*|.superpowers/brainstorm/*) return 0 ;;
-  esac
   return 1
 }
 
@@ -339,18 +432,14 @@ normalize_lexical_path() {
 
 # is_shared_state_file <filepath>
 # orchestrator(메인 세션) 전용 공유 진행 상태 파일인지 판정합니다. return 0 = 그렇습니다.
-# is_workflow_file 과 의미가 다릅니다 — 그쪽은 "단계 게이트에서 통과시킬 파일",
-# 이쪽은 "주체 게이트에서 막을 파일" 입니다. 두 집합을 한 함수로 합치면 한쪽 수정이
-# 다른 쪽을 깨뜨립니다.
+# 이 hook 에 남은 유일한 판정 집합입니다 — "주체 게이트에서 막을 파일".
 # 집합을 진행 상태 3종으로 좁게 유지합니다. spec/plan/report 는 단일 작성자 산출물이라
 # 경합 대상이 아니고, SESSION.md/CHECKPOINT.md/turns 는 외부 CLI 프로세스가 작성해
 # 최상위 판별 필드(agent_type, 없으면 agent_id)가 없으므로 넣어도 무효입니다.
 #
 # 왜 정규화가 필요한가: 원시 문자열 매칭은 '<root>/../<basename>/x' 처럼 벗어난 뒤
-# 되돌아오는 경로를 놓친다. is_workflow_file 도 같은 이유로 정규화를 쓴다(2026-08-17).
-# 다만 판정 후 처리는 다르다 — 그쪽은 화이트리스트라 미매칭이 "차단", 이쪽은
-# 블랙리스트라 미매칭이 "통과" 다. 실패 방향이 반대이므로 아래 ② 의 -ef 보조 판정은
-# 그 함수로 복제할 수 없다 (화이트리스트에서 -ef 는 방어가 아니라 확대가 된다).
+# 되돌아오는 경로를 놓친다(2026-08-17). 이 판정은 블랙리스트라 미매칭이 "통과" 이므로,
+# 아래 ② 의 -ef 보조 판정으로 lexical 정규화가 놓치는 별칭까지 함께 막는다.
 # 대상 경로와 project_root 를 **둘 다** 정규화한다 — project_root 쪽만 원시 문자열로 두면
 # '<root>/../<basename>/x' 처럼 벗어난 뒤 되돌아오는 경로를 놓친다.
 # 판정 대상은 이름이 아니라 파일이다 — 정규화 문자열 일치(①)와 실파일 동일성(②) 둘 다
@@ -412,35 +501,6 @@ is_nonblocking_status() {
     ""|"대기 중"|"완료") return 0 ;;
     *) return 1 ;;
   esac
-}
-
-# read_stop_hook_active
-# _hook_input(read_hook_input이 채운 전역 변수)에서 최상위 stop_hook_active 필드를 읽어
-# 'true' 또는 'false'를 stdout에 출력. extract_json_field는 .tool_input. 하위만 보므로 별도 처리.
-read_stop_hook_active() {
-  local val=""
-  if command -v jq &>/dev/null; then
-    val="$(printf '%s' "$_hook_input" | jq -r '.stop_hook_active // false' 2>/dev/null || true)"
-  fi
-  if [[ -z "$val" ]]; then
-    # bash 폴백: 최상위 "stop_hook_active" 값 추출
-    local tmp="${_hook_input#*\"stop_hook_active\"}"
-    if [[ "$tmp" != "$_hook_input" ]]; then
-      tmp="${tmp#*:}"
-      tmp="${tmp#*[[:space:]]}"
-      # true/false 판별 (따옴표 없는 boolean)
-      case "$tmp" in
-        true*) val="true" ;;
-        false*) val="false" ;;
-        \"true\"*) val="true" ;;
-        \"false\"*) val="false" ;;
-        *) val="false" ;;
-      esac
-    else
-      val="false"
-    fi
-  fi
-  printf '%s' "$val"
 }
 
 # read_hook_agent_id
@@ -527,124 +587,6 @@ read_hook_agent_id() {
   '
 }
 
-# _stale_edit_is_explained <gendir> <gen_invalid 0|1> <relpath> <abspath>
-# change spec §2.5 6단계. return 0 = 설명됨(정규 subagent 편집), 1 = 미설명.
-#
-# 판정 순서를 그대로 지킵니다 — 세대 무효 → .orc 원시 존재 → .sub 부재 → malformed →
-# relpath 불일치 → state_id 불일치. 어느 항목이든 어긋나면 미설명(block 방향)입니다.
-#
-# ③ **.orc 를 내용 불문 미설명으로 보는 이유**: malformed .orc 와 유효한 .sub 가 공존할 때
-#    .orc 를 무시하면 설명됨으로 통과합니다. orchestrator 편집의 흔적이 있으면 그 자체로
-#    저장이 필요하므로(그 편집은 CURRENT_TASK.md 저장으로 설명되어야 함) 보수적으로 봅니다.
-#    행위자별 별개 파일이라 편집 순서·최종 writer 와 무관하게 이 성질이 성립합니다.
-_stale_edit_is_explained() {
-  local gen="${1-}" gen_invalid="${2-}" rel="${3-}" abs="${4-}" sid cur
-  # 세대가 없거나 무효하면 그 세대의 레코드는 어떤 것도 근거가 되지 않습니다.
-  [[ -n "$gen" && "$gen_invalid" -eq 0 ]] || return 1
-  if ep_orc_exists "$gen" "$rel"; then
-    return 1
-  fi
-  # .sub 부재 · 필드 수 ≠ 2 · relpath 불일치는 ep_read_record 가 전부 return 1 로 흡수합니다.
-  sid="$(ep_read_record "$gen" sub "$rel" 2>/dev/null)" || return 1
-  [[ -n "$sid" ]] || return 1
-  cur="$(ep_state_id "$abs" 2>/dev/null)" || return 1
-  [[ "$sid" == "$cur" ]] || return 1
-  return 0
-}
-
-# current_task_is_stale
-# return 0 = stale (CURRENT_TASK.md 갱신 필요), return 1 = not stale 또는 판정 불가 (fail-open).
-#
-# 판정 기준 (change spec §2.5): git 추적 파일(rd-workflow-workspace/ 및 CURRENT_TASK.md 제외)
-# 중 mtime 이 CURRENT_TASK.md 보다 늦은 파일, 그리고 **같은 초에 편집 흔적이 있는 파일**을
-# 후보로 모아, 각 후보가 현재 세대의 subagent 정규 편집으로 설명되는지 봅니다.
-# 하나라도 설명되지 않으면 stale 입니다.
-#
-# ① **mtime == baseline 을 조건부로만 후보화하는 이유** — T16·T17·T18·AC5(f)를 동시에
-#    만족시키는 유일한 형태입니다. 같은 초 안에서는 mtime 만으로 `편집 → 저장`(T16, 통과해야
-#    함)과 `저장 → 편집`(T17·T18, 판정 대상)을 구별할 수 없습니다. 편집 흔적(현재 세대의
-#    레코드 또는 센티널)이 있을 때만 후보로 올리면 T16 은 이전 세대에만 흔적이 있어 후보에서
-#    빠지고, T17·T18 은 현재 세대 흔적으로 후보가 되어 각자 .orc/.sub 로 갈립니다.
-#    무조건 후보화(mtime >= baseline)로 바꾸면 T16 이 block 되고, 후보화를 아예 안 하면
-#    T17 이 통과합니다. 레코드가 하나도 없는 환경(헬퍼 미설치·producer 미설치)에서는 이
-#    분기가 항상 거짓이라 종전 동작(`-gt` 집합만 판정)과 바이트 단위로 같습니다 — AC5(f).
-# ② **후보화가 '원시 존재'를 쓰는 이유** — 유효한 레코드만 후보 조건으로 삼으면
-#    mtime == baseline 상태에서 레코드가 malformed 이거나 pathkey 충돌일 때 후보에서 빠져
-#    **통과**해, "손상은 block 방향" 이라는 전제가 깨집니다. 원시 존재로 후보화하고 손상
-#    판정은 6단계(_stale_edit_is_explained)에 맡기면 손상이 후보 안에서 미설명으로 귀결됩니다.
-#    증거가 소실될 수 있는 센티널(.overflow) 세대는 같은 이유로 무조건 후보화합니다.
-#
-# **판정 경로에 정리(prune) 호출이 없습니다** (§2.9) — 판정 프로세스가 남의 세대를 지우는
-# 성질이 포인터 후진·writer 장시간 정지 반례를 반복 생산했습니다. 세대 목록을 순회하지 않고
-# 포인터 세대 하나만 읽으므로 판정 비용은 잔존 세대 수와 무관합니다.
-# **.bump-failed 를 읽지 않습니다** (§2.12) — 그 파일은 진단 전용이며 어떤 판정 분기에도
-# 등장하지 않습니다. block reason 문구 보강은 판정이 끝난 뒤 Stop hook 이 담당합니다.
-current_task_is_stale() {
-  local ct="${project_root}/CURRENT_TASK.md"
-  [[ -f "$ct" ]] || return 1
-
-  # 1·2단계 — fail-open 유지 + baseline = CURRENT_TASK.md mtime
-  # mtime 취득 헬퍼 (BSD stat → GNU stat 폴백)
-  local ct_mtime
-  ct_mtime="$(stat -f %m "$ct" 2>/dev/null || stat -c %Y "$ct" 2>/dev/null || true)"
-  [[ -z "$ct_mtime" ]] && return 1
-
-  # git ls-files로 추적 파일 순회
-  local tracked_files
-  tracked_files="$(git -C "$project_root" ls-files 2>/dev/null)" || return 1
-  [[ -z "$tracked_files" ]] && return 1
-
-  # 3단계 — 현재 세대 G. **.current 포인터가 유일한 권위**이며 최대 번호를 고르지 않습니다.
-  # 헬퍼 미설치(source 실패) 시 G="" 이고 gen_sentinel=0 이라 아래 조건부 후보화가 항상
-  # 거짓이 되어 종전 동작으로 수렴합니다.
-  local gen="" gen_invalid=0 gen_sentinel=0 want_title=""
-  if declare -f ep_current_gen >/dev/null 2>&1; then
-    gen="$(ep_current_gen 2>/dev/null || true)"
-    if [[ -n "$gen" ]]; then
-      want_title="$(get_current_short_title)"
-      ep_gen_has_sentinel "$gen" && gen_sentinel=1
-      # 센티널·short-title 불일치·부재는 모두 ep_gen_valid 가 흡수합니다.
-      ep_gen_valid "$gen" "$want_title" || gen_invalid=1
-    fi
-  fi
-
-  local f abs_path f_mtime
-  while IFS= read -r f; do
-    [[ -z "$f" ]] && continue
-    # rd-workflow-workspace/ 하위 및 CURRENT_TASK.md 자신은 skip
-    case "$f" in
-      rd-workflow-workspace/*) continue ;;
-      CURRENT_TASK.md) continue ;;
-    esac
-    abs_path="${project_root}/${f}"
-    [[ -f "$abs_path" ]] || continue
-    f_mtime="$(stat -f %m "$abs_path" 2>/dev/null || stat -c %Y "$abs_path" 2>/dev/null || true)"
-    [[ -z "$f_mtime" ]] && continue
-
-    # 4단계 — 후보 구성. 비교는 기존 -gt 를 유지합니다 (-ge 로 바꾸면 T16 이 깨집니다).
-    if [[ "$f_mtime" -gt "$ct_mtime" ]]; then
-      : # 무조건 후보
-    elif [[ "$f_mtime" -eq "$ct_mtime" ]]; then
-      if [[ $gen_sentinel -eq 1 ]]; then
-        : # (b) 증거 소실 대비 보수적 후보화
-      elif [[ -n "$gen" ]] && ep_record_file_exists "$gen" "$f"; then
-        : # (a) 원시 존재
-      else
-        continue
-      fi
-    else
-      continue
-    fi
-
-    # 6·7단계 — 미설명 후보가 하나라도 나오면 즉시 stale 입니다.
-    _stale_edit_is_explained "$gen" "$gen_invalid" "$f" "$abs_path" && continue
-    return 0
-  done <<< "$tracked_files"
-
-  # 5단계(후보 없음)와 7단계(전부 설명됨)는 모두 통과입니다.
-  return 1
-}
-
 # --- JSON 파싱 ---
 
 _hook_input=""
@@ -702,7 +644,7 @@ scan_command_commit() {
 }
 
 # 현행(폴백) 문자열 판정 — 스캐너를 쓸 수 없을 때만 사용한다.
-# fr_branch_gate 는 자기 경계 정규식을 폴백으로 쓰므로 이 함수를 쓰지 않는다.
+# 제거된 fr_branch_gate 가 자기 경계 정규식을 폴백으로 쓰던 자리라 이 함수는 쓰지 않습니다.
 _legacy_commit_glob() {
   local cmd="$1"
   [[ "$cmd" == *git\ *commit* || "$cmd" == *git$'\t'*commit* || "$cmd" == git\ commit* ]]

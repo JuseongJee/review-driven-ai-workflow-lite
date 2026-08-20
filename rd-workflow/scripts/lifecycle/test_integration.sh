@@ -39,6 +39,27 @@ out_has() {  # out_has <needle> — stdin 을 읽어 needle 포함 여부 반환
   [[ "$out" == *"$needle"* ]]
 }
 
+# fixture 전용 전수 검증 대역을 씁니다.
+#
+# 아카이브는 merge 직후 "이 내용으로 전수 검증을 통과한 기록" 을 요구하고, 기록이 없으면
+# 그 자리에서 전수 검증을 직접 돌립니다. fixture 에는 진짜 검증 대상이 없으므로 대역을 두어
+# 증명만 남기게 합니다 — 대역이 없으면 모든 lifecycle 시나리오가 게이트에서 막힙니다.
+# 게이트 자체의 판정(차단·통과·untracked 분기)은 lifecycle 단위 테스트가 검증합니다.
+# 성공 경로에서 stderr 를 쓰지 않습니다 — 무출력 계약을 검사하는 시나리오가 있습니다.
+write_selftest_proof_stub() {  # write_selftest_proof_stub <경로>
+  cat > "$1" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+_r="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=/dev/null
+. "$_r/rd-workflow/scripts/_smoke_common.sh" 2>/dev/null || exit 1
+_fp="$(smoke_proof_fingerprint "$_r" worktree)" || exit 1
+_us=0; smoke_untracked_state "$_r" >/dev/null 2>&1 || _us=$?
+smoke_record_full_pass "$_r" "$_fp" "$_us" 2>/dev/null || exit 1
+exit 0
+STUB
+}
+
 # Common setup helper — temp git repo with lifecycle scripts copied in
 setup_repo() {
   local branch="${1:-main}"
@@ -57,10 +78,12 @@ setup_repo() {
       printf '# Current Task\n\n## Short Title\n-\n\n## Branch / Worktree\nmain\n\n## Status\n대기 중\n' > CURRENT_TASK.md; \
     fi; \
     mkdir -p rd-workflow/scripts/lifecycle rd-workflow/scripts/hooks rd-workflow-workspace/.lifecycle; \
-    printf 'rd-workflow-workspace/.lifecycle/loop-state\nrd-workflow-workspace/.lifecycle/.loop-state.*\n' > .gitignore; \
+    printf 'rd-workflow-workspace/.lifecycle/loop-state\nrd-workflow-workspace/.lifecycle/.loop-state.*\nrd-workflow-workspace/.lifecycle/selftest-full-cache\n' > .gitignore; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/lifecycle/*.sh rd-workflow/scripts/lifecycle/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/hooks/*.sh rd-workflow/scripts/hooks/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_state_common.sh rd-workflow/scripts/; \
+    cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_smoke_common.sh rd-workflow/scripts/; \
+    write_selftest_proof_stub rd-workflow/scripts/self_test.sh; \
     git add -A; \
     git commit -q -m "init"
   )
@@ -587,47 +610,6 @@ run_promote "$REPO" --short-title test-baz --no-worktree >/dev/null
 
 rm -rf "$REPO" "$BARE"
 
-# === Scenario 4: fr_branch_gate hook smoke ===
-echo "== scenario 4: fr_branch_gate hook smoke =="
-HOOK="$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/hooks/fr_branch_gate.sh"
-if [[ -x "$HOOK" ]]; then
-  # temp repo (main branch) 안에서 호출해 호출자 git state 의존성을 제거한다
-  REPO="$(setup_repo)"
-  pushd "$REPO" >/dev/null
-  # bypass marker 가 git commit invocation prefix → 통과
-  out_rc=0
-  echo '{"tool_input":{"command":"RD_LIFECYCLE_BYPASS_REASON=bootstrap git commit -m test"}}' | bash "$HOOK" 2>/dev/null || out_rc=$?
-  [[ "$out_rc" -eq 0 ]] && pass "hook: bypass marker prefix 통과" || fail "hook: bypass marker prefix 차단됨 (rc=$out_rc)"
-  # env prefix 형태도 정상 통과
-  out_rc=0
-  echo '{"tool_input":{"command":"env RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit -m test"}}' | bash "$HOOK" 2>/dev/null || out_rc=$?
-  [[ "$out_rc" -eq 0 ]] && pass "hook: env bypass prefix 통과" || fail "hook: env bypass prefix 차단됨 (rc=$out_rc)"
-  # spoof 차단 — marker 가 git commit 의 env prefix 가 아니면 통과해서는 안 된다
-  out_rc=0
-  echo '{"tool_input":{"command":"echo RD_LIFECYCLE_BYPASS_REASON=lifecycle && git commit -m x"}}' | bash "$HOOK" 2>/dev/null || out_rc=$?
-  [[ "$out_rc" -eq 2 ]] && pass "hook: spoof 차단 (echo && commit)" || fail "hook: spoof 통과됨 (rc=$out_rc)"
-  # non-commit 명령 → 통과
-  out_rc=0
-  echo '{"tool_input":{"command":"ls -la"}}' | bash "$HOOK" 2>/dev/null || out_rc=$?
-  [[ "$out_rc" -eq 0 ]] && pass "hook: non-commit 통과" || fail "hook: non-commit 차단됨 (rc=$out_rc)"
-  # false positive 차단 — echo / cat 안에 'git commit' 텍스트가 substring 으로 포함되어도 통과해야 한다
-  out_rc=0
-  echo '{"tool_input":{"command":"echo git commit"}}' | bash "$HOOK" 2>/dev/null || out_rc=$?
-  [[ "$out_rc" -eq 0 ]] && pass "hook: false positive (echo git commit) 통과" || fail "hook: false positive (echo git commit) 차단 (rc=$out_rc)"
-  out_rc=0
-  echo '{"tool_input":{"command":"cat git commit log"}}' | bash "$HOOK" 2>/dev/null || out_rc=$?
-  [[ "$out_rc" -eq 0 ]] && pass "hook: false positive (cat ... git commit ...) 통과" || fail "hook: false positive (cat ... git commit ...) 차단 (rc=$out_rc)"
-  out_rc=0
-  echo '{"tool_input":{"command":"git commitments"}}' | bash "$HOOK" 2>/dev/null || out_rc=$?
-  [[ "$out_rc" -eq 0 ]] && pass "hook: false positive (git commitments) 통과" || fail "hook: false positive (git commitments) 차단 (rc=$out_rc)"
-  # main 에서 prefix 없는 git commit → 차단
-  out_rc=0
-  echo '{"tool_input":{"command":"git commit -m x"}}' | bash "$HOOK" 2>/dev/null || out_rc=$?
-  [[ "$out_rc" -eq 2 ]] && pass "hook: main 직접 commit 차단" || fail "hook: main 직접 commit 통과됨 (rc=$out_rc)"
-  popd >/dev/null
-  rm -rf "$REPO"
-fi
-
 # === Scenario 5: worktree promote rerun ===
 echo "== scenario 5: worktree promote rerun =="
 REPO="$(setup_repo)"
@@ -788,11 +770,6 @@ REPO_PARENT="$(dirname "$REPO")"
 BARE11="$REPO_PARENT/bare-mirror-11-$$"
 git init --bare "$BARE11" -q 2>/dev/null || true
 ( cd "$REPO" && git remote add origin "$BARE11" )
-
-# gate: master 직접 commit 차단 — fixture에 복사된 hook을 fixture cwd에서 실행 (scenario 4 패턴)
-out_rc=0
-( cd "$REPO" && echo '{"tool_input":{"command":"git commit -m x"}}' | bash rd-workflow/scripts/hooks/fr_branch_gate.sh >/dev/null 2>&1 ) || out_rc=$?
-[[ "$out_rc" -eq 2 ]] && pass "master-gate: 직접 commit 차단" || fail "master-gate: 통과됨 (rc=$out_rc)"
 
 run_promote "$REPO" --short-title test-master --no-worktree >/dev/null 2>&1 \
   && pass "master-promote: exit 0" || fail "master-promote: 실패"
@@ -1477,11 +1454,12 @@ sa_rc=0
 # to the following files would be overwritten by merge"), --force-dirty 를 줘도
 # archive 는 metadata cleanup 커밋에 도달하지 못하고 merge 단계에서 중단된다.
 #
-# 이 "도달 불가" 는 merge 를 실제로 수행하는 경로에 한정된 사실이다. archive.sh:102-104 은
-# fr 브랜치가 이미 HEAD 의 ancestor 이면 merge 를 통째로 건너뛰므로, 그 경로에서는 dirty
-# index 로도 metadata cleanup 커밋에 정상 도달한다 — 거기서는 경로 한정 커밋(_lc_paths)이
-# 실제로 무관 staged 를 배제하는 보호로 동작한다. 그 경로는 바로 아래 (d) merge-skip
-# 케이스가 덮으며, _lc_paths 의 경로 한정 효과를 고정하는 것도 그 케이스다.
+# **2026-08-20 갱신**: 중단 지점이 앞당겨졌다. 이제 merge 보다 먼저 Step 2.5 의 증명 전제
+# 확인이 막는다(final diff review turn 004 Finding 1) — dirty 상태에서 merge 를 만들어 두면
+# 그 merge 가 main 에 남아, 사용자가 main 에서 고쳐 재실행할 때 예전 fr tip 리뷰만으로
+# 발행되는 경로가 열리기 때문이다. 보호는 약해지지 않고 **더 앞에서** 작동한다.
+# 아래 oracle 도 그에 맞춰 새 중단 사유를 확인한다 — rc!=0 만 보면 archive 가 다른 이유로
+# 실패해도 통과해 통제군보다 약한 oracle 이 된다.
 # ensure_worktree_clean·merge 순서 둘 다 사용자를 보호하는 기존 동작이므로 완화하지 않는다.
 # LC_ALL=C 고정: 아래 oracle 이 git 의 영문 오류 메시지를 판정에 쓰므로,
 # 번역 locale 환경에서 거짓 실패하지 않도록 실행 locale 을 못박는다.
@@ -1489,9 +1467,10 @@ sa_out="$( cd "$REPO" && LC_ALL=C bash rd-workflow/scripts/lifecycle/archive.sh 
     --force-dirty --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || sa_rc=$?
 # 중단 사유까지 확인한다 — rc != 0 만 보면 archive 가 다른 이유로 실패해도 통과해
 # 통제군보다 약한 oracle 이 된다.
-[[ "$sa_rc" -ne 0 ]] && printf '%s' "$sa_out" | out_has "would be overwritten by merge" \
-  && pass "staged/archive: 무관 staged 상태에서 merge 단계 중단 (rc=$sa_rc)" \
-  || fail "staged/archive: merge 단계 중단이 아님 (rc=$sa_rc) — $sa_out"
+[[ "$sa_rc" -ne 0 ]] && printf '%s' "$sa_out" | out_has "merge 전에 중단했습니다" \
+  && printf '%s' "$sa_out" | out_has "커밋되지 않은 변경이 있어" \
+  && pass "staged/archive: 무관 staged 상태에서 merge **이전** 중단 (rc=$sa_rc)" \
+  || fail "staged/archive: merge 이전 중단이 아님 (rc=$sa_rc) — $sa_out"
 ( cd "$REPO" && git log --all --oneline | out_has "archive test-stga metadata 정리" ) \
   && fail "staged/archive: 중단됐는데 metadata 정리 커밋이 생성됨" \
   || pass "staged/archive: lifecycle 커밋 미생성"
@@ -1516,7 +1495,32 @@ run_promote "$REPO" --short-title test-mskip --no-worktree >/dev/null 2>&1
 # 선행 수동 merge — 이것이 archive.sh 의 merge skip 분기를 트리거한다.
 ( cd "$REPO" && git merge --no-ff fr/test-mskip -m "manual merge" -q )
 install_blocking_pre_commit "$REPO"
+# 이 케이스가 지키려는 성질은 **`_lc_paths` 경로 한정**이다 — lifecycle 커밋에 무관한
+# staged 파일이 섞이지 않는가. 어떤 파일을 staged 로 두는가는 그 성질을 관측하기 위한
+# 수단이며, 수단은 증명 집합 **밖**(transient)이어야 한다.
+#
+# 원래는 `src/app.js` 였다. self-test-runtime-reduction Task 8b 에서 archive 전 전수 검증
+# 게이트가 "워킹트리 = HEAD(증명 범위)" 를 요구하게 되어(change spec §5.5 · Task 8 리뷰 §4),
+# 증명 집합 안의 파일이 커밋되지 않은 채 staged 이면 게이트가 정상적으로 차단한다
+# (게이트가 증명하는 것은 워킹트리이고 tag·push 로 발행되는 것은 HEAD 이므로, 갈라진 채
+# 통과하면 검증하지 않은 내용이 발행된다). 그 차단은 의도된 동작이므로 완화하지 않고,
+# 대신 vehicle 을 `smoke_proof_exclude` 가 제외하는 transient 파일로 바꿨다.
+# 이 파일은 `_lc_paths`(task-state · CURRENT_TASK.md)에 없으므로 경로 한정 관측력은 그대로다.
+#
+# 순서 주의: 반대 방향(증명 집합 안 staged → 게이트 차단)을 **먼저** 확인한다. 성공
+# 아카이브가 끝나면 fr branch 와 metadata 가 정리되어 재실행은 게이트에 도달하지 못한다
+# (rerun 안전망이 먼저 응답한다) — 뒤에 두면 rc 만 맞고 사유가 다른 거짓 통과가 된다.
 ( cd "$REPO" && mkdir -p src && echo "user work" > src/app.js && git add src/app.js )
+ms_rc2=0
+ms_out2="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh \
+    --force-dirty --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || ms_rc2=$?
+[[ "$ms_rc2" -ne 0 ]] && printf '%s' "$ms_out2" | out_has "발행 대상" \
+  && pass "staged/archive-mergeskip: 증명 집합 안 staged 는 게이트가 차단 (rc=$ms_rc2)" \
+  || fail "staged/archive-mergeskip: 증명 집합 안 staged 를 통과시켰다 (rc=$ms_rc2) — $ms_out2"
+( cd "$REPO" && git rm -q --cached src/app.js >/dev/null 2>&1; rm -rf src )
+
+MS_UNREL="rd-workflow-workspace/.lifecycle/unrelated_zzfx.log"
+( cd "$REPO" && echo "user work" > "$MS_UNREL" && git add "$MS_UNREL" )
 ms_rc=0
 ms_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh \
     --force-dirty --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || ms_rc=$?
@@ -1525,12 +1529,12 @@ ms_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh \
 ( cd "$REPO" && git log main --oneline -10 | out_has "archive test-mskip metadata 정리" ) \
   && pass "staged/archive-mergeskip: lifecycle 커밋 생성" \
   || fail "staged/archive-mergeskip: lifecycle 커밋 부재 — $ms_out"
-( cd "$REPO" && git log main -1 --name-only --format= | out_has "src/app.js" ) \
-  && fail "staged/archive-mergeskip: 사용자 파일이 lifecycle 커밋에 포함됨" \
-  || pass "staged/archive-mergeskip: 사용자 파일이 커밋에서 제외됨"
-( cd "$REPO" && git diff --cached --name-only | out_has "src/app.js" ) \
-  && pass "staged/archive-mergeskip: 사용자 staged 상태 보존" \
-  || fail "staged/archive-mergeskip: 사용자 staged 소실"
+( cd "$REPO" && git log main -1 --name-only --format= | out_has "$MS_UNREL" ) \
+  && fail "staged/archive-mergeskip: 무관 staged 파일이 lifecycle 커밋에 포함됨" \
+  || pass "staged/archive-mergeskip: 무관 staged 파일이 커밋에서 제외됨"
+( cd "$REPO" && git diff --cached --name-only | out_has "$MS_UNREL" ) \
+  && pass "staged/archive-mergeskip: 무관 staged 상태 보존" \
+  || fail "staged/archive-mergeskip: 무관 staged 소실"
 printf '%s' "$ms_out" | out_has "commit-msg" \
   && pass "staged/archive-mergeskip: 우회 범위 특정 안내" \
   || fail "staged/archive-mergeskip: 안내 누락 — $ms_out"
@@ -1642,6 +1646,105 @@ remote_after="$( git --git-dir="$BAREAF" rev-parse main 2>/dev/null || echo none
   && pass "add-fail/archive: remote ref 불변 (push 부수효과 없음)" \
   || fail "add-fail/archive: 중단됐는데 remote 가 갱신됨 ($remote_before → $remote_after)"
 rm -rf "$REPO" "$BAREAF" "$WRAPBIN2"
+
+# === Scenario: 전수 검증 전제/실패 시 main HEAD 전이 (final diff review 2026-08-20 turn 004) ===
+#
+# 닫으려는 경로: merge 는 됐는데 전수 검증이 막히고 main 이 merge 된 채 남으면, 사용자가
+# 그 main 에서 고쳐 커밋하고 재실행할 때 **예전 fr tip 리뷰만으로 그 커밋이 발행**됩니다.
+# 소스 토큰 검사(test_lifecycle.sh)로는 이 상태 전이를 못 봅니다 — 여기서 실제로 잽니다.
+echo "== scenario: archive 전수 검증 실패 시 main HEAD 전이 =="
+
+# --- (a) proof 대상 dirty + --force-dirty: merge 전에 막혀 main 이 움직이면 안 된다 ---
+# `--force-dirty` 는 clean 검사를 넘기는 **지원되는 정상 호출**이라, 여기서 main 이 전진하면
+# 위 우회 경로가 정상 사용 중에 열립니다.
+REPO="$(setup_repo)"
+run_promote "$REPO" --short-title test-dirtyarch --no-worktree --status "구현 중" >/dev/null
+( cd "$REPO" && git switch fr/test-dirtyarch -q \
+  && echo "# archived" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" \
+  && git switch main -q )
+main_before="$( cd "$REPO" && git rev-parse HEAD )"
+( cd "$REPO" && printf '\n## dirty\n' >> CURRENT_TASK.md )
+( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --no-remote --force-dirty \
+    --force-skip-review-check "통합 테스트 fixture" ) >/dev/null 2>&1 \
+  && fail "force-dirty/archive: 증명 전제가 깨졌는데 rc 0" \
+  || pass "force-dirty/archive: 증명 전제 위반 차단"
+main_after="$( cd "$REPO" && git rev-parse HEAD )"
+[[ "$main_before" == "$main_after" ]] \
+  && pass "force-dirty/archive: main HEAD 불변 (merge 전 차단)" \
+  || fail "force-dirty/archive: main 이 전진함 ($main_before → $main_after) — 미리뷰 커밋 발행 경로가 열린다"
+( cd "$REPO" && git rev-parse --verify fr/test-dirtyarch >/dev/null 2>&1 ) \
+  && pass "force-dirty/archive: fr branch 보존 (고칠 곳이 남아 있다)" \
+  || fail "force-dirty/archive: fr branch 소실"
+rm -rf "$REPO"
+
+# --- (b) clean 상태에서 전수 검증 자체가 실패: 이 실행이 만든 merge 를 되돌려야 한다 ---
+REPO="$(setup_repo)"
+run_promote "$REPO" --short-title test-failarch --no-worktree --status "구현 중" >/dev/null
+( cd "$REPO" && git switch fr/test-failarch -q \
+  && echo "# archived" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" \
+  && git switch main -q )
+# 전수 검증이 실패하는 대역으로 교체하고 **커밋**한다 (워킹트리를 clean 으로 유지해야
+# 전제 확인을 통과해 merge 까지 간다 — 되돌림 경로를 타게 하는 것이 이 케이스의 목적).
+( cd "$REPO" && printf '#!/usr/bin/env bash\nexit 1\n' > rd-workflow/scripts/self_test.sh \
+  && git add rd-workflow/scripts/self_test.sh && git commit -q -m "failing selftest stub" )
+main_before="$( cd "$REPO" && git rev-parse HEAD )"
+( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --no-remote \
+    --force-skip-review-check "통합 테스트 fixture" ) >/dev/null 2>&1 \
+  && fail "fail-selftest/archive: 전수 검증이 실패했는데 rc 0" \
+  || pass "fail-selftest/archive: 전수 검증 실패 차단"
+main_after="$( cd "$REPO" && git rev-parse HEAD )"
+[[ "$main_before" == "$main_after" ]] \
+  && pass "fail-selftest/archive: merge 되돌림으로 main HEAD 복귀" \
+  || fail "fail-selftest/archive: merge 가 main 에 남음 ($main_before → $main_after) — main 직접 수정이 리뷰를 우회한다"
+( cd "$REPO" && git rev-parse --verify fr/test-failarch >/dev/null 2>&1 ) \
+  && pass "fail-selftest/archive: fr branch 보존" \
+  || fail "fail-selftest/archive: fr branch 소실"
+[[ -z "$( cd "$REPO" && git tag --list "fr/*/test-failarch" )" ]] \
+  && pass "fail-selftest/archive: tag 미생성" \
+  || fail "fail-selftest/archive: 중단됐는데 tag 생성됨"
+# tracked 기준으로 봅니다 — 아카이브가 스스로 만드는 untracked 산출물(audit log 등)은
+# 증명 대상이 아니고, 되돌림도 그것을 지우지 않습니다.
+[[ -z "$( cd "$REPO" && git status --porcelain --untracked-files=no )" ]] \
+  && pass "fail-selftest/archive: 되돌림 후 tracked 변경 없음" \
+  || fail "fail-selftest/archive: 되돌림이 tracked 파일을 더럽혔다"
+rm -rf "$REPO"
+
+# --- (c) 하위 디렉터리 호출은 merge 이전에 거부된다 (실제 동작 고정) ---
+# turn 006 이 "nested 호출에서 rollback clean 판정이 저장소 전체를 못 본다" 를 지적했다.
+# 판정 범위 문제 자체는 사실이라 `git -C "$CURRENT_WT"` 로 고쳤지만, **그 경로는 현재
+# 도달 불가**다 — `_state_common.sh` 의 TASK_STATE_PATH 가 `${project_root:-$PWD}` 로
+# 해석되는데 archive.sh 는 그 파일을 source 한 **뒤에** project_root 를 채우므로, nested
+# 호출은 metadata 를 못 찾고 `active fr 없음` 으로 merge 훨씬 전에 끝난다.
+# 여기서는 그 **실제 동작**을 고정한다: nested 호출이 아무것도 건드리지 않고 거부되는 것.
+# 이 단언이 깨지면(= nested 호출이 진행되면) rollback 판정 범위가 즉시 실제 위험이 되므로,
+# 그때 FR `archive-cwd-dependent-state-path` 의 처방을 함께 넣어야 한다.
+REPO="$(setup_repo)"
+run_promote "$REPO" --short-title test-nested --no-worktree --status "구현 중" >/dev/null
+( cd "$REPO" && git switch fr/test-nested -q \
+  && echo "# archived" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" \
+  && git switch main -q )
+main_before="$( cd "$REPO" && git rev-parse HEAD )"
+nst_out="$( cd "$REPO/rd-workflow/scripts/lifecycle" && bash ./archive.sh --no-remote \
+    --force-skip-review-check "통합 테스트 fixture" 2>&1 )" \
+  && fail "nested/archive: 하위 디렉터리 호출이 rc 0" \
+  || pass "nested/archive: 하위 디렉터리 호출 거부"
+printf '%s' "$nst_out" | out_has "active fr 없음" \
+  && pass "nested/archive: metadata 미해석으로 조기 종료 (merge 이전)" \
+  || fail "nested/archive: 다른 사유로 종료 — rollback 판정 범위가 실제 위험이 된다: $nst_out"
+[[ "$main_before" == "$( cd "$REPO" && git rev-parse HEAD )" ]] \
+  && pass "nested/archive: main HEAD 불변" || fail "nested/archive: main 이 전진함"
+[[ -z "$( cd "$REPO" && git status --porcelain )" ]] \
+  && pass "nested/archive: 워킹트리 무변경" || fail "nested/archive: 워킹트리가 변경됨"
+rm -rf "$REPO"
+
+# --- (d) rollback clean 판정은 저장소 루트 기준이어야 한다 (배선 고정) ---
+# (c) 가 보여 주듯 행동으로는 아직 못 잡는다. 그렇다고 두면 `git -C` 가 조용히 지워져도
+# 초록으로 남으므로, 최소한 배선을 고정한다. `.` pathspec 은 호출 위치 기준이라
+# `git -C "$CURRENT_WT"` 가 없으면 prefix 밖 변경을 못 보고 사용자 변경을 reset 으로 지운다.
+ARCH_SRC="$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/lifecycle/archive.sh"
+grep -qE '^[^#]*_rb_dirty="\$\(git -C "\$CURRENT_WT" status --porcelain' "$ARCH_SRC" \
+  && pass "rollback: clean 판정이 저장소 루트 기준(git -C)" \
+  || fail "rollback: clean 판정이 호출 위치 기준 — prefix 밖 사용자 변경을 reset 으로 지운다"
 
 echo "== 결과: PASS=$PASS FAIL=$FAIL =="
 [[ $FAIL -eq 0 ]]
