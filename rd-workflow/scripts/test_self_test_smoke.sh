@@ -1532,37 +1532,58 @@ CMD_CHECKER="${SCRIPT_DIR}/check_claudemd_size.sh"
 if [[ ! -f "$CMD_CHECKER" ]]; then
   ok "check_claudemd_size.sh 없음 — 크기 검사 행렬 건너뜀 (lite 산출물)"
 else
-  cmd_case() { # cmd_case <라벨> <프로젝트 줄수|-> <정본 줄수|-> <기대rc>
+  # 제한 단위는 **글자 수**입니다. 줄 수로 재면 한 줄에 얼마를 넣든 세지 않으므로 분량이
+  # 2배가 되어도 통과하고, 반대로 짧은 항목을 줄바꿈으로 나열하는 편집은 분량이 늘지 않았는데도
+  # 막힙니다. 그래서 케이스도 글자 수로 고정합니다 — `%*s` 로 정확히 N 글자를 만듭니다
+  # (개행을 붙이지 않으므로 `wc -m` 결과가 N 과 같습니다).
+  CMD_LIMIT=12000
+  cmd_mk() { printf '%*s' "$1" '' > "$2"; }
+  cmd_case() { # cmd_case <라벨> <프로젝트 글자수|-> <정본 글자수|-> <기대rc>
     local label="$1" proj="$2" tpl="$3" want="$4" d rc
     d="$TMP/cmdsz_$RANDOM"
     mkdir -p "$d/rd-workflow/scripts"
     cp "$CMD_CHECKER" "$d/rd-workflow/scripts/"
-    [[ "$proj" == "-" ]] || seq "$proj" > "$d/CLAUDE.md"
-    if [[ "$tpl" != "-" ]]; then mkdir -p "$d/_ROOT_FILES"; seq "$tpl" > "$d/_ROOT_FILES/CLAUDE.md"; fi
+    [[ "$proj" == "-" ]] || cmd_mk "$proj" "$d/CLAUDE.md"
+    if [[ "$tpl" != "-" ]]; then mkdir -p "$d/_ROOT_FILES"; cmd_mk "$tpl" "$d/_ROOT_FILES/CLAUDE.md"; fi
     bash "$d/rd-workflow/scripts/check_claudemd_size.sh" >/dev/null 2>&1 && rc=0 || rc=1
     if [[ "$rc" == "$want" ]]; then ok "크기 검사 — ${label}"; else no "크기 검사 — ${label} (rc=$rc, 기대 $want)"; fi
     rm -rf "$d"
   }
   # REQUIRED 부재는 rc=1 입니다. 예전에는 안내만 하고 exit 0 이었는데, 그것은 이름만 필수이고
   # 동작은 fail-open 이라 "검사했다" 는 신호를 거짓으로 만듭니다.
-  cmd_case "REQUIRED 부재 → 실패"            -   -   1
-  cmd_case "정상 / OPTIONAL 부재 → 통과"     10  -   0
-  cmd_case "정상 / 정본 초과 → 실패"         10  201 1
-  cmd_case "프로젝트 초과 / 정본 정상 → 실패" 201 10  1
-  cmd_case "둘 다 정상 → 통과"               10  20  0
-  cmd_case "둘 다 초과 → 실패"               201 201 1
-  # 경계값 — 제한과 같은 줄 수는 통과입니다 (`-gt` 판정).
-  cmd_case "정본이 제한과 동률 → 통과"        10  200 0
+  cmd_case "REQUIRED 부재 → 실패"            -    -                     1
+  cmd_case "정상 / OPTIONAL 부재 → 통과"     100  -                     0
+  cmd_case "정상 / 정본 초과 → 실패"         100  $((CMD_LIMIT + 1))    1
+  cmd_case "프로젝트 초과 / 정본 정상 → 실패" $((CMD_LIMIT + 1)) 100    1
+  cmd_case "둘 다 정상 → 통과"               100  200                   0
+  cmd_case "둘 다 초과 → 실패"               $((CMD_LIMIT + 1)) $((CMD_LIMIT + 1)) 1
+  # 경계값 — 제한과 같은 글자 수는 통과입니다 (`-gt` 판정).
+  cmd_case "정본이 제한과 동률 → 통과"        100  "$CMD_LIMIT"          0
+  # 판정이 줄 수로 되돌아가면 갈리는 두 경계입니다. 옛 200줄 판정에서는 위가 실패·아래가
+  # 통과였는데, 분량 기준으로는 정반대여야 합니다.
+  cmd_d="$TMP/cmdsz_unit"
+  mkdir -p "$cmd_d/rd-workflow/scripts" "$cmd_d/_ROOT_FILES"
+  cp "$CMD_CHECKER" "$cmd_d/rd-workflow/scripts/"
+  cmd_mk 100 "$cmd_d/CLAUDE.md"
+  seq 1000 > "$cmd_d/_ROOT_FILES/CLAUDE.md"   # 1000줄이지만 약 3.9k자
+  if bash "$cmd_d/rd-workflow/scripts/check_claudemd_size.sh" >/dev/null 2>&1; then
+    ok "크기 검사 — 줄은 많고 분량은 제한 내 → 통과"
+  else no "크기 검사 — 줄 수가 아니라 글자 수로 재야 합니다 (1000줄/약 3.9k자가 막혔습니다)"; fi
+  { i=0; while [ $i -lt 60 ]; do printf '%*s\n' 200 ''; i=$((i+1)); done; } > "$cmd_d/_ROOT_FILES/CLAUDE.md"
+  if bash "$cmd_d/rd-workflow/scripts/check_claudemd_size.sh" >/dev/null 2>&1; then
+    no "크기 검사 — 60줄/약 12.1k자가 통과했습니다 (한 줄에 몰아쓰면 우회됩니다)"
+  else ok "크기 검사 — 줄은 적고 분량이 제한 초과 → 실패"; fi
+  rm -rf "$cmd_d"
 
   # 실패 이유가 **어느 파일 때문인지** 사용자에게 보여야 합니다. 파일이 둘이라 이유 없이
   # 실패하면 어디를 줄여야 할지 알 수 없습니다.
   cmd_d="$TMP/cmdsz_reason"
   mkdir -p "$cmd_d/rd-workflow/scripts" "$cmd_d/_ROOT_FILES"
   cp "$CMD_CHECKER" "$cmd_d/rd-workflow/scripts/"
-  seq 10 > "$cmd_d/CLAUDE.md"; seq 201 > "$cmd_d/_ROOT_FILES/CLAUDE.md"
+  cmd_mk 100 "$cmd_d/CLAUDE.md"; cmd_mk $((CMD_LIMIT + 1)) "$cmd_d/_ROOT_FILES/CLAUDE.md"
   out="$(bash "$cmd_d/rd-workflow/scripts/check_claudemd_size.sh" 2>&1 || true)"
   has "크기 검사 — 실패 이유에 배포 정본 표시" "$out" "배포 정본"
-  has "크기 검사 — 파일별 줄 수 표시" "$out" "201줄"
+  has "크기 검사 — 파일별 글자 수 표시" "$out" "$((CMD_LIMIT + 1))자"
   has "크기 검사 — 실패 이유 블록" "$out" "실패 이유"
   rm -rf "$cmd_d"
 fi

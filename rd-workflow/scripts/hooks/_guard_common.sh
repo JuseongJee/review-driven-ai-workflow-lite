@@ -241,14 +241,16 @@ archive_selftest_precheck() {
 # 형태라 사람 눈에 띄지 않습니다 (이 저장소에서 이미 3개 중 2개를 놓쳤습니다).
 #   - `RD_SELFTEST_*`        실행 범위·모드 제어 (dry-run, checker-only, 우회 사유 …)
 #   - `RD_EDIT_PROVENANCE_*` 검출력 제어 (스트레스 회차, 기록 위치 …)
-#   - `CLAUDEMD_LINE_LIMIT`  계열이 없는 단독 변수. 제한을 올리면 크기 검사 스텝이
-#                            아무것도 검사하지 않고 통과합니다.
+#   - `CLAUDEMD_CHAR_LIMIT`  계열이 없는 단독 변수. 제한을 올리면 크기 검사 스텝이
+#                            아무것도 검사하지 않고 통과합니다. 구 이름
+#                            (`CLAUDEMD_LINE_LIMIT`)도 함께 떨어뜨립니다 — 값으로는
+#                            더 쓰이지 않지만, 남아 있으면 경고를 유발합니다.
 # 실제로 없는 이름을 `env -u` 에 넘겨도 무해하므로, 과다 산출은 위험이 아닙니다
 # (반대로 과소 산출은 그대로 구멍입니다). 계열은 이름만 보고 판단하므로 대상 스크립트를
 # 읽지 않아도 새 변수가 자동으로 닫힙니다.
 archive_selftest_env_denylist() {
   { env 2>/dev/null | grep -oE '^(RD_SELFTEST|RD_EDIT_PROVENANCE)_[A-Za-z0-9_]+' || true
-    printf 'CLAUDEMD_LINE_LIMIT\n'
+    printf 'CLAUDEMD_CHAR_LIMIT\nCLAUDEMD_LINE_LIMIT\n'
   } | sort -u
 }
 
