@@ -293,7 +293,7 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 - `hooks/pre_commit_archive_gate.sh` — FR 미아카이브 커밋 차단. 그대로 동작합니다.
 - `hooks/implementation_gate.sh` 의 **subagent 주체 게이트** — 병렬 구현자가 `CURRENT_TASK.md`·`REQUEST.md`·`task-state` 를 쓰는 것을 계속 차단합니다. hook 파일 자체는 남으므로 등록을 지우지 마십시오.
 - `hooks/session_start.sh` — 그대로 동작합니다.
-- `lifecycle/archive.sh` 의 `archive_review_precheck` · `archive_selftest_gate` — 아카이브 시점의 무우회 안전망이며 강화도 완화도 하지 않았습니다.
+- `lifecycle/archive.sh` 의 `archive_review_precheck` — 아카이브 시점의 리뷰 종결성 검사이며 강화도 완화도 하지 않았습니다. (같은 자리에 있던 `archive_selftest_gate` 는 2026-09-03 에 제거했습니다.)
 
 **실행 절차**:
 1. `.claude/settings.json` 의 stale hook 등록 제거는 **M005 가 그대로 처리합니다.** 제거된 5개 스크립트는 clone 에 존재하지 않고 템플릿 `.claude/settings.json` 에도 등록이 없으므로 M005 의 3중 조건에 걸립니다. M007 을 위해 따로 스니펫을 돌릴 필요가 없습니다.
@@ -328,6 +328,12 @@ bash rd-workflow/scripts/defect_reports.sh set-upstream "<배포 repo URL>"
 - 이미 값이 있으면 "이미 설정됨" 을 출력하고 원본을 유지합니다.
 - URL 문법을 지원하지 않으면 아무것도 쓰지 않고 보류합니다. 잘못된 대상에 추측 발행하지
   않기 위함이며, 이 경우 결함 보고 전달은 미전달 목록에 남습니다.
+- **`rd-workflow/config/workflow.json` 이 없으면 이 단계를 건너뜁니다.** 설정 파일을 새로
+  만들지 않습니다 — 파일 부재는 `CLAUDE.md` 가 규정한 정상 상태입니다. 이 경우 결함 보고
+  전달은 발행 시 `--upstream <owner/repo>` 수동 지정에 의존합니다.
+- config 부재에서의 각 서브커맨드 동작: `set-upstream` 은 안내 후 **성공 종료**(무변경),
+  `preview`·`publish` 는 전달 대상을 빈 값으로 보고 **미전달로 남깁니다**. 세 경우 모두
+  파일을 만들지 않습니다.
 
 ### 6. 검증 및 버전 갱신
 

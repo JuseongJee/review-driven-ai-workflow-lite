@@ -2,7 +2,18 @@
 # rd — 워크플로 task CLI (v2 Phase 2b). 사용: bash rd-workflow/scripts/rd task <subcommand> [args]
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/_task_common.sh"
+# 공용 함수 파일이 스크립트 옆에 없으면 루트를 확정할 수 없다 — 실행 파일 자체가
+# 심볼릭 링크이거나 rd 만 프로젝트 밖으로 복사된 경우다 (비지원). bash 의 source 실패
+# 메시지만 남기면 사유가 드러나지 않으므로 여기서 명시적으로 알린다.
+if [[ ! -f "${SCRIPT_DIR}/_task_common.sh" ]]; then
+  echo "프로젝트 루트를 확정할 수 없습니다: '${SCRIPT_DIR}' 에 _task_common.sh 가 없습니다." >&2
+  echo "  실행 파일 자체가 심볼릭 링크이거나 스크립트가 프로젝트 구조 밖에 놓여 있습니다 (비지원)." >&2
+  echo "  프로젝트 안의 실제 경로로 호출하세요: bash rd-workflow/scripts/rd task ..." >&2
+  exit 3
+fi
+# 루트 확정 실패(마커 부재)는 여기서 끝난다 — state_ensure 에 닿지 않으므로
+# 상태 파일이 만들어지지 않는다 (AC 17).
+source "${SCRIPT_DIR}/_task_common.sh" || exit 3
 # 진입 시 task-state 보장 — 부재 시 마이그레이션 수행 (결정 4). 손상 legacy → exit 3.
 state_ensure || exit 3
 
@@ -18,6 +29,7 @@ usage() {
                                            --source-fr 는 promote 전용 (생략 시 '-' 리셋)
   source-fr                                task-state source-fr 출력 (부재 시 '-')
   set-source-fr <값>                       source-fr 설정 ('-' 또는 items path, 계약 위반 exit 1)
+  set-title <slug> [--force]                Short Title 설정 (미설정→설정만 허용, --force 는 복구 전용)
   capture --stage <s> [--title <slug>] [--source <src>]   본문은 stdin (fail-open)
   backup-request [--orphan] [--title <slug>]               REQUEST.md collision-safe 백업
   archive-captures --stages <csv> [--title <slug>]         캡처를 raw-captures/archive/로 이동
@@ -61,6 +73,22 @@ case "$cmd" in
     val="${1:-}"; [[ $# -gt 0 ]] && shift
     [[ -z "$val" ]] && { usage; exit 1; }
     task_set_source_fr "$val"
+    ;;
+  set-title)
+    # slug 자리에 option token 이 오면 "인자 누락" 이다. 그대로 통과시키면
+    # `rd task set-title --force` 에서 val="--force" 가 되고 normalize_slug 가
+    # 이를 'force' 로 정규화해 실제 제목으로 기록한다 (change spec D3 위반).
+    # '-' 단독은 task_set_title 이 자체 메시지로 거부하므로 여기서 잡지 않는다.
+    case "${1:-}" in
+      "")   usage; exit 1 ;;
+      -?*)  usage; exit 1 ;;
+    esac
+    val="$1"; shift
+    force=0
+    if [[ "${1:-}" == "--force" ]]; then force=1; shift; fi
+    # 잉여 인자는 usage — 오타가 조용히 무시되지 않게 한다
+    if [[ $# -gt 0 ]]; then usage; exit 1; fi
+    task_set_title "$val" "$force"
     ;;
   guard)
     cand="" gmode="" gsrc=""

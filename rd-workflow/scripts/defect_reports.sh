@@ -161,9 +161,13 @@ set_upstream() {
   # $1=url
   local url="${1:-}" current canonical tmp
 
+  # config 파일을 새로 만들지 않는다 — 부재는 CLAUDE.md 가 규정한 정상 상태이고,
+  # 템플릿 sync 가 소비 프로젝트에 없던 설정 파일을 만들지 않기로 결정했다.
+  # 조용한 exit 0 은 호출자가 "설정됐다" 고 오인하므로 사유와 대안을 함께 낸다.
   if [[ ! -f "$CONFIG_FILE" ]]; then
-    echo "오류: '$CONFIG_FILE' 이 없습니다." >&2
-    return 1
+    echo "'$CONFIG_FILE' 이 없어 건너뜁니다 (설정 파일을 새로 만들지 않습니다)."
+    echo "  전달 대상을 지정하려면 발행 시 --upstream <owner/repo> 를 주십시오."
+    return 0
   fi
 
   current="$(cfg_upstream)"

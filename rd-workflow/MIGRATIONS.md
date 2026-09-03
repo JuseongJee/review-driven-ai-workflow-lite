@@ -3,6 +3,27 @@
 템플릿 구조 변경 시 기존 프로젝트에 적용할 마이그레이션 목록.
 `sync_template.md` Step 4에서 이 파일(**clone된 템플릿의 사본**)을 읽고 해당하는 항목을 실행합니다.
 
+## 항목 추가 규칙
+
+**보존 파일의 정의 문구를 바꾸는 배포는 그 문구를 갱신하는 마이그레이션 항목을 동반합니다.**
+
+`sync_template.md` 2단계의 보존 목록에 있는 파일은 동기화가 덮지 않습니다. 그래서 배포가
+그 파일의 **정의 문구**(상태 값·종류 값 목록, 규약 서술 등)를 바꾸면 기존 프로젝트의 문구는
+구버전에 묶입니다. 그 문구를 검사하는 self_test 스텝이 있으면 **sync 직후 반드시 실패**하며,
+신규 부트스트랩 프로젝트만 통과합니다.
+
+새 어휘·새 규약을 도입할 때는 다음을 함께 확인하십시오.
+
+1. 바뀐 문구가 보존 파일에 있는가 (`sync_template.md` 2단계 목록 대조)
+2. 그 문구를 검사하는 스텝이 있는가 (`scripts/test_*.sh` 에서 해당 파일을 grep 하는지 확인)
+3. 둘 다 참이면 이 문서에 마이그레이션 항목을 추가한다 — 조건·실행·**보존 범위**(사용자
+   데이터를 건드리지 않는 경계)를 명시하고, 실행은 재실행이 안전한 형태로 쓴다
+
+이 규칙이 없어 실제로 발생한 사례: FR status 어휘 `blocked` 도입 시 정의처
+`rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` 가 보존 대상인데 갱신 항목이 없어,
+FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_status.sh` 로 실패했습니다
+(M009 가 그 뒤처리입니다).
+
 ---
 
 ## M000: sync 절차 문서 권위 전환
@@ -201,14 +222,7 @@
 - `hooks/session_start.sh` — 그대로 동작합니다.
 - `lifecycle/archive.sh` 의 `archive_review_precheck` — 아카이브 시점의 리뷰 종결 확인. 강화도 완화도 하지 않았습니다.
 
-**새로 강제되는 것** — 이것은 "제거" 만 하는 마이그레이션이 아닙니다:
-
-- `lifecycle/archive.sh` 의 **`archive_selftest_gate` 는 이번 버전이 신설**했습니다(이전 템플릿에 없습니다). 아카이브할 때마다 **`self_test.sh consumer` 통과가 강제**됩니다 — `consumer` 는 소비 프로젝트에서 뜻이 있는 스텝만 도는 청중 필터이고, rd-workflow 정본 저작 규칙(`dev-only`)은 강제 대상이 아닙니다. **유효한 `full` 증명이 있으면 그것으로도 충족**됩니다(상위 집합). 즉 게이트가 요구하는 것은 실행 모드 이름이 아니라 `consumer` 청중 전량이 통과했다는 검증 범위입니다.
-- 통과 증명이 없거나 낡았으면 게이트가 **그 자리에서 검증을 실행합니다**(프로젝트 규모에 따라 다릅니다). 막고 끝내지 않고 돌려 주므로 같은 명령을 두 번 칠 필요는 없습니다. 실행 예정 스텝 수와 청중 제외 내역은 시작 배너에 표시됩니다.
-- **우회 밸브가 없습니다.** 커밋 전 게이트에 있던 `RD_SELFTEST_FULL_BYPASS_REASON` 류의 탈출구는 여기에 두지 않았습니다 — 그 우회가 상시 사용돼 커밋 게이트를 형해화시킨 것이 제거의 직접 원인이기 때문입니다.
-- **커밋되지 않은 변경이나 untracked 파일이 있으면 검증을 돌리지도 않고 막습니다.** 증명 대상(워킹트리)과 발행 대상(HEAD)이 달라 검증이 성립하지 않기 때문입니다. `archive.sh --force-dirty` 는 clean 검사만 넘길 뿐 이 게이트는 넘지 못합니다.
-- **실패 지점이 merge 이후·tag/push 이전**입니다. 즉 검증이 실패하면 merge 는 이미 반영된 채로 중단되고, 원인을 고친 뒤 `archive.sh` 를 다시 실행하면 그 지점부터 이어집니다.
-- **동기화 직후 첫 아카이브 전에 `bash rd-workflow/scripts/self_test.sh consumer` 를 한 번 돌려 보십시오.** 여기서 실패하는 프로젝트는 아카이브를 완료할 수 없습니다. (`full` 은 정본 위생 검사까지 포함하므로 소비 프로젝트에서는 아카이브 조건이 아닙니다 — 참고용으로만 씁니다.) 실패가 나오면 아카이브를 시도하기 전에 원인을 해소하는 편이 쌉니다(merge 이후에 발견하는 것보다 되돌리기 쉽습니다).
+**아카이브 검증 게이트에 관하여**: 이 마이그레이션의 초기 버전은 `lifecycle/archive.sh` 에 `archive_selftest_gate` 를 신설해 아카이브마다 `self_test.sh consumer` 통과를 강제했습니다. 2026-09-03 에 그 게이트와 smoke 감축 엔진을 걷어냈습니다 — 구현 직후 돌린 검증을 아카이브가 다시 돌려 얻는 것이 없었고, 아카이브마다 15~20분을 썼습니다. 지금 템플릿에는 그 게이트가 없으며, 검증은 구현 직후 `bash rd-workflow/scripts/self_test.sh [그룹...]` 로 사람이 돌리고 final diff review 가 결과를 확인합니다.
 
 **실행 절차**:
 1. `.claude/settings.json` 의 stale hook 등록 제거는 **M005 가 그대로 처리합니다.** 제거된 5개 스크립트는 clone 에 존재하지 않고 템플릿 `.claude/settings.json` 에도 등록이 없으므로 M005 의 3중 조건에 걸립니다. M007 을 위해 따로 스니펫을 돌릴 필요가 없습니다.
@@ -342,3 +356,159 @@
 4. M008 이 끝난 뒤 M003 을 실행합니다. 이 순서를 지키면 M003 의 정확 일치 대조가 정상 동작합니다.
 
 **주의**: 이 항목이 만든 변경은 자동 커밋하지 않고 다음 정규 커밋에 편승시킵니다 (M004 와 같은 계약).
+
+## M009: 보존 파일 정의 문구 — FR status `blocked` (`FUTURE_REQUESTS.md`)
+
+**조건**: 프로젝트 `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` 의 「상태 값」 또는
+「파일 분리」 섹션에 `blocked` 서술이 없을 때. 파일 자체가 없으면 해당 없음입니다.
+
+**실행 순서**: 다른 항목과 독립입니다 (대상 파일이 `.claude/settings.json` 이 아닙니다).
+순서 제약을 두지 않습니다.
+
+**동작 범위**:
+- **추가만 합니다.** 기존 행을 교체하지 않습니다 — 프로젝트가 그 행을 손댔을 수 있습니다.
+- **인덱스 표와 기존 FR 항목 내용은 건드리지 않습니다.**
+- 「상태 값」은 `- \`done\`` 행 앞에 넣어 배포본 순서를 따릅니다. 「파일 분리」는 **첫 목록
+  항목 앞**에 넣습니다 — `test_fr_blocked_status.sh` 가 `grep -A4` 로 판정하므로 섹션 끝에
+  붙이면 범위를 벗어납니다.
+- **안전**: 사전검증 실패는 원본을 바꾸지 않고 종료합니다. 변경이 있을 때만 같은 디렉터리
+  임시 파일에 쓴 뒤 `os.replace` 로 **원자 교체**하므로, 쓰기 도중 중단돼도 원본이 남습니다.
+  기존 파일 권한을 보존합니다.
+- **멱등입니다.** 판정은 **정식 항목 형태**(아래 canonical 행의 접두)로 하며, 단순 `blocked`
+  문자열 포함 여부로 보지 않습니다 — 섹션에 `blocked 는 아직 미지원` 같은 메모만 있어도
+  정식 정의가 없는 상태에서 건너뛰면 거짓 성공이 됩니다.
+
+**canonical 결과** — 이 마이그레이션이 설치하는 정식 형태는 아래 두 행입니다.
+
+```
+## 상태 값
+- `blocked`: 무인 드레인(ralph)이 …
+
+## 파일 분리
+- **`blocked` 항목**: 활성 인덱스에 **잔류**합니다 …
+```
+
+**신규 부트스트랩 프로젝트와 형태가 다릅니다.** 배포본 「파일 분리」는 `- **이 파일**:` 항목
+본문 안에 `blocked` 서술을 품는데, 이 마이그레이션은 그 행을 **교체하지 않고**(프로젝트가
+손댄 내용을 지우지 않기 위해) 전용 행을 추가합니다. 따라서 두 경로의 문장 구조가 갈리며,
+**그것이 의도된 계약입니다** — 마이그레이션 경로의 정본은 위 전용 행이고, `test_sync_template.sh`
+의 M009 회귀가 그 정확한 행을 oracle 로 고정합니다. 형태를 통일하려면 「이 파일」 행 교체가
+필요하고 그것은 사용자 데이터 보존과 충돌합니다.
+
+**실행 절차**: 프로젝트 루트에서 아래 스니펫을 실행합니다.
+
+   ```bash
+   python3 - <<'PY'
+   import os, stat, sys, tempfile
+
+   PATH = "rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
+
+   STATUS_ITEM = (
+       "- `blocked`: 무인 드레인(ralph)이 중단조건에 걸려 set-aside 한 항목. 활성 인덱스에 "
+       "잔류하되 auto-pick·`/fr pri`·`/fr push` 대상에서 제외되고 `/fr list` 에는 set-aside "
+       "요약(건수)으로만 표기. 원인 해소 후 `validated` 로 복원해 재시도"
+   )
+   SPLIT_ITEM = (
+       "- **`blocked` 항목**: 활성 인덱스에 **잔류**합니다 (parked 처럼 별도 파일로 옮기지 "
+       "않습니다). auto-pick·`/fr pri`·`/fr push` 대상에서 제외되고 `/fr list` 에는 "
+       "set-aside 요약으로만 표기됩니다."
+   )
+
+   if not os.path.exists(PATH):
+       print("M009: %s 없음 — 해당 없음" % PATH)
+       sys.exit(0)
+
+   with open(PATH, encoding="utf-8") as f:
+       lines = f.read().split("\n")
+
+   # --- 판정 단계: 쓰기 전에 전부 끝낸다 ---
+   targets = {}
+   for name in ("상태 값", "파일 분리"):
+       hits = [i for i, l in enumerate(lines) if l.strip() == "## " + name]
+       if len(hits) != 1:
+           print(
+               "M009 실패: '## %s' 헤딩이 %d개입니다 (정확히 1개여야 합니다) — "
+               "원본을 바꾸지 않았습니다." % (name, len(hits)),
+               file=sys.stderr,
+           )
+           print(
+               "  조치: %s 에서 그 헤딩을 하나만 남기거나, 배포본의 해당 섹션 문구를 "
+               "직접 옮겨 적으십시오." % PATH,
+               file=sys.stderr,
+           )
+           sys.exit(1)
+       targets[name] = hits[0]
+
+   def section_end(start):
+       for i in range(start + 1, len(lines)):
+           if lines[i].startswith("## "):
+               return i
+       return len(lines)
+
+   # 완료 판정은 **정식 항목 형태**로 합니다. 단순히 "blocked" 라는 글자가 섹션 안에
+   # 있는지만 보면, 예컨대 "blocked 는 아직 미지원" 같은 메모만 있어도 정식 정의가 없는
+   # 상태에서 건너뛰어 거짓 성공이 됩니다.
+   MARKERS = {"상태 값": "- `blocked`:", "파일 분리": "- **`blocked` 항목**:"}
+
+   pending = []   # (삽입 인덱스, 본문)
+   for name, item in (("상태 값", STATUS_ITEM), ("파일 분리", SPLIT_ITEM)):
+       start = targets[name]
+       body = lines[start + 1:section_end(start)]
+       if any(l.startswith(MARKERS[name]) for l in body):
+           continue
+       offset = None
+       if name == "상태 값":
+           for j, l in enumerate(body):
+               if l.startswith("- `done`"):
+                   offset = j
+                   break
+       if offset is None:
+           for j, l in enumerate(body):
+               if l.startswith("- "):
+                   offset = j
+                   break
+       if offset is None:
+           print(
+               "M009 실패: '## %s' 섹션에 목록 항목이 없습니다 — 원본을 바꾸지 "
+               "않았습니다." % name,
+               file=sys.stderr,
+           )
+           print("  조치: 배포본의 해당 섹션 문구를 직접 옮겨 적으십시오.", file=sys.stderr)
+           sys.exit(1)
+       pending.append((start + 1 + offset, item))
+
+   if not pending:
+       print("M009: 두 섹션에 이미 blocked 서술이 있습니다 — 해당 없음")
+       sys.exit(0)
+
+   # --- 쓰기 단계: 임시 파일 + os.replace 원자 교체 ---
+   for idx, text in sorted(pending, reverse=True):
+       lines.insert(idx, text)
+   rendered = "\n".join(lines).encode("utf-8")
+
+   d = os.path.dirname(os.path.abspath(PATH))
+   mode = stat.S_IMODE(os.stat(PATH).st_mode)
+   tmp = None
+   try:
+       fd, tmp = tempfile.mkstemp(dir=d, prefix=".FUTURE_REQUESTS.md.m009.")
+       with os.fdopen(fd, "wb") as f:
+           f.write(rendered)
+           f.flush()
+           os.fsync(f.fileno())
+       os.chmod(tmp, mode)
+       os.replace(tmp, PATH)
+       tmp = None
+   except Exception as e:
+       if tmp is not None:
+           try:
+               os.unlink(tmp)
+           except OSError:
+               pass
+       print("M009 실패: 쓰기 오류 — 원본을 바꾸지 않았습니다: %s" % e, file=sys.stderr)
+       sys.exit(1)
+
+   print("M009: %d개 섹션에 blocked 서술을 삽입했습니다." % len(pending))
+   PY
+   ```
+
+**검증**: `bash rd-workflow/scripts/test_fr_blocked_status.sh` 가 PASS 합니다.

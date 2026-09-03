@@ -59,8 +59,9 @@
 
 - **구현 완료 후 반드시 `/final-diff-review`를 거친다.** 건너뛰고 merge하거나 작업을 종료하지 않는다.
 - **Superpowers가 사용 가능하면 반드시 사용한다.** 불가능할 때만 직접 산출물을 작성한다.
+- **테스트는 꼭 필요한 것만, 시간 비용을 재서 만든다.** 테스트의 가치는 실수를 잡는 데 있다. 통과만 하고 시간을 먹는 테스트는 부채이므로 만들지 않고, 발견하면 지운다. spec/plan 과 리뷰에서 다음을 점검한다: ① 이 테스트가 없으면 어떤 실수가 실제로 새는가 — 답이 없으면 만들지 않는다 ② 테스트 도구·fixture·판정 로직 자체를 검사하는 메타 테스트, 같은 사실을 다른 경로로 다시 확인하는 중복, "옛 패턴이 다시 나타나지 않는가" 류의 잔존 grep, 현실에서 일어나지 않는 실패 주입(가짜 git·바이트 훼손·경쟁 창 재현)은 기본적으로 만들지 않는다 ③ 실행 시간을 추정해 수 초를 넘는 케이스는 그 비용을 정당화하는 사유를 plan 에 적는다 ④ 검증은 고친 영역에 맞는 범위만 돌리고, 전수 재실행을 절차(아카이브·커밋 게이트)에 넣지 않는다. (근거: 2026-09-03 self_test 정리 — 감축 엔진·아카이브 재검증·주입 시나리오를 걷어내 전수 21분 → 12분)
 - **검증**: 구현 후 `bash rd-workflow/scripts/{test,lint,typecheck,build}.sh`를 실행한다(프로젝트에 맞게 교체). typecheck는 정적 타입·컴파일 검사, build는 전체 빌드이며 build 실패는 검증 실패다. 교체 전(`TEMPLATE_STUB` 마커 존재)에는 **설계상 exit 1을 반환한다** — plan의 검증 Expected를 exit 0으로 쓰지 말고, 교체 후 기대값이나 프로젝트가 정의한 실질 검증 명령 기준으로 쓴다.
-- **워크플로 인프라 검증**: rd-workflow 인프라(lifecycle·review 스크립트)를 수정했다면 `bash rd-workflow/scripts/self_test.sh`로 검증한다. **인자 없이 부르면 `smoke`다**(`full`은 명시해야 한다) — 변경 파일과 참조 관계로 연결된 스텝만 돌고, 어떤 스텝과도 연결되지 않으면 자동으로 full로 되돌아간다. `RD_SELFTEST_SMOKE_DRYRUN=1`은 미리보기이므로 검증 결과가 아니다. **`CURRENT_TASK.md`·`REQUEST.md`가 dirty하면 감축이 거의 사라지므로** 진행 상태를 먼저 커밋하고 돌린다. `full`은 전수 실행이며 **아카이브 시 `archive.sh`가 우회 없이 강제**하므로 평소에 손으로 돌릴 필요는 없다 — `--force-dirty`로도 이 게이트는 넘지 못하니(증명 대상=워킹트리, 발행 대상=HEAD) 무관한 변경은 commit이나 stash 후 아카이브한다.
+- **워크플로 인프라 검증**: rd-workflow 인프라(lifecycle·review 스크립트)를 수정했다면 `bash rd-workflow/scripts/self_test.sh [그룹...]`로 검증한다. 그룹은 `hooks` `review` `lifecycle` `skills` `build`이고 고친 영역의 그룹만 골라 돌린다. 인자 없음은 전수, `consumer`는 소비 프로젝트에서 뜻이 있는 스텝만, `RD_SELFTEST_DRYRUN=1`은 실행 예정 스텝만 출력한다.
 
 ## Review 규칙
 
@@ -78,7 +79,7 @@
 
 ## Task Tracking
 
-Status·Short Title 변경은 `rd task` CLI를 경유합니다 (기계 판정 권위: `rd-workflow-workspace/.lifecycle/task-state` — `CURRENT_TASK.md`의 해당 필드는 표시용 미러).
+Status·Short Title·Source FR 변경은 `rd task` CLI를 경유합니다 (기계 판정 권위: `rd-workflow-workspace/.lifecycle/task-state` — `CURRENT_TASK.md`의 해당 필드는 표시용 미러). 미러는 표시용이면서 **권위 손실 시의 대조 출처**이므로, 세 필드를 손으로 한쪽만 고치지 않습니다 — promote 는 `source-fr` 가 양쪽에서 다르면 어느 쪽이 최신인지 판정하지 않고 중단합니다.
 
 Status 허용값 (`rd task` CLI 전이표가 이 값으로 판정하며, hook이 강제하지 않으므로 사람과 AI가 지킵니다): `대기 중` / `REQUEST review 대기` / `spec/plan 작성 중` / `spec/plan review 대기` / `구현 중` / `검증 중` / `diff review 대기` / `완료`.
 

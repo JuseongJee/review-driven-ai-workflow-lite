@@ -2,11 +2,26 @@
 # _task_common.sh — task CLI 공용 함수. source 전용 (rd, test_task_cli.sh 사용).
 # 정책 준거: docs/v2/policy-spec.md — SEC-01~07, SEC-13, GRD-01/02, LC-18/19/21
 
-project_root="${project_root:-$PWD}"
-export project_root
 _TC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# project_root — cwd 비의존. 주입값 우선(테스트), 없으면 스크립트 위치 기준.
+# 마커(rd-workflow-workspace/)가 없으면 조용히 다른 위치를 루트로 삼지 않고 멈춘다.
+# readlink -f / realpath 를 쓰지 않는다 (macOS 부재·환경 차이). 그래서 실행 파일
+# 자체가 심볼릭 링크면 마커를 잃고 이 검사에서 걸린다 — 의도된 비지원이다.
+if [[ -z "${project_root:-}" ]]; then
+  project_root="$(cd "${_TC_DIR}/../.." && pwd)"
+fi
+if [[ ! -d "${project_root}/rd-workflow-workspace" ]]; then
+  echo "프로젝트 루트를 확정할 수 없습니다: '${project_root}' 에 rd-workflow-workspace/ 가 없습니다." >&2
+  echo "  스크립트가 프로젝트 구조 밖에 놓여 있거나(사본·잘못된 배치), 실행 파일 자체가 심볼릭 링크일 수 있습니다." >&2
+  echo "  확인: ls -d '${project_root}/rd-workflow-workspace'" >&2
+  return 3 2>/dev/null || exit 3
+fi
+export project_root
 # 파서 단일화: hooks 공통 파서 재사용 (제3 구현 금지 — spec §3)
 source "${_TC_DIR}/hooks/_guard_common.sh"
+# slug 정규화 단일 출처 — promote.sh 와 같은 규칙이어야 두 경로가 같은 값을 만든다
+source "${_TC_DIR}/lifecycle/slug.sh"
 
 TASK_CANONICAL_STATUSES=("대기 중" "REQUEST review 대기" "spec/plan 작성 중" "spec/plan review 대기" "구현 중" "검증 중" "diff review 대기" "완료")
 
@@ -84,6 +99,17 @@ task_set_status() {
       return 4
     fi
   fi
+  # 미러 섹션 부재를 **권위 쓰기 전에** 잡는다 (final diff review Finding 2).
+  # `_task_section_write` 가 섹션 부재를 실패로 바꾼 뒤부터, 뒤에서 잡으면 task-state 는
+  # 새 값이고 미러는 그대로인 부분 갱신이 남는다. `|| rc=$?` 는 코드를 보존할 뿐
+  # 선행 쓰기를 되돌리지 않는다.
+  # 이 검사가 `task_read_status` 로 대체되지 않는 이유: `get_task_status` 는 task-state 가
+  # 있으면 그것만 읽으므로 미러의 `## Status` 부재를 보지 못한다.
+  if ! _task_section_exists "Status"; then
+    echo "set-status: CURRENT_TASK.md 에 '## Status' 섹션이 없어 중단합니다 (상태 변경 없음)." >&2
+    echo "  미러가 baseline 형식이 아닙니다. 확인: grep -n '^## ' '${project_root}/CURRENT_TASK.md'" >&2
+    return 3
+  fi
   # task-state 갱신 (권위) + CURRENT_TASK.md 뷰 미러링 (결정 3: LC-18 3-way 계약 유지)
   if state_file_exists; then
     state_write_fields "status=${to}" || return 3
@@ -147,6 +173,9 @@ task_guard_decide() {
       printf '## Short Title\n-\n\n' >> "$file"
     fi
     _task_section_write "Short Title" "$cand"
+    # promote 모드는 source-fr 도 권위에 썼으므로 미러도 함께 맞춘다 (change spec D12-3).
+    # 씨앗 값이 없으면 이후 모든 rerun 이 거짓 divergence 를 본다.
+    [[ "$mode" == "promote" ]] && _task_source_fr_mirror_write "$src_val"
     echo "decision=write"
     if [[ "$mode" == "promote" ]]; then
       echo "message=Short Title을 ${cand} 로 기록했습니다 (source-fr=${src_val})."
@@ -180,7 +209,13 @@ task_guard_decide() {
         state_write_fields "short-title=${cand}"
       fi
     fi
+    # write 경로와 같은 append 를 둔다 — 없으면 task-state 만 갱신되고 미러는 빠진
+    # partial state 가 남는다 (`_task_section_write` 가 섹션 부재를 실패로 바꿨으므로).
+    if ! grep -q '^## Short Title' "$file" 2>/dev/null; then
+      printf '## Short Title\n-\n\n' >> "$file"
+    fi
     _task_section_write "Short Title" "$cand"
+    [[ "$mode" == "promote" ]] && _task_source_fr_mirror_write "$src_val"
     echo "decision=rebind"
     if [[ "$mode" == "promote" ]]; then
       echo "message=이전 Short Title (${cur}) 이 Status = 대기 중 인 stale 값이라 ${cand} 로 교체하고 진행합니다 (source-fr=${src_val})."
@@ -287,8 +322,17 @@ task_archive_captures() {
 
 # 섹션 값 재기록 — 해당 섹션의 첫 비어있지 않은 줄만 교체, 나머지 byte 보존.
 # 섹션이 비어 있으면 다음 헤더 직전(또는 EOF)에 값 삽입.
+# **섹션 헤더 자체가 없으면 return 1.** 종전에는 입력을 그대로 복사하고 0 으로 끝나서,
+# 호출자가 "미러 갱신 성공" 을 받고도 미러는 계속 부재했다 (final diff review Finding 4).
+# 헤더를 임의 위치에 새로 만들지는 않는다 — 미러의 섹션 순서는 baseline 계약이고,
+# 없다는 것은 파일이 baseline 이 아니라는 신호이므로 사람이 볼 일이다.
 _task_section_write() {
   local file="${project_root}/CURRENT_TASK.md" section="$1" value="$2" tmp
+  if ! grep -q "^## ${section}\$" "$file" 2>/dev/null; then
+    echo "CURRENT_TASK.md 에 '## ${section}' 섹션이 없습니다 — 미러를 갱신할 수 없습니다." >&2
+    echo "  확인: grep -n '^## ' '$file'" >&2
+    return 1
+  fi
   tmp="$(mktemp)"
   awk -v target="## ${section}" -v val="$value" '
     $0 == target { print; in_s=1; replaced=0; next }
@@ -299,13 +343,84 @@ _task_section_write() {
   ' "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
-# task_set_source_fr <value> — 값 계약 검증 후 task-state source-fr 갱신.
+# _task_section_exists <section> — 미러에 섹션 헤더가 있는지. 쓰기 전 선검사용.
+# task-state 를 먼저 쓰고 미러 쓰기가 실패하면 partial state write 가 남으므로,
+# 값 계약 검증과 같은 단계에서 확인한다.
+_task_section_exists() {
+  grep -q "^## ${1}\$" "${project_root}/CURRENT_TASK.md" 2>/dev/null
+}
+
+# _task_source_fr_mirror_write <value> — 미러의 '## Source FR' 갱신. 섹션이 없으면 append.
+#
+# `Status`·`Short Title` 은 섹션 부재를 hard error 로 다루는데(미러가 깨졌다는 뜻) 여기는
+# append 한다. 이 섹션은 change spec D12 에서 신설됐으므로, 부재는 "깨졌다" 가 아니라
+# **"그 결정 이전에 만들어진 미러"** 라는 다른 사실이다. 같은 hard error 로 다루면
+# 진행 중인 기존 작업의 정상 흐름이 끊긴다 (D12-2).
+_task_source_fr_mirror_write() {
+  local v="${1-}" f="${project_root}/CURRENT_TASK.md"
+  [[ -f "$f" ]] || return 0
+  if _task_section_exists "Source FR"; then
+    _task_section_write "Source FR" "$v"
+    return
+  fi
+  printf '\n## Source FR\n%s\n' "$v" >> "$f" || {
+    echo "set-source-fr: CURRENT_TASK.md 에 '## Source FR' 섹션을 추가하지 못했습니다." >&2
+    return 1
+  }
+}
+
+# task_set_source_fr <value> — 값 계약 검증 후 task-state + 미러 source-fr 갱신.
 # 위반 return 1 (stderr 사유), 쓰기 실패 return 1. 검증 규칙: source_fr_validate (_state_common.sh).
+#
+# 미러를 함께 쓰는 이유는 표시 편의가 아니라 **대조 출처**다 (change spec D12).
+# `source-fr` 만 미러에 없어서, 권위 파일이 사라진 뒤 index 에서 되살리면 이 필드가
+# 승격 시점 값으로 돌아간 것을 아무도 판정할 수 없었다 — 실행은 성공하므로 유실이
+# 드러나지 않고 archive 가 다른 FR 을 done 처리한다. 미러가 있으면 promote 가 divergence
+# 를 보고 멈출 수 있다 (D12-4).
 task_set_source_fr() {
   local v="${1-}"
   if ! source_fr_validate "$v"; then
     echo "set-source-fr: 값 계약 위반 — '-' 또는 rd-workflow-workspace/backlog/items/<파일>.md 만 허용 (절대경로/../개행/slug 거부): '${v}'" >&2
     return 1
   fi
-  state_write_fields "source-fr=${v}"
+  state_write_fields "source-fr=${v}" || return 1
+  _task_source_fr_mirror_write "$v" || return 1
+}
+
+# task_set_title <slug> [force] — short-title 기록. sentinel '-' → 값 방향만 허용.
+# return 0 성공(멱등 포함) / 1 값 계약 위반 / 2 다른 값 존재(force 없음) / 3 쓰기 실패
+# 동일 값 재실행은 성공이지만 완전 no-op 이 아니다 — CURRENT_TASK.md 미러가 어긋나 있으면
+# 복구한다. prepare_review_pipeline.sh 처럼 미러를 직접 파싱하는 소비처가 틀린 값을
+# 계속 보는 것을 막기 위함이다 (change spec D3).
+task_set_title() {
+  local raw="${1-}" force="${2:-0}" slug cur
+  if [[ -z "$raw" || "$raw" == "-" ]]; then
+    echo "set-title: 빈 값과 '-' 는 허용되지 않습니다 (sentinel 은 archive 가 되돌립니다)." >&2
+    return 1
+  fi
+  case "$raw" in
+    *"
+"*) echo "set-title: 값에 개행을 포함할 수 없습니다." >&2; return 1 ;;
+  esac
+  slug="$(normalize_slug "$raw")" || return 1
+  cur="$(get_current_short_title)"
+  if [[ -n "$cur" && "$cur" != "-" && "$cur" != "$slug" && "$force" != "1" ]]; then
+    echo "set-title: 이미 다른 작업 이름이 있습니다 — 현재 값: '${cur}'" >&2
+    echo "  작업 이름은 시작 시 1회 정하고 archive 까지 유지합니다." >&2
+    echo "  정말 바꾸려면 --force 를 쓰세요 (복구 전용)." >&2
+    return 2
+  fi
+  # 미러 섹션 부재를 **task-state 쓰기 전에** 잡는다. 뒤에서 잡으면 권위는 갱신되고
+  # 미러만 안 된 partial state 가 남는다 (final diff review Finding 4).
+  if ! _task_section_exists "Short Title"; then
+    echo "set-title: CURRENT_TASK.md 에 '## Short Title' 섹션이 없어 중단합니다 (상태 변경 없음)." >&2
+    echo "  미러가 baseline 형식이 아닙니다. 확인: grep -n '^## ' '${project_root}/CURRENT_TASK.md'" >&2
+    return 3
+  fi
+  if state_file_exists; then
+    state_write_fields "short-title=${slug}" || return 3
+  fi
+  # 값이 같아도 미러는 맞춘다 (drift 복구)
+  _task_section_write "Short Title" "$slug" || return 3
+  return 0
 }

@@ -35,9 +35,7 @@ fi
 if [[ "$FORCE_DIRTY" -eq 0 ]]; then
   ensure_worktree_clean || { printf 'archive: worktree dirty — git status 확인 후 commit/stash 후 재실행\n' >&2; exit 1; }
 elif ! ensure_worktree_clean; then
-  # 문구를 "강제 진행" 으로만 쓰면 네 줄 아래 전수 검증 게이트의 중단(워킹트리≠HEAD)과
-  # 한 화면에서 모순돼 보입니다. 이 플래그의 실제 효과는 **이 clean 검사 하나**입니다.
-  printf 'archive: WARNING — dirty state 로 진행 (--force-dirty 는 이 clean 검사만 넘깁니다. 전수 검증 게이트는 워킹트리=HEAD 를 그대로 요구합니다)\n' >&2
+  printf 'archive: WARNING — dirty state 로 진행 (--force-dirty 는 이 clean 검사만 넘깁니다)\n' >&2
 fi
 
 # FR identity source-of-truth
@@ -100,35 +98,13 @@ if ! grep -qE '(^|/)(REQUEST\.md|CURRENT_TASK\.md|FUTURE_REQUESTS\.md|request-ar
   printf 'archive: WARNING — fr branch 마지막 commit 에 archive content 미감지\n' >&2
 fi
 
-# Step 2.5 — 증명 전제를 **merge 전에** 확인 (final diff review 2026-08-20 turn 004 Finding 1)
-#
-# Step 3.5 의 게이트도 같은 확인을 하지만, 거기서 실패하면 **main 은 이미 merge 된 뒤**입니다.
-# 그리고 그 실패 사유가 dirty 이면 아래 rollback 이 clean 을 요구하므로 발동하지 못해
-# merge 가 그대로 남습니다. 특히 `--force-dirty` 는 이 상태를 **정상 호출로 만들어** 줍니다.
-# 그 뒤 사용자가 안내대로 main 에서 commit 하고 재실행하면 fr 이 이미 조상이라 merge 가
-# skip 되고, **예전 fr tip 리뷰만으로 그 main commit 이 발행**됩니다.
-#
-# 여기서 먼저 막으면 main 이 아예 움직이지 않아 그 경로가 생기지 않습니다. 어차피 Step 3.5
-# 에서 같은 사유로 막힐 것이므로 **차단 결과는 같고 부작용만 없앱니다** — `--force-dirty` 가
-# 전수 검증 게이트를 넘지 못한다는 것은 이미 문서화된 계약입니다.
-archive_selftest_preconditions "$CURRENT_WT" || {
-  printf 'archive: merge 전에 중단했습니다 — main 은 움직이지 않았습니다\n' >&2
-  exit 1
-}
-
 # Step 3 — merge (idempotent)
-#
-# **이 지점의 HEAD 를 기억해 둡니다** — Step 3.5 의 전수 검증이 실패하면 여기로 되돌립니다.
-# 이유는 아래 rollback 블록 주석에 있습니다.
-PRE_MERGE_HEAD="$(git rev-parse HEAD 2>/dev/null || true)"
-MERGE_CREATED_HERE=0
 if git merge-base --is-ancestor "$FR_BRANCH" HEAD 2>/dev/null; then
   printf 'archive: %s 이미 merge 됨 — skip\n' "$FR_BRANCH"
 else
   git merge --no-ff "$FR_BRANCH" -m "merge: $SLUG (autopilot 완료)" || {
     printf 'archive: merge 실패 — conflict resolve 후 재실행\n' >&2; exit 1
   }
-  MERGE_CREATED_HERE=1
 fi
 
 # 순서 불변식: 판정 base 는 반드시 merge 완료 "이후" 에 캡처한다.
@@ -141,91 +117,41 @@ MERGE_BASE_COMMIT="$(git rev-parse HEAD)" || {
   exit "$_mb_rc"
 }
 
-# Step 3.5 — 전수 검증(self_test full) 통과 강제 (change spec §5.5)
+# Step 3.6 — 기준선 이후 얹힌 커밋 검사 (빠른 실패)
 #
-# 위치가 계약의 일부입니다. 이 게이트는 "지금 워킹트리 내용" 의 지문을 증명과 대조하므로:
-#   - merge **뒤**여야 합니다. 머지 전 기본 브랜치 워킹트리에는 fr 내용이 없어 증명이
-#     구조적으로 항상 불일치하고, 게이트가 매번 무의미한 전수 검증을 강요합니다.
-#   - Step 4 **앞**이어야 합니다. Step 4 는 CURRENT_TASK.md 와 task-state 를 baseline 으로
-#     덮어쓰는데 둘 다 tracked = 증명 대상이라, 뒤에 두면 지문이 다시 구조적으로
-#     불일치합니다.
-#   - tag·push **앞**이어야 합니다. 게이트 뒤에 오는 변경이 적을수록 발행물과 검증
-#     대상이 가까워집니다.
-# 이 세 조건을 동시에 만족하는 구간은 여기뿐입니다 (lifecycle 테스트가 이 순서를
-# 단언합니다).
+# 재실행 경로의 구멍을 막는다: merge 직후 중단된 뒤 기본 브랜치를 직접 고쳐 재실행하면 review 종결성 검사가 예전 fr tip
+# 세션만 보고 통과해(_guard_common.sh 의 fr_ref 조회) 리뷰되지 않은 커밋이 발행된다.
 #
-# **게이트 이후 변경은 Step 4 의 metadata baseline 복원 2파일(CURRENT_TASK.md·task-state)
-# 뿐입니다.** 둘 다 증명 집합에 속하므로 tag 가 가리키는 트리는 전수 검증이 본 트리와
-# 정확히 같지는 않습니다 — "미검증 내용이 전혀 발행되지 않는다" 고 읽지 마십시오.
-# 배치 제약상 불가피하고 delta 가 결정적인 baseline 복원으로 한정되어 실질 위험은
-# 낮습니다. 이 두 파일 밖의 변경을 게이트 뒤로 옮기면 그 순간 이 서술이 거짓이 됩니다.
-#
-# 우회 밸브를 두지 않습니다. 커밋 전 게이트에는 사용자 승인 우회가 있고 이 저장소는
-# 인프라 커밋이 대부분이라 상시 우회됩니다 — 통합 직전인 이 지점이 축소 실행(smoke)이
-# 놓친 것을 반드시 잡는 유일한 지점입니다. 판정·실행·재대조는 전부 헬퍼가 하고 여기서는
-# 호출만 합니다 (그래야 실행 여부와 rc 반영을 격리 fixture 로 회귀 고정할 수 있습니다).
-if ! archive_selftest_gate "$CURRENT_WT"; then
-  # **실패하면 이 실행이 만든 merge 를 되돌립니다.**
-  #
-  # 되돌리지 않으면 이런 경로가 생깁니다 (final diff review 2026-08-20 Finding 2):
-  #   merge 성공 → 전수 검증 실패 → 사용자가 **지금 보고 있는 main 워킹트리**에서 고쳐 커밋
-  #   → 재실행 → review precheck 는 여전히 **예전 fr tip** 만 보고 통과하고, fr 이 이미
-  #   조상이라 merge 는 skip → 리뷰된 적 없는 main 커밋이 tag·push 됩니다.
-  # 공격적 우회가 아니라 **정상적인 복구 행동**에서 발생합니다. 실패 안내가 수정 위치를
-  # 제한하지 않고, 이 브랜치에서 main 직접 커밋을 막던 fr_branch_gate 도 제거됐기 때문입니다.
-  #
-  # main 을 merge 이전으로 되돌리면 고칠 곳이 fr branch 밖에 남지 않아 경로가 끊깁니다.
-  # 잃는 것은 없습니다 — fr branch 가 내용을 그대로 들고 있고, 재실행하면 다시 merge 합니다.
-  #
-  # **완전한 처방은 아닙니다.** 사용자가 전수 검증 도중 중단하면 여기에 닿지 못해 merge 가
-  # 남습니다. 그 구간까지 닫으려면 archive 시작 시점의 main 을 lifecycle 상태로 남기고
-  # 재실행 때 대조해야 하며, 새 상태 파일과 계약이 필요해 FR
-  # `archive-retry-unreviewed-main-commit` 로 분리했습니다.
-  #
-  # 되돌리기는 **이 실행이 만든 merge 가 HEAD 그대로일 때만** 합니다. 그 뒤에 무엇이든
-  # 얹혔거나 워킹트리가 더러우면 사람의 것을 지울 수 있으므로 손대지 않고 알리기만 합니다.
-  #
-  # clean 판정은 **증명과 같은 제외 규칙**을 써야 합니다. raw `git status --porcelain` 은
-  # `.lifecycle/*.log` 같은 일시 산출물까지 더럽다고 보는데, 그것들은 증명 대상이 아니라
-  # 아카이브가 스스로 만드는 파일입니다. 더 엄격하게 잡으면 **정당한 되돌리기가 스스로
-  # 막혀** 되돌림이 죽은 코드가 됩니다 (통합 테스트가 실제로 이 상태를 잡았습니다 —
-  # `--force-skip-review-check` 가 쓰는 audit log 하나 때문에 발동하지 않았습니다).
-  # 헬퍼를 못 읽으면 raw 판정으로 내려갑니다 — 그쪽이 더 엄격해 되돌리지 않을 뿐이라 안전합니다.
-  _rb_specs=(".") _rb_sp=""
-  # 게이트는 헬퍼를 서브셸에서 읽으므로 이 스코프에는 남지 않습니다. 여기서 한 번 더 읽습니다
-  # (quiet — 실패해도 아래 raw 판정으로 내려가면 되고, 사유는 게이트가 이미 냈습니다).
-  if ! declare -F smoke_proof_exclude >/dev/null 2>&1; then
-    _archive_selftest_helper_load "$CURRENT_WT" quiet || true
-  fi
-  if declare -F smoke_proof_exclude >/dev/null 2>&1; then
-    while IFS= read -r _rb_sp; do [[ -n "$_rb_sp" ]] && _rb_specs+=("$_rb_sp"); done < <(smoke_proof_exclude)
-  fi
-  # **`git -C "$CURRENT_WT"` 가 필수입니다.** `.` pathspec 은 **호출 위치 기준**이라, 저장소
-  # 하위 디렉터리에서 archive 를 부르면(Step 0 은 main worktree 안이기만 하면 통과하므로
-  # 지원되는 형태입니다) 그 prefix 밖의 변경이 판정에서 통째로 빠집니다. clean 으로 오판하면
-  # 바로 아래 `git reset --hard` 가 **저장소 전체를 되돌려 사용자 변경을 지웁니다** —
-  # "사람의 것을 지우지 않는다" 는 이 가드의 존재 이유가 정확히 뒤집힙니다.
-  # (실측: 같은 시점에 하위 디렉터리 `status -- .` 은 0건, 저장소 루트는 5건이었습니다.)
-  _rb_dirty="$(git -C "$CURRENT_WT" status --porcelain -- ${_rb_specs[@]+"${_rb_specs[@]}"} 2>/dev/null || echo dirty)"
-  if [[ "$MERGE_CREATED_HERE" -eq 1 && -n "$PRE_MERGE_HEAD" ]] \
-     && [[ "$(git rev-parse HEAD 2>/dev/null || true)" == "$MERGE_BASE_COMMIT" ]] \
-     && [[ -z "$_rb_dirty" ]]; then
-    if git reset --hard "$PRE_MERGE_HEAD" >/dev/null 2>&1; then
-      printf 'archive: 전수 검증이 실패해 이 실행이 만든 merge 를 되돌렸습니다 (main = %s)\n' \
-        "$(git rev-parse --short "$PRE_MERGE_HEAD")" >&2
-      printf 'archive:   원인은 **%s 브랜치에서** 고치고 diff review 를 거친 뒤 다시 실행하십시오\n' \
-        "$FR_BRANCH" >&2
-      printf 'archive:   main 에서 직접 고치면 그 수정은 리뷰를 거치지 않은 채 발행됩니다\n' >&2
-    else
-      printf 'archive: 전수 검증 실패 후 merge 되돌리기에 실패했습니다 — main 이 merge 된 상태로 남았습니다\n' >&2
-      printf 'archive:   **main 에서 직접 고치지 마십시오.** %s 브랜치에서 고쳐야 리뷰를 거칩니다\n' "$FR_BRANCH" >&2
-    fi
-  else
-    printf 'archive: merge 는 이 실행이 만들지 않았거나 이후 변경이 있어 그대로 둡니다\n' >&2
-    printf 'archive:   **main 에서 직접 고치지 마십시오.** %s 브랜치에서 고쳐야 리뷰를 거칩니다\n' "$FR_BRANCH" >&2
-  fi
+# **이 판정은 근사다.** 커밋의 출처를 구분하지 못하므로 최종 판단은 Step 4.5 의 내용
+# 검증이 내린다. 여기 두는 이유는 빠른 실패다.
+BASELINE_OID=""
+_bl_rc=0
+BASELINE_OID="$(archive_baseline_commit "$CURRENT_WT" "$FR_BRANCH" "$MERGE_BASE_COMMIT")" || _bl_rc=$?
+if [[ "$_bl_rc" -eq 2 ]]; then
+  printf 'archive: 기준선 판정에 필요한 git 명령이 실패했습니다 — 무엇이 얹혔는지 알 수 없어 중단합니다\n' >&2
+  archive_block_notice "$FR_BRANCH" "$CURRENT_WT" unknown
+  exit 1
+elif [[ "$_bl_rc" -ne 0 ]]; then
+  printf 'archive: %s 를 부모로 갖는 merge 를 찾지 못했고, first-parent 이력에도 없습니다\n' "$FR_BRANCH" >&2
+  printf 'archive:   기대하지 않은 커밋 그래프라 무엇이 발행될지 판정할 수 없습니다 — 중단합니다\n' >&2
+  archive_block_notice "$FR_BRANCH" "$CURRENT_WT" unknown
   exit 1
 fi
+
+_ec_rc=0
+archive_extra_commits_check "$CURRENT_WT" "$BASELINE_OID" "$MERGE_BASE_COMMIT" || _ec_rc=$?
+if [[ "$_ec_rc" -eq 2 ]]; then
+  printf 'archive: 얹힌 커밋 판정에 필요한 git 명령이 실패했습니다 — 중단합니다\n' >&2
+  archive_block_notice "$FR_BRANCH" "$CURRENT_WT" unknown
+  exit 1
+elif [[ "$_ec_rc" -ne 0 ]]; then
+  archive_block_notice "$FR_BRANCH" "$CURRENT_WT"
+  exit 1
+fi
+
+# Step 3.5 (제거, 2026-09-03) — 이 자리에서 self_test consumer 전수를 강제하고 증명을 대조하던
+# 게이트를 걷어냈다. 검증은 구현 직후 사람이 self_test.sh (그룹 지정) 로 돌리고 final diff review 가
+# 그 결과를 확인한다. 아카이브가 같은 검증을 다시 돌려 얻는 것은 없었고 매번 15~20분을 썼다.
 
 # Step 4 — metadata cleanup commit on main (publish 전)
 if metadata_exists; then
@@ -264,14 +190,37 @@ if metadata_exists; then
   metadata_clear
   state_write_fields "short-title=-" "status=대기 중"
 
-  # 이 커밋에 포함할 경로 — 판정과 커밋 양쪽에 같은 목록을 쓴다
-  _lc_paths=( "$TASK_STATE_PATH" "$_ct_path" )
-  # staging 은 두 파일 모두 성공해야 한다. CURRENT_TASK.md staging 이 실패해도 task-state
-  # 변경 때문에 아래 git diff --cached --quiet 가 non-quiet 이 되어 커밋이 진행되고,
-  # 미러가 빠진 채 tag·push 로 이어진다.
-  # v2 2b: LIFECYCLE_METADATA_PATH 폐지 → TASK_STATE_PATH 사용
-  if ! git add "$TASK_STATE_PATH" "$_ct_path"; then
-    printf 'archive: task-state·CURRENT_TASK.md staging 실패 — 중단\n' >&2
+  # 이 커밋에 포함할 경로 — staging·판정·커밋이 **모두** 이 목록에서 나온다.
+  # 단일 출처는 lifecycle_metadata_paths() 이고 얹힌 커밋 검사·발행 내용 검증도 같은
+  # 함수를 소비한다. 여기서 직접 나열하면 두 벌이 되어 조용히 갈라진다.
+  #
+  # legacy active-fr 은 **tracked 일 때만** 포함한다 — 삭제분 staging 이 목적이라
+  # 존재 여부가 조건인 유일한 항목이다. 목록에서 빼지 않고 여기서 걸러야
+  # "목록에 있는 경로는 전부 다뤄진다" 는 계약이 유지된다.
+  #
+  # **목록을 먼저 캡처하고 helper 의 rc 를 따로 본다.** heredoc 안 명령 치환은 그 함수의
+  # 종료 코드를 소거하므로 "일부 출력 후 실패" 가 정상 목록으로 취급된다 — 축소된 목록으로
+  # staging·커밋을 진행하면 남은 경로가 조용히 빠진다 (final diff review Turn 002 F3).
+  _lc_paths_out="$(lifecycle_metadata_paths)" && _lc_paths_rc=0 || _lc_paths_rc=$?
+  if [[ "$_lc_paths_rc" -ne 0 ]]; then
+    printf 'archive: 허용 경로 목록 생성 실패 (lifecycle_metadata_paths rc %s) — 중단\n' "$_lc_paths_rc" >&2
+    exit 1
+  fi
+  _lc_paths=()
+  while IFS= read -r _lc_rel; do
+    [[ -n "$_lc_rel" ]] || continue
+    case "$_lc_rel" in
+      */active-fr)
+        git ls-files --error-unmatch "$CURRENT_WT/$_lc_rel" >/dev/null 2>&1 || continue
+        ;;
+    esac
+    _lc_paths+=( "$CURRENT_WT/$_lc_rel" )
+  done <<EOF
+$_lc_paths_out
+EOF
+  # staging 대상도 _lc_paths 다 — 목록에 항목이 늘면 staging 도 함께 늘어야 한다.
+  if ! git add "${_lc_paths[@]}"; then
+    printf 'archive: lifecycle metadata staging 실패 — 중단\n' >&2
     exit 1
   fi
   # index 에 올라간 CURRENT_TASK.md 의 "내용" 이 방금 만든 baseline 과 같은지 확인한다.
@@ -283,19 +232,6 @@ if metadata_exists; then
   if ! git show ":CURRENT_TASK.md" 2>/dev/null | diff -q - "$_ct_path" >/dev/null 2>&1; then
     printf 'archive: index 의 CURRENT_TASK.md 가 baseline 과 불일치 — 중단\n' >&2
     exit 1
-  fi
-  # legacy active-fr 잔재가 tracked 파일로 존재하면 삭제분도 staged (metadata_clear가 rm -f 처리)
-  _legacy_afr_path="$CURRENT_WT/rd-workflow-workspace/.lifecycle/active-fr"
-  # "선택" 은 경로의 존재 여부에만 적용된다. tracked 임이 확인된 경로는 metadata_clear 가
-  # 이미 삭제한 cleanup 대상이므로, 그 add 실패는 선택 사항이 아니라 중단 사유다.
-  # 경고 후 진행하면 archive 가 tag·push 까지 성공한 것처럼 보이면서 워킹트리에 삭제가
-  # 남고 metadata 커밋이 불완전해진다 (rollback 필수 경로·기존 archive 선례와 같은 원칙).
-  if git ls-files --error-unmatch "$_legacy_afr_path" >/dev/null 2>&1; then
-    if ! git add "$_legacy_afr_path"; then
-      printf 'archive: legacy active-fr staging 실패 — 중단\n' >&2
-      exit 1
-    fi
-    _lc_paths+=( "$_legacy_afr_path" )
   fi
   # 판정을 경로로 좁힌다 — index 전체를 보면 사용자의 무관한 staged 변경만으로도
   # 커밋이 진행되어 lifecycle 커밋에 제품 코드가 담긴다
@@ -312,8 +248,49 @@ if metadata_exists; then
   fi
 fi
 
+# Step 4.5 — 발행 후보 확정과 내용 검증
+#
+# **여기서 캡처한 OID 가 발행 대상이다.** 이후 tag 와 push 는 HEAD 나 브랜치 tip 을
+# 다시 해석하지 않고 이 값을 소비한다. "다시 검사" 가 아니라 **"검사한 객체를 발행"**
+# 이어야 검사와 발행 사이의 경쟁 창이 닫힌다 (REQUEST review Turn 004 Finding 2).
+PUBLISH_OID="$(git rev-parse HEAD)" || {
+  printf 'archive: 발행 후보 commit 결정 실패 — 중단\n' >&2
+  archive_block_notice "$FR_BRANCH" "$CURRENT_WT" unknown
+  exit 1
+}
+
+# 경로 판정을 발행 후보 기준으로 다시 한 번. merge 이후 기본 브랜치가
+# 전진했을 수 있고, Step 4 의 metadata 커밋도 이 시점에는 얹힌 커밋에 포함된다
+# (허용 경로만 담으므로 자연히 통과한다).
+_ec2_rc=0
+archive_extra_commits_check "$CURRENT_WT" "$BASELINE_OID" "$PUBLISH_OID" || _ec2_rc=$?
+if [[ "$_ec2_rc" -eq 2 ]]; then
+  printf 'archive: 발행 전 얹힌 커밋 판정에 필요한 git 명령이 실패했습니다 — 중단합니다\n' >&2
+  archive_block_notice "$FR_BRANCH" "$CURRENT_WT" unknown
+  exit 1
+elif [[ "$_ec2_rc" -ne 0 ]]; then
+  archive_block_notice "$FR_BRANCH" "$CURRENT_WT"
+  exit 1
+fi
+
+# 최종 판단 — 허용 경로 파일의 **내용**이 실제로 baseline 인가.
+# 경로 판정만으로는 사람이 만든 metadata-only 커밋의 내용이 남는 것을 막지 못한다.
+_pc_rc=0
+archive_publish_content_check "$CURRENT_WT" "$BASELINE_OID" "$PUBLISH_OID" || _pc_rc=$?
+if [[ "$_pc_rc" -eq 2 ]]; then
+  # rc 2 는 git 실행 오류와 **허용 경로 목록 생성 실패**를 함께 담는다 — 둘 다 "검사
+  # 자체가 불가능" 이며, 파일 내용을 되돌려서 해결되는 상태가 아니다. 그래서 사유를
+  # git 오류로 단정하지 않는다 (final diff review Turn 004 F6).
+  printf 'archive: 발행 내용을 판정할 수 없습니다 (git 실행 오류 또는 허용 경로 목록 생성 실패) — 중단합니다\n' >&2
+  archive_block_notice "$FR_BRANCH" "$CURRENT_WT" unknown
+  exit 1
+elif [[ "$_pc_rc" -ne 0 ]]; then
+  archive_block_notice "$FR_BRANCH" "$CURRENT_WT" content
+  exit 1
+fi
+
 # Step 5 — Tag (HEAD = cleanup commit, rerun reuse)
-TARGET_TAG="$(git tag --list "fr/*/$SLUG" --points-at HEAD 2>/dev/null | head -1)"
+TARGET_TAG="$(git tag --list "fr/*/$SLUG" --points-at "$PUBLISH_OID" 2>/dev/null | head -1)"
 if [[ -z "$TARGET_TAG" ]]; then
   TS="$(date +%Y-%m-%d-%H%M)"
   TARGET_TAG="$(resolve_unique_ref tag "fr/$TS/$SLUG")" || {
@@ -323,22 +300,129 @@ fi
 
 if git rev-parse --verify "refs/tags/$TARGET_TAG" >/dev/null 2>&1; then
   EXISTING="$(git rev-parse "refs/tags/$TARGET_TAG^{commit}")"
-  HEAD_REV="$(git rev-parse HEAD)"
+  HEAD_REV="$PUBLISH_OID"
   [[ "$EXISTING" == "$HEAD_REV" ]] || {
     printf 'archive: tag %s 충돌 (다른 commit) — 수동 해결 후 재실행: git tag -d %s\n' "$TARGET_TAG" "$TARGET_TAG" >&2
     exit 1
   }
   printf 'archive: tag %s 이미 존재 (HEAD 가리킴) — skip\n' "$TARGET_TAG"
 else
-  git tag "$TARGET_TAG" -m "archive: $SLUG @ $(date +"%Y-%m-%d %H:%M")"
+  git tag "$TARGET_TAG" "$PUBLISH_OID" -m "archive: $SLUG @ $(date +"%Y-%m-%d %H:%M")"
   printf 'archive: tag %s 부착 (cleanup commit 가리킴)\n' "$TARGET_TAG"
 fi
 
+# 생성·재사용 **직후** tag object OID 를 고정하고, 그 객체가 실제로 $PUBLISH_OID 를
+# 가리키는지 다시 확인한다. 이후 tag 발행은 이 불변 OID 만 소비한다.
+#
+# **ref 이름(`git push origin "$TARGET_TAG"`)으로 발행하면 안 된다.** 그 형태는 push
+# 실행 시점의 로컬 tag ref 를 다시 해석하므로, 위 검증 이후 다른 프로세스가 tag 를
+# force-move 하면 기본 브랜치는 $PUBLISH_OID 로 안전하게 나가도 **원격 tag 만 미검증
+# 커밋을 가리킨다.** 기본 브랜치 push 와 같은 이유(검사한 객체를 발행)이며, tag 쪽에도
+# 같은 결속이 있어야 check→publish 경쟁 창이 닫힌다 (final diff review Turn 002 F1).
+TAG_OID="$(git rev-parse --verify --quiet "refs/tags/$TARGET_TAG")" || {
+  printf 'archive: tag %s 의 OID 를 읽지 못했습니다 — 수동 해결 후 재실행: git tag -d %s\n' "$TARGET_TAG" "$TARGET_TAG" >&2
+  exit 1
+}
+TAG_COMMIT="$(git rev-parse --verify --quiet "${TAG_OID}^{commit}")" || {
+  printf 'archive: tag %s 가 커밋을 가리키지 않습니다 — 수동 해결 후 재실행: git tag -d %s\n' "$TARGET_TAG" "$TARGET_TAG" >&2
+  exit 1
+}
+[[ "$TAG_COMMIT" == "$PUBLISH_OID" ]] || {
+  printf 'archive: tag %s 가 발행 대상이 아닌 커밋을 가리킵니다 (%s != %s) — 수동 해결 후 재실행: git tag -d %s\n' \
+    "$TARGET_TAG" "${TAG_COMMIT:0:8}" "${PUBLISH_OID:0:8}" "$TARGET_TAG" >&2
+  exit 1
+}
+
 # Step 6 — Remote publish (blocking)
+#
+# **검증된 OID 를 명시적으로 push 한다.** `git push origin <branch>` 는 실행 시점의
+# 로컬 tip 을 해석하므로, 검사 이후 전진한 미검증 커밋이 함께 나간다.
+# `${PUBLISH_OID}` 의 중괄호는 refspec 문자열에서 변수 경계를 명확히 하기 위한 것이다.
 if [[ "$REMOTE_MODE" == "remote" ]]; then
   DEFAULT_BRANCH="$(get_default_branch)" || { printf 'archive: 기본 브랜치 결정 실패 — push 중단\n' >&2; exit 1; }
-  git push origin "$DEFAULT_BRANCH" || { printf 'archive: %s push 실패 — 재실행으로 복구\n' "$DEFAULT_BRANCH" >&2; exit 1; }
-  git push origin "$TARGET_TAG" || { printf 'archive: tag push 실패 — 재실행으로 복구\n' >&2; exit 1; }
+
+  # push 실패는 **git 의 원래 진단을 보존**한다. "재실행으로 복구" 만 내면 원격이 앞선
+  # 경우 재실행이 같은 실패를 반복하고, 사용자를 force push 라는 잘못된 처방으로 민다
+  # (FR publish-clone-failure-init-fallback 이 같은 유형을 기록했다).
+  _push_out=""
+  if ! _push_out="$(git push origin "${PUBLISH_OID}:refs/heads/${DEFAULT_BRANCH}" 2>&1)"; then
+    printf 'archive: %s push 실패\n' "$DEFAULT_BRANCH" >&2
+    printf '%s\n' "$_push_out" | sed 's/^/archive:   git: /' >&2
+    case "$_push_out" in
+      *"non-fast-forward"*|*"fetch first"*)
+        printf 'archive:   원격이 이 저장소보다 앞서 있습니다. 재실행만으로는 해결되지 않습니다\n' >&2
+        printf 'archive:   **force push 를 쓰지 마십시오** — 원격 이력이 사라집니다\n' >&2
+        printf 'archive:   (cd %s && git fetch origin && git log --oneline %s..origin/%s) 로 원격 쪽 커밋을 먼저 확인하십시오\n' \
+          "$CURRENT_WT" "$DEFAULT_BRANCH" "$DEFAULT_BRANCH" >&2
+        ;;
+      *)
+        # 원인을 단정하지 않는다. non-fast-forward 계열이 아닌 거부는 네트워크·권한 실패일
+        # 수도, 서버측 거부(pre-receive hook·보호 브랜치 규칙)일 수도 있다 — 위 git 원문
+        # 진단이 실제 원인을 담고 있으므로 그쪽을 보라고 가리키기만 한다.
+        printf 'archive:   위에 출력된 git 진단을 확인하십시오 — 네트워크·권한 문제이거나, 서버측 거부(pre-receive hook·보호 브랜치 규칙)일 수 있습니다\n' >&2
+        printf 'archive:   원인을 특정할 수 없어 단정하지 않습니다. 원인 해소 후 재실행하십시오\n' >&2
+        ;;
+    esac
+    exit 1
+  fi
+  # 캡처한 tag object OID 를 명시한 refspec 으로 발행한다 — ref 이름을 주면 push 시점의
+  # 로컬 tag 를 다시 해석해 그 사이 force-move 된 미검증 커밋이 원격 tag 로 나간다
+  # (위 TAG_OID 주석 참조). `${TAG_OID}` 의 중괄호는 refspec 문자열에서 변수 경계를
+  # 명확히 하기 위한 것이다.
+  git push origin "${TAG_OID}:refs/tags/${TARGET_TAG}" \
+    || { printf 'archive: tag push 실패 — 재실행으로 복구\n' >&2; exit 1; }
+
+  # tag push **직후** 로컬 tag ref 를 다시 읽어 캡처한 OID 와 비교한다.
+  #
+  # 원격은 검증된 $TAG_OID 로 나갔으므로 발행 무결성은 지켜졌다. 그러나 그 사이 로컬
+  # refs/tags/$TARGET_TAG 가 force-move 되면 같은 이름의 로컬 tag 와 원격 tag 가 서로
+  # 다른 커밋을 가리킨 채 실행이 완료·정리되고, 다음 재실행은 fr branch 가 사라진
+  # 상태에서 slug tag 의 존재만 보고 Step 0 의 "이미 archive 완료" 를 출력한다.
+  #
+  # **여기서 차단하지 않는다.** 원격 발행이 이미 정상 완료된 지점이라, 실패시키면
+  # 아카이브가 반쯤 끝난 상태(원격은 나갔고 로컬 정리는 안 된 상태)로 남아 더 나쁘다.
+  # 그래서 막지 않고 두 OID 와 로컬을 맞추는 명령을 명시적으로 보여 준다
+  # (final diff review Turn 004 F5).
+  #
+  # 로컬 tag 를 **읽지 못하는 경우**(ref 삭제 등)도 같은 경고 경로로 보낸다 — 조용히
+  # 넘기면 사용자는 로컬에 검증된 tag 가 남아 있다고 오해한다.
+  _local_tag_commit="$(git rev-parse --verify --quiet "refs/tags/${TARGET_TAG}^{commit}")" || _local_tag_commit=""
+  if [[ "$_local_tag_commit" != "$TAG_COMMIT" ]]; then
+    printf 'archive: 로컬 tag %s 가 검증 시점 이후 이동했습니다 (원격 발행은 이미 완료됐습니다)\n' "$TARGET_TAG" >&2
+    printf 'archive:   검증·발행된 커밋: %s\n' "$TAG_COMMIT" >&2
+    printf 'archive:   현재 로컬 tag 커밋: %s\n' \
+      "${_local_tag_commit:-읽지 못했습니다 (ref 삭제 또는 커밋이 아님)}" >&2
+    printf 'archive:   원격 tag 는 위 검증된 커밋으로 발행됐습니다 — 원격은 안전합니다\n' >&2
+    printf 'archive:   로컬을 맞추려면: git tag -f %s %s\n' "$TARGET_TAG" "$TAG_COMMIT" >&2
+    printf 'archive:   맞추지 않으면 다음 재실행이 이 로컬 tag 만 보고 "이미 archive 완료" 로 오판할 수 있습니다\n' >&2
+  fi
+fi
+
+# 로컬 tip 이 발행 대상과 다르면 알린다 (차단하지 않는다).
+#
+# OID 결속으로 미검증 발행은 이미 막혔다. 여기서 실패까지 시키면 다른 세션의 정당한
+# 병행 커밋이 archive 를 실패시킨다. 다만 조용히 넘기면 사용자는 자기 커밋이 발행된
+# 줄 안다 — 무엇이 빠졌는지 보여준다.
+#
+# **"앞서 있다" 를 단정하지 않는다.** 분기·후퇴·detached 상태에서는 그 말이 거짓이고
+# 제외 커밋 목록도 틀린다. 조상 관계를 확인해 ahead 와 diverged 를 구분한다.
+_local_tip="$(git rev-parse HEAD 2>/dev/null || true)"
+if [[ -n "$_local_tip" && "$_local_tip" != "$PUBLISH_OID" ]]; then
+  if git merge-base --is-ancestor "$PUBLISH_OID" "$_local_tip" 2>/dev/null; then
+    printf 'archive: 로컬 기본 브랜치가 발행 대상보다 앞서 있습니다 (ahead)\n' >&2
+    printf 'archive:   발행: %s / 로컬: %s\n' \
+      "$(git rev-parse --short "$PUBLISH_OID")" "$(git rev-parse --short "$_local_tip")" >&2
+    printf 'archive:   아래 커밋은 검증을 거치지 않아 발행에서 제외했습니다 —\n' >&2
+    git log --oneline --first-parent "${PUBLISH_OID}..${_local_tip}" 2>/dev/null | sed 's/^/archive:     /' >&2
+    printf 'archive:   발행하려면 diff review 를 거친 뒤 archive 를 다시 실행하십시오\n' >&2
+  else
+    printf 'archive: 로컬 tip 이 발행 대상의 자손이 아닙니다 (diverged 또는 detached)\n' >&2
+    printf 'archive:   발행: %s / 로컬: %s\n' \
+      "$(git rev-parse --short "$PUBLISH_OID")" "$(git rev-parse --short "$_local_tip")" >&2
+    printf 'archive:   두 지점이 갈라져 있어 제외된 커밋을 단정할 수 없습니다\n' >&2
+    printf 'archive:   (cd %s && git log --oneline --graph %s %s) 로 관계를 확인하십시오\n' \
+      "$CURRENT_WT" "$(git rev-parse --short "$PUBLISH_OID")" "$(git rev-parse --short "$_local_tip")" >&2
+  fi
 fi
 
 # ---------------------------------------------------------------------------

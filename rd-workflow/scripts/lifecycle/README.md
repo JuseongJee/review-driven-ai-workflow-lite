@@ -42,13 +42,19 @@ REQUEST 승격 시 호출. fr branch 생성 + checkout(또는 worktree) + task-s
 ```bash
 bash rd-workflow/scripts/lifecycle/promote.sh \
   [--short-title <slug>] \
+  (--size large|small | --status <canonical>) \
   [--worktree-path <path>] \
   [--no-worktree] \
-  [--status <text>] \
+  [--source-fr <path|->] \
   [--dry-run]
 ```
 
 **호출 시점:** FR 등록 기본 브랜치 commit **직후**. 호출 위치는 기본 브랜치 worktree.
+
+**시작 상태:** `--size` 로 지정하며 기본값은 없다.
+- 큰 작업 → `--size large` (`대기 중`). 다음 단계 `REQUEST review 대기` 로 `--force` 없이 전이한다.
+- 작은 작업 → `--size small` (`구현 중`).
+- `--status <canonical>` 은 복구·마이그레이션 전용이며 `--size` 와 함께 쓸 수 없다.
 
 ### `archive.sh`
 

@@ -123,6 +123,17 @@ source_fr_validate() {
   return 0
 }
 
+# source_fr_request_missing [request_file] — REQUEST 파일 부재 여부.
+# return 0: 파일이 없다 / 1: 있다.
+# 파일 부재와 '파일 안의 값이 -' 는 다른 신호다 — 후자는 사용자의 명시적 "FR 없음"이고,
+# 전자는 정상 흐름에서 발생하지 않는다(_ROOT_FILES/REQUEST.md 가 배포에 포함되고
+# archive 가 초기 템플릿으로 되돌린다). change spec D8.
+source_fr_request_missing() {
+  local f="${1:-${project_root:-$PWD}/REQUEST.md}"
+  [[ -f "$f" ]] && return 1
+  return 0
+}
+
 # source_fr_from_request [request_file] — REQUEST.md '## Source FR' 첫 유효행 출력
 #   백틱·양끝 공백 제거. HTML 주석 행(<!-- ... -->)은 건너뛴다 — 템플릿이 형식 예시를
 #   주석으로 담기 때문이다. 파일/섹션 부재·값 '-'·빈 값이면 빈 출력.

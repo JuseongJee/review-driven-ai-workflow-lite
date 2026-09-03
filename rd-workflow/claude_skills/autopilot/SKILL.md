@@ -16,11 +16,11 @@ digraph autopilot {
 
     select [label="1. FUTURE_REQUESTS 목록 제시\n사용자가 선택"];
     mode [label="2. 실행 모드 선택\n(autopilot 추천 + 사용자 결정)" shape=diamond];
-    request [label="3. REQUEST.md 생성"];
-    request_review [label="4. REQUEST review (Reviewer)"];
-    design [label="5. brainstorming → spec → plan"];
-    spec_review [label="6. spec/plan review (Reviewer)"];
-    branch [label="7. fr 브랜치 승격 (promote.sh)"];
+    branch [label="3. fr 브랜치 승격 (promote.sh --size)"];
+    request [label="4. REQUEST.md 생성"];
+    request_review [label="5. REQUEST review (Reviewer)"];
+    design [label="6. brainstorming → spec → plan"];
+    spec_review [label="7. spec/plan review (Reviewer)"];
     implement [label="8. 구현 (TDD + auto-debug)"];
     verify [label="9. 검증 (test/lint/typecheck/build)"];
     diff_review [label="10. final diff review (Reviewer)"];
@@ -28,11 +28,11 @@ digraph autopilot {
     archive [label="12. REQUEST 아카이브"];
     report [label="13. 최종 보고"];
 
-    select -> mode -> request;
+    select -> mode -> branch -> request;
     request -> request_review [label="모드 A"];
-    request_review -> design -> spec_review -> branch;
-    request -> branch [label="모드 B"];
-    branch -> implement -> verify -> diff_review -> finish -> archive -> report;
+    request_review -> design -> spec_review -> implement;
+    request -> implement [label="모드 B"];
+    implement -> verify -> diff_review -> finish -> archive -> report;
 
     escalate [label="범위 이탈 감지\n(모드 B → A 중간 승격)" shape=diamond style=dashed];
     implement -> escalate [style=dashed];
@@ -93,7 +93,7 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 �
 
 - **생략**: REQUEST review, brainstorming → spec → plan 설계 단계, spec/plan review
 - **유지**: REQUEST.md 생성(§1), fr 브랜치 승격(§3), 구현·검증(§4), **final diff review(항상 수행 — 생략 불가)**, 마무리·아카이브(§6), 최종 보고(§7)
-- **promote 타이밍**: 모드 B는 spec/plan review가 없으므로 REQUEST.md 생성 직후 promote한다 (§3).
+- **promote 타이밍**: 모드 A·B 모두 FR 등록 커밋 직후 promote 한다 (§3). 모드만 `--size` 값이 다르다 — A 는 `large`, B 는 `small`.
 - **AC 게이트**: REQUEST.md의 Acceptance Criteria가 비어 있거나 모호하면 구현을 시작하지 않는다. request seed로부터 구체적 AC를 생성하는 것이 REQUEST 생성 단계의 책임이며, seed가 빈약해 AC를 만들 수 없으면 `awaiting-user`로 멈춘다.
 - 그 외 공통 규칙(Autonomy Override, §4의 자율 구현 규칙 전체, §5 세션 한계 대응, §2 리뷰 수렴 규칙)은 모드 B에도 전부 동일 적용된다.
 
@@ -210,7 +210,9 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 �
 - 각 항목의 priority를 읽으려면 상세 파일(`items/*.md`)의 `priority` 필드를 확인한다. priority 읽기/fallback 규칙은 `/fr list`와 동일: 필드 없음/`-` → unranked, malformed 값 → unranked + 경고, 상세 파일 누락 → 건너뜀 + 경고
 - **AskUserQuestion으로 목록을 보여주고 사용자가 선택한다** — 목록에 priority 컬럼을 포함하여 정렬 이유를 사용자에게 보여준다
 - 항목 선택 직후 실행 모드를 선택한다 — "실행 모드" 섹션의 모드 선택 규칙을 따른다 (autopilot 추천 + 사용자 결정 필수, 기본값 모드 A)
-- 선택된 항목의 `request seed`를 기반으로 `REQUEST.md`를 생성한다
+- **선택한 항목의 상세 파일 경로(`rd-workflow-workspace/backlog/items/<파일>.md`)를 기억한다.** 이 값이 §3 승격의 `--source-fr` 인자다. 이 단계가 유일한 producer이고, promote가 REQUEST.md보다 앞서므로 REQUEST 본문에서 추론할 수 없다.
+- **다음은 §3 승격이다** (아래 `REQUEST.md` 생성보다 **앞**). 문서상 §3에 적혀 있으나 실행 순서는 여기가 먼저다.
+- §3 승격 완료 후, 선택된 항목의 `request seed`를 기반으로 `REQUEST.md`를 생성한다. REQUEST의 `## Source FR`에는 위에서 §3에 넘긴 것과 같은 경로를 쓴다 (권위는 task-state이고 REQUEST는 사람이 읽는 기록이다)
 - REQUEST.md 생성 후 `CURRENT_TASK.md` Notes에 `started_at: YYYY-MM-DD HH:MM` 형식으로 현재 시각을 기록한다. autopilot 재실행 시 이전 값을 덮어쓴다.
 
 ### 2. 리뷰 — 모드 A는 3단계 전부, 모드 B는 final diff review만
@@ -244,10 +246,20 @@ WAIT_TIMEOUT=3600 bash rd-workflow/scripts/run_review_turn.sh <session-path>
 
 ### 3. fr 브랜치 승격 (promote)
 
-- 모드 A는 spec/plan review 통과 후, 모드 B는 REQUEST.md 생성 직후 — 구현 시작 전에 lifecycle 정규 경로로 fr 브랜치를 만든다. **기본 브랜치 worktree에서** 호출한다:
+- **FR 등록 커밋 직후** — 모드 A·B 공통이며 REQUEST.md 작성보다 **앞**이다. 실제 실행이 이 순서이고(`lifecycle/README.md` 규약과 일치), 종전 서술("모드 A는 spec/plan review 통과 후")은 실행과 어긋나 2026-08-21 에 정정했다. **기본 브랜치 worktree에서** 호출한다:
+  모드 A (큰 작업):
   ```bash
-  bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug>
+  bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug> --size large \
+    --source-fr rd-workflow-workspace/backlog/items/<선택한-항목>.md
   ```
+  모드 B (작은 작업) — `--size` 만 다르다:
+  ```bash
+  bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug> --size small \
+    --source-fr rd-workflow-workspace/backlog/items/<선택한-항목>.md
+  ```
+  - **모드에 맞는 블록을 골라 쓴다.** 두 모드를 한 블록으로 두면 그대로 복사하는 실행자가 작은 작업도 `large` 로 시작해, 추가 전이·`--force` 우회 문제가 되살아난다. 이 계약은 `rd-workflow/scripts/check_autopilot_promote_contract.sh` 가 정적으로 점검한다 — 모드 라벨과 `--size` 값의 대응, 명령마다의 `--source-fr` canonical 경로까지 본다. 자연어 문장의 의미 반전은 점검 범위가 아니므로 사람 리뷰가 받는다.
+  - `large` 는 시작 상태 `대기 중`(다음 단계 `REQUEST review 대기` 로 `--force` 없이 전이), `small` 은 `구현 중` 이다.
+  - **`--source-fr` 를 반드시 명시한다.** 이 호출은 REQUEST.md 작성보다 앞서므로 REQUEST 본문에서 Source FR 을 읽을 수 없다. 생략하면 baseline REQUEST 의 `-` 가 기록되어(또는 stale REQUEST 가 남아 있으면 이전 작업 경로가 기록되어) §6 archive 의 FR done 자동 처리가 무동작하거나 다른 FR 을 건드린다. 값은 §1 에서 기억한 그 경로다.
   - `<slug>`는 `CURRENT_TASK.md ## Short Title` 값이다(생략 시 promote.sh가 자동 추출).
   - promote.sh가 `fr/<slug>` 브랜치 + task-state fr 필드 기록(commit) + CURRENT_TASK 갱신을 생성하고 fr 브랜치로 전환한다. 이는 §6 step 7 archive.sh가 요구하는 형식과 일치한다.
 - 구현 중 커밋은 이 `fr/<slug>` 브랜치에 쌓인다

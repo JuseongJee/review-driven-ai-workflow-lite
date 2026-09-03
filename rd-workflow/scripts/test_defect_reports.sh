@@ -264,11 +264,11 @@ before="$(cat "$WS/rd-workflow/config/workflow.json")"
 check "exit 0 (URL 을 보지도 않음)" "$rc" "0"
 check "원본 유지" "$(cat "$WS/rd-workflow/config/workflow.json")" "$before"
 
-echo "-- set-upstream: config 파일이 없으면 exit 1 --"
+echo "-- set-upstream: config 파일이 없으면 성공 skip (exit 0) --"
 setup_workspace
 rm -f "$WS/rd-workflow/config/workflow.json"
 (cd "$WS" && bash "$TARGET" set-upstream 'https://github.com/O/R.git' >/dev/null 2>&1); rc=$?
-check "exit 1" "$rc" "1"
+check "exit 0" "$rc" "0"
 [[ ! -f "$WS/rd-workflow/config/workflow.json" ]] && ok "config 를 새로 만들지 않음" || nok "config 를 새로 만들지 않음"
 
 echo "-- set-upstream: 원자적 쓰기(mv) 실패면 원본 유지 + exit 1 --"
@@ -740,6 +740,33 @@ mode="$(stat -f %Lp "$f" 2>/dev/null || stat -c %a "$f" 2>/dev/null)"
 check "원본 권한 보존 (640)" "$mode" "640"
 leftover="$(find "$(dirname "$f")" -name '.rd-defect.*' | wc -l | tr -d ' ')"
 check "임시 파일 잔존 없음" "$leftover" "0"
+
+# --- config 부재에서 set-upstream 은 성공 skip 이다 (파일을 만들지 않는다) ---
+DR9_DIR="$(mktemp -d)"
+mkdir -p "$DR9_DIR/rd-workflow/config" "$DR9_DIR/rd-workflow/scripts"
+cp "$SCRIPT_DIR/defect_reports.sh" "$DR9_DIR/rd-workflow/scripts/"
+cp "$SCRIPT_DIR/sync_template.sh" "$DR9_DIR/rd-workflow/scripts/" 2>/dev/null || true
+
+DR9_OUT="$DR9_DIR/out.txt"
+( cd "$DR9_DIR" && bash rd-workflow/scripts/defect_reports.sh set-upstream \
+    "https://github.com/example/repo" ) > "$DR9_OUT" 2>&1
+DR9_RC=$?
+
+check "config 부재 set-upstream 종료코드 0" "$DR9_RC" "0"
+check "config 파일을 만들지 않음" \
+  "$( [ -e "$DR9_DIR/rd-workflow/config/workflow.json" ] && echo exists || echo absent )" "absent"
+check "건너뜀 안내 출력" "$(grep -c '건너뜁니다' "$DR9_OUT")" "1"
+check "--upstream 대안 안내 출력" "$(grep -c -- '--upstream' "$DR9_OUT")" "1"
+
+# 기존 파일이 있으면 변경하지 않는다 (이미 설정됨 경로와 구분)
+printf '{\n  "defect_report_upstream": "owner/repo"\n}\n' \
+  > "$DR9_DIR/rd-workflow/config/workflow.json"
+cp "$DR9_DIR/rd-workflow/config/workflow.json" "$DR9_DIR/wj.before"
+( cd "$DR9_DIR" && bash rd-workflow/scripts/defect_reports.sh set-upstream \
+    "https://github.com/other/repo" ) > /dev/null 2>&1
+check "이미 설정됨 — 파일 무변경" \
+  "$(diff "$DR9_DIR/wj.before" "$DR9_DIR/rd-workflow/config/workflow.json" | wc -l | tr -d ' ')" "0"
+rm -rf "$DR9_DIR"
 
 printf '\n결과: pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

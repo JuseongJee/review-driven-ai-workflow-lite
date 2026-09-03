@@ -144,4 +144,4 @@ v2 Phase 2b 이전의 `LIFECYCLE_METADATA_PATH` 환경 변수(`.lifecycle/active
 - `_task_common.sh` — CLI 계층 (`TASK_CANONICAL_STATUSES`, `task_read_status`)
 - `hooks/_guard_common.sh` — guard 판정 함수 (`get_task_status`, `get_current_short_title`)
 - `lifecycle/_lifecycle_common.sh` — `metadata_*` 래퍼 + loop-guard helper
-- `scripts/self_test.sh` — LC-19 3자 일치 + stale 참조 회귀 grep 검증
+- `scripts/self_test.sh` — LC-19 3자 일치 검증 (`lifecycle` 그룹)

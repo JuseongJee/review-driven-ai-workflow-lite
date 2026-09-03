@@ -4,20 +4,6 @@ rd-workflow-workspace/.lifecycle/migration-backup/
 # 새로 생기지는 않지만, 기존 저장소에 남은 파일이 untracked 로 잡혀 아카이브 게이트를
 # 막지 않도록 항목은 유지합니다 (직접 지워도 무방합니다).
 rd-workflow-workspace/.lifecycle/verify-cache
-# self_test full 통과 지문 (휘발성 런타임 상태 — 커밋 불필요).
-# ignore 하지 않으면 full 을 한 번 돌리는 것만으로 워킹트리에 untracked 가 생겨,
-# 그 상태를 증명할 수 없다는 이유로 자기 자신이 커밋과 archive 를 막습니다.
-rd-workflow-workspace/.lifecycle/selftest-full-cache
-# 기록은 `mktemp "<캐시>.XXXXXX"` → `mv -f` 로 이루어집니다. 전수 검증이 그 창에서
-# 중단되면 임시 파일이 남는데, ignore 하지 않으면 untracked 로 잡혀 우회 밸브가 없는
-# 아카이브 게이트를 영구 차단합니다.
-rd-workflow-workspace/.lifecycle/selftest-full-cache.*
-
-# consumer 청중 전량 통과 증명 (archive gate 가 인정하는 두 증명 중 하나).
-# full 캐시와 파일을 나눠 두므로 **두 패턴을 함께** 무시해야 합니다 — 빠지면 consumer PASS 가
-# 만든 캐시가 다음 판정에서 untracked 로 잡혀 방금 만든 증명을 스스로 무효화합니다.
-rd-workflow-workspace/.lifecycle/selftest-consumer-cache
-rd-workflow-workspace/.lifecycle/selftest-consumer-cache.*
 # 제거된 편집 출처(edit provenance) 기록의 잔여 디렉터리.
 # 새로 생기지는 않지만, 기존 저장소에 남은 디렉터리가 untracked 로 잡혀 아카이브 게이트를
 # 막지 않도록 항목은 유지합니다 (직접 지워도 무방합니다).

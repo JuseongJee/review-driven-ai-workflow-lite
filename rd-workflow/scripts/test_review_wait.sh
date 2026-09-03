@@ -7,6 +7,8 @@
 #   4. 폴링 부재 grep (adapter_codex.sh + adapter_claude.sh)
 #   5. malformed owner 실패 (Bogus / 빈 값 / awaiting-reviewer Status)
 #   6. timeout 마커 정리 (정상 완료 경로에서 .wait_timeout 잔존 금지)
+#  16. writable surface 세션 하위 폐쇄 — last-message 는 세션 하위 mktemp(사전 배치 symlink 비추종),
+#      --add-dir 는 symlink 를 따라간 세션 physical 경로 (codex-adapter-writable-root)
 set -euo pipefail
 
 PASS=0
@@ -1121,6 +1123,113 @@ exit 0
 }
 
 # ===========================================================================
+# 케이스 16: writable surface 세션 하위 폐쇄 (codex-adapter-writable-root)
+#   (a) last-message 파일은 세션 하위 mktemp 템플릿 — 세션에 미리 놓인 고정명 symlink
+#       `.last_message` 를 따라가 세션 밖 파일을 truncate 하지 않는다 (final diff review 002턴).
+#   (b) 그 파일은 정상 종료 후 남지 않는다.
+#   (c) --add-dir 에는 SESSION_PATH 의 symlink 를 따라간 physical 경로가 전달된다.
+#   세션은 symlink 경로로 넘긴다 (team-overlay 재현). 실제 codex 대신 인자를 기록하는 mock.
+# ===========================================================================
+run_case16() {
+  local sandbox victim_dir victim link_root sess_link sess_real
+  sandbox="$(make_sandbox)"
+  sess_real="$(cd "$sandbox" && pwd -P)"
+
+  # team-overlay 재현: PROJECT_ROOT 안의 symlink 가 세션 실제 위치를 가리킨다
+  link_root="$(mktemp -d)"
+  sess_link="$link_root/sess"
+  ln -s "$sess_real" "$sess_link"
+
+  # 세션 밖 피해 후보 + 고정명 symlink 사전 배치 (checkout·이전 비정상 실행 상황 재현)
+  victim_dir="$(mktemp -d)"
+  victim="$victim_dir/victim.txt"
+  printf 'KEEP\n' > "$victim"
+  ln -s "$victim" "$sandbox/.last_message"
+
+  local turn_file="$sandbox/turns/turn-001-reviewer.md"
+  local args_out="$sandbox/mock_args.txt"
+  write_session "$sandbox" "Author" "awaiting-author"
+
+  # mock: 인자 전부 기록, --output-last-message 경로에 쓰기, 턴 파일 + SESSION 갱신
+  local bin_dir="$sandbox/mock_bin"
+  mkdir -p "$bin_dir"
+  cat > "$bin_dir/codex" <<'MOCK_EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$CASE16_ARGS_OUT"
+lm=""
+for ((i=1; i<=$#; i++)); do
+  if [ "${!i}" = "--output-last-message" ]; then j=$((i+1)); lm="${!j}"; fi
+done
+[ -n "$lm" ] && echo "done" > "$lm"
+touch "$CASE16_TURN_FILE"
+cat > "$SESSION_PATH/SESSION.md" <<'SESS_EOF'
+## Current Owner
+Author
+
+## Status
+awaiting-author
+
+## Turn Limit
+20
+SESS_EOF
+cat >/dev/null
+exit 0
+MOCK_EOF
+  chmod +x "$bin_dir/codex"
+
+  local rc=0
+  CASE16_ARGS_OUT="$args_out" \
+  CASE16_TURN_FILE="$turn_file" \
+  TOOL_BIN="$bin_dir/codex" \
+  SESSION_PATH="$sess_link" \
+  PROMPT_FILE="/dev/null" \
+  EXPECTED_TURN_FILE="$turn_file" \
+  PROJECT_ROOT="$link_root" \
+    bash "$ADAPTER" >/dev/null 2>&1 || rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    fail "케이스 16: 전제 실패 — 어댑터 rc=$rc (정상 완료 기대)"
+  else
+    # (a) 사전 배치 symlink 비추종 — 피해 후보 내용 보존, symlink 자체도 그대로
+    if [ "$(cat "$victim")" = "KEEP" ] && [ -L "$sandbox/.last_message" ]; then
+      pass "케이스 16a: 고정명 symlink .last_message 를 따라가지 않음 (세션 밖 파일 보존)"
+    else
+      fail "케이스 16a: 사전 배치 symlink 추종 — victim='$(cat "$victim" 2>/dev/null)', link=$([ -L "$sandbox/.last_message" ] && echo kept || echo gone)"
+    fi
+
+    # last-message 경로: 세션 하위 mktemp 템플릿 (고정명 아님)
+    local lm_path
+    lm_path="$(awk '/^--output-last-message$/{getline; print}' "$args_out")"
+    case "$lm_path" in
+      "$sess_link"/.last_message.??????)
+        pass "케이스 16: last-message 는 세션 하위 mktemp 템플릿 ($(basename "$lm_path"))" ;;
+      *)
+        fail "케이스 16: last-message 경로가 세션 하위 템플릿이 아님 — '$lm_path'" ;;
+    esac
+
+    # (b) 정상 종료 후 템플릿 파일 잔존 없음 (사전 배치 symlink 만 남아야 한다)
+    local leftover
+    leftover="$(find "$sandbox" -maxdepth 1 -name '.last_message.*' | wc -l | tr -d ' ')"
+    if [ "$leftover" -eq 0 ]; then
+      pass "케이스 16b: 정상 종료 후 .last_message.* 잔존 없음"
+    else
+      fail "케이스 16b: .last_message.* ${leftover}개 잔존"
+    fi
+
+    # (c) --add-dir 는 symlink 를 따라간 physical 경로
+    local add_dir
+    add_dir="$(awk '/^--add-dir$/{getline; print}' "$args_out")"
+    if [ "$add_dir" = "$sess_real" ]; then
+      pass "케이스 16c: --add-dir 에 세션 physical 경로 전달 (symlink 해석됨)"
+    else
+      fail "케이스 16c: --add-dir 기대='$sess_real', 실제='$add_dir'"
+    fi
+  fi
+
+  rm -rf "$sandbox" "$link_root" "$victim_dir"
+}
+
+# ===========================================================================
 # 실행
 # ===========================================================================
 echo "=== adapter_codex.sh 대기 계약·판정 단일화 테스트 ==="
@@ -1156,6 +1265,12 @@ echo ""
 
 run_case14
 run_case15
+
+echo ""
+echo "=== 회귀 테스트 — writable surface 세션 하위 폐쇄 (codex-adapter-writable-root) ==="
+echo ""
+
+run_case16
 
 echo ""
 echo "=== 결과: PASS=$PASS FAIL=$FAIL ==="

@@ -65,7 +65,13 @@ check_turn_complete() {
 }
 
 # --- Codex background 실행 ---
-last_message_file="$(mktemp)"
+# last-message 파일은 세션 디렉토리 하위에 둔다. codex 가 쓰는 writable surface 를
+# SESSION_PATH 하나로 닫아 /tmp 가 writable 이라는 전제를 제거한다 (spec/plan review 004턴).
+# 고정명이 아니라 mktemp 템플릿이어야 한다 — 고정명 + `: >` 는 세션 디렉토리에 미리 놓인
+# 같은 이름의 symlink 를 따라가 세션 밖 파일을 truncate 하고(codex sandbox 시작 전, 호출자
+# 권한으로), 같은 세션의 동시 실행이 서로의 파일을 비우거나 cleanup 으로 지운다.
+# mktemp 는 배타적으로 새 파일을 만들므로 둘 다 막힌다 (final diff review 002턴).
+last_message_file="$(mktemp "${session_dir}/.last_message.XXXXXX")"
 chmod 600 "$last_message_file"
 
 codex_pid=""
@@ -172,6 +178,13 @@ watchdog_fd_open=1
 extra_args=()
 [ -n "${TOOL_EFFORT:-}" ] && extra_args+=(-c "model_reasoning_effort=\"${TOOL_EFFORT}\"")
 
+# workspace-write sandbox 는 physical 경로 기준으로 쓰기 범위를 판정한다. team-overlay
+# 구성에서는 SESSION_PATH 가 PROJECT_ROOT 안의 symlink 를 따라간 실제 위치(overlay repo)에
+# 있어 쓰기 금지 영역이 되고, codex 가 턴 파일을 만들지 못한다. 세션 디렉토리의 physical
+# 경로를 --add-dir 로 무조건 추가한다 — 비-overlay 구성에서는 이미 PROJECT_ROOT 트리 안이라
+# 중복 지정이 무해하므로 overlay 감지 분기를 두지 않는다. 개방 범위는 이 디렉토리 하나다.
+session_real="$(cd "$session_dir" && pwd -P)"
+
 # codex 를 자체 process group 리더로 띄운다 (set -m). cleanup 이 그룹 단위로 종료해
 # codex 가 남긴 자식까지 정리할 수 있게 하기 위함이며, pgid == codex_pid 를 ps 로 확인한
 # 뒤에만 그룹 종료하므로 무관한 그룹을 건드리지 않는다.
@@ -179,6 +192,7 @@ set -m
 "$codex_bin" --ask-for-approval never exec \
   --cd "$PROJECT_ROOT" \
   --sandbox workspace-write \
+  --add-dir "$session_real" \
   --skip-git-repo-check \
   "${extra_args[@]+"${extra_args[@]}"}" \
   --output-last-message "$last_message_file" \

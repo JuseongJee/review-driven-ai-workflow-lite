@@ -173,7 +173,7 @@ rm -rf "$ISO"
 # 복사해 두면 문서와 테스트가 갈라져도 초록이 나오므로, 문서가 유일한 진실이어야 합니다.
 #
 # 이 파일에 두는 이유: 새 테스트 파일을 만들면 `self_test.sh` 의 `run_step` 등록이 하나 늘어
-# 42스텝 집계와 청중 exact 집합 단언을 흔듭니다. 이 스텝은 이미 sync·마이그레이션 도구를
+# self_test 스텝 집계와 청중 exact 집합 단언을 흔듭니다. 이 스텝은 이미 sync·마이그레이션 도구를
 # 담당하는 `consumer` 스텝입니다.
 echo "-- M008 hook 표기 정규화 --"
 M8_DIR="$WORK/m008"; mkdir -p "$M8_DIR"
@@ -334,26 +334,6 @@ J
   if m8_run FG 2>&1 | grep -qF "알림"; then ok "같은 matcher 다중 group → 알림"; else nok "같은 matcher 다중 group 인데 알림이 없습니다"; fi
   check "같은 matcher 다중 group 은 접지 않음 (2건 유지)" "$(m8_items FG)" "2"
 
-  # --- M007 문구 정합 (final diff review Turn 002 Finding 2) ----------------
-  # 게이트가 강제하는 범위가 `consumer` 로 좁아졌으므로 문서가 그것을 그대로 말해야 합니다.
-  # "전수/full 강제" 라는 서술이 남으면 사용자는 정본 위생 검사까지 끝났다고 오인합니다.
-  m7="$(sed -n '/^## M007/,/^## /p' "$M8_MD")"
-  if printf '%s' "$m7" | grep -qF 'self_test.sh consumer' ; then
-    ok "M007 이 consumer 강제를 명시"
-  else
-    nok "M007 에 consumer 강제 서술이 없습니다"
-  fi
-  if printf '%s' "$m7" | grep -qF 'self_test.sh full 통과가 강제'; then
-    nok "M007 에 'full 통과가 강제' 서술이 남아 있습니다"
-  else
-    ok "M007 에 full 강제 서술이 남지 않음"
-  fi
-  if printf '%s' "$m7" | grep -qE '전수 검증을 돌리지도 않고|전수 검증이 실패하면'; then
-    nok "M007 의 사전조건·실패 서술이 여전히 '전수 검증' 이라고 말합니다"
-  else
-    ok "M007 사전조건·실패 서술이 범위에 맞게 정정됨"
-  fi
-
   # --- 종단: 정규화 → M003 --------------------------------------------------
   # 정규화 단독 결과만 보면 M003 이 뒤에서 다시 중복을 만드는지 알 수 없습니다.
   # 유일성 축은 command 가 아니라 **(event, matcher, command) triple** 입니다 — 템플릿은
@@ -422,6 +402,185 @@ J
 J
     check "대조군 E3 (정규화 없이 M003): 추가 4 / hook 8 / triple 유일 아님" "$(m8_end E3)" "4 8 no 0"
   fi
+fi
+
+# --- M009: 보존 파일 정의 문구 마이그레이션 --------------------------------
+# snippet 을 MIGRATIONS.md 에서 추출해 fixture 에 실제로 실행한다.
+# 정적 문구 검사로 대체하지 않는다 (spec D1).
+M9_DIR="$(mktemp -d)"
+M9_MD="$SCRIPT_DIR/../MIGRATIONS.md"
+M9_SNIP="$M9_DIR/m9_snippet_zzfx.py"
+
+python3 - "$M9_MD" "$M9_SNIP" <<'M9EXTRACT'
+import sys
+md, out = sys.argv[1], sys.argv[2]
+lines = open(md, encoding="utf-8").read().split("\n")
+start = None
+for i, l in enumerate(lines):
+    if l.startswith("## M009"):
+        start = i
+        break
+if start is None:
+    sys.exit("M009 절을 찾지 못했습니다")
+body, grab = [], False
+for l in lines[start:]:
+    s = l.strip()
+    if s == "python3 - <<'PY'":
+        grab = True
+        continue
+    if grab and s == "PY":
+        break
+    if grab:
+        body.append(l[3:] if l.startswith("   ") else l)
+if not body:
+    sys.exit("M009 의 python3 heredoc 본문이 비어 있습니다")
+open(out, "w", encoding="utf-8").write("\n".join(body) + "\n")
+M9EXTRACT
+
+# 구형 FUTURE_REQUESTS.md (blocked 없음, 인덱스 항목 1건)
+m9_fixture() { # $1=케이스명
+  local d="$M9_DIR/$1/rd-workflow-workspace/backlog"
+  mkdir -p "$d"
+  cat > "$d/FUTURE_REQUESTS.md" <<'FR'
+# FUTURE_REQUESTS
+
+## 상태 값
+
+- `idea`: 아직 검증 안 됨
+- `validated`: 필요성 확인, 우선순위 아님
+- `ready-for-request`: REQUEST.md로 바로 올릴 수 있음
+- `parked`: 검토 완료, 지금은 안 함
+- `done` / `dropped`: 인덱스에서 삭제
+
+## 파일 분리
+
+- **이 파일**: 활성 항목(idea, validated, ready-for-request)
+- **`FUTURE_REQUESTS_PARKED.md`**: 보류 항목 (parked)
+- **`items/`**: 상세 파일
+
+## 인덱스
+
+| 날짜 | 제목 |
+|------|------|
+| 2026-01-01 | sample-item |
+FR
+}
+
+m9_run() { ( cd "$M9_DIR/$1" && python3 "$M9_SNIP" ) ; }
+m9_fr() { echo "$M9_DIR/$1/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md" ; }
+
+echo "== M009: 정상 변환 =="
+m9_fixture N1
+m9_run N1 > "$M9_DIR/n1.out" 2>&1
+check "N1 1회차 종료코드 0" "$?" "0"
+check "N1 상태 값에 blocked" \
+  "$(grep -c '^- `blocked`:' "$(m9_fr N1)")" "1"
+check "N1 blocked 가 done 앞" \
+  "$(awk '/^- `blocked`:/{b=NR} /^- `done`/{d=NR} END{print (b<d)?"yes":"no"}' "$(m9_fr N1)")" "yes"
+check "N1 파일 분리에 canonical 행" \
+  "$(grep -c '^- \*\*`blocked` 항목\*\*:' "$(m9_fr N1)")" "1"
+check "N1 파일 분리 grep -A4 판정 통과 (test_fr_blocked_status 기준)" \
+  "$(grep -A4 '## 파일 분리' "$(m9_fr N1)" | grep -c 'blocked')" "1"
+check "N1 인덱스 행 보존" \
+  "$(grep -c '^| 2026-01-01 | sample-item |' "$(m9_fr N1)")" "1"
+check "N1 임시 파일 잔여 없음" \
+  "$(find "$M9_DIR/N1/rd-workflow-workspace/backlog" -name '.FUTURE_REQUESTS.md.m009.*' | wc -l | tr -d ' ')" "0"
+
+# 섹션에 "blocked" 를 언급하는 **메모만** 있고 정식 항목이 없는 경우 — 삽입해야 한다.
+# substring 판정이면 여기서 건너뛰어 거짓 성공이 된다 (final diff review Turn 002 Finding 1).
+m9_fixture N2
+python3 - "$(m9_fr N2)" <<'M9N2'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+s = s.replace("- `parked`: 검토 완료, 지금은 안 함",
+              "- `parked`: 검토 완료, 지금은 안 함\n- (메모) blocked 는 아직 미지원")
+s = s.replace("- **`items/`**: 상세 파일",
+              "- **`items/`**: 상세 파일\n- (메모) blocked 관련 정리 필요")
+open(p, "w", encoding="utf-8").write(s)
+M9N2
+m9_run N2 > "$M9_DIR/n2.out" 2>&1
+check "N2 메모만 있어도 종료코드 0" "$?" "0"
+check "N2 상태 값에 canonical 행 삽입" \
+  "$(grep -c '^- `blocked`:' "$(m9_fr N2)")" "1"
+check "N2 파일 분리에 canonical 행 삽입" \
+  "$(grep -c '^- \*\*`blocked` 항목\*\*:' "$(m9_fr N2)")" "1"
+check "N2 기존 메모 보존" \
+  "$(grep -c '(메모) blocked 는 아직 미지원' "$(m9_fr N2)")" "1"
+
+echo "== M009: 멱등 (2회차 무변경) =="
+cp "$(m9_fr N1)" "$M9_DIR/n1.after1"
+m9_run N1 > "$M9_DIR/n1.out2" 2>&1
+check "N1 2회차 종료코드 0" "$?" "0"
+check "N1 2회차 전체 diff 공백" \
+  "$(diff "$M9_DIR/n1.after1" "$(m9_fr N1)" | wc -l | tr -d ' ')" "0"
+
+echo "== M009: fail-safe =="
+# 헤딩 부재 — sed -i 를 쓰지 않는다 (spec D9: 신규 코드에 BSD 비호환 구문 금지)
+m9_fixture F1
+python3 - "$(m9_fr F1)" <<'M9F1'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read().replace("## 파일 분리", "## 파일 분리 (프로젝트 변형)")
+open(p, "w", encoding="utf-8").write(s)
+M9F1
+cp "$(m9_fr F1)" "$M9_DIR/f1.before"
+m9_run F1 > "$M9_DIR/f1.out" 2>&1
+check "F1 헤딩 부재 → 종료코드 1" "$?" "1"
+check "F1 파일 무변경" \
+  "$(diff "$M9_DIR/f1.before" "$(m9_fr F1)" | wc -l | tr -d ' ')" "0"
+check "F1 원인 출력" "$(grep -c '헤딩이 0개' "$M9_DIR/f1.out")" "1"
+check "F1 조치 출력" "$(grep -c '조치:' "$M9_DIR/f1.out")" "1"
+
+# 헤딩 중복
+m9_fixture F2
+printf '\n## 상태 값\n\n- 중복 섹션\n' >> "$(m9_fr F2)"
+cp "$(m9_fr F2)" "$M9_DIR/f2.before"
+m9_run F2 > "$M9_DIR/f2.out" 2>&1
+check "F2 헤딩 중복 → 종료코드 1" "$?" "1"
+check "F2 파일 무변경" \
+  "$(diff "$M9_DIR/f2.before" "$(m9_fr F2)" | wc -l | tr -d ' ')" "0"
+
+# 대상 파일 부재 — 해당 없음으로 성공 종료
+mkdir -p "$M9_DIR/F3"
+( cd "$M9_DIR/F3" && python3 "$M9_SNIP" ) > "$M9_DIR/f3.out" 2>&1
+check "F3 대상 파일 부재 → 종료코드 0" "$?" "0"
+check "F3 해당 없음 출력" "$(grep -c '해당 없음' "$M9_DIR/f3.out")" "1"
+
+rm -rf "$M9_DIR"
+
+echo "--- acceptance_sync_once.sh: 임시 clone 폐기 가능 판정 (재귀 삭제 방어) ---"
+# 그 스크립트는 `set -e` 없이 진단을 모아 내는 방식이라, `mktemp` 가 실패해 경로가 비거나
+# 예상 밖 값이 와도 스스로 멈추지 않는다. 그대로 가면 `/proj`·`/remote` 에 파일을 만들고
+# `$(dirname "$CLONE")` 을 재귀 삭제한다. 그 판정을 `--check-clone` 으로 직접 고정한다.
+# (`mktemp` 실패 자체를 유도해 시험하지는 않는다 — macOS `mktemp` 는 TMPDIR 이 없어도
+#  `/var/folders/...` 로 폴백해 실패하지 않으므로 플랫폼마다 결과가 갈린다.)
+ACC_SH="${SCRIPT_DIR}/acceptance_sync_once.sh"
+if [[ -f "$ACC_SH" ]]; then
+  acc_guard() { bash "$ACC_SH" --check-clone "$1" >/dev/null 2>&1 && echo ok || echo reject; }
+
+  ACC_OK="$WORK/acc_ok"
+  mkdir -p "$ACC_OK/tmp.zzfx/template"
+  check "정상: tmp.*/template → 수용" "$(acc_guard "$ACC_OK/tmp.zzfx/template")" "ok"
+
+  check "빈 경로 → 거부" "$(acc_guard "")" "reject"
+  check "루트 → 거부" "$(acc_guard "/")" "reject"
+  check "홈 디렉터리 → 거부" "$(acc_guard "$HOME")" "reject"
+
+  mkdir -p "$WORK/acc_noname/tmp.zzfx/other"
+  check "이름이 template 이 아님 → 거부" "$(acc_guard "$WORK/acc_noname/tmp.zzfx/other")" "reject"
+
+  mkdir -p "$WORK/acc_noparent/notmp/template"
+  check "부모가 mktemp 산출물이 아님 → 거부" \
+    "$(acc_guard "$WORK/acc_noparent/notmp/template")" "reject"
+
+  # 부모에 다른 항목이 있으면 남의 디렉터리일 수 있다 — 재귀 삭제 대상으로 삼지 않는다
+  touch "$ACC_OK/tmp.zzfx/stranger"
+  check "부모에 다른 항목 존재 → 거부" "$(acc_guard "$ACC_OK/tmp.zzfx/template")" "reject"
+
+  check "존재하지 않는 경로 → 거부" "$(acc_guard "$WORK/acc_absent/tmp.zzfx/template")" "reject"
+else
+  echo "  skip  acceptance_sync_once.sh 없음"
 fi
 
 if [[ "$FAIL" == "0" ]]; then

@@ -54,7 +54,10 @@ rd-workflow 워크플로 템플릿을 사용하는 소비 프로젝트에서, �
 
 전달 대상은 `rd-workflow/config/workflow.json`의 `defect_report_upstream` 값으로 정합니다. 값 형식은 `owner/repo`(github.com 대상) 또는 `host/owner/repo`(GitHub Enterprise 등 다른 host 대상) 중 하나여야 합니다.
 
-이 값은 소비 프로젝트가 rd-workflow 템플릿을 업그레이드(`sync_template.sh`)할 때 원본 repo URL로부터 자동으로 채워집니다. **이미 값이 설정돼 있으면 덮어쓰지 않습니다** — 소비 프로젝트가 다른 대상(예: 사내 미러, 검토용 fork)을 의도적으로 지정했을 수 있기 때문입니다. 값이 비어 있으면 전달을 보류하며, 값을 수동으로 채우려면 `bash rd-workflow/scripts/defect_reports.sh set-upstream <repo-url>`을 실행합니다.
+이 값은 소비 프로젝트가 rd-workflow 템플릿을 업그레이드(`sync_template.sh`)할 때, **이미
+`rd-workflow/config/workflow.json` 이 있으면** 원본 repo URL로부터 자동으로 채워집니다.
+**설정 파일이 없으면 sync 는 파일을 만들지 않고 이 단계를 건너뜁니다** — 그 경우 전달 대상은
+발행 시 `--upstream <owner/repo>` 로 지정합니다. **이미 값이 설정돼 있으면 덮어쓰지 않습니다** — 소비 프로젝트가 다른 대상(예: 사내 미러, 검토용 fork)을 의도적으로 지정했을 수 있기 때문입니다. 값이 비어 있으면 전달을 보류하며, 값을 수동으로 채우려면 `bash rd-workflow/scripts/defect_reports.sh set-upstream <repo-url>`을 실행합니다.
 
 ### 2. 전달 시작
 
