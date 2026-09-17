@@ -103,7 +103,7 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 **실행 절차**:
 1. `bash rd-workflow/scripts/rd task status`를 1회 실행합니다.
 2. exit 0이고 `rd-workflow-workspace/.lifecycle/task-state`가 생성/존재하면 완료입니다. 마이그레이션이 수행되었다면(stderr 안내 출력) tracked 변경(active-fr 삭제·task-state 생성)을 다음 정규 커밋에 포함하라고 사용자에게 안내합니다.
-3. exit 3이면 `CURRENT_TASK.md`의 `## Status`를 canonical 8종 중 하나로 수동 복구한 뒤 재실행합니다. 복구 절차는 `rd-workflow/docs/guides/task-state-guide.md`의 "실패 시 복구"를 참조합니다.
+3. exit 3이면 `CURRENT_TASK.md`의 `## Status`를 canonical 9종 중 하나로 수동 복구한 뒤 재실행합니다. 복구 절차는 `rd-workflow/docs/guides/task-state-guide.md`의 "실패 시 복구"를 참조합니다.
 
 **주의**: 마이그레이션이 만든 변경은 자동 커밋하지 않습니다 ("다음 정규 커밋에 편승" 계약 — LC-20 archive clean 검증은 이 변경이 커밋된 상태를 전제합니다).
 
@@ -512,3 +512,90 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
    ```
 
 **검증**: `bash rd-workflow/scripts/test_fr_blocked_status.sh` 가 PASS 합니다.
+
+## M010: 위험 등급(risk tier) 도입 — small-task 사용자 지정·final diff review 절대 규칙 대체
+
+- 적용 대상: 2026-09-04 이전에 배포된 모든 소비 프로젝트.
+- 변경: `CLAUDE.md`(우선 원칙 4·5, Intake 규칙, 핵심 절차, 절대 규칙 1항, Review 규칙 1항), `WORKFLOW.md` 위험 등급 절, `REQUEST.md` 템플릿 `## Risk Tier`, `reports/tier-log.md` 신설, skill 6종, `prepare_review_pipeline.sh` 의 Risk Tier 판독.
+- 절차: `tpl update` 로 정본 문서·skill·스크립트를 받습니다. 손으로 유지하는 파일은 세 개입니다 — ① `CLAUDE.md`: 위 절을 배포본 문구로 교체(200줄 한도 유지) ② `REQUEST.md`: 진행 중 작업이 있으면 `## Source FR` 앞에 `## Risk Tier` 섹션(템플릿 참조) 을 추가합니다. 없어도 리뷰 파이프라인은 `Execution Path` 로 fallback 하므로 동작은 유지됩니다 ③ `rd-workflow-workspace/reports/tier-log.md`: 템플릿 헤더를 복사합니다(첫 `light` 마감 때 만들어도 됩니다).
+- 진행 중 작업은 착수 시점 절차(사실상 `full`) 를 그대로 마치고, 다음 작업부터 등급제를 적용합니다.
+- 검증: `bash rd-workflow/scripts/test_review_effort_override.sh` 의 `RT` 표 기반 케이스 통과, `grep -n "small로 판단\|스스로 small" CLAUDE.md` 0건.
+
+## M011: 종결 마커(seal) 기반 archive precheck · `아카이브 보류` 상태 · no-fr 모드
+
+**조건**: 종결 마커를 도입한 템플릿(`rd-workflow/scripts/rd` 에 `review seal` 서브커맨드가 있는 판)으로 동기화하는 모든 프로젝트.
+
+**동작 변화**
+
+1. **`archive.sh` 의 리뷰 종결 검사가 마커 파일 기준으로 바뀝니다.** 종전에는 fr tip 의 `handoffs/review_pipeline/` 세션 본문을 읽어 종결성을 판정했으나, 이제는 `rd-workflow-workspace/.lifecycle/review-seals/<session-id>.seal` 한 파일만 읽습니다. 세션 본문을 커밋하지 않는 프로젝트도 마커만 커밋하면 통과합니다.
+2. **task-state 에 필드 2개가 늘었습니다.**
+   - `base-commit` — 작업 시작 커밋의 full OID. `promote.sh` 가 fr 브랜치 생성 시 기록합니다. promote 를 쓰지 않는 프로젝트는 `bash rd-workflow/scripts/rd task set-base <ref>` 로 1회 설정합니다(입력이 ref 여도 OID 로 저장). diff review 의 base 판정에 쓰입니다.
+   - `review-session` — final diff review 세션 id 포인터. `prepare_review_pipeline.sh` 가 diff 세션 생성 시 기록하며, 발행 게이트는 **이 포인터가 가리키는 마커 하나만** 읽습니다.
+   두 필드는 `archive.sh` 의 metadata cleanup 이 baseline 으로 되돌립니다. 별도 마이그레이션 스크립트는 없습니다 — 위 경로(promote·`set-base`·diff 세션 생성)로 채워집니다. 다만 **promote 를 쓰지 않고 `--base` 도 주지 않으면 diff review 세션 생성이 `base 판정 입력이 없습니다` 로 실패**하므로, 그런 프로젝트는 첫 diff review 전에 `rd task set-base` 를 1회 실행해야 합니다.
+3. **canonical Status 에 `아카이브 보류` 가 추가됐습니다.** 「리뷰 종결·발행 대기」이며 **완료가 아닙니다.** 전이는 `diff review 대기` → `아카이브 보류` → `완료` 이고, 리뷰 후 변경이 필요하면 `아카이브 보류` → `구현 중` 으로 되돌립니다. 프로젝트 `CLAUDE.md` 의 Task Tracking 절에 있는 Status 허용값 목록에도 이 값이 들어가야 합니다. `CLAUDE.md` 는 동기화 대상이라 템플릿 판을 그대로 받으면 함께 들어오지만, 프로젝트가 이 절을 손댄 상태라면 동기화 후 목록에 `아카이브 보류` 가 있는지 직접 확인하고 없으면 추가합니다.
+4. **마커 디렉터리 `rd-workflow-workspace/.lifecycle/review-seals/` 는 추적 대상입니다.** 마커는 커밋되어야 효력이 생기므로(게이트가 워킹트리가 아니라 판정 대상 commit 에서 읽습니다) 프로젝트 `.gitignore` 에 `.lifecycle/` 을 통째로 무시하는 규칙이 있으면 **제거해야 합니다.** 그대로 두면 정상 작업이 발행 시점에 `마커 없음` 으로 차단됩니다.
+5. **fr 브랜치 없이 기본 브랜치에서 작업하는 no-fr 모드가 생겼습니다.** task-state 의 `fr-branch` 가 canonical `null` 일 때만 진입하며(빈 문자열·공백·`main` 등은 malformed 로 차단), 기본 브랜치가 아니거나 detached HEAD 이면 차단됩니다. 기존 fr 경로는 그대로입니다.
+
+**발행 절차 (새 순서 — 사용자·AI 가 지킵니다)**
+
+```
+final diff review 종결
+  → bash rd-workflow/scripts/rd review seal <세션 경로>
+  → bash rd-workflow/scripts/rd task set-status "아카이브 보류"
+  → archive 기록 커밋 (seal 파일 포함)
+  → bash rd-workflow/scripts/lifecycle/archive.sh
+```
+
+`archive.sh` 의 호출 형태·인자·내부 순서는 바뀌지 않았으므로, 위 준비를 마친 뒤 곧바로 부르면 종전의 one-shot 실행과 같습니다. 다음에 할 일은 `bash rd-workflow/scripts/rd task status` 가 안내합니다.
+
+**기존 리뷰 세션 (legacy)**
+
+동기화 이전에 만든 세션에는 `SESSION.md` 의 `## Branch Context` 에 `review-head-oid` 가 없습니다. **그것이 legacy 의 기계적 정의**이며, 이런 세션은 리뷰 당시 커밋이 어디에도 기록되어 있지 않아 일반 `rd review seal` 이 거부합니다. 진행 중이던 작업을 마감해야 한다면 전용 경로를 씁니다.
+
+```bash
+bash rd-workflow/scripts/rd review seal --legacy-unverified "<사유>" <세션 경로>
+```
+
+- **포기하는 것**: 이 마커는 **리뷰 당시 트리를 증명하지 않습니다.** 종결 이후 코드가 변경되었어도 발행을 막지 못합니다.
+- **남는 것**: 사유가 `rd-workflow-workspace/.lifecycle/review-skip-audit.log` 에 append 되고, `archive.sh` 와 `rd task status` **양쪽이 통과할 때마다 경고**를 냅니다.
+- `review-head-oid` 가 **있는** 세션에 이 플래그를 쓰면 거부됩니다 — 검증 가능한 세션을 무검증으로 낮추지 않습니다.
+- `--force-skip-review-check`(리뷰를 아예 건너뜀)와 구분됩니다. 이쪽은 "리뷰는 했으나 대상을 증명 못 함" 입니다.
+- 진행 중 작업이 없다면 이 경로가 필요 없습니다 — 동기화 후 새로 만드는 세션은 두 OID 를 기록합니다.
+
+## M012: 기본 실행 모드 `semi-auto` 전환 · `rd task mode` 출력 어휘 변경
+
+**조건**: 이 변경 이후 템플릿으로 동기화하는 모든 프로젝트.
+
+**동작 변화**
+
+1. **기본 실행 모드가 `semi-auto` 가 됩니다.** `rd-workflow/config/workflow.json` 의 `default_execution_mode` 가 없거나 그 파일 자체가 없으면(= 선호를 표현한 적이 없는 상태) 종전의 `manual` 대신 `semi-auto` 로 판정합니다. 없어지는 것은 **단계 진입 대기 하나**입니다 — 착수 지시를 받은 뒤에는 단계마다 확인을 받지 않고 진행합니다.
+   - **그대로인 것**: 리뷰 20턴 한도, self-review 차단(`self_review_policy=block`), 발행 승인(`archive.sh` 호출 직전 1회 질문). `REVIEW_TURN_LIMIT=50` 과 `RD_AUTOPILOT=1` 은 autopilot 전용이며 `semi-auto` 에는 붙지 않습니다.
+   - **판정 불가는 종전대로 `manual` + 경고**입니다 — 파싱 실패·최상위 non-object·비허용 값·`default_execution_mode` 키 중복·regular file 이 아닌 경로(디렉터리·dangling symlink·FIFO·socket)·읽기 실패·경로의 존재와 종류를 확인하지 못한 경우. 정본 규칙과 전체 목록은 `rd-workflow/docs/flows/AUTONOMY.md` 의 「모드 결정과 review 실행」 절입니다.
+   - Intake 규칙과 등급별 진입(`full` 의 FR 대기)은 모드와 무관하게 유지됩니다.
+2. **`rd task mode` 의 출력이 `manual` 에서 `non-autopilot` 으로 바뀝니다.** 이 명령은 처음부터 실행 모드 조회가 아니라 **`RD_AUTOPILOT=1` 여부 판정기**였고, 출력 어휘가 그 의미와 어긋나 기본 모드가 `semi-auto` 인 프로젝트에서 시작 보고와 서로 다른 값을 말하게 되므로 어휘를 실제 의미에 맞췄습니다. 출력은 `autopilot` | `non-autopilot` 이며, 판정 로직 자체는 바뀌지 않았습니다. **이 값을 파싱하던 스크립트·문서가 있으면 `manual` 비교를 `non-autopilot` 으로 고쳐야 합니다.** 실행 모드(`manual`/`semi-auto`)를 알고 싶다면 이 명령이 아니라 `AUTONOMY.md` 의 판정 규칙을 따릅니다.
+3. **동기화가 `rd-workflow/config/workflow.json` 을 배포합니다.** 동기화 5단계 복사에서 경로가 없으면 배포본(`{"default_execution_mode": "semi-auto"}`)이 새로 놓이고, 경로가 있으면(regular file 이든 symlink 이든) 내용도 경로 종류도 손대지 않습니다. 이 복사 단계는 사용자 설정 파일의 내용을 읽어 고치거나 키를 병합하지 않습니다.
+   - **다만 전체 sync 가 이 파일을 한 바이트도 건드리지 않는다는 뜻은 아닙니다.** 이어지는 5.1 절이 같은 파일에 **`defect_report_upstream` 키 하나만** 씁니다 — 그 값이 비어 있을 때에 한하며, 이미 값이 있으면 쓰지 않습니다. `default_execution_mode` 를 포함한 다른 키와 경로 종류는 그때도 바뀌지 않으므로, 이 M012 가 약속하는 실행 모드 보존은 그대로입니다. 절차는 `rd-workflow/docs/guides/sync_template.md` 5.1 절입니다.
+
+**종전 동작을 유지하는 방법**
+
+`rd-workflow/config/workflow.json` 에 `manual` 을 **명시**합니다. 명시된 값은 이후 동기화가 덮지 않습니다.
+
+```json
+{
+  "default_execution_mode": "manual"
+}
+```
+
+**자기 프로젝트가 어느 시나리오인지 판별하는 법**
+
+```bash
+ls -l rd-workflow/config/workflow.json          # 경로 유무와 종류(regular file / symlink / 그 밖)
+cat rd-workflow/config/workflow.json            # 내용과 default_execution_mode 키 유무
+```
+
+- **경로가 없었다면** — 동기화가 배포본을 새로 둡니다. 그 결과 파일이 생기고 값은 `semi-auto` 입니다. 대부분의 기존 프로젝트가 여기에 해당합니다.
+- **파일은 있는데 `default_execution_mode` 키가 없다면** — 파일은 그대로 두고 「키 부재 기본값」으로 `semi-auto` 로 판정합니다. 종전 동작을 원하면 위 키를 직접 추가합니다.
+- **값이 `manual` 또는 `semi-auto` 로 적혀 있다면** — 그 값이 그대로 쓰입니다. 아무 조치도 필요하지 않습니다.
+- **위 어디에도 해당하지 않는다면**(JSON 이 깨졌거나, 값이 허용 범위 밖이거나, 경로가 regular file 이 아니거나, 읽거나 확인할 수 없다면) — 판정 불가로 `manual` + 경고가 납니다. 경고에 적힌 원인·경로·복구 방법을 따라 고칩니다.
+
+판정 규칙의 전체 표와 경고 문구의 최소 정보는 `rd-workflow/docs/flows/AUTONOMY.md` 가 정본입니다.

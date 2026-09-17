@@ -126,14 +126,17 @@ PATHS
 
 # lifecycle_owned_state_keys — archive 가 task-state 에서 바꾸는 키 (공백 구분 한 줄).
 #
-# **단일 출처입니다.** metadata_clear 는 fr-branch·worktree-path·source-fr 를 재설정하고
-# created-at 을 제거하며, archive.sh Step 4 는 short-title·status 를 씁니다. 이 여섯이
-# 전부입니다 (REQUEST review Turn 006 확인).
+# **단일 출처입니다.** metadata_clear 는 fr-branch·worktree-path·source-fr·base-commit·
+# review-session 을 재설정하고 created-at 을 제거하며, archive.sh Step 4 는 short-title·
+# status 를 씁니다. 이 여덟이 전부입니다.
 #
 # 발행 직전 내용 검증이 "기준선 대비 이 키들 밖에서 불변인가" 를 판정하므로, 실제 쓰기
 # 범위를 늘리면서 이 목록을 갱신하지 않으면 **정상 아카이브가 차단됩니다.**
+# base-commit·review-session 이 여기 있는 이유가 정확히 그것입니다 — metadata_clear 가
+# 두 값을 baseline 으로 되돌리는데 목록에 없으면 그 차이가 "리뷰되지 않은 내용" 으로
+# 판정됩니다 (change spec §5.3).
 lifecycle_owned_state_keys() {
-  printf '%s\n' 'fr-branch worktree-path source-fr short-title status created-at'
+  printf '%s\n' 'fr-branch worktree-path source-fr short-title status created-at base-commit review-session'
 }
 
 # archive_baseline_commit <repo_root> <fr_ref> <head_oid>
@@ -468,7 +471,12 @@ archive_publish_content_check() {
     return 2
   fi
 
-  td="$(mktemp -d)" || return 2
+  td="$(mktemp -d)" || { echo "archive_publish_content_check: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 2; }
+  [[ -n "$td" && -d "$td" ]] || { echo "archive_publish_content_check: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 2; }
+
+  # 이 함수 안의 `rm -rf "$td"` 정리 지점들에는 빈 값 방어를 따로 붙이지 않습니다 —
+  # 생성 가드가 여기 한 곳이고 모든 정리가 같은 함수 안이므로, 가드를 통과하지 않고
+  # 정리에 도달하는 경로가 없습니다.
 
   # **허용 경로 목록을 순회한다** — 목록이 구동원이다.
   # 대응 규칙이 없는 경로를 만나면 fail-closed 로 막는다. 그러지 않으면 목록에 항목을
@@ -669,19 +677,122 @@ archive_block_notice() {
   printf 'archive:   현재 상태 확인: (cd %s && git log --oneline --first-parent -10)\n' "$root" >&2
 }
 
-# metadata_clear: fr-branch=null, worktree-path=null, source-fr=- reset + created-at 줄 제거 (파일 삭제 아님)
+# metadata_clear: fr-branch=null, worktree-path=null, source-fr=-, base-commit=null,
+# review-session=null reset + created-at 줄 제거 (파일 삭제 아님)
 # legacy active-fr 파일이 잔존하면 함께 삭제 (merge 후 main에 남는 legacy 잔재 정리).
+#
+# **이 함수가 fr 관련 task-state 필드 reset 의 단일 출처입니다** (change spec §5.3).
+# base-commit(작업 시작 커밋 OID)과 review-session(final diff review 세션 포인터)은 그
+# 작업에만 의미가 있는 값이라, 여기서 되돌리지 않으면 다음 작업으로 stale 하게 넘어갑니다 —
+# 다음 세션의 리뷰 base 가 지난 작업의 시작 커밋으로 잡히고, 발행 게이트가 지난 작업의
+# seal 마커를 가리키게 됩니다. 미설정 sentinel 은 `null` 입니다
+# (state_init_defaults 와 같은 표기 — 빈 값·`-` 를 쓰면 판정이 갈라집니다).
 metadata_clear() {
   state_file_exists || return 0
-  state_write_fields "fr-branch=null" "worktree-path=null" "source-fr=-"
+  state_write_fields "fr-branch=null" "worktree-path=null" "source-fr=-" \
+    "base-commit=null" "review-session=null"
   # created-at 줄 제거 (fr 비활성 시 부재 계약)
   local tmp
-  tmp="$(mktemp "$(dirname "$TASK_STATE_PATH")/.task-state.XXXXXX")"
+  tmp="$(mktemp "$(dirname "$TASK_STATE_PATH")/.task-state.XXXXXX")" || { echo "metadata_clear: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$tmp" && -f "$tmp" ]] || { echo "metadata_clear: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   awk -F'=' '$1!="created-at"' "$TASK_STATE_PATH" > "$tmp" && mv "$tmp" "$TASK_STATE_PATH"
   # legacy active-fr 잔재 정리 (archive cleanup 커밋에 자연 포함)
   local _legacy_afr="${project_root:-$PWD}/rd-workflow-workspace/.lifecycle/active-fr"
   [[ -f "$_legacy_afr" ]] && rm -f "$_legacy_afr"
   return 0
+}
+
+# index_row_ncol: stdin 한 줄(FUTURE_REQUESTS.md 표 줄) 의 컬럼 수를 stdout 에 낸다.
+#   GFM 과 같게 **이스케이프되지 않은 `|` 로만** 센다 — 셀 본문의 `\|` 는 구분자가 아니고
+#   `\\|` 는 「본문 역슬래시 + 구분자」다. `/fr add` 규약(claude_skills/fr/add.md) 이 요약의 `|` 를
+#   `\|` 로 쓰게 하므로, 이 규칙 없이 세면 정상 등록 커밋을 비등록으로 오판해 시작 계약의
+#   자동 채택이 막힌다.
+#   **lifecycle/merge_fr_index.sh 의 xsplit() 과 같은 계약이다** — 한쪽만 고치면 등록 커밋 판정과
+#   인덱스 병합이 갈린다. 양쪽에 계약 테스트가 있다(test_lifecycle.sh / test_merge_fr_index.sh).
+index_row_ncol() {
+  awk '{ n = 1; L = length($0); for (i = 1; i <= L; i++) { c = substr($0, i, 1); if (c == "\\" && i < L) { i++; continue } if (c == "|") n++ } print n }'
+}
+
+# registration_commit_shape <commit>: FR 등록 커밋 형태 검증 (REQUEST CD (1)-9, 자동 채택 범위 A).
+#   형태 = 부모 정확히 1개 + 그 부모 대비 raw diff 가 {인덱스 M(100644), items/<date>-<slug>.md A(100644, 직접 자식),
+#   (선택) raw-captures/*-fr-<slug>[-N].md A(100644, 직접 자식)} 로만 구성 + slug 가 canonical kebab-case
+#   + 인덱스 diff 가 '+' 1줄·'-' 0줄이고 그 줄이 헤더와 같은 컬럼 수의 표 행이며 제목 컬럼 == slug, [상세] 링크 == 추가된 상세 파일명.
+#   통과 시 slug 를 stdout 에 내고 rc 0. 그 외 rc 1 (출력 없음). 커밋 메시지·작성자는 보지 않는다.
+#   helper(rd task fr-register) 가 자기 커밋을 이 함수로 검증하고, 시작 계약이 ahead 커밋을 같은 함수로 분류한다.
+#   helper 가 만드는 것보다 넓은 커밋(중첩 경로·symlink·표 아닌 줄·링크 불일치)을 자동 채택하지 않도록 좁게 본다.
+registration_commit_shape() {
+  local c="$1" idx="rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
+  local items="rd-workflow-workspace/backlog/items" caps="rd-workflow-workspace/raw-captures"
+  local parents n raw meta path smode dmode ssha dsha status detail="" cap="" seen_idx=0 slug base line plus=0 minus=0 row="" title link ncol_h ncol_r
+  parents="$(git rev-list --parents -n 1 "$c" 2>/dev/null)" || return 1
+  n="$(printf '%s\n' "$parents" | wc -w | tr -d ' ')"
+  [[ "$n" -eq 2 ]] || return 1
+  raw="$(git diff-tree --no-commit-id -r --raw "${c}^" "$c" 2>/dev/null)" || return 1
+  [[ -n "$raw" ]] || return 1
+  while IFS=$'\t' read -r meta path; do
+    [[ -n "$meta" ]] || continue
+    read -r smode dmode ssha dsha status <<<"${meta#:}"
+    case "$status:$path" in
+      "M:$idx") [[ "$dmode" == "100644" ]] || return 1; seen_idx=1 ;;
+      "A:$items/"*.md) [[ "$dmode" == "100644" && -z "$detail" && "${path#"$items"/}" != */* ]] || return 1; detail="$path" ;;
+      "A:$caps/"*-fr-*.md) [[ "$dmode" == "100644" && -z "$cap" && "${path#"$caps"/}" != */* ]] || return 1; cap="$path" ;;
+      *) return 1 ;;
+    esac
+  done <<EOF
+$raw
+EOF
+  [[ "$seen_idx" -eq 1 && -n "$detail" ]] || return 1
+  base="$(basename "$detail" .md)"
+  slug="${base#[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-}"
+  [[ -n "$slug" && "$slug" != "$base" ]] || return 1
+  case "$slug" in -*|*-|*[!a-z0-9-]*) return 1 ;; esac
+  if [[ -n "$cap" ]]; then
+    case "$cap" in *"-fr-${slug}.md"|*"-fr-${slug}-"[0-9]*.md) ;; *) return 1 ;; esac
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      +++*|---*|@@*) ;;
+      +*) plus=$((plus+1)); row="${line#+}" ;;
+      -*) minus=$((minus+1)) ;;
+    esac
+  done <<EOF
+$(git diff --unified=0 "${c}^" "$c" -- "$idx" 2>/dev/null)
+EOF
+  [[ "$plus" -eq 1 && "$minus" -eq 0 ]] || return 1
+  case "$row" in \|*\|) ;; *) return 1 ;; esac
+  ncol_h="$(git show "${c}:${idx}" 2>/dev/null | awk '/^\|/ { print; exit }' | index_row_ncol)"
+  ncol_r="$(printf '%s\n' "$row" | index_row_ncol)"
+  [[ -n "$ncol_h" && "$ncol_h" == "$ncol_r" ]] || return 1
+  title="$(printf '%s\n' "$row" | awk -F'|' '{ t = $3; gsub(/^[ \t]+|[ \t]+$/, "", t); print t }')"
+  [[ "$title" == "$slug" ]] || return 1
+  link="$(printf '%s\n' "$row" | sed -n 's/.*\[상세\](items\/\([^)]*\.md\)).*/\1/p')"
+  [[ "$link" == "$(basename "$detail")" ]] || return 1
+  printf '%s\n' "$slug"
+}
+
+# classify_ahead_commits <local-ref> <upstream-ref>: 시작 계약 4항 판정 (WORKFLOW.md).
+#   stdout 한 줄: ahead=<N> behind=<K> registration=<M> decision=<...>
+#   decision: synchronized | auto-adopt (K=0, N>0, 모든 ahead 커밋이 등록 커밋 형태) | handover-ahead |
+#             handover-behind | handover-diverged | no-upstream. git 오류는 rc 2.
+classify_ahead_commits() {
+  local local_ref="$1" up="${2:-}" ahead behind reg=0 sha decision
+  if [[ -z "$up" ]] || ! git rev-parse -q --verify "${up}^{commit}" >/dev/null 2>&1; then
+    printf 'ahead=0 behind=0 registration=0 decision=no-upstream\n'; return 0
+  fi
+  ahead="$(git rev-list --count "${up}..${local_ref}" 2>/dev/null)" || return 2
+  behind="$(git rev-list --count "${local_ref}..${up}" 2>/dev/null)" || return 2
+  while IFS= read -r sha; do
+    [[ -n "$sha" ]] || continue
+    registration_commit_shape "$sha" >/dev/null 2>&1 && reg=$((reg+1))
+  done <<EOF
+$(git rev-list "${up}..${local_ref}" 2>/dev/null)
+EOF
+  if [[ "$ahead" -eq 0 && "$behind" -eq 0 ]]; then decision=synchronized
+  elif [[ "$behind" -gt 0 && "$ahead" -gt 0 ]]; then decision=handover-diverged
+  elif [[ "$behind" -gt 0 ]]; then decision=handover-behind
+  elif [[ "$reg" -eq "$ahead" ]]; then decision=auto-adopt
+  else decision=handover-ahead; fi
+  printf 'ahead=%s behind=%s registration=%s decision=%s\n' "$ahead" "$behind" "$reg" "$decision"
 }
 
 # metadata_exists: fr-branch 값이 비어있지 않고 null이 아니면 참 (파일 존재 여부가 아님)
@@ -729,6 +840,134 @@ main
 ## Notes
 -
 EOF
+}
+
+# === loop-guard state (safeguard-autopilot-loop-detection) ===
+LOOP_STATE_PATH="${LOOP_STATE_PATH:-rd-workflow-workspace/.lifecycle/loop-state}"
+
+# 키 검증: [A-Za-z0-9_:./-]+ 만 허용 (개행 / '=' 금지)
+_loop_state_valid_key() {
+  case "$1" in
+    "" ) return 1 ;;
+    *[!A-Za-z0-9_:./-]* ) return 1 ;;
+    * ) return 0 ;;
+  esac
+}
+
+# loop_state_get <key> → stdout 정수 (미존재 0)
+loop_state_get() {
+  local key="$1" v
+  [[ -f "$LOOP_STATE_PATH" ]] || { printf '0\n'; return 0; }
+  v="$(awk -F'=' -v k="$key" '$1==k{print $2; exit}' "$LOOP_STATE_PATH")"
+  if [[ "$v" =~ ^[0-9]+$ ]]; then printf '%s\n' "$v"; else printf '0\n'; fi
+}
+
+# loop_state_record <key> <incr|reset>
+loop_state_record() {
+  local key="$1" op="$2" cur new tmp
+  if ! _loop_state_valid_key "$key"; then
+    printf 'loop_state_record: invalid key: %s\n' "$key" >&2; return 1
+  fi
+  cur="$(loop_state_get "$key")"
+  case "$op" in
+    incr) new=$((cur + 1)) ;;
+    reset) new=0 ;;
+    *) printf 'loop_state_record: unknown op: %s\n' "$op" >&2; return 1 ;;
+  esac
+  mkdir -p "$(dirname "$LOOP_STATE_PATH")"
+  tmp="$(mktemp "$(dirname "$LOOP_STATE_PATH")/.loop-state.XXXXXX")" || { echo "loop_state_record: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$tmp" && -f "$tmp" ]] || { echo "loop_state_record: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  if [[ -f "$LOOP_STATE_PATH" ]]; then
+    awk -F'=' -v k="$key" -v val="$new" '
+      $1==k {print k"="val; found=1; next}
+      {print}
+      END{if(!found) print k"="val}
+    ' "$LOOP_STATE_PATH" > "$tmp"
+  else
+    printf '%s=%s\n' "$key" "$new" > "$tmp"
+  fi
+  mv "$tmp" "$LOOP_STATE_PATH"
+}
+
+# within-attempt 키만 제거 (verify-fail::, reedit::). rollback:: 보존.
+loop_state_clear_attempt() {
+  local tmp
+  [[ -f "$LOOP_STATE_PATH" ]] || return 0
+  tmp="$(mktemp "$(dirname "$LOOP_STATE_PATH")/.loop-state.XXXXXX")" || { echo "loop_state_clear_attempt: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$tmp" && -f "$tmp" ]] || { echo "loop_state_clear_attempt: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  awk -F'=' '$1 !~ /^(verify-fail::|reedit::)/' "$LOOP_STATE_PATH" > "$tmp"
+  mv "$tmp" "$LOOP_STATE_PATH"
+}
+
+# 전체 상태 제거 (FR 종결)
+loop_state_clear_all() {
+  [[ -f "$LOOP_STATE_PATH" ]] && rm -f "$LOOP_STATE_PATH"
+  return 0
+}
+
+LOOP_GUARD_CONFIG="${LOOP_GUARD_CONFIG:-rd-workflow/config/loop-guard.json}"
+
+# enabled (default true). enabled=false면 return 1
+loop_guard_enabled() {
+  local v
+  if [[ -f "$LOOP_GUARD_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
+    v="$(jq -r '.enabled' "$LOOP_GUARD_CONFIG" 2>/dev/null || echo true)"
+    [[ "$v" == "false" ]] && return 1
+  fi
+  return 0
+}
+
+# loop_guard_threshold <signal> → 정수 (기본 3)
+loop_guard_threshold() {
+  local signal="$1" v
+  if [[ -f "$LOOP_GUARD_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
+    v="$(jq -r --arg s "$signal" '.thresholds[$s] // empty' "$LOOP_GUARD_CONFIG" 2>/dev/null || true)"
+    if [[ "$v" =~ ^[0-9]+$ ]]; then printf '%s\n' "$v"; return 0; fi
+  fi
+  printf '3\n'
+}
+
+# loop_guard_check [slug] → 임계 초과 시 사유 stdout + return 1, 아니면 return 0
+# slug 미지정 시 metadata short-title 사용. slug 없으면 판정 대상 없음 → return 0.
+# 현재 slug 키만 판정한다 (FR scoping — Reviewer turn 002 Finding 1).
+loop_guard_check() {
+  loop_guard_enabled || return 0
+  [[ -f "$LOOP_STATE_PATH" ]] || return 0
+  local slug="${1:-}"
+  [[ -z "$slug" ]] && slug="$(metadata_read_field short-title 2>/dev/null || true)"
+  [[ -z "$slug" || "$slug" == "-" ]] && return 0
+  local th_vf th_rb th_re half max_vf=0 reasons="" k v
+  th_vf="$(loop_guard_threshold verify_fail)"
+  th_rb="$(loop_guard_threshold rollback)"
+  th_re="$(loop_guard_threshold reedit)"
+  half=$(( (th_vf + 1) / 2 ))   # ceil(th_vf/2)
+  local vf_pfx="verify-fail::${slug}::" re_pfx="reedit::${slug}::" rb_key="rollback::${slug}"
+  # 1패스: 현재 slug 의 verify-fail / rollback
+  while IFS='=' read -r k v; do
+    [[ "$v" =~ ^[0-9]+$ ]] || continue
+    case "$k" in
+      "$vf_pfx"*)
+        if (( v > max_vf )); then max_vf=$v; fi
+        if (( v >= th_vf )); then reasons="${reasons}검증 연속 실패 ${k#"$vf_pfx"}=$v (임계 $th_vf)"$'\n'; fi
+        ;;
+      "$rb_key")
+        if (( v >= th_rb )); then reasons="${reasons}반복 rollback ${slug}=$v (임계 $th_rb)"$'\n'; fi
+        ;;
+    esac
+  done < "$LOOP_STATE_PATH"
+  # 2패스: 현재 slug 의 reedit 결합 조건 (reedit≥임계 AND max verify-fail ≥ ceil(임계/2))
+  while IFS='=' read -r k v; do
+    [[ "$v" =~ ^[0-9]+$ ]] || continue
+    case "$k" in
+      "$re_pfx"*)
+        if (( v >= th_re )) && (( max_vf >= half )); then
+          reasons="${reasons}동일 파일 churn ${k#"$re_pfx"}=$v (임계 $th_re) + 검증 실패 동반"$'\n'
+        fi
+        ;;
+    esac
+  done < "$LOOP_STATE_PATH"
+  if [[ -n "$reasons" ]]; then printf '%s' "$reasons"; return 1; fi
+  return 0
 }
 
 # Claude Code 가 설치하는 .git/hooks/pre-commit 은 브랜치명이 main|master 일 때만 커밋을

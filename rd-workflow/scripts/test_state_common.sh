@@ -42,7 +42,8 @@ t_fail_rc() { # t_fail_rc <설명> <기대exit> cmd...
 }
 
 # sandbox 구성 ---------------------------------------------------------------
-TMP="$(mktemp -d)"
+TMP="$(mktemp -d)" || { echo "test_state_common.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$TMP" && -d "$TMP" ]] || { echo "test_state_common.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 
 export project_root="$TMP"
@@ -558,9 +559,13 @@ mkdir -p "$RES_ITEMS"
 : > "${RES_ITEMS}/2026-02-02-dup.md"
 mkdir -p "${RES_ITEMS}/2026-03-03-dir.md"
 : > "${RES_ITEMS}/2026-04-04-paren(x).md"
+: > "${RES_ITEMS}/2026-05-05-beta.md"
+: > "${RES_ITEMS}/2026-06-06-a|b.md"
 
 CANON="rd-workflow-workspace/backlog/items/2026-08-12-alpha.md"
 PAREN="rd-workflow-workspace/backlog/items/2026-04-04-paren(x).md"
+BETA="rd-workflow-workspace/backlog/items/2026-05-05-beta.md"
+PIPED="rd-workflow-workspace/backlog/items/2026-06-06-a|b.md"
 
 # --- 지원 표기 8종 (AC2) ---
 t_out "resolve: canonical 그대로" "$CANON" \
@@ -683,6 +688,140 @@ rd-workflow-workspace/backlog/items/2026-08-03-x.md
 REQEOF
 t_out "from_request: 주석 뒤 값 추출" "rd-workflow-workspace/backlog/items/2026-08-03-x.md" \
   source_fr_from_request "$REQ_FIX"
+
+# ---------------------------------------------------------------------------
+# source-fr 복수 표현 — resolve_list / join / split / 미러 집합 비교
+# final diff review F6 — 미러의 허용 표기('- ' 접두) 를 정규화하지 않으면 권위와
+# 같은 FR 인데도 다른 값으로 읽혀 정상 상태가 divergence 로 차단된다.
+_f6_dir="$(mktemp -d)" || { echo "test_state_common.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$_f6_dir" && -d "$_f6_dir" ]] || { echo "test_state_common.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+printf '## Source FR\n- rd-workflow-workspace/backlog/items/2026-01-01-a.md\n-   rd-workflow-workspace/backlog/items/2026-02-02-b.md\n' > "$_f6_dir/mirror.md"
+_f6_read="$(source_fr_mirror_read "$_f6_dir/mirror.md")"
+[[ "$_f6_read" == "$(printf 'rd-workflow-workspace/backlog/items/2026-01-01-a.md\nrd-workflow-workspace/backlog/items/2026-02-02-b.md')" ]] \
+  && echo "ok: F6 미러 읽기가 '- ' 접두·공백을 벗긴다" \
+  || { echo "FAIL: F6 미러 읽기 정규화 실패 ('${_f6_read}')"; FAIL=1; }
+source_fr_mirror_set_equal "$_f6_read" "$(printf 'rd-workflow-workspace/backlog/items/2026-02-02-b.md\nrd-workflow-workspace/backlog/items/2026-01-01-a.md')" \
+  && echo "ok: F6 접두·순서 차이가 있어도 같은 집합으로 판정" \
+  || { echo "FAIL: F6 거짓 divergence"; FAIL=1; }
+# (task-guard-source-fr-contract change spec §2.3·§2.3b, plan Phase1 T1)
+# ---------------------------------------------------------------------------
+
+# 케이스 1: 복수 왕복 — 3건 join → split → 같은 집합
+# 없으면: 직렬화·역직렬화가 어긋나 task-state 의 경로가 깨진다.
+_c1_list="$(source_fr_resolve_list "$CANON
+$PAREN
+$BETA" "$RES_ROOT")"
+_c1_joined="$(source_fr_join "$_c1_list")"
+_c1_split="$(source_fr_split "$_c1_joined" "$RES_ROOT")"
+if source_fr_mirror_set_equal "$_c1_list" "$_c1_split"; then
+  echo "ok: 복수 왕복 — 3건 join → split → 같은 집합"
+else
+  echo "FAIL: 복수 왕복 — join='$_c1_joined' split='$_c1_split' list='$_c1_list'"; FAIL=1
+fi
+
+# 케이스 2: 단일 값 하위 호환 — 기존 source-fr=<path> split → 원소 1개
+# 없으면: 기존 task-state 파일 전부가 해석 실패로 떨어진다.
+t_out "단일 값 하위 호환: split(canonical 단일) → 원소 1개" "$CANON" \
+  source_fr_split "$CANON" "$RES_ROOT"
+
+# 케이스 3: 중복·순서 — 같은 FR 의 2종 표기 포함 → 축약 + 첫 등장 순서
+# 없으면: 대표(첫 원소)가 흔들려 단일 값 소비처가 다른 FR 을 가리킨다.
+_c3_list="$(source_fr_resolve_list "$CANON
+items/2026-08-12-alpha.md
+$BETA" "$RES_ROOT")"
+t_out "중복·순서: 같은 FR 2종 표기 → 축약 + 첫 등장 순서" "$CANON
+$BETA" printf '%s' "$_c3_list"
+
+# 케이스 4: 부재 FR 혼합 → return 1 · stdout 없음 · 실패 항목 전부 열거
+# 없으면: 일부만 저장된 채 전부 등록됐다고 믿는 상태가 된다.
+_c4_out="$(source_fr_resolve_list "$CANON
+nosuch-one
+nosuch-two" "$RES_ROOT" 2>/dev/null)"
+_c4_rc=$?
+_c4_err="$(source_fr_resolve_list "$CANON
+nosuch-one
+nosuch-two" "$RES_ROOT" 2>&1 1>/dev/null)"
+if [[ "$_c4_rc" == "1" && -z "$_c4_out" ]]; then
+  echo "ok: 부재 FR 혼합 → return 1 · stdout 없음"
+else
+  echo "FAIL: 부재 FR 혼합 rc=$_c4_rc out='$_c4_out'"; FAIL=1
+fi
+case "$_c4_err" in
+  *"nosuch-one"*"nosuch-two"*|*"nosuch-two"*"nosuch-one"*)
+    echo "ok: 부재 FR 혼합 → 실패 항목 전부(2건) 열거" ;;
+  *) echo "FAIL: 부재 FR 혼합 stderr 에 실패 항목이 전부 없음 (got: $_c4_err)"; FAIL=1 ;;
+esac
+
+# 케이스 5: 레이블에 '|' 가 있는 괄호 표기 1건 → 원소 1개로 정규화
+# 없으면: 기존 유효 입력(괄호 레이블 안의 '|')이 두 항목으로 찢어진다 (리뷰 F4).
+t_out "레이블 '|' 포함 괄호 표기 → 원소 1개 정규화" "$CANON" \
+  source_fr_resolve_list "A|B (${CANON})" "$RES_ROOT"
+
+# 케이스 6: '|' 포함 canonical 경로 1건 → join 통과(값 그대로) → split 원소 1개
+# 없으면: 기존 단일 FR 의 재설정·복구 경로가 막힌다 (리뷰 F8).
+t_out "'|' 포함 canonical 1건 → join 통과(값 그대로)" "$PIPED" \
+  source_fr_join "$PIPED"
+t_out "'|' 포함 canonical 1건 → split 원소 1개" "$PIPED" \
+  source_fr_split "$PIPED" "$RES_ROOT"
+
+# 케이스 7: '|' 포함 경로가 다른 1건과 함께 → join 거부 · 상태 보존
+# 없으면: 되읽을 수 없는 값이 저장되어 두 경로로 찢어진다.
+t "'|' 포함 경로 + 다른 1건 → join 거부" 1 \
+  source_fr_join "$PIPED
+$BETA"
+
+# 케이스 8: 미러 집합 비교 — 순서·표기만 다른 목록은 동일 판정
+# 없으면: 거짓 divergence 로 promote rerun 이 막힌다.
+if source_fr_mirror_set_equal "$CANON
+$BETA" "$BETA
+$CANON"; then
+  echo "ok: 미러 집합 비교 — 순서만 다른 목록 동일 판정"
+else
+  echo "FAIL: 미러 집합 비교 — 순서만 다른 목록을 다르다고 판정"; FAIL=1
+fi
+if ! source_fr_mirror_set_equal "$CANON
+$BETA" "$CANON
+$PAREN"; then
+  echo "ok: 미러 집합 비교 — 실제로 다른 목록은 다르다고 판정"
+else
+  echo "FAIL: 미러 집합 비교 — 다른 목록을 같다고 오판"; FAIL=1
+fi
+
+# --- source_fr_from_request_list — 모든 유효행 (첫 행만 읽는 기존 함수와 구분) ---
+cat > "$REQ_FIX" <<REQEOF
+## Source FR
+<!-- 형식 안내 -->
+- ${CANON}
+${BETA}
+-
+REQEOF
+# '- ' 리스트 접두는 여기서 벗기지 않는다 — source_fr_from_request(첫 행) 와 같은 동작이며,
+# 접두 제거는 source_fr_resolve(_list) 의 단계 0 책임이다(§2.3 raw 정규화 분리).
+t_out "from_request_list: 여러 유효행 + '-' 제외" "- $CANON
+$BETA" source_fr_from_request_list "$REQ_FIX"
+
+# --- 복구 안내 문자열 helper — 두 형태가 서로 다른 문법을 낸다 (§2.4b, 리뷰 F7) ---
+_rec_pos="$(source_fr_recovery_cmd_positional "$CANON
+$BETA")"
+case "$_rec_pos" in
+  "rd task set-source-fr "*"$CANON"*"$BETA"*)
+    echo "ok: 복구 안내(positional) — set-source-fr 위치 인자 반복" ;;
+  *) echo "FAIL: 복구 안내(positional) 형식 불일치 (got: $_rec_pos)"; FAIL=1 ;;
+esac
+_rec_opt="$(source_fr_recovery_cmd_repeat_opt "promote.sh --size large" "$CANON
+$BETA")"
+case "$_rec_opt" in
+  "promote.sh --size large --source-fr "*"--source-fr"*)
+    echo "ok: 복구 안내(repeat-opt) — --source-fr 반복 지정" ;;
+  *) echo "FAIL: 복구 안내(repeat-opt) 형식 불일치 (got: $_rec_opt)"; FAIL=1 ;;
+esac
+_rec_bad="$(source_fr_recovery_cmd_positional "nosuch-file.md" 2>/dev/null)"
+_rec_bad_rc=$?
+if [[ "$_rec_bad_rc" == "1" && -z "$_rec_bad" ]]; then
+  echo "ok: 복구 안내(positional) — 값 계약 실패 항목 있으면 빈 출력 + return 1"
+else
+  echo "FAIL: 복구 안내(positional) 실패 처리 (rc=$_rec_bad_rc out='$_rec_bad')"; FAIL=1
+fi
 
 # ===========================================================================
 # 최종 결과

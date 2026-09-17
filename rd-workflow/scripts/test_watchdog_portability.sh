@@ -185,7 +185,8 @@ child_alive() {  # $1: child.pid 경로
 #   stubborn_child   : TERM 을 무시하는 자식 (escalation 검증)
 make_sandbox() {
   local kind="$1" sb
-  sb="$(mktemp -d)"
+  sb="$(mktemp -d)" || { echo "test_watchdog_portability.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$sb" && -d "$sb" ]] || { echo "test_watchdog_portability.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   mkdir -p "$sb/turns" "$sb/mock_bin" "$sb/tmp"
   printf '## Current Owner\nAuthor\n\n## Status\nawaiting-author\n\n## Turn Limit\n20\n' > "$sb/SESSION.md"
   {
@@ -261,7 +262,7 @@ fi
 
 # --- 1. 고아 타이머 자손 0개 (AC1) ---
 # 검출도 소유권 근거로 한다: 어댑터 종료 후 그 판정 그룹에 남은 구성원이 곧 고아다.
-sb="$(make_sandbox quick)"
+sb="$(make_sandbox quick)" || { bad "sandbox 생성 실패: 1. 고아 타이머 자손 0개(AC1)"; exit 1; }
 spawn_group "$sb/o.log" run_adapter "$sb" "$T_ORPHAN" env TMPDIR="$sb/tmp"
 g="$GROUP_PGID"
 wait "$JOB" 2>/dev/null
@@ -280,7 +281,7 @@ reap_owned "$sb" "$g"
 drop_sandbox "$sb"
 
 # --- 2. 호출자 파이프 EOF (AC2) ---
-sb="$(make_sandbox quick)"
+sb="$(make_sandbox quick)" || { bad "sandbox 생성 실패: 2. 호출자 파이프 EOF(AC2)"; exit 1; }
 spawn_group "$sb/wrap.log" piped_body "$sb" "$T_PIPE"
 job="$JOB"; g="$GROUP_PGID"
 w=0
@@ -297,7 +298,7 @@ drop_sandbox "$sb"
 # --- 3. 타임아웃 경로 exit 124 + 누수 0 (계측 status 매핑 계약 + AC4) ---
 # WAIT_TIMEOUT 은 실제로 발화해야 하므로 짧은 값(3)을 쓴다. 정리는 값이 아니라
 # 판정 그룹으로 하므로 흔한 값이어도 무관한 프로세스에 닿지 않는다.
-sb="$(make_sandbox hang)"
+sb="$(make_sandbox hang)" || { bad "sandbox 생성 실패: 3. 타임아웃 경로(AC4)"; exit 1; }
 spawn_group "$sb/o.log" run_adapter "$sb" 3 env TMPDIR="$sb/tmp"
 g="$GROUP_PGID"
 wait "$JOB" 2>/dev/null
@@ -317,7 +318,7 @@ drop_sandbox "$sb"
 # chmod 000 은 쓰지 않는다 — fifo 경로가 per-run 고유라 사전 지정 불가이고 root 가 mode 를 우회한다.
 i=4
 for mode in exit1 makedir; do
-  sb="$(make_sandbox quick)"
+  sb="$(make_sandbox quick)" || { bad "sandbox 생성 실패: 4·5. startup 실패 — mode=${mode}"; exit 1; }
   shim="$sb/shim"; mkdir -p "$shim"
   if [ "$mode" = "exit1" ]; then
     printf '#!/usr/bin/env bash\nexit 1\n' > "$shim/mkfifo"
@@ -346,7 +347,7 @@ for mode in exit1 makedir; do
 done
 
 # --- 6·7. TMPDIR 두 경로 (AC10) ---
-sb="$(make_sandbox quick)"
+sb="$(make_sandbox quick)" || { bad "sandbox 생성 실패: 6. TMPDIR 미설정(AC10-1)"; exit 1; }
 spawn_group "$sb/o.log" run_adapter "$sb" "$T_QUICK" env -u TMPDIR
 g="$GROUP_PGID"
 wait "$JOB" 2>/dev/null
@@ -359,7 +360,7 @@ else
 fi
 drop_sandbox "$sb"
 
-sb="$(make_sandbox quick)"
+sb="$(make_sandbox quick)" || { bad "sandbox 생성 실패: 7. TMPDIR 사용자 지정(AC10-2)"; exit 1; }
 spawn_group "$sb/o.log" run_adapter "$sb" "$T_QUICK" env TMPDIR="$sb/tmp"
 g="$GROUP_PGID"
 wait "$JOB" 2>/dev/null
@@ -379,7 +380,7 @@ drop_sandbox "$sb"
 # bash 3.2 의 서브셸에서 $$ 는 부모 PID 이므로(BASHPID 없음) launcher 프로세스를 쓴다.
 # codex 실행 sentinel 을 게이트로 확인한다 — sentinel 이 없으면 codex 가 아예 시작되지 않은
 # 경로이므로 rc·잔존·파이프가 모두 정상으로 보여 위양성이 된다.
-sb="$(make_sandbox hang_with_child)"
+sb="$(make_sandbox hang_with_child)" || { bad "sandbox 생성 실패: 8. TERM 계약(AC9)"; exit 1; }
 cat > "$sb/launch.sh" <<LAUNCH
 #!/usr/bin/env bash
 echo \$\$ > "$sb/adapter.pid"
@@ -426,7 +427,7 @@ for kind in hang_with_child exit_with_child stubborn_child; do
     exit_with_child) wt="$T_EXIT"; label="codex 정상 종료 후 자손 잔존" ;;
     stubborn_child)  wt=3;         label="TERM 무시 자손 escalation" ;;
   esac
-  sb="$(make_sandbox "$kind")"
+  sb="$(make_sandbox "$kind")" || { bad "sandbox 생성 실패: ${kind}(I8 codex 자손 lifecycle)"; exit 1; }
   spawn_group "$sb/wrap.log" piped_body "$sb" "$wt"
   job="$JOB"; g="$GROUP_PGID"
   k=0

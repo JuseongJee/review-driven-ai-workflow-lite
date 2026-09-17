@@ -1,0 +1,4 @@
+{
+  "default_execution_mode": "semi-auto",
+  "stale_behind_threshold": 20
+}

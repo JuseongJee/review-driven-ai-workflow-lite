@@ -20,6 +20,8 @@
 | prompts/review/ | 리뷰 평가 프롬프트 |
 | guides/setup.md | 초기 설정 가이드 (수동) |
 | guides/setup_with_claude.md | Claude 실행 설치 가이드 (권장) |
+| [guides/team-overlay-fresh-install.md](guides/team-overlay-fresh-install.md) | 팀 프로젝트 개인 설치 (submodule 구조) |
+| [guides/team-overlay-migration.md](guides/team-overlay-migration.md) | 기존 설치를 submodule 구조로 이관 |
 
 ## rd-workflow-workspace/
 
@@ -51,7 +53,7 @@
 |------|------|
 | workflow-router | 다음 단계 라우팅 |
 | request-to-reviewed-plan | 요청 → 리뷰된 plan |
-| small-task-implement | 작은 작업 바로 실행 |
+| small-task-implement | `standard` 등급 바로 실행 |
 | final-diff-review | 최종 diff 리뷰 |
 | fr | Future Request 관리 |
 | autopilot | 자율 파이프라인 실행 |

@@ -109,54 +109,329 @@ is_review_session_resolved() {
   return 0
 }
 
-# archive review precheck (3c) — 종결이거나 force-skip이면 진행, 아니면 차단. force-skip 시 audit append.
-# fr_branch_ref 가 주어지면 그 ref tip 의 세션을 검증 (merge 전, main 워킹트리 비의존).
-# 사용: archive_review_precheck <force_skip 0|1> <reason> <slug> <audit_log> [fr_branch_ref]. return 0=진행, 1=차단.
+# ---------------------------------------------------------------------------
+# 종결 마커 strict 검증 (change-spec §3.1·§3.3) — canonical 단일 출처
+# ---------------------------------------------------------------------------
+# 검증 규칙을 여기 한 곳에만 둡니다. `rd` 는 `_task_common.sh` 를 통해 이 파일을 source 해
+# 같은 함수를 부르고, 자체 구현을 두지 않습니다 — 규칙이 두 곳에 있으면 「`rd task status`
+# 는 발행 가능이라는데 `archive.sh` 가 막는」 어긋난 상태가 생깁니다 (spec §4.4).
+#
+# 판정 헬퍼는 `_state_common.sh` 의 T1 함수(`rd_repo_root`·`rd_resolve_commit_oid`·
+# `rd_protected_tree_hash`·`rd_branch_mode`·`state_read_review_session`) 를 재사용하며
+# 같은 판정을 다시 구현하지 않습니다.
+
+RD_SEAL_SCHEMA="1"
+# 마커 필수 필드 (§3.1). 공백 구분 — bash 3.2 라 연관배열을 쓰지 않습니다.
+RD_SEAL_REQUIRED_FIELDS="schema session-id review-type tree-hash head branch-mode fr-branch rd-version verified sealed-at"
+RD_SEAL_REL_DIR="rd-workflow-workspace/.lifecycle/review-seals"
+RD_SEAL_REL_STATE="rd-workflow-workspace/.lifecycle/task-state"
+RD_SEAL_AUDIT_REL="rd-workflow-workspace/.lifecycle/review-skip-audit.log"
+
+_rd_seal_dir() { printf '%s\n' "${project_root}/${RD_SEAL_REL_DIR}"; }
+
+# _rd_kv_get <file> <key> — key=value 파일에서 첫 값 출력 (부재 시 빈 출력)
+_rd_kv_get() {
+  [[ -f "$1" ]] || return 0
+  awk -F'=' -v k="$2" '$1==k{sub(/^[^=]+=/,""); print; exit}' "$1"
+}
+
+# _rd_version — rd-workflow VERSION (§8 self-modification 경고용). 부재 시 unknown.
+_rd_version() {
+  local f="${project_root}/rd-workflow/VERSION" v=""
+  [[ -f "$f" ]] && v="$(head -n 1 "$f" | tr -d '[:space:]')"
+  printf '%s\n' "${v:-unknown}"
+}
+
+# 검증 결과 전역 (§4.4 의 복구 안내가 사유마다 다르므로 kind 를 합치지 않습니다)
+#   RD_SEAL_FAIL_KIND — missing | hash-mismatch | pointer-missing | malformed | hash-error
+#   RD_SEAL_FAIL_MSG  — §3.3 표의 문구 그대로
+#   RD_SEAL_VERIFIED  — 성공 시 yes | legacy-unverified
+#   RD_SEAL_SESSION_ID — 포인터가 해석된 경우의 session-id (audit 기록용)
+RD_SEAL_FAIL_KIND=""
+RD_SEAL_FAIL_MSG=""
+RD_SEAL_VERIFIED=""
+RD_SEAL_SESSION_ID=""
+# 검증이 통과한 **보호 트리 해시**입니다. 발행 직전 재결속(archive.sh Step 4.6) 이 이 값을
+# 소비하므로, 성공했을 때만 채우고 실패·미실행 시에는 빈 값으로 남깁니다.
+RD_SEAL_TREE_HASH=""
+
+_rd_seal_fail() {
+  RD_SEAL_FAIL_KIND="$1"
+  RD_SEAL_FAIL_MSG="$2"
+  return 1
+}
+
+# _rd_seal_pointer_check <값> — review-session 값 계약 (경로 이탈 거부, §3.3)
+#   0 = 유효 / 1 = 미설정 / 2 = 경로 이탈
+_rd_seal_pointer_check() {
+  local v="${1-}"
+  case "$v" in
+    ""|null|-) return 1 ;;
+    */*|*\\*|.|..) return 2 ;;
+  esac
+  return 0
+}
+
+# rd_seal_verify <worktree|commit> [판정 대상 commit] [fr-branch 값]
+#
+#   return 0 — 유효. `RD_SEAL_VERIFIED` 에 verified 값(yes|legacy-unverified) 을,
+#              `RD_SEAL_TREE_HASH` 에 검증이 통과한 보호 트리 해시를 담습니다.
+#   return 1 — 무효. `RD_SEAL_FAIL_KIND`·`RD_SEAL_FAIL_MSG` 를 채웁니다.
+#
+# **source 인자 분리가 계약입니다 (§4.4).** 게이트(`archive_review_precheck`)는 언제나
+# `commit` 으로 §3.3.1 의 판정 대상 commit 을 읽고, `rd task status` 만 워킹트리를 추가로
+# 봅니다. 워킹트리를 게이트 판정에 넣으면 「fr 브랜치에 커밋 → 기본 브랜치로 switch →
+# archive.sh」 표준 흐름이 깨집니다.
+#
+# fr-branch 값은 **판정 입력이 아니라 판정 대상을 찾는 값**이므로(§3.3.1 의 유일한 예외)
+# 호출자가 넘깁니다. 생략하면 워킹트리 task-state 에서 읽습니다.
+rd_seal_verify() {
+  local src="${1-}" target="${2-}" fr_in="${3-}"
+  RD_SEAL_FAIL_KIND=""; RD_SEAL_FAIL_MSG=""; RD_SEAL_VERIFIED=""; RD_SEAL_SESSION_ID=""
+  RD_SEAL_TREE_HASH=""
+  local root sid tmp rc content_ok=0
+  root="$(rd_repo_root)" || { _rd_seal_fail "hash-error" "repo root 를 찾을 수 없습니다 — 판정 불가"; return 1; }
+
+  # --- 1) review-session 포인터 (§3.3 — 디렉터리 탐색 금지, 이 값 하나만 씁니다) ---
+  if [[ "$src" == "commit" ]]; then
+    tmp="$(mktemp "${TMPDIR:-/tmp}/rd-seal-state.XXXXXX")" \
+      || { _rd_seal_fail "hash-error" "mktemp 실패 — 판정 불가"; return 1; }
+    if ! git -C "$root" show "${target}:${RD_SEAL_REL_STATE}" > "$tmp" 2>/dev/null; then
+      rm -f "$tmp"
+      { _rd_seal_fail "pointer-missing" \
+        "final diff review 세션이 지정되지 않았습니다 — prepare_review_pipeline.sh diff 로 세션을 만드십시오"; return 1; }
+    fi
+    sid="$(_rd_kv_get "$tmp" "review-session")"
+    rm -f "$tmp"
+    _rd_seal_pointer_check "$sid"; rc=$?
+  else
+    sid="$(state_read_review_session 2>/dev/null)"; rc=$?
+  fi
+  if [[ "$rc" == "2" ]]; then
+    { _rd_seal_fail "malformed" "review-session 값에 경로 구분자나 '..' 가 있습니다: '${sid}'"; return 1; }
+  fi
+  if [[ "$rc" != "0" || -z "$sid" ]]; then
+    { _rd_seal_fail "pointer-missing" \
+      "final diff review 세션이 지정되지 않았습니다 — prepare_review_pipeline.sh diff 로 세션을 만드십시오"; return 1; }
+  fi
+  RD_SEAL_SESSION_ID="$sid"
+
+  # --- 2) 마커 파일 존재 (handoffs/ 를 보지 않습니다 — 마커 하나만 읽습니다) ---
+  tmp="$(mktemp "${TMPDIR:-/tmp}/rd-seal-marker.XXXXXX")" \
+    || { _rd_seal_fail "hash-error" "mktemp 실패 — 판정 불가"; return 1; }
+  if [[ "$src" == "commit" ]]; then
+    git -C "$root" show "${target}:${RD_SEAL_REL_DIR}/${sid}.seal" > "$tmp" 2>/dev/null && content_ok=1
+  else
+    [[ -f "$(_rd_seal_dir)/${sid}.seal" ]] && cat "$(_rd_seal_dir)/${sid}.seal" > "$tmp" 2>/dev/null && content_ok=1
+  fi
+  if [[ "$content_ok" != "1" ]]; then
+    rm -f "$tmp"
+    { _rd_seal_fail "missing" "마커 없음 — rd review seal <세션> 을 먼저 실행하세요"; return 1; }
+  fi
+
+  # --- 3) schema / 필수 필드 / session-id / review-type / branch / verified ---
+  local schema missing="" f v m_sid m_type m_mode m_fr m_hash m_verified m_version
+  schema="$(_rd_kv_get "$tmp" "schema")"
+  if [[ "$schema" != "$RD_SEAL_SCHEMA" ]]; then
+    rm -f "$tmp"
+    { _rd_seal_fail "malformed" "마커 schema 미지원 (파일=${schema:-<없음>}, 지원=${RD_SEAL_SCHEMA})"; return 1; }
+  fi
+  for f in $RD_SEAL_REQUIRED_FIELDS; do
+    v="$(_rd_kv_get "$tmp" "$f")"
+    [[ -z "$v" ]] && missing="${missing:+${missing}, }${f}"
+  done
+  if [[ -n "$missing" ]]; then
+    rm -f "$tmp"
+    { _rd_seal_fail "malformed" "마커 형식 오류 — 누락 필드: ${missing}"; return 1; }
+  fi
+  m_sid="$(_rd_kv_get "$tmp" "session-id")"
+  m_type="$(_rd_kv_get "$tmp" "review-type")"
+  m_mode="$(_rd_kv_get "$tmp" "branch-mode")"
+  m_fr="$(_rd_kv_get "$tmp" "fr-branch")"
+  m_hash="$(_rd_kv_get "$tmp" "tree-hash")"
+  m_verified="$(_rd_kv_get "$tmp" "verified")"
+  m_version="$(_rd_kv_get "$tmp" "rd-version")"
+  rm -f "$tmp"
+
+  # 파일명(<session-id>.seal) 과 내부 session-id 일치 — 복사·개명 탐지.
+  if [[ "$m_sid" != "$sid" ]]; then
+    { _rd_seal_fail "malformed" "마커 세션 불일치 — 복사되었거나 이름이 잘못되었습니다"; return 1; }
+  fi
+  # 내부 session-id 와 task-state `review-session` 포인터 일치 (§3.3 의 별도 항목).
+  # 마커 경로를 포인터로 조립하므로 위 검사가 통과하면 이 검사도 통과합니다 — 두 사유가
+  # 실제로는 겹칩니다. 포인터를 쓰지 않는 경로가 생겼을 때 조용히 통과하지 않도록
+  # 검사와 문구를 그대로 남겨 둡니다 (§3.3 표의 10종 중 한 줄).
+  if [[ "$m_sid" != "$RD_SEAL_SESSION_ID" ]]; then
+    { _rd_seal_fail "malformed" "마커가 현재 작업의 세션이 아닙니다"; return 1; }
+  fi
+  if [[ "$m_type" != "diff-review" ]]; then
+    { _rd_seal_fail "malformed" "마커가 final diff review 의 것이 아닙니다 (review-type=${m_type})"; return 1; }
+  fi
+  # branch-mode·fr-branch 는 현재 task 와 일치해야 합니다 (§3.2.2 표기).
+  local cur_fr cur_mode cur_fr_field
+  cur_fr="$fr_in"
+  [[ -z "$cur_fr" ]] && cur_fr="$(state_read_field "fr-branch")"
+  cur_mode="$(rd_branch_mode "$cur_fr" 2>/dev/null)" \
+    || { _rd_seal_fail "malformed" "task-state fr-branch 값이 canonical 이 아닙니다: '${cur_fr}'"; return 1; }
+  if [[ "$cur_mode" == "no-fr" ]]; then cur_fr_field="null"; else cur_fr_field="$cur_fr"; fi
+  if [[ "$m_mode" != "$cur_mode" || "$m_fr" != "$cur_fr_field" ]]; then
+    { _rd_seal_fail "malformed" "마커 branch 모드 불일치"; return 1; }
+  fi
+  # verified 는 2값만 허용합니다 (§3.3).
+  case "$m_verified" in
+    yes|legacy-unverified) ;;
+    *) { _rd_seal_fail "malformed" "마커 verified 값이 올바르지 않습니다: ${m_verified}"; return 1; } ;;
+  esac
+
+  # --- 4) 보호 트리 해시 일치 (§2.2 fail-closed — 계산 실패는 통과가 아닙니다) ---
+  local cur_hash ref
+  if [[ "$src" == "commit" ]]; then ref="$target"; else ref="HEAD"; fi
+  cur_hash="$(rd_protected_tree_hash "$ref" 2>/dev/null)" \
+    || { _rd_seal_fail "hash-error" "보호 트리 해시를 계산할 수 없습니다 — 판정 불가로 차단합니다"; return 1; }
+  if [[ "$m_hash" != "$cur_hash" ]]; then
+    { _rd_seal_fail "hash-mismatch" \
+      "리뷰 대상 불일치 — 종결 후 코드가 변경되었습니다. 재리뷰 후 seal 을 다시 실행하세요"; return 1; }
+  fi
+
+  # rd-version 불일치는 경고만 합니다 (§8) — 버전이 오른 것 자체는 정상이며, 차단하면
+  # 업그레이드가 곧 발행 불가가 됩니다.
+  if [[ "$m_version" != "$(_rd_version)" ]]; then
+    echo "경고: 마커의 rd-version(${m_version}) 이 현재 VERSION($(_rd_version)) 과 다릅니다." >&2
+  fi
+  RD_SEAL_VERIFIED="$m_verified"
+  # 통과한 해시를 남깁니다 — 이 시점에 `m_hash` 와 `cur_hash` 는 같습니다. 발행 직전
+  # 재결속은 "마커가 승인한 트리" 를 기준으로 해야 하므로 마커 값을 그대로 씁니다.
+  RD_SEAL_TREE_HASH="$m_hash"
+  return 0
+}
+
+# _rd_seal_legacy_warning — legacy 마커 지속 고지 (§3.3 Finding 5).
+# 통과할 때마다 냅니다 — 생성 시점 1회 고지로는 나중에 실행하는 사람이 알 수 없습니다.
+_rd_seal_legacy_warning() {
+  echo "경고: 이 마커는 검증되지 않은 legacy 전환입니다 (verified=legacy-unverified)." >&2
+  echo "      리뷰 당시 트리를 증명하지 않습니다. 사유: ${RD_SEAL_AUDIT_REL}" >&2
+}
+
+# archive review precheck — 발행 직전 종결 마커 strict 검증 (change-spec §3.3·§3.3.1).
+#
+# **`handoffs/` 를 읽지 않습니다.** 종전에는 fr tip 의 `review_pipeline` 서브트리를 통째로
+# 추출해 세션 종결성을 다시 판정했으나, 이제는 §3.1 의 마커 한 파일만 읽습니다 (AC 11).
+# 세션 본문을 커밋하지 않는 프로젝트도 마커만 커밋하면 통과합니다.
+#
+# 판정 입력은 전부 **하나의 판정 대상 commit** 에서 읽습니다 (§3.3.1).
+#   fr    — `<fr-branch>^{commit}` (fr tip). 기존 main-worktree 비의존 계약을 보존합니다.
+#   no-fr — 현재 `HEAD^{commit}` (Step 0 clean 검사 통과 후).
+# 워킹트리 파일을 읽으면 「fr 브랜치에 커밋 → 기본 브랜치로 switch → archive.sh」 표준
+# 흐름에서 마커를 못 보거나 기본 브랜치의 stale 한 상태를 읽습니다.
+#
+# fr 브랜치 **이름만** 예외입니다 — 판정 입력이 아니라 판정 대상을 찾는 값이므로 인자
+# (`archive.sh` 의 `FR_BRANCH`) 또는 워킹트리 task-state 에서 옵니다. 모드 판정은
+# `rd_branch_mode` 한 곳에서만 합니다.
+#
+# **승인한 보호 트리 해시를 밖으로 남깁니다 (`RD_ARCHIVE_REVIEWED_TREE_HASH`).** 이 검증은
+# 발행 대상이 확정되기 **전**의 commit 을 보므로, 그 뒤 HEAD 가 전진하면 검증한 트리와
+# 발행하는 트리가 갈라질 수 있습니다. 그 창을 닫으려면 호출자가 발행 직전에 같은 해시로
+# 다시 대조해야 하고, cleanup 이 `review-session` 을 baseline 으로 되돌리므로 그 시점에
+# `rd_seal_verify` 를 다시 부르는 방식은 성립하지 않습니다 — 그래서 해시를 값으로 넘깁니다.
+# 우회(`--force-skip-review-check`) 로 통과한 경우에는 승인한 해시가 없으므로 빈 값입니다.
+#
+# 사용: archive_review_precheck <force_skip 0|1> <reason> <slug> <audit_log> [fr_branch]
+#       return 0=진행, 1=차단. 인자 형태는 종전과 같습니다.
+RD_ARCHIVE_REVIEWED_TREE_HASH=""
 archive_review_precheck() {
   local force_skip="$1" reason="$2" slug="$3" audit_log="$4" fr_ref="${5:-}"
-  local review_dir="" audit_ref="" resolved=1
-  if [[ -n "$fr_ref" ]]; then
-    local tmp; tmp="$(mktemp -d)"
-    # fr tip 의 review_pipeline 서브트리만 temp 로 추출. 추출 실패(경로 부재/corrupt ref/tar 실패)는
-    # 전부 "세션 없음"으로 귀결 → fail-closed 차단. 진단보다 안전(미검증 archive 차단)을 우선한다.
-    git -C "$project_root" archive "$fr_ref" -- rd-workflow-workspace/handoffs/review_pipeline 2>/dev/null \
-      | tar -x -C "$tmp" 2>/dev/null || true
-    local fr_base="$tmp/rd-workflow-workspace/handoffs/review_pipeline" _d
-    # fr_ref identity 로 후보 고정: SESSION.md Branch Context fr-branch == fr_ref 인 최신 final-diff-review.
-    # main 워킹트리(get_current_short_title) 비의존 + stale/unrelated closed 세션 false-positive 방지
-    # + suffix(fr/foo-2) 정확 매칭. Branch Context fr-branch 부재(legacy/malformed)는 매칭 실패 → fail-closed.
-    for _d in "$fr_base/"*_final-diff-review; do
-      [[ -d "$_d" ]] || continue
-      [[ "$(_session_fr_branch "$_d")" == "$fr_ref" ]] || continue
-      review_dir="$_d"
-    done
-    if [[ -n "$review_dir" ]] && is_review_session_resolved "$review_dir"; then
-      resolved=0
-    fi
-    # temp 경로는 정리 후 무의미 → audit 은 repo-상대 경로로 정규화.
-    [[ -n "$review_dir" ]] && audit_ref="rd-workflow-workspace/handoffs/review_pipeline/$(basename "$review_dir")"
-    rm -rf "$tmp"
-  else
-    review_dir="$(get_latest_diff_review_dir)"
-    if [[ -n "$review_dir" ]] && is_review_session_resolved "$review_dir"; then
-      resolved=0
-    fi
-    audit_ref="$review_dir"
+  local mode="" target="" audit_ref="" ok=1 fail_msg=""
+  RD_ARCHIVE_REVIEWED_TREE_HASH=""
+
+  if [[ -z "$fr_ref" ]]; then
+    fr_ref="$(state_read_field "fr-branch")"
   fi
-  if [[ "$resolved" -eq 0 ]]; then
+  if ! mode="$(rd_branch_mode "$fr_ref" 2>/dev/null)"; then
+    fail_msg="fr-branch 값이 canonical 이 아닙니다 ('${fr_ref}') — 'fr/<slug>' 또는 'null' 이어야 합니다"
+  elif [[ "$mode" == "fr" ]]; then
+    if ! target="$(rd_resolve_commit_oid "$fr_ref" 2>/dev/null)"; then
+      target=""
+      fail_msg="fr 브랜치 '${fr_ref}' 의 commit 을 찾을 수 없습니다 — 판정 대상이 없습니다"
+    fi
+  else
+    if ! target="$(rd_resolve_commit_oid "HEAD" 2>/dev/null)"; then
+      target=""
+      fail_msg="HEAD 를 commit 으로 해석할 수 없습니다 — 판정 불가"
+    fi
+  fi
+
+  if [[ -z "$fail_msg" ]]; then
+    if rd_seal_verify "commit" "$target" "$fr_ref"; then
+      ok=0
+    else
+      fail_msg="$RD_SEAL_FAIL_MSG"
+    fi
+  fi
+  # audit 은 temp 경로가 아니라 repo-상대 마커 경로로 남깁니다.
+  [[ -n "$RD_SEAL_SESSION_ID" ]] && audit_ref="${RD_SEAL_REL_DIR}/${RD_SEAL_SESSION_ID}.seal"
+
+  if [[ "$ok" -eq 0 ]]; then
+    RD_ARCHIVE_REVIEWED_TREE_HASH="$RD_SEAL_TREE_HASH"
+    [[ "$RD_SEAL_VERIFIED" == "legacy-unverified" ]] && _rd_seal_legacy_warning
     return 0
   fi
+
+  printf 'archive: 종결 마커 검증 실패 — %s\n' "$fail_msg" >&2
   if [[ "$force_skip" != "1" ]]; then
-    printf 'archive: review 미종결 (세션 없음 또는 미종결). --force-skip-review-check "<사유>"로만 우회 가능.\n' >&2
+    printf 'archive: review 미종결 (마커 없음 또는 무효). --force-skip-review-check "<사유>"로만 우회 가능.\n' >&2
     return 1
   fi
   if [[ -z "$reason" ]]; then
     printf 'archive: --force-skip-review-check 사유 필수\n' >&2
     return 1
   fi
-  mkdir -p "$(dirname "$audit_log")"
-  printf '%s | %s | %s | %s\n' "$(date '+%Y-%m-%d %H:%M')" "$slug" "$reason" "${audit_ref:-<세션없음>}" >> "$audit_log"
+  # audit 기록은 이 우회 경로의 **유일한 흔적**입니다. `mkdir -p` 와 append 의 종료 상태를
+  # 확인하지 않으면 기록이 통째로 사라진 채 "audit log 기록" 이라고 잘못 알리고 발행이
+  # 계속됩니다 (final diff review turn 004 Finding 1). 실패는 차단으로 전파합니다 —
+  # 리뷰 검증을 명시적으로 우회하면서 사유조차 남지 않는 발행은 허용하지 않습니다.
+  local audit_dir
+  audit_dir="$(dirname "$audit_log")"
+  if ! mkdir -p "$audit_dir" 2>/dev/null; then
+    printf 'archive: audit 디렉터리를 만들 수 없습니다 (%s) — 우회 사유를 남길 수 없어 차단합니다.\n' "$audit_dir" >&2
+    return 1
+  fi
+  if ! printf '%s | %s | %s | %s\n' "$(date '+%Y-%m-%d %H:%M')" "$slug" "$reason" "${audit_ref:-<세션없음>}" >> "$audit_log" 2>/dev/null; then
+    printf 'archive: audit log 기록에 실패했습니다 (%s) — 우회 사유를 남길 수 없어 차단합니다.\n' "$audit_log" >&2
+    return 1
+  fi
   printf 'archive: WARNING — review 검증 우회 (사유: %s). audit log 기록.\n' "$reason" >&2
+  return 0
+}
+
+# archive_publish_rebind_check <승인된 보호 트리 해시> <발행 대상 commit>
+#
+# precheck 가 승인한 트리와 **실제로 발행할 commit** 의 트리를 다시 결속합니다 (§2.2·§3.3.1).
+#
+# precheck 는 metadata cleanup commit 이전의 commit 을 봅니다. 그 뒤 cleanup commit 이 붙고
+# 발행 대상 OID 가 확정되는데, 그 사이에 보호 경로를 바꾼 커밋이 HEAD 를 전진시키면 검증한
+# 트리와 발행하는 트리가 갈라집니다. cleanup 이 `review-session` 포인터를 baseline 으로
+# 되돌리므로 이 시점에 `rd_seal_verify` 를 다시 부를 수는 없습니다 — 그래서 승인 시점의
+# 해시를 값으로 받아 대조합니다.
+#
+#   return 0 — 일치. 발행해도 됩니다.
+#   return 1 — 불일치. 미검토 코드가 섞였습니다.
+#   return 2 — 판정 불가 (인자 누락 또는 해시 계산 실패). fail-closed 라 통과가 아닙니다.
+archive_publish_rebind_check() {
+  local reviewed="${1-}" publish_oid="${2-}" cur=""
+  if [[ -z "$reviewed" || -z "$publish_oid" ]]; then
+    echo "archive: 발행 재대조에 필요한 값이 없습니다 (승인 해시 또는 발행 대상) — 판정 불가로 차단합니다." >&2
+    return 2
+  fi
+  cur="$(rd_protected_tree_hash "$publish_oid" 2>/dev/null)" || {
+    echo "archive: 발행 대상의 보호 트리 해시를 계산할 수 없습니다 — 판정 불가로 차단합니다." >&2
+    return 2
+  }
+  if [[ "$cur" != "$reviewed" ]]; then
+    echo "archive: 발행 대상이 리뷰된 트리와 다릅니다 — 종결 마커 검증 이후 보호 경로가 바뀌었습니다." >&2
+    echo "archive:   리뷰된 해시=${reviewed}" >&2
+    echo "archive:   발행 대상(${publish_oid}) 해시=${cur}" >&2
+    return 1
+  fi
   return 0
 }
 
@@ -394,6 +669,195 @@ read_hook_agent_id() {
   '
 }
 
+# --- 차단 계측 (guard-block-instrumentation) ---
+#
+# 가드가 실제로 무엇을 막았는지 한 줄씩 남긴다. 목적은 나중에 사람이 「이 가드가 실수를
+# 잡았나, 정당한 작업만 막았나」를 판정하는 것이다 — 가드는 늘기만 하고 은퇴하지 않는데
+# 은퇴를 판정할 데이터가 없었다.
+#
+# **왜 EXIT trap 이 아닌가.** 처음엔 이 파일에 EXIT trap 을 하나 달아 모든 가드를 자동으로
+# 덮으려 했다. 폐기했다 — 이 파일을 source 하는 곳은 hooks 만이 아니고
+# `lifecycle/archive.sh`·`lifecycle/test_lifecycle.sh` 도 포함되며, `test_lifecycle.sh` 는
+# **조용한 중단 센티넬 EXIT trap** 을 먼저 걸고 나중에 이 파일을 source 한다. bash 는 EXIT
+# trap 을 하나만 가지므로 나중에 건 쪽이 앞의 것을 말없이 지운다 — 계측이 그 센티넬을
+# 무력화했다(`self_test.sh lifecycle` 이 검출). 반대로 소비자가 나중에 trap 을 걸면 계측이
+# 조용히 꺼진다. **동작하는 것처럼 보이면서 꺼지는 것이 잊을 수 있는 것보다 나쁘다.**
+#
+# 그래서 차단 지점마다 `guard_deny` 를 부른다. 「새 가드가 계측을 빠뜨릴 수 있다」는 약점은
+# `self_test.sh` 의 구조 검사(`guard_deny_convention_check`)가 대신 막는다. 그 검사는 텍스트
+# 기반이므로 모든 셸 표현을 증명하지는 못한다 — 규약 위반을 흔한 형태에서 잡는 장치다.
+#
+# **통과는 기록하지 않는다.** 모든 Bash·Edit·Write 호출마다 한 줄씩 쌓이면 로그가 무의미해
+# 지고 저장소가 부풀어 오른다. 알고 싶은 것은 "무엇을 막았나" 다.
+#
+# **로그가 자라는 것을 회전으로 감추지 않는다.** 차단은 드물어야 정상이므로, 로그가 빠르게
+# 자란다면 그 자체가 「이 가드가 정당한 작업을 막고 있다」는 신호다. 조용히 버리지 않는다.
+#
+# **경로는 env 로 override 할 수 있다.** 편의가 아니라 오염 방지다 — 차단 가드의 테스트는
+# **실제 hook** 을 부르고 hook 은 자기 위치에서 project_root 를 도출하므로, 그냥 두면 검증이
+# 운영 감사 로그에 쓴다(실측: `self_test.sh hooks` 한 번에 28줄). 그러면 로그가 테스트
+# 잡음으로 채워져 「이 가드가 무엇을 막았나」를 볼 수 없다. `self_test.sh` 와 **실제 hook 을
+# 부르는 개별 테스트가 각각** 이 변수를 임시 경로로 돌린다(둘 다 필요하다 — self_test 만
+# 격리하면 테스트를 직접 실행하는 정상적인 개발 경로가 여전히 오염시킨다).
+RD_GUARD_BLOCK_LOG="${RD_GUARD_BLOCK_LOG:-${project_root}/rd-workflow-workspace/.lifecycle/guard-block-audit.log}"
+
+# _rd_guard_sanitize <문자열> — 한 차단 = 한 줄을 보장한다.
+#
+# **외부 바이너리를 쓰지 않는다.** 초판은 `tr`·`cut` 을 썼는데, 그것들이 없는 제한된 PATH
+# (테스트의 격리 환경, 최소 컨테이너)에서 127 로 죽어 **차단(2)이 127 로 나갔다.** 차단이
+# 차단으로 보이지 않게 되는 실제 버그였다. 제어문자 치환과 길이 제한을 bash 3.2 의 패턴
+# 치환·부분문자열로만 한다. 필드 구분자(`|`)도 공백으로 바꿔 열이 밀리지 않게 한다.
+_rd_guard_sanitize() {
+  local v="${1-}"
+  v="${v//[[:cntrl:]]/ }"
+  v="${v//|/ }"
+  printf '%s' "${v:0:200}"
+}
+
+# _rd_guard_cmd_summary <명령 원문> — **인자를 버리고 프로그램 이름만 남긴다.**
+#
+# **원문 명령을 기록하면 안 된다.** headless 차단은 임의의 Bash 명령에 걸리므로 토큰이 담긴
+# `curl -H "Authorization: Bearer …"` 나 환경변수 대입이 그대로 들어온다. 감사 목적에는
+# 「어떤 종류의 명령을 막았나」가 충분하고, 인자는 필요 없다. 로그를 추적 제외로 두는 것과
+# 별개로 내용 자체를 줄인다 — 두 방어를 함께 둔다.
+#
+# **첫 토큰을 그대로 믿으면 안 된다.** 초판은 공백까지 잘라 프로그램 이름으로 봤는데, bash
+# 의 리다이렉션·here-string 연산자는 **공백 없이 붙을 수 있다** — `cat<<<SECRET` 이나
+# `printf>/secret/path` 는 첫 토큰 자체에 비밀을 담는다(리뷰에서 실측). 선행 환경변수 대입
+# (`TOKEN=abc curl …`)도 같은 부류다.
+#
+# 그래서 **화이트리스트로 판정한다.** 첫 토큰이 프로그램 이름으로 안전하다고 확신할 수 있는
+# 문자만으로 되어 있을 때에만 그 값을 남기고, 그 밖에는 고정 표식으로 축약한다. 셸 연산자·
+# 인용·확장이 섞이면 안전한 이름을 확신할 수 없으므로 보수적으로 버린다. 입력을 실행하거나
+# 셸에 평가시키지 않는다.
+_rd_guard_cmd_summary() {
+  local c="${1-}" first
+  c="${c#"${c%%[![:space:]]*}"}"          # 앞 공백 제거
+  first="${c%%[[:space:]]*}"
+  [[ -n "$first" ]] || { printf '%s' '-'; return 0; }
+  case "$first" in
+    *=*) printf '%s' '<env-assign>'; return 0 ;;   # 값이 비밀일 수 있다
+  esac
+  # 허용: 영숫자 · _ . - + / (경로 포함 실행 파일 이름). 그 밖의 문자가 하나라도 있으면 버린다.
+  case "$first" in
+    *[!A-Za-z0-9_.+/-]*) printf '%s' '<unparsed>'; return 0 ;;
+  esac
+  printf '%s' "${first##*/}"                        # 경로가 붙어 있으면 이름만
+}
+
+# _rd_guard_json_get <jq 표현> — jq → python3 순으로 읽는다.
+#
+# **jq 만 있는 경로로 만들면 안 된다.** 판정(`hook_input_bool_true`)은 python3 폴백을 갖는데
+# 계측만 jq 를 요구하면, jq 가 없는 지원 환경에서 차단은 정상 동작하면서 로그는 `tool=-
+# target=- session=-` 만 남는다 — 「언제 무엇을 막았나」라는 목적 자체가 무너진다.
+# 둘 다 없으면 필드를 비우고 진행한다(기능 축소이며, 차단 판정에는 영향이 없다).
+_rd_guard_json_get() {
+  local expr="${1-}" out=""
+  if command -v jq >/dev/null 2>&1; then
+    out="$(printf '%s' "$_hook_input" | jq -r "$expr // \"\"" 2>/dev/null)" || out=""
+    printf '%s' "$out"; return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    # jq 표현을 그대로 쓸 수 없으므로 키 이름만 넘긴다 — 호출측이 단순 경로만 쓴다.
+    out="$(printf '%s' "$_hook_input" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.exit(0)
+cur = d
+for k in sys.argv[1].split("."):
+    if not k:
+        continue
+    if isinstance(cur, dict) and k in cur:
+        cur = cur[k]
+    else:
+        sys.exit(0)
+if isinstance(cur, (str, int, float)) and not isinstance(cur, bool):
+    sys.stdout.write(str(cur))
+' "${2-}" 2>/dev/null)" || out=""
+    printf '%s' "$out"; return 0
+  fi
+  printf '%s' ""
+}
+
+# guard_deny — 차단을 기록하고 exit 2 로 끝낸다. **가드의 마지막 줄에서 `exit 2` 대신 쓴다.**
+#
+# **기록 실패가 차단을 바꾸면 안 된다.** 로그를 못 써도 차단은 차단이다. 그래서 외부
+# 바이너리에 의존하지 않고(`date` 만 예외이며 실패해도 `||` 로 흡수), 쓰기 실패를 흡수한 뒤
+# 반드시 `exit 2` 한다.
+#
+# **다만 실패를 숨기지는 않는다.** 초판은 모든 실패를 무음으로 흡수했는데, 이 기능은 사람이
+# 로그를 보고 가드를 평가하는 것이므로 누락을 모르면 「차단한 적 없음」이라는 반대 결론으로
+# 이어진다. 셸의 원시 오류(차단 안내를 오염시킨다)는 막고, 대신 **우리가 만든 한 줄 경고와
+# 로그 경로**를 보여준다. 원래 차단 안내와 exit 2 는 그대로다.
+#
+# **리다이렉션 실패는 명령이 아니라 셸이 보고한다.** `printf ... >> f 2>/dev/null` 은 `>>`
+# 자체가 실패할 때 메시지를 막지 못하므로(실측), 블록으로 감싼다.
+#
+# **`reason` 인자(선택, guard-block-reason-identifier)** — 한 가드 안에 판정 분기가 여럿일 때
+# 로그 한 줄만으로 어느 분기였는지 구별하기 위한 짧은 고정 식별자다. 형식은
+# `<가드 파일명(접미사 제외)>.<분기 토큰>` (예: `pre_commit_archive_gate.incomplete-source-fr`).
+# **자유 텍스트를 넣지 않는다** — 고정 토큰만 허용해야 원문 인자 미기록(F1) 방향과 양립한다.
+# **필수 인자가 아니다.** 소비 프로젝트의 vendored 사본·extension 가드가 인자 없이
+# `guard_deny`를 호출해도 깨지지 않아야 한다(하위호환) — 그래서 인자를 생략하면 `reason=`
+# 필드 자체를 붙이지 않는다(빈 값 강제가 아니라 필드 누락으로 하위호환한다). 이 저장소 안의
+# 호출부(스캔 범위: `rd-workflow/scripts/hooks/*.sh` + `_ROOT_FILES` 사본, `test_*` 제외)는
+# `self_test.sh`의 `guard_deny_convention_check`가 식별자 누락을 강제한다.
+guard_deny() {
+  local reason="${1-}"
+  local guard tool target sid ts line dir src cmd
+  src="${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}"
+  guard="${src##*/}"
+  [[ -n "$guard" ]] || guard="unknown"
+
+  tool=""; target=""; sid=""
+  if [[ -n "${_hook_input:-}" ]]; then
+    tool="$(_rd_guard_json_get '.tool_name' 'tool_name')"
+    sid="$(_rd_guard_json_get '.session_id' 'session_id')"
+    cmd="$(_rd_guard_json_get '.tool_input.command' 'tool_input.command')"
+    if [[ -n "$cmd" ]]; then
+      target="$(_rd_guard_cmd_summary "$cmd")"
+    else
+      # Edit·Write 는 file_path 가 실질 대상이다. 인자가 아니라 경로이므로 그대로 남긴다.
+      target="$(_rd_guard_json_get '.tool_input.file_path' 'tool_input.file_path')"
+    fi
+  fi
+
+  ts="$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null)" || ts=""
+  [[ -n "$ts" ]] || ts="unknown-time"
+
+  line="${ts} | $(_rd_guard_sanitize "$guard")"
+  line="${line} | rc=2"
+  line="${line} | tool=$(_rd_guard_sanitize "${tool:--}")"
+  line="${line} | target=$(_rd_guard_sanitize "${target:--}")"
+  line="${line} | session=$(_rd_guard_sanitize "${sid:--}")"
+  # **필드는 항상 끝에 추가한다.** 기존 필드 순서를 바꾸지 않아야 기존 소비 도구(수동
+  # grep·test_guard_block_log.sh)의 파싱 가정이 깨지지 않는다. 인자가 없으면 이 필드
+  # 자체를 붙이지 않는다 — 무인자 호출 시 로그 줄이 이 변경 이전과 바이트 동일하다.
+  if [[ -n "$reason" ]]; then
+    line="${line} | reason=$(_rd_guard_sanitize "$reason")"
+  fi
+
+  # **슬래시가 없으면 부모는 현재 디렉터리다.** `${v%/*}` 는 슬래시 없는 값을 그대로
+  # 돌려주므로, `RD_GUARD_BLOCK_LOG=audit.log` 같은 상대 파일명에서는 `mkdir -p audit.log` 가
+  # **로그 파일 자리에 디렉터리를 만들고** 이후 모든 append 가 영구 실패한다(리뷰에서 실측 —
+  # 경고는 권한 문제라고 안내하지만 권한을 고쳐도 기록되지 않는다).
+  case "$RD_GUARD_BLOCK_LOG" in
+    */*) dir="${RD_GUARD_BLOCK_LOG%/*}" ;;
+    *)   dir="." ;;
+  esac
+  { mkdir -p "$dir"; } 2>/dev/null || true
+  if ! { printf '%s\n' "$line" >> "$RD_GUARD_BLOCK_LOG"; } 2>/dev/null; then
+    printf '[guard] 차단은 적용됐으나 감사 로그 기록에 실패했습니다 — %s\n' \
+      "$RD_GUARD_BLOCK_LOG" >&2
+    printf '[guard] 이 차단은 은퇴 심사 데이터에 남지 않습니다. 경로 쓰기 권한을 확인하십시오.\n' >&2
+  fi
+  exit 2
+}
+
 # --- JSON 파싱 ---
 
 _hook_input=""
@@ -421,6 +885,51 @@ extract_json_field() {
   fi
 
   printf '%s' "$value"
+}
+
+# hook_input_bool_true <key>
+# _hook_input 의 .tool_input.<key> 가 JSON literal true 이면 0, 그 외·판정 불가면 1.
+#
+# **extract_json_field 를 이 용도에 쓰면 안 된다.** 그 헬퍼는 값이 문자열이라고
+# 가정한다 — jq 경로의 `// empty` 는 boolean false 를 빈 값으로 만들고, bash 폴백은
+# 따옴표를 찾으므로 boolean 값에는 뒤따르는 **다른 필드의 값**을 집어온다.
+#
+# **판독은 실제 JSON 파서로만 한다.** 문자열 안/밖만 가르는 조각 인식기는 문법
+# 검증기가 아니어서 후행 쉼표·쉼표 누락·괄호 짝 불일치·잘못된 escape·중복 키에서
+# 파서와 다른 답을 낸다(리뷰에서 실행으로 확인). boolean 하나를 위해 awk 로 JSON
+# 파서를 새로 쓰는 것은 유지비가 맞지 않으므로 python3 을 2순위로 둔다.
+#
+# 둘 다 없으면 판정하지 않고 1(=통과)을 반환한다. 그 환경에서는 이 hook 의 강제가
+# 없고 산문 규율만 남는다 — 계약의 축소이며 change spec 2.1 에 명시돼 있다.
+#
+# 판정 실패는 곧 "true 아님"(return 1)이며, 호출측 hook 은 이를 통과로 다룬다 —
+# positive 감지 한정 fail-open. 이 fail-open 은 hook 전용이며 완료 판정에 쓰지 않는다.
+hook_input_bool_true() {
+  local key="$1"
+  [[ -n "$_hook_input" ]] || return 1
+
+  if command -v jq &>/dev/null; then
+    # -e 는 결과를 exit code 에 싣는다 — `//` 함정을 원천 회피한다.
+    # tool_input 부재는 empty 로 비0, 깨진 JSON 은 파싱 실패로 비0 이다.
+    printf '%s' "$_hook_input" \
+      | jq -e --arg k "$key" '(.tool_input // empty) | (.[$k]? == true)' >/dev/null 2>&1
+    return $?
+  fi
+
+  if command -v python3 &>/dev/null; then
+    printf '%s' "$_hook_input" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+ti = d.get("tool_input") if isinstance(d, dict) else None
+sys.exit(0 if isinstance(ti, dict) and ti.get(sys.argv[1]) is True else 1)
+' "$key" >/dev/null 2>&1
+    return $?
+  fi
+
+  return 1
 }
 
 # --- commit scan 계약 (guard-hook-commit-target-scope) ---

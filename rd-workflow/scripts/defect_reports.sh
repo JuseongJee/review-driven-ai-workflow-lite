@@ -76,14 +76,81 @@ _insert_after_line() {
 # 복사+삭제로 떨어지고, 그 순간 크래시하면 파일이 깨진다. 같은 디렉토리면 rename 이
 # 보장된다 (final diff review 개선 제안).
 _tmp_beside() {
-  local dir; dir="$(dirname "$1")"
-  mktemp "${dir}/.rd-defect.XXXXXX"
+  local dir f; dir="$(dirname "$1")"
+  f="$(mktemp "${dir}/.rd-defect.XXXXXX")" || { echo "_tmp_beside: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$f" && -f "$f" ]] || { echo "_tmp_beside: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  printf '%s\n' "$f"
+}
+
+# symlink 체인을 따라가 **최종 referent(실제 regular file) 경로**를 출력한다.
+# `readlink -f` 는 GNU 전용이라 배포 대상인 macOS 에서 쓸 수 없으므로 `readlink` 만으로
+# 직접 돈다. 상대 경로 target 은 **링크가 놓인 디렉터리 기준**으로 이어 붙이고, 순환·과도한
+# 체인을 막기 위해 횟수 상한(16회)을 둔다. 해석에 실패하면 아무것도 쓰지 않고 비영을 낸다.
+# $1=경로 -> stdout 에 referent 경로
+_resolve_symlink() {
+  local path="$1" hops=0 target dir
+  while [[ -L "$path" ]]; do
+    hops=$((hops + 1))
+    if (( hops > 16 )); then
+      echo "오류: symlink 체인이 너무 깊습니다(16회 초과) — '$1' 의 최종 대상을 해석할 수 없습니다." >&2
+      return 1
+    fi
+    target="$(readlink "$path")" || {
+      echo "오류: symlink 를 읽을 수 없습니다: '$path'" >&2
+      return 1
+    }
+    if [[ -z "$target" ]]; then
+      echo "오류: symlink target 이 비어 있습니다: '$path'" >&2
+      return 1
+    fi
+    case "$target" in
+      /*) path="$target" ;;
+      *)  dir="$(dirname "$path")"; path="${dir%/}/${target}" ;;
+    esac
+  done
+  if [[ ! -e "$path" ]]; then
+    echo "오류: symlink '$1' 의 최종 대상이 존재하지 않습니다: '$path'" >&2
+    return 1
+  fi
+  printf '%s\n' "$path"
 }
 
 # 권한을 보존하며 교체한다. mktemp 는 0600 으로 만들므로 그대로 mv 하면 원본 권한을 잃는다.
 # `chmod --reference` 는 GNU 전용이라 stat 으로 mode 를 읽어 적용한다 (BSD → GNU 폴백).
+#
+# **대상이 symlink 이면 링크 자체를 `mv` 로 갈아치우지 않는다.** `mv` 는 링크를 지우고 그
+# 자리에 regular file 을 놓으므로, 사용자가 `workflow.json` 을 dotfile 저장소 등으로 링크해
+# 둔 경우 링크가 조용히 사라지고 원본과의 연결이 끊긴다.
+# 그래서 링크가 최종적으로 가리키는 **referent 를 해석해 그 옆에 임시 파일을 만들고 `mv` 로
+# 원자 교체**한다. 이렇게 하면 링크 정체성(링크는 그대로 남는다)과 원자성(교체는 같은
+# 파일시스템 안의 rename 이라 중간 상태가 관찰되지 않는다)을 동시에 지킨다. 임시 파일을
+# 링크가 놓인 디렉터리에 만들면 referent 와 파일시스템이 달라 rename 이 복사+삭제로 떨어지고
+# 원자성이 깨지므로, 반드시 referent 쪽에 만든다.
+# 실패하면 임시 파일만 지우고 referent 의 기존 내용을 그대로 남긴 채 비영을 반환한다.
 _replace_preserving_mode() {
-  local tmp="$1" target="$2" mode
+  local tmp="$1" target="$2" mode referent rtmp
+  if [[ -L "$target" ]]; then
+    referent="$(_resolve_symlink "$target")" || {
+      echo "오류: '$target' 의 링크 대상을 해석하지 못해 아무것도 쓰지 않았습니다." >&2
+      return 1
+    }
+    rtmp="$(_tmp_beside "$referent")" || {
+      echo "오류: '$referent' 옆에 임시 파일을 만들지 못했습니다." >&2
+      return 1
+    }
+    if ! cat "$tmp" > "$rtmp"; then
+      rm -f "$rtmp"
+      return 1
+    fi
+    mode="$(stat -f %Lp "$referent" 2>/dev/null || stat -c %a "$referent" 2>/dev/null || true)"
+    [[ -n "$mode" ]] && chmod "$mode" "$rtmp" 2>/dev/null
+    if ! mv "$rtmp" "$referent"; then
+      rm -f "$rtmp"
+      return 1
+    fi
+    rm -f "$tmp"
+    return 0
+  fi
   mode="$(stat -f %Lp "$target" 2>/dev/null || stat -c %a "$target" 2>/dev/null || true)"
   [[ -n "$mode" ]] && chmod "$mode" "$tmp" 2>/dev/null
   mv "$tmp" "$target"
@@ -148,30 +215,146 @@ set_issue() {
 
 # ---- upstream 설정 (config) --------------------------------------------
 
+# JSON 구조 검사기를 탐지합니다. `python3` 이 있으면 그것을 쓰고, 없으면 비영을 냅니다.
+# **`python3` 을 이 스크립트의 필수 의존성으로 선언하지 않습니다** — 없으면 config 기반 자동
+# 판정(설정·발행 대상)을 모두 보류할 뿐, 명시적 `--upstream` 경로는 그대로 동작합니다.
+_json_checker() {
+  command -v python3 >/dev/null 2>&1
+}
+
+# 파일을 **구조적으로** 읽어 최상위 object 여부와 top-level `defect_report_upstream` 을 답합니다.
+# 정규식과 달리 중첩 object 안의 동명 키를 top-level 로 오인하지 않고, 중복 top-level 키를
+# 판정 불가로 처리합니다 (`object_pairs_hook` 로 쌍 목록을 그대로 받아 검사합니다).
+# $1=파일
+#   0 = 최상위 object + top-level 키 존재 (stdout 에 문자열 값)
+#   3 = 최상위 object + top-level 키 없음
+#   2 = 구조 검사기 없음 (판정 자체가 불가능)
+#   1 = 판정 불가 (JSON 파싱 실패 · 최상위가 object 아님 · 중복 top-level 키 · 값이 문자열 아님)
+_json_top_upstream() {
+  local file="$1" rc
+  _json_checker || return 2
+  python3 - "$file" <<'PY'
+import json, sys
+
+
+class Obj(dict):
+    pass
+
+
+def hook(pairs):
+    o = Obj(pairs)
+    keys = [k for k, _ in pairs]
+    o.dup = len(keys) != len(set(keys))
+    return o
+
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh, object_pairs_hook=hook)
+except Exception:
+    sys.exit(1)
+if not isinstance(data, Obj):
+    sys.exit(4)          # 최상위가 object 가 아닙니다 (배열·스칼라)
+if data.dup:
+    sys.exit(5)          # 최상위에 같은 키가 두 번 — 어느 쪽이 유효한지 판정하지 않습니다
+if "defect_report_upstream" not in data:
+    sys.exit(3)
+value = data["defect_report_upstream"]
+if not isinstance(value, str):
+    sys.exit(6)
+sys.stdout.write(value)
+PY
+  rc=$?
+  case "$rc" in
+    0|2|3) return "$rc" ;;
+    *)     return 1 ;;
+  esac
+}
+
+# config 의 top-level `defect_report_upstream` 을 **구조적으로만** 읽습니다.
+# $1 없음 -> stdout 에 값(있을 때만). 종료 상태가 계약입니다.
+#   0 = top-level 에 비어 있지 않은 문자열 값이 있습니다 (stdout 에 값)
+#   3 = 값이 없습니다 (config 파일 부재 · top-level 키 없음 · 빈 문자열)
+#   2 = **판정 불가** — JSON 구조 검사기(python3)가 없습니다
+#   1 = **판정 불가** — 파싱 실패 · 최상위가 object 아님 · top-level 중복 키 · 값이 문자열 아님
+#
+# **정규식 폴백을 두지 않습니다.** 정규식은 중첩 object 안의 동명 키를 top-level 로 오인하는데,
+# 이 값은 `set_upstream` 의 「이미 설정됨」 판정과 **발행 대상 판정** 양쪽에 쓰입니다. 오인하면
+# 인자 없는 `publish --yes` 가 사용자가 승인한 적 없는 외부 저장소로 결함 보고를 내보냅니다.
+# 「읽기 전용이라 오판해도 보류로 이어질 뿐」이라는 종전 근거는 틀렸습니다 — 검증할 수 없으면
+# 값을 추측하지 않고 「판정 불가」를 알려, 호출자가 「미설정」과 다르게 다루게 합니다.
 cfg_upstream() {
-  [[ -f "$CONFIG_FILE" ]] || return 0
-  sed -n 's/.*"defect_report_upstream"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_FILE" | head -1
+  [[ -f "$CONFIG_FILE" ]] || return 3
+  local val rc
+  val="$(_json_top_upstream "$CONFIG_FILE")"; rc=$?
+  case "$rc" in
+    0)
+      [[ -n "$val" ]] || return 3
+      printf '%s\n' "$val"
+      return 0
+      ;;
+    3) return 3 ;;
+    2) return 2 ;;
+    *) return 1 ;;
+  esac
 }
 
 sync_template_bin() {
   bash "$SCRIPT_DIR/sync_template.sh" "$@"
 }
 
+# 교체 후보(임시 파일)가 실제로 쓸 만한 결과인지 **교체 전에** 구조적으로 확인합니다.
+# 쓰기와 같은 정규식으로 확인하면 "정규식이 스스로를 검사" 하는 꼴이라, 중첩 object 안의 동명
+# 키를 고쳐 놓고도 통과합니다. 그래서 파서로 최상위 object 여부와 **top-level 키의 값**을 봅니다.
+# $1=임시 파일 $2=기대하는 canonical 값
+_verify_upstream_result() {
+  local candidate="$1" expected="$2" got rc
+  got="$(_json_top_upstream "$candidate")"; rc=$?
+  [[ "$rc" -eq 0 ]] || return 1
+  [[ "$got" == "$expected" ]] || return 1
+  return 0
+}
+
 set_upstream() {
   # $1=url
-  local url="${1:-}" current canonical tmp
+  local url="${1:-}" current canonical tmp gen_rc=0
 
-  # config 파일을 새로 만들지 않는다 — 부재는 CLAUDE.md 가 규정한 정상 상태이고,
-  # 템플릿 sync 가 소비 프로젝트에 없던 설정 파일을 만들지 않기로 결정했다.
-  # 조용한 exit 0 은 호출자가 "설정됐다" 고 오인하므로 사유와 대안을 함께 낸다.
+  # config 파일을 새로 만들지 않습니다 — 생성은 이 스크립트의 책임이 아니고,
+  # 배포는 템플릿 sync 5단계가 합니다. 그러므로 sync 를 거친 프로젝트에서는 이 경로가
+  # 이미 있으며, 그래도 없는 경우(sync 밖에서 이 스크립트를 직접 호출한 경우)에는
+  # 만들지 않고 건너뜁니다.
+  # 조용한 exit 0 은 호출자가 "설정됐다" 고 오인하므로 사유와 대안을 함께 냅니다.
   if [[ ! -f "$CONFIG_FILE" ]]; then
-    echo "'$CONFIG_FILE' 이 없어 건너뜁니다 (설정 파일을 새로 만들지 않습니다)."
+    echo "'$CONFIG_FILE' 이 없어 건너뜁니다 (이 스크립트는 설정 파일을 만들지 않습니다 — 배포는 템플릿 sync 5단계가 합니다)."
     echo "  전달 대상을 지정하려면 발행 시 --upstream <owner/repo> 를 주십시오."
     return 0
   fi
 
-  current="$(cfg_upstream)"
-  if [[ -n "$current" ]]; then
+  local cfg_rc
+  current="$(cfg_upstream)"; cfg_rc=$?
+
+  # ── 구조 검사기가 없으면 **아무것도 쓰지 않고 보류합니다** (exit 0).
+  #
+  # 이 분기는 「이미 설정됨」 판정보다 **먼저** 옵니다. 검사기가 없으면 현재 값이 top-level 에
+  # 있는지조차 알 수 없어, 중첩 object 안의 동명 키를 보고 「이미 설정됨」으로 거짓 성공한 뒤
+  # 이 안내에 닿지 못했습니다.
+  # **exit 0 인 이유**: 이것은 환경 조건이지 사용자 오류가 아니고, config 부재 시 exit 0 으로
+  # 건너뛰는 기존 계약과 같은 성격이며, 템플릿 sync 5.1 이 여기서 멈추면 안 되기 때문입니다.
+  if [[ "$cfg_rc" -eq 2 ]]; then
+    canonical="$(sync_template_bin --print-upstream "$url" 2>/dev/null)" || canonical=""
+    echo "JSON 구조 검증기(python3)가 없어 '$CONFIG_FILE' 을 고치지 않고 보류합니다."
+    echo "  현재 값을 구조적으로 확인할 수 없어 이미 설정됐는지도 판정하지 않습니다 (추측하지 않습니다)."
+    if [[ -n "$canonical" ]]; then
+      echo "  수동 설정: '$CONFIG_FILE' 의 **최상위**에 \"defect_report_upstream\": \"${canonical}\" 을 직접 추가하십시오."
+      echo "  또는 발행 시 --upstream ${canonical} 를 주십시오."
+    else
+      echo "  수동 설정: '$CONFIG_FILE' 의 **최상위**에 \"defect_report_upstream\": \"<owner/repo>\" 를 직접 추가하십시오."
+      echo "  또는 발행 시 --upstream <owner/repo> 를 주십시오."
+    fi
+    return 0
+  fi
+
+  if [[ "$cfg_rc" -eq 0 && -n "$current" ]]; then
     echo "이미 설정됨: $current"
     return 0
   fi
@@ -182,18 +365,80 @@ set_upstream() {
     return 1
   fi
 
-  tmp="$(_tmp_beside "$CONFIG_FILE")" || { echo "오류: 임시 파일 생성 실패" >&2; return 1; }
-  if grep -q '"defect_report_upstream"' "$CONFIG_FILE"; then
-    sed "s|\"defect_report_upstream\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"defect_report_upstream\": \"${canonical}\"|" \
-      "$CONFIG_FILE" > "$tmp"
-  else
-    awk -v val="$canonical" '
-      NR == 1 && /\{/ { print; print "  \"defect_report_upstream\": \"" val "\","; next }
-      { print }
-    ' "$CONFIG_FILE" > "$tmp"
+  # ── 쓰기 **전에** 원본이 유효한 JSON object 인지 구조적으로 확인합니다.
+  # 여기서 걸리는 것: 파싱 실패(malformed) · 최상위가 object 아님(배열 등) · 중복 top-level 키 ·
+  # 키 값이 문자열이 아님. 어느 쪽이든 **아무것도 쓰지 않습니다.**
+  local pre_rc
+  _json_top_upstream "$CONFIG_FILE" >/dev/null; pre_rc=$?
+  if [[ "$pre_rc" -ne 0 && "$pre_rc" -ne 3 ]]; then
+    echo "오류: '$CONFIG_FILE' 을 구조적으로 읽을 수 없어 아무것도 쓰지 않았습니다 (원본 그대로)." >&2
+    echo "      유효한 JSON object 가 아니거나, 최상위에 defect_report_upstream 키가 중복됩니다." >&2
+    echo "      조치 : '$CONFIG_FILE' 을 고친 뒤, 또는 발행 시 --upstream ${canonical} 로 지정하십시오." >&2
+    return 1
   fi
 
-  if [[ $? -ne 0 ]] || ! _replace_preserving_mode "$tmp" "$CONFIG_FILE"; then
+  tmp="$(_tmp_beside "$CONFIG_FILE")" || { echo "오류: 임시 파일 생성 실패" >&2; return 1; }
+  # 분기는 **구조적 판정**으로 정합니다. `grep` 은 중첩 object 안의 동명 키에도 걸려, 키가
+  # top-level 에 없는데도 치환 경로로 보내 남의 값을 고칩니다.
+  if [[ "$pre_rc" -eq 0 ]]; then
+    # `sed` 는 구조를 모릅니다 — 같은 이름의 키가 파일 안에 둘 이상이면(중첩 object 등)
+    # 어느 쪽이 바뀔지 보장할 수 없으므로 치환하지 않고 보류합니다.
+    local key_hits
+    key_hits="$(grep -o '"defect_report_upstream"' "$CONFIG_FILE" | grep -c . || true)"
+    if [[ "$key_hits" != "1" ]]; then
+      rm -f "$tmp"
+      echo "오류: '$CONFIG_FILE' 안에 defect_report_upstream 이 여러 곳에 나타나 안전하게 치환할 수 없습니다 (원본 그대로)." >&2
+      echo "      조치 : 최상위 값을 직접 \"${canonical}\" 로 고치십시오." >&2
+      return 1
+    fi
+    sed "s|\"defect_report_upstream\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"defect_report_upstream\": \"${canonical}\"|" \
+      "$CONFIG_FILE" > "$tmp" || gen_rc=1
+  else
+    # **줄 배치를 전제하지 않는다.** 이전 구현은 "1행에 `{` 가 있으면 그 행 전체를 출력한 뒤
+    # 키 줄을 붙이는" 방식이라, 한 줄 객체(`{"a":"b"}`)에서는 완성된 객체 뒤에 멤버를 붙여
+    # invalid JSON 을 만들고, 첫 줄이 빈 줄이면 아무것도 삽입하지 않은 채 성공을 보고했다.
+    # 그래서 여는 `{` 를 **위치로** 찾아 바로 뒤에 넣는다.
+    #   - `{` 가 그 줄의 마지막 유의미 문자면 기존 pretty-printed 형식을 지켜 다음 줄에 삽입
+    #   - 그렇지 않으면(한 줄 객체 등) `{` 바로 뒤에 인라인 삽입
+    #   - 빈 객체면 뒤따르는 쉼표를 넣지 않아야 유효하다
+    # 여는 `{` 가 없으면(배열·잘린 파일 등) 아무것도 쓰지 않고 실패한다.
+    local compact empty_obj=0
+    compact="$(tr -d '[:space:]' < "$CONFIG_FILE")"
+    [[ "$compact" == "{}" ]] && empty_obj=1
+    awk -v val="$canonical" -v empty="$empty_obj" '
+      BEGIN { inserted = 0; sep = (empty == 1 ? "" : ",") }
+      inserted { print; next }
+      /^[[:space:]]*$/ { print; next }
+      {
+        lead = $0
+        sub(/[^[:space:]].*$/, "", lead)
+        pos = length(lead) + 1
+        if (substr($0, pos, 1) != "{") { exit 3 }
+        head = substr($0, 1, pos)
+        rest = substr($0, pos + 1)
+        if (rest ~ /^[[:space:]]*$/) {
+          print head rest
+          print "  \"defect_report_upstream\": \"" val "\"" sep
+        } else {
+          print head "\"defect_report_upstream\": \"" val "\"" sep rest
+        }
+        inserted = 1
+        next
+      }
+      END { if (inserted == 0) exit 3 }
+    ' "$CONFIG_FILE" > "$tmp" || gen_rc=1
+  fi
+
+  # 생성 실패거나, 결과가 계약을 만족하지 못하면 **원본 bytes 를 그대로 둔 채** 실패한다.
+  if [[ "$gen_rc" -ne 0 ]] || ! _verify_upstream_result "$tmp" "$canonical"; then
+    rm -f "$tmp"
+    echo "오류: '$CONFIG_FILE' 에 defect_report_upstream 을 안전하게 넣지 못했습니다 (원본은 변경하지 않았습니다)." >&2
+    echo "      여는 '{' 를 찾지 못했거나 결과가 유효한 JSON 이 아닙니다." >&2
+    echo "      조치 : '$CONFIG_FILE' 을 열어 \"defect_report_upstream\": \"${canonical}\" 을 직접 추가하십시오." >&2
+    return 1
+  fi
+
+  if ! _replace_preserving_mode "$tmp" "$CONFIG_FILE"; then
     rm -f "$tmp"
     echo "오류: '$CONFIG_FILE' 갱신 실패" >&2
     return 1
@@ -235,13 +480,32 @@ target_repo() {
 }
 
 # $1=--upstream 인자(없으면 빈 문자열). 유효하면 stdout 에 target, 무효/미설정이면 exit 1(무출력).
+# **명시적 `--upstream` 은 구조 검사기 유무와 무관하게 동작합니다.** config 에서 대상을 고르는
+# 것은 검사기가 있고 top-level 값을 확실히 읽었을 때뿐입니다 — 판정 불가(검사기 부재·파싱 실패·
+# 최상위 비 object·top-level 중복 키)는 「대상 없음」으로 fail-closed 합니다. 추측한 값으로
+# 발행하면 사용자가 승인한 적 없는 저장소에 결함 보고가 나갑니다.
 resolve_target() {
-  local arg="${1:-}" target
+  local arg="${1:-}" target rc
   if [[ -n "$arg" ]]; then
-    target="$arg"
-  else
-    target="$(cfg_upstream)"
+    valid_target "$arg" || return 1
+    printf '%s\n' "$arg"
+    return 0
   fi
+  target="$(cfg_upstream)"; rc=$?
+  case "$rc" in
+    0) ;;
+    2)
+      echo "참고: JSON 구조 검증기(python3)가 없어 '$CONFIG_FILE' 의 전달 대상을 판정하지 않았습니다 (추측하지 않습니다)." >&2
+      echo "      발행하려면 --upstream <owner/repo> 로 대상을 직접 지정하십시오." >&2
+      return 1
+      ;;
+    1)
+      echo "참고: '$CONFIG_FILE' 을 구조적으로 읽을 수 없어 전달 대상을 판정하지 않았습니다 (fail-closed)." >&2
+      echo "      발행하려면 --upstream <owner/repo> 로 대상을 직접 지정하십시오." >&2
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
   [[ -n "$target" ]] && valid_target "$target" || return 1
   printf '%s\n' "$target"
 }

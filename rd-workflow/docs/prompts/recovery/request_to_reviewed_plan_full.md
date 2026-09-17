@@ -9,7 +9,7 @@
 3. `REQUEST.md`가 있으면 그대로 재사용하고 REQUEST review부터 시작한다. `REQUEST.md`를 새로 쓰지 않는다
 4. 범위를 넓히지 말고 꼭 필요한 정보만 질문한다
 5. `Execution Path`를 판단한다
-6. `small-task`면 이유만 남기고 멈춘다
+6. `full` 이 아니라고 보이면 하향을 제안만 하고 멈춘다 (하향은 사용자만)
 7. 큰 작업이면 `REQUEST review -> spec/change spec -> plan -> spec/plan review` 순서로 진행한다
 8. review는 `prepare_review_pipeline.sh`와 `run_review_turn.sh ...`를 사용한다
 9. Superpowers를 쓸 수 있으면 그 workflow를 실행하고, 아니면 같은 위치에 같은 산출물을 만든다

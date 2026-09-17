@@ -12,7 +12,10 @@ fail() { echo "FAIL: $1"; FAIL=1; }
 
 # 샌드박스: 가짜 프로젝트 루트 구성 (project scope → <sandbox>/.claude/skills 에 설치됨)
 setup_sandbox() {
-  SANDBOX="$(mktemp -d)"
+  # 호출부 8곳이 rc 를 보지 않고 곧장 $SANDBOX 를 파생시킨다 — 함수 반환(return)으로는
+  # 빈 경로 사용을 막지 못하므로 실패 시 스크립트 전체를 종료한다(exit).
+  SANDBOX="$(mktemp -d)" || { echo "test_install_claude_skills.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+  [[ -n "$SANDBOX" && -d "$SANDBOX" ]] || { echo "test_install_claude_skills.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
   CLEANUP_DIRS+=("$SANDBOX")
   mkdir -p "${SANDBOX}/rd-workflow/scripts" \
            "${SANDBOX}/rd-workflow/claude_skills/alpha" \
@@ -143,7 +146,8 @@ echo "$OUT" | grep -q "already installed: alpha" \
 
 # --- T13: personal scope는 절대 경로 유지 ---
 setup_sandbox
-FAKE_HOME="$(mktemp -d)"
+FAKE_HOME="$(mktemp -d)" || { echo "test_install_claude_skills.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$FAKE_HOME" && -d "$FAKE_HOME" ]] || { echo "test_install_claude_skills.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 CLEANUP_DIRS+=("$FAKE_HOME")
 OUT="$(cd "$SANDBOX" && HOME="$FAKE_HOME" bash rd-workflow/scripts/install_claude_skills.sh personal link 2>&1)"
 RC=$?
@@ -153,7 +157,8 @@ target="$(readlink "${FAKE_HOME}/.claude/skills/alpha")"
   && ok "T13-b personal은 절대 경로 유지" || fail "T13-b target: $target"
 
 # --- T14: _ROOT_FILES dogfooding 실행 → parent root에 상대 symlink ---
-SANDBOX="$(mktemp -d)"
+SANDBOX="$(mktemp -d)" || { echo "test_install_claude_skills.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$SANDBOX" && -d "$SANDBOX" ]] || { echo "test_install_claude_skills.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 CLEANUP_DIRS+=("$SANDBOX")
 mkdir -p "${SANDBOX}/_ROOT_FILES/rd-workflow/scripts" \
          "${SANDBOX}/_ROOT_FILES/rd-workflow/claude_skills/alpha"

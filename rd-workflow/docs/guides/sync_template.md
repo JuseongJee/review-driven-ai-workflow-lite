@@ -30,6 +30,7 @@
 2. **mid-task 업그레이드 강행**: 아래 영향을 안내한 뒤 진행합니다.
    - 구버전에서 생성된 review 세션은 `SESSION.md`에 Branch Context `fr-branch`가 없어, 이후 archive precheck가 fail-closed로 차단될 수 있습니다. 이 경우 `bash rd-workflow/scripts/lifecycle/archive.sh --force-skip-review-check "<사유>"`로만 우회할 수 있습니다 (사유 필수, `rd-workflow-workspace/.lifecycle/review-skip-audit.log`에 감사 기록됨).
    - review 세션 `CHECKPOINT.md`의 `## Open Issues`는 canonical 마커 규약을 따라야 합니다 — 미해결 이슈가 없으면 정확히 `- 없음` 또는 `- None` 한 줄로만 표기합니다 (후행 마침표 1개 허용). 빈 섹션·비정형 표기는 미종결로 판정되어 archive가 차단됩니다.
+   - 구버전 세션에는 `SESSION.md`에 `review-head-oid`가 없어(= legacy 정의) 종결 마커를 만드는 `rd review seal`이 거부합니다. 그 작업을 마감하려면 `bash rd-workflow/scripts/rd review seal --legacy-unverified "<사유>" <세션 경로>`가 유일한 경로이며, **이 마커는 리뷰 당시 트리를 증명하지 않습니다** (상세·트레이드오프: 아래 M011).
 
 ### 1. 버전 확인 및 템플릿 소스 확보
 
@@ -80,6 +81,10 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 - `rd-workflow/config/review-tools.json` (프로젝트별 리뷰 도구 설정, `.example`은 동기화 대상)
 - `rd-workflow/config/verification.json` (프로젝트별 검증 설정, `.example`은 동기화 대상)
 - `rd-workflow/config/extensions.json` (설치된 extension 이력, `.example`은 동기화 대상)
+- `rd-workflow/config/workflow.json` (프로젝트별 워크플로 설정, `.example`은 동기화 대상) — **이 항목의 보존은 위 세 항목과 의미가 다릅니다.** 위 세 항목은 「있으면 덮지 않는다」뿐이지만, `workflow.json` 은 **5단계 복사에서 경로가 없으면 배포본을 새로 만들고, 있으면 내용도 경로 종류도 손대지 않습니다.** 다만 이 보존은 **5단계 복사에 대한 것이고**, 이어지는 5.1 절은 같은 파일에 **`defect_report_upstream` 키 하나만** 의도적으로 씁니다(값이 비어 있을 때만). `default_execution_mode` 를 포함한 다른 키와 경로 종류는 그때도 바뀌지 않습니다 — 즉 「전체 sync 를 마친 뒤에도 파일이 바이트 단위로 같다」는 뜻은 아닙니다.
+  - **「있으면」의 판정은 `[ -e 경로 ] || [ -L 경로 ]` 입니다.** dangling symlink 는 `-e` 가 거짓이므로 `-L` 을 함께 보지 않으면 「부재」로 오판해 배포본으로 덮어씁니다. 그러면 사용자가 걸어 둔 링크가 사라지고, 판정 불가(`manual`)여야 할 상태가 조용히 `semi-auto` 로 올라갑니다.
+  - 유효한 symlink 도 **링크 자체를 보존합니다** — 링크를 따라가 target 을 덮어쓰지 않고, 링크를 regular file 로 바꾸지도 않습니다.
+  - **끊어진 symlink 는 정리하지 않고 보존합니다.** 정리하는 쪽은 사용자가 설정을 두려 한 흔적을 지우면서 자율성을 올리는 방향이라 이 작업의 안전 원칙과 어긋납니다. 보존하면 판정이 불가로 남아 `manual` + 경고가 나므로 사용자가 링크를 직접 고칠 수 있습니다.
 - extension으로 설치된 스킬 `rd-workflow/claude_skills/<name>/` — `<name>`이 `rd-workflow/extensions/`의 extension 디렉토리 이름 또는 `extensions.json` 기재 항목과 일치하는 경우 (예: verify, design-review). extension 스킬 원본은 템플릿의 `extensions/`에 있고 clone의 `claude_skills/`에는 없어 삭제 후보 정의에 걸리지만, 삭제하면 8단계에서 미설치로 재판정되어 불필요한 재설치 질문이 발생하므로 보존한다 (최신본 갱신은 8단계 자동 재설치가 담당)
 - 프로젝트 고유 설정 파일 (`.gitignore`, `.swiftlint.yml`, `.claude/` 등)
   - 단, `.claude/settings.json`의 hook 등록 목록과 `.gitignore`의 워크플로 관리 라인은 M003 마이그레이션이 **부재 항목만 추가**하고, 템플릿 유래 stale hook 등록(존재하지 않는 스크립트를 가리키는 항목)은 M005 마이그레이션이 제거합니다 (통째 동기화 아님 — 4단계 참조)
@@ -186,7 +191,7 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 **실행 절차**:
 1. `bash rd-workflow/scripts/rd task status`를 1회 실행합니다.
 2. exit 0이고 `rd-workflow-workspace/.lifecycle/task-state`가 생성/존재하면 완료입니다. 마이그레이션이 수행되었다면(stderr 안내 출력) tracked 변경(active-fr 삭제·task-state 생성)을 다음 정규 커밋에 포함하라고 사용자에게 안내합니다.
-3. exit 3이면 `CURRENT_TASK.md`의 `## Status`를 canonical 8종 중 하나로 수동 복구한 뒤 재실행합니다. 복구 절차는 `rd-workflow/docs/guides/task-state-guide.md`의 "실패 시 복구"를 참조합니다.
+3. exit 3이면 `CURRENT_TASK.md`의 `## Status`를 canonical 9종 중 하나로 수동 복구한 뒤 재실행합니다. 복구 절차는 `rd-workflow/docs/guides/task-state-guide.md`의 "실패 시 복구"를 참조합니다.
 
 **주의**: 마이그레이션이 만든 변경은 자동 커밋하지 않습니다 ("다음 정규 커밋에 편승" 계약 — LC-20 archive clean 검증은 이 변경이 커밋된 상태를 전제합니다).
 
@@ -307,6 +312,47 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 - **`RD_LIFECYCLE_BYPASS_REASON=<reason>` 접두는 lifecycle 스크립트에 그대로 남아 있습니다.** 읽는 hook 이 사라져 템플릿 안에서는 무의미하지만, 아직 동기화하지 않은 다른 프로젝트·worktree 에 hook 사본이 남아 있을 수 있어 제거하지 않았습니다.
 - 단계 게이트가 사라졌으므로 "리뷰 대기 중에는 구현 파일을 못 고친다" 는 **더 이상 기계가 강제하지 않습니다.** `CLAUDE.md` 의 Review 규칙을 사람과 AI 가 지킵니다.
 
+#### M011: 종결 마커(seal) 기반 archive precheck · `아카이브 보류` 상태 · no-fr 모드
+
+**조건**: 종결 마커를 도입한 템플릿(`rd-workflow/scripts/rd` 에 `review seal` 서브커맨드가 있는 판)으로 동기화하는 모든 프로젝트.
+
+**동작 변화**
+
+1. **`archive.sh` 의 리뷰 종결 검사가 마커 파일 기준으로 바뀝니다.** 종전에는 fr tip 의 `handoffs/review_pipeline/` 세션 본문을 읽어 종결성을 판정했으나, 이제는 `rd-workflow-workspace/.lifecycle/review-seals/<session-id>.seal` 한 파일만 읽습니다. 세션 본문을 커밋하지 않는 프로젝트도 마커만 커밋하면 통과합니다.
+2. **task-state 에 필드 2개가 늘었습니다.**
+   - `base-commit` — 작업 시작 커밋의 full OID. `promote.sh` 가 fr 브랜치 생성 시 기록합니다. promote 를 쓰지 않는 프로젝트는 `bash rd-workflow/scripts/rd task set-base <ref>` 로 1회 설정합니다(입력이 ref 여도 OID 로 저장). diff review 의 base 판정에 쓰입니다.
+   - `review-session` — final diff review 세션 id 포인터. `prepare_review_pipeline.sh` 가 diff 세션 생성 시 기록하며, 발행 게이트는 **이 포인터가 가리키는 마커 하나만** 읽습니다.
+   두 필드는 `archive.sh` 의 metadata cleanup 이 baseline 으로 되돌립니다. 별도 마이그레이션 스크립트는 없습니다 — 위 경로(promote·`set-base`·diff 세션 생성)로 채워집니다. 다만 **promote 를 쓰지 않고 `--base` 도 주지 않으면 diff review 세션 생성이 `base 판정 입력이 없습니다` 로 실패**하므로, 그런 프로젝트는 첫 diff review 전에 `rd task set-base` 를 1회 실행해야 합니다.
+3. **canonical Status 에 `아카이브 보류` 가 추가됐습니다.** 「리뷰 종결·발행 대기」이며 **완료가 아닙니다.** 전이는 `diff review 대기` → `아카이브 보류` → `완료` 이고, 리뷰 후 변경이 필요하면 `아카이브 보류` → `구현 중` 으로 되돌립니다. 프로젝트 `CLAUDE.md` 의 Task Tracking 절에 있는 Status 허용값 목록에도 이 값이 들어가야 합니다. `CLAUDE.md` 는 동기화 대상이라 템플릿 판을 그대로 받으면 함께 들어오지만, 프로젝트가 이 절을 손댄 상태라면 동기화 후 목록에 `아카이브 보류` 가 있는지 직접 확인하고 없으면 추가합니다.
+4. **마커 디렉터리 `rd-workflow-workspace/.lifecycle/review-seals/` 는 추적 대상입니다.** 마커는 커밋되어야 효력이 생기므로(게이트가 워킹트리가 아니라 판정 대상 commit 에서 읽습니다) 프로젝트 `.gitignore` 에 `.lifecycle/` 을 통째로 무시하는 규칙이 있으면 **제거해야 합니다.** 그대로 두면 정상 작업이 발행 시점에 `마커 없음` 으로 차단됩니다.
+5. **fr 브랜치 없이 기본 브랜치에서 작업하는 no-fr 모드가 생겼습니다.** task-state 의 `fr-branch` 가 canonical `null` 일 때만 진입하며(빈 문자열·공백·`main` 등은 malformed 로 차단), 기본 브랜치가 아니거나 detached HEAD 이면 차단됩니다. 기존 fr 경로는 그대로입니다.
+
+**발행 절차 (새 순서 — 사용자·AI 가 지킵니다)**
+
+```
+final diff review 종결
+  → bash rd-workflow/scripts/rd review seal <세션 경로>
+  → bash rd-workflow/scripts/rd task set-status "아카이브 보류"
+  → archive 기록 커밋 (seal 파일 포함)
+  → bash rd-workflow/scripts/lifecycle/archive.sh
+```
+
+`archive.sh` 의 호출 형태·인자·내부 순서는 바뀌지 않았으므로, 위 준비를 마친 뒤 곧바로 부르면 종전의 one-shot 실행과 같습니다. 다음에 할 일은 `bash rd-workflow/scripts/rd task status` 가 안내합니다.
+
+**기존 리뷰 세션 (legacy)**
+
+동기화 이전에 만든 세션에는 `SESSION.md` 의 `## Branch Context` 에 `review-head-oid` 가 없습니다. **그것이 legacy 의 기계적 정의**이며, 이런 세션은 리뷰 당시 커밋이 어디에도 기록되어 있지 않아 일반 `rd review seal` 이 거부합니다. 진행 중이던 작업을 마감해야 한다면 전용 경로를 씁니다.
+
+```bash
+bash rd-workflow/scripts/rd review seal --legacy-unverified "<사유>" <세션 경로>
+```
+
+- **포기하는 것**: 이 마커는 **리뷰 당시 트리를 증명하지 않습니다.** 종결 이후 코드가 변경되었어도 발행을 막지 못합니다.
+- **남는 것**: 사유가 `rd-workflow-workspace/.lifecycle/review-skip-audit.log` 에 append 되고, `archive.sh` 와 `rd task status` **양쪽이 통과할 때마다 경고**를 냅니다.
+- `review-head-oid` 가 **있는** 세션에 이 플래그를 쓰면 거부됩니다 — 검증 가능한 세션을 무검증으로 낮추지 않습니다.
+- `--force-skip-review-check`(리뷰를 아예 건너뜀)와 구분됩니다. 이쪽은 "리뷰는 했으나 대상을 증명 못 함" 입니다.
+- 진행 중 작업이 없다면 이 경로가 필요 없습니다 — 동기화 후 새로 만드는 세션은 두 OID 를 기록합니다.
+
 ### 5. 동기화 실행
 
 사용자 확인 후:
@@ -326,14 +372,30 @@ bash rd-workflow/scripts/defect_reports.sh set-upstream "<배포 repo URL>"
 
 - 값이 비어 있으면 canonical 값(`owner/repo` 또는 `host/owner/repo`)을 기록합니다.
 - 이미 값이 있으면 "이미 설정됨" 을 출력하고 원본을 유지합니다.
-- URL 문법을 지원하지 않으면 아무것도 쓰지 않고 보류합니다. 잘못된 대상에 추측 발행하지
-  않기 위함이며, 이 경우 결함 보고 전달은 미전달 목록에 남습니다.
-- **`rd-workflow/config/workflow.json` 이 없으면 이 단계를 건너뜁니다.** 설정 파일을 새로
-  만들지 않습니다 — 파일 부재는 `CLAUDE.md` 가 규정한 정상 상태입니다. 이 경우 결함 보고
-  전달은 발행 시 `--upstream <owner/repo>` 수동 지정에 의존합니다.
-- config 부재에서의 각 서브커맨드 동작: `set-upstream` 은 안내 후 **성공 종료**(무변경),
+- **이 절이 쓰는 것은 `defect_report_upstream` 키 하나뿐입니다.** `default_execution_mode`
+  를 포함한 다른 키의 값과 경로 종류(regular file / symlink)는 바꾸지 않습니다. 2단계
+  보존 규칙과 모순되지 않습니다 — 그 규칙은 5단계 복사에 대한 것이고, 이 절은 그 위에서
+  키 하나만 채우는 별도 단계입니다.
+- **URL 문법을 지원하지 않아 유도에 실패하면(스크립트 exit 1) 이는 예상 분기입니다.**
+  아무것도 쓰지 않고 **보류한 뒤 sync 를 계속합니다** — 6단계 이후(검증·버전 갱신·skill
+  재설치·extension 재설치)를 건너뛰지 않습니다. 잘못된 대상에 추측 발행하지 않기 위함이며,
+  이 경우 결함 보고 전달은 미전달 목록에 남습니다. 9단계 완료 보고에
+  「`defect_report_upstream` 미설정」과 그 사유, 수동 지정 방법(결함 보고 발행 시
+  `--upstream <owner/repo>` 로 지정하거나 `rd-workflow/config/workflow.json` 에 직접 기입)
+  을 표시합니다.
+- **유도 실패와 실제 쓰기 실패는 구분합니다.** 위 보류-후-계속은 URL 에서 대상을 유도하지
+  못한 경우에만 해당합니다. 파일 갱신 자체가 실패했다면(쓰기 권한·JSON 훼손 등) 그것은
+  보류가 아니라 보고하고 사람이 확인할 문제이므로, 사용자에게 알리고 판단을 받습니다.
+- **스크립트에 새 exit code 를 만들지 않는 이유**: 이 절차는 에이전트가 따르는 문서이고,
+  standalone 호출자에게는 유도 실패에 exit 1 이 올바른 신호이므로 분기 처리는 이 문서가 맡습니다.
+- **5단계가 배포본을 복사하므로 이 절에 들어오는 시점에는 `rd-workflow/config/workflow.json`
+  이 존재합니다.** 2단계 보존 규칙에 따라 경로가 이미 있었다면 그 파일이 그대로 남아 있고,
+  없었다면 배포본이 새로 놓입니다.
+- **그럼에도 파일이 여전히 없는 경우의 동작은 바꾸지 않습니다** — 이 스크립트는 sync 밖에서
+  직접 호출되기도 하기 때문입니다. `set-upstream` 은 안내 후 **성공 종료**(무변경),
   `preview`·`publish` 는 전달 대상을 빈 값으로 보고 **미전달로 남깁니다**. 세 경우 모두
-  파일을 만들지 않습니다.
+  파일을 만들지 않으며, 이때 결함 보고 전달은 발행 시 `--upstream <owner/repo>` 수동 지정에
+  의존합니다.
 
 ### 6. 검증 및 버전 갱신
 
@@ -513,6 +575,8 @@ manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
 - 복사/추가/삭제된 파일 수
 - 마이그레이션 실행 여부와 결과
 - 보존된 파일 요약
+- `rd-workflow/config/workflow.json` 의 5단계 복사 결과 — `신규 생성`(경로가 없어 배포본을 새로 두었습니다. 다음 작업부터 기본 실행 모드가 `semi-auto` 입니다) 또는 `기존 파일 보존`(경로가 있어 내용도 경로 종류도 손대지 않았습니다. 현재 판정 모드는 그 파일 내용이 정합니다). 이 결과는 복사 단계에 대한 것이며, 아래 `defect_report_upstream` 항목은 5.1 절이 같은 파일에 키 하나를 채운 별도 결과입니다
+- `defect_report_upstream` 결과 — `설정됨: <값>` 또는 `미설정 — <사유>`(사유와 함께 수동 지정 방법을 적습니다: 결함 보고 발행 시 `--upstream <owner/repo>` 로 지정하거나 `rd-workflow/config/workflow.json` 에 직접 기입). 유도 실패로 보류했더라도 sync 자체는 끝까지 진행된 것이므로 실패가 아니라 이 항목으로 보고합니다
 - Skill 재설치 결과 (설치/건너뛴 수)
 - Extension 자동 재설치 결과 (자동 재설치/신규 설치/건너뛴 수)
 - Verify Preset 머지 결과 요약 (추가/보존/업데이트된 verifier, 변경된 criteria) — verify preset이 자동 재설치된 경우에만

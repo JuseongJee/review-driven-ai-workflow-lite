@@ -34,7 +34,7 @@ AI가 필요한 파일을 가져온 뒤, 프로젝트에 대해 질문하면서 
 
 ## 사용 예시 — 단계별 프롬프트
 
-### 큰 작업
+### `full` 등급
 
 ```text
 1. "이 요구사항으로 진행해줘: 면접 질문지에 컬쳐 인터뷰 항목 추가"
@@ -51,11 +51,11 @@ AI가 필요한 파일을 가져온 뒤, 프로젝트에 대해 질문하면서 
 5. (review 확인 후) "좋아, 마무리해줘"
 ```
 
-### 작은 작업
+### `standard` 등급
 
 ```text
-1. "small-task로 바로 해줘: 운영 매뉴얼의 고객 응대 섹션 업데이트"
-   → AI가 바로 작성 → 검증 → review까지 진행합니다
+1. "운영 매뉴얼의 고객 응대 섹션 업데이트해줘"
+   → AI 가 등급(`standard`) 을 보고하고 작성 → 검증 → review 까지 진행합니다
 ```
 
 ### Autopilot
@@ -79,17 +79,19 @@ AI가 필요한 파일을 가져온 뒤, 프로젝트에 대해 질문하면서 
 
 ## 워크플로
 
-### 큰 작업
-```
-FR 자동 등록 → [large 판단] → REQUEST 작성 → REQUEST review → spec/plan → spec/plan review → 실행 → 검증 → final output review → 아카이브
-```
+모든 작업은 위험 등급(`light` / `standard` / `full`) 에 따라 절차가 달라집니다. 등급은 AI 가 `rd-workflow/docs/flows/WORKFLOW.md` 위험 등급 절의 신호표로 판정해 시작 보고를 내고, 하향은 사용자만 합니다.
 
-### 작은 작업
-```
-FR 자동 등록 → [small 판단] → REQUEST 정리 → 실행 → 검증 → 아카이브
-```
+### `full` (새 기능, 산출물 구조·품질 기준의 큰 변경)
 
-사용자가 작업을 요청하면 먼저 FR에 자동 등록된 뒤, Intake 규칙이 small/large를 자동 판단하여 해당 경로로 진행합니다.
+FR 자동 등록 → REQUEST 작성 → REQUEST review → spec/plan → spec/plan review → 실행 → 검증 → final output review → 아카이브
+
+### `standard` (국소 변경)
+
+promote → 축약 REQUEST → 실행 → 검증 → 재분류 → final output review → 아카이브
+
+### `light` (문구·포맷 수정)
+
+실행 → 검증 → 재분류 → 기본 브랜치 커밋 1회 (+ `reports/tier-log.md` 행, 원격 모드면 push — 실패 시 "미push" 로 보고). REQUEST·리뷰·아카이브 없음
 
 ## Developer 버전과의 차이
 

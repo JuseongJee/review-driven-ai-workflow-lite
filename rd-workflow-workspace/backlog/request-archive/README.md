@@ -119,9 +119,5 @@ archive 실행 주체는 Claude (CLAUDE.md 의 Task Tracking 섹션 규약). 사
    ```
    `archive.sh` 가 merge + tag + push + branch/worktree 정리를 일괄 처리한다.
 
-   **small-task (fr branch 없이 main 직접 commit 흐름):**
-   fr branch lifecycle 을 거치지 않으므로 `archive.sh` 호출은 생략할 수 있다. 대신 commit 시 다음 환경변수를 명시한다:
-   ```bash
-   RD_LIFECYCLE_BYPASS_REASON=small-task git commit -m "..."
-   ```
-   bypass reason 을 명시하면 guard hook 이 lifecycle skip 을 정상 처리로 기록한다.
+   **`standard` (fr branch 사용, `--size small`):** 위 1–4단계와 `archive.sh` 를 그대로 따릅니다.
+   **`light` (fr branch 없음):** REQUEST·아카이브가 없으므로 이 절차의 대상이 아닙니다. 기록은 `reports/tier-log.md` 행이며 커밋에 별도 환경변수를 붙이지 않습니다.

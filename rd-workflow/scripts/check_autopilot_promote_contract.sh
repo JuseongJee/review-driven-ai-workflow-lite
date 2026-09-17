@@ -68,6 +68,12 @@ fi
 #     한쪽 모드를 `--source-fr -` 나 값 누락으로 바꿔도 통과한다. 전자는 선택한 FR 연결을
 #     **조용히** 잃고(CLI 가 `-` 를 허용하므로 성공한다), 후자는 실행에서 깨진다.
 #     그래서 **명령마다** canonical 경로 형식을 요구한다.
+#
+# `--size` 는 여전히 정확히 1회여야 한다 — promote.sh 파서가 마지막 값을 취하므로
+# 반복은 "값 교차" 위험이다. `--source-fr` 는 반복 지정이 정식 계약이 됐으므로
+# (change spec §2.3b/§2.4b — promote.sh --source-fr 는 옵션 반복) **1회 이상**을
+# 요구하고, **나타난 모든 occurrence** 가 canonical 형식인지 개별 검사한다 — 하나만
+# 검사하면 두 번째 이후에 `-` 나 값 누락을 몰래 섞어도 통과한다.
 if ! viol="$(awk '
   /^[[:space:]]*모드 A[ (]/ { mode="A"; next }
   /^[[:space:]]*모드 B[ (]/ { mode="B"; next }
@@ -85,20 +91,28 @@ if ! viol="$(awk '
       # (final diff review 7라운드 Finding 3). 왼쪽은 줄 시작 또는 공백이어야 한다.
       hasLarge = (line ~ /(^|[[:space:]])--size large([[:space:]]|$)/)
       hasSmall = (line ~ /(^|[[:space:]])--size small([[:space:]]|$)/)
-      hasSfr   = (line ~ /(^|[[:space:]])--source-fr[[:space:]]+rd-workflow-workspace\/backlog\/items\/[^[:space:]]+\.md([[:space:]]|$)/)
-      # **같은 옵션이 두 번 나오면 거부한다.** `promote.sh` 파서는 순서대로 대입하므로
-      # 마지막 값이 이긴다. 기대값의 "존재" 만 보면 `--size small --size large` 가
-      # hasSmall=1 로 통과하면서 실제로는 large 로 실행되고,
-      # `--source-fr <canonical> --source-fr -` 는 Source FR 을 조용히 지운다.
-      # 횟수 판정도 같은 양쪽 경계를 쓴다 — 한쪽만 보면 `x--size` 가 1회로 세어진다.
+      # **같은 옵션이 두 번 나오면 거부한다(--size 만).** `promote.sh` 파서는 순서대로
+      # 대입하므로 마지막 값이 이긴다. 기대값의 "존재" 만 보면 `--size small --size large`
+      # 가 hasSmall=1 로 통과하면서 실제로는 large 로 실행된다.
       tmp = line; nSize = gsub(/(^|[[:space:]])--size([[:space:]]|$)/, " ", tmp)
-      tmp = line; nSfr  = gsub(/(^|[[:space:]])--source-fr([[:space:]]|$)/, " ", tmp)
+      # --source-fr 는 토큰 단위로 훑어 **occurrence 마다** 다음 토큰이 canonical FR
+      # 경로인지 검사한다 (반복 지정이 정식 계약이므로 "어딘가에 하나는 있다" 로는
+      # 부족하다 — 두 번째 이후에 `-` 나 값 누락을 섞어도 그 검사로는 안 잡힌다).
+      nTok = split(line, tok, /[ \t]+/)
+      nSfr = 0; badSfr = 0
+      for (i = 1; i <= nTok; i++) {
+        if (tok[i] == "--source-fr") {
+          nSfr++
+          val = (i + 1 <= nTok) ? tok[i + 1] : ""
+          if (val !~ /^rd-workflow-workspace\/backlog\/items\/[^[:space:]]+\.md$/) badSfr++
+        }
+      }
       if (mode == "")                   print start ": 모드 라벨 없는 승격 명령"
       else if (mode == "A" && !hasLarge) print start ": 모드 A 는 --size large 여야 합니다 (값 경계 포함)"
       else if (mode == "B" && !hasSmall) print start ": 모드 B 는 --size small 여야 합니다 (값 경계 포함)"
       if (nSize != 1) print start ": --size 가 " nSize "회 나타납니다 — 정확히 1회여야 합니다 (파서는 마지막 값을 씁니다)"
-      if (!hasSfr) print start ": --source-fr 에 canonical FR 경로(rd-workflow-workspace/backlog/items/<파일>.md)가 없습니다"
-      if (nSfr != 1) print start ": --source-fr 가 " nSfr "회 나타납니다 — 정확히 1회여야 합니다 (파서는 마지막 값을 씁니다)"
+      if (nSfr < 1) print start ": --source-fr 가 없습니다 — 최소 1회, canonical FR 경로(rd-workflow-workspace/backlog/items/<파일>.md)로 지정하세요 (반복 지정 가능)"
+      else if (badSfr > 0) print start ": --source-fr " nSfr "회 중 " badSfr "회가 canonical FR 경로가 아닙니다 (rd-workflow-workspace/backlog/items/<파일>.md 형식이어야 합니다)"
       mode = ""
     }
   }

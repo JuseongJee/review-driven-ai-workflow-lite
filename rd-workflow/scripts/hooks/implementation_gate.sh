@@ -25,7 +25,8 @@ if [[ -n "$(read_hook_agent_id)" ]] && is_shared_state_file "$file_path"; then
   echo "[guard] 이 파일은 orchestrator(메인 세션) 전용입니다: ${rel_path}" >&2
   echo "        병렬 구현자는 공유 진행 상태를 수정하지 않습니다." >&2
   echo "        진행 상황·완료 보고는 결과 텍스트로 반환하면 orchestrator 가 반영합니다." >&2
-  exit 2
+  # reason: subagent가 공유 진행 상태 파일(orchestrator 전용)을 쓰려 한 분기.
+  guard_deny "implementation_gate.shared-state-write"
 fi
 
 exit 0

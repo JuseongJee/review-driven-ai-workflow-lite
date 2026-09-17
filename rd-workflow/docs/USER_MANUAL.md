@@ -20,16 +20,25 @@
 
 핵심: `PROJECT_CONTEXT.md`를 채우는 것이 첫 번째이자 가장 중요한 단계입니다.
 
+### 팀 프로젝트에 개인 설치
+
+내 private overlay repo 를 루트로 두고 팀 저장소를 그 아래 git submodule 로 붙입니다.
+팀 repo 워킹트리에는 아무것도 두지 않습니다.
+
+- **처음 설치**: [team-overlay-fresh-install.md](guides/team-overlay-fresh-install.md)
+- **이미 설치된 프로젝트에서 이관**: [team-overlay-migration.md](guides/team-overlay-migration.md)
+
 ## 핵심 개념
 
 ### 작업 분류
 
-| 구분 | 기준 | 흐름 |
+| 등급 | 기준 | 흐름 |
 |------|------|------|
-| 작은 작업 | 사용자가 **명시적으로** small 지정 | REQUEST → 실행 → 검증 → 아카이브 |
-| 큰 작업 | 그 외 전부 | REQUEST → 리뷰 → spec/plan → 리뷰 → 실행 → 검증 → output 리뷰 → 아카이브 |
+| `light` | 문구·오탈자 등 경미한 수정 | 실행 → 검증 → 재분류 → 기본 브랜치 커밋 1회 |
+| `standard` | 국소 변경, 산출물 구조 불변 | REQUEST → 실행 → 검증 → 재분류 → final output review → 아카이브 |
+| `full` | 새 기능, 산출물 구조·품질 기준의 큰 변경 | REQUEST → 리뷰 → spec/plan → 리뷰 → 실행 → 검증 → output 리뷰 → 아카이브 |
 
-AI가 자체적으로 작업 크기를 판단하지 않습니다. 사용자가 small이라고 말하지 않으면 큰 작업입니다.
+AI가 `rd-workflow/docs/flows/WORKFLOW.md` 위험 등급 절의 신호표로 `light`/`standard`/`full` 등급을 판정해 시작 보고를 냅니다. 등급 하향은 사용자만 할 수 있습니다.
 
 ### 4개 핵심 문서
 
@@ -63,7 +72,7 @@ idea → validated → ready-for-request → REQUEST로 승격 → done
 
 ## 일상 워크플로
 
-### 큰 작업
+### `full` 등급
 
 ```
 1. "이 요구사항으로 진행해줘: ..."
@@ -77,13 +86,13 @@ idea → validated → ready-for-request → REQUEST로 승격 → done
 
 사용자는 각 리뷰 결과를 확인하고, 필요하면 피드백을 줍니다.
 
-### 작은 작업
+### `standard` 등급
 
 ```
-1. "small-task로 바로 작성해줘: ..."
-2. AI가 REQUEST.md 정리 → 바로 실행
+1. "바로 작성해줘: ..."
+2. AI가 등급 판정(`standard`) → 축약 REQUEST → 바로 실행
 3. 검증
-4. 필요 시 diff review
+4. final diff review
 5. REQUEST 아카이브
 ```
 
@@ -114,9 +123,9 @@ FUTURE_REQUESTS에서 작업을 선택하고 전체 파이프라인을 자율 �
 
 ### request-to-reviewed-plan
 
-큰 작업의 전체 준비 과정을 담당합니다.
-자유 텍스트 요구사항 → FR 자동 등록 → small/large 자동 판단 → 해당 skill로 진행.
-large일 때: REQUEST.md → REQUEST 리뷰 → spec → plan → spec/plan 리뷰.
+`full` 등급 작업의 전체 준비 과정을 담당합니다.
+자유 텍스트 요구사항 → FR 자동 등록 → 위험 등급 판정 → 해당 skill로 진행.
+`full`일 때: REQUEST.md → REQUEST 리뷰 → spec → plan → spec/plan 리뷰.
 
 ```
 "이 요구사항으로 request-to-reviewed-plan으로 진행해줘"
@@ -124,11 +133,11 @@ large일 때: REQUEST.md → REQUEST 리뷰 → spec → plan → spec/plan 리�
 
 ### small-task-implement
 
-Intake 규칙에서 small로 판단하거나 사용자가 명시적으로 지정한 작업을 바로 실행합니다.
-FR 자동 등록 → REQUEST 정리 → 실행 → 검증 → CURRENT_TASK.md 갱신.
+`standard` 등급(국소 변경, 산출물 구조 불변) 작업을 바로 실행합니다. 등급은 AI 가 `WORKFLOW.md` 위험 등급 절의 신호표로 판정하고, 하향은 사용자만 합니다. `light`(문구·오탈자) 는 skill 없이 커밋 1회로 끝납니다.
+promote → 축약 REQUEST → 실행 → 검증 → 재분류 → final diff review.
 
 ```
-"small-task로 바로 작성해줘: ..."
+"standard 로 바로 작성해줘: ..."
 ```
 
 ### final-diff-review
@@ -206,13 +215,17 @@ bash rd-workflow/scripts/typecheck.sh
 {
   "auto_completion_report": false,
   "intake_source": "text",
-  "fr_github": false
+  "fr_github": false,
+  "default_execution_mode": "semi-auto"
 }
 ```
 
 - `auto_completion_report`: 작업 완료 시 보고서 자동 생성 여부
 - `intake_source`: 입력 소스 유형
 - `fr_github`: GitHub Issues 연동 여부
+- `default_execution_mode`: 기본 실행 모드. **기본값은 `"semi-auto"`** 이며 파일이나 키가 없어도 `semi-auto` 로 판정합니다. 단계마다 확인받는 종전 동작으로 되돌리려면 이 키에 `"manual"` 을 적습니다. 값을 판정할 수 없으면 `manual` 로 떨어지며 경고가 표시되고, 세션 지시가 이 값보다 우선합니다.
+
+이 파일은 배포본에 실체로 포함되어 있으므로 **직접 편집합니다.** example 파일을 무조건 복사하면 배포한 기본값과 적어 둔 설정이 덮이므로, 복사는 **경로가 없을 때만** 합니다. `.example` 에서 최초 1회 만드는 것은 배포본에 실체가 없는 설정(예: `review-tools.json`)에 해당합니다.
 
 ### rd-workflow/config/review-tools.json
 
@@ -283,7 +296,7 @@ codex 의 추론 깊이는 `tools.codex.reasoning_effort`(리뷰 타입별로는
 | 상황 | 해결 |
 |------|------|
 | AI가 워크플로를 안 따름 | "CLAUDE.md 다시 읽고 워크플로대로 진행해" |
-| small-task인데 큰 작업으로 처리됨 | "small-task로 바로 실행해줘" 명시 |
+| 등급이 과하게 잡힘 | "standard 로 내려서 진행해줘" 명시 (하향은 사용자만) |
 | 검증이 계속 FAIL | `test.sh`/`lint.sh`/`typecheck.sh` 설정과 PROJECT_CONTEXT.md 검증 명령 확인 |
 | 리뷰가 20턴 넘어도 끝나지 않음 | `awaiting-user`로 전환됨 — 직접 판단 후 진행 지시 |
 | 산출물 파일을 못 찾음 | CURRENT_TASK.md의 `Output Files` 섹션 확인 |

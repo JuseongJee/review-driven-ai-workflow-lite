@@ -67,10 +67,11 @@ template_type_of() {
 }
 
 # 임시 clone
-CLONE_DIR="$(mktemp -d)"
+CLONE_DIR="$(mktemp -d)" || { echo "sync_template: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$CLONE_DIR" && -d "$CLONE_DIR" ]] || { echo "sync_template: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 # 성공 시 cleanup은 호출자(sync_template.md 6단계)가 담당
 # 실패 시 스크립트가 self-cleanup
-cleanup_on_failure() { rm -rf "$CLONE_DIR"; }
+cleanup_on_failure() { [[ -n "$CLONE_DIR" ]] && rm -rf "$CLONE_DIR"; }
 trap 'cleanup_on_failure' ERR
 
 echo "--- 템플릿 소스 clone ---" >&2

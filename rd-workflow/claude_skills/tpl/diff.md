@@ -13,8 +13,9 @@
 ### 2. 원격 clone
 
 ```bash
-TMPDIR=$(mktemp -d)
-git clone --depth 1 <template_repo> "$TMPDIR" 2>/dev/null
+tpl_tmp="$(mktemp -d)" || { echo "tpl diff: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$tpl_tmp" && -d "$tpl_tmp" ]] || { echo "tpl diff: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+git clone --depth 1 <template_repo> "$tpl_tmp" 2>/dev/null
 ```
 
 실패하면 "원격 repo를 가져올 수 없습니다" 출력 후 종료.
@@ -59,7 +60,7 @@ rd-workflow 템플릿 diff: 변경 없음 (로컬이 최신)
 ### 5. 정리
 
 ```bash
-rm -rf "$TMPDIR"
+[[ -n "$tpl_tmp" ]] && rm -rf "$tpl_tmp"
 ```
 
 ## 규칙

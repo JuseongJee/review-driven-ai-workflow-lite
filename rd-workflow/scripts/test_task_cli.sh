@@ -32,7 +32,7 @@ $2
 -
 EOF
   # v2 2b: task-state도 함께 갱신 (task-state가 권위 소스 — 결정 1/3)
-  # canonical 8종이 아닌 값(손상 테스트용)은 task-state를 생성하지 않음
+  # canonical 9종이 아닌 값(손상 테스트용)은 task-state를 생성하지 않음
   local _ts_dir="$1/rd-workflow-workspace/.lifecycle"
   mkdir -p "$_ts_dir"
   # canonical 여부 판정: 기존 STATE_CANONICAL_STATUSES 파이프 문자열 사용 가능하지만
@@ -59,13 +59,28 @@ TSEOF
       ;;
   esac
 }
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# mk_fr_items <root> — set-source-fr 픽스처가 가리키는 items 파일을 실제로 만든다.
+# set-source-fr 는 change-spec AC C-13 에 따라 파일 실존을 요구한다(오등록이 마감
+# 시점에야 드러나는 것을 막기 위함). 그 전에는 형식만 봤으므로, 실존하지 않는
+# 경로로 성공을 단정하던 종전 픽스처를 실제 파일 생성으로 바꾼다.
+mk_fr_items() {
+  local root="$1" rel
+  mkdir -p "$root/rd-workflow-workspace/backlog/items" || return 1
+  for rel in 2026-01-01-old 2026-02-02-new 2026-03-03-third; do
+    printf -- '# %s\n- status: validated\n' "$rel" \
+      > "$root/rd-workflow-workspace/backlog/items/${rel}.md" || return 1
+  done
+}
+TMP="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$TMP" && -d "$TMP" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+trap 'rm -rf "$TMP"' EXIT
 export project_root="$TMP"
+mk_fr_items "$TMP" || { echo "test_task_cli.sh: FR items 픽스처 생성 실패" >&2; exit 1; }
 mk_task_file "$TMP" "구현 중" "my-task"
 
 t "status 읽기" 0 "구현 중" bash "$RD" task status
 t "title 읽기" 0 "my-task" bash "$RD" task title
-t "mode manual" 0 "manual" env -u RD_AUTOPILOT bash "$RD" task mode
+t "mode non-autopilot" 0 "non-autopilot" env -u RD_AUTOPILOT bash "$RD" task mode
 out="$(RD_AUTOPILOT=1 bash "$RD" task mode)"; [[ "$out" == "autopilot" ]] && echo "ok: mode autopilot" || { echo "FAIL: mode autopilot"; FAIL=1; }
 
 # v2 2b: CURRENT_TASK.md 없음 + task-state 없음 → bootstrap(대기 중 exit 0)
@@ -215,6 +230,17 @@ rm -f "$TMP/rd-workflow-workspace/.lifecycle/task-state"
 printf '# Current Task\n\n## Status\n구현 중\n' > "$TMP/CURRENT_TASK.md"
 g "fr-add 섹션 부재(마이그레이션 후 sentinel): write" 0 "write" bash "$RD" task guard --candidate x --mode fr-add
 
+# --- guard 순위 4 (신설, change spec §2.1·§2.2) — 통합 slug 재진입 ---
+# cand 가 현재 task-state 의 source-fr 집합 구성원과 slug 기준으로 일치하면 mode 무관
+# proceed-readonly. fr-branch 는 null(비활성)이어도 순위 4 가 순위 5 보다 먼저 판정된다.
+mk_task_file "$TMP" "구현 중" "integrated-task"
+bash "$RD" task set-source-fr "rd-workflow-workspace/backlog/items/2026-01-01-old.md" >/dev/null 2>&1
+g "순위4: 통합 slug + 자기 source FR 재진입(intake) → proceed-readonly" 0 "proceed-readonly" \
+  bash "$RD" task guard --candidate old --mode intake
+t "순위4 판정 후 title 불변" 0 "integrated-task" bash "$RD" task title
+g "순위4: promote 모드에서도 동일 판정" 0 "proceed-readonly" \
+  bash "$RD" task guard --candidate old --mode promote
+
 # --- capture (SEC-03/04/05/06) ---
 mk_task_file "$TMP" "구현 중" "cap-task"
 mkdir -p "$TMP/rd-workflow-workspace"
@@ -314,7 +340,9 @@ EOF
 
 # --- TC-T1: rd task status — task-state 우선 ---
 echo "--- TC-T1: task status task-state 우선 ---"
-TMP2="$(mktemp -d)"; trap 'rm -rf "$TMP2"' EXIT
+TMP2="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$TMP2" && -d "$TMP2" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+trap 'rm -rf "$TMP2"' EXIT
 # task-state(status=검증 중) + CURRENT_TASK.md(status=구현 중): task-state 우선 보장
 mk_task_file "$TMP2" "구현 중" "foo"
 mk_task_state "$TMP2" "검증 중" "foo"
@@ -393,7 +421,9 @@ d_parse="$(printf '%s\n' "$out_guard4" | awk -F= '$1=="decision"{print $2}')"
 
 # --- TC-T5: 마이그레이션 통합 (task-state 부재 + legacy fixture → 첫 CLI 호출 자동 마이그레이션) ---
 echo "--- TC-T5: 마이그레이션 통합 ---"
-TMP3="$(mktemp -d)"; trap 'rm -rf "$TMP3"' EXIT
+TMP3="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$TMP3" && -d "$TMP3" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+trap 'rm -rf "$TMP3"' EXIT
 # legacy 환경: task-state 없이 CURRENT_TASK.md + active-fr만 존재
 mkdir -p "${TMP3}/rd-workflow-workspace/.lifecycle"
 cat > "${TMP3}/CURRENT_TASK.md" <<'CTEOF'
@@ -433,7 +463,9 @@ rc_mig=$?
 bk_cnt="$(find "${TMP3}/rd-workflow-workspace/.lifecycle/migration-backup" -name "CURRENT_TASK.md" 2>/dev/null | wc -l | tr -d ' ')"
 [[ "$bk_cnt" -ge 1 ]] && echo "ok: T5-d migration-backup 생성됨" || { echo "FAIL: T5-d migration-backup 없음"; FAIL=1; }
 # 손상 legacy(비canonical status) → exit 3 + task-state 미생성
-TMP4="$(mktemp -d)"; trap 'rm -rf "$TMP4"' EXIT
+TMP4="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$TMP4" && -d "$TMP4" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+trap 'rm -rf "$TMP4"' EXIT
 mk_task_file "$TMP4" "이상한값" "bad-task"
 env project_root="$TMP4" bash "$RD" task status >/dev/null 2>&1; rc_bad=$?
 [[ "$rc_bad" == "3" ]] && echo "ok: T5-e 손상 legacy → exit 3" || { echo "FAIL: T5-e 손상 legacy → exit $rc_bad (기대: 3)"; FAIL=1; }
@@ -444,7 +476,9 @@ env project_root="$TMP4" bash "$RD" task status >/dev/null 2>&1; rc_bad=$?
 # ===========================================================================
 
 echo "--- TC-FIX-1: fr-add guard + task-state 존재 + short-title 손상 → proceed-readonly ---"
-TMP_FIX="$(mktemp -d)"; trap 'rm -rf "$TMP_FIX"' EXIT
+TMP_FIX="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$TMP_FIX" && -d "$TMP_FIX" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+trap 'rm -rf "$TMP_FIX"' EXIT
 # task-state 존재하지만 short-title 키 없는 손상 fixture (mk_task_file 대신 직접 생성)
 mkdir -p "${TMP_FIX}/rd-workflow-workspace/.lifecycle"
 cat > "${TMP_FIX}/rd-workflow-workspace/.lifecycle/task-state" <<'FIXEOF'
@@ -482,7 +516,9 @@ ts_title_fix="$(awk -F'=' '$1=="short-title"{sub(/^[^=]+=/,"");print;exit}' "${T
 [[ -z "$ts_title_fix" ]] && echo "ok: TC-FIX-1b short-title 갱신 없음 (write 금지)" || { echo "FAIL: TC-FIX-1b short-title이 갱신됨 (got='${ts_title_fix}')"; FAIL=1; }
 
 echo "--- TC-FIX-2: set-status 쓰기 실패 → exit 3 ---"
-TMP_FIX2="$(mktemp -d)"; trap 'rm -rf "$TMP_FIX2"' EXIT
+TMP_FIX2="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$TMP_FIX2" && -d "$TMP_FIX2" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+trap 'rm -rf "$TMP_FIX2"' EXIT
 mk_task_file "$TMP_FIX2" "구현 중" "fix2-task"
 # task-state를 읽기 전용으로 만들어 state_write_fields 실패 시나리오 시뮬레이션
 _ts_path_fix2="${TMP_FIX2}/rd-workflow-workspace/.lifecycle"
@@ -588,6 +624,268 @@ bash "$RD" task set-source-fr "$SRC_OK" >/dev/null 2>&1
 t "guard fr-add 진행 중" 0 - bash "$RD" task guard --candidate other --mode fr-add
 t "fr-add 후 source-fr 불변" 0 "$SRC_OK" bash "$RD" task source-fr
 
+# --- set-source-fr 복수 (change spec §2.4b·§2.3b) ---
+SRC_OK3="rd-workflow-workspace/backlog/items/2026-03-03-third.md"
+
+# CLI 복수 왕복 — 3건 저장 → source-fr 조회가 3건, 미러가 줄 단위 목록 (AC E-20 ⑥)
+mk_task_file "$TMP" "대기 중" "-"
+t "set-source-fr 복수 저장" 0 - bash "$RD" task set-source-fr "$SRC_OK" "$SRC_OK2" "$SRC_OK3"
+mv_out="$(bash "$RD" task source-fr)"
+mv_want="$(printf '%s\n%s\n%s' "$SRC_OK" "$SRC_OK2" "$SRC_OK3")"
+[[ "$mv_out" == "$mv_want" ]] && echo "ok: 복수 왕복 — source-fr 조회 3건" \
+  || { echo "FAIL: 복수 왕복 조회 불일치 ('$mv_out' != '$mv_want')"; FAIL=1; }
+mv_mirror="$(awk '$0=="## Source FR"{f=1;next} f&&/^## /{exit} f&&NF{print}' "$TMP/CURRENT_TASK.md")"
+[[ "$mv_mirror" == "$mv_want" ]] && echo "ok: 복수 왕복 — 미러 줄 단위 목록" \
+  || { echo "FAIL: 복수 왕복 미러 불일치 ('$mv_mirror' != '$mv_want')"; FAIL=1; }
+# --- final diff review F5 회귀: fr-done 의 FR 경로 검증 ---
+FD5="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$FD5" && -d "$FD5" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+mkdir -p "$FD5/proj/rd-workflow-workspace/backlog/items" "$FD5/proj/rd-workflow-workspace/.lifecycle"
+printf '# outside\n- status: idea\n' > "$FD5/outside.md"
+printf '# a\n- status: validated\n' > "$FD5/proj/$SRC_OK"
+printf '# Current Task\n\n## Status\n구현 중\n\n## Short Title\nx\n\n## Source FR\n-\n' > "$FD5/proj/CURRENT_TASK.md"
+fd5_rd() { env project_root="$FD5/proj" bash "$RD" "$@"; }
+
+fd5_rd task fr-done ../outside.md >/dev/null 2>&1; fd5_rc=$?
+[[ "$fd5_rc" -ne 0 ]] && echo "ok: F5 items/ 밖 경로 → 거부" \
+  || { echo "FAIL: F5 items/ 밖 경로가 승인됨"; FAIL=1; }
+grep -q '^- status: idea$' "$FD5/outside.md" \
+  && echo "ok: F5 거부 시 프로젝트 밖 파일 불변" \
+  || { echo "FAIL: F5 프로젝트 밖 파일이 수정됐다"; FAIL=1; }
+fd5_rd task fr-done "rd-workflow-workspace/backlog/items/../../../outside.md" >/dev/null 2>&1 \
+  && { echo "FAIL: F5 canonical 접두 안의 '..' 가 승인됨"; FAIL=1; } \
+  || echo "ok: F5 canonical 접두 안의 '..' → 거부"
+fd5_rd task fr-done "$(printf '%s\n%s' "$SRC_OK" "$SRC_OK2")" >/dev/null 2>&1 \
+  && { echo "FAIL: F5 개행 든 인자가 승인됨"; FAIL=1; } \
+  || echo "ok: F5 개행 든 인자 → 거부"
+grep -q '^- status: validated$' "$FD5/proj/$SRC_OK" \
+  && echo "ok: F5 인자 검증 실패 시 정상 FR 도 바뀌지 않음 (전부-또는-전무)" \
+  || { echo "FAIL: F5 인자 검증 실패인데 정상 FR 이 바뀜"; FAIL=1; }
+# 손상된 저장값(items/ 밖) 은 쓰기 전에 걸러 실패로 보고한다
+printf 'short-title=x\nsource-fr=../outside.md\n' > "$FD5/proj/rd-workflow-workspace/.lifecycle/task-state"
+fd5_out="$(fd5_rd task fr-done 2>&1)"; fd5_out_rc=$?
+[[ "$fd5_out_rc" -ne 0 ]] && echo "ok: F5 손상 저장값 → 실패로 보고" \
+  || { echo "FAIL: F5 손상 저장값인데 성공 (out='${fd5_out}')"; FAIL=1; }
+grep -q '^- status: idea$' "$FD5/outside.md" \
+  && echo "ok: F5 손상 저장값에도 프로젝트 밖 파일 불변" \
+  || { echo "FAIL: F5 손상 저장값이 프로젝트 밖 파일을 바꿨다"; FAIL=1; }
+
+# --- final diff review F1~F4 회귀 ---
+FDR="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$FDR" && -d "$FDR" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+mk_fr_items "$FDR" || { echo "test_task_cli.sh: FR items 픽스처 생성 실패(FDR)" >&2; exit 1; }
+mkdir -p "$FDR/rd-workflow-workspace/.lifecycle"
+printf '# Current Task\n\n## Status\n대기 중\n\n## Short Title\n-\n\n## Source FR\n-\n\n## Notes\n-\n' > "$FDR/CURRENT_TASK.md"
+fdr_rd() { env project_root="$FDR" bash "$RD" "$@"; }
+fdr_mirror() { awk '$0=="## Source FR"{f=1;next} f&&/^## /{exit} f&&NF{print}' "$FDR/CURRENT_TASK.md"; }
+fdr_state() { awk -F= '$1=="source-fr"{sub(/^[^=]+=/,"");print}' "$FDR/rd-workflow-workspace/.lifecycle/task-state"; }
+
+# F1: 인덱스 행 재구성이 열 수·이스케이프 셀·상태 칸 위치를 보존한다.
+#     (split 이 돌려주는 바깥쪽 빈 원소까지 다시 쓰면 7열이 9열이 되어 상태가 밀린다)
+printf '| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |\n|---|---|---|---|---|---|---|\n| 2026-01-01 | old | 요약 a \\| b | feature | idea | P2 | [상세](x.md) |\n' \
+  > "$FDR/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
+fdr_rd task fr-done "$SRC_OK" >/dev/null 2>&1
+fdr_row="$(tail -1 "$FDR/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md")"
+[[ "$fdr_row" == '| 2026-01-01 | old | 요약 a \| b | feature | done | P2 | [상세](x.md) |' ]] \
+  && echo "ok: F1 인덱스 행이 열 수·이스케이프 셀 보존하며 상태만 done" \
+  || { echo "FAIL: F1 인덱스 행 손상 ('${fdr_row}')"; FAIL=1; }
+fdr_rd task fr-done "$SRC_OK" 2>&1 | grep -q "건너뜀 1" \
+  && echo "ok: F1 재실행 멱등 (행 부재 오보고 없음)" \
+  || { echo "FAIL: F1 재실행이 멱등하지 않음"; FAIL=1; }
+
+# F2: guard 의 write·rebind 가 미러에 저장 형식('|')을 노출하지 않는다.
+fdr_rd task guard --candidate bundle --mode promote --source-fr "$SRC_OK" --source-fr "$SRC_OK2" >/dev/null 2>&1
+[[ "$(fdr_mirror)" == "$(printf '%s\n%s' "$SRC_OK" "$SRC_OK2")" ]] \
+  && echo "ok: F2 guard write — 미러는 줄 단위 목록" \
+  || { echo "FAIL: F2 guard write 미러 형식 ('$(fdr_mirror)')"; FAIL=1; }
+[[ "$(fdr_state)" == "${SRC_OK}|${SRC_OK2}" ]] \
+  && echo "ok: F2 guard write — 권위는 직렬화 한 줄" \
+  || { echo "FAIL: F2 guard write 권위 형식 ('$(fdr_state)')"; FAIL=1; }
+# rebind 경로 (Status 대기 중 + 다른 후보)
+printf '# Current Task\n\n## Status\n대기 중\n\n## Short Title\nstale-one\n\n## Source FR\n-\n\n## Notes\n-\n' > "$FDR/CURRENT_TASK.md"
+fdr_rd task guard --candidate rebound --mode promote --source-fr "$SRC_OK" --source-fr "$SRC_OK3" >/dev/null 2>&1
+[[ "$(fdr_mirror)" == "$(printf '%s\n%s' "$SRC_OK" "$SRC_OK3")" ]] \
+  && echo "ok: F2 guard rebind — 미러는 줄 단위 목록" \
+  || { echo "FAIL: F2 guard rebind 미러 형식 ('$(fdr_mirror)')"; FAIL=1; }
+
+# F3: guard 도 파일 실존을 검사하고, 실패 시 아무것도 쓰지 않는다.
+fdr_state_before="$(fdr_state)"; fdr_mirror_before="$(fdr_mirror)"
+fdr_f3="$(fdr_rd task guard --candidate x --mode promote --source-fr "$SRC_OK" \
+  --source-fr rd-workflow-workspace/backlog/items/2099-12-31-missing.md 2>&1)"; fdr_f3_rc=$?
+[[ "$fdr_f3_rc" -ne 0 ]] && echo "ok: F3 guard 부재 경로 혼합 → 거부" \
+  || { echo "FAIL: F3 guard 부재 경로 혼합인데 성공"; FAIL=1; }
+case "$fdr_f3" in *"2099-12-31-missing.md"*) echo "ok: F3 부재 항목을 이름으로 알림" ;;
+  *) echo "FAIL: F3 부재 항목 이름 없음 ('${fdr_f3}')"; FAIL=1 ;; esac
+[[ "$(fdr_state)" == "$fdr_state_before" && "$(fdr_mirror)" == "$fdr_mirror_before" ]] \
+  && echo "ok: F3 거부 시 권위·미러 불변" \
+  || { echo "FAIL: F3 거부인데 상태가 바뀜"; FAIL=1; }
+
+# F4: 개행이 든 인자 하나가 두 항목으로 승인되지 않는다 (인자 경계 보존).
+fdr_f4="$(fdr_rd task guard --candidate y --mode promote --source-fr "$(printf '%s\n%s' "$SRC_OK" "$SRC_OK2")" 2>&1)"; fdr_f4_rc=$?
+[[ "$fdr_f4_rc" -ne 0 ]] && echo "ok: F4 개행 든 인자 → 거부" \
+  || { echo "FAIL: F4 개행 든 인자가 승인됨"; FAIL=1; }
+[[ "$(fdr_state)" == "$fdr_state_before" ]] \
+  && echo "ok: F4 거부 시 권위 불변" \
+  || { echo "FAIL: F4 거부인데 권위가 바뀜 ('$(fdr_state)')"; FAIL=1; }
+
+# 섹션이 **이미 있는** 미러에 복수 값 쓰기 (2026-09-10 실측 결함).
+# BSD awk 는 `-v` 값에 개행이 있으면 죽고, 그러면 `awk ... && mv` 가 끊겨 권위만
+# 갱신되고 미러는 그대로인 partial state 가 남는다. 섹션이 없는 픽스처는 append
+# 경로로 빠져 이 결함을 가리므로, 여기서는 섹션이 있는 상태에서 확인한다.
+MW_ROOT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$MW_ROOT" && -d "$MW_ROOT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+mk_fr_items "$MW_ROOT" || { echo "test_task_cli.sh: FR items 픽스처 생성 실패(MW_ROOT)" >&2; exit 1; }
+mkdir -p "$MW_ROOT/rd-workflow-workspace/.lifecycle"
+printf '# Current Task\n\n## Status\n구현 중\n\n## Short Title\nmw\n\n## Source FR\n-\n\n## Notes\n-\n' > "$MW_ROOT/CURRENT_TASK.md"
+mw_out="$(env project_root="$MW_ROOT" bash "$RD" task set-source-fr "$SRC_OK" "$SRC_OK2" 2>&1)"; mw_rc=$?
+[[ "$mw_rc" -eq 0 ]] \
+  && echo "ok: 섹션 존재 미러에 복수 값 쓰기 성공" \
+  || { echo "FAIL: 섹션 존재 미러 복수 쓰기 실패 (rc=${mw_rc}, out='${mw_out}')"; FAIL=1; }
+mw_mirror="$(awk '$0=="## Source FR"{f=1;next} f&&/^## /{exit} f&&NF{print}' "$MW_ROOT/CURRENT_TASK.md")"
+[[ "$mw_mirror" == "$(printf '%s\n%s' "$SRC_OK" "$SRC_OK2")" ]] \
+  && echo "ok: 섹션 존재 미러가 줄 단위 목록으로 갱신" \
+  || { echo "FAIL: 섹션 존재 미러 불일치 ('${mw_mirror}')"; FAIL=1; }
+grep -q '^## Notes$' "$MW_ROOT/CURRENT_TASK.md" \
+  && echo "ok: 뒤따르는 섹션 보존" \
+  || { echo "FAIL: 복수 쓰기가 뒤 섹션을 삼켰다"; FAIL=1; }
+
+mv_state="$(awk -F= '$1=="source-fr"{sub(/^[^=]+=/,"");print}' "$TMP/rd-workflow-workspace/.lifecycle/task-state")"
+[[ "$mv_state" == "${SRC_OK}|${SRC_OK2}|${SRC_OK3}" ]] && echo "ok: 복수 왕복 — task-state 저장 형식('|' 구분)" \
+  || { echo "FAIL: 복수 왕복 task-state 형식 불일치 ('$mv_state')"; FAIL=1; }
+
+# CLI 거부 시 상태 보존 — 유효값과 부재(계약 위반) 값 혼합 → nonzero + 상태·미러 불변 (AC E-20 ⑦)
+mk_task_file "$TMP" "대기 중" "-"
+bash "$RD" task set-source-fr "$SRC_OK" >/dev/null 2>&1
+rej_state_before="$(cat "$TMP/rd-workflow-workspace/.lifecycle/task-state")"
+rej_mirror_before="$(cat "$TMP/CURRENT_TASK.md")"
+# 형식은 맞지만 **실존하지 않는** 경로 (AC C-13). 종전 계약은 형식만 봤으므로 통과했고,
+# 오등록이 아카이브 게이트의 해석 실패로 **마감 시점에야** 드러났다.
+ne_before="$(bash "$RD" task source-fr)"
+ne_out="$(bash "$RD" task set-source-fr "$SRC_OK" "rd-workflow-workspace/backlog/items/2099-12-31-missing.md" 2>&1)"; ne_rc=$?
+[[ "$ne_rc" -ne 0 ]] \
+  && echo "ok: set-source-fr 실존하지 않는 경로 혼합 → 거부" \
+  || { echo "FAIL: set-source-fr 실존하지 않는 경로 혼합인데 성공 (rc=0)"; FAIL=1; }
+case "$ne_out" in
+  *"2099-12-31-missing.md"*) echo "ok: 실존하지 않는 항목을 이름으로 알림" ;;
+  *) echo "FAIL: 실존하지 않는 항목 이름이 출력에 없음 (out='${ne_out}')"; FAIL=1 ;;
+esac
+t "실존 거부 후 source-fr 불변" 0 "$ne_before" bash "$RD" task source-fr
+
+rej_out="$(bash "$RD" task set-source-fr "$SRC_OK2" "some-slug" 2>&1)"; rej_rc=$?
+[[ "$rej_rc" != "0" ]] && echo "ok: 혼합 입력 거부(exit $rej_rc)" || { echo "FAIL: 혼합 입력이 성공했다"; FAIL=1; }
+printf '%s' "$rej_out" | grep -q "some-slug" && echo "ok: 거부 사유에 실패 항목 포함" \
+  || { echo "FAIL: 거부 메시지에 실패 항목이 없다 ('$rej_out')"; FAIL=1; }
+[[ "$(cat "$TMP/rd-workflow-workspace/.lifecycle/task-state")" == "$rej_state_before" ]] \
+  && echo "ok: 거부 시 task-state 불변" || { echo "FAIL: 거부인데 task-state 가 바뀌었다"; FAIL=1; }
+[[ "$(cat "$TMP/CURRENT_TASK.md")" == "$rej_mirror_before" ]] \
+  && echo "ok: 거부 시 미러 불변" || { echo "FAIL: 거부인데 미러가 바뀌었다"; FAIL=1; }
+
+# --- rd task fr-done (change spec §2.5.1·§2.5.2, 리뷰 F1·F2) ---
+FD_ROOT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$FD_ROOT" && -d "$FD_ROOT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+trap 'rm -rf "$FD_ROOT"' EXIT
+mkdir -p "$FD_ROOT/rd-workflow-workspace/.lifecycle" "$FD_ROOT/rd-workflow-workspace/backlog/items"
+fd_rd() { env project_root="$FD_ROOT" bash "$RD" "$@"; }
+
+FD_A="rd-workflow-workspace/backlog/items/2026-04-01-alpha.md"    # items 아직 활성, 인덱스 아직 활성 → 둘 다 done
+FD_B="rd-workflow-workspace/backlog/items/2026-04-02-beta.md"     # items 이미 done, 인덱스 아직 활성 → 인덱스만 done (F1 회귀 방지)
+FD_C="rd-workflow-workspace/backlog/items/2026-04-03-gamma.md"    # 인덱스 행 자체가 없음 → "행 부재", 실패 아님
+FD_D="rd-workflow-workspace/backlog/items/2026-04-04-missing.md"  # 파일 자체가 없음 → 실패
+
+printf '%s\n' "# fr item" "- status: idea" > "$FD_ROOT/$FD_A"
+printf '%s\n' "# fr item" "- status: done" > "$FD_ROOT/$FD_B"
+printf '%s\n' "# fr item" "- status: idea" > "$FD_ROOT/$FD_C"
+# FD_D 는 의도적으로 만들지 않는다 (파일 부재 시나리오)
+
+cat > "$FD_ROOT/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md" <<EOF
+# FUTURE_REQUESTS
+
+## 인덱스
+
+| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |
+|------|------|------|------|------|----------|------|
+| 2026-04-01 | alpha | 요약 a\\|b | feature | idea | - | [상세](items/2026-04-01-alpha.md) |
+| 2026-04-02 | beta | 요약 | feature | validated | - | [상세](items/2026-04-02-beta.md) |
+EOF
+# FD_C(gamma)·FD_D(missing) 는 인덱스에 행이 없다 (행 부재 시나리오)
+
+cat > "$FD_ROOT/rd-workflow-workspace/.lifecycle/task-state" <<EOF
+schema=1
+short-title=bundle-task
+status=구현 중
+fr-branch=null
+worktree-path=null
+source-fr=${FD_A}|${FD_B}|${FD_C}|${FD_D}
+EOF
+printf '# Current Task\n\n## Short Title\nbundle-task\n\n## Status\n구현 중\n' > "$FD_ROOT/CURRENT_TASK.md"
+
+fd_out="$(fd_rd task fr-done 2>&1)"; fd_rc=$?
+[[ "$fd_rc" == "1" ]] && echo "ok: fr-done 부분 실패 → exit 1" || { echo "FAIL: fr-done rc=$fd_rc (기대 1)"; FAIL=1; }
+# alpha: items·인덱스 둘 다 변경(처리) / beta: items 건너뜀+인덱스 변경(처리) /
+# gamma: items 변경+인덱스 행 부재(처리, 행 부재는 실패로 세지 않는다) /
+# missing: items 실패(실패) → 처리 3 / 건너뜀 0 / 실패 1
+echo "$fd_out" | grep -q "처리 3 / 건너뜀 0 / 실패 1" \
+  && echo "ok: fr-done 요약 — 처리3/건너뜀0/실패1" \
+  || { echo "FAIL: fr-done 요약 불일치 (출력: $fd_out)"; FAIL=1; }
+echo "$fd_out" | grep -q "$FD_D" && echo "ok: fr-done 실패 항목 이름 노출" \
+  || { echo "FAIL: fr-done 출력에 실패 이름($FD_D)이 없다"; FAIL=1; }
+
+# items·인덱스 단계 분리 보고 확인 (FD_B: items 건너뜀 + 인덱스 done)
+fd_b_block="$(printf '%s\n' "$fd_out" | awk -v t="FR: ${FD_B}" '$0==t{f=1;next} f&&/^FR: /{exit} f')"
+printf '%s' "$fd_b_block" | grep -q "items: 건너뜀" \
+  && echo "ok: fr-done FD_B items 건너뜀 보고" || { echo "FAIL: FD_B items 단계 보고 없음 (block='$fd_b_block')"; FAIL=1; }
+printf '%s' "$fd_b_block" | grep -q "인덱스: done" \
+  && echo "ok: fr-done FD_B 인덱스 done 보고" || { echo "FAIL: FD_B 인덱스 단계 보고 없음 (block='$fd_b_block')"; FAIL=1; }
+
+# F1 회귀 방지 — FD_B 는 items 만 done 이었지만 인덱스가 실제로 done 으로 바뀌었는지 단정
+# 컬럼 인덱스로 읽지 않는다 — alpha 행은 요약 컬럼에 이스케이프된 '\|' 를 담고 있어
+# 순수 '|' 분리가 컬럼을 밀어낸다(운영 코드는 그 자리표시자 처리를 하지만, 테스트
+# 검증까지 같은 파싱을 다시 구현하는 대신 행 전체에서 최종 상태 문구를 확인한다).
+fd_b_row="$(grep 'beta' "$FD_ROOT/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md")"
+[[ "$fd_b_row" == *"| done |"* ]] && echo "ok: F1 회귀 방지 — FD_B 인덱스 status 가 실제로 done" \
+  || { echo "FAIL: F1 회귀 — FD_B 인덱스 행에 'done' 없음 (row='$fd_b_row')"; FAIL=1; }
+fd_a_row="$(grep 'alpha' "$FD_ROOT/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md")"
+[[ "$fd_a_row" == *"| done |"* ]] && echo "ok: fr-done FD_A 인덱스 status done" \
+  || { echo "FAIL: FD_A 인덱스 행에 'done' 없음 (row='$fd_a_row')"; FAIL=1; }
+fd_a_items_status="$(awk '/^- status:/{print $3; exit}' "$FD_ROOT/$FD_A")"
+[[ "$fd_a_items_status" == "done" ]] && echo "ok: fr-done FD_A items status done" \
+  || { echo "FAIL: FD_A items status='$fd_a_items_status' (기대 done)"; FAIL=1; }
+# 이스케이프된 '\|' 를 담은 alpha 행의 요약 컬럼이 손상되지 않았는지 확인 (표 형식 보존)
+grep -q '요약 a\\|b' "$FD_ROOT/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md" \
+  && echo "ok: fr-done 이스케이프된 셀(\\|)을 보존한다" \
+  || { echo "FAIL: 이스케이프된 셀이 손상되었다"; FAIL=1; }
+# FD_C(행 부재)는 실패로 세지 않는다 — 이미 위 요약(실패 1)에 FD_D 만 포함된 것으로 검증됨
+echo "$fd_out" | grep -q "행 부재" && echo "ok: fr-done 행 부재 보고" \
+  || { echo "FAIL: 행 부재 보고 없음"; FAIL=1; }
+
+# fr-done <path>... 인자 지정 — task-state 없이도 동작 (발행 후 재시도 경로, §2.5.4)
+FD_ROOT2="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$FD_ROOT2" && -d "$FD_ROOT2" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+trap 'rm -rf "$FD_ROOT" "$FD_ROOT2"' EXIT
+mkdir -p "$FD_ROOT2/rd-workflow-workspace/backlog/items"
+FD2_A="rd-workflow-workspace/backlog/items/2026-05-01-retry.md"
+printf '%s\n' "# fr item" "- status: idea" > "$FD_ROOT2/$FD2_A"
+cat > "$FD_ROOT2/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md" <<EOF
+# FUTURE_REQUESTS
+
+## 인덱스
+
+| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |
+|------|------|------|------|------|----------|------|
+| 2026-05-01 | retry | 요약 | feature | idea | - | [상세](items/2026-05-01-retry.md) |
+EOF
+# task-state 를 만들지 않는다 (발행 후 초기화된 상황 재현)
+fd2_out="$(env project_root="$FD_ROOT2" bash "$RD" task fr-done "$FD2_A" 2>&1)"; fd2_rc=$?
+[[ "$fd2_rc" == "0" ]] && echo "ok: fr-done 인자 지정 — task-state 없이 성공" \
+  || { echo "FAIL: fr-done 인자 지정 rc=$fd2_rc (out: $fd2_out)"; FAIL=1; }
+fd2_items_status="$(awk '/^- status:/{print $3; exit}' "$FD_ROOT2/$FD2_A")"
+[[ "$fd2_items_status" == "done" ]] && echo "ok: fr-done 인자 지정 — items done" \
+  || { echo "FAIL: fr-done 인자 지정 items status='$fd2_items_status'"; FAIL=1; }
+
+# 대상 없음 — task-state source-fr sentinel + 인자 없음 → exit 0
+mk_task_file "$TMP" "구현 중" "no-sfr-task"
+t "fr-done 대상 없음 → exit 0" 0 - bash "$RD" task fr-done
+
 # --- 루트 판정: cwd 비의존 (AC 14·15·16·17·18) ---
 # fixture helper — _task_common.sh 의 런타임 의존 전체를 복사한다.
 # Task 2 가 lifecycle/slug.sh source 를 추가하므로 그것까지 포함한다. 빠뜨리면
@@ -611,7 +909,8 @@ rt_make_bare() { # rt_make_bare <dir> — 마커 없는 배치
   cp "$SCRIPT_DIR/lifecycle/slug.sh" "$d/rd-workflow/scripts/lifecycle/"
 }
 
-RT_ROOT="$(mktemp -d)"
+RT_ROOT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$RT_ROOT" && -d "$RT_ROOT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 rt_make_root "$RT_ROOT"
 mk_task_file "$RT_ROOT" "구현 중" "roottest"
 RT_RD="$RT_ROOT/rd-workflow/scripts/rd"
@@ -639,7 +938,8 @@ else
 fi
 
 # (4) 프로젝트 밖 cwd + 절대 경로 호출 = 성공 (AC 16)
-RT_OUT="$(mktemp -d)"
+RT_OUT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$RT_OUT" && -d "$RT_OUT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 t "root: 밖의 cwd 에서 절대 경로 호출이 성공한다" 0 "구현 중" \
   env -u project_root bash -c "cd '$RT_OUT' && bash '$RT_RD' task status"
 
@@ -648,7 +948,8 @@ t "root: PATH 경유 호출이 성공한다" 0 "구현 중" \
   env -u project_root PATH="$RT_ROOT/rd-workflow/scripts:$PATH" bash -c "cd '$RT_OUT' && rd task status"
 
 # (5) 마커 없는 배치 = 멈춤 + 파일 0개 생성 (AC 17)
-RT_BAD="$(mktemp -d)"
+RT_BAD="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$RT_BAD" && -d "$RT_BAD" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 rt_make_bare "$RT_BAD"
 rt_bad_out="$(env -u project_root bash "$RT_BAD/rd-workflow/scripts/rd" task status 2>&1)"; rt_bad_rc=$?
 if [[ "$rt_bad_rc" == "0" ]]; then
@@ -662,14 +963,16 @@ else
 fi
 
 # (6) 조상 경로 심볼릭 링크는 지원 (AC 18)
-RT_LINKBASE="$(mktemp -d)"
+RT_LINKBASE="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$RT_LINKBASE" && -d "$RT_LINKBASE" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 ln -s "$RT_ROOT" "$RT_LINKBASE/linked"
 t "root: 조상 경로 링크 경유가 동작한다" 0 "구현 중" \
   env -u project_root bash "$RT_LINKBASE/linked/rd-workflow/scripts/rd" task status
 
 # (6-1) 실행 파일 자체가 링크 = 비지원, 명시적 오류 + 파일 0개 (AC 18)
 # 링크를 마커 밖에 두면 dirname 이 그 위치를 주므로 마커를 잃는다.
-RT_EXECLINK="$(mktemp -d)"
+RT_EXECLINK="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$RT_EXECLINK" && -d "$RT_EXECLINK" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 ln -s "$RT_RD" "$RT_EXECLINK/rd-link"
 rt_el_out="$(env -u project_root bash "$RT_EXECLINK/rd-link" task status 2>&1)"; rt_el_rc=$?
 if [[ "$rt_el_rc" == "0" ]]; then
@@ -683,7 +986,9 @@ else
 fi
 
 # (7) 공백 포함 경로 (AC 18)
-RT_SP="$(mktemp -d)/has space"
+RT_SP_BASE="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$RT_SP_BASE" && -d "$RT_SP_BASE" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+RT_SP="$RT_SP_BASE/has space"
 mkdir -p "$RT_SP"
 cp -R "$RT_ROOT/." "$RT_SP/"
 t "root: 공백 포함 경로에서 동작한다" 0 "구현 중" \
@@ -692,7 +997,8 @@ t "root: 공백 포함 경로에서 동작한다" 0 "구현 중" \
 rm -rf "$RT_ROOT" "$RT_OUT" "$RT_BAD" "$RT_LINKBASE" "$RT_EXECLINK" "${RT_SP%/*}"
 
 # --- set-title (AC 8~12) ---
-ST_ROOT="$(mktemp -d)"
+ST_ROOT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$ST_ROOT" && -d "$ST_ROOT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$ST_ROOT/rd-workflow-workspace/.lifecycle"
 mk_task_file "$ST_ROOT" "대기 중" "-"
 st_rd() { env project_root="$ST_ROOT" bash "$RD" "$@"; }
@@ -724,7 +1030,8 @@ t "set-title: --force 로 덮는다" 0 "-" st_rd task set-title other-task --for
 
 # (5) 값 계약 위반 (AC 10)
 t "set-title: 빈 값 거부" 1 "-" st_rd task set-title ""
-t "set-title: sentinel 값 거부" 1 "-" st_rd task set-title -
+# '-' 는 더 이상 무조건 거부가 아니다 — change spec D5(§2.6)로 reset 경로가 됐다.
+# 조건부 허용/거부는 아래 "set-title reset" 전용 섹션에서 검증한다.
 t "set-title: 비-ASCII 거부" 1 "-" st_rd task set-title 한글제목
 t "set-title: 인자 누락은 usage" 1 "-" st_rd task set-title
 t "set-title: 잉여 인자는 usage" 1 "-" st_rd task set-title a b c
@@ -759,7 +1066,8 @@ t "set-title: 대문자·공백을 정규화한다" 0 "-" st_rd task set-title "
 # CLI 가 "기록 성공" 을 보고하면서 미러는 계속 부재했다. 게다가 task-state 는 이미
 # 갱신된 뒤였으므로 partial state write 였다. 그래서 "실패한다" 만이 아니라
 # **"권위도 바뀌지 않았다"** 를 함께 단언한다.
-ST_NOSEC="$(mktemp -d)"
+ST_NOSEC="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$ST_NOSEC" && -d "$ST_NOSEC" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$ST_NOSEC/rd-workflow-workspace/.lifecycle"
 printf '# Current Task\n\n## Task\ntest\n\n## Status\n대기 중\n' > "$ST_NOSEC/CURRENT_TASK.md"
 printf 'schema=1\nshort-title=-\nstatus=대기 중\n' \
@@ -779,13 +1087,108 @@ printf '%s' "$ns_out" | grep -q "Short Title" \
   || { echo "FAIL: set-title: 섹션 부재 메시지가 사유를 지목하지 않는다 ('$ns_out')"; FAIL=1; }
 rm -rf "$ST_NOSEC"
 
-# (9) set-status 도 같은 계약이다 — 미러에 '## Status' 가 없으면 **권위도 쓰지 않는다**
+# --- set-title reset ('-') — change spec §2.6 (D5), plan T2 테스트 ⑤·⑨ ---
+#
+# 허용: Status == 대기 중 AND fr-branch 비활성(§2.2) → short-title·source-fr 을 함께
+# sentinel 로 되돌린다(미러 포함). 거부: 그 외 — 어떤 상태도 바꾸지 않는다.
+RST_ROOT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$RST_ROOT" && -d "$RST_ROOT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+mk_fr_items "$RST_ROOT" || { echo "test_task_cli.sh: FR items 픽스처 생성 실패(RST_ROOT)" >&2; exit 1; }
+trap 'rm -rf "$RST_ROOT"' EXIT
+mkdir -p "$RST_ROOT/rd-workflow-workspace/.lifecycle"
+rst_rd() { env project_root="$RST_ROOT" bash "$RD" "$@"; }
+rst_state() { awk -F= '$1=="short-title"{print $2}' "$RST_ROOT/rd-workflow-workspace/.lifecycle/task-state"; }
+rst_sfr() { awk -F= '$1=="source-fr"{print $2}' "$RST_ROOT/rd-workflow-workspace/.lifecycle/task-state"; }
+rst_mirror_title() { awk '/^## Short Title/{f=1;next} f&&NF{print;exit}' "$RST_ROOT/CURRENT_TASK.md"; }
+rst_mirror_sfr() { awk '$0=="## Source FR"{f=1;next} f && /^[^#]/{print;exit}' "$RST_ROOT/CURRENT_TASK.md"; }
+
+# 허용 케이스: Status=대기 중 + fr-branch=null(비활성)
+mk_task_file "$RST_ROOT" "대기 중" "reset-ok"
+rst_rd task set-source-fr "$SRC_OK" >/dev/null 2>&1
+t "set-title reset: 허용 조건에서 성공" 0 "-" rst_rd task set-title -
+[[ "$(rst_state)" == "-" ]] && echo "ok: reset 허용 — short-title sentinel" || { echo "FAIL: reset 허용 short-title='$(rst_state)'"; FAIL=1; }
+[[ "$(rst_sfr)" == "-" ]] && echo "ok: reset 허용 — source-fr sentinel" || { echo "FAIL: reset 허용 source-fr='$(rst_sfr)'"; FAIL=1; }
+[[ "$(rst_mirror_title)" == "-" ]] && echo "ok: reset 허용 — 미러 short title sentinel" || { echo "FAIL: reset 허용 미러 title='$(rst_mirror_title)'"; FAIL=1; }
+[[ "$(rst_mirror_sfr)" == "-" ]] && echo "ok: reset 허용 — 미러 source fr sentinel" || { echo "FAIL: reset 허용 미러 sfr='$(rst_mirror_sfr)'"; FAIL=1; }
+
+# 거부 케이스: Status != 대기 중 (구현 중) — 상태 무변경
+mk_task_file "$RST_ROOT" "구현 중" "busy-task"
+rst_rd task set-source-fr "$SRC_OK" >/dev/null 2>&1
+rst_out="$(rst_rd task set-title - 2>&1)"; rst_rc=$?
+[[ "$rst_rc" != "0" ]] && echo "ok: reset 거부 — Status!=대기 중" || { echo "FAIL: reset 이 Status=구현 중 에서도 통과했다"; FAIL=1; }
+[[ "$(rst_state)" == "busy-task" ]] && echo "ok: reset 거부 — short-title 불변" || { echo "FAIL: reset 거부인데 short-title 바뀜 ('$(rst_state)')"; FAIL=1; }
+[[ "$(rst_sfr)" == "$SRC_OK" ]] && echo "ok: reset 거부 — source-fr 불변" || { echo "FAIL: reset 거부인데 source-fr 바뀜 ('$(rst_sfr)')"; FAIL=1; }
+
+# reset 은 --force 를 지원하지 않는다 (허용 조건이어도 --force 동반은 거부)
+mk_task_file "$RST_ROOT" "대기 중" "reset-force-test"
+rst_out_force="$(rst_rd task set-title - --force 2>&1)"; rst_rc_force=$?
+[[ "$rst_rc_force" != "0" ]] && echo "ok: reset + --force 는 거부된다" || { echo "FAIL: reset+--force 가 통과했다"; FAIL=1; }
+[[ "$(rst_state)" == "reset-force-test" ]] && echo "ok: reset+--force 거부 — 상태 불변" || { echo "FAIL: reset+--force 거부인데 상태 바뀜 ('$(rst_state)')"; FAIL=1; }
+
+# 거부 케이스: Status=대기 중 이지만 fr-branch 활성(ref 실재) — 제목 불일치(rename) 겸용
+# (테스트 ⑨) — 실제 git 저장소가 있어야 show-ref 판정이 의미를 가진다.
+RST_GIT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$RST_GIT" && -d "$RST_GIT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+mk_fr_items "$RST_GIT" || { echo "test_task_cli.sh: FR items 픽스처 생성 실패(RST_GIT)" >&2; exit 1; }
+trap 'rm -rf "$RST_ROOT" "$RST_GIT"' EXIT
+( cd "$RST_GIT" && git init -q . && git commit --allow-empty -qm init -q && git branch fr/rename-live )
+mkdir -p "$RST_GIT/rd-workflow-workspace/.lifecycle"
+mk_task_file "$RST_GIT" "대기 중" "old-title"
+cat > "$RST_GIT/rd-workflow-workspace/.lifecycle/task-state" <<TSEOF
+schema=1
+short-title=old-title
+status=대기 중
+fr-branch=fr/rename-live
+worktree-path=null
+source-fr=$SRC_OK
+TSEOF
+rgit_rd() { env project_root="$RST_GIT" bash "$RD" "$@"; }
+rgit_state() { awk -F= '$1=="short-title"{print $2}' "$RST_GIT/rd-workflow-workspace/.lifecycle/task-state"; }
+rgit_sfr() { awk -F= '$1=="source-fr"{print $2}' "$RST_GIT/rd-workflow-workspace/.lifecycle/task-state"; }
+rgit_fb() { awk -F= '$1=="fr-branch"{print $2}' "$RST_GIT/rd-workflow-workspace/.lifecycle/task-state"; }
+
+# 무관 후보(브랜치 slug 'rename-live' 와 다른 candidate) guard → block-active, 3필드 보존
+rgit_guard_out="$(rgit_rd task guard --candidate unrelated-fr --mode intake 2>/dev/null)"; rgit_guard_rc=$?
+rgit_guard_d="$(printf '%s\n' "$rgit_guard_out" | awk -F= '$1=="decision"{print $2}')"
+[[ "$rgit_guard_rc" == "2" && "$rgit_guard_d" == "block-active" ]] \
+  && echo "ok: 대기 중+ref 실재+제목 불일치 → 무관 후보 block-active" \
+  || { echo "FAIL: 무관 후보 rc=$rgit_guard_rc d=$rgit_guard_d"; FAIL=1; }
+[[ "$(rgit_state)" == "old-title" && "$(rgit_sfr)" == "$SRC_OK" && "$(rgit_fb)" == "fr/rename-live" ]] \
+  && echo "ok: block-active 후 3필드(short-title·source-fr·fr-branch) 보존" \
+  || { echo "FAIL: block-active 후 필드 변경 (title=$(rgit_state) sfr=$(rgit_sfr) fb=$(rgit_fb))"; FAIL=1; }
+
+# reset 거부 — fr-branch 활성(ref 실재)
+rgit_rst_out="$(rgit_rd task set-title - 2>&1)"; rgit_rst_rc=$?
+[[ "$rgit_rst_rc" != "0" ]] && echo "ok: reset 거부 — fr-branch 활성(ref 실재)" || { echo "FAIL: reset 이 fr-branch 활성에서도 통과했다"; FAIL=1; }
+[[ "$(rgit_state)" == "old-title" && "$(rgit_sfr)" == "$SRC_OK" && "$(rgit_fb)" == "fr/rename-live" ]] \
+  && echo "ok: reset 거부 후 3필드 보존" \
+  || { echo "FAIL: reset 거부인데 필드 변경 (title=$(rgit_state) sfr=$(rgit_sfr) fb=$(rgit_fb))"; FAIL=1; }
+
+# archive 직후(ref 부재)에도 fr-branch 값은 남을 수 있다 — 그때는 비활성으로 판정해
+# rebind 가 여전히 동작해야 한다 (기존 동작 회귀 방지, 테스트 ②)
+cat > "$RST_GIT/rd-workflow-workspace/.lifecycle/task-state" <<TSEOF2
+schema=1
+short-title=stale-after-archive
+status=대기 중
+fr-branch=fr/deleted-branch
+worktree-path=null
+source-fr=-
+TSEOF2
+rgit_rebind_out="$(rgit_rd task guard --candidate fresh-task --mode intake 2>/dev/null)"; rgit_rebind_rc=$?
+rgit_rebind_d="$(printf '%s\n' "$rgit_rebind_out" | awk -F= '$1=="decision"{print $2}')"
+[[ "$rgit_rebind_rc" == "0" && "$rgit_rebind_d" == "rebind" ]] \
+  && echo "ok: archive 직후(ref 부재) → 여전히 rebind" \
+  || { echo "FAIL: archive 직후 rebind 기대 rc=$rgit_rebind_rc d=$rgit_rebind_d"; FAIL=1; }
+rm -rf "$RST_GIT"
+
+# --- set-status 도 같은 계약이다 — 미러에 '## Status' 가 없으면 **권위도 쓰지 않는다**
 #     (final diff review 2라운드 Finding 2)
 #
 # `_task_section_write` 가 섹션 부재를 실패로 바꾼 뒤부터, 선검사가 없으면 task-state 는
 # 새 값이고 미러는 그대로인 부분 갱신이 남는다. `task_read_status` 로는 못 잡는다 —
 # `get_task_status` 는 task-state 가 있으면 그것만 읽어 미러의 섹션 부재를 보지 못한다.
-ST_NOST="$(mktemp -d)"
+ST_NOST="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$ST_NOST" && -d "$ST_NOST" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$ST_NOST/rd-workflow-workspace/.lifecycle"
 printf '# Current Task\n\n## Task\ntest\n\n## Short Title\nx\n' > "$ST_NOST/CURRENT_TASK.md"
 printf 'schema=1\nshort-title=x\nstatus=대기 중\n' \
@@ -811,7 +1214,8 @@ rm -rf "$ST_ROOT"
 # --- promote 호출 인자 정적 점검 (AC 7) ---
 # 임시 루트를 인자로 주므로 실제 저장소를 건드리지 않는다.
 CK="$SCRIPT_DIR/check_promote_call_args.sh"
-CK_ROOT="$(mktemp -d)"
+CK_ROOT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$CK_ROOT" && -d "$CK_ROOT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$CK_ROOT/rd-workflow/docs" "$CK_ROOT/rd-workflow-workspace/plans"
 
 # (1) 인자 있는 단일 줄 호출 = 통과
@@ -864,7 +1268,8 @@ bash "$CK" "$CK_ROOT/does-not-exist-$$" >/dev/null 2>&1; ck_rc=$?
   || { echo "FAIL: check: 없는 root 를 exit $ck_rc 로 처리했다"; FAIL=1; }
 
 # (8) 점검 대상이 하나도 없으면 실패한다
-CK_EMPTY="$(mktemp -d)"
+CK_EMPTY="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$CK_EMPTY" && -d "$CK_EMPTY" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$CK_EMPTY/unrelated"
 printf 'bash rd-workflow/scripts/lifecycle/promote.sh --short-title x\n' > "$CK_EMPTY/unrelated/x.md"
 bash "$CK" "$CK_EMPTY" >/dev/null 2>&1; ck_rc=$?
@@ -907,7 +1312,8 @@ bash "$CK" "$CK_ROOT" >/dev/null 2>&1; ck_rc=$?
 # 검사하지 않아 `joined` 가 비고 pipeline 이 0 으로 끝나서, 검사하지 못한 파일이
 # 깨끗한 것으로 처리됐다 — "점검 자체 실패는 exit 2" 계약과 어긋난다.
 # root 를 깨끗한 상태로 두고 읽기 불가 파일 하나만 넣어, exit 2 가 이 파일 때문임을 고립한다.
-CK_UNREAD="$(mktemp -d)"
+CK_UNREAD="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$CK_UNREAD" && -d "$CK_UNREAD" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$CK_UNREAD/rd-workflow/docs"
 printf 'bash rd-workflow/scripts/lifecycle/promote.sh --short-title x --size large\n' \
   > "$CK_UNREAD/rd-workflow/docs/unreadable.md"
@@ -930,7 +1336,8 @@ rm -rf "$CK_ROOT"
 # 판정 로직을 스크립트로 분리한 이유가 바로 이 회귀다 — 실제 SKILL.md 를 오염시켜
 # 확인하면 같은 작업의 다른 변경과 로컬 변경을 함께 날린다. fixture 로 시험한다.
 AP="$SCRIPT_DIR/check_autopilot_promote_contract.sh"
-AP_DIR="$(mktemp -d)"
+AP_DIR="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$AP_DIR" && -d "$AP_DIR" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 ap_write() { # ap_write <파일> — 계약을 만족하는 최소 SKILL.md
   cat > "$1" <<'APEOF'
 ### 1. 작업 선택
@@ -1077,6 +1484,174 @@ bash "$AP" >/dev/null 2>&1; ap_rc=$?
 [[ "$ap_rc" == "2" ]] && echo "ok: ap: 인자 없음은 exit 2" \
   || { echo "FAIL: ap: 인자 없음에서 exit $ap_rc (2 여야 한다)"; FAIL=1; }
 rm -rf "$AP_DIR"
+
+# --- `아카이브 보류` 안내 우선순위 (change-spec §4.4, §6 의 12번) ---
+#
+# 이 절이 없으면 새는 실수: **정상 순서 중 사용자가 반대 안내를 받는 것**입니다. seal 은
+# §4.2 의 2번에서 워킹트리에 생기고 4번 커밋에서야 판정 대상 commit 에 들어가므로, 그 사이에
+# 판정 대상 commit 만 보고 안내하면 방금 seal 을 만든 사용자에게 "seal 을 먼저 실행하세요" 라고
+# 되돌려 보냅니다. reseal 전이(②)는 그보다 한 겹 더 깊습니다 — 커밋된 stale seal 이 있는데
+# 워킹트리에는 유효한 seal 이 있는 상태이며, 초안의 우선순위(해시 불일치를 워킹트리보다 앞에
+# 둠)는 여기서 "재리뷰 필요" 라는 반대 안내를 냅니다.
+#
+# 안내는 **stderr** 로 나갑니다 — `rd task status` 의 stdout 은 Status 값 한 줄이라는 기계
+# 계약이고, 이 파일이 그 계약을 정확히 비교합니다.
+G="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$G" && -d "$G" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+G="$(cd "$G" && pwd -P)"
+# CLI 출력 캡처 파일은 **저장소 밖**에 둡니다 — 안에 두면 `git add -A` 가 그 파일까지
+# 커밋해 보호 트리 해시가 바뀌고, 검증이 테스트 자신의 부산물 때문에 실패합니다.
+GT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$GT" && -d "$GT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+GUARD="${SCRIPT_DIR}/hooks/_guard_common.sh"
+(
+  export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+  git init -q -b main "$G" 2>/dev/null || { git init -q "$G"; git -C "$G" checkout -q -b main; }
+  git -C "$G" config user.email test@example.com
+  git -C "$G" config user.name test
+) >/dev/null 2>&1
+mkdir -p "$G/rd-workflow-workspace/.lifecycle/review-seals" \
+         "$G/rd-workflow-workspace/handoffs/review_pipeline"
+printf '# Current Task\n\n## Short Title\ndemo\n\n## Status\n아카이브 보류\n' > "$G/CURRENT_TASK.md"
+printf '# Change Request\n\n## Source FR\n-\n' > "$G/REQUEST.md"
+printf 'seed\n' > "$G/code.txt"
+cat > "$G/rd-workflow-workspace/.lifecycle/task-state" <<'GSTATE'
+schema=1
+short-title=demo
+status=아카이브 보류
+fr-branch=null
+worktree-path=null
+source-fr=-
+GSTATE
+git -C "$G" add -A >/dev/null 2>&1
+git -C "$G" commit -q -m base >/dev/null 2>&1
+
+g_state_set() { # g_state_set <key> <value>
+  local f="$G/rd-workflow-workspace/.lifecycle/task-state"
+  awk -F'=' -v k="$1" -v v="$2" '
+    $1 == k { print k "=" v; d = 1; next } { print }
+    END { if (!d) print k "=" v }' "$f" > "${f}.tmp"
+  cat "${f}.tmp" > "$f"; rm -f "${f}.tmp"
+}
+
+# g_session <session-id> <review-head-oid|""> — 종결된 diff-review 세션을 만듭니다.
+# review-head-oid 가 빈 값이면 §3.4 의 legacy 세션(일반 seal 로는 봉인 불가)입니다.
+g_session() {
+  local sd="$G/rd-workflow-workspace/handoffs/review_pipeline/$1"
+  mkdir -p "$sd/turns"
+  cat > "$sd/SESSION.md" <<GSESS
+# Review Session
+
+## Session ID
+$1
+
+## Review Type
+diff-review
+
+## Review Target
+git diff base..head
+
+## Status
+closed
+
+## Current Owner
+Author
+
+## Branch Context
+- fr-branch: null
+- worktree-path: $G
+- short-title: demo
+- lifecycle-stage: validating
+- remote-mode: local-only
+GSESS
+  if [[ -n "${2:-}" ]]; then
+    printf -- '- review-base-oid: %s\n- review-head-oid: %s\n' "$(git -C "$G" rev-parse HEAD)" "$2" \
+      >> "$sd/SESSION.md"
+  fi
+  printf '# Review Checkpoint\n\n## Open Issues\n- 없음\n' > "$sd/CHECKPOINT.md"
+  printf '%s\n' "$sd"
+}
+
+g_seal() { # g_seal <session-path> [옵션...] — rd review seal
+  local sp="$1"; shift
+  ( cd "$G" && project_root="$G" bash "$RD" review seal "$@" "${sp#$G/}" ) >/dev/null 2>&1
+}
+
+# 한 번의 호출로 stdout·stderr·exit code 를 모두 잡습니다 — 같은 상태를 확인하려고 CLI 를
+# 두 번 부르면 이 절만으로 실행 시간이 배로 늡니다.
+g_status() { # 결과: G_OUT / G_ERR
+  ( cd "$G" && project_root="$G" bash "$RD" task status ) >"${GT}/out" 2>"${GT}/err"
+  G_OUT="$(cat "${GT}/out")"; G_ERR="$(cat "${GT}/err")"
+}
+g_precheck() { # archive.sh 가 발행 직전에 부르는 그 함수. 결과: G_ERR / G_RC
+  ( cd "$G" && bash -c '
+      project_root="$1"; export project_root
+      source "$2"
+      archive_review_precheck 0 "" demo "${1}/audit.log"
+    ' _ "$G" "$GUARD" ) >/dev/null 2>"${GT}/err"
+  G_RC=$?
+  G_ERR="$(cat "${GT}/err")"
+}
+g_has() { case "$2" in *"$1"*) echo "ok: $3" ;; *) echo "FAIL: $3 (문구 없음: ${1})"; FAIL=1 ;; esac; }
+g_nothas() { case "$2" in *"$1"*) echo "FAIL: $3 (있으면 안 되는 문구: ${1})"; FAIL=1 ;; *) echo "ok: $3" ;; esac; }
+
+GS1="$(g_session "20260906_100000_final-diff-review" "$(git -C "$G" rev-parse HEAD)")"
+g_state_set "review-session" "20260906_100000_final-diff-review"
+# 포인터는 커밋해 두고 마커만 없는 상태를 만듭니다 — 포인터까지 없으면 '세션 미지정' 이라는
+# 다른 사유가 되어 "마커 없음" 안내를 시험할 수 없습니다 (§4.4 는 사유를 합치지 않습니다).
+git -C "$G" add -A >/dev/null 2>&1; git -C "$G" commit -q -m "review-session 포인터" >/dev/null 2>&1
+
+# 상태 3 — 마커 없음
+g_status
+[[ "$G_OUT" == "아카이브 보류" ]] && echo "ok: status stdout 은 Status 한 줄 (기계 계약)" \
+  || { echo "FAIL: status stdout 기계 계약 (실제 '${G_OUT}')"; FAIL=1; }
+g_has "rd review seal" "$G_ERR" "안내(마커 없음): seal 을 먼저 실행"
+
+# 전이 ① — seal 직후(워킹트리에만 있음) → 커밋 안내
+g_seal "$GS1"
+g_status
+g_has "seal 과 archive 기록을 커밋하세요" "$G_ERR" "안내(워킹트리 seal): 커밋하세요"
+
+# 전이 ① — 기록 커밋 직후 → 발행 안내
+git -C "$G" add -A >/dev/null 2>&1; git -C "$G" commit -q -m "seal + 기록" >/dev/null 2>&1
+g_status
+g_has "archive.sh" "$G_ERR" "안내(커밋된 seal): 발행"
+# 안내와 실제 게이트가 어긋나면 사용자는 "발행하세요" 를 보고 실행해 곧바로 막힙니다.
+g_precheck
+[[ "$G_RC" == 0 ]] && echo "ok: 안내가 '발행' 일 때 실제 precheck 도 통과 (안내와 게이트 일치)" \
+  || { echo "FAIL: 안내는 발행인데 precheck 가 막았다"; FAIL=1; }
+
+# 상태 4 — 해시 불일치 (종결 후 보호 경로 변경)
+printf 'changed\n' >> "$G/code.txt"; git -C "$G" commit -q -am "code 변경" >/dev/null 2>&1
+g_status
+g_has "재리뷰 필요" "$G_ERR" "안내(해시 불일치): 재리뷰 필요"
+
+# 전이 ② — reseal: 커밋된 stale seal + 유효한 워킹트리 seal 상태에서도 다음 행동은 '커밋' 입니다.
+#           ①만으로는 이 상태 자체가 만들어지지 않아 초안의 우선순위 오류가 재발합니다.
+sed -i.bak "s|^- review-head-oid: .*|- review-head-oid: $(git -C "$G" rev-parse HEAD)|" \
+  "$GS1/SESSION.md" && rm -f "$GS1/SESSION.md.bak"
+g_seal "$GS1"
+g_status
+g_has "seal 과 archive 기록을 커밋하세요" "$G_ERR" "안내(reseal 직후): 커밋하세요"
+g_nothas "재리뷰 필요" "$G_ERR" "안내(reseal 직후): '재리뷰 필요' 가 아님"
+
+# 전이 ② — reseal 커밋 직후 → 발행
+git -C "$G" add -A >/dev/null 2>&1; git -C "$G" commit -q -m "reseal 기록" >/dev/null 2>&1
+g_status
+g_has "archive.sh" "$G_ERR" "안내(reseal 커밋): 발행"
+
+# legacy 마커의 지속 고지 — 생성 시점 1회로는 나중에 실행하는 사람이 차이를 알 수 없으므로
+# `rd task status` 와 `archive.sh`(archive_review_precheck) 양쪽이 매번 냅니다 (§3.3).
+GS2="$(g_session "20260906_110000_final-diff-review" "")"
+g_state_set "review-session" "20260906_110000_final-diff-review"
+g_seal "$GS2" --legacy-unverified "OID 없는 legacy 세션"
+git -C "$G" add -A >/dev/null 2>&1; git -C "$G" commit -q -m "legacy seal 기록" >/dev/null 2>&1
+g_status
+g_has "legacy 전환입니다" "$G_ERR" "legacy 고지: rd task status 쪽"
+g_precheck
+g_has "legacy 전환입니다" "$G_ERR" "legacy 고지: archive.sh(precheck) 쪽"
+
+rm -rf "$G" "$GT"
 
 [[ "$FAIL" == 0 ]] && echo "test_task_cli: ALL PASS" || echo "test_task_cli: FAIL"
 exit "$FAIL"

@@ -1,0 +1,36 @@
+# 통과 1 — 한 줄 핸들러
+f="$(mktemp)" || return 1
+# 통과 2 — 줄이음 + 다음 줄 핸들러
+f="$(mktemp "$dir/x.XXXXXX")" \
+  || { echo "실패" >&2; return 1; }
+# 통과 3 — env 프리픽스 + fallback
+LOG="$(mktemp -t x.XXXXXX 2>/dev/null)" \
+  || LOG="/dev/null"
+# 통과 4 — 함수 반환형 다음 줄에 핸들러
+_t() {
+  f="$(mktemp)" || return 1
+}
+#EXPECT: violation
+tmp="$(mktemp)"
+#EXPECT: violation
+a="$(mktemp -d)"; b="$(mktemp)"
+# 통과 5 — 명령 시작 위치의 bare 호출 + 핸들러 (반환값을 stdout 으로 흘리는 형태)
+mktemp "$d/y.XXXXXX" || return 1
+#EXPECT: violation
+mktemp "$d/z.XXXXXX"
+# 통과 6 — 다음 논리 줄이 `\` 로 이어지고 핸들러가 그 뒤쪽에 있는 형태 (Turn 002 F3)
+f="$(mktemp)"
+echo checking \
+  || exit 1
+#EXPECT: violation
+tmp="$(mktemp)"
+echo checking \
+  && echo more
+# 대기 중 후보가 겹치는 경우 — 위반 위치가 뒤 후보로 덮이지 않아야 한다 (Turn 004 F4).
+# 아래 첫 줄만 위반이다: 자신과 다음 논리 줄(둘째~셋째 줄)에 `||` 가 없다. 둘째 줄의 후보는
+# 다음 논리 줄(넷째 줄)에 `||` 가 있으므로 통과다.
+#EXPECT: violation
+a="$(mktemp)"
+b="$(mktemp)" \
+  echo checking
+echo done || exit 1

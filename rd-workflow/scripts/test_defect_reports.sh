@@ -22,8 +22,8 @@ CASE_N=0
 
 _suite_root_ready() {
   [[ -n "$SUITE_ROOT" && -d "$SUITE_ROOT" ]] && return 0
-  SUITE_ROOT="$(mktemp -d)" || return 1
-  [[ -n "$SUITE_ROOT" && -d "$SUITE_ROOT" ]] || return 1
+  SUITE_ROOT="$(mktemp -d)" || { echo "test_defect_reports.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$SUITE_ROOT" && -d "$SUITE_ROOT" ]] || { echo "test_defect_reports.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   return 0
 }
 
@@ -199,7 +199,13 @@ if [[ -n "${FAKE_CAT_FAIL_PATTERN:-}" ]]; then
     [[ "$a" == *"$FAKE_CAT_FAIL_PATTERN"* ]] || continue
     n=0; [[ -s "${CAT_COUNT:-/dev/null}" ]] && n="$(< "$CAT_COUNT")"
     n=$((n+1)); printf '%s' "$n" > "$CAT_COUNT"
-    (( n > ${FAKE_CAT_FAIL_AFTER:-0} )) && { printf 'cat: 주입된 실패\n' >&2; exit 1; }
+    if (( n > ${FAKE_CAT_FAIL_AFTER:-0} )); then
+      # FAKE_CAT_PARTIAL 이 있으면 **일부 bytes 를 stdout 에 쓴 뒤** 실패한다.
+      # 이것이 검사하는 것은 `mv` 의 원자성이 아니라 **우리 코드의 쓰기 순서**다 —
+      # 실패한 bytes 가 원본 referent 가 아니라 새 임시 파일에만 들어가야 한다.
+      [[ -n "${FAKE_CAT_PARTIAL:-}" ]] && printf '%s' "$FAKE_CAT_PARTIAL"
+      printf 'cat: 주입된 실패\n' >&2; exit 1
+    fi
   done
 fi
 exec /bin/cat "$@"
@@ -742,7 +748,8 @@ leftover="$(find "$(dirname "$f")" -name '.rd-defect.*' | wc -l | tr -d ' ')"
 check "임시 파일 잔존 없음" "$leftover" "0"
 
 # --- config 부재에서 set-upstream 은 성공 skip 이다 (파일을 만들지 않는다) ---
-DR9_DIR="$(mktemp -d)"
+DR9_DIR="$(mktemp -d)" || { echo "test_defect_reports.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$DR9_DIR" && -d "$DR9_DIR" ]] || { echo "test_defect_reports.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$DR9_DIR/rd-workflow/config" "$DR9_DIR/rd-workflow/scripts"
 cp "$SCRIPT_DIR/defect_reports.sh" "$DR9_DIR/rd-workflow/scripts/"
 cp "$SCRIPT_DIR/sync_template.sh" "$DR9_DIR/rd-workflow/scripts/" 2>/dev/null || true
@@ -768,5 +775,248 @@ check "이미 설정됨 — 파일 무변경" \
   "$(diff "$DR9_DIR/wj.before" "$DR9_DIR/rd-workflow/config/workflow.json" | wc -l | tr -d ' ')" "0"
 rm -rf "$DR9_DIR"
 
-printf '\n결과: pass=%d fail=%d\n' "$PASS" "$FAIL"
+echo "== set-upstream: 줄 배치를 전제하지 않는다 (Turn 011 Finding 2) =="
+# 이전 구현은 "1행에 { 가 있으면 그 행 전체를 출력한 뒤 키 줄을 붙였다". 그래서
+#  - 한 줄 객체는 완성된 객체 **뒤**에 멤버가 붙어 invalid JSON 이 되는데 exit 0 이었고
+#  - 첫 줄이 빈 줄이면 키가 삽입되지 않은 채 exit 0 이었다 (완료 보고만 "설정됨").
+# python3 이 없는 환경에서는 JSON 파싱 검증만 건너뛴다 (production 과 같은 정책).
+# JSON 유효성 단언. **검사기가 없으면 조용히 통과시키지 않고 skip 으로 표시한다** —
+# 종전 구현은 python3 이 없으면 무조건 성공을 반환해, 검증되지 않은 사실을 "ok" 로 셌다.
+SKIP=0
+assert_json_valid() {  # $1=파일 $2=라벨
+  if ! command -v python3 >/dev/null 2>&1; then
+    SKIP=$((SKIP+1)); printf '  skip %s (python3 없음 — JSON 구조 검증 불가)\n' "$2"; return 0
+  fi
+  if python3 -c 'import json,sys;json.load(open(sys.argv[1]))' "$1" >/dev/null 2>&1
+  then ok "$2"; else nok "$2 ($(cat "$1"))"; fi
+}
+CFG_REL="rd-workflow/config/workflow.json"
+
+echo "-- 한 줄 객체 --"
+setup_workspace
+CFG="$WS/$CFG_REL"
+printf '{"default_execution_mode":"manual"}\n' > "$CFG"
+(cd "$WS" && bash "$TARGET" set-upstream 'https://github.com/O/R.git' >/dev/null 2>&1); rc=$?
+check "exit 0" "$rc" "0"
+assert_json_valid "$CFG" "유효 JSON 유지"
+check "upstream 값 삽입" \
+  "$(sed -n 's/.*"defect_report_upstream"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CFG" | head -1)" "O/R"
+grep -q '"default_execution_mode"[[:space:]]*:[[:space:]]*"manual"' "$CFG" \
+  && ok "기존 키 보존" || nok "기존 키 보존"
+
+echo "-- 첫 줄이 빈 줄인 객체 --"
+setup_workspace
+CFG="$WS/$CFG_REL"
+printf '\n{\n  "default_execution_mode": "manual"\n}\n' > "$CFG"
+(cd "$WS" && bash "$TARGET" set-upstream 'https://github.com/O/R.git' >/dev/null 2>&1); rc=$?
+check "exit 0" "$rc" "0"
+check "키가 실제로 삽입됨" \
+  "$(sed -n 's/.*"defect_report_upstream"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CFG" | head -1)" "O/R"
+assert_json_valid "$CFG" "유효 JSON"
+
+echo "-- 빈 객체는 쉼표 없이 삽입한다 --"
+setup_workspace
+CFG="$WS/$CFG_REL"
+printf '{}\n' > "$CFG"
+(cd "$WS" && bash "$TARGET" set-upstream 'https://github.com/O/R.git' >/dev/null 2>&1); rc=$?
+check "exit 0" "$rc" "0"
+assert_json_valid "$CFG" "유효 JSON (쉼표 없음)"
+check "upstream 값 삽입" \
+  "$(sed -n 's/.*"defect_report_upstream"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CFG" | head -1)" "O/R"
+
+echo "-- 여는 '{' 가 없으면 원본 유지 + exit 1 --"
+setup_workspace
+CFG="$WS/$CFG_REL"
+printf '[\n  "not-an-object"\n]\n' > "$CFG"
+before="$(cat "$CFG")"
+(cd "$WS" && bash "$TARGET" set-upstream 'https://github.com/O/R.git' >/dev/null 2>&1); rc=$?
+check "exit 1" "$rc" "1"
+check "원본 bytes 불변" "$(cat "$CFG")" "$before"
+leftover="$(find "$(dirname "$CFG")" -name '.rd-defect.*' | wc -l | tr -d ' ')"
+check "임시 파일 잔존 없음" "$leftover" "0"
+
+echo "-- symlink config 는 링크를 유지한 채 referent 를 갱신한다 --"
+setup_workspace
+CFG="$WS/$CFG_REL"
+mkdir -p "$WS/real"
+printf '{\n  "default_execution_mode": "manual"\n}\n' > "$WS/real/workflow.json"
+rm -f "$CFG"
+ln -s "../../real/workflow.json" "$CFG"
+(cd "$WS" && bash "$TARGET" set-upstream 'https://github.com/O/R.git' >/dev/null 2>&1); rc=$?
+check "exit 0" "$rc" "0"
+[[ -L "$CFG" ]] && ok "여전히 symlink" || nok "여전히 symlink"
+check "링크 target 동일" "$(readlink "$CFG")" "../../real/workflow.json"
+check "referent 내용 갱신" \
+  "$(sed -n 's/.*"defect_report_upstream"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$WS/real/workflow.json" | head -1)" "O/R"
+assert_json_valid "$WS/real/workflow.json" "referent 유효 JSON"
+
+echo "-- pretty-printed 통제군은 종전과 같은 결과 --"
+setup_workspace
+CFG="$WS/$CFG_REL"
+printf '{\n  "default_execution_mode": "manual"\n}\n' > "$CFG"
+(cd "$WS" && bash "$TARGET" set-upstream 'https://github.com/O/R.git' >/dev/null 2>&1); rc=$?
+check "exit 0" "$rc" "0"
+check "종전 형식 그대로" "$(cat "$CFG")" '{
+  "defect_report_upstream": "O/R",
+  "default_execution_mode": "manual"
+}'
+
+echo "== set-upstream: 구조 검증 없이는 사용자 config 를 고치지 않는다 (Turn 013 Finding 1) =="
+# python3 만 없는 PATH 를 만든다. /usr/bin 을 통째로 빼면 sed·awk 까지 사라져 다른 이유로
+# 죽으므로, 필요한 도구만 심링크한 디렉터리를 PATH 로 삼는다.
+make_nopython_path() {
+  local dir="$WS/nopybin" t path
+  mkdir -p "$dir" || return 1
+  for t in bash sed grep awk head tail cut sort tr wc find mktemp mkdir dirname basename \
+           stat chmod mv rm cp ln cat od date diff env; do
+    path="$(command -v "$t" 2>/dev/null)" || continue
+    [[ "$path" == /* ]] && ln -sf "$path" "$dir/$t"
+  done
+  printf '%s' "$dir"
+}
+
+echo "-- python3 이 없으면 malformed 원본을 건드리지 않는다 --"
+setup_workspace
+CFG="$WS/$CFG_REL"
+printf '{"default_execution_mode":"manual",}\n' > "$CFG"   # 유효하지 않은 JSON
+before="$(cat "$CFG")"
+NOPY="$(make_nopython_path)"
+if ( PATH="$NOPY"; command -v python3 >/dev/null 2>&1 )
+then nok "PATH 정리 실패 — python3 가 남아 이 케이스는 무의미"
+else ok "PATH 에 python3 없음"; fi
+(cd "$WS" && PATH="$NOPY" bash "$TARGET" set-upstream 'https://github.com/O/R.git' >/dev/null 2>&1); rc=$?
+check "malformed + 검사기 부재: 원본 bytes 불변" "$(cat "$CFG")" "$before"
+check "키가 삽입되지 않음" "$(grep -c 'defect_report_upstream' "$CFG")" "0"
+check "임시 파일 잔존 없음" "$(find "$(dirname "$CFG")" -name '.rd-defect.*' | wc -l | tr -d ' ')" "0"
+
+echo "-- python3 이 없으면 정상 원본에도 쓰지 않고 보류한다 (exit 0 + 안내) --"
+setup_workspace
+CFG="$WS/$CFG_REL"
+printf '{\n  "default_execution_mode": "manual"\n}\n' > "$CFG"
+before="$(cat "$CFG")"
+NOPY="$(make_nopython_path)"
+out="$( (cd "$WS" && PATH="$NOPY" bash "$TARGET" set-upstream 'https://github.com/O/R.git') 2>&1 )"; rc=$?
+check "exit 0 (환경 조건이므로 sync 를 멈추지 않는다)" "$rc" "0"
+check "원본 bytes 불변" "$(cat "$CFG")" "$before"
+case "$out" in *보류*) ok "보류 사유 안내";;        *) nok "보류 사유 안내 없음: [$out]";; esac
+case "$out" in *수동*) ok "수동 설정 방법 안내";;   *) nok "수동 설정 방법 안내 없음";; esac
+case "$out" in *--upstream*) ok "--upstream 대안 안내";; *) nok "--upstream 대안 안내 없음";; esac
+
+echo "-- 중첩 object 안의 동명 키를 top-level 로 오인하지 않는다 --"
+setup_workspace
+CFG="$WS/$CFG_REL"
+printf '{"integration":{"defect_report_upstream":""},"default_execution_mode":"manual"}\n' > "$CFG"
+(cd "$WS" && bash "$TARGET" set-upstream 'https://github.com/O/R.git' >/dev/null 2>&1); rc=$?
+check "exit 0" "$rc" "0"
+grep -q '"integration":{"defect_report_upstream":""}' "$CFG" \
+  && ok "중첩 값 무변경" || nok "중첩 값이 바뀜 ($(cat "$CFG"))"
+assert_json_valid "$CFG" "유효 JSON 유지"
+if command -v python3 >/dev/null 2>&1; then
+  top="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("defect_report_upstream",""))' "$CFG")"
+  check "top-level 키에 canonical 값" "$top" "O/R"
+else
+  SKIP=$((SKIP+1)); printf '  skip top-level 키 확인 (python3 없음)\n'
+fi
+
+echo "-- 최상위 중복 키는 판정 불가로 보류한다 --"
+setup_workspace
+CFG="$WS/$CFG_REL"
+printf '{"defect_report_upstream":"","defect_report_upstream":""}\n' > "$CFG"
+before="$(cat "$CFG")"
+(cd "$WS" && bash "$TARGET" set-upstream 'https://github.com/O/R.git' >/dev/null 2>&1); rc=$?
+[[ "$rc" -ne 0 ]] && ok "중복 키는 비영 종료 (rc=$rc)" || nok "중복 키인데 exit 0"
+check "원본 bytes 불변" "$(cat "$CFG")" "$before"
+check "임시 파일 잔존 없음" "$(find "$(dirname "$CFG")" -name '.rd-defect.*' | wc -l | tr -d ' ')" "0"
+
+echo "-- 통제군: top-level 빈 값은 정상 치환된다 --"
+setup_workspace
+CFG="$WS/$CFG_REL"
+printf '{"defect_report_upstream":"","default_execution_mode":"manual"}\n' > "$CFG"
+(cd "$WS" && bash "$TARGET" set-upstream 'https://github.com/O/R.git' >/dev/null 2>&1); rc=$?
+check "exit 0" "$rc" "0"
+check "값 치환" \
+  "$(sed -n 's/.*"defect_report_upstream"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CFG" | head -1)" "O/R"
+grep -q '"default_execution_mode":"manual"' "$CFG" && ok "기존 키 보존" || nok "기존 키 보존"
+assert_json_valid "$CFG" "유효 JSON"
+
+echo "-- symlink 대상에 쓰다 실패해도 referent 는 훼손되지 않는다 (Turn 013 Finding 2) --"
+# 부분 출력 후 실패하는 `cat` 대역을 끼운다. 종전 구현(`cat "$tmp" > "$target"`)은 링크를
+# 통해 원본에 직접 흘려보내 부분 bytes 로 referent 를 훼손했다.
+setup_workspace; setup_fake_gh
+CFG="$WS/$CFG_REL"
+mkdir -p "$WS/real2"
+printf '{\n  "default_execution_mode": "manual"\n}\n' > "$WS/real2/workflow.json"
+before="$(cat "$WS/real2/workflow.json")"
+rm -f "$CFG"
+ln -s "../../real2/workflow.json" "$CFG"
+(cd "$WS" && PATH="$FAKEBIN:$PATH" CAT_COUNT="$CAT_COUNT" \
+   FAKE_CAT_FAIL_PATTERN=".rd-defect." FAKE_CAT_FAIL_AFTER=0 FAKE_CAT_PARTIAL='{"partial' \
+   bash "$TARGET" set-upstream 'https://github.com/O/R.git' >/dev/null 2>&1); rc=$?
+[[ "$rc" -ne 0 ]] && ok "쓰기 실패는 비영 종료 (rc=$rc)" || nok "쓰기 실패인데 exit 0"
+check "referent bytes 불변" "$(cat "$WS/real2/workflow.json")" "$before"
+[[ -L "$CFG" ]] && ok "여전히 symlink" || nok "여전히 symlink"
+check "링크 target 동일" "$(readlink "$CFG")" "../../real2/workflow.json"
+check "임시 파일 잔존 없음 (referent 쪽)" \
+  "$(find "$WS/real2" -name '.rd-defect.*' | wc -l | tr -d ' ')" "0"
+check "임시 파일 잔존 없음 (링크 쪽)" \
+  "$(find "$(dirname "$CFG")" -name '.rd-defect.*' | wc -l | tr -d ' ')" "0"
+
+echo "== no-python × 중첩 동명 키: 값을 추측하지 않는다 (Turn 015 Finding 1) =="
+# 정규식 폴백은 `{"integration":{"defect_report_upstream":"other/repo"}}` 의 **중첩** 값을
+# top-level 로 읽었다. 그 값은 set-upstream 의 「이미 설정됨」 판정과 **발행 대상 판정**에
+# 함께 쓰이므로, 인자 없는 `publish --yes` 가 사용자가 승인한 적 없는 외부 저장소로 결함
+# 보고를 내보낼 수 있었다. 교차 조건(검사기 부재 × 중첩 동명 키)을 한 케이스로 고정한다.
+setup_workspace; setup_fake_gh
+CFG="$WS/$CFG_REL"
+printf '{"integration":{"defect_report_upstream":"other/repo"}}\n' > "$CFG"
+before="$(cat "$CFG")"
+NOPY="$(make_nopython_path)"
+if ( PATH="$NOPY"; command -v python3 >/dev/null 2>&1 )
+then nok "PATH 정리 실패 — python3 가 남아 이 케이스는 무의미"
+else ok "PATH 에 python3 없음"; fi
+
+# NOPY 를 앞에 두어 python3 을 가리고, fake gh 는 뒤쪽 FAKEBIN 에서 잡는다.
+# (NOPY 의 cat·mv·mktemp 는 실물 심링크라 주입 대역이 끼어들지 않는다.)
+nopy_dr() { (cd "$WS" && PATH="$NOPY:$FAKEBIN" GH_LOG="$GH_LOG" GH_BODY="$GH_BODY" \
+                        bash "$TARGET" "$@"); }
+
+out="$(nopy_dr set-upstream 'https://github.com/O/R.git' 2>&1)"; rc=$?
+check "set-upstream exit 0" "$rc" "0"
+case "$out" in *"이미 설정됨"*) nok "중첩 값으로 거짓 성공";; *) ok "거짓 「이미 설정됨」 없음";; esac
+case "$out" in *보류*)          ok "보류 사유 안내";; *) nok "보류 사유 안내 없음: [$out]";; esac
+case "$out" in *수동*)          ok "수동 설정 안내";; *) nok "수동 설정 안내 없음";; esac
+case "$out" in *--upstream*)    ok "--upstream 대안 안내";; *) nok "--upstream 대안 안내 없음";; esac
+check "원본 bytes 불변" "$(cat "$CFG")" "$before"
+
+f="$(make_report "2026-08-12-4001-nopy-nested.md")"
+snap="$(cat "$f")"
+: > "$GH_LOG"
+nopy_dr publish "$f" --yes >/dev/null 2>&1; rc=$?
+check "config 기반 publish 는 exit 2 (대상 없음)" "$rc" "2"
+check "gh 호출 0회 (로그 전체)" "$(wc -l < "$GH_LOG" | tr -d ' ')" "0"
+check "파일 무변경" "$(cat "$f")" "$snap"
+: > "$GH_LOG"
+nopy_dr preview "$f" >/dev/null 2>&1; rc=$?
+check "config 기반 preview 도 exit 2" "$rc" "2"
+check "preview 도 gh 호출 0회" "$(wc -l < "$GH_LOG" | tr -d ' ')" "0"
+
+echo "-- 명시적 --upstream 은 검사기 유무와 무관하게 동작한다 --"
+: > "$GH_LOG"
+nopy_dr publish "$f" --upstream "O/R" --yes >/dev/null 2>&1; rc=$?
+check "exit 0" "$rc" "0"
+check "지정한 대상으로 발행 1회" "$(grep -c 'ARGS=issue create --repo O/R' "$GH_LOG")" "1"
+
+echo "-- no-python + 정상 top-level 값도 자동 판정을 보류한다 (fail-closed 의 비용) --"
+setup_workspace; setup_fake_gh
+CFG="$WS/$CFG_REL"
+printf '{\n  "defect_report_upstream": "AAA/BBB"\n}\n' > "$CFG"
+NOPY="$(make_nopython_path)"
+f="$(make_report "2026-08-12-4002-nopy-top.md")"
+: > "$GH_LOG"
+err="$(nopy_dr publish "$f" --yes 2>&1 >/dev/null)"; rc=$?
+check "정상 값이어도 exit 2" "$rc" "2"
+check "gh 호출 0회" "$(wc -l < "$GH_LOG" | tr -d ' ')" "0"
+case "$err" in *--upstream*) ok "--upstream 진행 방법 안내";; *) nok "--upstream 안내 없음: [$err]";; esac
+
+printf '\n결과: pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ "$FAIL" -eq 0 ]]

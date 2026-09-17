@@ -17,32 +17,412 @@ source "${SCRIPT_DIR}/_task_common.sh" || exit 3
 # 진입 시 task-state 보장 — 부재 시 마이그레이션 수행 (결정 4). 손상 legacy → exit 3.
 state_ensure || exit 3
 
+# ---------------------------------------------------------------------------
+# 종결 마커 (change-spec §3.1~§3.4) 와 보류 상태 안내 (§4.4)
+# ---------------------------------------------------------------------------
+# **마커 strict 검증의 단일 출처는 `_guard_common.sh` 의 `rd_seal_verify` 입니다.** 여기에
+# 같은 규칙을 다시 두지 않습니다 — 두 곳에 있으면 「`rd task status` 는 발행 가능이라는데
+# `archive.sh` 가 막는」 어긋난 상태가 생깁니다 (spec §4.4). 마커 상수(`RD_SEAL_*`)와
+# 공용 헬퍼(`_rd_kv_get`·`_rd_version`·`_rd_seal_dir`·`_rd_seal_legacy_warning`) 도 같은
+# 파일에 있으며 `_task_common.sh` 가 source 합니다.
+#
+# 아래에 남는 것은 **producer(`rd review seal`) 전용** 파서와 보류 상태 안내뿐입니다.
+# 이들도 `_state_common.sh` 의 T1 헬퍼(`rd_repo_root`·`rd_resolve_commit_oid`·
+# `rd_protected_tree_hash`·`rd_branch_mode`·`state_read_review_session`) 와
+# `_guard_common.sh` 의 `is_review_session_resolved` 를 재사용합니다.
+# _rd_session_section <session-path> <헤더> — SESSION.md 의 '## <헤더>' 첫 유효행
+_rd_session_section() {
+  local sf="$1/SESSION.md"
+  [[ -f "$sf" ]] || return 1
+  awk -v t="## $2" '
+    $0 == t { f = 1; next }
+    f && /^## / { exit }
+    f && NF { sub(/^[ \t]+/, ""); sub(/[ \t]+$/, ""); print; exit }
+  ' "$sf"
+}
+
+# _rd_session_bc <session-path> <key> — '## Branch Context' 의 `- key: value`
+# Review Target 문자열은 파싱하지 않습니다 (§3.2.1) — 기계 판독 필드만 읽습니다.
+_rd_session_bc() {
+  local sf="$1/SESSION.md"
+  [[ -f "$sf" ]] || return 1
+  awk -v k="- $2:" '
+    /^## Branch Context/ { f = 1; next }
+    f && /^## / { exit }
+    f && index($0, k) == 1 { sub(/^[^:]*:[ \t]*/, ""); sub(/[ \t]+$/, ""); print; exit }
+  ' "$sf"
+}
+
+# _rd_seal_body <file> — sealed-at 을 뺀 본문 (재실행 no-op 판정용, §3.2)
+# sealed-at 은 실행 시각이라 매번 달라집니다. 그 한 줄 때문에 마커를 교체하면
+# "내용이 같으면 no-op" 계약이 사실상 사라지므로 비교에서 제외합니다.
+_rd_seal_body() { grep -v '^sealed-at=' "$1"; }
+
+# ---------------------------------------------------------------------------
+# 마커 strict 검증 호출 (§3.3) — canonical 구현은 `_guard_common.sh` 에 있습니다
+# ---------------------------------------------------------------------------
+# 사용: _rd_seal_verify <worktree|commit> [판정 대상 commit] [fr-branch 값]
+#
+# `_guard_common.sh` 가 실려 있지 않으면(스크립트만 일부 복사된 배치 등) **자체 검증으로
+# 대체하지 않고 차단합니다.** 대체 구현을 두는 순간 이 task 가 없앤 이중 정의가 되살아나며,
+# 검증 없이 통과시키는 것은 더 나쁩니다.
+_rd_seal_verify() {
+  if ! declare -f rd_seal_verify >/dev/null 2>&1; then
+    RD_SEAL_FAIL_KIND="hash-error"
+    RD_SEAL_FAIL_MSG="검증 함수(_guard_common.sh 의 rd_seal_verify) 를 불러올 수 없습니다 — 판정 불가로 차단합니다"
+    RD_SEAL_VERIFIED=""
+    return 1
+  fi
+  rd_seal_verify ${1+"$@"}
+}
+
+# _rd_seal_audit_append <session-id> <사유>: legacy 전환 사유를 audit 에 남깁니다 (§3.4).
+#
+# **각 단계의 실패를 전파합니다.** 이 기록이 없으면 마커가 무엇을 포기했는지 알 길이
+# 없으므로, 실패를 삼키고 성공 메시지를 내면 안 됩니다 (final diff review Finding 6).
+_rd_seal_audit_append() {
+  local sid="$1" reason="$2" audit dir
+  audit="${project_root}/${RD_SEAL_AUDIT_REL}"
+  dir="$(dirname "$audit")"
+  if ! mkdir -p "$dir"; then
+    echo "review seal: audit 디렉터리를 만들 수 없습니다 (${dir}) — 마커를 기록하지 않습니다." >&2
+    return 1
+  fi
+  if ! printf '%s | %s | %s | %s\n' "$(date '+%Y-%m-%d %H:%M')" \
+      "$(state_read_field "short-title")" "legacy-unverified: ${reason}" \
+      "rd-workflow-workspace/handoffs/review_pipeline/${sid}" >> "$audit"; then
+    echo "review seal: audit 기록에 실패했습니다 (${RD_SEAL_AUDIT_REL}) — 마커를 기록하지 않습니다." >&2
+    return 1
+  fi
+  return 0
+}
+
+# _rd_seal_audit_has <session-id>: 그 세션의 legacy 기록이 audit 에 이미 있는지.
+_rd_seal_audit_has() {
+  local sid="$1" audit
+  audit="${project_root}/${RD_SEAL_AUDIT_REL}"
+  [[ -f "$audit" ]] || return 1
+  grep -q "legacy-unverified: .* | rd-workflow-workspace/handoffs/review_pipeline/${sid}\$" "$audit" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# producer — rd review seal (§3.2, §3.4)
+# ---------------------------------------------------------------------------
+rd_review_seal() {
+  # 공용 상수·헬퍼(`RD_SEAL_*`·`_rd_version`·`_rd_seal_dir`)의 출처가 실려 있지 않으면
+  # 마커를 만들지 않습니다 — 규칙을 여기서 다시 정의하지 않는 것이 이 통합의 전제입니다.
+  if ! declare -f rd_seal_verify >/dev/null 2>&1; then
+    echo "review seal: 검증 함수(_guard_common.sh 의 rd_seal_verify) 를 불러올 수 없습니다 — 중단합니다." >&2
+    return 1
+  fi
+  local legacy=0 reason="" session_path=""
+  while [[ $# -gt 0 ]]; do
+    case "${1}" in
+      --legacy-unverified)
+        if [[ $# -lt 2 ]]; then
+          echo "review seal: --legacy-unverified 는 사유가 필수입니다." >&2
+          return 1
+        fi
+        legacy=1; reason="$2"; shift 2 ;;
+      --) shift ;;
+      -*) echo "review seal: 알 수 없는 옵션입니다: $1" >&2; return 1 ;;
+      *)
+        if [[ -n "$session_path" ]]; then
+          echo "review seal: 인자가 너무 많습니다 (세션 경로 1개만 받습니다)." >&2
+          return 1
+        fi
+        session_path="$1"; shift ;;
+    esac
+  done
+  if [[ -z "$session_path" ]]; then
+    echo "사용법: bash rd-workflow/scripts/rd review seal [--legacy-unverified <사유>] <session-path>" >&2
+    return 1
+  fi
+  if [[ "$legacy" == "1" && -z "$reason" ]]; then
+    echo "review seal: --legacy-unverified 는 사유가 필수입니다." >&2
+    return 1
+  fi
+  session_path="${session_path%/}"
+  if [[ ! -d "$session_path" ]]; then
+    echo "review seal: 세션 경로가 없습니다: ${session_path}" >&2
+    return 1
+  fi
+
+  local session_id internal_id
+  session_id="$(basename "$session_path")"
+  internal_id="$(_rd_session_section "$session_path" "Session ID" 2>/dev/null)" || internal_id=""
+  if [[ -n "$internal_id" && "$internal_id" != "$session_id" ]]; then
+    echo "review seal: 세션 디렉터리 이름과 내부 Session ID 가 다릅니다 (디렉터리=${session_id}, 내부=${internal_id})." >&2
+    return 1
+  fi
+
+  # 검사 1 — 세션 종결성 (`is_review_session_resolved` 재사용, §3.2)
+  if ! is_review_session_resolved "$session_path"; then
+    echo "review seal: 세션이 종결되지 않았습니다." >&2
+    return 1
+  fi
+
+  # 검사 2 — review-type
+  local review_type
+  review_type="$(_rd_session_section "$session_path" "Review Type" 2>/dev/null)" || review_type=""
+  if [[ "$review_type" != "diff-review" ]]; then
+    echo "review seal: final diff review 세션이 아닙니다 (review-type=${review_type:-<없음>})." >&2
+    return 1
+  fi
+
+  # 검사 3 — review-head-oid 존재·형식. legacy 판별의 기계적 기준입니다 (§3.4).
+  local raw_head raw_base reviewed_oid=""
+  raw_head="$(_rd_session_bc "$session_path" "review-head-oid" 2>/dev/null)" || raw_head=""
+  raw_base="$(_rd_session_bc "$session_path" "review-base-oid" 2>/dev/null)" || raw_base=""
+  # 두 줄은 한 묶음입니다 — 한쪽만 있는 세션은 legacy 가 아니라 손상이고, legacy 와
+  # 일반 경로 어느 쪽으로도 보내지 않습니다 (final diff review turn 006 Finding 1).
+  # 종전에는 head 가 있다는 이유만으로 base 없는 세션이 `verified=yes` 로 봉인됐습니다.
+  if [[ -n "$raw_head" && -z "$raw_base" ]] || [[ -z "$raw_head" && -n "$raw_base" ]]; then
+    echo "review seal: 세션의 reviewed OID 가 한쪽만 있습니다 (base='${raw_base}', head='${raw_head}') — 판정 불가로 차단합니다." >&2
+    return 1
+  fi
+  if [[ "$legacy" == "1" ]]; then
+    if [[ -n "$raw_head" ]]; then
+      echo "review seal: 이 세션에는 review-head-oid 가 있어 검증이 가능합니다 — --legacy-unverified 를 쓸 수 없습니다." >&2
+      return 1
+    fi
+  else
+    if [[ -z "$raw_head" ]]; then
+      echo "review seal: reviewed OID 없음 — legacy 세션입니다. --legacy-unverified 를 쓰십시오." >&2
+      return 1
+    fi
+    reviewed_oid="$(rd_resolve_commit_oid "$raw_head")" || {
+      echo "review seal: review-head-oid('${raw_head}') 를 commit 으로 해석할 수 없습니다 — 판정 불가." >&2
+      return 1
+    }
+    # raw 필드는 저장소 native full OID 여야 합니다 (같은 Finding). `rd_resolve_commit_oid`
+    # 는 이동 ref·축약 OID 도 해석하므로, 그런 값이 남아 있으면 리뷰 시점과 이 시점 사이에
+    # 대상이 다시 움직일 수 있습니다.
+    if [[ "$raw_head" != "$reviewed_oid" ]]; then
+      echo "review seal: review-head-oid('${raw_head}') 가 full OID 가 아닙니다 (resolve 결과: ${reviewed_oid}) — 판정 불가로 차단합니다." >&2
+      return 1
+    fi
+    # base 도 같은 검사를 받습니다 (final diff review turn 008). head 에만 걸면 base 가
+    # `main`·`HEAD~1` 같은 이동 표현이나 축약 OID·해석 불가 값이어도 봉인되어, 「두 raw
+    # 필드는 native full OID」라는 묶음 계약이 절반만 성립합니다. 턴 경로는 이미 두 값을
+    # 모두 보므로 seal 만 비대칭이었습니다.
+    local resolved_base
+    resolved_base="$(rd_resolve_commit_oid "$raw_base")" || {
+      echo "review seal: review-base-oid('${raw_base}') 를 commit 으로 해석할 수 없습니다 — 판정 불가." >&2
+      return 1
+    }
+    if [[ "$raw_base" != "$resolved_base" ]]; then
+      echo "review seal: review-base-oid('${raw_base}') 가 full OID 가 아닙니다 (resolve 결과: ${resolved_base}) — 판정 불가로 차단합니다." >&2
+      return 1
+    fi
+  fi
+
+  # 현재 보호 트리 해시 (§2.2 fail-closed — 계산 실패는 통과가 아닙니다)
+  local cur_hash head_now
+  cur_hash="$(rd_protected_tree_hash "HEAD")" || {
+    echo "review seal: 보호 트리 해시를 계산할 수 없습니다 — 판정 불가로 차단합니다." >&2
+    return 1
+  }
+  head_now="$(rd_resolve_commit_oid "HEAD")" || {
+    echo "review seal: HEAD 를 commit 으로 해석할 수 없습니다 — 판정 불가." >&2
+    return 1
+  }
+
+  # 검사 4 — reviewed head 의 해시 == 현재 해시 (이 설계의 실질, §3.2)
+  local verified="legacy-unverified"
+  if [[ "$legacy" != "1" ]]; then
+    local reviewed_hash
+    reviewed_hash="$(rd_protected_tree_hash "$reviewed_oid")" || {
+      echo "review seal: reviewed head 의 보호 트리 해시를 계산할 수 없습니다 — 판정 불가로 차단합니다." >&2
+      return 1
+    }
+    if [[ "$reviewed_hash" != "$cur_hash" ]]; then
+      echo "review seal: 리뷰 종결 후 보호 경로가 변경되었습니다 — 재리뷰가 필요합니다." >&2
+      return 1
+    fi
+    verified="yes"
+  fi
+
+  # branch-mode 표기는 §3.2.2 헬퍼 한 곳에서만 판정합니다.
+  local fr_val mode fr_field
+  fr_val="$(state_read_field "fr-branch")"
+  mode="$(rd_branch_mode "$fr_val")" || return 1
+  if [[ "$mode" == "no-fr" ]]; then fr_field="null"; else fr_field="$fr_val"; fi
+
+  local dir marker tmp
+  dir="$(_rd_seal_dir)"
+  mkdir -p "$dir" || { echo "review seal: 마커 디렉터리를 만들 수 없습니다: ${dir}" >&2; return 1; }
+  marker="${dir}/${session_id}.seal"
+  tmp="$(mktemp "${dir}/.seal.XXXXXX")" || { echo "review seal: mktemp 실패" >&2; return 1; }
+  cat > "$tmp" <<EOF
+schema=${RD_SEAL_SCHEMA}
+session-id=${session_id}
+review-type=diff-review
+tree-hash=${cur_hash}
+head=${head_now}
+branch-mode=${mode}
+fr-branch=${fr_field}
+rd-version=$(_rd_version)
+verified=${verified}
+sealed-at=$(date '+%Y-%m-%d-%H%M')
+EOF
+
+  # 재실행 no-op (§3.2) — sealed-at 을 뺀 본문이 같으면 기존 마커를 건드리지 않습니다.
+  if [[ -f "$marker" ]] && [[ "$(_rd_seal_body "$marker")" == "$(_rd_seal_body "$tmp")" ]]; then
+    rm -f "$tmp"
+    # legacy 는 마커만으로 완결되지 않습니다 — 사유가 audit 에 남아야 나중에 실행하는
+    # 사람이 무엇을 포기했는지 압니다. 앞선 실행에서 audit append 가 실패했다면 마커만
+    # 남고 기록이 비어 있으므로, 그 상태를 여기서 복구합니다 (final diff review Finding 6).
+    if [[ "$legacy" == "1" ]] && ! _rd_seal_audit_has "$session_id"; then
+      _rd_seal_audit_append "$session_id" "$reason" || return 1
+      echo "review seal: 기존 마커의 누락된 audit 기록을 복구했습니다 (${RD_SEAL_AUDIT_REL})." >&2
+    fi
+    echo "review seal: 기존 마커와 내용이 같습니다 — 변경 없음 (${marker})."
+    return 0
+  fi
+
+  # legacy 는 audit 기록을 **마커보다 먼저** 남깁니다 (final diff review Finding 6).
+  # 초안은 마커 교체 뒤에 append 하면서 종료 상태를 확인하지 않아, 권한·용량 문제로
+  # append 가 실패해도 `verified=legacy-unverified` 마커는 남고 CLI 는 "사유를 기록했다"
+  # 고 거짓 안내를 냈습니다. 순서를 뒤집으면 실패 시 마커가 아예 생기지 않습니다.
+  if [[ "$legacy" == "1" ]] && ! _rd_seal_audit_append "$session_id" "$reason"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  # reseal — 4검사를 모두 통과한 지금에서만 도달합니다. 같은 디렉터리 임시 파일 + mv 로
+  # 원자적으로 교체하며, 실패하면 기존 마커를 그대로 둡니다 (§3.2).
+  if ! mv "$tmp" "$marker"; then
+    rm -f "$tmp"
+    echo "review seal: 마커 교체에 실패했습니다 — 기존 마커를 그대로 둡니다." >&2
+    return 1
+  fi
+
+  if [[ "$legacy" == "1" ]]; then
+    echo "review seal: legacy 전환으로 마커를 기록했습니다 (${marker})."
+    echo "  이 마커는 리뷰 당시 트리를 증명하지 않습니다. 종결 이후 코드가 변경되었어도 발행을 막지 못합니다."
+    echo "  사유를 audit 에 기록했습니다: ${RD_SEAL_AUDIT_REL}"
+  else
+    echo "review seal: 마커를 기록했습니다 (${marker})."
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# `아카이브 보류` 안내 (§4.4) — 우선순위가 계약입니다
+# ---------------------------------------------------------------------------
+# 1) 판정 대상 commit 의 seal 유효 → 발행
+# 2) (1 아님) 워킹트리 seal 이 현재 head 에 유효 → 커밋 안내 (신규·reseal 구분 없음)
+# 3) 그 외 → 판정 대상 commit 쪽 실패 사유별 복구 안내 (사유를 합치지 않습니다)
+#
+# 발행 안전성은 그대로입니다 — 워킹트리 조회는 안내에만 쓰이고, `발행` 을 안내하는 경우는
+# 판정 대상 commit 이 유효할 때뿐입니다.
+_rd_status_pending_guidance() {
+  local fr_val mode target advice="" c_kind="" c_msg="" legacy=0
+  fr_val="$(state_read_field "fr-branch")"
+  if ! mode="$(rd_branch_mode "$fr_val" 2>/dev/null)"; then
+    advice="task-state fr-branch 값이 canonical 이 아닙니다 ('${fr_val}') — 'fr/<slug>' 또는 'null' 로 고치세요"
+  else
+    if [[ "$mode" == "fr" ]]; then
+      target="$(rd_resolve_commit_oid "$fr_val" 2>/dev/null)" || target=""
+      [[ -z "$target" ]] && advice="fr 브랜치 '${fr_val}' 의 commit 을 찾을 수 없습니다 — 판정 대상이 없습니다"
+    else
+      target="$(rd_resolve_commit_oid "HEAD" 2>/dev/null)" || target=""
+      [[ -z "$target" ]] && advice="HEAD 를 commit 으로 해석할 수 없습니다 — 판정 불가"
+    fi
+  fi
+
+  if [[ -z "$advice" ]]; then
+    if _rd_seal_verify "commit" "$target" "$fr_val"; then
+      advice="발행: bash rd-workflow/scripts/lifecycle/archive.sh"
+      [[ "$RD_SEAL_VERIFIED" == "legacy-unverified" ]] && legacy=1
+    else
+      c_kind="$RD_SEAL_FAIL_KIND"; c_msg="$RD_SEAL_FAIL_MSG"
+      if _rd_seal_verify "worktree" "" "$fr_val"; then
+        advice="seal 과 archive 기록을 커밋하세요"
+        [[ "$RD_SEAL_VERIFIED" == "legacy-unverified" ]] && legacy=1
+      else
+        case "$c_kind" in
+          missing)        advice="먼저 실행: bash rd-workflow/scripts/rd review seal <세션>" ;;
+          hash-mismatch)  advice="재리뷰 필요 — 종결 후 코드가 변경되었습니다" ;;
+          pointer-missing) advice="final diff review 세션이 지정되지 않았습니다 — prepare_review_pipeline.sh diff 로 세션을 만드십시오" ;;
+          hash-error)     advice="보호 트리 해시를 계산할 수 없습니다 — 판정 불가" ;;
+          *)              advice="$c_msg" ;;
+        esac
+      fi
+    fi
+  fi
+
+  echo "아카이브 보류 — 리뷰는 끝났고 발행이 남았습니다." >&2
+  echo "  ${advice}" >&2
+  echo "  되돌리기: bash rd-workflow/scripts/rd task set-status \"구현 중\"" >&2
+  [[ "$legacy" == "1" ]] && _rd_seal_legacy_warning
+  return 0
+}
+
 usage() {
   cat <<'EOF'
 사용법: bash rd-workflow/scripts/rd task <subcommand>
   status                                   Status 출력 (파싱 불가 exit 3)
   title                                    Short Title 출력 (섹션 부재 exit 3)
-  mode                                     autopilot | manual (RD_AUTOPILOT=1 판정)
-  set-status <값> [--force]                전이표 검증 후 Status 갱신 (위반 exit 4)
-  guard --candidate <slug> --mode <m> [--source-fr <path|->]
+  mode                                     autopilot | non-autopilot (RD_AUTOPILOT=1 판정)
+                                           실행 모드(manual/semi-auto) 조회가 아닙니다
+                                           — rd-workflow/docs/flows/AUTONOMY.md 참조
+  set-status <값> [--force] [--task <slug>]  전이표 검증 후 Status 갱신 (위반 exit 4)
+                                           --task: 대상 작업 명시(worktree 여러 건일 때).
+                                           생략 시 현재 worktree 의 작업, 그마저 없고
+                                           작업이 여러 건이면 목록 안내 후 exit 1
+  list [--rebuild]                         진행 중인 모든 작업의 단계·worktree·세션 상태 출력
+                                           (--rebuild: 색인을 worktree 목록에서 재구성)
+  resolve-launch <slug> [--assume-ended]    기동 예약(launching)·미확정(unknown)을 사람이 확정/해소
+                                           (진행 중이면 exit 1, 확정 시 launch=ok|failed|none)
+                                           --assume-ended: herdr 로 조회할 수 없을 때, 세션이
+                                           없거나 끝났음을 직접 확인했다고 밝혀 failed 로 확정
+  guard --candidate <slug> --mode <m> [--source-fr <path|-> ...]
                                            m: intake|promote|fr-add. decision=... 출력 (차단 exit 2)
-                                           --source-fr 는 promote 전용 (생략 시 '-' 리셋)
-  source-fr                                task-state source-fr 출력 (부재 시 '-')
-  set-source-fr <값>                       source-fr 설정 ('-' 또는 items path, 계약 위반 exit 1)
-  set-title <slug> [--force]                Short Title 설정 (미설정→설정만 허용, --force 는 복구 전용)
+                                           --source-fr 는 promote 전용, 반복 지정으로 복수 허용
+                                           (생략 시 '-' 리셋. '-' 는 단독일 때만 허용)
+  source-fr                                task-state source-fr 출력 (줄 단위 목록, 부재 시 '-')
+  set-source-fr <값>...                    source-fr 설정 (위치 인자 반복. 각 값은 '-' 또는
+                                           items path, 계약 위반 시 아무것도 쓰지 않고 exit 1.
+                                           '-' 는 단독일 때만 허용(값 없음 reset))
+  set-title <slug|-> [--force]              Short Title 설정. '-' 는 reset(§2.6) — Status='대기 중'
+                                           이고 fr-branch 가 활성이 아닐 때만 허용, --force 불가.
+                                           그 외에는 미설정→설정만 허용(--force 는 복구 전용)
+  fr-done [<path>...]                       묶은 FR 전부의 items·인덱스 status 를 done 으로.
+                                           인자 없으면 task-state source-fr 집합이 대상(발행 전),
+                                           인자 지정 시 그 경로들이 대상(발행 후 재시도). 실패
+                                           1건 이상이면 exit 1(발행은 막지 않음 — 호출부 책임)
   capture --stage <s> [--title <slug>] [--source <src>]   본문은 stdin (fail-open)
   backup-request [--orphan] [--title <slug>]               REQUEST.md collision-safe 백업
   archive-captures --stages <csv> [--title <slug>]         캡처를 raw-captures/archive/로 이동
+  fr-register --slug <slug>                 등록 결과(인덱스 행·items·fr 캡처)를 기본 브랜치에 커밋 (skipped exit 3)
+  set-base <ref>                            작업 시작 커밋 기록 (입력이 ref 여도 OID 로 저장)
+
+사용법: bash rd-workflow/scripts/rd review <subcommand>
+  seal [--legacy-unverified <사유>] <session-path>
+                                           final diff review 종결 마커 생성 (4검사 통과 시 verified=yes)
 EOF
 }
 
 ns="${1:-}"; [[ $# -gt 0 ]] && shift
-if [[ "$ns" != "task" ]]; then usage; exit 1; fi
+case "$ns" in task|review) ;; *) usage; exit 1 ;; esac
 cmd="${1:-}"; [[ $# -gt 0 ]] && shift
+
+# review 네임스페이스 — 종결 마커 producer (change-spec §3.2·§3.4)
+if [[ "$ns" == "review" ]]; then
+  case "$cmd" in
+    seal) rd_review_seal ${1+"$@"}; exit $? ;;
+    *) usage; exit 1 ;;
+  esac
+fi
 
 case "$cmd" in
   status)
-    task_read_status || exit 3
+    # stdout 은 Status 값 한 줄이라는 기계 계약을 유지합니다 — `아카이브 보류` 안내는
+    # 사람에게 보이되 파싱을 깨지 않도록 stderr 로 냅니다 (change-spec §4.4).
+    _st="$(task_read_status)" || exit 3
+    printf '%s\n' "$_st"
+    if [[ "$_st" == "아카이브 보류" ]]; then _rd_status_pending_guidance; fi
     ;;
   title)
     # task-state 존재 시 task-state에서 읽기 (결정 3: 기계 소비는 task-state 단일 소스)
@@ -57,28 +437,60 @@ case "$cmd" in
     fi
     ;;
   mode)
-    if [[ "${RD_AUTOPILOT:-}" == "1" ]]; then echo "autopilot"; else echo "manual"; fi
+    if [[ "${RD_AUTOPILOT:-}" == "1" ]]; then echo "autopilot"; else echo "non-autopilot"; fi
     ;;
   set-status)
     to="${1:-}"; [[ $# -gt 0 ]] && shift
-    force=0; [[ "${1:-}" == "--force" ]] && force=1
+    force=0; ss_task=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --force) force=1; shift ;;
+        --task) ss_task="${2:-}"; shift 2 ;;
+        *) usage; exit 1 ;;
+      esac
+    done
     [[ -z "$to" ]] && { usage; exit 1; }
-    task_set_status "$to" "$force"
+    # 대상 선택 (spec D4) — 색인 없는 단일 worktree 사용은 기존과 동일하게 동작한다.
+    ss_target="$(task_resolve_target write "$ss_task")"; ss_rc=$?
+    [[ "$ss_rc" -ne 0 ]] && exit "$ss_rc"
+    ss_orig_root="$project_root"; ss_orig_tsp="$TASK_STATE_PATH"
+    project_root="$ss_target"
+    TASK_STATE_PATH="${ss_target}/rd-workflow-workspace/.lifecycle/task-state"
+    task_set_status "$to" "$force"; ss_rc=$?
+    project_root="$ss_orig_root"; TASK_STATE_PATH="$ss_orig_tsp"
+    exit "$ss_rc"
     ;;
   source-fr)
+    # 저장 형식('|' 구분)을 노출하지 않는다 — 줄 단위 목록으로 고정한다(change spec §2.4b).
     v="$(state_read_field "source-fr")"
-    printf '%s\n' "${v:--}"
+    lst="$(source_fr_split "${v:--}" "$project_root")"
+    if [[ -z "$lst" ]]; then
+      printf -- '-\n'
+    else
+      printf '%s\n' "$lst"
+    fi
+    ;;
+  set-base)
+    # §5.3 — 입력이 ref 여도 저장 시점에 OID 로 resolve 합니다 (커밋이 아니면 거부).
+    ref="${1:-}"; [[ $# -gt 0 ]] && shift
+    [[ -z "$ref" || $# -gt 0 ]] && { usage; exit 1; }
+    state_write_base_commit "$ref" || exit 1
+    printf 'base-commit=%s\n' "$(state_read_base_commit)"
     ;;
   set-source-fr)
-    val="${1:-}"; [[ $# -gt 0 ]] && shift
-    [[ -z "$val" ]] && { usage; exit 1; }
-    task_set_source_fr "$val"
+    # 위치 인자 반복(change spec §2.4b) — 옵션 파서를 추가하지 않는다.
+    [[ $# -eq 0 ]] && { usage; exit 1; }
+    task_set_source_fr "$@"
+    ;;
+  fr-done)
+    # 위치 인자 반복, 생략 시 task-state source-fr 집합(change spec §2.5.2).
+    task_fr_done "$@"
     ;;
   set-title)
     # slug 자리에 option token 이 오면 "인자 누락" 이다. 그대로 통과시키면
     # `rd task set-title --force` 에서 val="--force" 가 되고 normalize_slug 가
     # 이를 'force' 로 정규화해 실제 제목으로 기록한다 (change spec D3 위반).
-    # '-' 단독은 task_set_title 이 자체 메시지로 거부하므로 여기서 잡지 않는다.
+    # '-' 단독은 reset 경로(§2.6) 이므로 여기서 잡지 않는다 — task_set_title 로 넘긴다.
     case "${1:-}" in
       "")   usage; exit 1 ;;
       -?*)  usage; exit 1 ;;
@@ -91,24 +503,53 @@ case "$cmd" in
     task_set_title "$val" "$force"
     ;;
   guard)
-    cand="" gmode="" gsrc=""
+    cand="" gmode="" gsrc="" gsrc_count=0 gsrc_list="" gsrc_fail=0
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --candidate) cand="${2:-}"; shift 2 ;;
         --mode) gmode="${2:-}"; shift 2 ;;
-        --source-fr) gsrc="${2:-}"; shift 2 ;;
+        --source-fr)
+          # 검증은 **파싱 시점**에 인자 경계 그대로 한다 — 목록으로 합친 뒤 줄 단위로
+          # 보면 개행이 든 인자 하나가 두 항목으로 승인된다 (final diff review F4).
+          # 첫 실패에서 멈추지 않고 전부 열거한 뒤 아무것도 쓰지 않는다 (F3).
+          source_fr_check_direct_arg "${2:-}" "$project_root" || gsrc_fail=1
+          gsrc_list="${gsrc_list:+${gsrc_list}$'\n'}${2:-}"
+          gsrc_count=$((gsrc_count + 1))
+          shift 2 ;;
         *) usage; exit 1 ;;
       esac
     done
     case "$gmode" in intake|promote|fr-add) ;; *) usage; exit 1 ;; esac
     [[ -z "$cand" ]] && { usage; exit 1; }
-    if [[ -n "$gsrc" && "$gmode" != "promote" ]]; then
+    if [[ "$gsrc_count" -gt 0 && "$gmode" != "promote" ]]; then
       echo "guard: --source-fr 는 promote 모드 전용입니다 (mode=${gmode})" >&2
       exit 1
     fi
-    if [[ -n "$gsrc" ]] && ! source_fr_validate "$gsrc"; then
-      echo "guard: --source-fr 값 계약 위반 — '-' 또는 rd-workflow-workspace/backlog/items/<파일>.md 만 허용: '${gsrc}'" >&2
+    if [[ "$gsrc_fail" -eq 1 ]]; then
+      echo "guard: --source-fr 항목 검증에 실패해 아무것도 쓰지 않았습니다 (위 항목을 전부 고치세요)." >&2
       exit 1
+    fi
+    if [[ "$gsrc_count" -gt 0 ]]; then
+      # '-' (값 없음) 은 단독일 때만 허용한다 (change spec §2.4) — 다른 항목과 섞이면 거부.
+      dash_count=0
+      while IFS= read -r _gv; do
+        [[ "$_gv" == "-" ]] && dash_count=$((dash_count + 1))
+      done <<< "$gsrc_list"
+      if [[ "$dash_count" -gt 0 && "$gsrc_count" -gt 1 ]]; then
+        echo "guard: --source-fr 의 '-' (값 없음) 은 다른 항목과 함께 지정할 수 없습니다." >&2
+        exit 1
+      fi
+      if [[ "$gsrc_count" -eq 1 && "$gsrc_list" == "-" ]]; then
+        gsrc="-"
+      else
+        gseen=""
+        while IFS= read -r _gv; do
+          [[ -z "$_gv" ]] && continue
+          _sfr_list_contains "$_gv" "$gseen" && continue
+          gseen="${gseen:+${gseen}$'\n'}${_gv}"
+        done <<< "$gsrc_list"
+        gsrc="$(source_fr_join "$gseen")" || exit 1
+      fi
     fi
     task_guard_decide "$cand" "$gmode" "$gsrc"
     ;;
@@ -171,6 +612,44 @@ case "$cmd" in
       exit 2
     fi
     task_archive_captures "$stages" "$title"
+    ;;
+  fr-register)
+    slug=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --slug) slug="${2:-}"; shift 2 ;;
+        *) usage; exit 1 ;;
+      esac
+    done
+    [[ -n "$slug" ]] || { usage; exit 1; }
+    source "${SCRIPT_DIR}/_fr_register_common.sh" || exit 3
+    fr_register_run "$slug"
+    ;;
+  list)
+    lr_rebuild=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --rebuild) lr_rebuild=(--rebuild); shift ;;
+        *) usage; exit 1 ;;
+      esac
+    done
+    # bash 3.2(macOS 기본) 에서는 빈 배열의 "${arr[@]}" 가 set -u 아래 unbound
+    # variable 로 죽는다 — ${arr[@]+"${arr[@]}"} 로 우회한다(이 파일 상단 usage 의
+    # 다른 배열 확장과 test_lifecycle.sh 의 _ast_cleanup 이 이미 쓰는 패턴).
+    bash "${SCRIPT_DIR}/lifecycle/tasks_list.sh" ${lr_rebuild[@]+"${lr_rebuild[@]}"}
+    ;;
+  resolve-launch)
+    rl_slug="${1:-}"; [[ $# -gt 0 ]] && shift
+    [[ -z "$rl_slug" ]] && { usage; exit 1; }
+    rl_flags=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --assume-ended) rl_flags+=("$1"); shift ;;
+        *) usage; exit 1 ;;
+      esac
+    done
+    # bash 3.2 + set -u 에서 빈 배열의 "${arr[@]}" 는 unbound variable 이다.
+    task_resolve_launch "$rl_slug" ${rl_flags[@]+"${rl_flags[@]}"}
     ;;
   *) usage; exit 1 ;;
 esac

@@ -3,11 +3,40 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/slug.sh"
 source "$SCRIPT_DIR/_lifecycle_common.sh"
+# 색인·락(Task 1) — launching 예약 확인·발행 기록(state=cleanup-pending)에 쓴다.
+# 가볍고 project_root 를 요구하지 않아 항상 source 해 둔다(호출 시점에만 git 저장소면 된다).
+source "$SCRIPT_DIR/_tasks_index.sh"
 
-DRY_RUN=0; FORCE_DIRTY=0; NO_REMOTE=0; FR_BRANCH_OVERRIDE=""; FORCE_SKIP_REVIEW=0; SKIP_REASON=""
+# _archive_read_field_at <worktree-path> <key> — 다른 worktree 의 task-state 를
+# **cd 없이 경로로 직접** 읽는다. `state_read_field` 는 source 시점에 확정된
+# TASK_STATE_PATH 만 읽으므로 다른 worktree 를 대상으로 쓸 수 없다(brief 핵심 함정).
+# metadata_read_field 와 같은 legacy active-fr fallback 을 유지한다.
+_archive_read_field_at() {
+  # bash 3.2 는 **같은 `local` 문 안에서 앞 변수를 참조**하지 못한다 — `local base="$1"
+  # p="$base/..."` 는 4.x 에서는 되지만 3.2 에서는 `set -u` 아래 `base: unbound variable`
+  # 로 즉사한다(이 머신이 3.2 다). 그래서 선언과 조립을 두 줄로 나눈다.
+  local base="$1" key="$2"
+  local p="$base/rd-workflow-workspace/.lifecycle/task-state"
+  if [[ -f "$p" ]]; then
+    awk -F'=' -v k="$key" '$1==k{sub(/^[^=]+=/,""); print; exit}' "$p"
+    return 0
+  fi
+  local legacy="$base/rd-workflow-workspace/.lifecycle/active-fr"
+  if [[ -f "$legacy" ]]; then
+    awk -F'=' -v k="$key" '$1==k{sub(/^[^=]+=/,""); print; exit}' "$legacy"
+  fi
+}
+
+# 파서보다 앞에서 원본 인자를 보존한다 — 파서가 shift 하므로 파싱 후에는
+# --no-remote·--dry-run·--fr-branch 등이 사라진다. 기본 worktree 재실행(Step -1)이
+# 이 배열을 그대로 전달한다.
+ORIG_ARGS=("$@")
+
+DRY_RUN=0; FORCE_DIRTY=0; NO_REMOTE=0; FR_BRANCH_OVERRIDE=""; FORCE_SKIP_REVIEW=0; SKIP_REASON=""; TASK_SLUG_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fr-branch) FR_BRANCH_OVERRIDE="$2"; shift 2 ;;
+    --task) TASK_SLUG_ARG="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --force-dirty) FORCE_DIRTY=1; shift ;;
     --no-remote) NO_REMOTE=1; shift ;;
@@ -16,20 +45,204 @@ while [[ $# -gt 0 ]]; do
       # 다음 토큰이 없거나 -로 시작하면 사유 누락 → 빈 값 유지 (precheck에서 차단)
       if [[ $# -ge 2 && "$2" != -* ]]; then SKIP_REASON="$2"; shift 2; else shift 1; fi
       ;;
-    -h|--help) printf '%s\n' "usage: archive.sh [--fr-branch <ref>] [--no-remote] [--force-dirty] [--force-skip-review-check <사유>] [--dry-run]"; exit 0 ;;
+    -h|--help) printf '%s\n' "usage: archive.sh [--fr-branch <ref>] [--task <slug>] [--no-remote] [--force-dirty] [--force-skip-review-check <사유>] [--dry-run]"; exit 0 ;;
     *) printf 'archive: unknown arg: %s\n' "$1" >&2; exit 1 ;;
   esac
 done
 
-# Step 0 — 기본 브랜치 worktree 검증
-MAIN_WT="$(get_main_worktree_path)" || { printf 'archive: 기본 브랜치 worktree 검출 실패\n' >&2; exit 1; }
-CURRENT_WT="$(git rev-parse --show-toplevel)" || {
+# ---------------------------------------------------------------------------
+# Step -1 — 대상 확정과 기본 worktree 재실행 (spec D5)
+#
+# archive 의 core 산출물(merge·tag·push)은 항상 "기본 worktree"에서만 만들어진다.
+# 작업 worktree 안에서 호출해도 그 사실은 바뀌지 않는다 — **cd 서브셸로는 해결되지
+# 않는다.** `_state_common.sh` 가 `TASK_STATE_PATH` 를 source 시점에
+# `${project_root:-$PWD}` 로 이미 확정했으므로, 이 프로세스 안에서 아무리 cd 해도
+# 그 값은 바뀌지 않는다 — metadata_clear·state_write_fields 가 여전히 호출 worktree
+# 의 상태를 지운다. 그래서 대상을 확정한 뒤 기본 worktree 로 이동해 **새 프로세스**로
+# 자기 자신을 재실행한다.
+#
+# 기본 worktree 는 "기본 브랜치를 체크아웃한 worktree 를 찾는 방식"(구
+# get_main_worktree_path)이 아니라 공유 .git 의 물리 위치(부모 디렉터리)로 확정한다.
+# 전자는 `--no-worktree` 로 그 체크아웃이 fr 브랜치로 넘어가는 순간 실패한다 —
+# promote.sh(Task 4)가 이미 같은 이유로 이 방식으로 갈아탔다(I4).
+# `dirname "$(git ... 2>/dev/null)"` 로 한 줄에 합치면 안 된다 — `||` 가 **dirname 의
+# rc** 만 보고, git 이 실패해 빈 문자열을 내도 `dirname ""` → "." 는 rc=0 이라 에러
+# 분기가 실행되지 않는다(`--path-format` 은 git 2.31+ 이라 구버전에서 이 경로를 실제로
+# 탄다). 그러면 PUBLISH_WT="." 가 되어 CALLER_WT 와 달라 mismatch 분기로 들어가고,
+# `cd "."`(=호출자 worktree) 후 그 자리에서 재실행돼 **작업 worktree 안에서 발행**된다
+# (리뷰 지적) — 그래서 git 명령의 rc 와 출력값을 직접 검증한다. stderr 도 가리지 않는다
+# (2>/dev/null 제거) — 실패 시 git 의 원래 진단이 그대로 보여야 원인을 알 수 있다.
+_archive_git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir)" || {
+  printf 'archive: git-common-dir 조회 실패(git repo 외부이거나 --path-format 미지원 구버전 git) — 중단합니다.\n' >&2
+  exit 1
+}
+case "$_archive_git_common_dir" in
+  /*) ;;
+  *)
+    printf 'archive: git-common-dir 값이 절대경로가 아닙니다(%s) — git --version 확인 후 재실행하십시오.\n' "$_archive_git_common_dir" >&2
+    exit 1
+    ;;
+esac
+PUBLISH_WT="$(dirname "$_archive_git_common_dir")"
+CALLER_WT="$(git rev-parse --show-toplevel)" || {
   printf 'archive: git repo 외부에서 실행 불가\n' >&2; exit 1
 }
-if [[ "$MAIN_WT" != "$CURRENT_WT" ]]; then
-  DB="$(get_default_branch)"
-  printf 'archive: 기본 브랜치(%s) worktree에서만 호출 가능. 해당 worktree path: %s\n' "$DB" "$MAIN_WT" >&2; exit 1
+
+# 하위 디렉터리에서의 호출은 **명시적으로** 거부한다. `_state_common.sh` 가
+# `TASK_STATE_PATH` 를 source 시점의 `$PWD` 로 굳히므로(FR archive-cwd-dependent-state-path),
+# 여기서 그대로 진행하면 상태 파일이 하위 디렉터리 밑에 생긴다. 예전에는 metadata 를
+# 읽지 못해 "active fr 없음" 으로 **우연히** 조기 종료했지만, 대상 판정이 git 대조로
+# 정확해진 뒤(final diff review F2)로는 그 우연이 사라졌다 — 우연에 기대지 않고 막는다.
+# (재실행 자식은 기본 worktree 루트에서 시작하므로 이 검사를 그대로 통과한다.)
+_archive_cwd_real="$(pwd -P)"
+_archive_caller_real="$(cd "$CALLER_WT" && pwd -P)"
+if [[ "$_archive_cwd_real" != "$_archive_caller_real" ]]; then
+  printf 'archive: 저장소 루트에서 실행하십시오 — 하위 디렉터리 호출은 상태 파일을 그 자리에 만듭니다 (현재: %s).\n' "$_archive_cwd_real" >&2
+  printf '  실행: cd %q && bash rd-workflow/scripts/lifecycle/archive.sh\n' "$CALLER_WT" >&2
+  exit 1
 fi
+
+if [[ -z "${RD_ARCHIVE_REEXEC:-}" ]]; then
+  # 대상 확정 — Task 3 의 task_resolve_target 을 쓴다(판정 로직 복제 금지). read 모드다:
+  # 이 시점은 "누구를 발행할지" 만 정할 뿐 아직 아무것도 쓰지 않는다.
+  project_root="$CALLER_WT"
+  source "$SCRIPT_DIR/../_task_common.sh"
+
+  _tr_out=""
+  if ! _tr_out="$(task_resolve_target read "$TASK_SLUG_ARG")"; then
+    exit 1
+  fi
+  _tr_kind="${_tr_out%%$'\t'*}"
+  _tr_val="${_tr_out#*$'\t'}"
+
+  if [[ -n "$TASK_SLUG_ARG" ]]; then
+    # 명시 대상은 slug 자체가 곧 fr-branch 다 — 어느 worktree 의 파일도 읽지 않는다.
+    # 읽기 권위는 fr tip 이고 쓰기 위치는 발행 worktree 다 — 호출 위치는 둘 중
+    # 무엇도 아니므로 여기서 어떤 파일도 읽을 필요가 없다(spec D13).
+    [[ -z "$FR_BRANCH_OVERRIDE" ]] && FR_BRANCH_OVERRIDE="fr/${TASK_SLUG_ARG}"
+  elif [[ "$_tr_kind" == "ref" ]]; then
+    [[ -z "$FR_BRANCH_OVERRIDE" ]] && FR_BRANCH_OVERRIDE="$_tr_val"
+  elif [[ "$_tr_val" != "$CALLER_WT" ]]; then
+    # 색인이 CALLER_WT 가 아닌 다른 작업을 단일 대상으로 자동 선택했다 — 그 worktree
+    # 의 파일을 경로로 직접 읽는다(cd 로 옮겨가지 않는다 — 위 TASK_STATE_PATH 함정 회피).
+    [[ -z "$FR_BRANCH_OVERRIDE" ]] && FR_BRANCH_OVERRIDE="$(_archive_read_field_at "$_tr_val" fr-branch)"
+  fi
+  # 그 외(대상이 CALLER_WT 자기 자신) — FR_BRANCH_OVERRIDE 를 강제하지 않는다. 아래
+  # 기존 "FR identity source-of-truth" 블록이 CALLER_WT 에 바인딩된
+  # metadata_read_field 로 그대로 읽는다(기존 단일 worktree 사용자와 동일 경로).
+
+  if [[ "$CALLER_WT" != "$PUBLISH_WT" ]]; then
+    # 자기 자신을 archive 하는 가장 흔한 경우(자기 worktree 안에서 호출, --task 없음)
+    # 는 위에서 override 를 만들지 않았다 — cd 하기 전, 지금 CALLER_WT 에서 읽어 둔다.
+    if [[ -z "$FR_BRANCH_OVERRIDE" ]]; then
+      FR_BRANCH_OVERRIDE="$(metadata_read_field fr-branch)"
+    fi
+    # override 를 못 만들면 재실행하지 않는다. 그대로 넘기면 자식이 PUBLISH_WT 자신의
+    # baseline task-state(fr-branch=null)를 읽어 no-fr 모드로 들어가고, 기본 worktree 는
+    # 정의상 기본 브랜치 위에 있으므로 no-fr 의 안전 조건(§5.1)을 그냥 통과해
+    # **호출자의 작업이 아니라 main 자체를 발행**한다(리뷰 지적 — 빈 값이 baseline 의
+    # short-title=- 를 우연히 걸러내는 경우도 있었으나, fr-branch=null 이 그대로
+    # 넘어가면 그 우연조차 없다).
+    if [[ -z "$FR_BRANCH_OVERRIDE" ]]; then
+      printf 'archive: 대상 작업을 확정할 수 없습니다 — --task <slug> 로 지정하십시오.\n' >&2
+      exit 1
+    fi
+    # 호출자 override 가 자식으로 새지 않게 한다 — 새 프로세스가 PUBLISH_WT 기준으로
+    # 다시 바인딩해야 한다.
+    unset TASK_STATE_PATH STATE_MIGRATION_BACKUP_DIR
+
+    # bash 3.2 + set -u 에서 빈 배열의 "${arr[@]}" 는 unbound variable 다. 인자 없이
+    # 호출하는 것이 이 Task 의 대표 경로(작업 worktree 안에서 archive.sh 단독 호출)이므로
+    # 가드 없는 전개는 실사용에서 바로 죽는다.
+    _reexec_args=(${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"})
+    if [[ -n "$FR_BRANCH_OVERRIDE" ]]; then
+      _archive_has_fr_branch_opt=0
+      for _archive_reexec_a in ${_reexec_args[@]+"${_reexec_args[@]}"}; do
+        [[ "$_archive_reexec_a" == "--fr-branch" ]] && _archive_has_fr_branch_opt=1
+      done
+      [[ "$_archive_has_fr_branch_opt" -eq 0 ]] && _reexec_args+=(--fr-branch "$FR_BRANCH_OVERRIDE")
+    fi
+
+    # PUBLISH_WT 판정 자체가 틀렸을 가능성(구버전 git·예기치 못한 git-common-dir 형태)을
+    # 재실행 직전에 한 번 더 막는다 — 대상 스크립트가 없으면 잘못된 위치에서 재실행을
+    # 시도하는 대신 여기서 멈춘다(리뷰 지적).
+    if [[ ! -f "$PUBLISH_WT/rd-workflow/scripts/lifecycle/archive.sh" ]]; then
+      printf 'archive: 재실행 대상 스크립트를 찾을 수 없습니다: %s — 기본 worktree 판정이 잘못됐을 수 있습니다. 중단합니다.\n' \
+        "$PUBLISH_WT/rd-workflow/scripts/lifecycle/archive.sh" >&2
+      exit 1
+    fi
+    cd "$PUBLISH_WT" || exit 1   # ← 이것이 빠지면 위 TASK_STATE_PATH 문제가 그대로 남는다
+    RD_ARCHIVE_REEXEC=1 RD_ARCHIVE_CALLER_WT="$CALLER_WT" project_root="$PUBLISH_WT" \
+      bash "$PUBLISH_WT/rd-workflow/scripts/lifecycle/archive.sh" ${_reexec_args[@]+"${_reexec_args[@]}"}
+    exit $?
+  fi
+fi
+
+# 사전 검증 순서 (구현 시점 결정, 2026-09-05)
+#
+# FR identity 확정과 no-fr 실행 브랜치 검사를 Step 0 의 worktree 검사 **앞**에 둡니다.
+# 뒤에 두면 `get_main_worktree_path` 가 항상 먼저 실패해, no-fr 사용자가 detached HEAD 에서
+# `기본 브랜치 worktree 검출 실패` 라는 무관한 안내만 받고 무엇을 해야 하는지 알 수 없습니다
+# (change spec §5.1 이 정한 두 메시지가 도달 불가였습니다 — T4 구현 보고에서 드러났습니다).
+# 여기 있는 것은 전부 **읽기 전용 사전 검증**이라 발행 순서(one-shot 계약)와 무관합니다.
+
+# FR identity source-of-truth
+#
+# 여기서 실행 모드를 확정합니다 (change spec §5.1·§3.2.2).
+#   fr    — `fr/<slug>` 브랜치를 merge 해 발행하는 기존 경로
+#   no-fr — fr 브랜치 없이 기본 브랜치에서 직접 작업한 경우의 발행 경로
+#
+# 판정은 `rd_branch_mode`(_state_common.sh) **한 곳**에서만 합니다. "비어 있으면 no-fr" 로
+# 다루지 않는 것이 핵심입니다 — 필드가 유실된 파손 상태와 사용자가 명시한 no-fr 을
+# 구분하지 못하면 파손된 task-state 가 조용히 no-fr 발행으로 흘러갑니다. canonical no-fr
+# 표기는 `null` 하나뿐이고 빈 문자열·공백·`main` 등은 전부 malformed 로 막습니다.
+FR_BRANCH="$FR_BRANCH_OVERRIDE"
+if [[ -z "$FR_BRANCH" ]]; then
+  FR_BRANCH="$(metadata_read_field fr-branch)"
+fi
+if [[ -z "$FR_BRANCH" ]]; then
+  # 빈 값은 no-fr 이 아니라 "metadata 를 해석하지 못했다" 입니다 (파손·경로 오해석 포함).
+  printf 'archive: active fr 없음. promote.sh 호출 후 archive 가능합니다.\n' >&2
+  printf 'archive:   no-fr 모드는 task-state 의 fr-branch 가 canonical `null` 일 때만 진입합니다 — 빈 값은 파손으로 봅니다.\n' >&2
+  exit 1
+fi
+BRANCH_MODE=""
+BRANCH_MODE="$(rd_branch_mode "$FR_BRANCH")" || {
+  # rd_branch_mode 가 허용 표기를 stderr 로 이미 안내했습니다.
+  printf 'archive: fr-branch 값이 canonical 이 아니라 진행할 수 없습니다 — 중단합니다.\n' >&2
+  exit 1
+}
+
+# no-fr 실행 브랜치 안전 조건 (change spec §5.1)
+#
+# no-fr 모드는 merge 대상 브랜치가 없어 metadata cleanup commit·tag·push 를 **현재 checkout**
+# 에 그대로 수행합니다. 그래서 "어디에서 실행했는가" 가 곧 "무엇이 발행되는가" 입니다.
+# 이 지점은 위 Step -1 재실행 덕분에 항상 기본 worktree 입니다 — fr 모드는 merge 대상을
+# branch 이름(`$FR_BRANCH`)으로 참조하므로 어디에 체크아웃돼 있든 무관하지만, no-fr 은
+# 브랜치가 아예 없어 "이 프로세스의 현재 checkout" 자체가 발행 대상입니다.
+if [[ "$BRANCH_MODE" == "no-fr" ]]; then
+  NOFR_DEFAULT_BRANCH="$(get_default_branch)" || {
+    printf 'archive: 기본 브랜치 결정 실패 — no-fr 모드는 진행할 수 없습니다\n' >&2; exit 1
+  }
+  # detached HEAD 는 symbolic-ref 가 nonzero 이므로 여기서 갈립니다. 조용히 통과시키면
+  # 발행 대상 브랜치가 없는 채로 tag·push 가 나갑니다.
+  NOFR_CURRENT_BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)" || NOFR_CURRENT_BRANCH=""
+  if [[ -z "$NOFR_CURRENT_BRANCH" ]]; then
+    printf 'archive: detached HEAD 에서는 no-fr archive 를 할 수 없습니다 — 기본 브랜치로 전환 후 재실행하세요.\n' >&2
+    exit 1
+  fi
+  if [[ "$NOFR_CURRENT_BRANCH" != "$NOFR_DEFAULT_BRANCH" ]]; then
+    printf 'archive: no-fr 모드는 기본 브랜치(%s)에서만 호출 가능합니다 — 현재: %s. git switch %s 후 재실행하세요.\n' \
+      "$NOFR_DEFAULT_BRANCH" "$NOFR_CURRENT_BRANCH" "$NOFR_DEFAULT_BRANCH" >&2
+    exit 1
+  fi
+fi
+
+# Step 0 — 기본 worktree 확정
+# Step -1 이 이미 대상과 실행 위치를 확정했다 — 이 지점에 도달했다면 원래부터 기본
+# worktree 에서 호출됐거나(재실행 불필요) 방금 재실행된 자식 프로세스다. 두 경우 모두
+# 현재 위치는 PUBLISH_WT 와 같다.
+CURRENT_WT="$PUBLISH_WT"
 
 # Step 0 — clean state (unless --force-dirty)
 if [[ "$FORCE_DIRTY" -eq 0 ]]; then
@@ -37,16 +250,6 @@ if [[ "$FORCE_DIRTY" -eq 0 ]]; then
 elif ! ensure_worktree_clean; then
   printf 'archive: WARNING — dirty state 로 진행 (--force-dirty 는 이 clean 검사만 넘깁니다)\n' >&2
 fi
-
-# FR identity source-of-truth
-FR_BRANCH="$FR_BRANCH_OVERRIDE"
-if [[ -z "$FR_BRANCH" ]]; then
-  FR_BRANCH="$(metadata_read_field fr-branch)"
-fi
-if [[ -z "$FR_BRANCH" ]]; then
-  printf 'archive: active fr 없음. promote.sh 호출 후 archive 가능합니다.\n' >&2; exit 1
-fi
-[[ "$FR_BRANCH" == fr/* ]] || { printf 'archive: 잘못된 fr ref: %s\n' "$FR_BRANCH" >&2; exit 1; }
 
 # Override mismatch guard — override 가 active metadata 와 다르면 unrelated FR 정리/metadata 손상을 막기 위해 중단.
 if [[ -n "$FR_BRANCH_OVERRIDE" ]] && metadata_exists; then
@@ -59,8 +262,111 @@ if [[ -n "$FR_BRANCH_OVERRIDE" ]] && metadata_exists; then
   fi
 fi
 
-SLUG="${FR_BRANCH#fr/}"
-REMOTE_MODE="$(detect_remote_mode)"
+# SLUG — tag 이름(`fr/<날짜>/<slug>`)의 재료. tag 형식은 두 모드가 같습니다 (§5.1).
+#   fr    : 브랜치 이름이 곧 slug 입니다.
+#   no-fr : 브랜치가 없으므로 task-state `short-title` 을 정규화해 씁니다. baseline(`-`)이나
+#           비어 있는 short-title 은 normalize_slug 가 거부하므로 fail-closed 입니다 —
+#           이름을 임의로 지어내면 tag 가 어떤 작업의 것인지 추적할 수 없어집니다.
+if [[ "$BRANCH_MODE" == "no-fr" ]]; then
+  SLUG="$(normalize_slug "$(metadata_read_field short-title)")" || {
+    printf 'archive: no-fr 모드의 tag slug 를 task-state short-title 에서 만들 수 없습니다 — 중단합니다.\n' >&2
+    printf 'archive:   먼저 실행: bash rd-workflow/scripts/rd task set-title <제목>\n' >&2
+    exit 1
+  }
+else
+  SLUG="${FR_BRANCH#fr/}"
+fi
+
+# ---------------------------------------------------------------------------
+# 공유 락 — 여기서 **한 번** 잡고 스크립트가 끝날 때까지 쥔다 (final diff review F7).
+#
+# 예전에는 기동 상태 조회·색인 기록·행 삭제 세 군데에서 짧게 잡고 바로 놓았다. 그래서
+# Step 3 merge → Step 4 metadata cleanup → Step 6 publish 가 전부 락 밖이었고, 두
+# archive 가 각자 짧은 검사를 통과한 뒤 같은 기본 worktree 의 HEAD·index·상태 파일을
+# 동시에 바꿀 수 있었다. git 의 `index.lock` 은 한 명령 안에서만 유효해 **여러 명령에
+# 걸친** merge·정리·commit 을 직렬화하지 못한다. AC 13(promote·archive·rollback 배타)·
+# AC 14(점유 실패 호출은 자기 변경 없이 끝나고 점유자·사유·재시도 방법을 낸다).
+#
+# 위치의 근거:
+#   - **재실행 이후**여야 한다. 락 owner 파일에는 `$$` 가 적히고 `tasks_lock_release` 는
+#     `$$` 가 일치할 때만 지운다. archive 는 Step -1 에서 기본 worktree 로 **자식 bash
+#     프로세스를 재실행**하므로(`RD_ARCHIVE_REEXEC=1`), 부모가 잡은 락은 자식이 풀지
+#     못한다. 이 지점은 재실행이 끝난 뒤(또는 애초에 재실행이 불필요했던 프로세스)다.
+#   - **SLUG 확정 직후**여야 한다. 점유자 정보에 대상 slug 를 실어야 하고, 아직 아무것도
+#     바꾸지 않은 지점이어야 점유 실패가 곧 "자기 변경 없음" 이 된다.
+#
+# `tasks_lock_acquire` 는 **재진입하지 않는다** — 아래 기동 상태 조회·색인 기록·행 삭제는
+# 더 이상 각자 잡지 않는다(다시 잡으면 자기 자신과 교착한다).
+#
+# `--dry-run` 은 아무것도 바꾸지 않으므로 이 락을 요구하지 않는다. 진단 명령이 점유 때문에
+# 막히면 사용자가 진단 자체를 못 하기 때문이다(기존 dry-run 우회 주석과 같은 취지).
+# 읽기 경로(`tasks_index_get` 등)는 원래 락을 잡지 않으므로 조회에는 영향이 없다.
+ARCHIVE_LOCK_HELD=0
+_archive_on_exit() {
+  if [[ "${ARCHIVE_LOCK_HELD:-0}" -eq 1 ]]; then
+    tasks_lock_release || true
+    ARCHIVE_LOCK_HELD=0
+  fi
+  return 0
+}
+trap '_archive_on_exit' EXIT
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  if tasks_lock_acquire archive "$SLUG"; then
+    ARCHIVE_LOCK_HELD=1
+  else
+    _archive_lock_rc=$?
+    # 점유자(cmd·slug·started-at)는 `tasks_lock_acquire` 가 이미 stderr 로 냈다.
+    if [[ "$_archive_lock_rc" -eq 2 ]]; then
+      printf 'archive: 락 상태가 불확실합니다 — 위 stderr 안내(rm -rf 명령)로 다른 프로세스가 없음을 검증한 뒤 회수하고 재시도하십시오 (상태 변경 없음).\n' >&2
+    else
+      printf 'archive: 다른 lifecycle 명령이 실행 중입니다 — 위 점유자 정보를 확인하고 끝난 뒤 재시도하십시오 (상태 변경 없음).\n' >&2
+      printf 'archive:   재시도: 같은 명령을 그대로 다시 실행하십시오. 취소하려면 아무것도 하지 않아도 됩니다(이 호출은 아무 변경도 남기지 않았습니다).\n' >&2
+    fi
+    exit 1
+  fi
+fi
+
+# launching(또는 unknown) 예약 중인 작업은 발행하지 않는다 (spec D7·plan 1076행).
+#   promote.sh 는 worktree·브랜치·색인 등록을 마친 뒤 launch=launching + launch-token 을
+#   기록하고 **락을 풀고 나서** 세션을 기동한다 — 그 구간은 락이 잡혀 있지 않아 다른
+#   명령이 자유롭게 들어온다. 그 창에서 archive 가 merge·tag·push·worktree 정리까지
+#   마치면, 방금 기동한 세션이 이미 정리된 worktree 를 넘겨받는다(promote_rollback.sh
+#   에서 같은 구멍이 실제 Critical 로 확인됐다 — archive 는 발행까지 하므로 더 위험).
+#   판정은 **락 안에서** 한다(promote.sh 610행 부근과 같은 패턴) — 대상 확정 직후,
+#   merge 등 실제 발행 동작보다 앞이어야 TOCTOU 창이 좁아진다.
+#   `unknown` 은 legacy 이관 행·probe 조회 불가 상태를 나타내는 **실제 저장값**이다
+#   (promote.sh 471·474·605행) — `none`(기동 시도 없음)과 다르다. `none`·`ok`·`failed`·
+#   빈 값(색인에 행이 없는 legacy 단일 worktree 사용)은 발행을 막지 않는다.
+# dry-run 은 이 가드를 우회한다(경고만 내고 통과) — 가드의 목적은 "무변경 중단" 인데
+# dry-run 은 애초에 아무것도 바꾸지 않는다. 오히려 tasks_list.sh 가 「⚠ 발행 확인 필요」
+# 진단 명령으로 안내하는 바로 그 `archive.sh --dry-run` 이 이 가드에 막히면(리뷰 지적)
+# 사용자가 진단 자체를 할 수 없게 된다.
+# 락은 이미 위에서 잡았다(dry-run 은 잡지 않는다 — 읽기는 원래 락이 필요 없다).
+if [[ "$BRANCH_MODE" == "fr" ]]; then
+  _archive_launch_state="$(tasks_index_get "$SLUG" launch 2>/dev/null)" || _archive_launch_state=""
+  case "$_archive_launch_state" in
+    launching|unknown)
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf 'archive: WARNING — %s 작업이 기동 확인 대기 상태입니다(launch=%s) — dry-run 이라 계속 진행합니다. 실제 발행은 이 상태에서 거부됩니다.\n' "$SLUG" "$_archive_launch_state" >&2
+        printf 'archive:   확인: bash rd-workflow/scripts/rd task resolve-launch %s\n' "$SLUG" >&2
+      else
+        printf 'archive: %s 작업이 기동 확인 대기 상태입니다(launch=%s) — 발행하지 않습니다.\n' "$SLUG" "$_archive_launch_state" >&2
+        printf 'archive:   확인: bash rd-workflow/scripts/rd task resolve-launch %s\n' "$SLUG" >&2
+        printf 'archive:   herdr 로 조회할 수 없는 환경이면: bash rd-workflow/scripts/rd task resolve-launch %s --assume-ended\n' "$SLUG" >&2
+        exit 1
+      fi
+      ;;
+  esac
+fi
+
+# REMOTE_MODE_RAW — --no-remote 로 덮기 **전** 의 실제 원격 유무. tasks_list.sh 는
+# --no-remote 라는 archive.sh 전용 플래그를 모르고 항상 detect_remote_mode() 로만
+# 판정하므로(:40), 발행 기록(D8)의 tasks_publish_evidence 재확인도 같은 값을 써야 두
+# 판정이 일치한다. REMOTE_MODE(override 반영)는 실제 push/원격 ref 삭제 등 이 스크립트
+# 자신의 동작 분기에 계속 쓴다 — 그 부분은 --no-remote 의도대로 로컬만 처리해야 한다.
+REMOTE_MODE_RAW="$(detect_remote_mode)"
+REMOTE_MODE="$REMOTE_MODE_RAW"
 [[ "$NO_REMOTE" -eq 1 ]] && REMOTE_MODE="local-only"
 
 # remote tag preflight (hard-stop on fetch failure)
@@ -72,16 +378,27 @@ if [[ "$REMOTE_MODE" == "remote" ]]; then
 fi
 
 # Rerun 안전망 — fr branch 부재 + 동일 slug tag 존재 = 이미 archive 완료
-if ! git rev-parse --verify "$FR_BRANCH" >/dev/null 2>&1; then
-  EXISTING_TAG="$(git tag --list "fr/*/$SLUG" 2>/dev/null | head -1)"
-  if [[ -n "$EXISTING_TAG" ]]; then
-    printf 'archive: 이미 archive 완료 — nothing to do (tag=%s)\n' "$EXISTING_TAG"
-    exit 0
+#
+# 이 판정의 축은 "fr 브랜치가 사라졌는가" 이므로 fr 모드 전용입니다. no-fr 모드에는 브랜치가
+# 애초에 없어 조건이 항상 참이 되고, 같은 slug 로 두 번째 작업을 하면 첫 tag 만 보고
+# "이미 완료" 로 조기 종료합니다. no-fr 의 재실행 멱등성은 Step 5 의 `--points-at $PUBLISH_OID`
+# tag 재사용이 담당합니다 (같은 커밋이면 tag 를 새로 만들지 않습니다).
+if [[ "$BRANCH_MODE" == "fr" ]]; then
+  if ! git rev-parse --verify "$FR_BRANCH" >/dev/null 2>&1; then
+    EXISTING_TAG="$(git tag --list "fr/*/$SLUG" 2>/dev/null | head -1)"
+    if [[ -n "$EXISTING_TAG" ]]; then
+      printf 'archive: 이미 archive 완료 — nothing to do (tag=%s)\n' "$EXISTING_TAG"
+      exit 0
+    fi
+    printf 'archive: branch %s 미존재\n' "$FR_BRANCH" >&2; exit 1
   fi
-  printf 'archive: branch %s 미존재\n' "$FR_BRANCH" >&2; exit 1
 fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
+  if [[ "$BRANCH_MODE" == "no-fr" ]]; then
+    printf 'would archive: no-fr 모드, 브랜치=%s slug=%s (tag는 cleanup commit 부착 후 결정)\n' \
+      "$NOFR_CURRENT_BRANCH" "$SLUG"; exit 0
+  fi
   printf 'would archive: branch=%s (tag는 cleanup commit 부착 후 결정)\n' "$FR_BRANCH"; exit 0
 fi
 
@@ -93,18 +410,61 @@ AUDIT_LOG="$CURRENT_WT/rd-workflow-workspace/.lifecycle/review-skip-audit.log"
 archive_review_precheck "$FORCE_SKIP_REVIEW" "$SKIP_REASON" "$SLUG" "$AUDIT_LOG" "$FR_BRANCH" || exit 1
 
 # Step 2 — archive content 휴리스틱 (warning만)
-LAST_COMMIT_FILES="$(git log -1 "$FR_BRANCH" --name-only --pretty=format: 2>/dev/null || true)"
+# no-fr 모드에는 fr tip 이 없으므로 같은 휴리스틱을 현재 HEAD 의 마지막 커밋에 적용합니다.
+# 경고일 뿐이라 판정을 바꾸지 않지만, "아카이브 내용을 커밋하지 않았다" 는 흔한 실수는
+# 두 모드에서 똑같이 일어나므로 no-fr 이라고 알림을 없애지 않습니다.
+if [[ "$BRANCH_MODE" == "no-fr" ]]; then
+  LAST_COMMIT_REF="HEAD"
+else
+  LAST_COMMIT_REF="$FR_BRANCH"
+fi
+LAST_COMMIT_FILES="$(git log -1 "$LAST_COMMIT_REF" --name-only --pretty=format: 2>/dev/null || true)"
 if ! grep -qE '(^|/)(REQUEST\.md|CURRENT_TASK\.md|FUTURE_REQUESTS\.md|request-archive/.*\.md)' <<<"$LAST_COMMIT_FILES"; then
-  printf 'archive: WARNING — fr branch 마지막 commit 에 archive content 미감지\n' >&2
+  printf 'archive: WARNING — %s 마지막 commit 에 archive content 미감지\n' "$LAST_COMMIT_REF" >&2
 fi
 
 # Step 3 — merge (idempotent)
-if git merge-base --is-ancestor "$FR_BRANCH" HEAD 2>/dev/null; then
+# no-fr 모드는 합칠 브랜치가 없습니다 — 작업 커밋이 이미 기본 브랜치 위에 있습니다 (§5.1).
+if [[ "$BRANCH_MODE" == "no-fr" ]]; then
+  printf 'archive: no-fr 모드 — merge 대상 브랜치가 없어 merge 를 건너뜁니다\n'
+elif git merge-base --is-ancestor "$FR_BRANCH" HEAD 2>/dev/null; then
   printf 'archive: %s 이미 merge 됨 — skip\n' "$FR_BRANCH"
 else
-  git merge --no-ff "$FR_BRANCH" -m "merge: $SLUG (autopilot 완료)" || {
-    printf 'archive: merge 실패 — conflict resolve 후 재실행\n' >&2; exit 1
-  }
+  if ! git merge --no-ff "$FR_BRANCH" -m "merge: $SLUG (autopilot 완료)"; then
+    # FUTURE_REQUESTS.md 단독 충돌은 행 집합 3-way 병합으로 해결한다 (spec D7).
+    #   등록 커밋이 기본 브랜치에 먼저 쌓이는 구조에서 fr 브랜치와 기본 브랜치가 표 끝에 서로 다른 행을
+    #   append 하면 git 줄 병합은 반드시 충돌한다. 인덱스는 제목을 키로 하는 행 집합이므로 집합 병합이 맞다.
+    #   다른 경로가 함께 충돌하거나 집합 병합도 실패하면 종전대로 사람이 해결한다 (충돌 상태 유지).
+    _IDX="rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
+    _conf="$(git diff --name-only --diff-filter=U 2>/dev/null)"
+    if [[ "$_conf" == "$_IDX" ]]; then
+      _mb="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+      [[ -n "$_mb" && -f "$_mb" ]] || { echo "archive: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+      _mo="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+      [[ -n "$_mo" && -f "$_mo" ]] || { echo "archive: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+      _mt="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+      [[ -n "$_mt" && -f "$_mt" ]] || { echo "archive: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+      _mr="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+      [[ -n "$_mr" && -f "$_mr" ]] || { echo "archive: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+      # 정리 확인: 아래 `rm -f "$_mb" "$_mo" "$_mt" "$_mr"` 는 전부 위 네 가드를 통과한 뒤에만
+      # 도달하는 분기(성공 경로 :206·:211, 실패 경로 :208·:213) 안에 있다. 가드가 막히면
+      # exit 1 로 즉시 빠지므로 미생성 변수를 rm 하는 경로가 없다 — 조치 불필요.
+      if git show ":1:$_IDX" > "$_mb" 2>/dev/null && git show ":2:$_IDX" > "$_mo" 2>/dev/null && git show ":3:$_IDX" > "$_mt" 2>/dev/null \
+         && bash "$SCRIPT_DIR/merge_fr_index.sh" "$_mb" "$_mo" "$_mt" > "$_mr"; then
+        cp "$_mr" "$_IDX" && git add "$_IDX" || { rm -f "$_mb" "$_mo" "$_mt" "$_mr"; printf 'archive: 인덱스 병합 결과 반영 실패 — git status 로 확인 후 수동 resolve 하고 git commit --no-edit, 또는 git merge --abort\n' >&2; exit 1; }
+        _nv=""; if lifecycle_needs_hook_bypass; then _nv="--no-verify"; fi
+        RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit ${_nv:+"$_nv"} --no-edit -m "merge: $SLUG (autopilot 완료)" >/dev/null || { rm -f "$_mb" "$_mo" "$_mt" "$_mr"; printf 'archive: 인덱스 충돌은 해결했으나 merge 커밋이 실패했습니다. git status 로 확인한 뒤 git commit --no-edit 으로 merge 를 마치고 archive.sh 를 재실행하거나, git merge --abort 로 되돌리십시오\n' >&2; exit 1; }
+        [[ -n "$_nv" ]] && lifecycle_notify_hook_bypass archive
+        printf 'archive: FUTURE_REQUESTS.md 충돌을 행 집합 병합으로 해결했습니다 (merge_fr_index.sh)\n'
+        rm -f "$_mb" "$_mo" "$_mt" "$_mr"
+      else
+        rm -f "$_mb" "$_mo" "$_mt" "$_mr"
+        printf 'archive: merge 실패 — FUTURE_REQUESTS.md 행 집합 병합도 실패했습니다. conflict resolve 후 재실행\n' >&2; exit 1
+      fi
+    else
+      printf 'archive: merge 실패 — conflict resolve 후 재실행\n' >&2; exit 1
+    fi
+  fi
 fi
 
 # 순서 불변식: 판정 base 는 반드시 merge 완료 "이후" 에 캡처한다.
@@ -124,9 +484,20 @@ MERGE_BASE_COMMIT="$(git rev-parse HEAD)" || {
 #
 # **이 판정은 근사다.** 커밋의 출처를 구분하지 못하므로 최종 판단은 Step 4.5 의 내용
 # 검증이 내린다. 여기 두는 이유는 빠른 실패다.
+#
+# **이 검사군(3.6·4.5)은 fr 모드 전용입니다.** 기준선의 정의가 "fr tip 을 들여온 merge"
+# 이므로 no-fr 에는 대응물이 없습니다. base-commit 을 기준선으로 대신 쓸 수도 없습니다 —
+# no-fr 에서 base-commit..HEAD 사이 커밋은 정리 대상이 아니라 **작업 그 자체**여서,
+# 허용 경로 밖 변경으로 판정되어 정상 아카이브를 통째로 막습니다.
+# no-fr 에서 "리뷰된 대상이 그대로 발행되는가" 는 seal 의 보호 트리 해시 비교가
+# 담당합니다 (§2·§3.3.1 — archive_review_precheck 가 이미 위에서 돌았습니다).
 BASELINE_OID=""
 _bl_rc=0
-BASELINE_OID="$(archive_baseline_commit "$CURRENT_WT" "$FR_BRANCH" "$MERGE_BASE_COMMIT")" || _bl_rc=$?
+if [[ "$BRANCH_MODE" == "fr" ]]; then
+  BASELINE_OID="$(archive_baseline_commit "$CURRENT_WT" "$FR_BRANCH" "$MERGE_BASE_COMMIT")" || _bl_rc=$?
+else
+  printf 'archive: no-fr 모드 — 기준선 기반 얹힌 커밋 검사를 건너뜁니다 (리뷰 대상 동일성은 seal 이 보증합니다)\n'
+fi
 if [[ "$_bl_rc" -eq 2 ]]; then
   printf 'archive: 기준선 판정에 필요한 git 명령이 실패했습니다 — 무엇이 얹혔는지 알 수 없어 중단합니다\n' >&2
   archive_block_notice "$FR_BRANCH" "$CURRENT_WT" unknown
@@ -139,7 +510,9 @@ elif [[ "$_bl_rc" -ne 0 ]]; then
 fi
 
 _ec_rc=0
-archive_extra_commits_check "$CURRENT_WT" "$BASELINE_OID" "$MERGE_BASE_COMMIT" || _ec_rc=$?
+if [[ "$BRANCH_MODE" == "fr" ]]; then
+  archive_extra_commits_check "$CURRENT_WT" "$BASELINE_OID" "$MERGE_BASE_COMMIT" || _ec_rc=$?
+fi
 if [[ "$_ec_rc" -eq 2 ]]; then
   printf 'archive: 얹힌 커밋 판정에 필요한 git 명령이 실패했습니다 — 중단합니다\n' >&2
   archive_block_notice "$FR_BRANCH" "$CURRENT_WT" unknown
@@ -154,7 +527,13 @@ fi
 # 그 결과를 확인한다. 아카이브가 같은 검증을 다시 돌려 얻는 것은 없었고 매번 15~20분을 썼다.
 
 # Step 4 — metadata cleanup commit on main (publish 전)
-if metadata_exists; then
+#
+# no-fr 모드에서는 `metadata_exists` 가 거짓입니다 (fr-branch 가 canonical `null` 이므로).
+# 그런데 이 블록은 fr 필드 정리만 하는 것이 아니라 **작업 상태 전체를 baseline 으로
+# 되돌리는 자리**입니다 (status·short-title·base-commit·review-session·CURRENT_TASK.md).
+# 조건을 그대로 두면 no-fr 작업이 끝난 뒤에도 완료된 작업이 진행 중으로 남아, 다음 세션이
+# 끝난 일을 남은 일로 안내받습니다. 그래서 no-fr 을 명시적으로 함께 태웁니다 (§5.1 "유지").
+if metadata_exists || [[ "$BRANCH_MODE" == "no-fr" ]]; then
   # LC-14 대칭: archive 완료 시 미러(CURRENT_TASK.md)와 권위(task-state)를 함께 baseline 으로
   # 되돌린다 (promote_rollback.sh:82,98 과 동일 패턴). 권위만 되돌리면 완료된 작업 내용이
   # 진입점 문서에 남아 다음 세션이 끝난 일을 남은 일로 안내받는다.
@@ -255,7 +634,11 @@ fi
 # 이어야 검사와 발행 사이의 경쟁 창이 닫힌다 (REQUEST review Turn 004 Finding 2).
 PUBLISH_OID="$(git rev-parse HEAD)" || {
   printf 'archive: 발행 후보 commit 결정 실패 — 중단\n' >&2
-  archive_block_notice "$FR_BRANCH" "$CURRENT_WT" unknown
+  # archive_block_notice 의 복구 절차는 "fr 브랜치에서 다시 만들라" 를 전제하므로
+  # no-fr 에서는 성립하지 않습니다. 사유는 위 한 줄로 이미 나갔습니다.
+  if [[ "$BRANCH_MODE" == "fr" ]]; then
+    archive_block_notice "$FR_BRANCH" "$CURRENT_WT" unknown
+  fi
   exit 1
 }
 
@@ -263,7 +646,9 @@ PUBLISH_OID="$(git rev-parse HEAD)" || {
 # 전진했을 수 있고, Step 4 의 metadata 커밋도 이 시점에는 얹힌 커밋에 포함된다
 # (허용 경로만 담으므로 자연히 통과한다).
 _ec2_rc=0
-archive_extra_commits_check "$CURRENT_WT" "$BASELINE_OID" "$PUBLISH_OID" || _ec2_rc=$?
+if [[ "$BRANCH_MODE" == "fr" ]]; then
+  archive_extra_commits_check "$CURRENT_WT" "$BASELINE_OID" "$PUBLISH_OID" || _ec2_rc=$?
+fi
 if [[ "$_ec2_rc" -eq 2 ]]; then
   printf 'archive: 발행 전 얹힌 커밋 판정에 필요한 git 명령이 실패했습니다 — 중단합니다\n' >&2
   archive_block_notice "$FR_BRANCH" "$CURRENT_WT" unknown
@@ -276,7 +661,9 @@ fi
 # 최종 판단 — 허용 경로 파일의 **내용**이 실제로 baseline 인가.
 # 경로 판정만으로는 사람이 만든 metadata-only 커밋의 내용이 남는 것을 막지 못한다.
 _pc_rc=0
-archive_publish_content_check "$CURRENT_WT" "$BASELINE_OID" "$PUBLISH_OID" || _pc_rc=$?
+if [[ "$BRANCH_MODE" == "fr" ]]; then
+  archive_publish_content_check "$CURRENT_WT" "$BASELINE_OID" "$PUBLISH_OID" || _pc_rc=$?
+fi
 if [[ "$_pc_rc" -eq 2 ]]; then
   # rc 2 는 git 실행 오류와 **허용 경로 목록 생성 실패**를 함께 담는다 — 둘 다 "검사
   # 자체가 불가능" 이며, 파일 내용을 되돌려서 해결되는 상태가 아니다. 그래서 사유를
@@ -287,6 +674,39 @@ if [[ "$_pc_rc" -eq 2 ]]; then
 elif [[ "$_pc_rc" -ne 0 ]]; then
   archive_block_notice "$FR_BRANCH" "$CURRENT_WT" content
   exit 1
+fi
+
+# Step 4.6 — 발행 직전 재결속 (no-fr 전용)
+#
+# precheck(`archive_review_precheck`) 는 **cleanup commit 이전의 commit** 을 봅니다. 그 뒤
+# metadata cleanup commit 이 붙고 `PUBLISH_OID` 가 확정되는데, 그 사이에 다른 프로세스나
+# hook 이 보호 경로 변경 커밋으로 HEAD 를 전진시키면 cleanup commit 이 그 커밋을 부모로
+# 삼거나 `PUBLISH_OID` 가 그 커밋을 가리킵니다. tag/push 는 OID 에 잘 결속되어 있지만
+# **그 OID 자체가 리뷰되지 않은 코드를 담게 됩니다.** 그래서 precheck 가 승인한 보호 트리
+# 해시를 실제 발행 대상의 해시와 여기서 한 번 더 대조합니다.
+#
+# **fr 모드는 대상이 아닙니다.** fr 의 발행 트리는 fr tip 의 트리와 원래 같지 않습니다
+# (기본 브랜치에 정당하게 먼저 들어온 다른 작업이 merge 로 합쳐집니다). 같은 대조를 걸면
+# 정상 아카이브가 통째로 막힙니다. fr 에서 이 창을 닫는 것은 위 Step 4.5 의
+# `archive_extra_commits_check`·`archive_publish_content_check` 이며, 둘 다
+# `BASELINE_OID..PUBLISH_OID`(= merge 이후 전진분 전체) 를 보므로 precheck 이후에 얹힌
+# 커밋을 이미 잡습니다. 여기 중복해서 넣지 않습니다.
+#
+# 우회(`--force-skip-review-check`) 로 통과한 경우에는 승인된 해시 자체가 없습니다. 대조할
+# 기준이 없어 건너뛰되 무엇을 확인하지 못했는지 알립니다 — 우회 사실 자체는 precheck 가
+# 이미 audit log 와 경고로 남겼습니다.
+if [[ "$BRANCH_MODE" == "no-fr" ]]; then
+  if [[ -z "${RD_ARCHIVE_REVIEWED_TREE_HASH:-}" ]]; then
+    printf 'archive: WARNING — 승인된 보호 트리 해시가 없어 발행 대상 재대조를 건너뜁니다 (review 검증 우회)\n' >&2
+  else
+    _rb_rc=0
+    archive_publish_rebind_check "$RD_ARCHIVE_REVIEWED_TREE_HASH" "$PUBLISH_OID" || _rb_rc=$?
+    if [[ "$_rb_rc" -ne 0 ]]; then
+      printf 'archive:   미검토 코드를 발행하지 않기 위해 tag/push 전에 중단합니다.\n' >&2
+      printf 'archive:   git log 로 늘어난 커밋을 확인해 되돌리거나, 재리뷰(prepare_review_pipeline.sh diff → rd review seal) 후 다시 실행하십시오.\n' >&2
+      exit 1
+    fi
+  fi
 fi
 
 # Step 5 — Tag (HEAD = cleanup commit, rerun reuse)
@@ -478,6 +898,48 @@ git_supports_lease() {  # git >= 1.8.5 이면 0. 미지원·판정 불능이면 
   [[ "$patch" -ge 5 ]]
 }
 
+# ---------------------------------------------------------------------------
+# 발행 기록 — 색인 행을 지우지 않고 state=cleanup-pending 을 남긴다 (spec D8).
+#   즉시 tasks_index_remove 로 지우면, 아직 살아 있는 worktree(예: skipped-self)를
+#   --rebuild 가 다시 "진행 중" 으로 재구성하고, 그 뒤 그 worktree 에서 새 커밋이
+#   쌓이면 동적 발행 증거 판정(tasks_publish_evidence)이 in-progress 로 되돌아가
+#   이미 발행된 작업이 목록에 되살아난다. 행을 남겨 두면 tasks_list.sh 가 이 필드를
+#   보고 dynamic 판정 없이 무조건 "정리 대기" 로 고정해 보여준다.
+#   락 획득 실패는 발행 자체를 되돌리지 않는다(이미 끝난 core 산출물) — 경고만 남긴다.
+#   no-fr 모드는 tasks_index 대상이 아니므로 건드리지 않는다.
+# ---------------------------------------------------------------------------
+if [[ "$BRANCH_MODE" == "fr" ]]; then
+  # tasks_publish_evidence 가 단일 출처다 — 그냥 기록하면 --no-remote(로컬만 완료,
+  # 원격 미반영)에서도 "정리 대기" 가 영구히 고정돼 tasks_list.sh 의 needs-verify
+  # (⚠ 발행 확인 필요) 경로를 조용히 지운다(리뷰 지적).
+  # **REMOTE_MODE 가 아니라 REMOTE_MODE_RAW 를 쓴다.** REMOTE_MODE 는 --no-remote 로
+  # local-only 로 덮여 있을 수 있는데, tasks_list.sh 는 --no-remote 라는 archive.sh
+  # 전용 플래그를 모르고 항상 detect_remote_mode() 로만 판정한다(:40). origin 이 있는
+  # 저장소에서 --no-remote 로 마감하면 이 재확인이 remote_mode="local-only" 로 원격
+  # 검사를 건너뛰어 merge+tag 만으로 cleanup-pending 을 내고, tasks_list.sh 는
+  # remote_mode="remote" 로 「⚠ 발행 확인 필요」를 내야 할 상황을 놓친다(2차 리뷰 지적).
+  _archive_publish_default_branch="$(get_default_branch 2>/dev/null)" || _archive_publish_default_branch=""
+  _archive_publish_fr_tip="$(git rev-parse --verify --quiet "$FR_BRANCH" 2>/dev/null)" || _archive_publish_fr_tip=""
+  _archive_publish_evidence=""
+  if [[ -n "$_archive_publish_default_branch" && -n "$_archive_publish_fr_tip" ]]; then
+    _archive_publish_evidence="$(tasks_publish_evidence "$SLUG" "$_archive_publish_fr_tip" "$_archive_publish_default_branch" "$REMOTE_MODE_RAW")"
+  fi
+  if [[ "$_archive_publish_evidence" == "cleanup-pending" ]]; then
+    # 락은 이 스크립트 시작 지점에서 이미 쥐고 있다 (F7) — 다시 잡으면 자기 자신과 교착한다.
+    tasks_index_upsert "$SLUG" \
+      "state=cleanup-pending" \
+      "published-at=$(date -u '+%Y-%m-%d-%H%M')" \
+      "publish-tag=$TARGET_TAG" \
+      || printf 'archive: WARNING — tasks 색인 갱신 실패(state=cleanup-pending) — rd task list 가 이 작업을 정리 대기로 보여주지 못할 수 있습니다\n' >&2
+  else
+    # 증거가 아직 cleanup-pending 이 아니다(예: --no-remote 로 원격 미반영, 또는 판정
+    # 불가) — 정적 기록을 남기지 않는다. tasks_list.sh 는 이 slug 를 dynamic
+    # tasks_publish_evidence 로 계속 판정해 needs-verify(⚠ 발행 확인 필요) 를 정확히
+    # 보여준다. 여기서 "state=cleanup-pending" 을 써 버리면 그 판정을 영구히 덮는다.
+    printf 'archive: 색인에 정리 대기 기록을 남기지 않았습니다(발행 증거=%s) — rd task list 는 dynamic 판정으로 보여줍니다.\n' "${_archive_publish_evidence:-판정불가}"
+  fi
+fi
+
 # Step 7 — Worktree teardown (post-success cleanup)
 #
 # 안전 불변식: "정리를 마친 뒤 다시 조회했을 때 fr 브랜치를 체크아웃한 worktree 등록이 0건" 일 때만
@@ -514,7 +976,9 @@ wt_owns_fr_branch() {  # wt_owns_fr_branch <path> — 0 = 대상 브랜치의 wo
 }
 
 WT_COUNT_BEFORE=""
-if ! WT_COUNT_BEFORE="$(wt_match_count)"; then
+if [[ "$BRANCH_MODE" == "no-fr" ]]; then
+  : # no-fr — 정리할 fr worktree 가 없습니다 (WORKTREE_PENDING 은 0 을 유지합니다)
+elif ! WT_COUNT_BEFORE="$(wt_match_count)"; then
   WORKTREE_PENDING=1
   safety_violation "worktree" "$FR_BRANCH" \
     "worktree 등록 조회 실패 — 로컬 ref 삭제의 선행 조건을 판정할 수 없어 삭제하지 않았습니다" \
@@ -542,6 +1006,22 @@ elif [[ "$WT_COUNT_BEFORE" -gt 0 ]]; then
       # 대상이 실제로 남아 있다면 아래 (d) 재조회가 잡아 pending 으로 만든다.
       printf 'archive: %s 는 %s 의 worktree 루트가 아님 — 제거 건너뜀\n' "$fr_wt" "$FR_BRANCH" >&2
       continue
+    fi
+    # skipped-self — 제거 대상이 이 archive 를 호출한(re-exec 이전) worktree 면 지우지
+    # 않는다. RD_ARCHIVE_CALLER_WT 는 재실행 때만 설정된다(spec D5) — 재실행이 없었으면
+    # (원래부터 기본 worktree 에서 호출) 이 분기는 적용되지 않는다. 아래 (d) 재조회가
+    # 이 worktree 를 여전히 등록된 것으로 보고 WORKTREE_PENDING 을 자연히 세운다 —
+    # 로컬 branch 삭제(Step 8)도 그 값으로 함께 막힌다.
+    if [[ -n "${RD_ARCHIVE_CALLER_WT:-}" ]]; then
+      _archive_caller_norm="$(cd "$RD_ARCHIVE_CALLER_WT" 2>/dev/null && pwd -P)" || _archive_caller_norm="$RD_ARCHIVE_CALLER_WT"
+      _archive_frwt_norm="$(cd "$fr_wt" 2>/dev/null && pwd -P)" || _archive_frwt_norm="$fr_wt"
+      if [[ "$_archive_frwt_norm" == "$_archive_caller_norm" ]]; then
+        printf 'archive: %s 는 이 archive 를 호출한 worktree 라 제거하지 않습니다 — 기본 worktree 에서 정리하십시오\n' "$fr_wt" >&2
+        cleanup_add "worktree" "$fr_wt" \
+          "실행 중인 worktree(호출자)라 이 프로세스에서 제거하지 않았습니다. 기본 worktree 에서 정리하십시오" \
+          "git -C $(printf '%q' "$PUBLISH_WT") worktree remove $(printf '%q' "$fr_wt")"
+        continue
+      fi
     fi
     if ! git worktree remove "$fr_wt"; then
       printf 'archive: worktree remove %s 실패 — 정리 잔여로 기록\n' "$fr_wt" >&2
@@ -573,7 +1053,9 @@ fi
 # git branch -d 는 upstream 이 설정된 브랜치를 "HEAD 기준" 이 아니라 "upstream 기준" 으로 판정한다.
 # 이 워크플로는 fr 을 매 커밋마다 push 하지 않으므로 local fr tip > origin/fr tip 이 정상 상태이고,
 # 그 정상 상태가 오판정되어 실패했다. 판정을 MERGE_BASE_COMMIT 기준 ancestor 검사로 바꾼다.
-if [[ "$WORKTREE_PENDING" -eq 1 ]]; then
+if [[ "$BRANCH_MODE" == "no-fr" ]]; then
+  : # no-fr — 삭제할 fr 로컬 브랜치가 없습니다
+elif [[ "$WORKTREE_PENDING" -eq 1 ]]; then
   # update-ref -d 는 branch -d 와 달리 "다른 worktree 가 체크아웃 중인 브랜치" 보호가 없다.
   # worktree 가 남았거나 목록 판정이 불가능한 상태에서 ref 를 지우면 그 worktree 가
   # broken HEAD 가 되므로 시도하지 않는다.
@@ -641,7 +1123,8 @@ else
 fi
 
 # Step 9 — Remote branch delete (검증 → lease 삭제)
-if [[ "$REMOTE_MODE" == "remote" ]]; then
+# no-fr 모드에는 삭제할 원격 fr 브랜치가 없습니다 (기본 브랜치 push 는 Step 6 에서 끝났습니다).
+if [[ "$BRANCH_MODE" == "fr" && "$REMOTE_MODE" == "remote" ]]; then
   FRQ="$(printf '%q' "$FR_BRANCH")"
   if [[ "$SAFETY_VIOLATION" -eq 1 ]]; then
     # 안전 불변식 위반이 이미 감지되면 뒤따르는 ref 삭제를 건너뛴다.
@@ -702,6 +1185,16 @@ if [[ "$REMOTE_MODE" == "remote" ]]; then
       fi
     fi
   fi
+fi
+
+# 정리가 완전히 끝났을 때만 색인 행을 지운다 (spec D8) — 부분 정리(예: skipped-self)
+# 상태에서 지우면 state=cleanup-pending 표시가 사라지고, 다음 --rebuild 가 아직 살아
+# 있는 worktree/branch 를 다시 "진행 중" 으로 재구성한다. 락 획득 실패는 조용한 경고로
+# 남긴다 — 정리 완료 자체(worktree·branch 제거)는 이미 끝난 뒤라 되돌릴 것이 없다.
+if [[ "$BRANCH_MODE" == "fr" && "$WORKTREE_PENDING" -eq 0 && "$SAFETY_VIOLATION" -eq 0 ]]; then
+  # 락은 이 스크립트가 계속 쥐고 있다 (F7) — 종료 trap 이 해제한다.
+  tasks_index_remove "$SLUG" \
+    || printf 'archive: WARNING — 정리 완료 후 색인 행 제거 실패 — rd task list 에 완료된 작업이 남아 보일 수 있습니다\n' >&2
 fi
 
 # ---- 정리 잔여 요약 (stdout) ----

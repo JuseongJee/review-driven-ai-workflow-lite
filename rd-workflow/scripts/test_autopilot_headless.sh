@@ -6,7 +6,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WRAPPER="${SCRIPT_DIR}/autopilot_headless.sh"
-TMP="$(mktemp -d)"
+TMP="$(mktemp -d)" || { echo "test_autopilot_headless.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$TMP" && -d "$TMP" ]] || { echo "test_autopilot_headless.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 
 FAIL=0

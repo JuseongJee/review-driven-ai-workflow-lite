@@ -1,0 +1,37 @@
+#EXPECT: ok template-match
+  ok_var="$(mktemp -d)" || { echo "sample_ok: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$ok_var" && -d "$ok_var" ]] || { echo "sample_ok: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+#EXPECT: violation or-typo
+  v1="$(mktemp -d)" || { echo "v1: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+  [[ -n "$v1" || -d "$v1" ]] || { echo "v1: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+#EXPECT: violation empty-allowed
+  v2="$(mktemp -d)" || { echo "v2: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+  [[ -z "$v2" || -d "$v2" ]] || { echo "v2: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+#EXPECT: violation handler-removed
+  v3="$(mktemp -d)"
+  [[ -n "$v3" && -d "$v3" ]] || { echo "v3: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+#EXPECT: violation decl-combined
+  local v4="$(mktemp -d)" || { echo "v4: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+  [[ -n "$v4" && -d "$v4" ]] || { echo "v4: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+#EXPECT: violation use-before-verify
+  v5="$(mktemp -d)" || { echo "v5: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+  mkdir -p "$v5/early"
+  [[ -n "$v5" && -d "$v5" ]] || { echo "v5: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+#EXPECT: violation zero-terminator
+  v6="$(mktemp -d)" || { echo "v6: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 0; }
+  [[ -n "$v6" && -d "$v6" ]] || { echo "v6: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 0; }
+#EXPECT: violation command-prefix
+  v7="$(command mktemp -d)" || { echo "v7: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+  [[ -n "$v7" && -d "$v7" ]] || { echo "v7: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+#EXPECT: violation echo-substitution
+  echo "$(mktemp -d)"
+#EXPECT: violation escaped-substitution
+  echo "\$(mktemp -d)"
+#EXPECT: violation bare-use
+  cd "$(mktemp -d)"
+#EXPECT: violation escape-then-bare-then-subst
+  echo "\$(noop"; mktemp -d; echo "$(date)"
+#EXPECT: non-candidate comment-line
+#  nc_a="$(mktemp -d)" || { echo "nc_a: x" >&2; exit 1; }
+#EXPECT: non-candidate declared-literal-marker
+  echo "    TMP_WT=\"\$(mktemp -d)/fix\"" >&2   # mktemp-scan: literal

@@ -98,7 +98,7 @@ command -v gemini &>/dev/null && echo "gemini: 설치됨" || echo "gemini: 없�
 
 ```text
 "이 요구사항으로 진행해줘: ..."        # 큰 작업
-"small-task로 바로 작성해줘: ..."     # 작은 작업
+"바로 작성해줘: ..."     # AI 가 등급 판정
 ```
 
 자세한 사용법은 `WORKING_WITH_AI.md`를 참조하세요.

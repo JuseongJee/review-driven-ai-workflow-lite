@@ -14,7 +14,8 @@ eq()   { # eq <실제> <기대> <라벨>
   if [ "$1" = "$2" ]; then pass "$3"; else fail "$3 (기대=[$2] 실제=[$1])"; fi
 }
 
-TMP="$(mktemp -d)"
+TMP="$(mktemp -d)" || { echo "test_review_effort_override.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$TMP" && -d "$TMP" ]] || { echo "test_review_effort_override.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
@@ -112,6 +113,61 @@ eq "$bc_out" "5" "AC9 Review Scope 가 뒤따라도 Branch Context 는 5필드�
   validate_branch_context "$TMP/bc" >/dev/null 2>&1 )
 chk $? "AC9 Branch Context strict 검증이 새 섹션과 공존해도 통과"
 eq "$(ep "$TMP/bc/SESSION.md")" "small-task" "AC8 두 섹션 공존 시 execution-path 정상 판정"
+
+# ============================================================
+# 1b) REQUEST `## Risk Tier` → execution-path 매핑 (review-tiering-by-risk AC 9) — _state_common.sh
+#     케이스마다 파서의 다른 분기 하나를 잡는다. 기대값 `unknown` 은 stderr 경고까지 확인한다.
+# ============================================================
+echo "=== Risk Tier 판독 ==="
+mkdir -p "$TMP/rt"
+rtfix() { # rtfix <이름> <Execution Path 값> <Risk Tier 블록 (빈 값이면 섹션 없음)> [<Source FR 뒤 추가 줄>]
+  { printf '# Change Request\n\n## Execution Path\n%s\n\n' "$2"
+    [ -n "$3" ] && printf '## Risk Tier\n%s\n\n' "$3"
+    printf '## Source FR\n-\n%s\n' "${4:-}"; } > "$TMP/rt/$1.md"
+}
+rtfix standard  existing-code-change '- 최종 등급: standard
+- 최초 등급: standard'
+rtfix full      existing-code-change '- 최종 등급: full'
+rtfix absent    small-task           ''
+rtfix nofield   small-task           '- 최초 등급: standard'
+rtfix dupempty  existing-code-change '- 최종 등급: standard
+- 최종 등급:'
+rtfix duphdr    existing-code-change '- 최종 등급: full
+
+## Risk Tier'
+rtfix template  existing-code-change '- 최종 등급: -'
+rtfix badcase   existing-code-change '- 최종 등급: Standard'
+rtfix nextsect  existing-code-change '- 최초 등급: full' '- 최종 등급: full'
+rtfix comment   existing-code-change '- 최종 등급: standard            <!-- light | standard | full -->'
+
+# rtx <fixture> → "값|warn|nowarn"
+rtx() { ( source "${script_dir}/_state_common.sh" 2>/dev/null; set +e
+  v="$(review_execution_path_from_request "$TMP/rt/$1.md" 2>"$TMP/rt/$1.err")"
+  if grep -q 'Risk Tier' "$TMP/rt/$1.err"; then w=warn; else w=nowarn; fi
+  printf '%s|%s' "$v" "$w" ); }
+while IFS='|' read -r name v w label; do
+  eq "$(rtx "$name")" "$v|$w" "RT $label"
+done <<'RT_TABLE'
+standard|small-task|nowarn|standard → small-task
+full|other|nowarn|full → other
+absent|small-task|nowarn|헤더 부재 → Execution Path fallback
+nofield|unknown|warn|헤더 있음 + 줄 없음 → unknown+경고
+dupempty|unknown|warn|유효 1줄 + 빈 값 1줄 → unknown+경고 (필드 계수)
+duphdr|unknown|warn|헤더 2개 → unknown+경고
+template|unknown|warn|템플릿 값 - → unknown+경고
+badcase|unknown|warn|미인식 값 Standard → unknown+경고
+nextsect|unknown|warn|다음 섹션의 최종 등급 줄은 무시 → unknown+경고
+comment|small-task|nowarn|inline comment 붙은 standard → small-task
+RT_TABLE
+
+# prepare_review_pipeline.sh 연결 정적 단언 — 함수 테스트는 호출 한 줄과 heredoc 기록의 회귀를 보지 못한다.
+PREP="${script_dir}/prepare_review_pipeline.sh"
+grep -qF 'CTX_EXEC_PATH="$(review_execution_path_from_request "${project_root}/REQUEST.md")"' "$PREP"
+chk $? "RT prepare 가 review_execution_path_from_request 결과를 CTX_EXEC_PATH 에 대입"
+grep -qF -- '- execution-path: $CTX_EXEC_PATH' "$PREP"
+chk $? "RT prepare 가 CTX_EXEC_PATH 를 execution-path 로 기록"
+! grep -q '/\^## Execution Path/' "$PREP"
+chk $? "RT prepare 에 옛 inline Execution Path 판정이 남아 있지 않음"
 
 # ============================================================
 # 2) 가시성 상태 5종 (AC 23) — compute_effort_status

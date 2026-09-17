@@ -22,13 +22,16 @@ git archive --remote=<template_repo> HEAD rd-workflow/VERSION 2>/dev/null | tar 
 실패하면 shallow clone으로 fallback:
 
 ```bash
-TMPDIR=$(mktemp -d)
-git clone --depth 1 <template_repo> "$TMPDIR" 2>/dev/null
-cat "$TMPDIR/rd-workflow/VERSION"
-rm -rf "$TMPDIR"
+tpl_tmp="$(mktemp -d)" || { echo "tpl status: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$tpl_tmp" && -d "$tpl_tmp" ]] || { echo "tpl status: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+git clone --depth 1 <template_repo> "$tpl_tmp" 2>/dev/null
+cat "$tpl_tmp/rd-workflow/VERSION"
+[[ -n "$tpl_tmp" ]] && rm -rf "$tpl_tmp"
 ```
 
 둘 다 실패하면 "원격 버전을 확인할 수 없습니다" 출력 후 로컬 버전만 표시.
+
+(위 fallback 이 임시 디렉터리를 만들지 못해 비영 종료하는 경우도 "실패" 에 포함된다.)
 
 ### 3. 출력
 

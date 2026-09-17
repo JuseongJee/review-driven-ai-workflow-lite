@@ -6,7 +6,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRAIN="${SCRIPT_DIR}/ralph_drain.sh"
 
-TMP="$(mktemp -d)"
+TMP="$(mktemp -d)" || { echo "test_ralph_drain.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$TMP" && -d "$TMP" ]] || { echo "test_ralph_drain.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 
 # exit code 시퀀스를 반환하는 stub wrapper. 호출마다 counter 파일로 다음 코드를 낸다.
@@ -36,7 +37,13 @@ run_case() {
   local counter="${TMP}/counter"; : > "$counter"
   local outcome="${TMP}/outcome"; : > "$outcome"
   local out ec
-  out=$(env "$@" \
+  # ralph_drain.sh 가 소비하는 변수 중 부모 셸에서 새어들 수 있는 것을 지워 케이스를
+  # 부모 환경과 무관하게 만든다. 아래 고정 대입이 덮는 RD_AUTOPILOT_OUTCOME_FILE·
+  # RD_RALPH_WRAPPER_CMD 는 대상이 아니다. PATH 등은 유지해야 하므로 env -i 는 쓰지 않는다.
+  # 주의: BSD/macOS env 는 옵션을 환경 대입보다 **앞**에 두어야 한다 (test_review_wait.sh probe() 와 동일).
+  #       -u 를 "$@" 앞에 두므로, 호출부가 이 변수를 의도적으로 넘기면 그 대입이 이긴다.
+  out=$(env -u RD_AUTOPILOT_FR -u RD_AUTOPILOT_MODE -u RD_FINISH_POLICY \
+        -u RD_RALPH_MAX_ITER -u RD_RALPH_NONPROGRESS_LIMIT "$@" \
         RD_STUB_CODES="$codes" RD_STUB_COUNTER="$counter" \
         RD_AUTOPILOT_OUTCOME_FILE="$outcome" \
         RD_RALPH_WRAPPER_CMD="bash $STUB" \

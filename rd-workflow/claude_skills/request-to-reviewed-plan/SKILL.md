@@ -1,10 +1,11 @@
 ---
 name: request-to-reviewed-plan
 description: Run REQUEST review, write spec or change spec and plan, and run spec / plan review until the task is ready for implementation. Requires an existing REQUEST.md written by /planning-design-intake (for free-text requirements) or by FR promotion. Use for new features and non-trivial existing code changes.
-disable-model-invocation: true
 ---
 
 # Request To Reviewed Plan
+
+`manual` 모드에서는 사용자의 단계 진입 지시 없이 이 skill 을 스스로 시작하지 않는다. 판정 기준은 `rd-workflow/docs/flows/AUTONOMY.md` 의 「실행 모드와 skill 호출 권한」 절이다.
 
 **이 skill 은 이미 작성된 `REQUEST.md` 를 입력으로 한다** (FR 승격 또는 `/planning-design-intake` 가 만든 REQUEST).
 **새 자유 텍스트 큰 작업은 `/planning-design-intake` 를 먼저 거쳐야 한다.**
@@ -49,6 +50,8 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
 ## Step 0. FR 승격 3-way 분기 (skill 진입 직후, 캡처 전)
 
 **FR 승격 진입 감지:** `REQUEST.md`의 `Source FR` 필드 또는 사용자 입력에서 source FR이 명시된 경우.
+
+**승격 직후 이 guard 호출은 정상 경로다** — 같은 작업의 재진입에서는 `proceed-readonly` 가 기대 결과이며(순위 2·4 판정), 이는 오판이 아니다. 이 호출을 생략하지 않는다.
 
 승격 진입이 감지되면:
 
@@ -108,8 +111,9 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
 
 - Keep the original scope. Do not widen the request.
 - Ask only when a missing fact is required to create `REQUEST.md` or to choose the execution path safely.
-- 사용자가 명시적으로 `small-task`로 지정한 경우에만 spec / plan 흐름을 중단하고 `/small-task-implement`를 추천한다. AI가 자체적으로 small-task로 재분류하지 않는다.
+- 이 skill 은 `full` 등급 경로다. 진행 중 `standard` 로 보이면 하향을 **제안**만 하고 사용자가 지시할 때만 `/small-task-implement` 로 넘긴다 (하향은 사용자만 — WORKFLOW.md 위험 등급 절). 지시가 있으면 `REQUEST.md ## Risk Tier` 이력에 기록한다.
 - If `Execution Path` is `existing-code-change` or `new-feature-or-large-task`, continue through request review, spec or change spec, plan, and spec / plan review.
+- REQUEST review 세션을 만들기 전에 `REQUEST.md ## Risk Tier` 6항목을 즉시 채운다 — `- 최종 등급: full`(이 skill 의 경로는 `full`), 최초 등급, baseline HEAD(`git rev-parse HEAD`), 근거 신호, override·상향 이력, 변경 파일 요약. `-` 로 두면 `prepare_review_pipeline.sh` 가 malformed 경고를 낸다.
 - Use `bash rd-workflow/scripts/prepare_review_pipeline.sh request` and `bash rd-workflow/scripts/run_review_turn.sh ...` for `REQUEST` review.
 - Use `bash rd-workflow/scripts/prepare_review_pipeline.sh spec-plan` or the explicit spec / plan paths plus `bash rd-workflow/scripts/run_review_turn.sh ...` for spec / plan review.
 - **Superpowers가 사용 가능하면 반드시 `brainstorming`과 `writing-plans`를 사용한다.** 사용 불가능할 때만 같은 산출물을 직접 작성한다.

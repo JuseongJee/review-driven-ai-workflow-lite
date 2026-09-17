@@ -6,7 +6,15 @@
 #
 #   (1) blocked 서술이 없는 구형 FUTURE_REQUESTS.md + 인덱스 항목 1건
 #   (2) 설치본 레이아웃 (<proj>/rd-workflow/scripts)
-#   (3) rd-workflow/config/workflow.json 부재
+#   (3) rd-workflow/config/workflow.json 부재 — fixture 는 config 부재로 시작하고,
+#       sync 5단계가 배포본을 둡니다 (절차 뒤에는 이 경로가 존재합니다)
+#
+# 이어서 **경로 보존 시나리오 셋**을 같은 clone 으로 추가 검증합니다. 보존 목록
+# (sync_template.md 2단계) 의 workflow.json 은 경로가 이미 있으면 내용도 경로 자체도
+# 손대지 않아야 하며, 이것이 깨지면 사용자의 명시적 `manual` opt-out 이 조용히 지워집니다.
+#   (A) 기존 regular file  -> byte-for-byte 동일
+#   (B) dangling symlink   -> 링크 자체 보존 (`-e` 만 보면 "부재" 로 오판해 덮어씁니다)
+#   (C) 유효 symlink       -> 링크 정체성 + target 내용 보존 (역참조 덮어쓰기 방지)
 #
 # 절차는 sync_template.md 의 단계 순서를 그대로 따른다:
 #   1단계 sync_template.sh(clone) -> 4단계 마이그레이션 -> 5단계 복사 -> 5.1 -> 6단계 검증
@@ -72,22 +80,76 @@ check() { # $1 설명  $2 실제  $3 기대
   else echo "  FAIL $1 (got='$2' want='$3')"; fail=1; fi
 }
 
+# JSON 문자열 값 하나를 읽습니다. `jq` 를 요구하지 않으려고 이 저장소의 다른 스크립트
+# (`defect_reports.sh` 의 `cfg_upstream`) 와 같은 `sed` 방식을 씁니다. 파일이 없으면
+# 빈 문자열이 나오고, 그 자체가 판정에 쓰입니다.
+json_str_value() { # $1=파일  $2=키
+  [[ -f "$1" ]] || return 0
+  sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -1
+}
+
+# 5.1 이 추가한 `defect_report_upstream` 줄만 걷어낸 결과를 출력합니다. 그 결과가 5단계
+# 직후 사본과 byte 로 같으면 「5.1 이 그 키 하나만 추가했고 나머지 줄은 손대지 않았다」가
+# 증명됩니다 (값·형식·들여쓰기·키 순서 전부 포함).
+strip_upstream_line() { # $1=파일
+  grep -v '"defect_report_upstream"' "$1"
+}
+
+# 5.1 절(`defect_reports.sh set-upstream`)을 프로젝트 디렉터리에서 실행합니다.
+# 실사용 sync 절차는 5단계 복사 뒤에 반드시 이 절을 돌리므로, 보존 시나리오도 여기까지
+# 통과해야 「보존됐다」고 말할 수 있습니다.
+run_step51() { # $1=proj  $2=로그 파일
+  ( cd "$1" && bash rd-workflow/scripts/defect_reports.sh set-upstream \
+      "https://github.com/example/repo" ) > "$2" 2>&1
+}
+
 # 디렉터리 내용을 대상에 병합 복사한다 (cp -R 의 "이미 있으면 안으로 넣기" 함정 회피).
 copy_into() { # $1=src dir  $2=dst dir
   mkdir -p "$2"
   ( cd "$1" && tar cf - . ) | ( cd "$2" && tar xf - )
 }
 
+# sync_template.md 5단계(복사·신규 추가)를 모사합니다. 2단계 보존 목록 중
+# `rd-workflow/config/workflow.json` 은 **경로가 이미 있으면 내용도 경로 자체도
+# 손대지 않습니다.** 「있으면」의 판정은 `[ -e ] || [ -L ]` 입니다 — dangling symlink 는
+# `-e` 가 거짓이므로 `-L` 을 함께 보지 않으면 "부재" 로 오판해 배포본으로 덮어씁니다.
+# 보존은 링크를 따라가지 않는 `mv` 로 옮겼다가 되돌리는 방식이라, 유효 symlink 도
+# 역참조되지 않고 링크 정체성과 target 내용이 그대로 남습니다.
+sync_copy_step() { # $1=clone  $2=proj  (실패하면 1 을 반환합니다)
+  local clone="$1" proj="$2" base rc=0
+  local cfg="$proj/rd-workflow/config/workflow.json" saved=""
+  if [ -e "$cfg" ] || [ -L "$cfg" ]; then
+    saved="$proj/rd-workflow/config/.workflow.json.preserve.$$"
+    if ! mv "$cfg" "$saved"; then
+      echo "  보존 대상 대피 실패: $cfg" >&2; rc=1; saved=""
+    fi
+  fi
+  for base in $(cd "$clone" && ls -A | grep -v '^\.git$'); do
+    if [[ -d "$clone/$base" ]]; then
+      if ! copy_into "$clone/$base" "$proj/$base"; then
+        echo "  복사 실패(디렉터리): $base" >&2; rc=1
+      fi
+    else
+      if ! cp "$clone/$base" "$proj/$base"; then
+        echo "  복사 실패(파일): $base" >&2; rc=1
+      fi
+    fi
+  done
+  if [[ -n "$saved" ]]; then
+    rm -f "$cfg"
+    if ! mv "$saved" "$cfg"; then
+      echo "  보존 대상 복원 실패: $cfg" >&2; rc=1
+    fi
+  fi
+  return $rc
+}
+
 # 임시 작업 디렉터리는 **경로를 파생하기 전에** fail-closed 로 확정한다.
-# `set -e` 를 쓰지 않는 스크립트이므로 `mktemp` 가 실패해도 멈추지 않고, 그러면 WORK 가 빈
-# 문자열이 되어 REMOTE=/remote · PROJ=/proj 로 계산된다. 권한이 있는 CI·컨테이너에서는
-# 루트 바로 아래에 실제 파일을 만들면서도 trap 은 빈 경로만 받아 정리하지 못한다.
-WORK="$(mktemp -d 2>/dev/null)" || WORK=""
-if [[ -z "$WORK" || ! -d "$WORK" ]]; then
-  echo "acceptance_sync_once: 임시 작업 디렉터리 생성 실패 — 경로를 파생하지 않고 중단합니다." >&2
-  echo "  mktemp -d 가 실패했습니다 (TMPDIR='${TMPDIR:-}')." >&2
-  exit 1
-fi
+# 실패하면 WORK 가 빈 문자열이 되어 REMOTE=/remote · PROJ=/proj 로 계산되고, 권한이 있는
+# CI·컨테이너에서는 루트 바로 아래에 실제 파일을 만들면서도 trap 은 빈 경로만 받아
+# 정리하지 못한다. 형태는 전 지점 공통 템플릿을 따른다.
+WORK="$(mktemp -d)" || { echo "acceptance_sync_once: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$WORK" && -d "$WORK" ]] || { echo "acceptance_sync_once: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
 REMOTE="$WORK/remote"
 PROJ="$WORK/proj"
@@ -111,7 +173,8 @@ cp "$DIST_ROOT/rd-workflow/scripts/test_fr_blocked_status.sh" "$PROJ/rd-workflow
 copy_into "$DIST_ROOT/rd-workflow/claude_skills" "$PROJ/rd-workflow/claude_skills"
 printf '2026-01-01-000000
 ' > "$PROJ/rd-workflow/VERSION"
-# (3) workflow.json 을 두지 않는다 (config 디렉터리도 만들지 않는다)
+# (3) workflow.json 을 두지 않습니다 (config 디렉터리도 만들지 않습니다).
+#     config 없는 기존 프로젝트가 바로 이 시나리오이며, sync 5단계가 배포본을 둡니다.
 
 # (1) 구형 정의 문구
 cat > "$PROJ/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md" <<'FR'
@@ -212,17 +275,7 @@ copy_failed=0
 if ! cp "$PROJ/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md" "$WORK/preserve_FR.md"; then
   echo "  보존 대상 백업 실패" >&2; copy_failed=1
 fi
-for base in $(cd "$CLONE" && ls -A | grep -v '^\.git$'); do
-  if [[ -d "$CLONE/$base" ]]; then
-    if ! copy_into "$CLONE/$base" "$PROJ/$base"; then
-      echo "  복사 실패(디렉터리): $base" >&2; copy_failed=1
-    fi
-  else
-    if ! cp "$CLONE/$base" "$PROJ/$base"; then
-      echo "  복사 실패(파일): $base" >&2; copy_failed=1
-    fi
-  fi
-done
+sync_copy_step "$CLONE" "$PROJ" || copy_failed=1
 if ! cp "$WORK/preserve_FR.md" "$PROJ/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"; then
   echo "  보존 대상 복원 실패" >&2; copy_failed=1
 fi
@@ -237,13 +290,19 @@ check "루트 CLAUDE.md 존재" \
   "$( [ -f "$PROJ/CLAUDE.md" ] && echo yes || echo no )" "yes"
 check "보존 대상 FUTURE_REQUESTS.md 가 덮이지 않음 (M009 결과 유지)" \
   "$(grep -c '^- `blocked`:' "$PROJ/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md")" "1"
+check "sync 5단계가 workflow.json 을 배포함" \
+  "$( [ -f "$PROJ/rd-workflow/config/workflow.json" ] && echo yes || echo no )" "yes"
+check "배포된 workflow.json 의 default_execution_mode" \
+  "$(json_str_value "$PROJ/rd-workflow/config/workflow.json" default_execution_mode)" "semi-auto"
 
-echo "== 5.1: defect_report_upstream (config 부재) =="
+echo "== 5.1: defect_report_upstream (sync 가 배포한 config) =="
 ( cd "$PROJ" && bash rd-workflow/scripts/defect_reports.sh set-upstream \
     "https://github.com/example/repo" ) > "$WORK/up.out" 2>&1
 check "5.1 set-upstream 종료코드 0" "$?" "0"
-check "5.1 이 config 를 만들지 않음" \
-  "$( [ -e "$PROJ/rd-workflow/config/workflow.json" ] && echo exists || echo absent )" "absent"
+check "5.1 이 defect_report_upstream 을 canonical 값으로 넣음" \
+  "$(json_str_value "$PROJ/rd-workflow/config/workflow.json" defect_report_upstream)" "example/repo"
+check "5.1 이후에도 default_execution_mode 가 유지됨" \
+  "$(json_str_value "$PROJ/rd-workflow/config/workflow.json" default_execution_mode)" "semi-auto"
 
 echo "== 6단계: 직후 self_test consumer =="
 # 여기까지 sync 절차 밖에서 fixture 를 손댄 명령이 없다 = 중간 수동 교정 없음
@@ -257,6 +316,121 @@ fi
 check "인덱스 항목 보존" \
   "$(grep -c '^| 2026-01-01 | sample-item |' \
       "$PROJ/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md")" "1"
+
+echo "== 보존 시나리오 A: 기존 workflow.json (regular file) =="
+# 사용자의 명시적 `manual` opt-out 이 조용히 지워지는 것이 이 변경 최대의 위험이므로,
+# 값이 아니라 **byte** 를 비교합니다 — 「값은 맞는데 형식이 다시 쓰였다」도
+# 「내용을 읽지도 고치지도 않는다」 계약 위반입니다. 그래서 fixture 에 다른 사용자 키·
+# 고유한 들여쓰기·다른 키 순서를 함께 둡니다.
+KEEP="$WORK/proj_keep"
+mkdir -p "$KEEP/rd-workflow/config"
+cat > "$KEEP/rd-workflow/config/workflow.json" <<'KEEPJSON'
+{
+      "review_tools_profile": "local",
+  "default_execution_mode": "manual",
+        "default_branch": "main"
+}
+KEEPJSON
+cp "$KEEP/rd-workflow/config/workflow.json" "$WORK/keep_before.json"
+sync_copy_step "$CLONE" "$KEEP"
+check "A 복사 종료코드 0" "$?" "0"
+check "A 기존 config 가 byte-for-byte 동일" \
+  "$( cmp -s "$WORK/keep_before.json" "$KEEP/rd-workflow/config/workflow.json" \
+        && echo same || echo differ )" "same"
+
+# 5단계에서 멈추면 실사용과 다릅니다 — sync 는 이어서 5.1 을 돌리고, 그 절이 같은 경로를
+# 씁니다. 여기서부터는 「byte 동일」이 아니라 「경로 종류·기존 줄 유지 + 그 키만 추가」가
+# 계약입니다.
+run_step51 "$KEEP" "$WORK/keep_up.out"
+check "A 5.1 종료코드 0" "$?" "0"
+check "A 5.1 후에도 regular file" \
+  "$( [ -f "$KEEP/rd-workflow/config/workflow.json" ] \
+      && [ ! -L "$KEEP/rd-workflow/config/workflow.json" ] && echo yes || echo no )" "yes"
+check "A 5.1 이 defect_report_upstream 을 넣음" \
+  "$(json_str_value "$KEEP/rd-workflow/config/workflow.json" defect_report_upstream)" "example/repo"
+check "A 5.1 후 default_execution_mode 가 manual 그대로" \
+  "$(json_str_value "$KEEP/rd-workflow/config/workflow.json" default_execution_mode)" "manual"
+check "A 5.1 후 사용자 키 review_tools_profile 생존" \
+  "$(json_str_value "$KEEP/rd-workflow/config/workflow.json" review_tools_profile)" "local"
+check "A 5.1 후 사용자 키 default_branch 생존" \
+  "$(json_str_value "$KEEP/rd-workflow/config/workflow.json" default_branch)" "main"
+strip_upstream_line "$KEEP/rd-workflow/config/workflow.json" > "$WORK/keep_after_stripped.json"
+check "A 5.1 이 추가한 것이 defect_report_upstream 줄뿐" \
+  "$( cmp -s "$WORK/keep_before.json" "$WORK/keep_after_stripped.json" \
+        && echo same || echo differ )" "same"
+
+echo "== 보존 시나리오 B: dangling symlink =="
+# `-e` 만 보면 "부재" 로 오판해 경로를 배포본(regular file)으로 덮어씁니다. 그러면
+# 사용자의 링크가 사라지고, 판정 불가(manual)여야 할 상태가 조용히 semi-auto 로 올라갑니다.
+DANG="$WORK/proj_dangling"
+DANG_TARGET="../../../dotfiles-not-mounted/workflow.json"
+mkdir -p "$DANG/rd-workflow/config"
+ln -s "$DANG_TARGET" "$DANG/rd-workflow/config/workflow.json"
+sync_copy_step "$CLONE" "$DANG"
+check "B 복사 종료코드 0" "$?" "0"
+check "B 경로가 여전히 symlink" \
+  "$( [ -L "$DANG/rd-workflow/config/workflow.json" ] && echo yes || echo no )" "yes"
+check "B 링크 대상이 그대로" \
+  "$(readlink "$DANG/rd-workflow/config/workflow.json")" "$DANG_TARGET"
+
+# 5.1 은 `[ -f ]` 검사에서 걸러져(dangling 은 거짓) 아무것도 쓰지 않고 종료 0 이어야 합니다.
+# 여기서 파일을 만들어 버리면 링크가 실체를 얻어, 마운트되면 나타날 사용자 설정을 가립니다.
+run_step51 "$DANG" "$WORK/dang_up.out"
+check "B 5.1 종료코드 0" "$?" "0"
+check "B 5.1 후에도 dangling symlink" \
+  "$( [ -L "$DANG/rd-workflow/config/workflow.json" ] \
+      && [ ! -e "$DANG/rd-workflow/config/workflow.json" ] && echo yes || echo no )" "yes"
+check "B 5.1 후 링크 대상이 그대로" \
+  "$(readlink "$DANG/rd-workflow/config/workflow.json")" "$DANG_TARGET"
+
+echo "== 보존 시나리오 C: 유효 symlink =="
+# B 와 중복이 아닙니다 — B 는 `-L` 누락(경로가 새 파일로 바뀜)을, C 는 sync 가 링크를
+# **역참조해 target 내용을 덮는** 결함을 잡습니다. 후자는 target 이 없는 B 에서는
+# 일어날 수 없습니다. (`readlink -f` 등 GNU 전용 옵션은 쓰지 않습니다 — 대상은 macOS 입니다.)
+LNK="$WORK/proj_symlink"
+LNK_TARGET="../../dotfiles/workflow.json"
+mkdir -p "$LNK/rd-workflow/config" "$LNK/dotfiles"
+cat > "$LNK/dotfiles/workflow.json" <<'LNKJSON'
+{
+        "default_branch": "main",
+  "default_execution_mode": "manual",
+    "review_tools_profile": "local"
+}
+LNKJSON
+cp "$LNK/dotfiles/workflow.json" "$WORK/symlink_target_before.json"
+ln -s "$LNK_TARGET" "$LNK/rd-workflow/config/workflow.json"
+sync_copy_step "$CLONE" "$LNK"
+check "C 복사 종료코드 0" "$?" "0"
+check "C 경로가 여전히 symlink" \
+  "$( [ -L "$LNK/rd-workflow/config/workflow.json" ] && echo yes || echo no )" "yes"
+check "C 링크 대상이 그대로" \
+  "$(readlink "$LNK/rd-workflow/config/workflow.json")" "$LNK_TARGET"
+check "C target 파일 내용이 그대로" \
+  "$( cmp -s "$WORK/symlink_target_before.json" "$LNK/dotfiles/workflow.json" \
+        && echo same || echo differ )" "same"
+
+# 5.1 은 이 경로를 실제로 씁니다(`[ -f ]` 가 링크를 따라가 참). 링크를 regular file 로
+# 갈아치우지 않고 **최종 referent 를 해석해 그 옆에 만든 임시 파일을 원자 교체**해야 사용자의
+# 링크와 원본이 모두 남습니다. 링크를 통해 내용을 흘려보내면(`> 링크경로`) 쓰기 도중 실패했을
+# 때 원본이 부분 훼손되므로 그 방식은 쓰지 않습니다.
+run_step51 "$LNK" "$WORK/lnk_up.out"
+check "C 5.1 종료코드 0" "$?" "0"
+check "C 5.1 후에도 symlink" \
+  "$( [ -L "$LNK/rd-workflow/config/workflow.json" ] && echo yes || echo no )" "yes"
+check "C 5.1 후 링크 대상이 그대로" \
+  "$(readlink "$LNK/rd-workflow/config/workflow.json")" "$LNK_TARGET"
+check "C 5.1 후 target 파일이 살아 있음" \
+  "$( [ -f "$LNK/dotfiles/workflow.json" ] && echo yes || echo no )" "yes"
+check "C 5.1 이 defect_report_upstream 을 넣음" \
+  "$(json_str_value "$LNK/dotfiles/workflow.json" defect_report_upstream)" "example/repo"
+check "C 5.1 후 default_execution_mode 가 manual 그대로" \
+  "$(json_str_value "$LNK/dotfiles/workflow.json" default_execution_mode)" "manual"
+check "C 5.1 후 사용자 키 review_tools_profile 생존" \
+  "$(json_str_value "$LNK/dotfiles/workflow.json" review_tools_profile)" "local"
+strip_upstream_line "$LNK/dotfiles/workflow.json" > "$WORK/symlink_target_after_stripped.json"
+check "C 5.1 이 추가한 것이 defect_report_upstream 줄뿐" \
+  "$( cmp -s "$WORK/symlink_target_before.json" "$WORK/symlink_target_after_stripped.json" \
+        && echo same || echo differ )" "same"
 
 # 임시 clone 정리 — 삭제 직전에 조건을 다시 확인한다. 이 지점에 오기까지 clone 부모의
 # 내용은 바뀌지 않지만(5단계는 clone 에서 읽기만 한다), 재귀 삭제 앞에서 존재 여부만 보고

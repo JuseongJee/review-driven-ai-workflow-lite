@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 # Temp repo 기반 통합 테스트 — promote / archive / rollback / hook의 git state transition 자동 검증
 set -euo pipefail
+
+# herdr pane 안에서 돌면 HERDR_ENV=1 이 하위 프로세스로 그대로 상속되어, 임시 저장소의
+# promote 가 **사용자의 실제 herdr 에 pane 을 만든다**. 이 스위트는 임시 저장소만 건드린다는
+# 전제로 돌므로, 기동 경로는 환경에서 원천 차단한다(2026-09 사고: 테스트가 실제 pane 을 생성).
+#   - HERDR_ENV= : session_launch 의 herdr 환경 판정 자체를 끈다.
+#   - RD_CHILD_SESSION=1 : 이미 자식 세션이라는 깊이-1 제한 경로로 보내 기동을 거부한다.
+# 둘 다 두는 이유는 어느 한쪽 판정이 바뀌어도 차단이 남게 하기 위해서다.
+export HERDR_ENV=
+export RD_CHILD_SESSION=1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # canonical(_ROOT_FILES/rd-workflow/scripts/lifecycle/) 와 mirror(rd-workflow/scripts/lifecycle/) 양쪽에서 동작.
 # _ROOT_FILES 디렉토리를 가진 부모를 SCRIPT_DIR 에서 위로 거슬러 검출한다.
@@ -47,6 +57,10 @@ out_has() {  # out_has <needle> — stdin 을 읽어 needle 포함 여부 반환
 # 흐름이 아니라 손상된 작업공간을 시험하게 된다. REQUEST 템플릿의 Source FR 은 '-' 라서
 # "FR 없음" 으로 해석된다 — 개별 시나리오가 값을 덮어써 자기 조건을 만든다.
 #
+# `.gitignore` 의 `.worktrees/` 는 실배포 `_ROOT_FILES/.gitignore` 와 같은 항목이다. 재설계된
+# promote 는 기본값으로 `<main worktree>/.worktrees/<slug>` 에 worktree 를 만들므로, 이 항목이
+# 없으면 착수하자마자 기본 worktree 가 untracked 로 더러워져 archive 의 clean 검증을 막는다.
+#
 # rd-workflow-workspace/.gitkeep 도 같은 이유로 커밋한다. 배포본은 이 디렉터리 아래에
 # 추적 파일(backlog/FUTURE_REQUESTS.md 등)을 가지므로 git worktree add 로 만든 체크아웃에
 # 항상 이 디렉터리가 생긴다. git 은 빈 디렉터리를 추적하지 않아, 추적 파일이 하나도 없으면
@@ -55,7 +69,8 @@ out_has() {  # out_has <needle> — stdin 을 읽어 needle 포함 여부 반환
 setup_repo() {
   local branch="${1:-main}"
   local d
-  d="$(mktemp -d)"
+  d="$(mktemp -d)" || { echo "test_integration.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$d" && -d "$d" ]] || { echo "test_integration.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   # macOS: /var is a symlink to /private/var; resolve to canonical path so git worktree paths match
   d="$(cd "$d" && pwd -P)"
   ( cd "$d" && \
@@ -75,12 +90,14 @@ setup_repo() {
     fi; \
     mkdir -p rd-workflow/scripts/lifecycle rd-workflow/scripts/hooks rd-workflow-workspace/.lifecycle; \
     : > rd-workflow-workspace/.gitkeep; \
-    printf 'rd-workflow-workspace/.lifecycle/loop-state\nrd-workflow-workspace/.lifecycle/.loop-state.*\n' > .gitignore; \
+    printf '.worktrees/\nrd-workflow-workspace/.lifecycle/loop-state\nrd-workflow-workspace/.lifecycle/.loop-state.*\n' > .gitignore; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/lifecycle/*.sh rd-workflow/scripts/lifecycle/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/hooks/*.sh rd-workflow/scripts/hooks/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_state_common.sh rd-workflow/scripts/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_task_common.sh rd-workflow/scripts/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/rd rd-workflow/scripts/; \
+    cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_fr_register_common.sh rd-workflow/scripts/; \
+    cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/fr_backlog_scan.sh rd-workflow/scripts/; \
     git add -A; \
     git commit -q -m "init"
   )
@@ -94,8 +111,10 @@ run_promote() {
 
 # bare remote fixture — 신규 archive cleanup 시나리오 공용
 mk_bare() {  # mk_bare <tag> → bare repo 절대경로
-  local b
-  b="$(dirname "$(mktemp -d)")/bare-mirror-$1-$$"
+  local b _bm
+  _bm="$(mktemp -d)" || { echo "test_integration.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$_bm" && -d "$_bm" ]] || { echo "test_integration.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  b="$(dirname "$_bm")/bare-mirror-$1-$$"
   git init --bare "$b" -q
   echo "$b"
 }
@@ -129,9 +148,9 @@ HOOK
 # "우회하지 않아도 lifecycle 이 완주한다" 는 시나리오(커스텀 기본 브랜치)를 만들 수 없다.
 #
 # 실행 브랜치명을 marker 에 한 줄씩 append 한다. 파일 존재 여부만으로는 판정할 수 없기
-# 때문이다: promote 는 기본 브랜치의 metadata 커밋 다음에 fr 브랜치 승격 커밋을 한 번 더
-# 만들고, 그 커밋은 우회 대상이 아니라 언제나 hook 을 실행한다. 어느 브랜치에서 hook 이
-# 돌았는지를 기록해야 우회 여부를 정확히 읽을 수 있다.
+# 때문이다: 한 번의 lifecycle 실행이 fr 브랜치 커밋(우회 대상 아님 — 언제나 hook 을 실행)과
+# 기본 브랜치 커밋(우회 대상)을 모두 만들 수 있다. 어느 브랜치에서 hook 이 돌았는지를
+# 기록해야 우회 여부를 정확히 읽을 수 있다.
 install_marker_pre_commit() {  # install_marker_pre_commit <repo>
   cat > "$1/.git/hooks/pre-commit" <<'HOOK'
 #!/bin/sh
@@ -154,13 +173,17 @@ marker_has() {  # marker_has <repo> <needle> — marker 파일에 needle 이 있
 # === Scenario 1: promote → archive lifecycle ===
 echo "== scenario 1: promote → archive lifecycle =="
 REPO="$(setup_repo)"
+MAIN_TIP_BEFORE="$( cd "$REPO" && git rev-parse main )"
 # --status "구현 중": archive 후 baseline reset 검증을 위해 실제 stale 상황(비-baseline status) 재현
 run_promote "$REPO" --short-title test-foo --no-worktree --status "구현 중" >/dev/null
 ( cd "$REPO" && git rev-parse --verify fr/test-foo >/dev/null 2>&1 ) && pass "promote: branch fr/test-foo 존재" || fail "promote: branch 부재"
 ( cd "$REPO" && [[ "$(git rev-parse --abbrev-ref HEAD)" == "fr/test-foo" ]] ) && pass "promote: HEAD == fr/test-foo" || fail "promote: HEAD 불일치"
-# metadata is committed on main — check from main's tree (HEAD is fr/test-foo after promote)
-# v2 2b: active-fr → task-state 전환, fr-branch 필드 확인
-( cd "$REPO" && git show main:rd-workflow-workspace/.lifecycle/task-state 2>/dev/null | grep -q "fr-branch=fr/test-foo" ) && pass "promote: metadata 기록 (task-state)" || fail "promote: metadata 부재"
+# 「promote 가 기본 브랜치에 metadata 를 커밋했는가」 단언은 새 계약에서 개념 자체가 사라져
+# 제거했습니다 — promote.sh 는 이제 기본 브랜치에 아무것도 커밋하지 않고, 작업 상태는 fr
+# 브랜치 위 task-state 에만 있습니다. 같은 자리에 새 계약이 보장하는 것을 세웁니다:
+# 기본 브랜치 tip 이 promote 로 전혀 움직이지 않아야 합니다.
+# (fr 브랜치 task-state 의 필드 정합 자체는 scenario 9 가 봅니다 — 여기서 겹쳐 보지 않습니다.)
+( cd "$REPO" && [[ "$(git rev-parse main)" == "$MAIN_TIP_BEFORE" ]] ) && pass "promote: 기본 브랜치 tip 불변 (커밋 없음)" || fail "promote: 기본 브랜치에 커밋이 생김"
 
 # Idempotent rerun
 ( cd "$REPO" && git switch main -q )
@@ -174,8 +197,10 @@ run_promote "$REPO" --short-title test-foo --size small --no-worktree >/dev/null
 # Archive 호출 (--no-remote 모드)
 # review precheck 는 test_lifecycle.sh 가 단위 검증하므로, 여기서는 force-skip 으로 관문만 통과하고
 # git state 전이(merge/tag/branch 정리)에 집중한다.
+# 새 계약: 기본 브랜치로 되돌아온 시점의 기본 worktree 는 baseline 이므로(task-state 가
+# 어느 작업도 대표하지 않는다) 대상을 `--task` 로 명시해야 한다 (spec D13).
 ( cd "$REPO" && git switch main -q && \
-  bash rd-workflow/scripts/lifecycle/archive.sh --no-remote --force-skip-review-check "통합 테스트 fixture" ) >/dev/null
+  bash rd-workflow/scripts/lifecycle/archive.sh --task test-foo --no-remote --force-skip-review-check "통합 테스트 fixture" ) >/dev/null
 
 ( cd "$REPO" && ! git rev-parse --verify fr/test-foo >/dev/null 2>&1 ) && pass "archive: branch 삭제" || fail "archive: branch 잔존"
 ( cd "$REPO" && git tag --list "fr/*/test-foo" | grep -q . ) && pass "archive: tag 존재" || fail "archive: tag 부재"
@@ -208,7 +233,7 @@ fi
 # archive 재실행 — fr branch 부재 + tag 존재 → success exit
 # review-skip-audit.log가 untracked으로 생성될 수 있으므로 clean 트리를 보장하여 LC-20(멱등) 커버리지 복원
 ( cd "$REPO" && git clean -f rd-workflow-workspace/.lifecycle/review-skip-audit.log 2>/dev/null || true )
-out="$(cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch fr/test-foo --no-remote 2>&1 || true)"
+out="$(cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-foo --fr-branch fr/test-foo --no-remote 2>&1 || true)"
 [[ "$out" == *"이미 archive 완료"* ]] && pass "archive rerun: success exit (이미 완료)" || fail "archive rerun: $out"
 # rerun(이미 완료)은 task-state를 건드리지 않는다 — baseline 유지 확인
 ( cd "$REPO" && grep -q "^short-title=-$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null && grep -q "^status=대기 중$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "archive rerun: task-state 불변 (baseline 유지)" || fail "archive rerun: task-state 변경됨"
@@ -237,7 +262,7 @@ run_promote "$REPO" --short-title test-pre --no-worktree --status "구현 중" >
   emit_current_task_baseline > CURRENT_TASK.md )
 ( cd "$REPO" && git add REQUEST.md CURRENT_TASK.md && git commit -q -m "archive content (미러 baseline 포함)" )
 if out="$( cd "$REPO" && git switch main -q && \
-     bash rd-workflow/scripts/lifecycle/archive.sh --no-remote --force-skip-review-check "통합 테스트 fixture" 2>&1 )"; then
+     bash rd-workflow/scripts/lifecycle/archive.sh --task test-pre --no-remote --force-skip-review-check "통합 테스트 fixture" 2>&1 )"; then
   pass "scenario 1b: 이미 baseline 인 미러에서 archive 성공"
 else
   fail "scenario 1b: archive 실패 — $out"
@@ -267,7 +292,7 @@ cat > "$REPO/REQUEST.md" <<'REQEOF'
 REQEOF
 ( cd "$REPO" && git add -A && git commit -qm "test: sfr fixture" )
 run_promote "$REPO" --short-title sfr-ok --no-worktree --status "구현 중" >/dev/null
-( cd "$REPO" && git show main:rd-workflow-workspace/.lifecycle/task-state \
+( cd "$REPO" && git show fr/sfr-ok:rd-workflow-workspace/.lifecycle/task-state \
     | grep -q "source-fr=rd-workflow-workspace/backlog/items/2026-08-12-alpha.md" ) \
   && pass "promote sfr: 링크 표기 → canonical 기록" \
   || fail "promote sfr: 링크 표기 정규화 실패"
@@ -298,7 +323,9 @@ CTEOF
 ( cd "$REPO" && git add -A && git commit -qm "test: sfr bad fixture" )
 
 SFR_STATE="$REPO/rd-workflow-workspace/.lifecycle/task-state"
-SFR_SNAP="$(mktemp -d)"    # repo 밖에 snapshot 을 둔다
+# repo 밖에 snapshot 을 둔다
+SFR_SNAP="$(mktemp -d)" || { echo "test_integration.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$SFR_SNAP" && -d "$SFR_SNAP" ]] || { echo "test_integration.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 before_head="$( cd "$REPO" && git rev-parse HEAD )"
 before_status="$( cd "$REPO" && git status --porcelain )"
 cp "$REPO/CURRENT_TASK.md" "$SFR_SNAP/CURRENT_TASK.md"
@@ -309,7 +336,10 @@ if [[ -f "$SFR_STATE" ]]; then
 fi
 
 # stdout 과 stderr 를 분리 캡처한다 — 교정 안내가 stderr 로 나가는지 검증해야 한다.
-sfr_out="$(mktemp)"; sfr_err="$(mktemp)"
+sfr_out="$(mktemp)" || { echo "test_integration.sh: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$sfr_out" && -f "$sfr_out" ]] || { echo "test_integration.sh: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+sfr_err="$(mktemp)" || { echo "test_integration.sh: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$sfr_err" && -f "$sfr_err" ]] || { echo "test_integration.sh: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 set +e
 run_promote "$REPO" --short-title sfr-bad --no-worktree --status "구현 중" \
   >"$sfr_out" 2>"$sfr_err"
@@ -351,10 +381,14 @@ rm -rf "$sfr_out" "$sfr_err" "$SFR_SNAP"
 # (2b) --dry-run 도 같은 판정을 낸다.
 #      사전 점검이 성공을 알리고 실제 실행이 실패하면 신호가 반대가 되어 쓸모가 없다.
 #      해석은 read-only 이므로 dry-run 조기 종료보다 먼저 수행할 수 있다.
-DRY_SNAP="$(mktemp -d)"
+DRY_SNAP="$(mktemp -d)" || { echo "test_integration.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$DRY_SNAP" && -d "$DRY_SNAP" ]] || { echo "test_integration.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 cp "$REPO/CURRENT_TASK.md" "$DRY_SNAP/CURRENT_TASK.md"
 dry_before_status="$( cd "$REPO" && git status --porcelain )"
-dry_out="$(mktemp)"; dry_err="$(mktemp)"
+dry_out="$(mktemp)" || { echo "test_integration.sh: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$dry_out" && -f "$dry_out" ]] || { echo "test_integration.sh: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+dry_err="$(mktemp)" || { echo "test_integration.sh: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$dry_err" && -f "$dry_err" ]] || { echo "test_integration.sh: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 set +e
 run_promote "$REPO" --short-title sfr-dry --no-worktree --status "구현 중" --dry-run \
   >"$dry_out" 2>"$dry_err"
@@ -412,21 +446,33 @@ REQEOF
 ( cd "$REPO" && git add -A && git commit -qm "test: sfr 우선순위 fixture" )
 run_promote "$REPO" --short-title sfr-pri --no-worktree --status "구현 중" \
   --source-fr "rd-workflow-workspace/backlog/items/2026-08-12-gamma.md" >/dev/null
-( cd "$REPO" && git show main:rd-workflow-workspace/.lifecycle/task-state \
+( cd "$REPO" && git show fr/sfr-pri:rd-workflow-workspace/.lifecycle/task-state \
     | grep -q "source-fr=rd-workflow-workspace/backlog/items/2026-08-12-gamma.md" ) \
   && pass "promote sfr: 명시 인자 우선" || fail "promote sfr: 우선순위 역전"
 
 # === Scenario 2: promote → rollback ===
 echo "== scenario 2: promote → rollback =="
 REPO="$(setup_repo)"
-run_promote "$REPO" --short-title test-bar --size small --no-worktree >/dev/null
-( cd "$REPO" && git switch main -q && \
-  bash rd-workflow/scripts/lifecycle/promote_rollback.sh --fr-branch fr/test-bar ) >/dev/null
+# 새 계약에서는 worktree 격리가 기본이고, rollback 은 **그 작업의 worktree·branch·색인 행만**
+# 되돌립니다. `--no-worktree` 작업은 기본 체크아웃 자체가 그 작업의 worktree 라
+# promote_rollback.sh 의 「실행 중인 worktree 는 지우지 않는다」 가드에 걸려 이 전이를 볼 수
+# 없으므로, 기본 경로(worktree) 착수로 시험합니다.
+run_promote "$REPO" --short-title test-bar --size small >/dev/null
+WT_BAR="$REPO/.worktrees/test-bar"
+[[ -d "$WT_BAR" ]] && pass "rollback: 착수 worktree 생성" || fail "rollback: 착수 worktree 부재"
+MAIN_TIP_BEFORE="$( cd "$REPO" && git rev-parse main )"
+# `--fr-branch` 별칭은 제거되었습니다 — 대상 지정은 작업 단위(`--task <slug>`)로 통일했습니다.
+( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task test-bar ) >/dev/null
 ( cd "$REPO" && ! git rev-parse --verify fr/test-bar >/dev/null 2>&1 ) && pass "rollback: branch 삭제" || fail "rollback: branch 잔존"
-# v2 2b: active-fr 폐지 → task-state에서 fr-branch=null, short-title=-, status=대기 중 (LC-14)
-( cd "$REPO" && grep -q "^fr-branch=null$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "rollback: fr-branch=null (LC-14)" || fail "rollback: fr-branch still active"
-( cd "$REPO" && grep -q "^short-title=-$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "rollback: short-title=- (LC-14)" || fail "rollback: short-title not reset"
-( cd "$REPO" && grep -q "^status=대기 중$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "rollback: status=대기 중 (LC-14)" || fail "rollback: status not reset"
+[[ ! -d "$WT_BAR" ]] && pass "rollback: worktree 제거" || fail "rollback: worktree 잔존"
+( cd "$REPO" && [[ -z "$(bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get test-bar fr-branch' 2>/dev/null)" ]] ) \
+  && pass "rollback: 색인 행 제거" || fail "rollback: 색인 행 잔존"
+# 「rollback 이 기본 worktree 의 task-state 를 baseline 으로 되돌렸는가」(구 LC-14) 는 새
+# 계약에서 개념 자체가 사라져 제거했습니다 — 되돌릴 작업 상태는 지워질 fr 브랜치·worktree
+# 안에만 있고, 기본 worktree 는 처음부터 baseline 입니다. 같은 자리에 새 계약이 보장하는
+# 것을 세웁니다: rollback 은 기본 worktree 를 전혀 건드리지 않습니다.
+( cd "$REPO" && [[ "$(git rev-parse main)" == "$MAIN_TIP_BEFORE" && -z "$(git status --porcelain)" ]] ) \
+  && pass "rollback: 기본 worktree 불변 (tip·working tree)" || fail "rollback: 기본 worktree 오염"
 rm -rf "$REPO"
 
 # === Scenario 3: archive partial publish rerun (deterministic via direct git state setup) ===
@@ -482,21 +528,24 @@ WT_PATH="$REPO_PARENT/wt-test-quux-$$"
 
 run_promote "$REPO" --short-title test-quux --size small --worktree-path "$WT_PATH" >/dev/null
 [[ -d "$WT_PATH" ]] && pass "worktree-promote: worktree 생성" || fail "worktree-promote: worktree 부재"
-# v2 2b: active-fr → task-state 전환
-( cd "$REPO" && git switch main -q && grep -q "worktree-path=$WT_PATH" rd-workflow-workspace/.lifecycle/task-state ) && pass "worktree-promote: metadata 기록 (task-state)" || fail "worktree-promote: metadata 부재"
+# 작업 상태의 권위는 fr 브랜치 위 task-state 다(기본 브랜치에는 커밋되지 않는다).
+( cd "$REPO" && git show fr/test-quux:rd-workflow-workspace/.lifecycle/task-state 2>/dev/null \
+  | grep -qF "worktree-path=$WT_PATH" ) && pass "worktree-promote: metadata 기록 (task-state)" || fail "worktree-promote: metadata 부재"
 
-# Rerun without --worktree-path
-( cd "$REPO" && git switch main -q )
-run_promote "$REPO" --short-title test-quux --size small >/dev/null
+# 인자 없는 재실행 — 살아 있는 worktree 가 있으면 「이미 진행 중」으로 거부한다.
+# (구 계약의 "동일 worktree 재사용" 은 거부로 바뀌었다. 검사 의도는 그대로다 —
+#  재실행이 조용히 **다른 worktree 를 만들지 않는다**.)
+out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title test-quux --size small 2>&1 ) || true )"
+[[ "$out" == *"이미 진행 중"* ]] && pass "worktree-rerun: 인자 없는 재실행은 거부" || fail "worktree-rerun: 거부되지 않음 ($out)"
 EXISTING_WT="$(cd "$REPO" && git worktree list --porcelain | awk '
   /^worktree /{p=$0; sub(/^worktree /,"",p); next}
   /^branch refs\/heads\/fr\/test-quux/{print p; exit}')"
-[[ "$EXISTING_WT" == "$WT_PATH" ]] && pass "worktree-rerun: 동일 worktree 재사용" || fail "worktree-rerun: 다른 worktree ($EXISTING_WT)"
+[[ "$EXISTING_WT" == "$WT_PATH" ]] && pass "worktree-rerun: 등록된 worktree 불변" || fail "worktree-rerun: 다른 worktree ($EXISTING_WT)"
 
-# Rerun with different path → hard error
-( cd "$REPO" && git switch main -q )
+# 다른 경로를 명시한 재실행 → 거부 + 원래 worktree 보존 (조용한 "이사" 금지)
 out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title test-quux --size small --worktree-path "$REPO_PARENT/wt-other-$$" 2>&1 ) || true )"
-[[ "$out" == *"기존 worktree path 와 다름"* ]] && pass "worktree-rerun: 인자 mismatch hard error" || fail "worktree-rerun: 충돌 감지 실패 ($out)"
+[[ "$out" == *"이미 진행 중"* || "$out" == *"인자로 준 경로"* ]] && pass "worktree-rerun: 인자 mismatch hard error" || fail "worktree-rerun: 충돌 감지 실패 ($out)"
+[[ -d "$WT_PATH" && ! -d "$REPO_PARENT/wt-other-$$" ]] && pass "worktree-rerun: 다른 경로로 이사하지 않음" || fail "worktree-rerun: worktree 가 이동됨"
 
 rm -rf "$REPO" "$WT_PATH" "$REPO_PARENT/wt-other-$$"
 
@@ -512,8 +561,9 @@ mkdir -p "$PARENT_DIR"
 RELATIVE_WT="../$SPACE_PARENT_NAME/wt foo"
 ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title test-rel --size small --worktree-path "$RELATIVE_WT" ) >/dev/null
 EXPECTED_ABS="$PARENT_DIR/wt foo"
-# v2 2b: active-fr → task-state 전환
-( cd "$REPO" && git switch main -q && grep -qF "worktree-path=$EXPECTED_ABS" rd-workflow-workspace/.lifecycle/task-state ) \
+# 권위는 fr 브랜치 위 task-state 다 (기본 브랜치에는 아무것도 커밋되지 않는다).
+( cd "$REPO" && git show fr/test-rel:rd-workflow-workspace/.lifecycle/task-state 2>/dev/null \
+  | grep -qF "worktree-path=$EXPECTED_ABS" ) \
   && pass "rel-space: metadata canonical absolute path 기록 (task-state)" || fail "rel-space: canonicalize 실패"
 [[ -d "$EXPECTED_ABS" ]] && pass "rel-space: worktree 디렉토리 생성 (공백 포함)" || fail "rel-space: worktree 부재"
 
@@ -532,14 +582,16 @@ run_promote "$REPO" --short-title test-fetchfail --size small --no-worktree >/de
 ( cd "$REPO" && git switch fr/test-fetchfail -q && echo "ar" > REQUEST.md && git add REQUEST.md && git commit -q -m "ar content" )
 ( cd "$REPO" && git switch main -q )
 
-out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh 2>&1 ) || true )"
+# 기본 브랜치로 되돌아온 기본 worktree 는 baseline 이므로 대상을 `--task` 로 명시한다 (spec D13).
+out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-fetchfail 2>&1 ) || true )"
 [[ "$out" == *"fetch --tags origin 실패"* ]] \
   && pass "fetch-fail: preflight hard error" || fail "fetch-fail: 메시지 부재 ($out)"
 
 # Side effect 부재 검증
 ( cd "$REPO" && git rev-parse --verify fr/test-fetchfail >/dev/null 2>&1 ) && pass "fetch-fail: fr branch 보존" || fail "fetch-fail: fr branch 삭제됨"
-# v2 2b: active-fr 폐지 → task-state에 fr-branch 값이 유효하면 metadata 보존 상태
-( cd "$REPO" && grep -q "^fr-branch=fr/" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "fetch-fail: metadata 보존 (task-state fr-branch 유효)" || fail "fetch-fail: metadata 삭제됨"
+# 작업 상태의 권위는 fr 브랜치 위 task-state 다 — 그 값이 그대로면 metadata 가 보존된 것이다.
+( cd "$REPO" && git show fr/test-fetchfail:rd-workflow-workspace/.lifecycle/task-state 2>/dev/null \
+  | grep -q "^fr-branch=fr/test-fetchfail$" ) && pass "fetch-fail: metadata 보존 (task-state fr-branch 유효)" || fail "fetch-fail: metadata 삭제됨"
 ( cd "$REPO" && [[ -z "$(git tag --list 'fr/*/test-fetchfail')" ]] ) && pass "fetch-fail: tag 미생성" || fail "fetch-fail: tag 생성됨"
 
 rm -rf "$REPO"
@@ -549,23 +601,28 @@ rm -rf "$REPO"
 # unrelated active FR (branch + metadata) 가 보존되어야 한다.
 echo "== scenario 8: override mismatch guard =="
 REPO="$(setup_repo)"
+# `--no-worktree` 착수라 기본 체크아웃이 그대로 그 작업의 worktree 다 — **기본 브랜치로
+# 되돌리지 않는다.** archive 의 override mismatch 가드는 호출 worktree 의 task-state 가
+# 실제 작업을 가리킬 때(= metadata_exists) 동작하고, 기본 브랜치 worktree 는 새 계약에서
+# 항상 baseline 이라 그 가드를 볼 수 없다.
 run_promote "$REPO" --short-title test-foo --size small --no-worktree >/dev/null
-( cd "$REPO" && git switch main -q )
 ( cd "$REPO" && git branch fr/test-bar main )
 
 # archive override mismatch
 out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch fr/test-bar --no-remote 2>&1 ) || true )"
 [[ "$out" == *"불일치"* ]] && pass "archive override-mismatch: hard error" || fail "archive override-mismatch: 통과 ($out)"
 ( cd "$REPO" && git rev-parse --verify fr/test-foo >/dev/null 2>&1 ) && pass "archive override-mismatch: active branch 보존" || fail "archive override-mismatch: active branch 삭제됨"
-# v2 2b: active-fr → task-state 전환 (fr-branch 필드로 확인)
 ( cd "$REPO" && grep -q "^fr-branch=fr/test-foo$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "archive override-mismatch: active metadata 보존 (task-state)" || fail "archive override-mismatch: metadata 삭제됨"
 
-# rollback override mismatch
-out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh --fr-branch fr/test-bar 2>&1 ) || true )"
-[[ "$out" == *"불일치"* ]] && pass "rollback override-mismatch: hard error" || fail "rollback override-mismatch: 통과 ($out)"
-( cd "$REPO" && git rev-parse --verify fr/test-foo >/dev/null 2>&1 ) && pass "rollback override-mismatch: active branch 보존" || fail "rollback override-mismatch: active branch 삭제됨"
-# v2 2b: active-fr → task-state 전환
-( cd "$REPO" && grep -q "^fr-branch=fr/test-foo$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "rollback override-mismatch: active metadata 보존 (task-state)" || fail "rollback override-mismatch: metadata 삭제됨"
+# rollback 쪽 「override 가 active metadata 와 불일치하면 hard error」 단언은 새 계약에서
+# 개념 자체가 사라져 제거했습니다 — rollback 은 `--fr-branch` 를 받지 않고 대상을
+# `--task <slug>` 로만 고르므로, "active 하나와 override 가 어긋난다" 는 상태가 없습니다.
+# 그 단언이 지키려던 것(무관한 진행 중 작업의 branch·metadata 보존)은 그대로 세웁니다:
+# 다른 작업을 대상으로 지정해도 진행 중인 test-foo 는 건드려지지 않아야 합니다.
+out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task test-bar 2>&1 ) || true )"
+[[ "$out" == *"완료"* ]] && pass "rollback 다른 작업 지정: 그 대상만 되돌림" || fail "rollback 다른 작업 지정: 실패 ($out)"
+( cd "$REPO" && git rev-parse --verify fr/test-foo >/dev/null 2>&1 ) && pass "rollback 다른 작업 지정: 진행 중 branch 보존" || fail "rollback 다른 작업 지정: 진행 중 branch 삭제됨"
+( cd "$REPO" && grep -q "^fr-branch=fr/test-foo$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "rollback 다른 작업 지정: 진행 중 metadata 보존 (task-state)" || fail "rollback 다른 작업 지정: metadata 삭제됨"
 
 rm -rf "$REPO"
 
@@ -580,7 +637,11 @@ TS="$REPO/rd-workflow-workspace/.lifecycle/task-state"
 ( grep -q "^short-title=test-sync$" "$TS" 2>/dev/null ) && pass "checkout-sync: short-title 정합" || fail "checkout-sync: short-title 회귀"
 ( grep -q "^status=구현 중$" "$TS" 2>/dev/null ) && pass "checkout-sync: status 정합" || fail "checkout-sync: status 회귀"
 ( grep -q "^fr-branch=fr/test-sync$" "$TS" 2>/dev/null ) && pass "checkout-sync: fr-branch 정합" || fail "checkout-sync: fr-branch 회귀"
-( cd "$REPO" && git show main:rd-workflow-workspace/.lifecycle/task-state 2>/dev/null | grep -q "^fr-branch=fr/test-sync$" ) && pass "checkout-sync: main측 metadata 유지" || fail "checkout-sync: main측 metadata 부재"
+# 「기본 브랜치 쪽 metadata 가 유지되는가」 는 새 계약에서 개념이 사라졌습니다 — promote 는
+# 기본 브랜치에 아무것도 커밋하지 않습니다. 같은 자리에 권위 쪽 보장을 세웁니다:
+# 워킹트리 값이 fr 브랜치 tip 에 **커밋까지** 되어 있어야 합니다 (커밋 누락이면 다음 promote 가
+# divergent 로 판정해 재개가 막힙니다).
+( cd "$REPO" && git show fr/test-sync:rd-workflow-workspace/.lifecycle/task-state 2>/dev/null | grep -q "^fr-branch=fr/test-sync$" ) && pass "checkout-sync: fr tip 에 커밋됨" || fail "checkout-sync: fr tip 미커밋"
 rm -rf "$REPO"
 
 # 모드 2 — worktree promote (--worktree-path). worktree 내부 task-state가 정합해야 한다
@@ -596,34 +657,41 @@ WTS="$WT_SYNC/rd-workflow-workspace/.lifecycle/task-state"
 ( cd "$REPO" && git worktree remove --force "$WT_SYNC" ) >/dev/null 2>&1 || true
 rm -rf "$REPO" "$WT_SYNC"
 
-# === Scenario 10: stale fr-branch 진단 (promote 조기 실패 + rollback 복구) ===
-# metadata의 fr-branch가 실재하지 않는 로컬 브랜치를 가리키면 promote는 진입 시점에
-# stale 진단 + promote_rollback.sh 안내로 실패해야 한다 (refs/heads 전용 판정).
-echo "== scenario 10: stale fr-branch 진단 =="
+# === Scenario 10: fr 브랜치 외부 삭제 후 재착수 복구 ===
+# 구 계약의 「stale fr-branch 진단」 중 case 1·2(기본 브랜치 metadata 가 실재하지 않는 브랜치를
+# 가리키면 promote 가 진단과 함께 조기 실패)는 새 설계에서 개념 자체가 사라져 제거했습니다 —
+# 기본 브랜치에 작업 metadata 가 커밋되지 않으므로 그 상태가 만들어지지 않고, promote 는 ref
+# 부재를 그냥 fresh 로 판정합니다. 그 케이스들이 지키려던 실질(사람이 fr 브랜치를 손으로 지운
+# 뒤에도 재착수로 복구된다)을 남깁니다.
+#
+# case 3(동명 tag)은 **판정의 관측 결과만 뒤집혔을 뿐 불변식은 그대로**라 형태를 바꿔
+# 살렸습니다. promote 의 ref 조회는 여전히 `refs/heads/` 로 한정되어야 합니다 — 접두사를
+# 잃으면 동명 tag 가 resolve 되어 ref 가 있는 것으로 오판하고, fresh 여야 할 착수가
+# duplicate·ambiguous 로 막힙니다. 구 계약에서는 그 오판이 "stale 진단 누락" 으로,
+# 새 계약에서는 "착수 불가" 로 나타납니다.
+echo "== scenario 10: fr 브랜치 외부 삭제 후 재착수 =="
 REPO="$(setup_repo)"
 run_promote "$REPO" --short-title test-stale --size small --no-worktree >/dev/null
 ( cd "$REPO" && git switch main -q && git branch -D fr/test-stale -q )
 
-# case 1 — short-title 불일치 경로: stale 진단으로 실패
-out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title other-slug --size small --no-worktree 2>&1 ) || true )"
-[[ "$out" == *"실재하지 않는 stale 상태"* ]] && pass "stale-mismatch: 진단 메시지" || fail "stale-mismatch: 진단 부재 ($out)"
-[[ "$out" == *"promote_rollback.sh"* ]] && pass "stale-mismatch: rollback 안내" || fail "stale-mismatch: rollback 안내 부재 ($out)"
-( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title other-slug --size small --no-worktree >/dev/null 2>&1 ) && fail "stale-mismatch: exit 0" || pass "stale-mismatch: exit 1"
+run_promote "$REPO" --short-title test-stale --size small --no-worktree >/dev/null 2>&1 \
+  && pass "외부 삭제 복구: promote 재실행 성공" || fail "외부 삭제 복구: promote 재실행 실패"
+( cd "$REPO" && git rev-parse --verify fr/test-stale >/dev/null 2>&1 ) \
+  && pass "외부 삭제 복구: fr 브랜치 재생성" || fail "외부 삭제 복구: fr 브랜치 부재"
+( cd "$REPO" && git show fr/test-stale:rd-workflow-workspace/.lifecycle/task-state 2>/dev/null \
+  | grep -q "^fr-branch=fr/test-stale$" ) \
+  && pass "외부 삭제 복구: 작업 상태 재초기화" || fail "외부 삭제 복구: 작업 상태 미초기화"
 
-# case 2 — short-title 일치(idempotent rerun) 경로: 후속 git 에러가 아닌 진입 시점 stale 진단
-out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title test-stale --size small --no-worktree 2>&1 ) || true )"
-[[ "$out" == *"실재하지 않는 stale 상태"* ]] && pass "stale-match: 진단 메시지" || fail "stale-match: 진단 부재 ($out)"
+rm -rf "$REPO"
 
-# case 3 — 동명 tag만 존재해도 stale 판정 (refs/heads 전용 검증)
-( cd "$REPO" && git tag fr/test-stale )
-out="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title test-stale --size small --no-worktree 2>&1 ) || true )"
-[[ "$out" == *"실재하지 않는 stale 상태"* ]] && pass "stale-tag: 동명 tag에도 stale 판정" || fail "stale-tag: tag resolve로 오판 ($out)"
-( cd "$REPO" && git tag -d fr/test-stale >/dev/null )
-
-# case 4 — 복구 회귀: stale 상태에서 rollback 정상 종료 + metadata clear + promote 재실행 성공
-( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh >/dev/null 2>&1 ) && pass "stale-rollback: exit 0" || fail "stale-rollback: 실패"
-( cd "$REPO" && grep -q "^fr-branch=null$" rd-workflow-workspace/.lifecycle/task-state 2>/dev/null ) && pass "stale-rollback: fr-branch=null" || fail "stale-rollback: metadata 잔존"
-run_promote "$REPO" --short-title test-stale --size small --no-worktree >/dev/null 2>&1 && pass "stale-rollback: promote 재실행 성공" || fail "stale-rollback: promote 재실행 실패"
+# 동명 tag 만 있고 브랜치는 없는 상태 — refs/heads 전용 판정이면 fresh 로 보고 착수해야 한다.
+REPO="$(setup_repo)"
+( cd "$REPO" && git tag fr/test-tagonly )
+run_promote "$REPO" --short-title test-tagonly --size small --no-worktree >/dev/null 2>&1 \
+  && pass "tag-only: 동명 tag 는 ref 존재로 오판하지 않는다 (착수 성공)" \
+  || fail "tag-only: 동명 tag 를 resolve 해 착수가 막혔다"
+( cd "$REPO" && git rev-parse --verify refs/heads/fr/test-tagonly >/dev/null 2>&1 ) \
+  && pass "tag-only: fr 브랜치 생성" || fail "tag-only: fr 브랜치 부재"
 
 rm -rf "$REPO"
 
@@ -636,11 +704,11 @@ git init --bare "$BARE11" -q 2>/dev/null || true
 
 run_promote "$REPO" --short-title test-master --size small --no-worktree >/dev/null 2>&1 \
   && pass "master-promote: exit 0" || fail "master-promote: 실패"
-( cd "$REPO" && git show master:rd-workflow-workspace/.lifecycle/task-state 2>/dev/null | grep -q "fr-branch=fr/test-master" ) \
+( cd "$REPO" && git show fr/test-master:rd-workflow-workspace/.lifecycle/task-state 2>/dev/null | grep -q "fr-branch=fr/test-master" ) \
   && pass "master-promote: metadata 기록" || fail "master-promote: metadata 부재"
 # fr branch 위 작업 commit 후 master로 돌아가 archive (review-check는 fixture라 force-skip)
 ( cd "$REPO" && git commit -q --allow-empty -m "work" )
-( cd "$REPO" && git switch master -q && bash rd-workflow/scripts/lifecycle/archive.sh --force-skip-review-check "통합 테스트 fixture" >/dev/null 2>&1 ) \
+( cd "$REPO" && git switch master -q && bash rd-workflow/scripts/lifecycle/archive.sh --task test-master --force-skip-review-check "통합 테스트 fixture" >/dev/null 2>&1 ) \
   && pass "master-archive: exit 0" || fail "master-archive: 실패"
 _tag11="$(cd "$REPO" && git tag --list "fr/*/test-master" | head -1)"
 ( [[ -n "$_tag11" ]] && cd "$REPO" && git merge-base --is-ancestor "$_tag11" master 2>/dev/null ) \
@@ -650,17 +718,41 @@ _tag11="$(cd "$REPO" && git tag --list "fr/*/test-master" | head -1)"
 ( cd "$REPO" && git tag --list "fr/*/test-master" | grep -q . ) \
   && pass "master-archive: tag 생성" || fail "master-archive: tag 부재"
 
-# diff review 기본 target 일반화 (prepare_review_pipeline.sh)
+# diff review base 판정 (prepare_review_pipeline.sh, change spec §5.2)
 # 전제: setup_repo()가 이미 lifecycle/*.sh(_lifecycle_common.sh 포함)와 _state_common.sh를
 # fixture의 rd-workflow/scripts/ 아래에 복사해 두므로, prepare가 source할 의존성은 충족되어 있다.
 # 여기서는 prepare_review_pipeline.sh 한 파일만 추가 복사하면 된다.
+#
+# 이 fixture 는 archive 직후라 `fr-branch=null`·`base-commit` 미설정입니다. 종전 단언은
+# `git diff master...HEAD` **문자열**을 기대했으나, 새 설계에서 Review Target 은 고정 OID
+# 두 점이고 입력이 없으면 **세션을 만들지 않고 exit 1** 입니다 (AC 4 — 빈 diff 가 조용히
+# 통과하던 원 결함을 막는 의도된 동작). 두 상태를 모두 단언합니다.
 ( cd "$REPO" && mkdir -p rd-workflow/scripts \
   && cp "$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/prepare_review_pipeline.sh" rd-workflow/scripts/ \
-  && cp "$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/init_review_pipeline.sh" rd-workflow/scripts/ \
-  && bash rd-workflow/scripts/prepare_review_pipeline.sh diff >/dev/null 2>&1 ) || true
-DIFF_SES="$(ls -d "$REPO"/rd-workflow-workspace/handoffs/review_pipeline/*final-diff-review 2>/dev/null | head -1)"
-( [[ -n "$DIFF_SES" ]] && grep -q 'git diff master...HEAD' "$DIFF_SES/SESSION.md" ) \
-  && pass "master-diff: 기본 target master...HEAD" || fail "master-diff: target 오검출 (SESSION=$DIFF_SES)"
+  && cp "$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/init_review_pipeline.sh" rd-workflow/scripts/ )
+# 세션 디렉터리 개수 — 없으면 0. `ls` 실패가 set -e 로 스위트를 죽이지 않게 감쌉니다.
+_ses_count() {
+  local n=0
+  n="$(ls -d "$1"/rd-workflow-workspace/handoffs/review_pipeline/*final-diff-review 2>/dev/null | wc -l | tr -d ' ')" || n=0
+  printf '%s' "${n:-0}"
+}
+( cd "$REPO" && bash rd-workflow/scripts/prepare_review_pipeline.sh diff >/dev/null 2>&1 ) \
+  && fail "master-diff: base 입력 없는데 exit 0" || pass "master-diff: base 입력 없음 → exit 1"
+[[ "$(_ses_count "$REPO")" == "0" ]] \
+  && pass "master-diff: base 입력 없음 → 세션 미생성" || fail "master-diff: 세션이 만들어짐"
+
+# base-commit 을 설정하면 두 끝이 고정 OID 인 target 으로 세션이 만들어집니다.
+_base11="$(cd "$REPO" && git rev-parse HEAD~1)"
+( cd "$REPO" && bash rd-workflow/scripts/rd task set-base "$_base11" >/dev/null 2>&1 ) \
+  && pass "master-diff: set-base 성공" || fail "master-diff: set-base 실패"
+( cd "$REPO" && bash rd-workflow/scripts/prepare_review_pipeline.sh diff >/dev/null 2>&1 ) \
+  && pass "master-diff: base-commit → 세션 생성" || fail "master-diff: 세션 생성 실패"
+DIFF_SES="$(ls -d "$REPO"/rd-workflow-workspace/handoffs/review_pipeline/*final-diff-review 2>/dev/null | head -1)" || DIFF_SES=""
+_head11="$(cd "$REPO" && git rev-parse HEAD)"
+( [[ -n "$DIFF_SES" ]] && grep -qF "git diff ${_base11}..${_head11}" "$DIFF_SES/SESSION.md" ) \
+  && pass "master-diff: Review Target 이 OID 두 점" || fail "master-diff: target 오검출 (SESSION=$DIFF_SES)"
+( [[ -n "$DIFF_SES" ]] && grep -qF -e "- review-head-oid: ${_head11}" "$DIFF_SES/SESSION.md" ) \
+  && pass "master-diff: review-head-oid 기록" || fail "master-diff: review-head-oid 미기록"
 
 rm -rf "$REPO" "$BARE11"
 
@@ -678,7 +770,7 @@ run_promote "$REPO" --short-title test-behind --size small --no-worktree >/dev/n
 ( cd "$REPO" && git switch main -q )
 
 rc12=0
-( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh \
+( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-behind \
     --force-skip-review-check "통합 테스트 fixture" ) >/dev/null 2>&1 || rc12=$?
 [[ "$rc12" -eq 0 ]] && pass "behind-upstream: exit 0" || fail "behind-upstream: exit=$rc12"
 ( cd "$REPO" && ! git rev-parse --verify fr/test-behind >/dev/null 2>&1 ) \
@@ -720,7 +812,7 @@ git update-ref -d refs/heads/fr/test-absent
 HOOK
 chmod +x "$REPO/.git/hooks/post-commit"
 
-out13="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh \
+out13="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-absent \
     --force-skip-review-check "통합 테스트 fixture" ) 2>&1 )" && rc13=0 || rc13=$?
 [[ "$rc13" -eq 0 ]] && pass "no-op: exit 0" || fail "no-op: exit=$rc13"
 [[ "$out13" != *"CLEANUP-PENDING"* ]] \
@@ -741,7 +833,7 @@ run_promote "$REPO" --short-title test-localonly --size small --no-worktree >/de
 ( cd "$REPO" && echo "ar" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" )
 ( cd "$REPO" && git switch main -q )
 rc13b=0
-( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --no-remote \
+( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-localonly --no-remote \
     --force-skip-review-check "통합 테스트 fixture" ) >/dev/null 2>&1 || rc13b=$?
 [[ "$rc13b" -eq 0 ]] && pass "local-only: exit 0 (원격 미시도)" || fail "local-only: exit=$rc13b"
 ( cd "$REPO" && ! git rev-parse --verify fr/test-localonly >/dev/null 2>&1 ) \
@@ -770,7 +862,7 @@ git update-ref refs/heads/fr/test-childref/child "$oid"
 HOOK
 chmod +x "$REPO/.git/hooks/post-commit"
 
-out13c="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --no-remote \
+out13c="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-childref --no-remote \
     --force-skip-review-check "통합 테스트 fixture" ) 2>&1 )" && rc13c=0 || rc13c=$?
 [[ "$rc13c" -eq 0 ]] && pass "child-ref: exit 0" || fail "child-ref: exit=$rc13c"
 [[ "$out13c" == *"로컬 브랜치"*"없음"* ]] \
@@ -811,7 +903,7 @@ git branch -f fr/test-unmerged "$new"
 HOOK
 chmod +x "$REPO/.git/hooks/post-commit"
 
-out14="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh \
+out14="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-unmerged \
     --force-skip-review-check "통합 테스트 fixture" ) 2>&1 )" && rc14=0 || rc14=$?
 [[ "$rc14" -ne 0 ]] && pass "unmerged: non-zero 종료" || fail "unmerged: exit 0 (위반 미검출)"
 ( cd "$REPO" && git rev-parse --verify fr/test-unmerged >/dev/null 2>&1 ) \
@@ -843,7 +935,7 @@ echo "dirty" > "$WT14/junk-untracked.txt"
 mkdir -p "$REPO/rd-workflow-workspace/.lifecycle"
 printf 'verify-fail::test-wtfail::test=2\n' > "$REPO/rd-workflow-workspace/.lifecycle/loop-state"
 
-out14b="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh \
+out14b="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-wtfail \
     --force-skip-review-check "통합 테스트 fixture" ) 2>&1 )" && rc14b=0 || rc14b=$?
 [[ "$rc14b" -eq 0 ]] && pass "wt-fail: exit 0 유지 (일반 cleanup 실패)" || fail "wt-fail: exit=$rc14b"
 [[ "$out14b" == *"CLEANUP-PENDING"* ]] && pass "wt-fail: 요약 블록 출력" || fail "wt-fail: 요약 블록 부재"
@@ -876,7 +968,7 @@ run_promote "$REPO" --short-title test-conflict --size small --no-worktree >/dev
 ( cd "$REPO" && git switch main -q && echo "main-side" > conflict.txt \
   && RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit -q -am "main edit" )
 rc14c=0
-( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --no-remote \
+( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-conflict --no-remote \
     --force-skip-review-check "통합 테스트 fixture" ) >/dev/null 2>&1 || rc14c=$?
 [[ "$rc14c" -ne 0 ]] && pass "core-fail: merge conflict non-zero" || fail "core-fail: exit 0"
 ( cd "$REPO" && git rev-parse --verify fr/test-conflict >/dev/null 2>&1 ) \
@@ -900,7 +992,7 @@ ALIEN15="$( cd "$REPO" && git commit-tree "$(git rev-parse HEAD^{tree})" \
 ( cd "$REPO" && git push -q --force origin "$ALIEN15:refs/heads/fr/test-rdrift" )
 ( cd "$REPO" && git switch main -q )
 
-out15="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh \
+out15="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-rdrift \
     --force-skip-review-check "통합 테스트 fixture" ) 2>&1 )" && rc15=0 || rc15=$?
 [[ "$rc15" -ne 0 ]] && pass "remote-drift: non-zero 종료" || fail "remote-drift: exit 0"
 ( cd "$REPO" && git ls-remote origin refs/heads/fr/test-rdrift 2>/dev/null | grep -q . ) \
@@ -919,17 +1011,25 @@ REPO="$(setup_repo trunk)"
   && git add -A && git commit -q -m "config" )
 WT="${REPO}-side-wt"
 ( cd "$REPO" && git worktree add -q "$WT" -b side )
-for _mm in "promote:promote.sh --short-title test-mm --size small --no-worktree" \
-           "rollback:promote_rollback.sh" \
-           "archive:archive.sh"; do
-  _name="${_mm%%:*}"; _cmd="${_mm#*:}"
-  RC=0; ERR="$( (cd "$WT" && bash rd-workflow/scripts/lifecycle/${_cmd}) 2>&1 )" || RC=$?
-  [[ "$RC" -eq 1 ]] && pass "$_name mismatch: exit 1" || fail "$_name mismatch: exit=$RC"
-  printf '%s' "$ERR" | grep -q "기본 브랜치(trunk) worktree" \
-    && pass "$_name mismatch: resolved 브랜치명 안내" || fail "$_name mismatch: 브랜치명 문구 누락 — $ERR"
-  printf '%s' "$ERR" | grep -q "해당 worktree path:" \
-    && pass "$_name mismatch: path 안내" || fail "$_name mismatch: path 문구 누락 — $ERR"
-done
+# promote — `--no-worktree` 는 기본 브랜치 체크아웃에서만 허용한다. 다른 worktree 에서 부르면
+# 그 worktree 의 체크아웃이 통째로 넘어가므로 거부하고, 안내에 resolved 기본 브랜치명을 담는다.
+RC=0; ERR="$( (cd "$WT" && bash rd-workflow/scripts/lifecycle/promote.sh \
+  --short-title test-mm --size small --no-worktree) 2>&1 )" || RC=$?
+[[ "$RC" -eq 1 ]] && pass "promote mismatch: exit 1" || fail "promote mismatch: exit=$RC"
+printf '%s' "$ERR" | grep -q "기본 브랜치(trunk)" \
+  && pass "promote mismatch: resolved 브랜치명 안내" || fail "promote mismatch: 브랜치명 문구 누락 — $ERR"
+( cd "$REPO" && ! git rev-parse --verify fr/test-mm >/dev/null 2>&1 ) \
+  && pass "promote mismatch: 브랜치 미생성 (상태 변경 없음)" || fail "promote mismatch: 브랜치가 생성됨"
+
+# rollback — fr 브랜치가 아닌 worktree 는 되돌릴 대상이 아니므로 무변경으로 거부한다.
+RC=0; ERR="$( (cd "$WT" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh) 2>&1 )" || RC=$?
+[[ "$RC" -eq 1 ]] && pass "rollback mismatch: exit 1" || fail "rollback mismatch: exit=$RC"
+printf '%s' "$ERR" | grep -q "상태 변경 없음" \
+  && pass "rollback mismatch: 무변경 안내" || fail "rollback mismatch: 무변경 문구 누락 — $ERR"
+
+# archive 의 「기본 브랜치 worktree 밖 호출 거부」 단언은 새 계약에서 개념 자체가 사라져
+# 제거했습니다 — archive 는 이제 거부하지 않고 발행 worktree 로 `cd` 해 자기 자신을
+# 재실행합니다(spec D5). 그 재실행 경로는 test_archive_worktree.sh 가 봅니다.
 ( cd "$REPO" && git worktree remove --force "$WT" ) || true
 rm -rf "$REPO"
 
@@ -955,28 +1055,36 @@ for _br in main master; do
     || fail "hook-block/$_br 통제군: 실패 원인이 hook 이 아님 — $ctl_err"
   ( cd "$REPO" && git reset -q )
 
-  # (b) promote
+  # (b) promote — 「기본 브랜치 metadata 커밋이 hook 을 뚫고 기록되는가」 단언은 새 계약에서
+  #     개념 자체가 사라져 제거했습니다(promote 는 기본 브랜치에 아무것도 커밋하지 않습니다).
+  #     같은 자리에 새 계약이 보장하는 것을 세웁니다: 차단 hook 아래에서도 착수는 끝까지
+  #     가고, 기본 브랜치 tip 은 움직이지 않습니다.
+  hb_tip="$( cd "$REPO" && git rev-parse "$_br" )"
   prc=0
   run_promote "$REPO" --short-title test-hb --size small --no-worktree >/dev/null 2>&1 || prc=$?
   [[ "$prc" -eq 0 ]] \
     && pass "hook-block/$_br promote: exit 0" || fail "hook-block/$_br promote: exit=$prc"
-  ( cd "$REPO" && git log "$_br" --oneline -20 | out_has "promote test-hb metadata 기록" ) \
-    && pass "hook-block/$_br promote: metadata 커밋이 HEAD 이력에 반영" \
-    || fail "hook-block/$_br promote: metadata 커밋 부재"
+  ( cd "$REPO" && [[ "$(git rev-parse "$_br")" == "$hb_tip" ]] ) \
+    && pass "hook-block/$_br promote: 기본 브랜치 tip 불변 (커밋 없음)" \
+    || fail "hook-block/$_br promote: 기본 브랜치에 커밋이 생김"
   rm -rf "$REPO"
 
-  # (c) promote_rollback
+  # (c) promote_rollback — rollback 도 더 이상 커밋을 만들지 않습니다(되돌릴 상태가 지워질
+  #     worktree·branch 안에만 있습니다). 「커밋이 이력에 반영」 단언을 제거하고, 차단 hook
+  #     아래에서도 되돌리기가 완주하고 기본 브랜치를 건드리지 않는다는 것을 세웁니다.
   REPO="$(setup_repo "$_br")"
-  run_promote "$REPO" --short-title test-hbr --size small --no-worktree >/dev/null 2>&1
+  run_promote "$REPO" --short-title test-hbr --size small >/dev/null 2>&1
   install_blocking_pre_commit "$REPO"
-  ( cd "$REPO" && git switch "$_br" -q )
+  hbr_tip="$( cd "$REPO" && git rev-parse "$_br" )"
   rrc=0
-  ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh ) >/dev/null 2>&1 || rrc=$?
+  ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task test-hbr ) >/dev/null 2>&1 || rrc=$?
   [[ "$rrc" -eq 0 ]] \
     && pass "hook-block/$_br rollback: exit 0" || fail "hook-block/$_br rollback: exit=$rrc"
-  ( cd "$REPO" && git log "$_br" --oneline -20 | out_has "rollback 완료" ) \
-    && pass "hook-block/$_br rollback: 커밋이 HEAD 이력에 반영" \
-    || fail "hook-block/$_br rollback: 커밋 부재"
+  ( cd "$REPO" && ! git rev-parse --verify fr/test-hbr >/dev/null 2>&1 ) \
+    && pass "hook-block/$_br rollback: branch 삭제" || fail "hook-block/$_br rollback: branch 잔존"
+  ( cd "$REPO" && [[ "$(git rev-parse "$_br")" == "$hbr_tip" ]] ) \
+    && pass "hook-block/$_br rollback: 기본 브랜치 tip 불변 (커밋 없음)" \
+    || fail "hook-block/$_br rollback: 기본 브랜치에 커밋이 생김"
   rm -rf "$REPO"
 
   # (d) archive
@@ -988,7 +1096,7 @@ for _br in main master; do
   ( cd "$REPO" && git switch "$_br" -q )
   install_blocking_pre_commit "$REPO"
   arc=0
-  ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh \
+  ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-hba \
       --force-skip-review-check "통합 테스트 fixture" ) >/dev/null 2>&1 || arc=$?
   [[ "$arc" -eq 0 ]] \
     && pass "hook-block/$_br archive: exit 0" || fail "hook-block/$_br archive: exit=$arc"
@@ -1009,23 +1117,38 @@ done
 # --no-verify 를 붙일 이유가 없고, 붙이면 소비 프로젝트의 pre-commit·commit-msg 검증만
 # 불필요하게 줄어든다.
 #
-# promote 한 경로로만 검증한다 — 세 지점(promote·promote_rollback·archive)이 모두 같은
-# lifecycle_needs_hook_bypass 판정을 쓰므로 브랜치 조건은 공통이고, promote 가 fixture
-# 준비(bare remote·archive content 불필요)가 가장 단순해 조건 자체를 가장 좁게 고정한다.
+# **archive 한 경로로만 검증한다.** 재설계 이후 기본 브랜치에 커밋을 만드는 lifecycle 지점은
+# archive 뿐이고(promote·promote_rollback 은 기본 브랜치에 커밋하지 않는다),
+# lifecycle_needs_hook_bypass 를 쓰는 곳도 archive 뿐이다.
 #
 # trunk 와 main 을 짝으로 둔다. 한쪽만 보면 "우회 안내가 없다" 가 우회를 안 해서인지
 # 안내 지점에 도달하지 못해서인지 구분되지 않아 판정이 성립하지 않는다.
+#
+# marker hook 은 **promote 보다 먼저** 설치한다 — promote 의 fr 브랜치 커밋이 언제나 hook 을
+# 실행하므로(우회 대상이 아니다), 그 흔적이 "hook 자체가 동작한다" 는 통제군이 된다.
+_hookcond_case() {  # _hookcond_case <기본 브랜치> <slug>
+  local br="$1" slug="$2" repo out rc=0
+  repo="$(setup_repo "$br")"
+  if [[ "$br" != "main" && "$br" != "master" ]]; then
+    ( cd "$repo" && mkdir -p rd-workflow/config \
+      && printf '{"default_branch": "%s"}\n' "$br" > rd-workflow/config/workflow.json \
+      && git add -A && git commit -q -m "config" )
+  fi
+  install_marker_pre_commit "$repo"
+  run_promote "$repo" --short-title "$slug" --size small --no-worktree >/dev/null 2>&1
+  ( cd "$repo" && echo "ar" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" )
+  ( cd "$repo" && git switch "$br" -q )
+  out="$( cd "$repo" && bash rd-workflow/scripts/lifecycle/archive.sh --task "$slug" --no-remote \
+      --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || rc=$?
+  printf '%s\t%s\t%s\n' "$repo" "$rc" "${out//$'\n'/ }"
+}
 
 # (a) trunk — 우회하지 않는다
-REPO="$(setup_repo trunk)"
-( cd "$REPO" && mkdir -p rd-workflow/config \
-  && printf '{"default_branch": "trunk"}\n' > rd-workflow/config/workflow.json \
-  && git add -A && git commit -q -m "config" )
-install_marker_pre_commit "$REPO"
-nbt_rc=0
-nbt_out="$( run_promote "$REPO" --short-title test-nbt --size small --no-worktree 2>&1 )" || nbt_rc=$?
+_hc="$(_hookcond_case trunk test-nbt)"
+REPO="${_hc%%$'\t'*}"; _hc_rest="${_hc#*$'\t'}"
+nbt_rc="${_hc_rest%%$'\t'*}"; nbt_out="${_hc_rest#*$'\t'}"
 [[ "$nbt_rc" -eq 0 ]] \
-  && pass "hook-cond/trunk: promote rc=0" || fail "hook-cond/trunk: rc=$nbt_rc — $nbt_out"
+  && pass "hook-cond/trunk: archive rc=0" || fail "hook-cond/trunk: rc=$nbt_rc — $nbt_out"
 marker_has "$REPO" "ran:trunk" \
   && pass "hook-cond/trunk: 기본 브랜치 커밋에서 hook 실행됨 (우회 안 함)" \
   || fail "hook-cond/trunk: hook 미실행 — 차단 대상이 아닌 브랜치를 우회함"
@@ -1035,17 +1158,16 @@ printf '%s' "$nbt_out" | out_has "hook 을 건너뛰고 커밋했습니다" \
 rm -rf "$REPO"
 
 # (b) main — 우회한다 (대조군)
-REPO="$(setup_repo main)"
-install_marker_pre_commit "$REPO"
-nbm_rc=0
-nbm_out="$( run_promote "$REPO" --short-title test-nbm --size small --no-worktree 2>&1 )" || nbm_rc=$?
+_hc="$(_hookcond_case main test-nbm)"
+REPO="${_hc%%$'\t'*}"; _hc_rest="${_hc#*$'\t'}"
+nbm_rc="${_hc_rest%%$'\t'*}"; nbm_out="${_hc_rest#*$'\t'}"
 [[ "$nbm_rc" -eq 0 ]] \
-  && pass "hook-cond/main: promote rc=0" || fail "hook-cond/main: rc=$nbm_rc — $nbm_out"
+  && pass "hook-cond/main: archive rc=0" || fail "hook-cond/main: rc=$nbm_rc — $nbm_out"
 marker_has "$REPO" "ran:main" \
   && fail "hook-cond/main: 차단 대상 브랜치인데 hook 이 실행됨 (우회 실패)" \
   || pass "hook-cond/main: 기본 브랜치 커밋에서 hook 미실행 (우회함)"
-# hook 이 애초에 설치·동작하지 않아서 marker 가 비었을 가능성을 같은 실행 안에서 배제한다.
-# fr 브랜치 승격 커밋은 우회 대상이 아니므로 반드시 hook 을 실행한다.
+# hook 이 애초에 설치·동작하지 않아서 marker 가 비었을 가능성을 같은 fixture 안에서 배제한다.
+# promote 의 fr 브랜치 승격 커밋은 우회 대상이 아니므로 반드시 hook 을 실행했어야 한다.
 marker_has "$REPO" "ran:fr/test-nbm" \
   && pass "hook-cond/main: 비우회 커밋에서는 hook 실행됨 (hook 동작 확인)" \
   || fail "hook-cond/main: hook 자체가 동작하지 않음 — 위 판정이 무의미"
@@ -1057,6 +1179,10 @@ rm -rf "$REPO"
 # 각 케이스는 rc·기대 커밋 생성·사용자 파일 제외·index 보존·안내를 동일 실행에서 확인한다.
 
 # (a) promote
+# 「기본 브랜치 metadata 커밋」·「우회 범위 안내」 단언은 제거했습니다 — promote 는 기본
+# 브랜치에 커밋하지 않고, 그래서 hook 우회도 하지 않습니다(fr 브랜치 커밋은 원래 우회
+# 대상이 아닙니다). 이 케이스가 지키려던 실질(무관한 staged 변경이 promote 의 커밋에
+# 딸려가지 않고 index 에 그대로 남는가)은 그대로 둡니다.
 REPO="$(setup_repo)"
 install_blocking_pre_commit "$REPO"
 ( cd "$REPO" && mkdir -p src && echo "user work" > src/app.js && git add src/app.js )
@@ -1064,39 +1190,34 @@ sp_rc=0
 sp_out="$( run_promote "$REPO" --short-title test-stgp --size small --no-worktree 2>&1 )" || sp_rc=$?
 [[ "$sp_rc" -eq 0 ]] \
   && pass "staged/promote: rc=0" || fail "staged/promote: rc=$sp_rc — $sp_out"
-( cd "$REPO" && git log main --oneline -10 | out_has "promote test-stgp metadata 기록" ) \
-  && pass "staged/promote: lifecycle 커밋 생성" || fail "staged/promote: lifecycle 커밋 부재"
-( cd "$REPO" && git log main -1 --name-only --format= | out_has "src/app.js" ) \
+( cd "$REPO" && git log fr/test-stgp --oneline -10 | out_has "test-stgp 작업 착수" ) \
+  && pass "staged/promote: fr 브랜치 승격 커밋 생성" || fail "staged/promote: 승격 커밋 부재"
+( cd "$REPO" && git log fr/test-stgp -1 --name-only --format= | out_has "src/app.js" ) \
   && fail "staged/promote: 사용자 파일이 lifecycle 커밋에 포함됨" \
   || pass "staged/promote: 사용자 파일이 커밋에서 제외됨"
-# index 보존은 promote 실행 "전체" 기준이다 — metadata 우회 커밋만이 아니라 그 뒤에 이어지는
-# fr 브랜치 승격 커밋(CURRENT_TASK.md 갱신)까지 경로 한정이라야 참이 된다. 둘 중 하나라도
-# pathspec 을 잃으면 남아 있던 staged src/app.js 가 흡수되어 이 assertion 이 실패한다.
+# index 보존은 promote 실행 "전체" 기준이다 — 승격 커밋이 pathspec 을 잃으면 남아 있던
+# staged src/app.js 가 흡수되어 이 assertion 이 실패한다.
 ( cd "$REPO" && git diff --cached --name-only | out_has "src/app.js" ) \
   && pass "staged/promote: 사용자 staged 상태 보존" || fail "staged/promote: 사용자 staged 소실"
-printf '%s' "$sp_out" | out_has "commit-msg" \
-  && pass "staged/promote: 우회 범위 특정 안내" || fail "staged/promote: 안내 누락 — $sp_out"
 rm -rf "$REPO"
 
 # (b) promote_rollback
+# rollback 은 이제 어떤 커밋도 만들지 않습니다(되돌릴 상태는 지워질 worktree·branch 안에만
+# 있습니다). 「lifecycle 커밋 생성」·「우회 범위 안내」 단언은 개념이 사라져 제거하고, 남은
+# 실질인 **사용자 index 무손상**과 **기본 브랜치 무변경**을 세웁니다.
 REPO="$(setup_repo)"
-run_promote "$REPO" --short-title test-stgr --size small --no-worktree >/dev/null 2>&1
-( cd "$REPO" && git switch main -q )
+run_promote "$REPO" --short-title test-stgr --size small >/dev/null 2>&1
 install_blocking_pre_commit "$REPO"
 ( cd "$REPO" && mkdir -p src && echo "user work" > src/app.js && git add src/app.js )
+sr_tip="$( cd "$REPO" && git rev-parse main )"
 sr_rc=0
-sr_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh 2>&1 )" || sr_rc=$?
+sr_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task test-stgr 2>&1 )" || sr_rc=$?
 [[ "$sr_rc" -eq 0 ]] \
   && pass "staged/rollback: rc=0" || fail "staged/rollback: rc=$sr_rc — $sr_out"
-( cd "$REPO" && git log main --oneline -10 | out_has "rollback 완료" ) \
-  && pass "staged/rollback: lifecycle 커밋 생성" || fail "staged/rollback: lifecycle 커밋 부재"
-( cd "$REPO" && git log main -1 --name-only --format= | out_has "src/app.js" ) \
-  && fail "staged/rollback: 사용자 파일이 lifecycle 커밋에 포함됨" \
-  || pass "staged/rollback: 사용자 파일이 커밋에서 제외됨"
+( cd "$REPO" && [[ "$(git rev-parse main)" == "$sr_tip" ]] ) \
+  && pass "staged/rollback: 기본 브랜치 tip 불변 (커밋 없음)" || fail "staged/rollback: 기본 브랜치에 커밋이 생김"
 ( cd "$REPO" && git diff --cached --name-only | out_has "src/app.js" ) \
   && pass "staged/rollback: 사용자 staged 상태 보존" || fail "staged/rollback: 사용자 staged 소실"
-printf '%s' "$sr_out" | out_has "commit-msg" \
-  && pass "staged/rollback: 우회 범위 특정 안내" || fail "staged/rollback: 안내 누락 — $sr_out"
 rm -rf "$REPO"
 
 # (c) archive
@@ -1121,7 +1242,7 @@ sa_rc=0
 # 전수 검증 게이트를 걷어내면서 그 선행 확인도 함께 제거했다. 다시 git merge 의 거부가 중단 지점이다.)
 # LC_ALL=C 고정: 아래 oracle 이 git 의 영문 오류 메시지를 판정에 쓰므로,
 # 번역 locale 환경에서 거짓 실패하지 않도록 실행 locale 을 못박는다.
-sa_out="$( cd "$REPO" && LC_ALL=C bash rd-workflow/scripts/lifecycle/archive.sh \
+sa_out="$( cd "$REPO" && LC_ALL=C bash rd-workflow/scripts/lifecycle/archive.sh --task test-stga \
     --force-dirty --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || sa_rc=$?
 # 중단 사유까지 확인한다 — rc != 0 만 보면 archive 가 다른 이유로 실패해도 통과해
 # 통제군보다 약한 oracle 이 된다.
@@ -1162,7 +1283,7 @@ install_blocking_pre_commit "$REPO"
 MS_UNREL="rd-workflow-workspace/.lifecycle/unrelated_zzfx.log"
 ( cd "$REPO" && echo "user work" > "$MS_UNREL" && git add "$MS_UNREL" )
 ms_rc=0
-ms_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh \
+ms_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-mskip \
     --force-dirty --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || ms_rc=$?
 [[ "$ms_rc" -eq 0 ]] \
   && pass "staged/archive-mergeskip: rc=0" || fail "staged/archive-mergeskip: rc=$ms_rc — $ms_out"
@@ -1180,32 +1301,12 @@ printf '%s' "$ms_out" | out_has "commit-msg" \
   || fail "staged/archive-mergeskip: 안내 누락 — $ms_out"
 rm -rf "$REPO" "$BAREMS"
 
-# ---- lifecycle 대상 변경이 없고 무관 staged 만 있을 때 lifecycle 커밋이 생기지 않는가 ----
-REPO="$(setup_repo)"
-run_promote "$REPO" --short-title test-neg --size small --no-worktree >/dev/null 2>&1
-( cd "$REPO" && git switch main -q )
-# 준비 실행 — rc 를 반드시 확인한다. 여기서 실패하면 이후 assertion 이 무의미하다.
-prep_rc=0
-prep_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh 2>&1 )" || prep_rc=$?
-[[ "$prep_rc" -eq 0 ]] \
-  && pass "negative: 준비 rollback rc=0" || fail "negative: 준비 rollback rc=$prep_rc — $prep_out"
-neg_before="$( cd "$REPO" && git rev-parse main )"
-install_blocking_pre_commit "$REPO"
-( cd "$REPO" && mkdir -p src && echo "user work" > src/app.js && git add src/app.js )
-# 2회차는 --fr-branch 명시가 필수다 (metadata 는 1회차에서 정리되었다).
-neg_rc=0
-neg_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh \
-    --fr-branch fr/test-neg 2>&1 )" || neg_rc=$?
-neg_after="$( cd "$REPO" && git rev-parse main )"
-[[ "$neg_rc" -eq 0 ]] \
-  && pass "negative: 2회차 rollback rc=0 (판정 지점 도달)" \
-  || fail "negative: 2회차 rollback rc=$neg_rc — 판정 이전 종료 의심: $neg_out"
-[[ "$neg_before" == "$neg_after" ]] \
-  && pass "negative: 대상 변경 없음 → lifecycle 커밋 미생성" \
-  || fail "negative: 무관 staged 만으로 lifecycle 커밋이 생김 (판정 범위 축소 누락)"
-( cd "$REPO" && git diff --cached --name-only | out_has "src/app.js" ) \
-  && pass "negative: 사용자 staged 보존" || fail "negative: 사용자 staged 소실"
-rm -rf "$REPO"
+# ---- (제거) 「lifecycle 대상 변경이 없고 무관 staged 만 있을 때 rollback 이 lifecycle 커밋을
+#      만들지 않는가」 ----
+# 새 계약에서 개념 자체가 사라져 제거했습니다. rollback 은 **어떤 경우에도** 커밋을 만들지
+# 않으므로(경로 한정 우회 커밋 자체가 없어졌습니다) "대상 변경이 없을 때만 커밋이 없다" 는
+# 조건부 성질이 성립하지 않고, 남은 실질(기본 브랜치 tip 불변 + 사용자 staged 보존)은 바로
+# 위 staged/rollback 케이스가 이미 봅니다 — 같은 사실을 두 경로로 확인하지 않습니다.
 
 # ---- tracked legacy active-fr 의 삭제가 경로 한정 커밋으로 기록되는가 ----
 REPO="$(setup_repo)"
@@ -1221,7 +1322,7 @@ run_promote "$REPO" --short-title test-legacy --size small --no-worktree >/dev/n
 ( cd "$REPO" && git switch main -q )
 install_blocking_pre_commit "$REPO"
 lg_rc=0
-lg_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh \
+lg_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-legacy \
     --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || lg_rc=$?
 [[ "$lg_rc" -eq 0 ]] \
   && pass "legacy: archive rc=0" || fail "legacy: archive rc=$lg_rc — $lg_out"
@@ -1242,6 +1343,12 @@ echo "== scenario: 하위 디렉터리 archive 호출 거부 =="
 # 여기서는 그 **실제 동작**을 고정한다: nested 호출이 아무것도 건드리지 않고 거부되는 것.
 # 이 단언이 깨지면(= nested 호출이 진행되면) rollback 판정 범위가 즉시 실제 위험이 되므로,
 # 그때 FR `archive-cwd-dependent-state-path` 의 처방을 함께 넣어야 한다.
+#
+# 2026-09-16 (final diff review F2): 대상 판정이 git 대조로 정확해지면서 nested 호출도
+# fr tip 으로 대상을 찾아내게 됐다 — "metadata 를 못 읽어 우연히 멈춘다" 는 전제가
+# 사라졌다. 그래서 archive.sh 가 **저장소 루트가 아닌 cwd 를 명시적으로 거부**하도록
+# 바꿨고, 이 시나리오는 그 거부를 고정한다. 검사 대상(아무것도 건드리지 않고 거부)은
+# 그대로이고 종료 사유 문구만 바뀐다.
 REPO="$(setup_repo)"
 run_promote "$REPO" --short-title test-nested --no-worktree --status "구현 중" >/dev/null
 ( cd "$REPO" && git switch fr/test-nested -q \
@@ -1252,8 +1359,8 @@ nst_out="$( cd "$REPO/rd-workflow/scripts/lifecycle" && bash ./archive.sh --no-r
     --force-skip-review-check "통합 테스트 fixture" 2>&1 )" \
   && fail "nested/archive: 하위 디렉터리 호출이 rc 0" \
   || pass "nested/archive: 하위 디렉터리 호출 거부"
-printf '%s' "$nst_out" | out_has "active fr 없음" \
-  && pass "nested/archive: metadata 미해석으로 조기 종료 (merge 이전)" \
+printf '%s' "$nst_out" | out_has "저장소 루트에서 실행하십시오" \
+  && pass "nested/archive: 저장소 루트 요구로 조기 종료 (merge 이전)" \
   || fail "nested/archive: 다른 사유로 종료 — rollback 판정 범위가 실제 위험이 된다: $nst_out"
 [[ "$main_before" == "$( cd "$REPO" && git rev-parse HEAD )" ]] \
   && pass "nested/archive: main HEAD 불변" || fail "nested/archive: main 이 전진함"
@@ -1453,7 +1560,9 @@ assert_eq "$(pr_field "$PR5" source-fr)" "-" "promote: REQUEST 의 '-' 는 FR �
 #
 # 메시지만 확인하면 계약의 절반이다. AC 19 가 rd 와 동일한 fail-closed 라면
 # "파일을 하나도 만들지 않는다" 와 의도한 exit code 도 함께 고정해야 한다.
-PR6="$(mktemp -d)"; PR6="$(cd "$PR6" && pwd -P)"
+PR6="$(mktemp -d)" || { echo "test_integration.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$PR6" && -d "$PR6" ]] || { echo "test_integration.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+PR6="$(cd "$PR6" && pwd -P)"
 mkdir -p "$PR6/rd-workflow/scripts/lifecycle" "$PR6/rd-workflow/scripts/hooks"
 cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/lifecycle/*.sh "$PR6/rd-workflow/scripts/lifecycle/"
 cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/hooks/*.sh "$PR6/rd-workflow/scripts/hooks/"
@@ -1476,19 +1585,21 @@ else
 fi
 rm -rf "$PR6"
 
-# (7) idempotent rerun 이 진행된 status 를 시작 status 로 되돌리지 않는다
-#     (final diff review Finding 1)
+# (7) 진행 중 작업의 rerun 계약 — **무변경 거부**
 #
-# Step D 는 rerun 에서도 미러를 다시 쓴다. rerun 이 시작 상태 인자를 그대로 쓰면
-# task-state 는 `검증 중` 인데 미러만 `대기 중` 으로 돌아가, **명령은 성공하고
-# 미러 변경까지 커밋되므로** 사용자가 회귀를 알아차리지 못한다. 미러를 직접 파싱하는
-# 소비처(prepare_review_pipeline.sh 등)가 틀린 단계를 본다.
+# 구 계약에서 rerun 은 "권위(task-state)를 읽어 미러(CURRENT_TASK.md)를 되살리는" 복구
+# 경로였고, (a)~(m) 13 케이스가 그 복구의 fail-closed 성질(실패 시 미러 byte 불변·worktree
+# 미생성·복구 안내 문구·안내 명령의 대상 바인딩 등)을 고정했습니다. **재설계로 그 복구
+# 경로 자체가 사라졌습니다** — 살아 있는 worktree 를 가진 작업의 rerun 은 D11 이
+# `duplicate` 로 판정해 즉시 무변경 거부하므로, 권위를 읽어 미러를 고칠 자리가 없습니다
+# (promote.sh 에 그 검증·안내 문구가 더 이상 존재하지 않습니다). 13 케이스가 공통으로
+# 지키려던 실질만 새 계약의 형태로 옮깁니다:
+#   ① 거부되고, 권위·미러·worktree 목록·HEAD 중 어느 것도 바뀌지 않는다
+#   ② 미러가 어긋나 있어도 거부 경로가 미러를 덮어쓰지 않는다
+#   ③ worktree 가 사라진 작업의 재부착(resume)은 성공하고 진행 단계를 되돌리지 않는다
 #
-# 초기값과 목표값이 달라야 되돌림이 드러나므로 `--size large`(대기 중) 로 시작해
-# `검증 중` 까지 진행시킨 뒤 같은 `--size large` 로 rerun 한다.
-# **worktree 경로로 시험한다.** `--no-worktree` rerun 은 Step A 가 기본 브랜치 worktree 를
-# 요구하므로(첫 승격이 공유 트리를 fr 로 바꿔 놓는다) 애초에 도달하지 않는다 — 그쪽으로
-# 쓰면 Step D 이전에 exit 1 이 나고 이 계약을 시험하지 못한다.
+# **worktree 경로로 시험한다.** `--no-worktree` 는 기본 브랜치 체크아웃에서만 허용되므로
+# (첫 착수가 공유 트리를 fr 로 바꿔 놓는다) 그쪽으로는 이 계약에 도달하지 못한다.
 PR7="$(setup_repo)"; pr_prepare "$PR7"
 # `$PR7` 형제 경로로 잡는다 — setup_repo 가 `pwd -P` 로 canonical 화한 값이라
 # macOS 의 /var → /private/var 심링크 때문에 metadata 저장값과 인자가 갈리지 않는다.
@@ -1510,287 +1621,48 @@ pr7_set() { # pr7_set <권위값> <미러값> — 대상 worktree 의 두 파일
       && git commit -qm "case" >/dev/null 2>&1 || true )
 }
 
-# (a) 정상 진행 — 권위·미러 모두 `검증 중`. rerun 이 둘 다 유지해야 한다.
+# (a) 진행 중 작업의 rerun — 무변경 거부
 pr7_set "검증 중" "검증 중"
+PR7A_AUTH_BEFORE="$(cat "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state")"
+PR7A_MIRROR_BEFORE="$(cat "$PR7_WT/CURRENT_TASK.md")"
+PR7A_WTLIST_BEFORE="$(cd "$PR7" && git worktree list --porcelain | LC_ALL=C sort)"
+PR7A_HEAD_BEFORE="$(cd "$PR7_WT" && git rev-parse HEAD)"
 pr7a_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
   && pr7a_rc=0 || pr7a_rc=$?
-# 실패했을 때만 출력을 드러낸다 — PASS 줄에 여러 줄 로그를 섞으면 결과가 읽기 어려워진다.
-[[ "$pr7a_rc" == "0" ]] || printf '  rerun(a) out: %s\n' "$pr7a_out" >&2
-assert_eq "$pr7a_rc" "0" "promote rerun(a): 진행된 작업의 rerun 은 성공한다"
-assert_eq "$(pr7_wt_state)" "검증 중" "promote rerun(a): 권위 불변"
-assert_eq "$(pr7_wt_status)" "검증 중" "promote rerun(a): 미러가 시작 상태로 되돌아가지 않는다"
-[[ "$pr7a_out" == *"권위 상태를 씁니다"* ]] && rc7=0 || rc7=1
-assert_eq "$rc7" "0" "promote rerun(a): 인자 무시를 사용자에게 알린다"
+assert_eq "$pr7a_rc" "1" "promote rerun(a): 진행 중 작업의 rerun 은 거부된다"
+[[ "$pr7a_out" == *"이미 진행 중"* ]] && rc7=0 || rc7=1
+assert_eq "$rc7" "0" "promote rerun(a): 거부 사유가 '이미 진행 중' 임을 알린다"
+assert_eq "$(cat "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state")" "$PR7A_AUTH_BEFORE" \
+  "promote rerun(a): 권위 byte 불변"
+assert_eq "$(cat "$PR7_WT/CURRENT_TASK.md")" "$PR7A_MIRROR_BEFORE" \
+  "promote rerun(a): 미러 byte 불변"
+assert_eq "$(cd "$PR7" && git worktree list --porcelain | LC_ALL=C sort)" "$PR7A_WTLIST_BEFORE" \
+  "promote rerun(a): worktree 목록 불변"
+assert_eq "$(cd "$PR7_WT" && git rev-parse HEAD)" "$PR7A_HEAD_BEFORE" "promote rerun(a): HEAD 불변"
 
-# (b) drift 복구 — 권위 `검증 중`, 미러 `대기 중`. **권위가 이겨야 한다.**
-#     미러를 채택하면 틀린 쪽이 이기고 drift 가 고착된다.
+# (b) 미러가 권위와 어긋난 상태여도 거부 경로가 미러를 덮어쓰지 않는다.
+#     (구 (c)(e)(h) 의 "실패 시 미러 byte 불변" 이 새 계약에서 살아남는 자리)
 pr7_set "검증 중" "대기 중"
+PR7B_MIRROR_BEFORE="$(cat "$PR7_WT/CURRENT_TASK.md")"
 pr7b_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
   && pr7b_rc=0 || pr7b_rc=$?
-[[ "$pr7b_rc" == "0" ]] || printf '  rerun(b) out: %s\n' "$pr7b_out" >&2
-assert_eq "$pr7b_rc" "0" "promote rerun(b): drift 상태의 rerun 은 성공한다"
+assert_eq "$pr7b_rc" "1" "promote rerun(b): drift 상태의 rerun 도 거부된다"
 assert_eq "$(pr7_wt_state)" "검증 중" "promote rerun(b): 권위 불변"
-assert_eq "$(pr7_wt_status)" "검증 중" "promote rerun(b): 미러를 권위 값으로 복구한다"
+assert_eq "$(cat "$PR7_WT/CURRENT_TASK.md")" "$PR7B_MIRROR_BEFORE" \
+  "promote rerun(b): 어긋난 미러도 덮어쓰지 않는다 (baseline 초기화 없음)"
 
-# (c) 권위가 비canonical 이면 fail-closed — 미러도 손대지 않는다
-pr7_set "얼렁뚱땅" "검증 중"
-PR7C_MIRROR_BEFORE="$(cat "$PR7_WT/CURRENT_TASK.md")"
+# (c) worktree 가 사라진 작업의 rerun 은 재부착(resume)으로 성공하고, 진행 단계를
+#     시작 상태(`--size large` = `대기 중`)로 되돌리지 않는다.
+pr7_set "검증 중" "검증 중"
+( cd "$PR7" && git worktree remove --force "$PR7_WT" >/dev/null 2>&1 || true )
+assert_eq "$([[ -e "$PR7_WT" ]] && echo yes || echo no)" "no" "promote rerun(c): 사전 조건(worktree 제거)"
 pr7c_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
   && pr7c_rc=0 || pr7c_rc=$?
-assert_eq "$pr7c_rc" "1" "promote rerun(c): 비canonical 권위는 exit 1"
-[[ "$pr7c_out" == *"canonical"* ]] && rc7c=0 || rc7c=1
-assert_eq "$rc7c" "0" "promote rerun(c): 사유가 canonical 위반임을 지목한다"
-assert_eq "$(cat "$PR7_WT/CURRENT_TASK.md")" "$PR7C_MIRROR_BEFORE" \
-  "promote rerun(c): 실패 시 미러 byte 불변"
-
-# (e) 미러 slug drift + 권위 손상 → **미러 byte 불변** (3라운드 Finding 1)
-#     baseline 초기화가 권위 검증보다 앞에 있으면, "상태 변경 없음" 이라고 실패하면서
-#     미러는 이미 baseline 으로 덮여 있다.
-pr7_set "검증 중" "검증 중"
-# 미러의 slug 를 흐트러 놓는다 — 이 상태에서 초기화가 먼저 돌면 파일 전체가 날아간다.
-awk '/^## Short Title/{print; f=1; next} f && /^[^#]/{print "다른이름"; f=0; next} {print}' \
-  "$PR7_WT/CURRENT_TASK.md" > "$PR7_WT/.ct.tmp" && mv "$PR7_WT/.ct.tmp" "$PR7_WT/CURRENT_TASK.md"
-printf '\n## Notes\n진행 중 기록 — 지워지면 안 된다\n' >> "$PR7_WT/CURRENT_TASK.md"
-sed -i.bak 's/^status=.*/status=얼렁뚱땅/' "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state"
-rm -f "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state.bak"
-( cd "$PR7_WT" && git add -A && git commit -qm "drift" >/dev/null 2>&1 || true )
-PR7E_BEFORE="$(cat "$PR7_WT/CURRENT_TASK.md")"
-pr7e_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7e_rc=0 || pr7e_rc=$?
-assert_eq "$pr7e_rc" "1" "promote rerun(e): slug drift + 권위 손상은 exit 1"
-assert_eq "$(cat "$PR7_WT/CURRENT_TASK.md")" "$PR7E_BEFORE" \
-  "promote rerun(e): 실패 시 미러 byte 불변 (baseline 초기화가 앞서지 않는다)"
-
-# (f) 미러 slug drift + 정상 권위 → 비대상 섹션 보존 + slug·status 복구
-#     rerun 에서 전체 baseline 초기화가 돌면 Notes 가 사라진다.
-sed -i.bak 's/^status=.*/status=검증 중/' "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state"
-rm -f "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state.bak"
-( cd "$PR7_WT" && git add -A && git commit -qm "fix-authority" >/dev/null 2>&1 || true )
-pr7f_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7f_rc=0 || pr7f_rc=$?
-[[ "$pr7f_rc" == "0" ]] || printf '  rerun(f) out: %s\n' "$pr7f_out" >&2
-assert_eq "$pr7f_rc" "0" "promote rerun(f): slug drift + 정상 권위는 성공한다"
-grep -q "진행 중 기록" "$PR7_WT/CURRENT_TASK.md" && rc7f=0 || rc7f=1
-assert_eq "$rc7f" "0" "promote rerun(f): 비대상 섹션(Notes)을 보존한다"
-assert_eq "$(awk '/^## Short Title/{f=1;next} f && /^[^#]/{print;exit}' "$PR7_WT/CURRENT_TASK.md")" \
-  "prt" "promote rerun(f): 미러 slug 를 복구한다"
-assert_eq "$(pr7_wt_status)" "검증 중" "promote rerun(f): 미러 status 를 권위 값으로 복구한다"
-
-# (g) worktree 가 제거된 상태 + 손상 권위 → **worktree 를 만들지 않는다** (4라운드 Finding 1)
-#     권위 검증이 Step C 뒤에 있으면 `git worktree add` 로 새 worktree 와 등록을 만든 뒤
-#     "(상태 변경 없음)" 이라며 실패한다. fail-closed 는 worktree 목록·HEAD 도 포함한다.
-pr7_set "검증 중" "검증 중"
-# 권위를 손상시킨 상태를 브랜치에 커밋한 뒤 worktree 만 제거한다 — metadata 는 남는다.
-sed -i.bak 's/^status=.*/status=얼렁뚱땅/' "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state"
-rm -f "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state.bak"
-( cd "$PR7_WT" && git add -A && git commit -qm "corrupt" >/dev/null 2>&1 || true )
-( cd "$PR7" && git worktree remove --force "$PR7_WT" >/dev/null 2>&1 || true )
-PR7G_WTLIST_BEFORE="$(cd "$PR7" && git worktree list --porcelain | LC_ALL=C sort)"
-PR7G_HEAD_BEFORE="$(cd "$PR7" && git rev-parse --abbrev-ref HEAD)"
-pr7g_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7g_rc=0 || pr7g_rc=$?
-assert_eq "$pr7g_rc" "1" "promote rerun(g): worktree 부재 + 손상 권위는 exit 1"
-assert_eq "$([[ -e "$PR7_WT" ]] && echo yes || echo no)" "no" \
-  "promote rerun(g): 실패했으므로 worktree 를 만들지 않았다"
-assert_eq "$(cd "$PR7" && git worktree list --porcelain | LC_ALL=C sort)" "$PR7G_WTLIST_BEFORE" \
-  "promote rerun(g): worktree 목록 불변"
-assert_eq "$(cd "$PR7" && git rev-parse --abbrev-ref HEAD)" "$PR7G_HEAD_BEFORE" \
-  "promote rerun(g): HEAD 불변"
-
-# 권위를 되살리고 worktree 를 복원해 이후 케이스를 잇는다 (브랜치 blob 경로도 여기서 통과한다)
-( cd "$PR7" && git worktree add "$PR7_WT" fr/prt >/dev/null 2>&1 || true )
-pr7_set "검증 중" "검증 중"
-
-# (h) 미러에 대상 섹션이 하나라도 없으면 **부분 갱신 없이** 멈춘다 (4라운드 Finding 2)
-#     awk 는 있는 섹션만 바꾸므로, 검증이 뒤에 있으면 다른 필드는 이미 바뀐 뒤다.
-# **커밋하지 않는다** — 커밋하면 아래 `git checkout --` 복원이 무효가 되어 이후 케이스가
-# 섹션 없는 미러를 물려받는다 (처음 이렇게 썼다가 (d) 가 깨졌다).
-awk '!/^## Short Title$/{print} /^## Short Title$/{skip=1; next} skip && /^[^#]/{skip=0; next}' \
-  "$PR7_WT/CURRENT_TASK.md" > "$PR7_WT/.ct.tmp" && mv "$PR7_WT/.ct.tmp" "$PR7_WT/CURRENT_TASK.md"
-PR7H_BEFORE="$(cat "$PR7_WT/CURRENT_TASK.md")"
-pr7h_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7h_rc=0 || pr7h_rc=$?
-assert_eq "$pr7h_rc" "1" "promote rerun(h): 미러 섹션 부재는 exit 1"
-assert_eq "$(cat "$PR7_WT/CURRENT_TASK.md")" "$PR7H_BEFORE" \
-  "promote rerun(h): 섹션 부재 시 미러 byte 불변 (부분 갱신 없음)"
-[[ "$pr7h_out" == *"Short Title"* ]] && rc7h=0 || rc7h=1
-assert_eq "$rc7h" "0" "promote rerun(h): 없는 섹션을 지목한다"
-# 미러를 복원해 이후 케이스를 잇는다
-( cd "$PR7_WT" && git checkout -- CURRENT_TASK.md >/dev/null 2>&1 || true )
-pr7_set "검증 중" "검증 중"
-
-# (i) 등록된 worktree 는 있는데 **권위 파일만 사라진** 경우 → blob 으로 물러서지 않는다
-#     (5라운드 Finding 1)
-#
-# 물러서면 브랜치에 남은 승격 시점 blob(`대기 중`)을 채택해 미러 status 를 되돌리고,
-# 그 변경을 커밋하면서 "완료" 를 보고한다. 삭제된 권위 파일은 복구되지 않는다.
-pr7_set "검증 중" "검증 중"
-PR7I_MIRROR_BEFORE="$(cat "$PR7_WT/CURRENT_TASK.md")"
-PR7I_HEAD_BEFORE="$(cd "$PR7_WT" && git rev-parse HEAD)"
-PR7I_WTLIST_BEFORE="$(cd "$PR7" && git worktree list --porcelain | LC_ALL=C sort)"
-# 커밋하지 않고 지운다 — 워킹트리에서 사라진 상태가 이 케이스다
-rm -f "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state"
-pr7i_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7i_rc=0 || pr7i_rc=$?
-assert_eq "$pr7i_rc" "1" "promote rerun(i): worktree 는 있고 권위 파일만 없으면 exit 1"
-[[ "$pr7i_out" == *"물러서지 않습니다"* ]] && rc7i=0 || rc7i=1
-assert_eq "$rc7i" "0" "promote rerun(i): blob fallback 을 하지 않는 이유를 알린다"
-assert_eq "$(cat "$PR7_WT/CURRENT_TASK.md")" "$PR7I_MIRROR_BEFORE" \
-  "promote rerun(i): 미러 byte 불변"
-assert_eq "$(cd "$PR7_WT" && git rev-parse HEAD)" "$PR7I_HEAD_BEFORE" "promote rerun(i): HEAD 불변"
-assert_eq "$(cd "$PR7" && git worktree list --porcelain | LC_ALL=C sort)" "$PR7I_WTLIST_BEFORE" \
-  "promote rerun(i): worktree 목록 불변"
-# (j) **제품이 안내한 복구 절차를 그대로 따라도 현재 단계가 보존된다** (6라운드 Finding 1)
-#
-# 이 케이스의 핵심은 index/HEAD 와 워킹트리의 불일치다. 진행 중 status 갱신은 즉시
-# 커밋되지 않으므로 정상 상황에서도 index blob 은 승격 시점 값(`대기 중`)이고 워킹트리는
-# 현재 값(`검증 중`)이다. 여기서 권위 파일이 지워지면 `git checkout --` 단독은 **오래된
-# index 값을 되살린다** — 그대로 rerun 하면 입력과 복원값이 둘 다 `대기 중` 이라
-# 인자 무시 안내조차 나오지 않고 미러가 조용히 되돌아간다.
-#
-# 그래서 안내 절차의 2단계(set-status)까지 수행한 뒤 단계가 보존되는지 본다.
-# 사전 조건: index=대기 중(승격 시점 그대로), 워킹트리 권위·미러=검증 중(커밋 안 함)
-# (i) 가 파일을 지운 상태이므로 먼저 되살린다.
-( cd "$PR7_WT" && git checkout -- rd-workflow-workspace/.lifecycle/task-state >/dev/null 2>&1 || true )
-# index 에 승격 시점 값(`대기 중`)을 넣고, 워킹트리만 현재 값(`검증 중`)으로 둔다.
-# 앞선 케이스들이 커밋을 남겼으므로 index 를 명시적으로 되돌려야 이 상황이 만들어진다.
-sed -i.bak 's/^status=.*/status=대기 중/' "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state"
-rm -f "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state.bak"
-( cd "$PR7_WT" && git add rd-workflow-workspace/.lifecycle/task-state )
-sed -i.bak 's/^status=.*/status=검증 중/' "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state"
-rm -f "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state.bak"
-awk '/^## Status/{print; f=1; next} f && /^[^#]/{print "검증 중"; f=0; next} {print}' \
-  "$PR7_WT/CURRENT_TASK.md" > "$PR7_WT/.ct.tmp" && mv "$PR7_WT/.ct.tmp" "$PR7_WT/CURRENT_TASK.md"
-PR7J_INDEX="$(cd "$PR7_WT" && git show ":rd-workflow-workspace/.lifecycle/task-state" \
-  | awk -F= '$1=="status"{sub(/^[^=]+=/,"");print;exit}')"
-assert_eq "$PR7J_INDEX" "대기 중" "promote rerun(j): 사전 조건(index 는 승격 시점 값)"
-
-rm -f "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state"
-pr7j_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7j_rc=0 || pr7j_rc=$?
-assert_eq "$pr7j_rc" "1" "promote rerun(j): 권위 파일 삭제는 exit 1"
-# 안내가 미러의 현재 단계를 값으로 제시해야 한다 — 그것이 복구 목표다
-[[ "$pr7j_out" == *"현재 단계는 '검증 중'"* ]] && rc7j=0 || rc7j=1
-assert_eq "$rc7j" "0" "promote rerun(j): 안내가 미러의 현재 단계를 값으로 제시한다"
-[[ "$pr7j_out" == *"set-status"* ]] && rc7j2=0 || rc7j2=1
-assert_eq "$rc7j2" "0" "promote rerun(j): 안내가 checkout 단독이 아니라 status 복구까지 포함한다"
-
-# 안내된 절차 1) 2) 를 그대로 수행한다
-( cd "$PR7_WT" && git checkout -- rd-workflow-workspace/.lifecycle/task-state >/dev/null 2>&1 )
-( cd "$PR7_WT" && bash rd-workflow/scripts/rd task set-status "검증 중" --force >/dev/null 2>&1 ) \
-  || printf '  (j) set-status 실패\n' >&2
-assert_eq "$(pr7_wt_state)" "검증 중" "promote rerun(j): 안내 절차 수행 후 권위가 현재 단계"
-
-# 3) 재시도 — 단계가 보존되어야 한다
-pr7j2_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7j2_rc=0 || pr7j2_rc=$?
-[[ "$pr7j2_rc" == "0" ]] || printf '  rerun(j2) out: %s\n' "$pr7j2_out" >&2
-assert_eq "$pr7j2_rc" "0" "promote rerun(j): 안내 절차 후 재시도는 성공한다"
-assert_eq "$(pr7_wt_state)" "검증 중" "promote rerun(j): 재시도 후에도 권위가 보존된다"
-assert_eq "$(pr7_wt_status)" "검증 중" "promote rerun(j): 재시도 후에도 미러가 보존된다 (단계 회귀 없음)"
-
-pr7_set "검증 중" "검증 중"
-
-# (k) 미러 status 가 canonical 이 아니면 **값으로 제시하지 않는다** (7라운드 Finding 2)
-#
-# 안내는 사용자가 복사 실행하는 문자열이다. 미러에서 읽은 값을 검증 없이 따옴표 안에
-# 넣으면, 값에 `'` 나 `;` 가 있을 때 따옴표가 닫히고 임의 명령이 실행된다.
-# canonical 8종은 고정 집합이라 안전하고, 그 밖의 값은 노출하지 않는다.
-pr7_set "검증 중" "검증 중"
-PR7K_CANARY="${PR7}-canary"
-awk -v v="검증 중'; touch $PR7K_CANARY; #" \
-  '/^## Status/{print; f=1; next} f && /^[^#]/{print v; f=0; next} {print}' \
-  "$PR7_WT/CURRENT_TASK.md" > "$PR7_WT/.ct.tmp" && mv "$PR7_WT/.ct.tmp" "$PR7_WT/CURRENT_TASK.md"
-rm -f "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state"
-pr7k_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7k_rc=0 || pr7k_rc=$?
-assert_eq "$pr7k_rc" "1" "promote rerun(k): 권위 부재 + 비canonical 미러는 exit 1"
-[[ "$pr7k_out" == *"canonical 값을 얻지 못했습니다"* ]] && rc7k=0 || rc7k=1
-assert_eq "$rc7k" "0" "promote rerun(k): 비canonical 미러 값을 복구 목표로 제시하지 않는다"
-[[ "$pr7k_out" == *"touch $PR7K_CANARY"* ]] && rc7k2=1 || rc7k2=0
-assert_eq "$rc7k2" "0" "promote rerun(k): 손상된 미러 값을 명령 문자열에 넣지 않는다"
-assert_eq "$([[ -e "$PR7K_CANARY" ]] && echo yes || echo no)" "no" \
-  "promote rerun(k): 주입 문자열이 실행되지 않았다"
-( cd "$PR7_WT" && git checkout -- CURRENT_TASK.md rd-workflow-workspace/.lifecycle/task-state >/dev/null 2>&1 || true )
-pr7_set "검증 중" "검증 중"
-
-# (l) 복구 안내가 **status 외 필드도 확인 대상으로 알린다** (7라운드 Finding 1)
-#
-# 되살린 파일은 승격 시점 값이므로 `source-fr`·`short-title` 도 과거 값이 된다.
-# Source FR 은 되돌아가도 실행이 성공하므로 유실이 드러나지 않는다 — archive 가 다른 FR 을
-# 완료 처리한다. 그래서 안내가 세 필드를 모두 지목해야 한다.
-sed -i.bak 's|^source-fr=.*|source-fr=rd-workflow-workspace/backlog/items/2026-01-01-new.md|' \
-  "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state"
-rm -f "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state.bak"
-PR7L_SFR_BEFORE="$(awk -F= '$1=="source-fr"{sub(/^[^=]+=/,"");print;exit}' \
-  "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state")"
-PR7L_SFR_INDEX="$(cd "$PR7_WT" && git show ":rd-workflow-workspace/.lifecycle/task-state" \
-  | awk -F= '$1=="source-fr"{sub(/^[^=]+=/,"");print;exit}')"
-[[ "$PR7L_SFR_BEFORE" != "$PR7L_SFR_INDEX" ]] && rc7l0=0 || rc7l0=1
-assert_eq "$rc7l0" "0" "promote rerun(l): 사전 조건(워킹트리 source-fr 가 index 와 다르다)"
-rm -f "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state"
-pr7l_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7l_rc=0 || pr7l_rc=$?
-assert_eq "$pr7l_rc" "1" "promote rerun(l): 권위 부재는 exit 1"
-[[ "$pr7l_out" == *"source-fr"* ]] && rc7l=0 || rc7l=1
-assert_eq "$rc7l" "0" "promote rerun(l): 안내가 source-fr 를 확인 대상으로 지목한다"
-[[ "$pr7l_out" == *"short-title"* ]] && rc7l2=0 || rc7l2=1
-assert_eq "$rc7l2" "0" "promote rerun(l): 안내가 short-title 도 확인 대상으로 지목한다"
-[[ "$pr7l_out" == *"archive"* ]] && rc7l3=0 || rc7l3=1
-assert_eq "$rc7l3" "0" "promote rerun(l): Source FR 유실의 결과(archive 오처리)를 알린다"
-( cd "$PR7_WT" && git checkout -- rd-workflow-workspace/.lifecycle/task-state >/dev/null 2>&1 || true )
-pr7_set "검증 중" "검증 중"
-
-# (m) 안내된 명령은 **대상 worktree 에 묶여 있어야 한다** (8라운드 Finding 2)
-#
-# 1단계 checkout 은 subshell 이라 호출자의 cwd 를 바꾸지 않는다. 그래서 `cd` 없는
-# `rd task ...` 를 안내하면, 성실히 따른 사용자가 promote 를 호출한 기본 worktree 를
-# 고치고 대상에는 승격 시점 값이 남는다. 그 뒤 rerun 은 대상의 stale 값을 받아들인다.
-#
-# 검증 방식: 안내 문자열을 눈으로 확인하는 것이 아니라 **출력에서 추출해 그대로 실행**한다.
-# 실행 위치는 대상이 아닌 기본 worktree($PR7)이다 — 명령이 스스로 대상으로 이동하지
-# 않으면 대상 파일이 바뀌지 않으므로 단언이 깨진다.
-pr7_set "검증 중" "검증 중"
-# index 의 short-title 을 일부러 다른 값으로 커밋해 둔다. 그러면 checkout 으로 되살린
-# 파일은 `other` 를 담고, 안내된 set-title 이 **대상에** 적용되었을 때만 `prt` 가 된다 —
-# 기본 worktree 를 고쳤다면 대상은 `other` 로 남아 단언이 깨진다.
-( cd "$PR7_WT" \
-    && bash rd-workflow/scripts/rd task set-title other --force >/dev/null 2>&1 \
-    && git add rd-workflow-workspace/.lifecycle/task-state \
-    && git commit -qm "case-m" >/dev/null 2>&1 || true )
-# checkout 이 되살리는 값은 index 값이다 (승격 시점 값일 수도, 그 뒤 커밋된 값일 수도 있다).
-# "되살아났다" 를 판정하려면 기대값을 index 에서 읽어야 한다 — 상수로 박으면 fixture 의
-# 커밋 이력에 따라 깨진다.
-PR7M_INDEX="$(cd "$PR7_WT" && git show ":rd-workflow-workspace/.lifecycle/task-state" \
-  | awk -F= '$1=="status"{sub(/^[^=]+=/,"");print;exit}')"
-rm -f "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state"
-pr7m_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7m_rc=0 || pr7m_rc=$?
-assert_eq "$pr7m_rc" "1" "promote rerun(m): 권위 부재는 exit 1"
-# 안내에 나오는 모든 `rd task set-*` 명령이 대상 worktree 경로를 포함하는지
-pr7m_bad="$(printf '%s\n' "$pr7m_out" | grep 'rd task set-' | grep -vc -- "$PR7_WT" || true)"
-assert_eq "$pr7m_bad" "0" "promote rerun(m): 안내된 rd task 명령이 모두 대상 worktree 에 묶여 있다"
-# source-fr 안내가 존재하는지만 본다. **값 정책의 판정은 D12(n)(o) 로 옮겼다** —
-# change spec D12 로 미러가 `## Source FR` 을 담게 되면서, promote 는 미러 값이 계약을
-# 통과할 때 그 값을 제시한다. 이 케이스의 책임은 대상 바인딩이므로 여기서 값을 다시
-# 단언하면 두 곳이 같은 계약을 중복 고정하고, 한쪽만 고쳤을 때 거짓 실패를 낸다.
-pr7m_sfr="$(printf '%s\n' "$pr7m_out" | grep -c 'set-source-fr')"
-[[ "$pr7m_sfr" -ge 1 ]] && rc7m1=0 || rc7m1=1
-assert_eq "$rc7m1" "0" "promote rerun(m): 안내에 source-fr 복구 명령이 있다"
-# 추출 실행 — checkout 과 set-title 을 출력 그대로, 기본 worktree 에서 실행한다
-pr7m_cmds="$(printf '%s\n' "$pr7m_out" | sed -n 's/^ *(\(cd .*\))$/(\1)/p' | grep -v 'set-source-fr')"
-[[ -n "$pr7m_cmds" ]] && rc7m2=0 || rc7m2=1
-assert_eq "$rc7m2" "0" "promote rerun(m): 실행 가능한 안내 명령을 출력에서 추출할 수 있다"
-( cd "$PR7" && eval "$pr7m_cmds" >/dev/null 2>&1 || true )
-assert_eq "$(pr7_wt_state)" "$PR7M_INDEX" "promote rerun(m): 추출 실행이 대상 worktree 파일을 되살린다"
-pr7m_title="$(awk -F= '$1=="short-title"{sub(/^[^=]+=/,"");print;exit}' \
-  "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state")"
-assert_eq "$pr7m_title" "prt" "promote rerun(m): set-title 이 대상 worktree 에 적용된다"
-( cd "$PR7_WT" && bash rd-workflow/scripts/rd task set-status "검증 중" --force >/dev/null 2>&1 || true )
-pr7m2_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7m2_rc=0 || pr7m2_rc=$?
-assert_eq "$pr7m2_rc" "0" "promote rerun(m): 안내 절차 후 재시도는 성공한다"
-assert_eq "$(pr7_wt_state)" "검증 중" "promote rerun(m): 재시도 후 권위가 보존된다"
+[[ "$pr7c_rc" == "0" ]] || printf '  rerun(c) out: %s\n' "$pr7c_out" >&2
+assert_eq "$pr7c_rc" "0" "promote rerun(c): worktree 부재 작업의 재부착은 성공한다"
+assert_eq "$([[ -d "$PR7_WT" ]] && echo yes || echo no)" "yes" "promote rerun(c): worktree 재생성"
+assert_eq "$(pr7_wt_state)" "검증 중" "promote rerun(c): 권위 단계 보존"
+assert_eq "$(pr7_wt_status)" "검증 중" "promote rerun(c): 미러 단계 보존 (회귀 없음)"
 pr7_set "검증 중" "검증 중"
 
 # --- D12: source-fr divergence (change spec D12-4, AC 29·30) ---
@@ -1808,59 +1680,24 @@ pr7_mirror_sfr() { awk '$0=="## Source FR"{f=1;next} f && /^[^#]/{print;exit}' \
 pr7_rd() { ( cd "$PR7_WT" && bash rd-workflow/scripts/rd "$@" ); }
 
 # 씨앗: 양쪽을 OLD 로 맞춰 커밋한다 (= index 값)
+# `set-source-fr` 는 change-spec AC C-13 에 따라 파일 실존을 요구하므로(오등록이 마감
+# 시점에야 드러나는 것을 막기 위함) 픽스처 items 파일을 실제로 만든다.
+mkdir -p "$PR7_WT/rd-workflow-workspace/backlog/items"
+printf -- '# old\n- status: validated\n' > "$PR7_WT/$PR7_SFR_OLD"
+printf -- '# new\n- status: validated\n' > "$PR7_WT/$PR7_SFR_NEW"
 pr7_set "검증 중" "검증 중"
 pr7_rd task set-source-fr "$PR7_SFR_OLD" >/dev/null 2>&1
 ( cd "$PR7_WT" && git add CURRENT_TASK.md rd-workflow-workspace/.lifecycle/task-state \
     && git commit -qm "d12-seed" >/dev/null 2>&1 || true )
 assert_eq "$(pr7_mirror_sfr)" "$PR7_SFR_OLD" "promote D12: 씨앗 — 미러에 source-fr 가 보인다"
 
-# (n) 권위와 미러가 다르면 fail-closed (AC 29)
-sed -i.bak "s|^source-fr=.*|source-fr=$PR7_SFR_NEW|" \
-  "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state"
-rm -f "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state.bak"
-PR7N_AUTH_B="$(md5 -q "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state" 2>/dev/null \
-  || md5sum "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state" | cut -d' ' -f1)"
-PR7N_MIR_B="$(md5 -q "$PR7_WT/CURRENT_TASK.md" 2>/dev/null \
-  || md5sum "$PR7_WT/CURRENT_TASK.md" | cut -d' ' -f1)"
-PR7N_HEAD="$(cd "$PR7_WT" && git rev-parse HEAD)"
-pr7n_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7n_rc=0 || pr7n_rc=$?
-assert_eq "$pr7n_rc" "1" "promote D12(n): source-fr divergence 는 exit 1"
-[[ "$pr7n_out" == *"$PR7_SFR_NEW"* && "$pr7n_out" == *"$PR7_SFR_OLD"* ]] && rc7n=0 || rc7n=1
-assert_eq "$rc7n" "0" "promote D12(n): 출력에 권위·미러 두 값이 모두 나온다"
-PR7N_AUTH_A="$(md5 -q "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state" 2>/dev/null \
-  || md5sum "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state" | cut -d' ' -f1)"
-PR7N_MIR_A="$(md5 -q "$PR7_WT/CURRENT_TASK.md" 2>/dev/null \
-  || md5sum "$PR7_WT/CURRENT_TASK.md" | cut -d' ' -f1)"
-assert_eq "$PR7N_AUTH_A" "$PR7N_AUTH_B" "promote D12(n): 권위 파일 바이트 불변"
-assert_eq "$PR7N_MIR_A" "$PR7N_MIR_B" "promote D12(n): 미러 파일 바이트 불변"
-assert_eq "$(cd "$PR7_WT" && git rev-parse HEAD)" "$PR7N_HEAD" "promote D12(n): HEAD 불변"
-
-# (o) Turn 016 Finding 1 의 종결 조건 — checkout 만 하고 재시도하면 막히고,
-#     양쪽을 함께 갱신한 뒤에는 **최신 값으로** 성공한다 (AC 30)
-pr7_rd task set-source-fr "$PR7_SFR_NEW" >/dev/null 2>&1
-assert_eq "$(pr7_mirror_sfr)" "$PR7_SFR_NEW" "promote D12(o): 사전 조건 — 양쪽이 최신 값"
-rm -f "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state"
-pr7o_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7o_rc=0 || pr7o_rc=$?
-assert_eq "$pr7o_rc" "1" "promote D12(o): 권위 부재는 exit 1"
-[[ "$pr7o_out" == *"$PR7_SFR_NEW"* ]] && rc7o=0 || rc7o=1
-assert_eq "$rc7o" "0" "promote D12(o): 복구 안내가 미러의 현재 source-fr 를 제시한다"
-# 사용자가 1단계만 실행 — 권위는 index 의 OLD 로 돌아간다
-( cd "$PR7_WT" && git checkout -- rd-workflow-workspace/.lifecycle/task-state )
-assert_eq "$(pr7_auth_sfr)" "$PR7_SFR_OLD" "promote D12(o): checkout 만 하면 권위가 stale"
-pr7o2_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7o2_rc=0 || pr7o2_rc=$?
-assert_eq "$pr7o2_rc" "1" "promote D12(o): checkout 만 한 재시도는 divergence 로 막힌다"
-assert_eq "$(pr7_auth_sfr)" "$PR7_SFR_OLD" "promote D12(o): 막힌 재시도는 아무것도 바꾸지 않는다"
-# 안내대로 양쪽을 함께 갱신하면 통과하고 최신 값이 보존된다
-pr7_rd task set-source-fr "$PR7_SFR_NEW" >/dev/null 2>&1
-pr7o3_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
-  && pr7o3_rc=0 || pr7o3_rc=$?
-assert_eq "$pr7o3_rc" "0" "promote D12(o): 양쪽 갱신 후 재시도는 성공한다"
-assert_eq "$(pr7_auth_sfr)" "$PR7_SFR_NEW" "promote D12(o): 최신 source-fr 가 보존된다"
-( cd "$PR7_WT" && git add -A && git commit -qm "d12-end" >/dev/null 2>&1 || true )
-pr7_set "검증 중" "검증 중"
+# (n)(o) 는 제거했습니다 — 새 계약에서 개념이 사라졌습니다.
+# 두 케이스는 **살아 있는 worktree 를 둔 채** source-fr divergence 를 만들고, promote 가
+# 권위·미러 두 값을 출력해 복구 절차(checkout → set-source-fr → 재시도)를 안내하는 것을
+# 고정했습니다. 재설계 이후 살아 있는 worktree 의 rerun 은 D11 이 `duplicate`(또는 미커밋이면
+# `divergent`)로 먼저 거부하므로 그 경로에 도달하지 않고, promote.sh 에 그 값 제시·복구 안내
+# 문구도 더 이상 없습니다. divergence 를 실제로 판정하는 자리는 worktree 가 없는 재개(resume)
+# 경로 하나이며, 그것은 아래 (p)(q) 가 그대로 봅니다.
 
 # (p)(q) worktree 부재 경로 — **권위와 미러의 출처가 짝지어져야 한다**
 #        (final diff review 9라운드 Finding 1)
@@ -1903,10 +1740,12 @@ PR7Q_BRANCHES="$(cd "$PR7" && git branch --format='%(refname:short)' | LC_ALL=C 
 pr7q_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --size large 2>&1)" \
   && pr7q_rc=0 || pr7q_rc=$?
 assert_eq "$pr7q_rc" "1" "promote D12(q): 브랜치 blob 안의 divergence 는 exit 1"
-[[ "$pr7q_out" == *"$PR7_SFR_OLD"* && "$pr7q_out" == *"$PR7_SFR_NEW"* ]] && rc7q=0 || rc7q=1
-assert_eq "$rc7q" "0" "promote D12(q): 출력에 두 값이 모두 나온다"
-[[ "$pr7q_out" == *"git worktree add"* ]] && rc7q2=0 || rc7q2=1
-assert_eq "$rc7q2" "0" "promote D12(q): 작업 트리가 없으므로 마련 경로를 안내한다"
+# 새 계약의 메시지는 두 값을 나열하는 대신 **대조할 두 출처**를 지목한다 — 어느 쪽이
+# 최신인지 promote 가 고르지 않는다는 것이 이 판정의 핵심이기 때문이다.
+[[ "$pr7q_out" == *"권위(task-state)와 미러(CURRENT_TASK.md)에서 다릅니다"* ]] && rc7q=0 || rc7q=1
+assert_eq "$rc7q" "0" "promote D12(q): 사유가 권위·미러 divergence 임을 지목한다"
+[[ "$pr7q_out" == *"git show fr/prt:"* ]] && rc7q2=0 || rc7q2=1
+assert_eq "$rc7q2" "0" "promote D12(q): 대조할 두 blob 을 확인 명령으로 안내한다"
 assert_eq "$([[ -e "$PR7_WT" ]] && echo yes || echo no)" "no" \
   "promote D12(q): 실패했으므로 worktree 를 만들지 않았다"
 assert_eq "$(cd "$PR7" && git worktree list --porcelain | LC_ALL=C sort)" "$PR7Q_WTLIST" \
@@ -1921,79 +1760,20 @@ pr7_rd task set-source-fr "$PR7_SFR_OLD" >/dev/null 2>&1
 ( cd "$PR7_WT" && git add -A && git commit -qm "d12-restore" >/dev/null 2>&1 || true )
 pr7_set "검증 중" "검증 중"
 
-# (r) `worktree-path=null` 분기의 복구 안내가 **성공까지 이어지는가**
-#     (final diff review 재확인 세션 Finding 1)
-#
-# 이 분기는 (q) 와 복구 순서가 다르다. metadata 가 경로를 모르므로 다음 rerun 도
-# worktree 탐색을 하지 않고 **대상 브랜치 blob** 을 읽고, 기본 worktree 에서 브랜치를
-# checkout 한다. 따라서 ① 정정을 커밋해야 보이고 ② 임시 트리를 남기면 재시도가
-# 'already checked out' 으로 실패한다. 안내가 이 둘을 담지 않으면, 안내를 성실히
-# 따른 사용자가 같은 divergence 에 다시 막힌다.
-#
-# 검증 방식: 안내 문구 확인이 아니라 **그 순서를 실제로 실행하고 최종 성공까지** 본다.
-PR7R_BASE_BRANCH="$(cd "$PR7" && git rev-parse --abbrev-ref HEAD)"
-# 대상 브랜치 blob 에 divergence 를 심는다 (권위=OLD, 미러=NEW, 둘 다 커밋)
-pr7_rd task set-source-fr "$PR7_SFR_NEW" >/dev/null 2>&1
-( cd "$PR7_WT" && git add -A && git commit -qm "r-seed" >/dev/null 2>&1 || true )
-sed -i.bak "s|^source-fr=.*|source-fr=$PR7_SFR_OLD|" \
-  "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state"
-rm -f "$PR7_WT/rd-workflow-workspace/.lifecycle/task-state.bak"
-( cd "$PR7_WT" && git add rd-workflow-workspace/.lifecycle/task-state \
-    && git commit -qm "r-divergence" >/dev/null 2>&1 || true )
-# metadata 를 null 로 만들고 worktree 를 제거한다 (no-worktree 로 시작한 작업의 형태)
-sed -i.bak 's|^worktree-path=.*|worktree-path=null|' \
-  "$PR7/rd-workflow-workspace/.lifecycle/task-state"
-rm -f "$PR7/rd-workflow-workspace/.lifecycle/task-state.bak"
-# **커밋한다.** 실제 흐름에서 metadata 는 promote 가 커밋해 둔 상태이고, 미커밋으로 두면
-# no-worktree rerun 의 `git switch` 가 "local changes would be overwritten" 으로 거부한다
-# — 제품 결함이 아니라 fixture 가 실제 상태를 재현하지 못한 것이다.
-( cd "$PR7" && git add rd-workflow-workspace/.lifecycle/task-state \
-    && git commit -qm "r-metadata-null" >/dev/null 2>&1 || true )
-( cd "$PR7" && git worktree remove --force "$PR7_WT" >/dev/null 2>&1 || true )
-# `--worktree-path` 를 주지 않는다 — 주면 TARGET_WT_PATH 가 채워져 (q) 분기가 된다
-pr7r_out="$(run_promote "$PR7" --short-title prt --size large 2>&1)" \
-  && pr7r_rc=0 || pr7r_rc=$?
-assert_eq "$pr7r_rc" "1" "promote D12(r): worktree-path=null divergence 는 exit 1"
-[[ "$pr7r_out" == *"mktemp"* ]] && rc7r=0 || rc7r=1
-assert_eq "$rc7r" "0" "promote D12(r): 안내가 임시 트리 생성을 제시한다"
-[[ "$pr7r_out" == *"git commit"* ]] && rc7r2=0 || rc7r2=1
-assert_eq "$rc7r2" "0" "promote D12(r): 안내가 정정의 커밋을 요구한다 (blob 을 읽으므로)"
-[[ "$pr7r_out" == *"worktree remove"* ]] && rc7r3=0 || rc7r3=1
-assert_eq "$rc7r3" "0" "promote D12(r): 안내가 임시 트리 제거를 요구한다 (checkout 충돌 방지)"
-# 안내된 순서를 **출력에서 추출해 그대로 실행한다.** 안전한 상수 순서를 손으로 적으면
-# "내가 아는 올바른 순서" 를 검증하는 것이 되어, 안내가 틀려도 통과한다.
-# 사용자가 채워야 하는 값(`'<path|->'`)만 실제 값으로 바꾼다 — 그것이 안내의 계약이다.
-pr7r_script="$(printf '%s\n' "$pr7r_out" \
-  | sed -n 's/^ \{4,\}\([^#].*\)$/\1/p' \
-  | sed "s#'<path|->'#'$PR7_SFR_NEW'#")"
-[[ -n "$pr7r_script" ]] && rc7r4=0 || rc7r4=1
-assert_eq "$rc7r4" "0" "promote D12(r): 실행 가능한 복구 순서를 출력에서 추출할 수 있다"
-( cd "$PR7" && eval "$pr7r_script" ) >/dev/null 2>&1 || true
-pr7r2_out="$(run_promote "$PR7" --short-title prt --size large 2>&1)" \
-  && pr7r2_rc=0 || pr7r2_rc=$?
-assert_eq "$pr7r2_rc" "0" "promote D12(r): 안내 순서를 그대로 따르면 재시도가 성공한다"
-PR7R_FINAL="$(awk -F= '$1=="source-fr"{sub(/^[^=]+=/,"");print;exit}' \
-  "$PR7/rd-workflow-workspace/.lifecycle/task-state")"
-assert_eq "$PR7R_FINAL" "$PR7_SFR_NEW" "promote D12(r): 최신 source-fr 가 보존된다"
-# 이후 케이스를 위해 원래 배치로 되돌린다
-( cd "$PR7" && git switch "$PR7R_BASE_BRANCH" >/dev/null 2>&1 || true )
-( cd "$PR7" && git worktree add "$PR7_WT" fr/prt >/dev/null 2>&1 || true )
-sed -i.bak "s|^worktree-path=.*|worktree-path=$PR7_WT|" \
-  "$PR7/rd-workflow-workspace/.lifecycle/task-state"
-rm -f "$PR7/rd-workflow-workspace/.lifecycle/task-state.bak"
-( cd "$PR7" && git add rd-workflow-workspace/.lifecycle/task-state \
-    && git commit -qm "r-metadata-restore" >/dev/null 2>&1 || true )
-pr7_rd task set-source-fr "$PR7_SFR_OLD" >/dev/null 2>&1
-( cd "$PR7_WT" && git add -A && git commit -qm "r-restore" >/dev/null 2>&1 || true )
-pr7_set "검증 중" "검증 중"
+# (r) 는 제거했습니다 — 새 계약에서 개념이 사라졌습니다.
+# 이 케이스는 `worktree-path=null` 분기에서 promote 가 임시 트리 생성(mktemp)·정정 커밋·
+# 임시 트리 제거로 이어지는 복구 **순서**를 안내하고, 그 순서를 출력에서 추출해 실행하면
+# 재시도가 성공하는 것까지 고정했습니다. 재설계로 그 다단계 안내 자체가 promote.sh 에서
+# 사라졌고(지금은 대조할 두 blob 만 지목합니다), `--no-worktree` 착수도 기본 브랜치
+# 체크아웃에서만 허용되어 이 fixture 가 재현하던 배치가 성립하지 않습니다. divergence 를
+# 무변경으로 막는다는 실질은 (q) 가 봅니다.
 
 # (d) --status 경로도 같은 계약이다 — 임의 단계를 미러에 주입할 수 없어야 한다
 pr7_set "검증 중" "검증 중"
 pr7d_out="$(run_promote "$PR7" --short-title prt --worktree-path "$PR7_WT" --status "대기 중" 2>&1)" \
   && pr7d_rc=0 || pr7d_rc=$?
-[[ "$pr7d_rc" == "0" ]] || printf '  rerun(d) out: %s\n' "$pr7d_out" >&2
-assert_eq "$pr7d_rc" "0" "promote rerun(d): --status 경로 rerun 도 성공한다"
-assert_eq "$(pr7_wt_status)" "검증 중" "promote rerun(d): --status 로도 미러 불변"
+assert_eq "$pr7d_rc" "1" "promote rerun(d): --status 경로 rerun 도 거부된다"
+assert_eq "$(pr7_wt_status)" "검증 중" "promote rerun(d): --status 로도 미러 불변 (임의 단계 주입 불가)"
 ( cd "$PR7" && git worktree remove --force "$PR7_WT" >/dev/null 2>&1 || true )
 
 # (8) 실제 작업공간 불변
@@ -2007,21 +1787,27 @@ echo "== scenario 20: 얹힌 커밋 검사 =="
 
 # arc_setup — promote 를 마치고 fr 브랜치에 archive content 를 올린 repo 를 만든다.
 # 반환: repo 경로. 호출측은 기본 브랜치로 돌아온 상태를 받는다.
+#
+# 재설계 이후 기본 착수는 worktree 격리다 — 기본 체크아웃($d)은 계속 기본 브랜치에 머물고
+# fr 브랜치는 `$d/.worktrees/<slug>` 에 붙는다. 그래서 archive content 는 그 worktree 안에서
+# 커밋한다(종전에는 `$d` 자체가 fr 로 넘어갔으므로 `$d` 에서 커밋하고 기본 브랜치로 되돌렸다).
 arc_setup() {  # arc_setup <slug>
-  local slug="$1" d
+  local slug="$1" d out
   d="$(setup_repo main)"
-  run_promote "$d" --short-title "$slug" --size large >/dev/null 2>&1 \
-    || { printf 'arc_setup(%s): run_promote 실패 — fixture 구성 중단\n' "$slug" >&2; exit 1; }
+  out="$(run_promote "$d" --short-title "$slug" --size large 2>&1)" \
+    || { printf 'arc_setup(%s): run_promote 실패 — fixture 구성 중단: %s\n' "$slug" "$out" >&2; exit 1; }
+  [[ -d "$d/.worktrees/$slug" ]] \
+    || { printf 'arc_setup(%s): 착수 worktree 부재 — fixture 구성 중단\n' "$slug" >&2; exit 1; }
   (
-    cd "$d"
+    cd "$d/.worktrees/$slug"
     printf '# Change Request\n\n## Source FR\n-\n' > REQUEST.md
     mkdir -p rd-workflow-workspace/backlog/request-archive
     printf 'archived\n' > "rd-workflow-workspace/backlog/request-archive/x.md"
     bash rd-workflow/scripts/lifecycle/_emit_baseline_helper.sh 2>/dev/null \
       || ( . rd-workflow/scripts/lifecycle/_lifecycle_common.sh && emit_current_task_baseline > CURRENT_TASK.md )
     git add -A && git commit -q -m "docs: archive content"
-    git checkout -q main
-  ) >/dev/null 2>&1
+  ) >/dev/null 2>&1 \
+    || { printf 'arc_setup(%s): archive content 커밋 실패 — fixture 구성 중단\n' "$slug" >&2; exit 1; }
   echo "$d"
 }
 
@@ -2255,6 +2041,207 @@ _d="$(arc_setup test-spacepath)"
 _out="$(arc_archive "$_d")" && _rc=0 || _rc=$?
 [[ "$_rc" -ne 0 ]] && pass "회귀 10: 공백·따옴표 경로도 정확 판정" || fail "회귀 10: 판정 실패 — $_out"
 rm -rf "$_d"
+
+echo "== scenario 21: fr 브랜치 등록 → 기본 브랜치 직접 행 추가 → archive 종착 (AC 13) =="
+REPO="$(setup_repo)"
+_IDX="rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
+( cd "$REPO" && mkdir -p rd-workflow-workspace/backlog/items rd-workflow-workspace/raw-captures \
+  && printf '# FR\n\n## 인덱스\n\n| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |\n|---|---|---|---|---|---|---|\n' > "$_IDX" \
+  && : > rd-workflow-workspace/raw-captures/.gitkeep && git add -A && git commit -q -m "backlog 초기" )
+run_promote "$REPO" --short-title test-reg --no-worktree --size small >/dev/null
+# fr 브랜치에서 /fr add 쓰기 단계 모사 + helper
+( cd "$REPO" && printf '| 2026-02-02 | reg-a | s | tooling | idea | - | [상세](items/2026-02-02-reg-a.md) |\n' >> "$_IDX" \
+  && printf '# reg-a\n- status: idea\n' > rd-workflow-workspace/backlog/items/2026-02-02-reg-a.md \
+  && printf -- '---\nstage: fr\n---\n' > rd-workflow-workspace/raw-captures/2026-02-02-fr-reg-a.md )
+out="$(cd "$REPO" && bash rd-workflow/scripts/rd task fr-register --slug reg-a 2>&1)"
+[[ "$out" == "result=committed branch=main"* ]] && pass "s21: fr 브랜치에서 등록 → main 커밋" || fail "s21: fr-register — $out"
+# iteration commit (등록 파일이 fr 브랜치에도 실림 — 동일 내용)
+( cd "$REPO" && echo impl > impl.txt && git add -A && git commit -q -m "구현" )
+# 기본 브랜치에 다른 FR 행 직접 추가 (동시 등록 변형)
+( cd "$REPO" && git switch -q main && printf '| 2026-02-03 | other-x | s | tooling | idea | - | [상세](items/2026-02-03-other-x.md) |\n' >> "$_IDX" \
+  && printf '# other-x\n' > rd-workflow-workspace/backlog/items/2026-02-03-other-x.md && git add -A && git commit -q -m "docs: FR 등록 — other-x" && git switch -q fr/test-reg )
+# archive content commit
+( cd "$REPO" && echo "# archived" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" )
+arc_out="$( cd "$REPO" && git switch -q main && bash rd-workflow/scripts/lifecycle/archive.sh --task test-reg --no-remote --force-skip-review-check "통합 테스트 fixture" 2>&1 )" \
+  && pass "s21: archive.sh 완료 (인덱스 충돌 자동 해결)" || fail "s21: archive 실패 — $arc_out"
+[[ "$arc_out" == *"행 집합 병합으로 해결"* ]] && pass "s21: 행 집합 병합 안내 출력" || fail "s21: 병합 안내 없음"
+( cd "$REPO" && [[ "$(grep -c '| reg-a |' "$_IDX")" == 1 && "$(grep -c '| other-x |' "$_IDX")" == 1 ]] ) && pass "s21: 인덱스 행 reg-a 1·other-x 1 (중복 없음)" || fail "s21: 행 수 — $(cd "$REPO" && cat "$_IDX")"
+( cd "$REPO" && [[ -f rd-workflow-workspace/backlog/items/2026-02-02-reg-a.md && -f rd-workflow-workspace/raw-captures/2026-02-02-fr-reg-a.md ]] ) && pass "s21: 상세 1·캡처 1 존재" || fail "s21: 상세/캡처 부재"
+( cd "$REPO" && [[ -z "$(git status --porcelain | grep -v review-skip-audit.log)" && "$(git worktree list | wc -l | tr -d ' ')" == 1 && ! "$(git for-each-ref --format='%(refname)')" == *"fr/test-reg"* ]] ) && pass "s21: clean + 임시 worktree·브랜치 없음" || fail "s21: 잔존 — $(cd "$REPO" && git status --porcelain; git for-each-ref)"
+rm -rf "$REPO"
+
+# === Scenario 22: 정상 경로 E2E (fr 모드) + 권위 tree (change spec §4.2·§3.3.1) ===
+#
+# **시간 예산 사유** (절대 규칙 ③): 이 케이스는 promote → 구현 커밋 → 리뷰 세션 생성 →
+# 종결 → seal → 상태 전이 → 게이트 → 기록 커밋 → archive 까지를 한 저장소에서 이어 돌리므로
+# 수 초를 넘습니다(실측 ~15초). 그 비용을 지불하는 이유는 **초안의 순환 의존**이 단위
+# 테스트로는 잡히지 않기 때문입니다 — 「보류 상태여야 기록 커밋 허용 + 기록 커밋 후 보류
+# 전이」는 각 단계를 따로 시험하면 전부 통과하고, 진입부터 발행까지 이어 붙였을 때만
+# "들어갈 수 없는 상태" 가 드러납니다. 각 단계를 쪼갠 단위 테스트로는 대체되지 않습니다.
+echo "== scenario 22: 정상 경로 E2E + 권위 tree =="
+
+# add_review_scripts <repo> — prepare/init_review_pipeline 은 setup_repo 가 복사하지 않습니다.
+add_review_scripts() {
+  cp "$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/prepare_review_pipeline.sh" "$1/rd-workflow/scripts/"
+  cp "$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/init_review_pipeline.sh" "$1/rd-workflow/scripts/"
+}
+# close_session <session-dir> — Status=closed + Open Issues=`- 없음` (정상 종결 형태)
+close_session() {
+  local t
+  t="$(mktemp)" || { echo "test_integration.sh: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$t" && -f "$t" ]] || { echo "test_integration.sh: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  awk '/^## Status$/{print; getline; print "closed"; next} {print}' "$1/SESSION.md" > "$t" && mv "$t" "$1/SESSION.md"
+  t="$(mktemp)" || { echo "test_integration.sh: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$t" && -f "$t" ]] || { echo "test_integration.sh: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  awk '/^## Open Issues$/{s=1; print; next} s && /^## /{s=0} s && $0=="-"{print "- 없음"; next} {print}' \
+    "$1/CHECKPOINT.md" > "$t" && mv "$t" "$1/CHECKPOINT.md"
+}
+# latest_diff_session <repo> — 최신 final-diff-review 세션 경로 (없으면 빈 문자열)
+latest_diff_session() {
+  local p=""
+  p="$(ls -d "$1"/rd-workflow-workspace/handoffs/review_pipeline/*final-diff-review 2>/dev/null | tail -1)" || p=""
+  printf '%s' "$p"
+}
+
+REPO="$(setup_repo)"
+add_review_scripts "$REPO"
+run_promote "$REPO" --short-title e2e --size small --no-worktree >/dev/null
+# fr 브랜치 위의 구현 커밋 — 이것이 리뷰 대상(보호 경로)입니다.
+( cd "$REPO" && printf 'code\n' > src.txt && git add -A && git commit -q -m "구현" )
+( cd "$REPO" && bash rd-workflow/scripts/prepare_review_pipeline.sh diff >/dev/null 2>&1 ) \
+  && pass "e2e: diff 세션 생성 (fr-branch → merge-base)" || fail "e2e: diff 세션 생성 실패"
+E2E_SES="$(latest_diff_session "$REPO")"
+[[ -n "$E2E_SES" ]] && pass "e2e: 세션 경로 확인" || fail "e2e: 세션 부재"
+( cd "$REPO" && grep -q "^review-session=$(basename "$E2E_SES")$" rd-workflow-workspace/.lifecycle/task-state ) \
+  && pass "e2e: task-state review-session 포인터 기록" || fail "e2e: 포인터 미기록"
+
+close_session "$E2E_SES"
+( cd "$REPO" && bash rd-workflow/scripts/rd review seal "$E2E_SES" >/dev/null 2>&1 ) \
+  && pass "e2e: seal 성공 (리뷰된 head == 현재 트리)" || fail "e2e: seal 실패"
+for _st in "검증 중" "diff review 대기" "아카이브 보류"; do
+  ( cd "$REPO" && bash rd-workflow/scripts/rd task set-status "$_st" >/dev/null 2>&1 ) \
+    || fail "e2e: set-status $_st 실패"
+done
+( cd "$REPO" && grep -q '^status=아카이브 보류$' rd-workflow-workspace/.lifecycle/task-state ) \
+  && pass "e2e: 아카이브 보류 진입 (seal 뒤·기록 커밋 앞)" || fail "e2e: 보류 전이 실패"
+
+# 권위 tree 음성 — 포인터·상태만 먼저 커밋해 **마커만 워킹트리에 남은** 상태를 만듭니다.
+( cd "$REPO" && git add rd-workflow-workspace/.lifecycle/task-state CURRENT_TASK.md \
+  && git commit -q -m "chore: 리뷰 포인터·상태" )
+_e2e_err="$( cd "$REPO" && git switch -q main \
+  && bash rd-workflow/scripts/lifecycle/archive.sh --task e2e --no-remote --force-dirty 2>&1 || true )"
+[[ "$_e2e_err" == *"마커 없음"* ]] \
+  && pass "e2e: 워킹트리에만 있는 마커로는 통과 못 함 (§3.3.1)" || fail "e2e: 마커 없음 차단 아님 — $_e2e_err"
+
+# 기록 커밋 — FR 은 아직 idea 입니다. 이 시점에 게이트가 통과해야 §4.2 순서가 성립합니다
+# (게이트가 보류 상태를 인정하지 않으면 「기록 커밋 → 보류 전이」 순환으로 되돌아갑니다).
+( cd "$REPO" && git switch -q fr/e2e \
+  && mkdir -p rd-workflow-workspace/backlog/items rd-workflow-workspace/backlog/request-archive \
+  && printf '# e2e\n- status: idea\n' > rd-workflow-workspace/backlog/items/2026-09-06-e2e.md \
+  && printf '# Change Request\n\n## Source FR\nrd-workflow-workspace/backlog/items/2026-09-06-e2e.md\n' > REQUEST.md \
+  && git add -A && git commit -q -m "docs: FR 등록" )
+#
+# **게이트 판정 시점에 REQUEST.md 의 Source FR 이 살아 있어야 합니다.** 먼저 비우면 게이트가
+# "아카이브 불필요" 로 조기 통과해, 정작 보고 싶은 §4.3 예외 분기를 지나지 않습니다.
+( cd "$REPO" \
+  && cp REQUEST.md rd-workflow-workspace/backlog/request-archive/2026-09-06-0000-e2e.md \
+  && git add rd-workflow-workspace/backlog/request-archive rd-workflow-workspace/.lifecycle/review-seals )
+_gate_rc=0
+( cd "$REPO" && printf '{"tool_input":{"command":"git commit -m 기록"}}' \
+  | bash rd-workflow/scripts/hooks/pre_commit_archive_gate.sh >/dev/null 2>&1 ) || _gate_rc=$?
+[[ "$_gate_rc" -eq 0 ]] \
+  && pass "e2e: 보류 상태 + 기록 경로만 staged → 게이트 통과 (순환 없음)" \
+  || fail "e2e: 게이트가 기록 커밋을 차단 (exit=$_gate_rc)"
+( cd "$REPO" && printf '# Change Request\n\n## Source FR\n-\n' > REQUEST.md \
+  && sed 's/^- status: idea$/- status: done/' rd-workflow-workspace/backlog/items/2026-09-06-e2e.md > "$REPO/.fr.tmp" \
+  && mv "$REPO/.fr.tmp" rd-workflow-workspace/backlog/items/2026-09-06-e2e.md \
+  && git add -A && git commit -q -m "docs: REQUEST 아카이브" )
+
+# 발행 — `--force-skip-review-check` 없이 통과해야 합니다. 기본 브랜치 워킹트리에는 마커가
+# 없고 fr tip 에만 있으므로, 이것이 §3.3.1 권위 tree 의 양성 케이스입니다.
+_e2e_out="$( cd "$REPO" && git switch -q main \
+  && bash rd-workflow/scripts/lifecycle/archive.sh --task e2e --no-remote 2>&1 )" && _e2e_rc=0 || _e2e_rc=$?
+[[ "$_e2e_rc" -eq 0 ]] \
+  && pass "e2e: archive 발행 완료 (fr tip 마커로 검증, force-skip 없음)" \
+  || fail "e2e: archive 실패 (exit=$_e2e_rc) — $_e2e_out"
+( cd "$REPO" && git tag --list "fr/*/e2e" | grep -q . ) && pass "e2e: tag 생성" || fail "e2e: tag 부재"
+( cd "$REPO" && ! git rev-parse --verify fr/e2e >/dev/null 2>&1 ) \
+  && pass "e2e: fr 브랜치 정리" || fail "e2e: fr 브랜치 잔존"
+( cd "$REPO" && grep -q '^status=대기 중$' rd-workflow-workspace/.lifecycle/task-state ) \
+  && pass "e2e: task-state baseline 복귀" || fail "e2e: task-state 미복귀"
+rm -rf "$REPO"
+
+# === Scenario 23: no-fr archive + 실행 브랜치 안전 + sentinel (change spec §5.1·§3.2.2) ===
+#
+# **시간 예산 사유** (절대 규칙 ③): 위와 같은 이유로 수 초를 넘습니다(실측 ~10초).
+# 목적은 **no-fr archive 완주**입니다 — 진입 조건만 단위로 시험하면 merge·branch 삭제·
+# worktree 정리를 건너뛴 경로가 tag·push 까지 실제로 도달하는지 알 수 없습니다.
+# fr 경로 무변화는 scenario 1·11·12·21 이 이미 매 실행마다 확인하므로 여기서 다시 만들지 않습니다.
+echo "== scenario 23: no-fr archive / 브랜치 안전 / sentinel =="
+REPO="$(setup_repo)"
+add_review_scripts "$REPO"
+BARE23="$(mk_bare 23)"
+( cd "$REPO" && git remote add origin "$BARE23" && git push -q origin main )
+( cd "$REPO" && bash rd-workflow/scripts/rd task set-title nofr >/dev/null 2>&1 \
+  && bash rd-workflow/scripts/rd task set-base HEAD >/dev/null 2>&1 \
+  && bash rd-workflow/scripts/rd task set-status "구현 중" >/dev/null 2>&1 ) \
+  && pass "no-fr: task-state 준비 (base-commit 설정)" || fail "no-fr: task-state 준비 실패"
+( cd "$REPO" && printf 'code\n' > src.txt && git add -A && git commit -q -m "구현" )
+( cd "$REPO" && bash rd-workflow/scripts/prepare_review_pipeline.sh diff >/dev/null 2>&1 ) \
+  && pass "no-fr: base-commit 으로 diff 세션 생성" || fail "no-fr: 세션 생성 실패"
+NOFR_SES="$(latest_diff_session "$REPO")"
+close_session "$NOFR_SES"
+( cd "$REPO" && bash rd-workflow/scripts/rd review seal "$NOFR_SES" >/dev/null 2>&1 ) \
+  && pass "no-fr: seal 성공 (branch-mode=no-fr)" || fail "no-fr: seal 실패"
+( grep -q '^branch-mode=no-fr$' "$REPO/rd-workflow-workspace/.lifecycle/review-seals/$(basename "$NOFR_SES").seal" \
+  && grep -q '^fr-branch=null$' "$REPO/rd-workflow-workspace/.lifecycle/review-seals/$(basename "$NOFR_SES").seal" ) \
+  && pass "no-fr: 마커에 no-fr 표기" || fail "no-fr: 마커 표기 오류"
+for _st in "검증 중" "diff review 대기" "아카이브 보류"; do
+  ( cd "$REPO" && bash rd-workflow/scripts/rd task set-status "$_st" >/dev/null 2>&1 ) || fail "no-fr: set-status $_st 실패"
+done
+( cd "$REPO" && git add -A && git commit -q -m "docs: 기록 커밋" )
+
+# 실행 브랜치 안전 — 두 검사 모두 Step 0(worktree 검출) **앞**에 있어야 사용자가 무엇을
+# 해야 하는지 알 수 있습니다. 뒤에 있으면 `기본 브랜치 worktree 검출 실패` 라는 무관한 안내만 나옵니다.
+_det_err="$( cd "$REPO" && git checkout -q --detach \
+  && bash rd-workflow/scripts/lifecycle/archive.sh --no-remote 2>&1 || true )"
+[[ "$_det_err" == *"detached HEAD 에서는 no-fr archive"* ]] \
+  && pass "no-fr: detached HEAD 차단" || fail "no-fr: detached 안내 부재 — $_det_err"
+_side_err="$( cd "$REPO" && git switch -q main && git switch -q -c side \
+  && bash rd-workflow/scripts/lifecycle/archive.sh --no-remote 2>&1 || true )"
+[[ "$_side_err" == *"기본 브랜치(main)에서만 호출 가능"* ]] \
+  && pass "no-fr: 기본 브랜치 아님 차단" || fail "no-fr: 브랜치 안내 부재 — $_side_err"
+( cd "$REPO" && git switch -q main && git branch -D side -q )
+
+# sentinel — canonical `null` 만 no-fr 이고 빈값·`main`·공백은 malformed 차단입니다 (§3.2.2).
+# "비어 있으면 no-fr" 로 다루면 파손된 task-state 가 조용히 발행으로 흘러갑니다.
+NOFR_TS="$REPO/rd-workflow-workspace/.lifecycle/task-state"
+cp "$NOFR_TS" "$NOFR_TS.bak"
+_sentinel_case() {  # _sentinel_case <값> <기대 문구> <설명>
+  local out
+  sed "s|^fr-branch=.*|fr-branch=$1|" "$NOFR_TS.bak" > "$NOFR_TS"
+  out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --no-remote --force-dirty 2>&1 || true )"
+  [[ "$out" == *"$2"* ]] && pass "no-fr sentinel: $3" || fail "no-fr sentinel: $3 — $out"
+}
+_sentinel_case "" "빈 값은 파손으로 봅니다" "빈값 → 파손 차단"
+_sentinel_case "main" "canonical 이 아니라 진행할 수 없습니다" "'main' → malformed 차단"
+_sentinel_case " " "canonical 이 아니라 진행할 수 없습니다" "공백 → malformed 차단"
+cp "$NOFR_TS.bak" "$NOFR_TS"; rm -f "$NOFR_TS.bak"
+
+# 정상 발행 — `--no-remote` 이므로 push 하지 않고 tag 만 로컬에 남습니다 (AC 24).
+_nofr_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --no-remote 2>&1 )" && _nofr_rc=0 || _nofr_rc=$?
+[[ "$_nofr_rc" -eq 0 ]] && pass "no-fr: archive 완주 (merge 없이 발행)" || fail "no-fr: archive 실패 (exit=$_nofr_rc) — $_nofr_out"
+[[ "$_nofr_out" == *"merge 대상 브랜치가 없어 merge 를 건너뜁니다"* ]] \
+  && pass "no-fr: merge 건너뜀 안내" || fail "no-fr: merge 건너뜀 안내 부재"
+( cd "$REPO" && git tag --list "fr/*/nofr" | grep -q . ) && pass "no-fr: tag 로컬 생성" || fail "no-fr: tag 부재"
+( cd "$REPO" && [[ -z "$(git ls-remote origin 'refs/tags/*' 2>/dev/null)" ]] ) \
+  && pass "no-fr: --no-remote → tag 미push" || fail "no-fr: tag 가 push 됨"
+( cd "$REPO" && [[ "$(git ls-remote origin refs/heads/main | awk '{print $1}')" != "$(git rev-parse main)" ]] ) \
+  && pass "no-fr: --no-remote → main 미push" || fail "no-fr: main 이 push 됨"
+( cd "$REPO" && grep -q '^status=대기 중$' rd-workflow-workspace/.lifecycle/task-state \
+  && grep -q '^base-commit=null$' rd-workflow-workspace/.lifecycle/task-state ) \
+  && pass "no-fr: task-state baseline 복귀 (base-commit 포함)" || fail "no-fr: task-state 미복귀"
+rm -rf "$REPO" "$BARE23"
 
 echo "== 결과: PASS=$PASS FAIL=$FAIL =="
 [[ $FAIL -eq 0 ]]

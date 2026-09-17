@@ -26,7 +26,18 @@ cleanup_all() {
     NOJQ_DIR=""
   fi
 }
-trap 'cleanup_all' EXIT INT TERM
+
+# 이 테스트는 **실제 차단 hook** 을 부르고, hook 은 자기 위치에서 project_root 를 도출해
+# 운영 감사 로그(`rd-workflow-workspace/.lifecycle/guard-block-audit.log`)에 쓴다. 그대로
+# 두면 검증 차단이 실사용 차단과 섞여 가드 은퇴 심사 데이터가 오염된다 — `self_test.sh`
+# 경유만 격리하면 이 파일을 직접 실행하는 정상적인 개발 경로가 여전히 오염시킨다.
+RD_GUARD_BLOCK_LOG="$(mktemp -t rd-guard-block-test.XXXXXX 2>/dev/null)" \
+  || RD_GUARD_BLOCK_LOG="/dev/null"
+export RD_GUARD_BLOCK_LOG
+_rd_gbl_cleanup() {
+  [ "$RD_GUARD_BLOCK_LOG" = "/dev/null" ] || rm -f "$RD_GUARD_BLOCK_LOG"
+}
+trap 'cleanup_all; _rd_gbl_cleanup' EXIT INT TERM
 
 # ---------------------------------------------------------------------------
 # Fixture 생성
@@ -38,7 +49,8 @@ trap 'cleanup_all' EXIT INT TERM
 make_fixture() {
   local status="$1" autopilot="$2" with_state="${3:-}"
   local fixture
-  fixture="$(mktemp -d)"
+  fixture="$(mktemp -d)" || { echo "test_implementation_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$fixture" && -d "$fixture" ]] || { echo "test_implementation_gate.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   mkdir -p "$fixture/rd-workflow/scripts/hooks"
   cp "$HOOK_SOURCE" "$fixture/rd-workflow/scripts/hooks/implementation_gate.sh"
   cp "$GUARD_COMMON" "$fixture/rd-workflow/scripts/hooks/_guard_common.sh"
@@ -165,7 +177,8 @@ run_hook() {
     return 0
   fi
   local pfile
-  pfile="$(mktemp)"
+  pfile="$(mktemp)" || { echo "test_implementation_gate.sh: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$pfile" && -f "$pfile" ]] || { echo "test_implementation_gate.sh: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   printf '%s' "$payload" > "$pfile"
   run_with_timeout "$HOOK_TIMEOUT_SEC" "$pfile" \
     bash "$fixture/rd-workflow/scripts/hooks/implementation_gate.sh"
@@ -180,7 +193,11 @@ run_hook() {
 run_scenario() {
   local num="$1" name="$2" status="$3" autopilot="$4" path_tmpl="$5" expected="$6" agent_id="${7:-}" with_state="${8:-}"
   local fixture
-  fixture="$(make_fixture "$status" "$autopilot" "$with_state")"
+  fixture="$(make_fixture "$status" "$autopilot" "$with_state")" || {
+    echo "[FAIL] scenario ${num}: ${name} — fixture 생성 실패 (make_fixture rc=$?)" >&2
+    FAIL=$((FAIL + 1))
+    return 1
+  }
   if [[ "$expected" == "CASE" ]]; then
     # make_fixture 가 만든 CURRENT_TASK.md 가 소문자 이름으로도 보이면 비구분 볼륨이다.
     if [[ -e "$fixture/current_task.md" ]]; then expected=2; else expected=0; fi
@@ -219,7 +236,11 @@ PERF_LIMIT_SEC=10
 run_perf_scenario() {
   local num="$1" name="$2"
   local fixture
-  fixture="$(make_fixture "구현 중" "no")"
+  fixture="$(make_fixture "구현 중" "no")" || {
+    echo "[FAIL] scenario ${num}: ${name} — fixture 생성 실패 (make_fixture rc=$?)" >&2
+    FAIL=$((FAIL + 1))
+    return 1
+  }
   _current_fixture="$fixture"
   local t0=$SECONDS
   HOOK_TIMEOUT_SEC="$PERF_LIMIT_SEC" run_hook "$fixture" "$fixture/CURRENT_TASK.md" "__BIG__"
@@ -259,7 +280,8 @@ _pid_terminated() {
 run_watchdog_scenario() {
   local num="$1" name="$2"
   local dir probe child rc_ok=0 desc_ok=0 child_pid=""
-  dir="$(mktemp -d)"
+  dir="$(mktemp -d)" || { echo "test_implementation_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$dir" && -d "$dir" ]] || { echo "test_implementation_gate.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   probe="$dir/probe.sh"
   child="$dir/child.pid"
   # hook 과 같은 형태: 명령 치환 자식이 오래 도는 작업을 맡는다.
@@ -304,6 +326,14 @@ run_scenario 8 "빈 file_path → 통과" \
 # 판별 필드(agent_type, 없으면 agent_id)는 subagent 안에서만 오는 hook 입력 최상위 필드다.
 run_scenario 11 "subagent + CURRENT_TASK.md → 차단" \
   "구현 중" "no" "{F}/CURRENT_TASK.md" 2 "agent_abc123"
+# guard-block-reason-identifier: 이 분기(implementation_gate.sh 유일 차단 지점)가 실제로
+# 유발됐을 때 기대한 reason 값이 감사 로그에 기록되는지 값 대응 검증.
+if tail -n1 "$RD_GUARD_BLOCK_LOG" 2>/dev/null | grep -qE 'reason=implementation_gate\.shared-state-write$'; then
+  PASS=$((PASS + 1))
+else
+  echo "[FAIL] scenario 11 reason 검증 — 감사 로그에 reason=implementation_gate.shared-state-write 가 없습니다" >&2
+  FAIL=$((FAIL + 1))
+fi
 run_scenario 12 "메인 세션(판별 필드 없음) + CURRENT_TASK.md → 통과 (회귀 방지)" \
   "구현 중" "no" "{F}/CURRENT_TASK.md" 0
 # autopilot 우회보다 앞에서 판정해야 한다 — 유실 사고가 autopilot 실행 중 발생했다.
@@ -408,13 +438,15 @@ run_watchdog_scenario 43 "watchdog 상한 초과 → 명령 치환 자손까지 
 # 실패하는 jq shim 을 PATH 앞에 두면 command -v jq 는 성공하고 jq 호출은 실패하므로
 # 두 파서 함수(read_hook_agent_id / extract_json_field)의
 # bash 폴백 분기가 환경과 무관하게 반드시 실행된다.
-NOJQ_DIR="$(mktemp -d)"
+NOJQ_DIR="$(mktemp -d)" || { echo "test_implementation_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$NOJQ_DIR" && -d "$NOJQ_DIR" ]] || { echo "test_implementation_gate.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 printf '%s\n' '#!/bin/bash' 'exit 1' > "$NOJQ_DIR/jq"
 chmod +x "$NOJQ_DIR/jq"
 _orig_path="$PATH"
 
 # 픽스처가 놓이는 볼륨이 대소문자를 구분하는지 남긴다 — case alias 시나리오의 기대값 근거다.
-_probe="$(mktemp -d)"
+_probe="$(mktemp -d)" || { echo "test_implementation_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$_probe" && -d "$_probe" ]] || { echo "test_implementation_gate.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 printf 'x\n' > "$_probe/CASEPROBE"
 if [[ -e "$_probe/caseprobe" ]]; then
   echo "volume: case-insensitive — case alias 시나리오(29·31·32)는 차단을 기대한다"

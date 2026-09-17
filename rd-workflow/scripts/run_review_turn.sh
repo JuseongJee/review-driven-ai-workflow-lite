@@ -6,6 +6,14 @@ project_root="$(cd "${script_dir}/../.." && pwd)"
 cd "${project_root}"
 
 source "${script_dir}/review_common.sh"
+# rd_resolve_commit_oid (저장소 native full OID resolve) 를 쓰기 위해 로드합니다 (§3.2.1).
+# **조건부 로드**입니다 — 이 스크립트만 복사해 쓰는 격리 fixture 가 있어서(예:
+# test_review_effort_override.sh 의 iso fixture) 무조건 source 하면 그 경로가 죽습니다.
+# 대신 실제로 필요할 때(reviewed OID 가 있는 diff-review 세션) 함수 부재를 fail-closed 로
+# 판정합니다 — resnapshot_review_head 참조.
+if [[ -f "${script_dir}/_state_common.sh" ]]; then
+  source "${script_dir}/_state_common.sh"
+fi
 PROJECT_ROOT="$project_root"
 
 # turn_limit은 session 검증 후 SESSION.md에서 읽음 (source-of-truth).
@@ -264,6 +272,218 @@ append_turn_metric() {
   return 0
 }
 
+# === reviewer 턴 head 재snapshot (change-spec §3.2.1) ===
+# 이 파이프라인의 표준 흐름은 reviewer 지적 → author 의 iteration commit → 다음 reviewer 턴입니다.
+# 세션 생성 시의 head 에 target 을 묶어두면 정상적인 다회차 리뷰가 봉인 불가능해지므로,
+# reviewer 턴을 시작하기 직전에 head 를 다시 snapshot 합니다.
+#
+# **base 는 갱신하지 않습니다 (불변).** 기본 브랜치가 리뷰 도중 전진하면 base 가 따라 움직여
+# 이미 리뷰된 변경분이 조용히 diff 에서 빠집니다. 리뷰 대상은 작업 전체이지 마지막 턴의 증분이 아닙니다.
+
+# session_branch_field <session-file> <key> — `## Branch Context` 의 `- key: value` 값
+# Review Target 문자열을 파싱하지 않습니다 — 파싱 계약을 두면 표현이 바뀔 때마다 깨집니다.
+session_branch_field() {
+  local session_file="$1" key="$2"
+  [[ -f "$session_file" ]] || return 0
+  awk -v k="- ${key}:" '
+    $0 == "## Branch Context" { f = 1; next }
+    f && /^## / { exit }
+    f && index($0, k) == 1 {
+      sub(/^[^:]*:[ \t]*/, ""); sub(/[ \t]+$/, ""); print; exit
+    }' "$session_file"
+}
+
+# turn_change_state <base> <head> — 두 커밋 사이에 실제 변경이 있는지 판정합니다.
+#   0 = 변경 있음 / 1 = 빈 diff / 2 = 판정 오류
+# `git diff --quiet` 의 종료 코드는 일반 명령과 의미가 반대입니다 (0 = 차이 없음). 세 값을
+# 구분하지 않으면 git 오류를 통과로 오독하므로 2 도 fail-closed 로 막습니다. OID 가 다르다는
+# 조건만으로는 부족합니다 — 완전 revert 로 트리가 base 와 같아지면 diff 가 비어 있습니다.
+turn_change_state() {
+  local rc=0
+  git diff --quiet "${1}..${2}" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) return 1 ;;
+    1) return 0 ;;
+    *) return 2 ;;
+  esac
+}
+
+# resnapshot_review_head <session-dir> <session-file> <review-type>
+#   return 0 — 갱신 완료 또는 대상 아님(no-op) / return 1 — 실패, SESSION 은 그대로
+#
+# 원자성 계약 (spec §3.2.1 — 순서 자체가 계약입니다):
+#   ① OID resolve·계보 검증을 먼저 전부 끝냅니다
+#   ② SESSION 전체를 같은 디렉터리의 임시 파일에 렌더링합니다
+#   ③ mv 로 원자적으로 교체하고 **그 종료 상태를 확인해 전파합니다**
+#   ④ 교체가 성공한 뒤에야 호출부가 어댑터 호출·턴 파일 생성으로 넘어갑니다
+# 1~3 중 어디서 실패해도 기존 SESSION 을 그대로 두고 턴을 시작하지 않습니다. `review-head-oid` 와
+# `Review Target` 이 한쪽만 바뀐 SESSION 으로 reviewer 가 dispatch 되면 이 절이 막으려던 상태
+# ("기록된 OID 와 reviewer 가 읽은 diff 가 다름") 가 그대로 생깁니다.
+resnapshot_review_head() {
+  local session_dir="$1" session_file="$2" rtype="$3"
+  local base_oid old_head new_head policy tmp rc cs
+
+  # diff-review 가 아니면 대상이 아닙니다 (author 턴은 호출부에서 이미 걸러집니다).
+  [[ "$rtype" == "diff-review" ]] || return 0
+
+  base_oid="$(session_branch_field "$session_file" "review-base-oid")"
+  old_head="$(session_branch_field "$session_file" "review-head-oid")"
+  # 둘 다 없으면 §5.2.1 의 파싱 불가 세션이거나 이 계약 이전의 legacy 세션이므로
+  # 건드리지 않습니다 (legacy 경로 유지).
+  if [[ -z "$base_oid" && -z "$old_head" ]]; then
+    return 0
+  fi
+  # **한쪽만 있는 세션은 legacy 가 아니라 손상입니다** (final diff review turn 006 Finding 1).
+  # 종전에는 이것도 조용한 no-op 이었는데, `rd review seal` 은 head 가 있다는 이유만으로
+  # 일반 `verified=yes` 경로를 허용하므로 base 없는 세션이 검증된 것처럼 봉인됩니다.
+  if [[ -z "$base_oid" || -z "$old_head" ]]; then
+    echo "review turn: SESSION 의 reviewed OID 가 한쪽만 있습니다 (base='${base_oid}', head='${old_head}')." >&2
+    echo "  두 줄은 한 묶음이라 한쪽만 있는 상태는 손상입니다. 판정 불가이므로 턴을 시작하지 않습니다." >&2
+    echo "  세션을 다시 만드십시오: bash rd-workflow/scripts/prepare_review_pipeline.sh diff" >&2
+    return 1
+  fi
+
+  # head 갱신 정책 (§3.2.1). 사용자가 위치 인자로 현재 HEAD 가 아닌 head 를 명시한 세션은
+  # `pinned` 이며, 재snapshot 하면 그 대상이 조용히 현재 HEAD 로 바뀝니다 — 사용자가 지정한
+  # 검토 대상과 reviewer 가 실제로 보는 대상이 갈리고, 내부 OID 와 프롬프트는 서로 일치하므로
+  # 오검토가 눈에 띄지 않습니다. 필드가 없는 기존 세션은 `auto`(현재 동작)로 봅니다.
+  policy="$(session_branch_field "$session_file" "review-head-policy")"
+  [[ -n "$policy" ]] || policy="auto"
+  if [[ "$policy" != "auto" && "$policy" != "pinned" ]]; then
+    echo "review turn: review-head-policy 값이 유효하지 않습니다: '${policy}' (허용: auto|pinned) — 판정 불가로 중단합니다." >&2
+    return 1
+  fi
+
+  # ① resolve · 계보 검증
+  #
+  # **정책은 갱신 여부만 가릅니다 — 대상 무결성 검증은 두 정책 모두 받습니다**
+  # (final diff review turn 004 Finding 2). `pinned` 을 검증 앞에서 조기 반환시키면,
+  # 명시 ref 삭제 후 객체 정리·저장소 교체·SESSION 의 부분 수정으로 기록 OID 가 더 이상
+  # resolve 되지 않는 세션이 그대로 reviewer dispatch 까지 가고, 사용자는 `git diff
+  # <invalid>..<invalid>` 로 돈 결과를 **성공한 리뷰 턴처럼** 받게 됩니다.
+  # 검증 대상 head 만 다릅니다 — `auto` 는 현재 `HEAD`, `pinned` 은 세션에 기록된 head.
+  if ! declare -f rd_resolve_commit_oid >/dev/null 2>&1; then
+    echo "review turn: rd_resolve_commit_oid 를 쓸 수 없습니다 (_state_common.sh 미로드) — 판정 불가로 중단합니다." >&2
+    return 1
+  fi
+  local resolved_base head_input head_label
+  resolved_base="$(rd_resolve_commit_oid "$base_oid")" || {
+    echo "review turn: 세션의 review-base-oid '${base_oid}' 를 커밋으로 해석할 수 없습니다 — 판정 불가로 중단합니다." >&2
+    return 1
+  }
+  if [[ "$policy" == "pinned" ]]; then
+    head_input="$old_head"
+    head_label="세션에 고정된 head"
+  else
+    head_input="HEAD"
+    head_label="현재 HEAD"
+  fi
+  new_head="$(rd_resolve_commit_oid "$head_input")" || {
+    echo "review turn: ${head_label} ('${head_input}') 를 커밋으로 해석할 수 없습니다 — 판정 불가로 중단합니다." >&2
+    return 1
+  }
+  if ! git merge-base --is-ancestor "$resolved_base" "$new_head" >/dev/null 2>&1; then
+    echo "review turn: ${head_label} (${new_head}) 가 review-base-oid (${resolved_base}) 의 후손이 아닙니다." >&2
+    echo "  amend·reset 등으로 계보가 끊긴 상태입니다. 판정 불가이므로 SESSION 을 바꾸지 않고 중단합니다." >&2
+    return 1
+  fi
+  # 조상 관계만으로는 빈 target 을 막지 못합니다 — iteration 중 변경이 완전히 revert 되면
+  # base 와 head 의 OID 는 달라도 트리가 같아 diff 가 비어 있습니다 (AC 4).
+  cs=0
+  turn_change_state "$resolved_base" "$new_head" || cs=$?
+  if [[ "$cs" == "1" ]]; then
+    echo "review turn: base (${resolved_base}) 와 ${head_label} (${new_head}) 사이에 변경이 없습니다 (커밋은 다르지만 트리가 같습니다)." >&2
+    echo "  빈 diff 를 리뷰 대상으로 기록하지 않기 위해 SESSION 을 바꾸지 않고 중단합니다." >&2
+    return 1
+  elif [[ "$cs" != "0" ]]; then
+    echo "review turn: base (${resolved_base}) 와 ${head_label} (${new_head}) 의 diff 판정에 실패했습니다 (git 오류)." >&2
+    echo "  판정 불가이므로 SESSION 을 바꾸지 않고 중단합니다." >&2
+    return 1
+  fi
+
+  # **raw 필드는 저장소 native full OID 여야 합니다** (final diff review turn 006 Finding 1).
+  # `rd_resolve_commit_oid` 는 `branch-B` 같은 이동 ref 와 축약 OID 도 해석하므로, 필드에
+  # 그런 값이 들어 있으면 reviewer 시점과 seal 시점 사이에 대상이 다시 움직일 수 있습니다.
+  # resolve 결과와 원본이 같은지 확인해 그 창을 닫습니다.
+  if [[ "$base_oid" != "$resolved_base" ]]; then
+    echo "review turn: review-base-oid('${base_oid}') 가 full OID 가 아닙니다 (resolve 결과: ${resolved_base})." >&2
+    echo "  이동 ref·축약 OID 는 리뷰 도중 대상이 바뀔 수 있어 받지 않습니다. 세션을 다시 만드십시오:" >&2
+    echo "  bash rd-workflow/scripts/prepare_review_pipeline.sh diff" >&2
+    return 1
+  fi
+  if [[ "$policy" == "pinned" && "$old_head" != "$new_head" ]]; then
+    echo "review turn: review-head-oid('${old_head}') 가 full OID 가 아닙니다 (resolve 결과: ${new_head})." >&2
+    echo "  pinned 세션의 head 는 고정 대상이므로 이동 ref·축약 OID 를 받지 않습니다. 세션을 다시 만드십시오:" >&2
+    echo "  bash rd-workflow/scripts/prepare_review_pipeline.sh diff" >&2
+    return 1
+  fi
+
+  # 검증을 통과한 `pinned` 세션은 여기서 끝냅니다 — SESSION 을 바꾸지 않습니다.
+  #
+  # **다만 반환 전에 `Review Target` 까지 같은 묶음으로 확인합니다** (같은 Finding).
+  # reviewer 에게 실제로 전달되는 것은 OID 두 줄이 아니라 `## Review Target` 섹션이고,
+  # `auto` 는 이 섹션을 재렌더링하면서 결속하지만 `pinned` 은 아무것도 다시 쓰지 않습니다.
+  # 그래서 OID 는 유효한데 target 만 stale·부분 수정된 세션이 검증을 통과한 채 **OID 가
+  # 가리키지 않는 diff** 를 reviewer 에게 보냈습니다. seal 은 `review-head-oid` 만 보므로
+  # 그렇게 잘못 리뷰된 결과도 `verified=yes` 로 봉인될 수 있습니다.
+  if [[ "$policy" == "pinned" ]]; then
+    local cur_target want_target
+    cur_target="$(extract_section "$session_file" "Review Target" | trim_blank_lines)"
+    want_target="git diff ${resolved_base}..${new_head}"
+    if [[ "$cur_target" != "$want_target" ]]; then
+      echo "review turn: SESSION 의 Review Target 이 기록된 OID 와 어긋납니다." >&2
+      echo "  기록된 OID 기준: ${want_target}" >&2
+      echo "  SESSION 의 값  : ${cur_target}" >&2
+      echo "  reviewer 가 읽을 diff 와 봉인 대상이 갈리므로 턴을 시작하지 않습니다. 세션을 다시 만드십시오:" >&2
+      echo "  bash rd-workflow/scripts/prepare_review_pipeline.sh diff" >&2
+      return 1
+    fi
+  fi
+
+  if [[ "$policy" == "pinned" ]]; then
+    echo "review head 정책: pinned — 지정된 head (${new_head}) 를 유지하고 재snapshot 하지 않습니다." >&2
+    echo "  이 세션에는 리뷰 도중의 iteration commit 이 반영되지 않습니다." >&2
+    return 0
+  fi
+
+  # ② 같은 디렉터리 임시 파일에 SESSION 전체를 렌더링
+  tmp="$(mktemp "${session_dir}/.SESSION.md.XXXXXX")" || {
+    echo "review turn: 임시 파일 생성 실패 — SESSION 을 바꾸지 않고 중단합니다." >&2
+    return 1
+  }
+  awk -v newhead="$new_head" -v target="git diff ${resolved_base}..${new_head}" '
+    {
+      if (skip) {
+        if ($0 ~ /^## /) { skip = 0; print "" } else { next }
+      }
+      if ($0 == "## Review Target") { print; print target; skip = 1; next }
+      if ($0 == "## Branch Context") { inbc = 1; print; next }
+      if (inbc && /^## /) { inbc = 0 }
+      if (inbc && index($0, "- review-head-oid:") == 1) {
+        print "- review-head-oid: " newhead; next
+      }
+      print
+    }' "$session_file" > "$tmp"
+  rc=$?
+  if [[ "$rc" != "0" || ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    echo "review turn: SESSION 렌더링 실패 (awk exit ${rc}) — 기존 SESSION 을 그대로 두고 중단합니다." >&2
+    return 1
+  fi
+
+  # ③ 원자적 교체. mv 의 종료 상태를 확인하지 않고 어댑터를 계속 부르면
+  #    reviewer 가 stale target 으로 시작합니다 — 이 계약이 막으려는 실수가 그것입니다.
+  if ! mv "$tmp" "$session_file"; then
+    rm -f "$tmp"
+    echo "review turn: SESSION 교체(mv) 실패 — 기존 SESSION 을 그대로 두고 턴을 시작하지 않습니다." >&2
+    return 1
+  fi
+
+  # ④ 여기부터가 어댑터 호출이 허용되는 지점입니다.
+  echo "review head 재snapshot: ${old_head} → ${new_head} (base ${resolved_base} 는 불변)" >&2
+  return 0
+}
+
 # --- 메인 ---
 # 테스트 seam: `source run_review_turn.sh` 로 호출되면 함수 정의만 로드하고 반환한다.
 # production 경로는 항상 `bash run_review_turn.sh <session>` 이므로 동작이 바뀌지 않는다.
@@ -333,8 +553,18 @@ if [[ "$EXISTING_TURN_COUNT" -ge "$turn_limit" || "$NEXT_TURN_INDEX" -gt "$turn_
   exit 1
 fi
 
+# --- reviewer 턴 dispatch 직전 head 재snapshot (§3.2.1) ---
+# 턴 한도 검사 뒤에 둡니다 — 턴을 시작하지 않는 경로에서 SESSION 을 건드리지 않기 위함입니다.
+if ! resnapshot_review_head "$session_dir" "$SESSION_FILE" "$REVIEW_TYPE"; then
+  echo "review turn: head 재snapshot 실패로 턴을 시작하지 않습니다." >&2
+  exit 1
+fi
+# 갱신된 Review Target 을 프롬프트에 반영합니다 — 기록된 OID 와 reviewer 가 읽는 diff 를 같게 유지합니다.
+load_session_state "$SESSION_FILE"
+
 # 프롬프트 생성
-prompt_file="$(mktemp)"
+prompt_file="$(mktemp)" || { echo "run_review_turn: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$prompt_file" && -f "$prompt_file" ]] || { echo "run_review_turn: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 chmod 600 "$prompt_file"
 cleanup() { rm -f "$prompt_file"; }
 trap cleanup EXIT
@@ -458,17 +688,82 @@ for tool in $PRIORITY; do
     used_tool="$tool"
     break
   else
-    echo "어댑터 실행 실패: ${tool}. 세션이 오염되었을 수 있으므로 즉시 중단합니다." >&2
-    # effort 를 전달했다면 무효값 가능성을 알리고 복구 경로를 제시한다.
-    # 자동 재시도는 하지 않는다 — 어느 지점에서 실패했는지 증명할 수 없으면
-    # 두 번째 agent 가 부분 수정된 세션을 이어서 고칠 위험이 더 크다.
-    if [[ "$tool" == "codex" && -n "$EFFORT_VALUE" ]]; then
-      echo "    reasoning effort '${EFFORT_VALUE}' (source: ${EFFORT_SOURCE}) 를 전달했습니다." >&2
-      echo "    이 값이 현재 모델에서 지원되지 않으면 codex 가 설정을 거부합니다. 복구 방법:" >&2
-      echo "      - 즉시 무력화: RD_REVIEW_EFFORT_OVERRIDE=0 을 설정하고 다시 실행" >&2
-      echo "      - 영구 해제: rd-workflow/config/review-tools.json 에서 해당 effort 키 제거" >&2
-    fi
-    exit 1
+    case "$adapter_rc" in
+      124)
+        # 대기 초과. 어댑터가 이미 사유·세션 상태·재개 방법을 출력했다.
+        # **여기서 "오염" 을 단정하지 않는다** — 어댑터가 판별한 사실이 권위다.
+        # **"재실행하십시오" 를 덧붙이지 않는다** — 부모는 재개 가능 여부(resumable)를
+        # 모른다. 어댑터가 재개 불가로 판정했으면(adapter_codex.sh) 재개 명령을 일부러
+        # 침묵했는데, 부모가 그 뒤에 "재실행하십시오" 를 붙이면 그 침묵이 무효화되어
+        # 사용자가 확인 없이 재실행해 부분 산출물을 덮어쓸 위험이 생긴다.
+        echo "리뷰 턴 대기가 종료되었습니다: ${tool}. 위의 세션 상태 안내를 확인하십시오." >&2
+        exit 124
+        ;;
+      *)
+        # 신호 종료(128+n, POSIX 셸 관례): 129=HUP 130=INT 143=TERM 137=KILL 131=QUIT 등
+        # 번호를 열거하지 않고 부등식으로 판정한다 — OOM killer·`timeout -k` 의 SIGKILL(137)
+        # 처럼 열거에 없는 신호도 외부 중단이며, 열거식이면 그런 신호가 아래 "오염" 분기로
+        # 떨어져 거짓 문장과 함께 코드까지 1 로 뭉개진다. 124(대기 초과)는 128 미만이라
+        # 이 판정과 충돌하지 않고, 어댑터 자신의 실패 코드(주로 1)도 안전하다.
+        if [[ "$adapter_rc" -gt 128 ]]; then
+          # 외부 중단(Ctrl-C, HUP, TERM, KILL 등). 도구 결함이 아니다.
+          # **재개 가능을 단정하지 않는다.** 신호는 리뷰 도구가 턴 파일이나 SESSION 을 쓰기
+          # 전·도중·직후 어느 때나 도착한다. 아무 파일도 다시 읽지 않은 채 "재실행하면
+          # 이어집니다" 를 출력하면 ① 이미 Owner 가 Author 로 넘어간 완성 턴에서는 같은
+          # 명령이 즉시 거부되고 ② 부분 산출물이 있으면 안전한 재개가 증명되지 않았는데
+          # 사용자가 확인 없이 재실행해 덮어쓴다. 타임아웃 경로에서 걷어낸 거짓 재개
+          # 안내가 신호 경로에 그대로 남아 있던 셈이다(final diff review Important 4).
+          # 판별 범위는 어댑터의 report_session_state 와 같다 — 턴 파일 부재 + SESSION.md 의
+          # Current Owner / Status 두 필드뿐이며, 그 범위를 함께 밝힌다.
+          echo "리뷰 턴이 외부에서 중단되었습니다: ${tool} (signal exit ${adapter_rc})." >&2
+          echo "    도구 결함이 아닙니다." >&2
+          # extract_section 은 awk 기반이라 파일을 열 수 없으면 rc=2 를 낸다. pipefail +
+          # errexit 아래에서 가드 없이 대입하면 여기서 부모가 죽어 신호 종료 코드조차
+          # 보존하지 못한다 — 흡수하면 빈 문자열이 되어 아래 조건을 자연히 불만족시킨다.
+          sig_owner="$( { extract_section "$SESSION_FILE" "Current Owner" 2>/dev/null || true; } | trim_blank_lines )"
+          sig_status="$( { extract_section "$SESSION_FILE" "Status" 2>/dev/null || true; } | trim_blank_lines )"
+          # **cleanup 완료를 보장하는 신호에서만** 조건부 재실행 안내를 허용한다.
+          # 어댑터가 cleanup(= codex process group 종료)을 보장하는 것은 명시적으로 트랩한
+          # HUP(129)·INT(130)·TERM(143) 뿐이다. SIGKILL(137)·SIGQUIT(131) 등은 트랩 불가이거나
+          # 트랩되지 않으므로, **어댑터만 죽고 별도 process group 의 codex 와 자손은 계속
+          # 실행·수정할 수 있다.** 그 상태에서도 "턴 파일 부재 + Owner=Reviewer/awaiting-reviewer"
+          # 는 그대로 참이므로, 세션 상태만 보고 재실행을 권하면 두 agent 가 같은 세션과
+          # 워크스페이스를 동시에 건드린다(final diff review 턴 004 Important 2).
+          case "$adapter_rc" in
+            129|130|143) sig_cleanup_guaranteed=1 ;;
+            *)           sig_cleanup_guaranteed=0 ;;
+          esac
+          if [[ "$sig_cleanup_guaranteed" -eq 1 && ! -f "$EXPECTED_TURN_FILE" \
+                && "$sig_owner" == "Reviewer" && "$sig_status" == "awaiting-reviewer" ]]; then
+            echo "    세션 상태: 턴 파일이 생성되지 않았고 SESSION.md 의 Current Owner=Reviewer / Status=awaiting-reviewer 가" >&2
+            echo "               보존되어 있습니다 → 같은 명령으로 재실행하면 그대로 이어집니다." >&2
+          elif [[ "$sig_cleanup_guaranteed" -ne 1 ]]; then
+            echo "    잔존 프로세스 경고: 이 신호(exit ${adapter_rc})는 어댑터가 cleanup 을 보장하지 못하는 신호입니다" >&2
+            echo "               (보장 범위는 HUP=129 / INT=130 / TERM=143 뿐이며 SIGKILL 은 트랩할 수 없습니다)." >&2
+            echo "               어댑터만 죽고 **별도 process group 의 리뷰 도구와 그 자손이 계속 실행·수정 중일 수 있습니다.**" >&2
+            echo "               세션 상태(턴 파일: $( [[ -f "$EXPECTED_TURN_FILE" ]] && echo 존재 || echo 부재 ), Current Owner='${sig_owner}', Status='${sig_status}')만으로는" >&2
+            echo "               재개 안전성을 말할 수 없습니다 — **프로세스가 모두 종료된 것을 확인하기 전에 재실행하지 마십시오.**" >&2
+            echo "               확인 없이 재실행하면 두 agent 가 같은 세션·워크스페이스를 동시에 건드립니다." >&2
+          else
+            echo "    세션 상태: 재개 가능 조건을 만족하지 않습니다 (턴 파일: $( [[ -f "$EXPECTED_TURN_FILE" ]] && echo 존재 || echo 부재 ), Current Owner='${sig_owner}', Status='${sig_status}')." >&2
+            echo "               세션을 직접 확인한 뒤 이어가십시오 — 확인 없이 재실행하면 거부되거나 부분 산출물을 덮어쓸 수 있습니다." >&2
+          fi
+          echo "    (부모가 확인한 것은 이 두 필드와 턴 파일뿐입니다. CHECKPOINT.md 등 다른 파일은 검사하지 않았습니다.)" >&2
+          exit "$adapter_rc"
+        fi
+        echo "어댑터 실행 실패: ${tool}. 세션이 오염되었을 수 있으므로 즉시 중단합니다." >&2
+        # effort 를 전달했다면 무효값 가능성을 알리고 복구 경로를 제시한다.
+        # 자동 재시도는 하지 않는다 — 어느 지점에서 실패했는지 증명할 수 없으면
+        # 두 번째 agent 가 부분 수정된 세션을 이어서 고칠 위험이 더 크다.
+        if [[ "$tool" == "codex" && -n "$EFFORT_VALUE" ]]; then
+          echo "    reasoning effort '${EFFORT_VALUE}' (source: ${EFFORT_SOURCE}) 를 전달했습니다." >&2
+          echo "    이 값이 현재 모델에서 지원되지 않으면 codex 가 설정을 거부합니다. 복구 방법:" >&2
+          echo "      - 즉시 무력화: RD_REVIEW_EFFORT_OVERRIDE=0 을 설정하고 다시 실행" >&2
+          echo "      - 영구 해제: rd-workflow/config/review-tools.json 에서 해당 effort 키 제거" >&2
+        fi
+        exit 1
+        ;;
+    esac
   fi
 done
 

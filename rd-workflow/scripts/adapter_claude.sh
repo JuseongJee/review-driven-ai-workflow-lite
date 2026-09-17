@@ -43,7 +43,8 @@ fi
 
 # 셀프 리뷰 경고를 턴 파일 헤더에 삽입
 if [[ "${SELF_REVIEW_WARNING:-true}" == "true" ]]; then
-  local_tmp="$(mktemp)"
+  local_tmp="$(mktemp)" || { echo "adapter_claude: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+  [[ -n "$local_tmp" && -f "$local_tmp" ]] || { echo "adapter_claude: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
   chmod 600 "$local_tmp"
   {
     echo '> **⚠️ Self-Review Notice:** 이 턴은 독립 리뷰어 대신 Claude(self-review)가 작성했습니다. 독립성이 보장되지 않으므로 결과를 비판적으로 검토하세요.'

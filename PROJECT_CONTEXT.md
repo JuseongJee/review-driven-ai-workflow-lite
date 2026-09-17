@@ -24,7 +24,7 @@
 - template_repo: (배포 repo URL, 예: https://github.com/user/repo)
 
 ## 워크플로 설정
-- small_task_threshold: (어디까지 small-task로 볼지 기준)
+- risk_tier_notes: (WORKFLOW.md 등급 신호표 외에 이 프로젝트에서 등급을 올려야 하는 산출물·경로)
 
 ## 품질 규칙
 - 산출물 내 용어와 표현은 일관성을 유지합니다.

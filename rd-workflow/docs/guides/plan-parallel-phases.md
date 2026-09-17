@@ -51,5 +51,5 @@ phase 내 task가 1개면 병렬의 의미가 없어 순차와 동일하게 동�
 
 ## 불변
 
-- **final diff review는 어떤 경우에도 생략·축약하지 않는다.** 병렬·리뷰 생략과 무관하게 최종 독립 게이트로 유지한다.
+- **`full` 에서 final diff review는 생략·축약하지 않는다.** 병렬·task review 생략과 무관하게 최종 독립 게이트로 유지한다 (이 규약은 `full` 의 subagent 병렬 실행에 적용된다).
 - 이 규약은 상호작용 모드(manual/semi-auto/autopilot)와 무관하게, subagent-driven-development를 쓰는 모든 실행에 적용한다.

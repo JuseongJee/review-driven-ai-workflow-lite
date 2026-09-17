@@ -22,7 +22,7 @@ REQUEST.md 있으니 request-to-reviewed-plan으로 spec/plan 진행해줘.
 ```
 
 ```text
-small-task로 보고 바로 구현해줘.
+standard 로 보고 바로 구현해줘.
 ```
 
 ```text

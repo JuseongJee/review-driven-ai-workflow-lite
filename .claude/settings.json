@@ -17,6 +17,10 @@
                     {
                         "type": "command",
                         "command": "bash \"${CLAUDE_PROJECT_DIR:-.}\"/rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"
+                    },
+                    {
+                        "type": "command",
+                        "command": "bash \"${CLAUDE_PROJECT_DIR:-.}\"/rd-workflow/scripts/hooks/headless_background_gate.sh"
                     }
                 ]
             },

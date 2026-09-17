@@ -13,7 +13,8 @@ fail() { printf '  FAIL  %s\n' "$1"; FAIL=1; }
 chk()  { if [ "$1" -eq 0 ]; then pass "$2"; else fail "$2"; fi; }
 eq()   { if [ "$1" = "$2" ]; then pass "$3"; else fail "$3 (기대=[$2] 실제=[$1])"; fi; }
 
-TMP="$(mktemp -d)"
+TMP="$(mktemp -d)" || { echo "test_review_adapter_parity.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$TMP" && -d "$TMP" ]] || { echo "test_review_adapter_parity.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 

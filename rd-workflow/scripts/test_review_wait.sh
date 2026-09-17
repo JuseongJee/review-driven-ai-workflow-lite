@@ -39,7 +39,8 @@ ADAPTER_CLAUDE="$SCRIPT_DIR/adapter_claude.sh"
 # --- sandbox 공통 함수 ---
 make_sandbox() {
   local d
-  d="$(mktemp -d)"
+  d="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$d" && -d "$d" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   mkdir -p "$d/turns"
   echo "$d"
 }
@@ -450,10 +451,14 @@ exit 0
   PROJECT_ROOT="$sandbox" \
     bash "$ADAPTER" >/dev/null 2>&1 || true
 
-  if [ ! -f "$sandbox/.wait_timeout" ]; then
-    pass "케이스 6: 정상 완료 경로에서 .wait_timeout 마커 잔존 없음"
+  # 마커는 안정 이름을 쓰지 않고 `.wait_timeout.XXXXXX` 로 배타 생성되므로 두 형태를
+  # 함께 센다 (안정 이름 잔존은 구버전 회귀 신호이기도 하다).
+  local marker_left
+  marker_left="$( { ls -d "$sandbox"/.wait_timeout "$sandbox"/.wait_timeout.* 2>/dev/null || true; } | wc -l | tr -d ' ' )"
+  if [ "$marker_left" -eq 0 ]; then
+    pass "케이스 6: 정상 완료 경로에서 타임아웃 마커 잔존 없음"
   else
-    fail "케이스 6: .wait_timeout 마커가 정상 완료 후에도 잔존"
+    fail "케이스 6: 타임아웃 마커 ${marker_left}개가 정상 완료 후에도 잔존"
   fi
 
   rm -rf "$sandbox"
@@ -532,7 +537,8 @@ run_parse_harness() {
   local extra_path="${3:-}"
 
   local harness_dir
-  harness_dir="$(mktemp -d)"
+  harness_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$harness_dir" && -d "$harness_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   # run_review_turn.sh 와 동일 디렉토리에서 실행해야 source 경로가 맞음 — 불필요
   # 함수만 inline으로 실행
 
@@ -589,7 +595,8 @@ run_case7() {
   fi
 
   local sandbox
-  sandbox="$(mktemp -d)"
+  sandbox="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$sandbox" && -d "$sandbox" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   local count_file="$sandbox/jq_count"
   touch "$count_file"
 
@@ -642,7 +649,8 @@ run_case8() {
   fi
 
   local sandbox
-  sandbox="$(mktemp -d)"
+  sandbox="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$sandbox" && -d "$sandbox" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   cat > "$sandbox/review-tools.json" <<'RJSON'
 {
   "default_priority": ["codex", "claude"],
@@ -681,7 +689,8 @@ run_case9() {
   fi
 
   local sandbox
-  sandbox="$(mktemp -d)"
+  sandbox="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$sandbox" && -d "$sandbox" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   # bin 값에 공백·= 포함 (예: 경로 with spaces, model=xxx 형식)
   cat > "$sandbox/review-tools.json" <<'RJSON'
 {
@@ -732,7 +741,8 @@ run_case10() {
   fi
 
   local sandbox
-  sandbox="$(mktemp -d)"
+  sandbox="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$sandbox" && -d "$sandbox" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   # codex: model 필드 아예 없음(missing), claude: model = null
   cat > "$sandbox/review-tools.json" <<'RJSON'
 {
@@ -751,7 +761,8 @@ RJSON
 
   # codex model(missing) 과 claude model(null) 모두 기본값 반환 확인
   local harness_dir
-  harness_dir="$(mktemp -d)"
+  harness_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$harness_dir" && -d "$harness_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   local harness_script="$harness_dir/harness10.sh"
   cat > "$harness_script" <<HARNESS10_BODY
 #!/usr/bin/env bash
@@ -812,7 +823,8 @@ HARNESS10_BODY
 run_case11() {
   # 11a: jq 부재 — PRIORITY 기본값 사용
   local sandbox
-  sandbox="$(mktemp -d)"
+  sandbox="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$sandbox" && -d "$sandbox" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   cat > "$sandbox/review-tools.json" <<'RJSON'
 {"default_priority": ["codex", "claude"], "tools": {}, "overrides": {}}
 RJSON
@@ -828,7 +840,8 @@ FAKE_JQ
   chmod +x "$no_jq_dir/jq"
 
   local harness_dir
-  harness_dir="$(mktemp -d)"
+  harness_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$harness_dir" && -d "$harness_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   local harness_script="$harness_dir/harness11a.sh"
   cat > "$harness_script" <<HARNESS11A_BODY
 #!/usr/bin/env bash
@@ -868,7 +881,8 @@ HARNESS11A_BODY
   local bad_json="$sandbox/bad.json"
   echo 'NOT VALID JSON {{{' > "$bad_json"
 
-  harness_dir="$(mktemp -d)"
+  harness_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$harness_dir" && -d "$harness_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   harness_script="$harness_dir/harness11b.sh"
   cat > "$harness_script" <<HARNESS11B_BODY
 #!/usr/bin/env bash
@@ -920,7 +934,8 @@ run_case12() {
   fi
 
   local sandbox
-  sandbox="$(mktemp -d)"
+  sandbox="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$sandbox" && -d "$sandbox" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
 
   # .tools 없는 축약 config — 기존 구현에서는 "null has no keys" 오류로
   # kv 전체가 폐기되어 priority가 기본값(codex claude)으로 fallback됐음.
@@ -960,7 +975,8 @@ run_case13() {
   fi
 
   local sandbox
-  sandbox="$(mktemp -d)"
+  sandbox="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$sandbox" && -d "$sandbox" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
 
   # .overrides 필드 자체 없음 — (.overrides // {})[$rt] 이 null 로 안전하게 처리되어야 함
   cat > "$sandbox/review-tools.json" <<'RJSON'
@@ -1136,12 +1152,14 @@ run_case16() {
   sess_real="$(cd "$sandbox" && pwd -P)"
 
   # team-overlay 재현: PROJECT_ROOT 안의 symlink 가 세션 실제 위치를 가리킨다
-  link_root="$(mktemp -d)"
+  link_root="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$link_root" && -d "$link_root" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   sess_link="$link_root/sess"
   ln -s "$sess_real" "$sess_link"
 
   # 세션 밖 피해 후보 + 고정명 symlink 사전 배치 (checkout·이전 비정상 실행 상황 재현)
-  victim_dir="$(mktemp -d)"
+  victim_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$victim_dir" && -d "$victim_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   victim="$victim_dir/victim.txt"
   printf 'KEEP\n' > "$victim"
   ln -s "$victim" "$sandbox/.last_message"
@@ -1230,6 +1248,1147 @@ MOCK_EOF
 }
 
 # ===========================================================================
+# 케이스 17: 환경변수 해석 — 유효/무효/fallthrough/0
+# ===========================================================================
+run_case17() {
+  local sandbox expected_turn mock_bin
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  write_session "$sandbox" "Reviewer" "awaiting-reviewer"
+  write_checkpoint "$sandbox" "Author"
+  # mock: 즉시 턴 파일을 만들고 끝낸다 (대기 로직을 타지 않게)
+  mock_bin="$(setup_mock "$sandbox" "printf 'x' > \"$expected_turn\"; exit 0")"
+
+  # 해석 결과를 stderr 에서 읽는다. 형식: "wait config: cap=<N>s idle=<N>s"
+  # 주의: BSD/macOS env 는 옵션을 환경 대입보다 **앞**에 두어야 한다.
+  #       `env NAME=v -u OTHER` 형태는 -u 를 실행할 명령으로 해석할 수 있다.
+  probe() {  # $1..: env 인자(-u 옵션이 먼저, 그다음 NAME=value) → stdout 에 config 줄
+    env "$@" \
+      TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+      EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+      bash "$ADAPTER" 2>&1 | grep -o 'wait config: cap=[0-9]*s idle=[0-9]*s' || true
+  }
+
+  local out
+  # (a) 기본값
+  out="$(probe -u WAIT_TIMEOUT -u POLL_TIMEOUT -u RD_REVIEW_IDLE_TIMEOUT)"
+  [ "$out" = "wait config: cap=7200s idle=600s" ] \
+    && pass "케이스 17a: 기본값 cap=7200 idle=600" \
+    || fail "케이스 17a: 기대 cap=7200 idle=600 — 실제 [$out]"
+
+  # (b) WAIT_TIMEOUT 유효
+  out="$(probe -u POLL_TIMEOUT -u RD_REVIEW_IDLE_TIMEOUT WAIT_TIMEOUT=1234)"
+  [ "$out" = "wait config: cap=1234s idle=600s" ] \
+    && pass "케이스 17b: WAIT_TIMEOUT 반영" \
+    || fail "케이스 17b: 기대 cap=1234 — 실제 [$out]"
+
+  # (c) WAIT_TIMEOUT 무효 + POLL_TIMEOUT 유효 → 다음 원천으로 내려간다
+  out="$(probe -u RD_REVIEW_IDLE_TIMEOUT WAIT_TIMEOUT=abc POLL_TIMEOUT=1200)"
+  [ "$out" = "wait config: cap=1200s idle=600s" ] \
+    && pass "케이스 17c: 무효값은 무시하고 alias 사용" \
+    || fail "케이스 17c: 기대 cap=1200 — 실제 [$out]"
+
+  # (d) 둘 다 무효 → 기본값
+  out="$(probe -u RD_REVIEW_IDLE_TIMEOUT WAIT_TIMEOUT=-5 POLL_TIMEOUT=3.5)"
+  [ "$out" = "wait config: cap=7200s idle=600s" ] \
+    && pass "케이스 17d: 둘 다 무효 → 기본값" \
+    || fail "케이스 17d: 기대 cap=7200 — 실제 [$out]"
+
+  # (e) IDLE=0 은 유효 (유휴 판별 비활성)
+  out="$(probe -u WAIT_TIMEOUT -u POLL_TIMEOUT RD_REVIEW_IDLE_TIMEOUT=0)"
+  [ "$out" = "wait config: cap=7200s idle=0s" ] \
+    && pass "케이스 17e: IDLE=0 유효(비활성)" \
+    || fail "케이스 17e: 기대 idle=0 — 실제 [$out]"
+
+  # (f) IDLE 무효 → 기본값 + 경고
+  local warn
+  warn="$(env -u WAIT_TIMEOUT -u POLL_TIMEOUT RD_REVIEW_IDLE_TIMEOUT=xyz \
+    TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    bash "$ADAPTER" 2>&1 | grep -c 'RD_REVIEW_IDLE_TIMEOUT' || true)"
+  [ "$warn" -ge 1 ] \
+    && pass "케이스 17f: IDLE 무효값 경고 출력" \
+    || fail "케이스 17f: 경고 미출력"
+
+  # (g) 조정 변수 두 개의 무효값도 경고한다
+  local w2
+  w2="$(env -u WAIT_TIMEOUT -u POLL_TIMEOUT \
+    RD_REVIEW_OBSERVER_FALLBACK_CAP=abc RD_REVIEW_HEARTBEAT=-3 \
+    TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    bash "$ADAPTER" 2>&1)" || true
+  if echo "$w2" | grep -q 'RD_REVIEW_OBSERVER_FALLBACK_CAP' \
+     && echo "$w2" | grep -q 'RD_REVIEW_HEARTBEAT'; then
+    pass "케이스 17g: 조정 변수 무효값 경고"
+  else
+    fail "케이스 17g: 조정 변수 무효값이 조용히 무시됨"
+  fi
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 18: 활동이 유휴 타이머를 반복 갱신한다 (총 경과 > 유휴 임계)
+# ===========================================================================
+run_case18() {
+  local sandbox expected_turn mock_bin rc=0
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  # mock 이 SESSION.md 를 다시 쓰지 않으므로(턴 파일만 생성) check_turn_complete 가
+  # 성공하려면 시작 시점부터 Owner=Author/Status=awaiting-author 여야 한다
+  # (케이스 1·6·14 와 동일 관례 — 브리프 원문의 Reviewer/awaiting-reviewer 는
+  # check_turn_complete 계약상 rc=0 을 구조적으로 불가능하게 하는 오기이므로 정정한다).
+  write_session "$sandbox" "Author" "awaiting-author"
+  write_checkpoint "$sandbox" "Reviewer"
+
+  # mock: 1초마다 출력을 내며 6초간 일한 뒤 턴 파일을 만들고 성공.
+  # 유휴 임계 2초 < 총 소요 6초 이므로, 유휴 갱신이 없으면 반드시 죽는다.
+  mock_bin="$(setup_mock "$sandbox" \
+    "for i in 1 2 3 4 5 6; do echo \"progress \$i\"; sleep 1; done; printf 'x' > \"$expected_turn\"; exit 0")"
+
+  TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+  EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+  WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=2 \
+    bash "$ADAPTER" >/dev/null 2>&1 || rc=$?
+
+  [ "$rc" -eq 0 ] \
+    && pass "케이스 18: 활동이 유휴 타이머를 갱신 (6초 작업 / 유휴 2초 / rc=0)" \
+    || fail "케이스 18: 기대 rc=0 — 실제 rc=$rc (유휴 갱신 실패)"
+
+  [ -s "$sandbox/.codex_output.log" ] \
+    && pass "케이스 18(보조): codex 출력 로그 보존" \
+    || fail "케이스 18(보조): .codex_output.log 부재 또는 빈 파일"
+
+  grep -q '^log_preserved: yes' "$sandbox/.review_wait_status" 2>/dev/null \
+    && pass "케이스 18(보조2): 정상 경로 log_preserved=yes 기록" \
+    || fail "케이스 18(보조2): log_preserved 기록 없음"
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 19: 무활동은 유휴 임계에서 124 로 종료된다
+# ===========================================================================
+run_case19() {
+  local sandbox expected_turn mock_bin rc=0 output start elapsed
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  write_session "$sandbox" "Reviewer" "awaiting-reviewer"
+  write_checkpoint "$sandbox" "Author"
+
+  # mock: 한 줄 찍고 조용히 오래 잔다 → 첫 출력 후 무활동
+  mock_bin="$(setup_mock "$sandbox" "echo start; exec sleep 60")"
+
+  start=$(date +%s)
+  output="$(
+    TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=3 \
+      bash "$ADAPTER" 2>&1
+  )" || rc=$?
+  elapsed=$(( $(date +%s) - start ))
+
+  if [ "$rc" -eq 124 ] && echo "$output" | grep -q "유휴"; then
+    pass "케이스 19: 무활동 → 유휴 사유로 exit 124 (${elapsed}초)"
+  else
+    fail "케이스 19: 기대 rc=124 + '유휴' 사유 — rc=$rc"
+  fi
+
+  # 상한(60초)이 아니라 유휴(3초)에서 끊겼는지 시간으로 확인한다
+  [ "$elapsed" -lt 30 ] \
+    && pass "케이스 19(보조): 상한이 아닌 유휴에서 종료 (${elapsed}초 < 30초)" \
+    || fail "케이스 19(보조): ${elapsed}초 — 유휴 판정이 동작하지 않음"
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 20: 활동 중이어도 절대 상한에서 종료된다
+# ===========================================================================
+run_case20() {
+  local sandbox expected_turn mock_bin rc=0 output
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  write_session "$sandbox" "Reviewer" "awaiting-reviewer"
+  write_checkpoint "$sandbox" "Author"
+
+  # mock: 계속 출력하며 절대 끝나지 않는다
+  mock_bin="$(setup_mock "$sandbox" "while :; do echo tick; sleep 1; done")"
+
+  output="$(
+    TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=4 RD_REVIEW_IDLE_TIMEOUT=600 \
+      bash "$ADAPTER" 2>&1
+  )" || rc=$?
+
+  if [ "$rc" -eq 124 ] && echo "$output" | grep -q "상한"; then
+    pass "케이스 20: 활동 중에도 절대 상한에서 exit 124"
+  else
+    fail "케이스 20: 기대 rc=124 + '상한' 사유 — rc=$rc"
+  fi
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 21: heartbeat 주기·필드와 상태 파일 보존
+# ===========================================================================
+run_case21() {
+  local sandbox expected_turn mock_bin rc=0 output beats
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  write_session "$sandbox" "Reviewer" "awaiting-reviewer"
+  write_checkpoint "$sandbox" "Author"
+
+  mock_bin="$(setup_mock "$sandbox" \
+    "for i in 1 2 3 4 5 6; do echo \"working \$i\"; sleep 1; done; printf 'x' > \"$expected_turn\"; exit 0")"
+
+  # HEARTBEAT_INTERVAL 을 2초로 낮춰 6초 실행에서 최소 2회 나오게 한다
+  output="$(
+    TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=30 RD_REVIEW_HEARTBEAT=2 \
+      bash "$ADAPTER" 2>&1
+  )" || rc=$?
+
+  beats="$(echo "$output" | grep -c '^\[review wait\]' || true)"
+  [ "$beats" -ge 2 ] \
+    && pass "케이스 21a: heartbeat 반복 출력 (${beats}회)" \
+    || fail "케이스 21a: heartbeat 기대 2회 이상 — 실제 ${beats}회"
+
+  # 네 필드가 모두 있는가
+  if echo "$output" | grep -q '^\[review wait\].*경과.*마지막 활동.*유휴여유.*상한'; then
+    pass "케이스 21b: heartbeat 네 필드 포함"
+  else
+    fail "케이스 21b: heartbeat 필드 누락 — $(echo "$output" | grep '^\[review wait\]' | head -1)"
+  fi
+
+  # 로그의 마지막 줄이 붙는가
+  echo "$output" | grep -q 'codex: working' \
+    && pass "케이스 21c: heartbeat 에 로그 마지막 줄 포함" \
+    || fail "케이스 21c: 로그 마지막 줄 미포함"
+
+  # 상태 파일이 정상 완료 후에도 보존되는가
+  [ -s "$sandbox/.review_wait_status" ] \
+    && pass "케이스 21d: 상태 파일 정상 종료 후 보존" \
+    || fail "케이스 21d: .review_wait_status 부재"
+
+  rm -rf "$sandbox"
+}
+# ===========================================================================
+# 케이스 22: 로그 경로 unlink 는 **관측을 훼손하지 않는다** (읽기 채널 fd 전용 계약)
+#   활동 관측은 codex spawn 전에 열어 둔 fd 로만 하므로, 경로가 사라져도 어댑터는 원래
+#   inode 에서 계속 새 바이트를 본다(codex 도 자기 fd 로 같은 inode 에 계속 쓴다).
+#   훼손되는 것은 사후 **로그 보존**뿐이며 그것은 log-vanished-during-run 으로 보고된다.
+#
+#   판별력: 구 코드는 매 tick `wc -c < "$codex_log"` 로 **경로를 다시 열었고**(이번 라운드
+#   Critical 의 정보 노출 창) unlink 시점에 관측기 고장으로 판정해 유효 상한 min(60,4)=4초
+#   에서 rc=124 로 죽었다. 새 코드는 관측이 유지되므로 mock 이 6초 뒤 턴을 완성하고 rc=0
+#   으로 끝난다. FALLBACK_CAP=4 를 그대로 주므로 구 코드로 되돌리면 이 케이스가 깨진다.
+# ===========================================================================
+run_case22() {
+  local sandbox expected_turn mock_bin errlog start elapsed rc=0 i logf out
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  # 완주(rc=0)를 기대하므로 SESSION 은 완료 상태로 둔다 — 어댑터의 완료 판정은 codex
+  # 종료 후에만 일어나므로 시작 시점 값이 실행 중 판정을 바꾸지 않는다(케이스 25 와 동일).
+  write_session "$sandbox" "Author" "awaiting-author"
+  # 1초마다 출력하며 6초 뒤 턴을 완성한다 → 관측이 유지되면 유휴(4초)로 죽지 않는다
+  mock_bin="$(setup_mock "$sandbox" \
+    "for i in 1 2 3 4 5 6; do echo tick; sleep 1; done; printf 'x' > \"$expected_turn\"; exit 0")"
+  errlog="$sandbox/adapter_err.txt"
+
+  # ABS_CAP=60(길게) / IDLE=4(짧게) / fallback 천장=4(짧게)
+  #   관측이 유지되면 매초 활동이 갱신되어 유휴 4초가 발동하지 않고 6초를 완주한다.
+  #   구 코드에서는 unlink(약 2초) 즉시 관측기 고장 → 유효 상한 4초 → rc=124.
+  start=$(date +%s)
+  spawn_group "$errlog" env \
+    TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=4 RD_REVIEW_OBSERVER_FALLBACK_CAP=4 \
+    bash "$ADAPTER"
+
+  # 로그 파일이 생기기를 기다렸다가 **실제로 지운다** (현실의 unlink 장애)
+  logf=""
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    logf="$( { ls "$sandbox"/.codex_output.?????? 2>/dev/null || true; } | head -n 1 )"
+    [ -n "$logf" ] && break
+    sleep 0.1
+  done
+  if [ -z "$logf" ]; then
+    fail "케이스 22: codex 출력 로그가 생성되지 않아 장애를 주입할 수 없음"
+    reap_group "$GROUP_PGID"; rm -rf "$sandbox"; return
+  fi
+  sleep 2
+  rm -f "$logf"
+
+  wait "$JOB" 2>/dev/null || rc=$?
+  elapsed=$(( $(date +%s) - start ))
+  reap_group "$GROUP_PGID"
+  out="$( { cat "$errlog" 2>/dev/null || true; } )"
+
+  # (a) unlink 에도 관측이 유지되어 턴을 완주했는가
+  if [ "$rc" -eq 0 ] && [ "$elapsed" -ge 5 ]; then
+    pass "케이스 22a: 로그 경로 unlink 에도 관측 유지 — 턴 완주 (${elapsed}초, rc=0)"
+  else
+    fail "케이스 22a: 기대 rc=0 & elapsed>=5 — rc=$rc elapsed=${elapsed}초 (경로 재열기 관측으로 회귀했을 수 있음)"
+  fi
+
+  # (b) 관측기 고장으로 오판하지 않았는가 (전환 경고 고유 접두사로 좁혀 판정)
+  local n; n="$( { echo "$out" | grep -c '^경고: 활동 관측기가 동작하지 않습니다' || true; } )"
+  if [ "$n" -eq 0 ]; then
+    pass "케이스 22b: 경로 소실을 관측기 고장으로 오판하지 않음"
+  else
+    fail "케이스 22b: 관측기 고장 경고 ${n}회 (fd 채널에서는 발생하지 않아야 함)"
+  fi
+
+  # (c) 상태 파일의 관측기 상태가 ok 인가
+  { grep -q '^observer: ok' "$sandbox/.review_wait_status" 2>/dev/null; } \
+    && pass "케이스 22c: 상태 파일에 observer: ok 기록" \
+    || fail "케이스 22c: observer 상태 이상 — $( { grep '^observer' "$sandbox/.review_wait_status" 2>/dev/null || true; } )"
+
+  # (d) 훼손된 것은 **보존**뿐이며 그것을 정직하게 보고했는가
+  { echo "$out" | grep -q '보존하지 못했습니다'; } \
+    && pass "케이스 22d: 로그 소실 시 stderr 로 보존 실패 보고" \
+    || fail "케이스 22d: stderr 보고 없음"
+
+  if { grep -q '^log_preserved: no' "$sandbox/.review_wait_status" 2>/dev/null; } \
+     && { grep -q '^log_preserved_reason: log-vanished-during-run' "$sandbox/.review_wait_status" 2>/dev/null; }; then
+    pass "케이스 22e: 상태 파일에 보존 실패와 사유 기록"
+  else
+    fail "케이스 22e: 상태 파일에 log_preserved/사유 없음 — $( { cat "$sandbox/.review_wait_status" 2>/dev/null || true; } | tr '\n' ' ')"
+  fi
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 23: 타임아웃 메시지 — 오염 단정 금지 + 재개 가능 판정
+# ===========================================================================
+run_case23() {
+  local sandbox expected_turn mock_bin rc=0 output
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  write_session "$sandbox" "Reviewer" "awaiting-reviewer"
+  write_checkpoint "$sandbox" "Author"
+  mock_bin="$(setup_mock "$sandbox" "echo begin; exec sleep 60")"
+
+  output="$(
+    TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=3 \
+      bash "$ADAPTER" 2>&1
+  )" || rc=$?
+
+  # (a) 오염을 단정하지 않는다
+  echo "$output" | grep -q '오염' \
+    && fail "케이스 23a: 타임아웃 경로에 '오염' 단정이 남아 있음" \
+    || pass "케이스 23a: 타임아웃 경로에 오염 단정 없음"
+
+  # (b) 재개 가능하다고 말한다
+  echo "$output" | grep -q '이어갈 수 있습니다' \
+    && pass "케이스 23b: 재개 가능 판정 출력" \
+    || fail "케이스 23b: 재개 가능 판정 없음"
+
+  # (c) 검사 범위를 밝힌다
+  echo "$output" | grep -q '검사하지 않았습니다' \
+    && pass "케이스 23c: 검사 범위 명시" \
+    || fail "케이스 23c: 검사 범위 미명시"
+
+  # (d) idle 사유에는 유휴 변수를 안내한다 (절대 상한을 올려도 재발하므로)
+  if echo "$output" | grep -q 'RD_REVIEW_IDLE_TIMEOUT=<더 큰 값>'; then
+    pass "케이스 23d: idle 사유에 유휴 임계 조정 안내"
+  else
+    fail "케이스 23d: idle 사유인데 유휴 변수 안내 없음"
+  fi
+
+  # (d2) idle 사유에 WAIT_TIMEOUT 을 안내하지 않는다
+  echo "$output" | grep -q 'WAIT_TIMEOUT=<더 큰 값>' \
+    && fail "케이스 23d2: idle 사유에 절대 상한 조정을 안내함 (재발하는 조치)" \
+    || pass "케이스 23d2: idle 사유에 절대 상한 안내 없음"
+
+  # (d3) cap 사유에는 WAIT_TIMEOUT 을 안내하고, 증명되지 않은 단정을 하지 않는다
+  local sandbox3 output3 rc3=0 mock3
+  sandbox3="$(make_sandbox)"
+  write_session "$sandbox3" "Reviewer" "awaiting-reviewer"
+  write_checkpoint "$sandbox3" "Author"
+  mock3="$(setup_mock "$sandbox3" "while :; do echo tick; sleep 1; done")"
+  output3="$(
+    TOOL_BIN="$mock3/codex" SESSION_PATH="$sandbox3" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$sandbox3/turns/turn-001-reviewer.md" PROJECT_ROOT="$sandbox3" \
+    WAIT_TIMEOUT=3 RD_REVIEW_IDLE_TIMEOUT=600 \
+      bash "$ADAPTER" 2>&1
+  )" || rc3=$?
+  echo "$output3" | grep -q 'WAIT_TIMEOUT=<더 큰 값>' \
+    && pass "케이스 23d3: cap 사유에 절대 상한 조정 안내" \
+    || fail "케이스 23d3: cap 사유에 절대 상한 안내 없음"
+  echo "$output3" | grep -q '마지막까지 출력' \
+    && fail "케이스 23d4: cap 메시지에 증명되지 않은 단정이 남아 있음" \
+    || pass "케이스 23d4: cap 메시지에 미증명 단정 없음"
+  echo "$output3" | grep -q '오염' \
+    && fail "케이스 23d5: cap 경로에도 '오염' 단정이 남아 있음" \
+    || pass "케이스 23d5: cap 경로에 오염 단정 없음"
+  rm -rf "$sandbox3"
+
+  # (e) 상태가 어긋나면 재개 가능하다고 말하지 않는다
+  local sandbox2 output2 rc2=0
+  sandbox2="$(make_sandbox)"
+  write_session "$sandbox2" "Bogus" "awaiting-reviewer"
+  write_checkpoint "$sandbox2" "Author"
+  local mock2
+  mock2="$(setup_mock "$sandbox2" "echo begin; exec sleep 60")"
+  output2="$(
+    TOOL_BIN="$mock2/codex" SESSION_PATH="$sandbox2" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$sandbox2/turns/turn-001-reviewer.md" PROJECT_ROOT="$sandbox2" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=3 \
+      bash "$ADAPTER" 2>&1
+  )" || rc2=$?
+  echo "$output2" | grep -q '이어갈 수 있습니다' \
+    && fail "케이스 23e: 상태가 어긋났는데 재개 가능하다고 말함" \
+    || pass "케이스 23e: 상태 불일치 시 재개 가능 주장 없음"
+  # "직접 확인하십시오" 라고 해놓고 재개 명령을 함께 내면 앞말이 무효가 된다
+  echo "$output2" | grep -q '^재개:' \
+    && fail "케이스 23e2: 상태 불일치인데 재개 명령을 출력함" \
+    || pass "케이스 23e2: 상태 불일치 시 재개 명령 없음"
+  rm -rf "$sandbox2"
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 24: effective_cap 순수 함수 — fallback 불변식
+# ===========================================================================
+run_case24() {
+  # 어댑터를 source 하지 않고 함수만 꺼내 쓴다 (어댑터는 set -e + 즉시 실행 스크립트).
+  local fn
+  fn="$(sed -n '/^effective_cap() {/,/^}/p' "$ADAPTER")"
+  [ -n "$fn" ] || { fail "케이스 24: effective_cap 정의를 찾지 못함"; return; }
+
+  local out rc=0
+  # `set -e` 아래에서 명령 치환 대입을 가드 없이 두면, 추출한 함수가 비영 종료할 때
+  # 케이스 FAIL 이 아니라 스위트 전체가 요약 없이 중단된다 — `|| true` 로 흡수하고
+  # 이어지는 값 비교로 판정한다.
+  out="$(bash -c "$fn"'
+    effective_cap 7200 1 600
+    echo
+    effective_cap 7200 0 600
+    echo
+    effective_cap 3 0 600
+    echo
+    effective_cap 60 0 4
+    echo' 2>/dev/null)" || rc=$?
+
+  local expected="7200
+600
+3
+4"
+  if [ "$rc" -ne 0 ]; then
+    fail "케이스 24: 추출한 effective_cap 실행이 비영 종료함 (rc=$rc) — 출력 [$out]"
+  elif [ "$out" = "$expected" ]; then
+    pass "케이스 24: effective_cap — 정상=상한 / 고장=min(상한,천장) / 짧은 상한 보존"
+  else
+    fail "케이스 24: 기대 [$expected] — 실제 [$out]"
+  fi
+}
+
+# ===========================================================================
+# 케이스 25: 상태 snapshot 은 매 실행 시작에 초기화되고 관리 키는 단일하다
+#   (a) 신규 세션의 빠른 종료(첫 heartbeat 전) — 필수 필드가 모두 있다
+#   (b) 기존 상태 파일이 있는 빠른 재실행 — 과거 임시 경로·과거 관측기 상태가 남지 않는다
+#   판정은 낱말 세기가 아니라 **키 존재와 키 개수(구조)** 로 한다.
+# ===========================================================================
+run_case25() {
+  local sandbox expected_turn mock_bin sf rc=0 k n missing="" dup=""
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  write_session "$sandbox" "Author" "awaiting-author"
+  mock_bin="$(setup_mock "$sandbox" "echo quick; printf 'x' > \"$expected_turn\"; exit 0")"
+  sf="$sandbox/.review_wait_status"
+
+  # (a) 신규 세션 — 1초 안에 끝나므로 heartbeat(기본 60초)는 한 번도 돌지 않는다
+  TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+  EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+  WAIT_TIMEOUT=30 RD_REVIEW_IDLE_TIMEOUT=20 \
+    bash "$ADAPTER" >/dev/null 2>&1 || rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    fail "케이스 25: 전제 실패 — 어댑터 rc=$rc (정상 완료 기대)"
+    rm -rf "$sandbox"; return
+  fi
+
+  for k in 'log_path:' 'observer:' 'effective_cap:' 'log_preserved:' 'log_path_final:'; do
+    if ! { grep -q "^${k}" "$sf" 2>/dev/null; }; then missing="${missing}${k} "; fi
+  done
+  if [ -z "$missing" ]; then
+    pass "케이스 25a: 첫 heartbeat 전 종료에도 필수 필드가 모두 존재"
+  else
+    fail "케이스 25a: 필드 누락 [$missing] — $( { cat "$sf" 2>/dev/null || true; } | tr '\n' '|' )"
+  fi
+
+  # 유효 상한은 이번 실행의 설정값(30초)이어야 한다
+  { grep -q '^effective_cap: 30s' "$sf" 2>/dev/null; } \
+    && pass "케이스 25a2: effective_cap 이 이번 실행 설정(30s)" \
+    || fail "케이스 25a2: effective_cap 불일치 — $( { grep '^effective_cap' "$sf" 2>/dev/null || true; } )"
+
+  # (b) 기존 상태 파일이 남아 있는 빠른 재실행 — 과거 문장이 섞여선 안 된다.
+  # 고유 토큰 OLDSTALE 로 판정한다 (production 문구에 의존하지 않는다).
+  printf '%s\n' \
+    '[review wait] 경과 55m00s | 마지막 활동 3m00s 전 | 유휴여유 2m00s | 상한 1h00m' \
+    '  codex: OLDSTALE-progress' \
+    "log_path: ${sandbox}/.codex_output.OLDSTALE" \
+    'observer: failed' \
+    'effective_cap: 4s' \
+    'log_preserved: no' \
+    'log_preserved_reason: log-vanished-during-run' \
+    'log_path_final: (없음)' \
+    'log_path_recovery: /tmp/OLDSTALE' > "$sf"
+
+  rc=0
+  TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+  EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+  WAIT_TIMEOUT=30 RD_REVIEW_IDLE_TIMEOUT=20 \
+    bash "$ADAPTER" >/dev/null 2>&1 || rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    fail "케이스 25b: 전제 실패 — 재실행 rc=$rc"
+  else
+    if { grep -q 'OLDSTALE' "$sf" 2>/dev/null; }; then
+      fail "케이스 25b: 이전 턴 snapshot 이 현재 상태로 보존됨 — $( { cat "$sf" 2>/dev/null || true; } | tr '\n' '|' )"
+    else
+      pass "케이스 25b: 재실행이 과거 snapshot(임시 경로·관측기 상태)을 물려받지 않음"
+    fi
+    { grep -q '^observer: ok' "$sf" 2>/dev/null; } \
+      && pass "케이스 25b2: 관측기 상태가 이번 실행 기준" \
+      || fail "케이스 25b2: observer 가 과거 값 — $( { grep '^observer' "$sf" 2>/dev/null || true; } )"
+    { grep -q '^log_preserved: yes' "$sf" 2>/dev/null; } \
+      && pass "케이스 25b3: 보존 결과가 이번 실행 기준(yes)" \
+      || fail "케이스 25b3: log_preserved 가 과거 값 — $( { grep '^log_preserved' "$sf" 2>/dev/null || true; } )"
+
+    for k in log_preserved log_preserved_reason log_path_final log_path_recovery; do
+      n="$( { grep -c "^${k}: " "$sf" 2>/dev/null || true; } | tr -d ' ' )"
+      [ -n "$n" ] || n=0
+      [ "$n" -gt 1 ] && dup="${dup}${k}=${n} "
+    done
+    if [ -z "$dup" ]; then
+      pass "케이스 25b4: 관리 키가 실행마다 중복되지 않음"
+    else
+      fail "케이스 25b4: 관리 키 중복 [$dup]"
+    fi
+  fi
+
+  # 임시 파일 잔존 없음
+  n="$( { find "$sandbox" -maxdepth 1 -name '.review_wait_status.*' 2>/dev/null || true; } | wc -l | tr -d ' ' )"
+  [ "$n" -eq 0 ] \
+    && pass "케이스 25c: 상태 파일 임시 잔여물 없음" \
+    || fail "케이스 25c: .review_wait_status.* ${n}개 잔존"
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 26: 상태 파일 쓰기가 세션 밖 파일을 truncate·유출하지 않는다 (보안 회귀)
+#   구 코드는 `.review_wait_status.tmp.$$` 로 썼고 그 `$$` 는 어댑터 PID 이다.
+#   background codex 에서 `$PPID` 가 곧 어댑터 PID 이므로 codex 는 그 경로를 정확히
+#   계산할 수 있었다 — 그 자리에 세션 밖 파일을 가리키는 symlink 를 심으면 `>` 가 링크를
+#   따라가 sandbox 밖 파일을 호출자 권한으로 truncate 한다(confused deputy).
+#   안정 경로 `.review_wait_status` 에 세션 밖 **디렉터리** symlink 를 심으면 `mv` 가
+#   그 안으로 상태 파일을 옮겨 세션 밖으로 유출시킨다.
+#   케이스 16(last_message)과 같은 성질을 상태 파일 두 경로에 대해 고정한다.
+# ===========================================================================
+run_case26() {
+  local sandbox expected_turn bin_dir victim_dir victim leak_dir rc=0 n
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  write_session "$sandbox" "Author" "awaiting-author"
+
+  victim_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$victim_dir" && -d "$victim_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  victim="$victim_dir/sentinel.txt"
+  printf 'SENTINEL-KEEP\n' > "$victim"
+  leak_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$leak_dir" && -d "$leak_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+
+  bin_dir="$sandbox/mock_bin"
+  mkdir -p "$bin_dir"
+  cat > "$bin_dir/codex" <<'MOCK_EOF'
+#!/usr/bin/env bash
+# 구 예측 규칙 두 형태를 모두 심는다: 어댑터 PID($PPID)와 mock 자신의 PID($$).
+ln -sf "$C26_SENTINEL" "$SESSION_PATH/.review_wait_status.tmp.$PPID" 2>/dev/null || true
+ln -sf "$C26_SENTINEL" "$SESSION_PATH/.review_wait_status.tmp.$$" 2>/dev/null || true
+# 안정 경로에는 세션 밖 디렉터리 symlink
+rm -f "$SESSION_PATH/.review_wait_status" 2>/dev/null || true
+ln -sfn "$C26_LEAKDIR" "$SESSION_PATH/.review_wait_status" 2>/dev/null || true
+echo working
+sleep 2
+touch "$C26_TURN_FILE"
+cat >/dev/null
+exit 0
+MOCK_EOF
+  chmod +x "$bin_dir/codex"
+
+  C26_SENTINEL="$victim" C26_LEAKDIR="$leak_dir" C26_TURN_FILE="$expected_turn" \
+  TOOL_BIN="$bin_dir/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+  EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+  WAIT_TIMEOUT=30 RD_REVIEW_IDLE_TIMEOUT=20 RD_REVIEW_HEARTBEAT=1 \
+    bash "$ADAPTER" >/dev/null 2>&1 || rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    fail "케이스 26: 전제 실패 — 어댑터 rc=$rc (정상 완료 기대)"
+  else
+    # (a) 예측 가능 경로 symlink 를 따라가 세션 밖 파일을 truncate 하지 않았다
+    if [ "$( { cat "$victim" 2>/dev/null || true; } )" = "SENTINEL-KEEP" ]; then
+      pass "케이스 26a: 예측 가능 임시 경로 symlink 비추종 (세션 밖 sentinel 내용 보존)"
+    else
+      fail "케이스 26a: 세션 밖 sentinel 이 훼손됨 — '$( { cat "$victim" 2>/dev/null || true; } )'"
+    fi
+
+    # (b) 안정 경로 디렉터리 symlink 를 따라가 세션 밖으로 상태 파일을 옮기지 않았다
+    n="$( { ls -A "$leak_dir" 2>/dev/null || true; } | wc -l | tr -d ' ' )"
+    [ "$n" -eq 0 ] \
+      && pass "케이스 26b: 안정 경로 디렉터리 symlink 비추종 (세션 밖 유출 없음)" \
+      || fail "케이스 26b: 세션 밖 디렉터리로 ${n}개 유출 — $( { ls -A "$leak_dir" 2>/dev/null || true; } | tr '\n' ' ')"
+
+    # (c) 상태 파일은 세션 안의 정규 파일로 남는다
+    if [ -f "$sandbox/.review_wait_status" ] && [ ! -L "$sandbox/.review_wait_status" ] \
+       && { grep -q '^log_preserved: ' "$sandbox/.review_wait_status" 2>/dev/null; }; then
+      pass "케이스 26c: 상태 파일이 세션 안 정규 파일로 기록됨"
+    else
+      fail "케이스 26c: 상태 파일이 정규 파일이 아니거나 비어 있음"
+    fi
+  fi
+
+  rm -rf "$sandbox" "$victim_dir" "$leak_dir"
+}
+
+# ===========================================================================
+# 케이스 27: 로그 최종 이동 실패를 성공으로 보고하지 않는다 (Important 3)
+#   (a) 안정 경로에 **실제 디렉터리** — 이동은 반드시 실패해야 하고, 그때
+#       log_preserved: no + 기계 판독 사유 + 회수 가능한 임시 경로가 남아야 한다.
+#       (구 코드는 `mv ... || true` 뒤에 무조건 yes 를 적었다.)
+#   (b) 안정 경로에 **세션 밖 디렉터리 symlink** — 로그가 세션 밖으로 새지 않아야 한다.
+# ===========================================================================
+run_case27() {
+  local sandbox expected_turn mock_bin sf err rc=0 n rec
+  # --- (a) 실제 디렉터리 ---
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  write_session "$sandbox" "Author" "awaiting-author"
+  mock_bin="$(setup_mock "$sandbox" "echo blocked; printf 'x' > \"$expected_turn\"; exit 0")"
+  mkdir -p "$sandbox/.codex_output.log"
+  sf="$sandbox/.review_wait_status"
+  err="$sandbox/err_a.txt"
+
+  TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+  EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+  WAIT_TIMEOUT=30 RD_REVIEW_IDLE_TIMEOUT=20 \
+    bash "$ADAPTER" >/dev/null 2>"$err" || rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    fail "케이스 27a: 전제 실패 — 어댑터 rc=$rc (턴 자체는 성공해야 함)"
+  else
+    if { grep -q '^log_preserved: no' "$sf" 2>/dev/null; } \
+       && { grep -q '^log_preserved_reason: log-move-failed' "$sf" 2>/dev/null; }; then
+      pass "케이스 27a: 이동 실패를 no + log-move-failed 로 기록"
+    else
+      fail "케이스 27a: 이동 실패인데 보존 성공으로 기록 — $( { cat "$sf" 2>/dev/null || true; } | tr '\n' '|' )"
+    fi
+
+    rec="$( { grep '^log_path_recovery: ' "$sf" 2>/dev/null || true; } | sed 's/^log_path_recovery: //' )"
+    if [ -n "$rec" ] && [ -f "$rec" ]; then
+      pass "케이스 27a2: 회수 가능한 임시 경로를 상태 파일에 남김 ($(basename "$rec"))"
+    else
+      fail "케이스 27a2: 회수 경로 없음 또는 실재하지 않음 — '$rec'"
+    fi
+
+    { grep -q '옮기지 못했습니다' "$err" 2>/dev/null; } \
+      && pass "케이스 27a3: stderr 로 이동 실패 보고" \
+      || fail "케이스 27a3: stderr 보고 없음"
+
+    n="$( { ls -A "$sandbox/.codex_output.log" 2>/dev/null || true; } | wc -l | tr -d ' ' )"
+    [ "$n" -eq 0 ] \
+      && pass "케이스 27a4: 디렉터리 안으로 로그를 밀어 넣지 않음" \
+      || fail "케이스 27a4: 디렉터리 안에 ${n}개 생성"
+  fi
+  rm -rf "$sandbox"
+
+  # --- (b) 세션 밖 디렉터리 symlink ---
+  local leak_dir sandbox2 expected2 mock2 rc2=0
+  sandbox2="$(make_sandbox)"
+  expected2="$sandbox2/turns/turn-001-reviewer.md"
+  write_session "$sandbox2" "Author" "awaiting-author"
+  mock2="$(setup_mock "$sandbox2" "echo leaky; printf 'x' > \"$expected2\"; exit 0")"
+  leak_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$leak_dir" && -d "$leak_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  ln -sfn "$leak_dir" "$sandbox2/.codex_output.log"
+
+  TOOL_BIN="$mock2/codex" SESSION_PATH="$sandbox2" PROMPT_FILE=/dev/null \
+  EXPECTED_TURN_FILE="$expected2" PROJECT_ROOT="$sandbox2" \
+  WAIT_TIMEOUT=30 RD_REVIEW_IDLE_TIMEOUT=20 \
+    bash "$ADAPTER" >/dev/null 2>&1 || rc2=$?
+
+  n="$( { ls -A "$leak_dir" 2>/dev/null || true; } | wc -l | tr -d ' ' )"
+  if [ "$n" -eq 0 ] && [ -f "$sandbox2/.codex_output.log" ] && [ ! -L "$sandbox2/.codex_output.log" ]; then
+    pass "케이스 27b: 안정 경로 디렉터리 symlink 로 로그가 세션 밖으로 새지 않음"
+  else
+    fail "케이스 27b: 유출 ${n}개 / 안정 경로 형태 이상 (rc=$rc2)"
+  fi
+  rm -rf "$sandbox2" "$leak_dir"
+}
+
+# ===========================================================================
+# 케이스 28: 경쟁 symlink — 안정 이름 rename 제거로 유출 창이 닫혔는가 (Important 3)
+#   구 코드는 매 갱신마다 안정 이름(`.review_wait_status`)으로 `mv` 했다. 검사·삭제·mv 는
+#   원자 연산이 아니므로 codex 가 그 이름을 **타이트한 루프로 계속** 외부 디렉터리 symlink 로
+#   재생성하면 창을 반복 공략해 상태 snapshot 을 세션 밖으로 빼낼 수 있었다.
+#   `.wait_timeout` 마커는 그 방어조차 없어 무방비 `mv` 였고, 마커가 밖으로 나가면 부모의
+#   존재 검사가 실패해 **실제 타임아웃을 일반 조기 종료로 오분류**했다.
+#   새 계약: 진행 중에는 안정 이름을 건드리지 않고(스트림 fd 전용), 마커는 spawn 전에 배타
+#   생성한 무작위 경로에 fd 로 쓴다. 그래서 이 mock 이 이겨야 할 창이 존재하지 않는다.
+#   판정: ① 외부 디렉터리 유출 0 ② 외부 정규 파일 훼손 없음 ③ 타임아웃 exit 124 보존
+#         ④ 사유가 사실대로(유휴) 보고됨
+# ===========================================================================
+run_case28() {
+  local sandbox expected_turn bin_dir leak_dir victim_dir victim rc=0 out n
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  write_session "$sandbox" "Reviewer" "awaiting-reviewer"
+  write_checkpoint "$sandbox" "Author"
+  leak_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$leak_dir" && -d "$leak_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  victim_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$victim_dir" && -d "$victim_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  victim="$victim_dir/sentinel.txt"
+  printf 'SENTINEL-KEEP\n' > "$victim"
+
+  bin_dir="$sandbox/mock_bin"
+  mkdir -p "$bin_dir"
+  cat > "$bin_dir/codex" <<'MOCK_EOF'
+#!/usr/bin/env bash
+# "한 번 미리 배치" 가 아니라 **반복 공략**을 재현한다. 안정 이름과, 세션 디렉터리를
+# **열거해 찾은 무작위 이름** 둘 다 노린다 (이름의 무작위성만으로는 열거를 막지 못한다).
+# 출력을 내지 않으므로 활동 관측기는 진행 없음으로 보고 유휴 타임아웃이 발동한다.
+while :; do
+  rm -f "$SESSION_PATH/.review_wait_status" 2>/dev/null
+  ln -sfn "$C28_LEAKDIR" "$SESSION_PATH/.review_wait_status" 2>/dev/null
+  rm -f "$SESSION_PATH/.wait_timeout" 2>/dev/null
+  ln -sfn "$C28_LEAKDIR" "$SESSION_PATH/.wait_timeout" 2>/dev/null
+  for f in "$SESSION_PATH"/.review_wait_status.?????? "$SESSION_PATH"/.wait_timeout.??????; do
+    [ -e "$f" ] || continue
+    if [ -L "$f" ]; then continue; fi
+    rm -f "$f" 2>/dev/null
+    ln -sfn "$C28_SENTINEL" "$f" 2>/dev/null
+  done
+  sleep 0.01
+done
+MOCK_EOF
+  chmod +x "$bin_dir/codex"
+
+  out="$(
+    C28_LEAKDIR="$leak_dir" C28_SENTINEL="$victim" \
+    TOOL_BIN="$bin_dir/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=3 RD_REVIEW_HEARTBEAT=1 \
+      bash "$ADAPTER" 2>&1
+  )" || rc=$?
+
+  # (a) 외부 디렉터리로 아무것도 나가지 않았다
+  n="$( { ls -A "$leak_dir" 2>/dev/null || true; } | wc -l | tr -d ' ' )"
+  [ "$n" -eq 0 ] \
+    && pass "케이스 28a: 경쟁 symlink 반복 공략에도 외부 디렉터리 유출 0" \
+    || fail "케이스 28a: 외부 디렉터리로 ${n}개 유출 — $( { ls -A "$leak_dir" 2>/dev/null || true; } | tr '\n' ' ' )"
+
+  # (b) 외부 정규 파일을 truncate·덮어쓰지 않았다 (fd 전용 쓰기의 증거)
+  [ "$( { cat "$victim" 2>/dev/null || true; } )" = "SENTINEL-KEEP" ] \
+    && pass "케이스 28b: 외부 정규 파일 내용 보존 (경로 재해석 없는 fd 쓰기)" \
+    || fail "케이스 28b: 외부 sentinel 훼손 — '$( { cat "$victim" 2>/dev/null || true; } )'"
+
+  # (c) 타임아웃 종료 코드가 보존됐다 — 마커가 빼돌려지면 조기 종료(exit 1)로 오분류된다
+  [ "$rc" -eq 124 ] \
+    && pass "케이스 28c: 마커 공략에도 타임아웃 exit 124 보존" \
+    || fail "케이스 28c: 기대 rc=124 — 실제 rc=$rc"
+
+  # (d) 사유를 사실대로 보고했다 (마커 내용이 fd 로 전달됐다는 증거)
+  echo "$out" | grep -q '유휴' \
+    && pass "케이스 28d: 타임아웃 사유(유휴)를 사실대로 보고" \
+    || fail "케이스 28d: 사유 보고 누락 — $out"
+
+  reap_group "$GROUP_PGID"
+  rm -rf "$sandbox" "$leak_dir" "$victim_dir"
+
+  # --- (e) 마커 오분류 — 결정적 시나리오 ---
+  # 위 (c) 는 반복 공략 루프이므로 마커 창을 이기는 시점이 확률적이다. 마커 구멍은
+  # **한 번 심고 유지**하면 결정적으로 재현된다: 구 코드는 안정 이름 `.wait_timeout` 으로
+  # 무방비 `mv` 했으므로 그 자리에 외부 디렉터리 symlink 가 있으면 마커가 세션 밖으로
+  # 옮겨지고, 부모의 `[ -f ]` 가 실패해 **실제 타임아웃을 조기 종료(exit 1)로 오분류**했다.
+  local sb2 leak2 out2 rc2=0 n2
+  sb2="$(make_sandbox)"
+  write_session "$sb2" "Reviewer" "awaiting-reviewer"
+  write_checkpoint "$sb2" "Author"
+  leak2="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$leak2" && -d "$leak2" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  local mock2
+  mock2="$(setup_mock "$sb2" 'ln -sfn "$C28E_LEAKDIR" "$SESSION_PATH/.wait_timeout" 2>/dev/null; exec sleep 60')"
+
+  out2="$(
+    C28E_LEAKDIR="$leak2" \
+    TOOL_BIN="$mock2/codex" SESSION_PATH="$sb2" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$sb2/turns/turn-001-reviewer.md" PROJECT_ROOT="$sb2" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=3 \
+      bash "$ADAPTER" 2>&1
+  )" || rc2=$?
+
+  n2="$( { ls -A "$leak2" 2>/dev/null || true; } | wc -l | tr -d ' ' )"
+  if [ "$rc2" -eq 124 ] && [ "$n2" -eq 0 ]; then
+    pass "케이스 28e: 안정 이름 마커 symlink 유지에도 타임아웃 보존 (rc=124, 유출 0)"
+  else
+    fail "케이스 28e: 마커 오분류 또는 유출 — rc=$rc2 (기대 124) 유출=${n2}개"
+  fi
+  echo "$out2" | grep -q '턴 완료 전에 종료' \
+    && fail "케이스 28e2: 실제 타임아웃을 조기 종료로 오분류함" \
+    || pass "케이스 28e2: 조기 종료 오분류 없음"
+
+  rm -rf "$sb2" "$leak2"
+}
+
+# ===========================================================================
+# 케이스 29: 소스 로그가 symlink 로 교체되면 거짓 "회수 가능" 을 보고하지 않는다 (Important 4)
+#   codex 는 세션을 열거해 무작위 `.codex_output.*` 이름을 찾을 수 있다. 그 경로를 외부
+#   **정규 파일** symlink 로 바꾸면 구 코드의 `[ -f ]` 는 링크를 따라 참이 되고 `mv` 는
+#   symlink 자체를 안정 경로로 옮겼다. 이후 `[ ! -L ]` 검증은 실패하지만 원래 임시 경로는
+#   이미 사라졌는데도 실패 분기가 무조건 "로그는 임시 경로에 남아 있습니다(회수 가능)" 를
+#   출력하고 `log_path_recovery` 에 그 **존재하지 않는 경로**를 적었다.
+#   (기존 케이스 27 은 목적지 directory/symlink 만 검사해 이 경로를 고정하지 못했다.)
+# ===========================================================================
+run_case29() {
+  local sandbox expected_turn bin_dir out_dir outside sf err rc=0
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  write_session "$sandbox" "Author" "awaiting-author"
+  out_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$out_dir" && -d "$out_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  outside="$out_dir/outside.txt"
+  printf 'OUTSIDE-CONTENT\n' > "$outside"
+  sf="$sandbox/.review_wait_status"
+  err="$sandbox/err.txt"
+
+  bin_dir="$sandbox/mock_bin"
+  mkdir -p "$bin_dir"
+  cat > "$bin_dir/codex" <<'MOCK_EOF'
+#!/usr/bin/env bash
+# 세션을 열거해 소스 로그 경로를 찾아 외부 **정규 파일** symlink 로 바꿔치기한다.
+for f in "$SESSION_PATH"/.codex_output.??????; do
+  [ -e "$f" ] || continue
+  rm -f "$f" 2>/dev/null
+  ln -sfn "$C29_OUTSIDE" "$f" 2>/dev/null
+done
+printf 'x' > "$C29_TURN_FILE"
+exit 0
+MOCK_EOF
+  chmod +x "$bin_dir/codex"
+
+  C29_OUTSIDE="$outside" C29_TURN_FILE="$expected_turn" \
+  TOOL_BIN="$bin_dir/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+  EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+  WAIT_TIMEOUT=30 RD_REVIEW_IDLE_TIMEOUT=20 \
+    bash "$ADAPTER" >/dev/null 2>"$err" || rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    fail "케이스 29: 전제 실패 — 어댑터 rc=$rc (턴 자체는 성공해야 함)"
+  else
+    # (a) 변조된 소스를 안정 경로로 끌어오지 않았다 (남의 파일을 codex 출력으로 보고 금지)
+    if [ ! -e "$sandbox/.codex_output.log" ] && [ ! -L "$sandbox/.codex_output.log" ]; then
+      pass "케이스 29a: symlink 소스를 안정 경로로 옮기지 않음"
+    else
+      fail "케이스 29a: 안정 경로에 산출물이 생김 (symlink=$( [ -L "$sandbox/.codex_output.log" ] && echo 예 || echo 아니오 ))"
+    fi
+
+    # (b) 보존 실패를 **별도 사유**로 정직하게 기록했다
+    if { grep -q '^log_preserved: no' "$sf" 2>/dev/null; } \
+       && { grep -q '^log_preserved_reason: log-source-replaced' "$sf" 2>/dev/null; }; then
+      pass "케이스 29b: 소스 변조를 no + log-source-replaced 로 기록"
+    else
+      fail "케이스 29b: 사유 기록 누락 — $( { cat "$sf" 2>/dev/null || true; } | tr '\n' '|' )"
+    fi
+
+    # (c) 존재하지 않는 경로를 "회수 가능" 으로 보고하지 않았다
+    if { grep -q '^log_path_recovery: ' "$sf" 2>/dev/null; }; then
+      fail "케이스 29c: 회수할 수 없는데 log_path_recovery 를 기록함 — $( { grep '^log_path_recovery' "$sf" 2>/dev/null || true; } )"
+    else
+      pass "케이스 29c: 회수 경로를 기록하지 않음"
+    fi
+    { grep -q '회수 가능' "$err" 2>/dev/null; } \
+      && fail "케이스 29c2: stderr 에 거짓 '회수 가능' 안내가 남아 있음" \
+      || pass "케이스 29c2: stderr 에 거짓 회수 안내 없음"
+
+    # (d) 외부 파일을 세션 안으로 끌어오거나 옮겨 버리지 않았다
+    if [ -f "$outside" ] && [ "$( { cat "$outside" 2>/dev/null || true; } )" = "OUTSIDE-CONTENT" ]; then
+      pass "케이스 29d: 외부 정규 파일이 제자리에 그대로 남음"
+    else
+      fail "케이스 29d: 외부 파일이 사라졌거나 변경됨"
+    fi
+  fi
+
+  rm -rf "$sandbox" "$out_dir"
+}
+
+# ===========================================================================
+# 케이스 30: 안정 상태 파일은 **실행 중에 존재하지 않는다** (final diff review 006 Important 2)
+#   계약: `.review_wait_status` 는 실행 중에는 없고 종료 후 1회 발행된다.
+#   구 코드는 시작 정리에서 `.turn_ready`·예상 턴·과거 마커만 지웠으므로 **이전 턴의 안정
+#   상태 파일이 이번 실행 중에도 그대로 남았다**(실측: 이전 안정 파일과 이번 실행 스트림
+#   동시 존재). 안정 경로만 보는 headless 소비자는 이전 턴의 log_path·observer·보존 결과를
+#   현재 실행 상태로 오인한다.
+#   판정 시점이 핵심이다 — 케이스 25 는 두 실행을 **모두 완료한 뒤** 최종 파일만 검사해 이
+#   구간을 놓친다. 여기서는 mock 을 rendezvous 파일로 붙잡아 **실행 중에** 단정한다.
+# ===========================================================================
+run_case30() {
+  local sandbox expected_turn mock_bin errlog rc=0 i started go n stream
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  # 완주(rc=0)를 기대하므로 SESSION 은 완료 상태로 둔다 — 어댑터의 완료 판정은 codex
+  # 종료 후에만 일어나므로 시작 시점 값이 실행 중 판정을 바꾸지 않는다(케이스 25 와 동일).
+  write_session "$sandbox" "Author" "awaiting-author"
+  started="$sandbox/mock_started"
+  go="$sandbox/mock_go"
+  errlog="$sandbox/adapter_err.txt"
+
+  # 이전 턴이 남긴 안정 산출물 — 고유 토큰 PREVRUN 으로 판정한다(production 문구 비의존).
+  printf '%s\n' \
+    '[review wait] 경과 55m00s | 마지막 활동 3m00s 전 | 유휴여유 2m00s | 상한 1h00m' \
+    '  codex: PREVRUN-progress' \
+    "log_path: ${sandbox}/.codex_output.PREVRUN" \
+    'observer: failed' \
+    'effective_cap: 4s' \
+    'log_preserved: yes' \
+    "log_path_final: ${sandbox}/.codex_output.log" > "$sandbox/.review_wait_status"
+  printf 'PREVRUN-log-content\n' > "$sandbox/.codex_output.log"
+
+  mock_bin="$(setup_mock "$sandbox" \
+    "echo started; printf 's' > \"$started\"; while [ ! -f \"$go\" ]; do sleep 0.1; done; printf 'x' > \"$expected_turn\"; exit 0")"
+
+  spawn_group "$errlog" env \
+    TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=30 \
+    bash "$ADAPTER"
+
+  # mock 이 실제로 떠 있는(= 실행 중인) 시점까지 기다린다
+  for i in $(seq 1 100); do
+    [ -f "$started" ] && break
+    sleep 0.1
+  done
+  if [ ! -f "$started" ]; then
+    fail "케이스 30: 전제 실패 — mock 이 시작되지 않아 실행 중 관측을 할 수 없음"
+    printf 'go' > "$go"; reap_group "$GROUP_PGID"; rm -rf "$sandbox"; return
+  fi
+
+  # --- 실행 중 단정 ---
+  if [ ! -e "$sandbox/.review_wait_status" ]; then
+    pass "케이스 30a: 실행 중 안정 상태 파일 부재 (이전 턴 상태가 남지 않음)"
+  else
+    fail "케이스 30a: 실행 중에도 안정 상태 파일이 존재 — $( { cat "$sandbox/.review_wait_status" 2>/dev/null || true; } | tr '\n' '|' )"
+  fi
+
+  stream="$( { ls "$sandbox"/.review_wait_status.?????? 2>/dev/null || true; } | head -n 1 )"
+  [ -n "$stream" ] \
+    && pass "케이스 30b: 실행 중 이번 실행의 상태 스트림 존재 ($(basename "$stream"))" \
+    || fail "케이스 30b: 이번 실행의 상태 스트림이 없음"
+
+  [ ! -e "$sandbox/.codex_output.log" ] \
+    && pass "케이스 30c: 실행 중 안정 로그 부재 (이전 턴 로그가 남지 않음)" \
+    || fail "케이스 30c: 실행 중에도 안정 로그가 존재 — $( { cat "$sandbox/.codex_output.log" 2>/dev/null || true; } | tr '\n' '|' )"
+
+  # --- 실행 종료 후 ---
+  printf 'go' > "$go"
+  wait "$JOB" 2>/dev/null || rc=$?
+  reap_group "$GROUP_PGID"
+
+  if [ "$rc" -ne 0 ]; then
+    fail "케이스 30d: 전제 실패 — 어댑터 rc=$rc (정상 완료 기대)"
+  elif [ -f "$sandbox/.review_wait_status" ] \
+       && ! { grep -q 'PREVRUN' "$sandbox/.review_wait_status" 2>/dev/null; }; then
+    pass "케이스 30d: 종료 후 이번 실행 기준으로 1회 발행"
+  else
+    fail "케이스 30d: 발행 누락 또는 이전 턴 내용 잔존 — $( { cat "$sandbox/.review_wait_status" 2>/dev/null || true; } | tr '\n' '|' )"
+  fi
+
+  { grep -q 'PREVRUN' "$sandbox/.codex_output.log" 2>/dev/null; } \
+    && fail "케이스 30e: 안정 로그가 이전 턴 내용 그대로임" \
+    || pass "케이스 30e: 안정 로그가 이번 실행 로그로 대체됨"
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 31: 로그·last-message **읽기**가 세션 밖 파일 내용을 노출하지 않는다
+#            (final diff review 006 Critical 1)
+#   위협 모델: 실행 중 codex 는 세션 디렉터리에 쓸 수 있고(`--sandbox workspace-write` +
+#   `--add-dir`), 어댑터는 그 sandbox **밖에서 호출자 권한으로** 돈다. 구 코드는 매 tick
+#   `wc -c < "$codex_log"`, heartbeat `grep ... "$codex_log" | tail -1`, 타임아웃 `tail -n 5`,
+#   조기 종료 `tail -n 20`, 실패 경로 `cat "$last_message_file"` 로 **가변 경로를 다시 열었다.**
+#   codex 가 그 이름을 세션 밖의 읽기 가능한 파일 symlink 로 바꾸면 그 내용이 stderr 와
+#   상태 파일로 흘러나온다(실측: 수정 전 어댑터에서 stderr 5회 + 안정 상태 파일 1회 노출).
+#   cleanup 의 `log-source-replaced` 판정은 **내용이 이미 노출된 뒤라 너무 늦다** — 그래서
+#   케이스 29(턴을 정상 완성시켜 heartbeat·오류 tail 경로를 지나지 않는다)로는 잡히지 않는다.
+#   이 케이스는 **heartbeat 가 발동하고 조기 종료 보고도 지나는** 시나리오를 만든다.
+#   판정: ① sentinel 고유 문자열이 stderr 와 최종 상태 파일 어디에도 없다
+#         ② 그 부재가 공허하지 않다 — 두 보고 경로를 실제로 지났고(heartbeat 2회 이상,
+#            우리 inode 의 고유 줄이 보고됨) last message 도 fd 로 읽혔다
+# ===========================================================================
+run_case31() {
+  local sandbox expected_turn bin_dir out_dir sentinel err sf rc=0 n beats
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  write_session "$sandbox" "Reviewer" "awaiting-reviewer"
+  write_checkpoint "$sandbox" "Author"
+  out_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$out_dir" && -d "$out_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  sentinel="$out_dir/secret.txt"
+  printf 'RDLEAK-SENTINEL-9f3a2b\n' > "$sentinel"
+  err="$sandbox/err.txt"
+  sf="$sandbox/.review_wait_status"
+
+  bin_dir="$sandbox/mock_bin"
+  mkdir -p "$bin_dir"
+  cat > "$bin_dir/codex" <<'MOCK_EOF'
+#!/usr/bin/env bash
+# ① 우리 inode 에 식별 가능한 로그를 남긴다 (상속한 stdout fd 로 나가므로 경로 교체와 무관)
+i=0
+while [ "$i" -lt 40 ]; do printf 'RDLOGLINE-%03d\n' "$i"; i=$((i+1)); done
+# ② 정상적인 last message 를 남긴다 (제자리 truncate 쓰기 — 실제 codex 와 같은 형태)
+lm=""
+for f in "$SESSION_PATH"/.last_message.??????; do [ -e "$f" ] && lm="$f"; done
+[ -n "$lm" ] && printf 'RDLASTMSG-OK\n' > "$lm"
+# ③ 세션을 열거해 두 경로를 세션 밖 sentinel symlink 로 바꾼다 (무작위 이름은 열거로 찾힌다)
+for f in "$SESSION_PATH"/.codex_output.?????? "$SESSION_PATH"/.last_message.??????; do
+  [ -e "$f" ] || continue
+  rm -f "$f" 2>/dev/null
+  ln -sfn "$RD31_SENTINEL" "$f" 2>/dev/null
+done
+# ④ heartbeat(1초)가 여러 번 지나가게 기다린 뒤 **턴 파일 없이** 종료 → 조기 종료 보고 경로
+sleep 3
+exit 3
+MOCK_EOF
+  chmod +x "$bin_dir/codex"
+
+  RD31_SENTINEL="$sentinel" \
+  TOOL_BIN="$bin_dir/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+  EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+  WAIT_TIMEOUT=30 RD_REVIEW_IDLE_TIMEOUT=20 RD_REVIEW_HEARTBEAT=1 \
+    bash "$ADAPTER" >/dev/null 2>"$err" || rc=$?
+
+  # (전제) 조기 종료 경로로 끝났는가
+  if [ "$rc" -ne 1 ]; then
+    fail "케이스 31: 전제 실패 — 기대 rc=1(조기 종료) 실제 rc=$rc"
+  fi
+
+  # (a) stderr 에 sentinel 이 없다
+  n="$( { grep -c 'RDLEAK-SENTINEL-9f3a2b' "$err" 2>/dev/null || true; } | tr -d ' ' )"
+  [ -n "$n" ] || n=0
+  [ "$n" -eq 0 ] \
+    && pass "케이스 31a: stderr 에 세션 밖 sentinel 노출 없음" \
+    || fail "케이스 31a: stderr 로 세션 밖 파일 내용 ${n}회 노출 (읽기 경로 재열기 회귀)"
+
+  # (b) 최종 상태 파일에도 없다 (heartbeat 가 상태 스트림에도 마지막 줄을 싣는다)
+  n="$( { grep -c 'RDLEAK-SENTINEL-9f3a2b' "$sf" 2>/dev/null || true; } | tr -d ' ' )"
+  [ -n "$n" ] || n=0
+  [ "$n" -eq 0 ] \
+    && pass "케이스 31b: 최종 상태 파일에 sentinel 노출 없음" \
+    || fail "케이스 31b: 상태 파일로 세션 밖 파일 내용 ${n}회 노출"
+
+  # (c) 부재가 공허하지 않다 — heartbeat 가 실제로 발동했다
+  beats="$( { grep -c '^\[review wait\]' "$err" 2>/dev/null || true; } | tr -d ' ' )"
+  [ -n "$beats" ] || beats=0
+  [ "$beats" -ge 2 ] \
+    && pass "케이스 31c: heartbeat 경로를 실제로 지남 (${beats}회)" \
+    || fail "케이스 31c: heartbeat 미발동 (${beats}회) — 노출 부재 판정이 공허해짐"
+
+  # (d) 두 보고 경로가 **우리 inode** 를 읽었다
+  { grep -q 'RDLOGLINE-039' "$err" 2>/dev/null; } \
+    && pass "케이스 31d: 로그 보고가 원래 inode 내용을 사용 (fd 채널 동작)" \
+    || fail "케이스 31d: 원래 inode 의 로그 줄이 보고되지 않음 — $( { cat "$err" 2>/dev/null || true; } | tr '\n' '|' )"
+
+  # (e) last message 도 fd 로 읽혔다 (경로가 교체된 뒤에도 원래 inode 내용)
+  { grep -q 'RDLASTMSG-OK' "$err" 2>/dev/null; } \
+    && pass "케이스 31e: last message 를 fd 로 읽어 정상 보고" \
+    || fail "케이스 31e: last message 보고 누락 (fd 읽기 회귀)"
+
+  # (f) 세션 밖 파일은 제자리에 그대로 남는다
+  if [ -f "$sentinel" ] && [ "$( { cat "$sentinel" 2>/dev/null || true; } )" = "RDLEAK-SENTINEL-9f3a2b" ]; then
+    pass "케이스 31f: 세션 밖 파일 내용·위치 보존"
+  else
+    fail "케이스 31f: 세션 밖 파일이 변경·이동됨"
+  fi
+
+  rm -rf "$sandbox" "$out_dir"
+}
+
+# ===========================================================================
+# 케이스 32: codex 종료 후 진단 읽기 지연에도 뒤늦은 마커로 오분류하지 않는다
+#            (final diff review 008턴 Important 1)
+#   `wait "$codex_pid"` 복귀 시점에 codex 는 이미 (턴 미완료 상태로) 자체 종료했다.
+#   구 코드는 watchdog 을 kill 하기 **전에** 로그 tail·last message 를 읽었으므로, 그
+#   읽기가 느려지면 그 사이 watchdog 이 계속 tick 하며 codex 생존 여부와 무관하게 cap
+#   도달 시 마커를 썼다 — 실제로는 조기 종료인데 "타임아웃" 으로 오분류(rc=124)됐다.
+#   이 케이스는 `tail`(로그·last-message 읽기가 경유하는 유일한 외부 명령)을 PATH 로
+#   가로채 확률에 기대지 않고 그 지연을 **결정적으로** 재현한다 — mock codex 는 cap
+#   보다 훨씬 이전에 턴 파일 없이 자체 종료하므로, 이 지연이 없으면 애초에 cap 에
+#   도달할 수 없다. 수정 전 어댑터로 이 fixture 를 겨누면 rc=124 가 나옴을 별도로
+#   확인했다(final-diff-review-fix-4 작업 리포트 참조).
+#   판정: ① rc=1(조기 종료) — rc=124(오분류 타임아웃) 아님 ② "턴 완료 전에 종료" 보고
+#         ③ "타임아웃" 오분류 문구 없음
+# ===========================================================================
+run_case32() {
+  local sandbox expected_turn mock_bin wrap_dir real_tail rc=0 out
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  write_session "$sandbox" "Reviewer" "awaiting-reviewer"
+  write_checkpoint "$sandbox" "Author"
+
+  # mock: cap(1초)에 한참 못 미치는 0.2초 만에, 턴 파일 없이 자체 종료한다.
+  mock_bin="$(setup_mock "$sandbox" "sleep 0.2; exit 1")"
+
+  # tail 을 PATH 로 가로채 codex 종료 후 진단 읽기(로그 tail·fd 3 last-message 읽기)만
+  # 지연시킨다. 실제 tail 경로는 PATH 를 바꾸기 전에 미리 확인해 둔다(환경마다
+  # busybox/GNU 등 위치가 다를 수 있어 하드코딩하지 않는다).
+  real_tail="$(command -v tail)"
+  wrap_dir="$sandbox/wrap"
+  mkdir -p "$wrap_dir"
+  cat > "$wrap_dir/tail" <<WRAPEOF
+#!/usr/bin/env bash
+if [ -n "\${RD_TEST_DIAG_DELAY:-}" ]; then
+  sleep "\${RD_TEST_DIAG_DELAY}"
+fi
+exec "$real_tail" "\$@"
+WRAPEOF
+  chmod +x "$wrap_dir/tail"
+
+  out="$(
+    PATH="$wrap_dir:$PATH" \
+    RD_TEST_DIAG_DELAY=2 \
+    TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=1 RD_REVIEW_IDLE_TIMEOUT=600 \
+      bash "$ADAPTER" 2>&1
+  )" || rc=$?
+
+  [ "$rc" -eq 1 ] \
+    && pass "케이스 32a: 진단 읽기 지연에도 오분류 없이 rc=1 (조기 종료)" \
+    || fail "케이스 32a: 기대 rc=1(조기 종료) — 실제 rc=$rc (124 면 뒤늦은 마커로 오분류 회귀)"
+
+  echo "$out" | grep -q '턴 완료 전에 종료' \
+    && pass "케이스 32b: 조기 종료를 사실대로 보고" \
+    || fail "케이스 32b: 조기 종료 보고 누락 — $out"
+
+  echo "$out" | grep -q '타임아웃' \
+    && fail "케이스 32c: 조기 종료를 타임아웃으로 오분류함 — $out" \
+    || pass "케이스 32c: 타임아웃 오분류 문구 없음"
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
 # 실행
 # ===========================================================================
 echo "=== adapter_codex.sh 대기 계약·판정 단일화 테스트 ==="
@@ -1271,6 +2430,77 @@ echo "=== 회귀 테스트 — writable surface 세션 하위 폐쇄 (codex-adap
 echo ""
 
 run_case16
+
+echo ""
+echo "=== 회귀 테스트 — 환경변수 해석 (review-turn-timeout-too-short Task 1) ==="
+echo ""
+
+run_case17
+
+echo ""
+echo "=== 회귀 테스트 — codex 출력 관측 기반 유휴 판정 (review-turn-timeout-too-short Task 2) ==="
+echo ""
+
+run_case18
+run_case19
+run_case20
+
+echo ""
+echo "=== 회귀 테스트 — heartbeat·상태 파일 (review-turn-timeout-too-short Task 3) ==="
+echo ""
+
+run_case21
+
+echo ""
+echo "=== 회귀 테스트 — 활동 관측 fd 채널·유효 상한 (review-turn-timeout-too-short Task 4 / 턴 006 Critical 1) ==="
+echo ""
+
+run_case22
+run_case24
+
+echo ""
+echo "=== 회귀 테스트 — 타임아웃 메시지 오염 단정 금지 (review-turn-timeout-too-short Task 5) ==="
+echo ""
+
+run_case23
+
+echo ""
+echo "=== 회귀 테스트 — 상태 snapshot 초기화·관리 키 단일 (final diff review Important 2) ==="
+echo ""
+
+run_case25
+
+echo ""
+echo "=== 회귀 테스트 — 상태 파일 쓰기 symlink 비추종 (final diff review Critical 1) ==="
+echo ""
+
+run_case26
+
+echo ""
+echo "=== 회귀 테스트 — 로그 최종 이동 실패 정직 보고 (final diff review Important 3) ==="
+echo ""
+
+run_case27
+
+echo ""
+echo "=== 회귀 테스트 — 산출물 수명 재설계 (final diff review 턴 004 Important 3·4) ==="
+echo ""
+
+run_case28
+run_case29
+
+echo ""
+echo "=== 회귀 테스트 — 읽기 채널 fd 전용·안정 이름 수명 (final diff review 턴 006 Critical 1·Important 2) ==="
+echo ""
+
+run_case30
+run_case31
+
+echo ""
+echo "=== 회귀 테스트 — 진단 읽기 지연에 의한 뒤늦은 마커 오분류 방지 (final diff review 008턴 Important 1) ==="
+echo ""
+
+run_case32
 
 echo ""
 echo "=== 결과: PASS=$PASS FAIL=$FAIL ==="

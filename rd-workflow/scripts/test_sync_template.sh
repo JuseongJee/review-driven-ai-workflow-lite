@@ -4,7 +4,8 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FAIL=0
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d)" || { echo "test_sync_template.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$WORK" && -d "$WORK" ]] || { echo "test_sync_template.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
 
 FULL_OLD="2026-07-01-120000"
@@ -150,7 +151,9 @@ do
 done
 
 echo "== --print-upstream: 부작용 없음 (격리 디렉토리 내용 fingerprint 비교) =="
-ISO="$(mktemp -d)"; ( cd "$ISO" && mkdir -p sub && echo seed > sub/seed.txt )
+ISO="$(mktemp -d)" || { echo "test_sync_template.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$ISO" && -d "$ISO" ]] || { echo "test_sync_template.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+( cd "$ISO" && mkdir -p sub && echo seed > sub/seed.txt )
 # 크기만 비교하면 같은 길이로 내용이 바뀌는 부작용을 놓친다 (Turn 006 Finding 3).
 # cksum 은 macOS/Linux 공통이며 파일명 없이 "체크섬 크기" 를 낸다.
 snap() { (cd "$1" && find . -type f | LC_ALL=C sort | while read -r f; do
@@ -384,30 +387,31 @@ uniq=all(v==1 for v in collections.Counter(tpl).values()) and not old
 print('$added', len(tpl), 'yes' if uniq else 'no', len(own))"
     }
     m8_mk E1 <<'J'
-{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/session_start.sh"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"}]},{"matcher":"Edit","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]},{"matcher":"Write","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]}]}}
+{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/session_start.sh"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"},{"type":"command","command":"bash rd-workflow/scripts/hooks/headless_background_gate.sh"}]},{"matcher":"Edit","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]},{"matcher":"Write","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]}]}}
 J
     m8_run E1 >/dev/null 2>&1
-    check "종단 E1 (구 표기 4건): M003 추가 0 / hook 4 / triple 유일 / 고유 0" "$(m8_end E1)" "0 4 yes 0"
+    check "종단 E1 (구 표기 5건): M003 추가 0 / hook 5 / triple 유일 / 고유 0" "$(m8_end E1)" "0 5 yes 0"
 
     m8_mk E2 <<'J'
-{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/session_start.sh"},{"type":"command","command":"bash \"${CLAUDE_PROJECT_DIR:-.}\"/rd-workflow/scripts/hooks/session_start.sh"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash scripts/my_own_zzfx.sh"},{"type":"command","command":"bash rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"},{"type":"command","command":"bash \"${CLAUDE_PROJECT_DIR:-.}\"/rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"}]},{"matcher":"Edit","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]},{"matcher":"Write","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]}]}}
+{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/session_start.sh"},{"type":"command","command":"bash \"${CLAUDE_PROJECT_DIR:-.}\"/rd-workflow/scripts/hooks/session_start.sh"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash scripts/my_own_zzfx.sh"},{"type":"command","command":"bash rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"},{"type":"command","command":"bash \"${CLAUDE_PROJECT_DIR:-.}\"/rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"},{"type":"command","command":"bash rd-workflow/scripts/hooks/headless_background_gate.sh"}]},{"matcher":"Edit","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]},{"matcher":"Write","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]}]}}
 J
     m8_run E2 >/dev/null 2>&1
-    check "종단 E2 (이미 중복 8건 + 고유 hook): M003 추가 0 / hook 4 / triple 유일 / 고유 1" "$(m8_end E2)" "0 4 yes 1"
+    check "종단 E2 (이미 중복 8건 + 고유 hook): M003 추가 0 / hook 5 / triple 유일 / 고유 1" "$(m8_end E2)" "0 5 yes 1"
 
     # **대조군 — 정규화를 건너뛰면 M003 이 실제로 중복을 만듭니다.** 이 케이스가 없으면
     # 위 두 단언이 "M003 은 원래 아무것도 안 한다" 와 구분되지 않습니다.
     m8_mk E3 <<'J'
-{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/session_start.sh"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"}]},{"matcher":"Edit","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]},{"matcher":"Write","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]}]}}
+{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/session_start.sh"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"},{"type":"command","command":"bash rd-workflow/scripts/hooks/headless_background_gate.sh"}]},{"matcher":"Edit","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]},{"matcher":"Write","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]}]}}
 J
-    check "대조군 E3 (정규화 없이 M003): 추가 4 / hook 8 / triple 유일 아님" "$(m8_end E3)" "4 8 no 0"
+    check "대조군 E3 (정규화 없이 M003): 추가 5 / hook 10 / triple 유일 아님" "$(m8_end E3)" "5 10 no 0"
   fi
 fi
 
 # --- M009: 보존 파일 정의 문구 마이그레이션 --------------------------------
 # snippet 을 MIGRATIONS.md 에서 추출해 fixture 에 실제로 실행한다.
 # 정적 문구 검사로 대체하지 않는다 (spec D1).
-M9_DIR="$(mktemp -d)"
+M9_DIR="$(mktemp -d)" || { echo "test_sync_template.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$M9_DIR" && -d "$M9_DIR" ]] || { echo "test_sync_template.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 M9_MD="$SCRIPT_DIR/../MIGRATIONS.md"
 M9_SNIP="$M9_DIR/m9_snippet_zzfx.py"
 
