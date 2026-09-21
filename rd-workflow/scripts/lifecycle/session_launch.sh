@@ -371,6 +371,96 @@ PYEOF
   return 1
 }
 
+# transcript 에서 현재 세션이 **실제로 응답한** 모델을 읽는다 (stdout: 모델 문자열).
+#
+# 왜 이 경로가 필요한가: `model-strategy.json` 은 사람이 만들어야 하는 파일인데 그
+# 사실이 SKILL.md 안에만 적혀 있어 실제로는 만들어지지 않는다(이 저장소에도 존재한 적이
+# 없다). 설정에만 의존하면 소비 프로젝트마다 같은 누락이 반복되고, 작업 탭이 부모와
+# 다른 모델로 조용히 뜬다.
+#
+# 2026-09-17 에는 "셸에서 현재 세션의 실제 모델을 알 수 없다"는 이유로 상속을 배제했으나,
+# 2026-09-21 실측으로 그 전제가 반증되었다 — transcript 의 `message.model` 은 전역 설정
+# 같은 **기본값이 아니라 실제 응답 모델의 기록**이고, subagent 응답은 부모 transcript 에
+# 기록되지 않아(조사한 세션 60건 모두 단일 모델, `isSidechain` 0건) 모델 오염이 없다.
+#
+# 파싱 백엔드 순서가 `_session_launch_json_get` 과 반대(python3 우선)인 것은 의도적이다.
+# 대상이 JSONL 이라 마지막 줄이 쓰이는 중이면 잘려 있을 수 있는데, python3 은 줄 단위로
+# 건너뛰고 jq 는 스트림 전체를 중단한다.
+_session_launch_transcript_models() {  # <transcript> → stdout: 파일 순서의 model 값들
+  local file="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$file" <<'PYEOF'
+import json, sys
+try:
+    f = open(sys.argv[1], encoding="utf-8", errors="replace")
+except OSError:
+    sys.exit(1)
+with f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue  # 쓰이는 중인 마지막 줄 등 — 건너뛴다
+        if not isinstance(rec, dict) or rec.get("isSidechain"):
+            continue
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            continue
+        model = msg.get("model")
+        if isinstance(model, str) and model:
+            print(model)
+PYEOF
+    return 0
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    jq -r 'select(.isSidechain | not) | (.message? | objects | .model?) | strings' \
+      "$file" 2>/dev/null || true
+    return 0
+  fi
+  return 1
+}
+
+# 현재 세션의 모델 (stdout). 찾지 못하면 비어 있는 상태로 1 을 반환한다.
+_session_launch_inherited_model() {
+  local sid="${CLAUDE_CODE_SESSION_ID:-}"
+  [[ -n "$sid" ]] || return 1
+  # 세션 ID 는 UUID 다. 경로 구분자·상위 참조가 섞였으면 글롭 밖을 가리키므로 거부한다.
+  case "$sid" in
+    */*|*'..'*) return 1 ;;
+  esac
+
+  # 프로젝트 슬러그를 cwd 에서 도출하지 않는다 — worktree 세션은 자체 프로젝트
+  # 디렉터리(`…--worktrees-<slug>`)를 가져 cwd 기반 도출이 어긋난다. 세션 ID 가 UUID 라
+  # 유일하므로 글롭으로 찾고, 유일하지 않으면(0건·2건 이상) 판정을 포기한다.
+  local base="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+  [[ -d "$base" ]] || return 1
+  local f matches=()
+  for f in "$base"/*/"$sid".jsonl; do
+    [[ -f "$f" ]] && matches+=("$f")
+  done
+  [[ "${#matches[@]}" -eq 1 ]] || return 1
+
+  local models=() line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && models+=("$line")
+  done < <(_session_launch_transcript_models "${matches[0]}")
+  [[ "${#models[@]}" -gt 0 ]] || return 1
+
+  # 뒤에서부터 첫 번째 **유효한** 값. 유효성 판정은 기존 함수를 그대로 쓴다 —
+  # 모든 세션에 1건씩 섞여 있는 `<synthetic>` 은 여기서 탈락한다.
+  local i
+  for (( i = ${#models[@]} - 1; i >= 0; i-- )); do
+    if session_launch_model_valid "${models[$i]}"; then
+      printf '%s\n' "${models[$i]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 session_launch_model() {
   local wt="$1" cfg raw
   if [[ -n "${RD_SESSION_MODEL:-}" ]]; then
@@ -382,15 +472,26 @@ session_launch_model() {
     printf 'default\t\n'; return 0
   fi
   cfg="${wt}/rd-workflow/config/model-strategy.json"
-  [[ -f "$cfg" ]] || { printf 'default\t\n'; return 0; }
-  if ! raw="$(_session_launch_json_get "$cfg" session_model)"; then
-    printf '세션 모델 설정 파일을 읽지 못했습니다(%s) — 미지정으로 둡니다.\n' "$cfg" >&2
-    printf 'default\t\n'; return 0
+  if [[ -f "$cfg" ]]; then
+    if ! raw="$(_session_launch_json_get "$cfg" session_model)"; then
+      printf '세션 모델 설정 파일을 읽지 못했습니다(%s) — 미지정으로 둡니다.\n' "$cfg" >&2
+      printf 'default\t\n'; return 0
+    fi
+    if [[ -n "$raw" ]]; then
+      if session_launch_model_valid "$raw"; then
+        printf 'config\t%s\n' "$raw"; return 0
+      fi
+      printf '세션 모델 설정(%s=%s)이 허용 범위를 벗어나 미지정으로 둡니다.\n' "$cfg" "$raw" >&2
+      printf 'default\t\n'; return 0
+    fi
   fi
-  [[ -n "$raw" ]] || { printf 'default\t\n'; return 0; }
-  if session_launch_model_valid "$raw"; then
-    printf 'config\t%s\n' "$raw"; return 0
+
+  # 최하위 fallback — 명시 설정이 없을 때만 현재 세션의 모델을 상속한다. 설정이 있으면
+  # 위에서 이미 반환했으므로 기존 두 경로의 동작은 바뀌지 않는다. 상속에 실패하면
+  # 종전과 같은 미지정으로 수렴한다(새 실패 모드를 만들지 않는다).
+  local inherited
+  if inherited="$(_session_launch_inherited_model)" && [[ -n "$inherited" ]]; then
+    printf 'inherit\t%s\n' "$inherited"; return 0
   fi
-  printf '세션 모델 설정(%s=%s)이 허용 범위를 벗어나 미지정으로 둡니다.\n' "$cfg" "$raw" >&2
   printf 'default\t\n'; return 0
 }

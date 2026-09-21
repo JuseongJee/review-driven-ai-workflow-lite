@@ -135,7 +135,7 @@ created-at=2026-07-05-1030
   - `lifecycle/promote.sh`: `--source-fr` 인자(반복 가능) > `REQUEST.md ## Source FR` 해석(모든 유효 행) > `-`. 명시 인자가 있으면 REQUEST 를 읽지도 해석하지도 않는다. 미러 쓰기·검증·rerun 비교는 목록 전체를 대상으로 하고(줄 단위 목록 교체 + 정규화된 집합 비교), 복구 안내 명령 문자열도 목록 전체로 만든다 — 전체가 계약을 통과할 때만 제시하고, 하나라도 통과하지 못하면 부분 목록을 제시하지 않고 「사람이 확인」으로 넘긴다.
 - **리셋 시점**: `metadata_clear` (`lifecycle/archive.sh`·`lifecycle/promote_rollback.sh`) 가 `-`로 복원. `rd task set-title -` (아래 'Short Title reset' 참조) 도 허용 조건을 만족하면 `short-title` 과 함께 `-`로 되돌린다.
 - **done 처리**: `rd task fr-done` 이 묶은 FR 전부의 `items/` status 와 `FUTURE_REQUESTS.md` 인덱스 행 status 를 함께 `done` 으로 바꾼다(각각 독립 판정 — 한쪽만 종료 상태여도 다른 쪽을 마저 갱신). **인덱스 행 삭제는 여전히 `/fr archive` 몫**이고 **발행(merge·tag·push)은 `archive.sh` 몫**이다(둘 다 변경 없음). 실패해도 발행은 막지 않는다 — 결과는 completion report 의 「FR 정리 결과」 절로 옮겨 발행 결과와 분리 보고하고, 재시도 대상은 아카이브된 REQUEST 사본의 `## Source FR` 과 그 보고서 절에서 회수한다.
-- **정정 CLI**: `rd task source-fr` (조회, 줄 단위 목록 출력), `rd task set-source-fr <값>...` (검증 후 설정 — 직접 파일 편집 금지), `rd task fr-done [<값>...]` (done 처리).
+- **정정 CLI**: `bash rd-workflow/scripts/rd task source-fr` (조회, 줄 단위 목록 출력), `bash rd-workflow/scripts/rd task set-source-fr <값>...` (검증 후 설정 — 직접 파일 편집 금지), `bash rd-workflow/scripts/rd task fr-done [<값>...]` (done 처리).
 
 ### guard 판정 (`task_guard_decide`, 7순위)
 
@@ -181,7 +181,7 @@ created-at=2026-07-05-1030
 **`base-commit`** — 이 작업이 시작된 커밋. 값은 **full commit OID** 이며 `main` 같은 ref 이름을 저장하지 않습니다. ref 를 저장하면 그 ref 가 움직였을 때 "작업 시작 커밋" 이 조용히 달라집니다.
 
 - 기록: `lifecycle/promote.sh` 가 fr 브랜치 승격 **직전 HEAD** 를 OID 로 기록합니다.
-- 수동 설정: `rd task set-base <ref>` — **입력이 ref 여도 저장 시점에 `git rev-parse --verify <ref>^{commit}` 으로 OID 를 resolve** 해 기록하고, 커밋으로 해석되지 않으면 기록하지 않고 nonzero 로 끝냅니다. promote 를 쓰지 않는 프로젝트(fr 브랜치 없이 기본 브랜치에서 작업)는 이 명령으로 1회 설정합니다.
+- 수동 설정: `bash rd-workflow/scripts/rd task set-base <ref>` — **입력이 ref 여도 저장 시점에 `git rev-parse --verify <ref>^{commit}` 으로 OID 를 resolve** 해 기록하고, 커밋으로 해석되지 않으면 기록하지 않고 nonzero 로 끝냅니다. promote 를 쓰지 않는 프로젝트(fr 브랜치 없이 기본 브랜치에서 작업)는 이 명령으로 1회 설정합니다.
 - 소비: `prepare_review_pipeline.sh diff` 의 base 판정 우선순위 3번 (`FILE_BASED_REVIEW_PIPELINE.md` 참조).
 - 구현: `state_read_base_commit` / `state_write_base_commit` (`_state_common.sh`).
 
@@ -251,7 +251,7 @@ rd-workflow-workspace/.lifecycle/migration-backup/<YYYYMMDD-HHMMSS>/
 
 1. `CURRENT_TASK.md`의 `## Status` 값을 canonical 9종 중 하나로 수정합니다.
 2. task-state 파일이 잔존하면 삭제합니다(`rm rd-workflow-workspace/.lifecycle/task-state`).
-3. `rd task status` 재실행 → 마이그레이션 재시도.
+3. `bash rd-workflow/scripts/rd task status` 재실행 → 마이그레이션 재시도.
 
 ### "다음 정규 커밋에 편승" 안내
 

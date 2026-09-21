@@ -22,9 +22,37 @@ usage() {
 EOF
 }
 
+# 머리말 블록의 마지막 줄 번호를 출력한다 — 블록은 첫 빈 줄 또는 첫 '## ' 헤더에서 끝난다.
+# 머리말 필드의 조회·치환·삽입은 모두 이 범위 안에서만 한다. 범위를 두지 않으면 본문
+# 코드블록 안에 스키마를 인용한 줄을 자기 머리말로 읽거나 덮어쓴다 (규약 자체를 논하는
+# 보고서는 스키마를 인용할 수밖에 없으므로 반복적으로 걸린다).
+_header_end_line() {
+  awk '/^$/ || /^## / { print NR - 1; found = 1; exit } END { if (!found) print NR }' "$1"
+}
+
+# 머리말 범위 안에서 패턴에 맞는 첫 줄 번호를 출력한다 (없으면 아무것도 출력하지 않음).
+# $1=file $2=BRE 패턴
+_header_line_no() {
+  local end; end="$(_header_end_line "$1")"
+  [[ "$end" -ge 1 ]] || return 0
+  sed -n "1,${end}{/${2}/=;}" "$1" | head -1
+}
+
 read_field() {
   # $1=file $2=field-name
-  sed -n "s/^- ${2}: \(.*\)\$/\1/p" "$1" | head -1
+  local end; end="$(_header_end_line "$1")"
+  [[ "$end" -ge 1 ]] || return 0
+  sed -n "1,${end}{s/^- ${2}: \(.*\)\$/\1/p;}" "$1" | head -1
+}
+
+# 머리말 범위 안의 한 줄을 통째로 갈아끼운다. $1=file $2=line-number $3=새 줄 내용
+_replace_line_at() {
+  local file="$1" lineno="$2" content="$3" tmp
+  tmp="$(_tmp_beside "$file")" || return 1
+  awk -v n="$lineno" -v ins="$content" \
+    '{ if (NR == n) print ins; else print }' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  _replace_preserving_mode "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+  return 0
 }
 
 is_pending() {
@@ -55,15 +83,23 @@ count_pending() {
 
 # 파일에 필드를 삽입할 위치를 정한다: '- 대상 산출물:' 줄 다음, 없으면
 # 머리말 블록의 마지막 '- ' 줄 다음, 그것도 없으면 첫 줄(제목) 다음.
-# $1=file  -> stdout 으로 삽입 대상 라인 번호를 출력
+# 머리말 블록 자체가 없으면(첫 줄이 빈 줄·'## ' 이거나 빈 파일) **0 = 파일 맨 앞**.
+# 첫 줄 뒤에 넣으면 그 줄이 머리말 범위 밖에 놓여, 쓰기는 성공하는데 조회 경로는
+# 영원히 읽지 못하는 상태가 된다 (final diff review Turn 002 F2).
+# $1=file  -> stdout 으로 삽입 대상 라인 번호를 출력 (0 = 맨 앞)
 _insert_after_line() {
-  local file="$1" line
-  line="$(grep -n '^- 대상 산출물:' "$file" | head -1 | cut -d: -f1)"
+  local file="$1" line end
+  end="$(_header_end_line "$file")"
+  if [[ "$end" -lt 1 ]]; then
+    printf '0\n'
+    return 0
+  fi
+  line="$(_header_line_no "$file" '^- 대상 산출물:')"
   if [[ -n "$line" ]]; then
     printf '%s\n' "$line"
     return 0
   fi
-  line="$(grep -n '^- ' "$file" | tail -1 | cut -d: -f1)"
+  line="$(sed -n "1,${end}{/^- /=;}" "$file" | tail -1)"
   if [[ -n "$line" ]]; then
     printf '%s\n' "$line"
     return 0
@@ -157,10 +193,11 @@ _replace_preserving_mode() {
 }
 
 _insert_line_after() {
-  # $1=file $2=line-number $3=content-to-insert
+  # $1=file $2=line-number (0 = 맨 앞) $3=content-to-insert
   local file="$1" lineno="$2" content="$3" tmp
   tmp="$(_tmp_beside "$file")" || return 1
   awk -v n="$lineno" -v ins="$content" '
+    BEGIN { if (n == 0) print ins }
     { print }
     NR == n { print ins }
   ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
@@ -172,7 +209,7 @@ ensure_id() {
   # $1=file
   local file="$1" existing
   existing="$(read_field "$file" "report-id")"
-  if [[ -n "$existing" ]]; then
+  if [[ -n "$existing" && "$existing" != "-" ]]; then
     if [[ "$existing" =~ ^[0-9]{14}-[0-9a-f]{6}$ ]]; then
       printf '%s\n' "$existing"
       return 0
@@ -181,29 +218,36 @@ ensure_id() {
     return 7
   fi
 
-  local new_id line
+  local new_id
   new_id="$(date +%Y%m%d%H%M%S)-$(od -An -tx1 -N3 /dev/urandom | tr -d ' \n')"
-  line="$(_insert_after_line "$file")"
-  if _insert_line_after "$file" "$line" "- report-id: ${new_id}"; then
-    printf '%s\n' "$new_id"
-    return 0
+
+  # 머리말에 이미 `- report-id: -` 줄이 있으면(값 없음 표기) 그 줄을 치환한다 —
+  # 새 줄을 덧붙이면 원래 줄이 남아 report-id 가 두 번 나타난다.
+  local existing_line
+  existing_line="$(_header_line_no "$file" '^- report-id:')"
+  if [[ -n "$existing_line" ]]; then
+    _replace_line_at "$file" "$existing_line" "- report-id: ${new_id}" \
+      || { echo "오류: '$file' report-id 갱신 실패" >&2; return 1; }
   else
-    echo "오류: '$file' 에 report-id 삽입 실패" >&2
-    return 1
+    local line
+    line="$(_insert_after_line "$file")"
+    _insert_line_after "$file" "$line" "- report-id: ${new_id}" \
+      || { echo "오류: '$file' 에 report-id 삽입 실패" >&2; return 1; }
   fi
+  printf '%s\n' "$new_id"
+  return 0
 }
 
 set_issue() {
   # $1=file $2=url
-  local file="$1" url="$2" tmp
-  if grep -q '^- upstream-issue:' "$file"; then
-    tmp="$(_tmp_beside "$file")" || { echo "오류: 임시 파일 생성 실패" >&2; return 1; }
-    sed "s|^- upstream-issue:.*\$|- upstream-issue: ${url}|" "$file" > "$tmp" \
-      && _replace_preserving_mode "$tmp" "$file" \
-      || { rm -f "$tmp"; echo "오류: '$file' upstream-issue 갱신 실패" >&2; return 1; }
+  local file="$1" url="$2" existing_line
+  existing_line="$(_header_line_no "$file" '^- upstream-issue:')"
+  if [[ -n "$existing_line" ]]; then
+    _replace_line_at "$file" "$existing_line" "- upstream-issue: ${url}" \
+      || { echo "오류: '$file' upstream-issue 갱신 실패" >&2; return 1; }
   else
     local line
-    line="$(grep -n '^- report-id:' "$file" | head -1 | cut -d: -f1)"
+    line="$(_header_line_no "$file" '^- report-id:')"
     if [[ -z "$line" ]]; then
       line="$(_insert_after_line "$file")"
     fi
@@ -594,7 +638,9 @@ print_failure_hint() {
 render_preview() {
   # $1=file $2=host $3=repo $4=visibility $5=report-id(없으면 빈 문자열)
   local file="$1" host="$2" repo="$3" visibility="$4" existing_id="$5" id_display title body
+  # `-` 는 필드 부재와 같은 "아직 값 없음" 표기다 — 승인 화면에 그대로 내보내지 않는다.
   id_display="${existing_id:-(발행 시 생성)}"
+  [[ "$id_display" == "-" ]] && id_display="(발행 시 생성)"
   # 승인 화면은 사람이 발행 여부를 결정하는 유일한 근거다 — 읽기가 실패했다면 반쯤 만들어진
   # 화면을 보여주지 않고 실패한다. 호출 순서상 6번 크기 검사가 먼저 걸리지만, 순서가 바뀌어도
   # 화면이 거짓을 말하지 않도록 여기서도 막는다.
@@ -657,7 +703,7 @@ cmd_preview() {
     echo "오류: gh CLI 를 찾을 수 없습니다. https://cli.github.com/ 에서 설치하십시오." >&2
     return 4
   fi
-  if ! gh_run "$host" auth status >/dev/null 2>&1; then
+  if ! gh_run "$host" auth status --hostname "$host" >/dev/null 2>&1; then
     echo "오류: '$host' 에 인증되지 않았습니다. 'gh auth login --hostname $host' 를 실행하십시오." >&2
     return 4
   fi
@@ -722,7 +768,7 @@ cmd_publish() {
   # 3. report-id 읽기 전용 검증 — gh 가용성 확인보다 앞선다 (malformed 시 gh 호출 0회)
   local existing_id
   existing_id="$(read_field "$file" "report-id")"
-  if [[ -n "$existing_id" && ! "$existing_id" =~ ^[0-9]{14}-[0-9a-f]{6}$ ]]; then
+  if [[ -n "$existing_id" && "$existing_id" != "-" && ! "$existing_id" =~ ^[0-9]{14}-[0-9a-f]{6}$ ]]; then
     echo "오류: report-id 형식이 올바르지 않습니다 ('$existing_id'). 값을 고치거나 \`- report-id:\` 줄을 지운 뒤 재실행하십시오." >&2
     return 7
   fi
@@ -733,7 +779,7 @@ cmd_publish() {
     print_failure_hint "$file" "$retry_opts"
     return 4
   fi
-  if ! gh_run "$host" auth status >/dev/null 2>&1; then
+  if ! gh_run "$host" auth status --hostname "$host" >/dev/null 2>&1; then
     echo "오류: '$host' 에 인증되지 않았습니다. 'gh auth login --hostname $host' 를 실행하십시오." >&2
     print_failure_hint "$file" "$retry_opts"
     return 4
@@ -755,10 +801,18 @@ cmd_publish() {
   #
   # 최종 본문 = 머리말(실제 id 삽입) + **8번 ensure-id 직후의 파일 내용**.
   # `attempting:` 기록(10-b)은 payload 생성(10-a) **뒤**이므로 본문에 들어가지 않는다.
-  # 따라서 증가분은 legacy 파일에 report-id 한 줄이 붙는 경우뿐이며, 그 줄은 길이가
-  # 고정이라 산술로 정확히 계산된다 — "- report-id: "(13) + id(21) + 개행(1) = 35 byte.
+  # 증가분은 ensure-id 가 파일을 바꾸는 두 경우뿐이고 둘 다 길이가 고정이라 산술로
+  # 정확히 계산된다.
+  #   - legacy(필드 부재): 줄 하나가 통째로 붙는다 — "- report-id: "(13) + id(21) + 개행(1) = 35
+  #   - 값 없음 표기(`-`): 기존 줄의 값만 바뀐다 — id(21) - "-"(1) = 20
+  # 값 없음 표기를 그대로 크기 검사에 쓰면 본문 안 마커·표·원문 필드가 각각 늘어나는 만큼
+  # 과소 계산돼 한도를 넘긴 본문이 발행된다 (final diff review Turn 002 F1).
   local size_check_id body_size delta=0
-  size_check_id="${existing_id:-00000000000000-000000}"   # 21자 — 실제 id 와 같은 길이
+  if [[ -z "$existing_id" || "$existing_id" == "-" ]]; then
+    size_check_id="00000000000000-000000"   # 21자 — 실제 id 와 같은 길이
+  else
+    size_check_id="$existing_id"
+  fi
   # 본문 생성 실패를 크기로 흘려보내지 않는다 — 실패한 본문은 짧아서 한도 검사를 통과한다.
   # `set -o pipefail` 이 있으므로 issue_body 실패가 파이프라인 실패로 드러난다.
   if ! body_size="$(issue_body "$file" "$size_check_id" | wc -c | tr -d ' ')"; then
@@ -766,7 +820,11 @@ cmd_publish() {
     print_failure_hint "$file" "$retry_opts"
     return 7
   fi
-  [[ -z "$existing_id" ]] && delta=35
+  if [[ -z "$existing_id" ]]; then
+    delta=35
+  elif [[ "$existing_id" == "-" ]]; then
+    delta=20
+  fi
   body_size=$((body_size + delta))
   if (( body_size > 60000 )); then
     echo "오류: 발행 시점 본문이 60,000 byte 를 초과합니다 (${body_size} byte)." >&2

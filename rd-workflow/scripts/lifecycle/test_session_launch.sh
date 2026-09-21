@@ -165,8 +165,10 @@ out="$(PATH="$STUB:$PATH" HERDR_ENV=1 session_probe alpha /tmp/wt 2>/dev/null)"
 [[ "$out" != "alive" ]] && pass "대상 불일치 세션을 alive 로 보지 않는다" || fail "대상 불일치"
 
 # 13) resolve-launch 의 alive 확정도 호출 세션 거취(멈춤) 문구를 낸다.
-TMP_RL="$(mktemp -d)" || { echo "test_session_launch.sh: mktemp 실패" >&2; exit 1; }
-TMP_RL2="$(mktemp -d)" || { echo "test_session_launch.sh: mktemp 실패" >&2; exit 1; }
+TMP_RL="$(mktemp -d)" || { echo "test_session_launch.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$TMP_RL" && -d "$TMP_RL" ]] || { echo "test_session_launch.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+TMP_RL2="$(mktemp -d)" || { echo "test_session_launch.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$TMP_RL2" && -d "$TMP_RL2" ]] || { echo "test_session_launch.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 TMP_RL="$(cd -P "$TMP_RL" && pwd -P)"
 TMP_RL2="$(cd -P "$TMP_RL2" && pwd -P)"
 git -C "$TMP_RL" init -q
@@ -243,7 +245,10 @@ session_launch_model_valid 'claude-x invalid value' && fail "공백 섞인 값�
 session_launch_model_valid 'claude-x/garbage' && fail "슬래시 섞인 값이 통과함(F5 재발)" || pass "슬래시 섞인 값 거부"
 session_launch_model_valid 'fable-' && fail "빈 접미부(fable-)가 통과함(F5 재발)" || pass "빈 접미부 거부"
 
-# 15) session_launch_model — 우선순위: env > config > default, 필드 순서는 source가 먼저다(F2)
+# 15) session_launch_model — 우선순위: env > config > 세션 상속 > default, 필드 순서는 source가 먼저다(F2)
+# 이 스위트를 Claude 세션 안에서 돌리면 상속 경로가 실제 transcript 를 타 결과가 환경에
+# 따라 갈린다. 상속을 직접 검사하는 구간 외에는 세션 식별자를 비워 hermetic 하게 만든다.
+export CLAUDE_CODE_SESSION_ID=""
 mkdir -p "$TMP/wt/rd-workflow/config"
 cat > "$TMP/wt/rd-workflow/config/model-strategy.json" <<'JSON'
 {"version": 1, "subagent": "sonnet", "session_model": "haiku"}
@@ -285,6 +290,75 @@ out="$(RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>/dev/null)"
   && pass "파일 하나에 JSON 문서가 두 개면 손상으로 취급한다(F4 turn 004 재발 방지)" \
   || fail "복수 JSON 문서를 정상 채택함(F4 재발): out=$out err=$err"
 rm -rf "$TMP/wt/rd-workflow"
+
+# 15b) 세션 상속 — 명시 설정이 없을 때만, transcript 의 마지막 유효 모델을 집는다
+_mk_transcript() {  # <session-id> <줄...> — $TMP/home 아래 가짜 transcript 를 만든다
+  local sid="$1"; shift
+  local dir="$TMP/home/.claude/projects/-fake-project"
+  mkdir -p "$dir"
+  : > "$dir/$sid.jsonl"
+  local l
+  for l in "$@"; do printf '%s\n' "$l" >> "$dir/$sid.jsonl"; done
+}
+_inherit_model() {  # <session-id> → session_launch_model 출력
+  HOME="$TMP/home" CLAUDE_CONFIG_DIR="$TMP/home/.claude" \
+    CLAUDE_CODE_SESSION_ID="$1" RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>/dev/null
+}
+
+rm -rf "$TMP/home"
+_mk_transcript sid-a \
+  '{"type":"assistant","message":{"model":"claude-sonnet-5"}}' \
+  '{"type":"user","message":{"role":"user"}}' \
+  '{"type":"assistant","message":{"model":"claude-opus-5"}}'
+out="$(_inherit_model sid-a)"
+[[ "$out" == $'inherit\tclaude-opus-5' ]] \
+  && pass "설정이 없으면 transcript 의 마지막 모델을 상속한다" || fail "상속 실패: $out"
+
+out="$(HOME="$TMP/home" CLAUDE_CONFIG_DIR="$TMP/home/.claude" \
+  CLAUDE_CODE_SESSION_ID=sid-a RD_SESSION_MODEL=haiku session_launch_model "$TMP/wt" 2>/dev/null)"
+[[ "$out" == $'env\thaiku' ]] && pass "env 가 상속보다 우선" || fail "env 우선(상속): $out"
+
+mkdir -p "$TMP/wt/rd-workflow/config"
+printf '{"session_model":"fable"}' > "$TMP/wt/rd-workflow/config/model-strategy.json"
+out="$(_inherit_model sid-a)"
+[[ "$out" == $'config\tfable' ]] && pass "config 가 상속보다 우선" || fail "config 우선(상속): $out"
+rm -rf "$TMP/wt/rd-workflow"
+
+# `<synthetic>` 은 모든 세션에 1건씩 섞여 있다 — 유효성 검사에서 탈락해야 한다
+_mk_transcript sid-b '{"type":"assistant","message":{"model":"<synthetic>"}}'
+out="$(_inherit_model sid-b)"
+[[ "$out" == $'default\t' ]] && pass "<synthetic> 만 있으면 상속하지 않는다" || fail "<synthetic> 채택됨: $out"
+
+# subagent 행이 섞여 들어와도(방어적) 부모 모델을 덮지 않는다
+_mk_transcript sid-c \
+  '{"type":"assistant","message":{"model":"claude-opus-5"}}' \
+  '{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-4-5-20251001"}}'
+out="$(_inherit_model sid-c)"
+[[ "$out" == $'inherit\tclaude-opus-5' ]] \
+  && pass "sidechain 행은 상속 대상에서 제외한다" || fail "sidechain 채택됨: $out"
+
+# 쓰이는 중이라 잘린 마지막 줄은 건너뛰고 그 앞의 유효 값을 쓴다
+_mk_transcript sid-d \
+  '{"type":"assistant","message":{"model":"claude-opus-5"}}' \
+  '{"type":"assistant","message":{"mod'
+out="$(_inherit_model sid-d)"
+[[ "$out" == $'inherit\tclaude-opus-5' ]] \
+  && pass "잘린 마지막 줄은 건너뛴다" || fail "잘린 줄 처리: $out"
+
+out="$(HOME="$TMP/home" CLAUDE_CONFIG_DIR="$TMP/home/.claude" \
+  CLAUDE_CODE_SESSION_ID= RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>/dev/null)"
+[[ "$out" == $'default\t' ]] && pass "세션 식별자가 없으면 상속하지 않는다" || fail "식별자 없음: $out"
+
+out="$(_inherit_model sid-none)"
+[[ "$out" == $'default\t' ]] && pass "transcript 가 없으면 상속하지 않는다" || fail "글롭 0건: $out"
+
+# 같은 세션 ID 가 두 프로젝트에 있으면 어느 쪽인지 정할 수 없다 — 판정을 포기한다
+mkdir -p "$TMP/home/.claude/projects/-other-project"
+cp "$TMP/home/.claude/projects/-fake-project/sid-a.jsonl" \
+   "$TMP/home/.claude/projects/-other-project/sid-a.jsonl"
+out="$(_inherit_model sid-a)"
+[[ "$out" == $'default\t' ]] && pass "transcript 가 2건이면 상속하지 않는다" || fail "글롭 2건: $out"
+rm -rf "$TMP/home"
 
 # 16) 수동 기동 명령에 모델이 반영된다(인자 없이 호출 — 자체 계산 경로)
 mkdir -p "$TMP/wt/rd-workflow/config"

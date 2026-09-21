@@ -693,6 +693,7 @@ else
   case "$_SESSION_MODEL_SRC" in
     env)     _SESSION_MODEL_LABEL="RD_SESSION_MODEL" ;;
     config)  _SESSION_MODEL_LABEL="model-strategy.json" ;;
+    inherit) _SESSION_MODEL_LABEL="현재 세션 상속" ;;
     *)       _SESSION_MODEL_LABEL="미지정 — CLI 기본값" ;;
   esac
   echo "promote: 다음 기동에 사용할 모델 — ${_SESSION_MODEL:-미지정} (출처: ${_SESSION_MODEL_LABEL})"

@@ -157,11 +157,31 @@ SCAN_AWK="${SCRIPT_DIR}/_mktemp_scan.awk"
 # promote.sh 는 재설계로 1 줄었습니다. 위반은 0 입니다.
 # 2026-09-16 final diff review 턴 004: 색인 격리 회귀(test_tasks_index.sh 의 `OTHER`)를
 # 추가해 배포 트리의 mktemp -d 지점이 1개 늘었습니다 (134 → 135). 위반은 0 입니다.
-MKTEMP_SCAN_EXPECT_SHELL=135
+# 2026-09-18 mktemp-guard-and-build-verify-leak: test_session_launch.sh:168-169의 mktemp 가드
+# 관용구를 파일 내 다른 템플릿에 맞춰 정합했습니다. 이 수정 자체는 배포 트리의 mktemp -d
+# site 수를 바꾸지 않습니다(스캐너는 대입 줄만 세고 검증 줄은 세지 않음). 옛 상수 135는
+# 이 작업 이전부터 이미 stale했고, 정본 전체 실측은 137이었습니다(spec/plan review turn 002).
+# 그 +2는 바로 이 test_session_launch.sh:168-169의 두 mktemp -d 줄로, FR
+# session-handoff-contract-and-model이 추가한 뒤 135에 반영되지 않아 stale-but-correct
+# 상태로 137까지 넘어와 있었습니다. 이번 작업은 그 실측치로 상수를 맞추고 기존 위반
+# 2건을 0으로 해소했습니다.
+MKTEMP_SCAN_EXPECT_SHELL=137
 # 2026-09-14 publish-clone-failure-init-fallback: scripts/test_publish_remote_state.sh
 # 신설로 개발 트리의 mktemp -d 지점이 1개 늘었습니다 (49 → 50). 위반은 0 이고
 # 증가분은 테스트 픽스처입니다.
-MKTEMP_SCAN_EXPECT_DEV_SHELL=50
+# 2026-09-18 mktemp-guard-and-build-verify-leak: scripts/test_build_template.sh 의
+# 회귀 케이스 6d(`fx=`/`VERIFY_TMPDIR=`) 신설로 2개 늘었습니다 (50 → 52). 위반은
+# 0 이고 증가분은 테스트 픽스처입니다.
+# 2026-09-18 mktemp-guard-and-build-verify-leak(final review 수정, 최종): case 6d
+# 의 TMPDIR 오버라이드가 vacuous(BSD mktemp -d 는 템플릿 없는 호출에서 TMPDIR 을
+# 무시함)했던 근본 원인은 build_template.sh cmd_verify 자신의 mktemp -d 호출에
+# 템플릿이 없었던 것입니다. cmd_verify 를
+# `mktemp -d "${TMPDIR:-/tmp}/build_template.verify.XXXXXX"` 로 바꿔(bash 가
+# TMPDIR 을 템플릿 문자열에 직접 전개) BSD/GNU 무관하게 TMPDIR 오버라이드가 항상
+# 먹히게 했고, case 6d 는 다시 TMPDIR 격리 방식(`fx=`/`verify_tmpdir=`, 가드
+# 사이트 2개)으로 돌아왔습니다 — 시스템 공유 임시 디렉터리를 스캔하지 않아
+# 소유권 오판 위험도 없습니다. 50 → 52.
+MKTEMP_SCAN_EXPECT_DEV_SHELL=52
 MKTEMP_SCAN_EXPECT_SNIPPET=2
 # spec §3.5 예측은 47(baseline 42 + archive.sh:196 1→4줄 +3 + test_integration.sh:314·359
 # 각 1→2줄 +2)이었지만 실측은 48입니다. 어긋난 쪽은 spec 의 baseline 42 입니다 —

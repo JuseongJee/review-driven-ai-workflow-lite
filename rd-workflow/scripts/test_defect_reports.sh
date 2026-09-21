@@ -124,6 +124,47 @@ snap="$(cat "$f")"
 check "형식 위반은 exit 7" "$rc" "7"
 check "파일 무변경 (자동 재생성 없음)" "$(cat "$f")" "$snap"
 
+# 규약 문서의 스키마를 그대로 따라 `- report-id: -` 로 두면 형식 오류로 거부당했다 —
+# 같은 규약 안에서 `upstream-issue` 는 `-` 를 "값 없음" 으로 받는데 여기만 비대칭이었다.
+# 규약 자체를 논하는 보고서는 본문에 그 스키마를 인용하므로, 인용 줄을 자기 머리말로
+# 읽거나 덮어쓰지 않는지도 함께 본다 (Issue #21 본안 + 부수 관찰).
+echo "== ensure-id: 값 없음 표기 '-' 를 새 id 로 채운다 (Issue #21) =="
+setup_workspace
+f="$(make_report "2026-08-12-1009-dash.md")"
+sed -i.bak 's/^- report-id: .*$/- report-id: -/' "$f"; rm -f "$f.bak"
+printf '\n```\n- report-id: <자동 생성 — defect_reports.sh ensure-id>\n```\n' >> "$f"
+id="$(cd "$WS" && bash "$TARGET" ensure-id "$f" 2>/dev/null)"; rc=$?
+check "'-' 는 exit 0" "$rc" "0"
+[[ "$id" =~ ^[0-9]{14}-[0-9a-f]{6}$ ]] && ok "새 id 생성" || nok "새 id 생성 ($id)"
+check "머리말 줄을 치환 (중복 줄 없음)" "$(grep -c "^- report-id: ${id}\$" "$f")" "1"
+check "본문 코드블록 인용 보존" "$(grep -c '^- report-id: <자동 생성' "$f")" "1"
+
+# 머리말 블록이 없는 파일(첫 줄이 빈 줄·'## ', 빈 파일)에서 삽입 위치가 머리말 범위
+# 밖이면 쓰기는 성공하는데 조회는 영원히 빈 값을 낸다 — ensure-id 가 매번 새 id 를
+# 만들고, publish 는 기존 완료 URL·attempting 을 못 읽어 중복 Issue 를 낼 수 있다
+# (final diff review Turn 002 F2).
+echo "== 머리말이 없는 파일도 읽을 수 있는 위치에 기록한다 (Turn 002 F2) =="
+setup_workspace
+f="$WS/rd-workflow-workspace/reports/workflow-defects/2026-08-12-1011-nohdr.md"
+printf '\n# rd-workflow 결함 보고: 머리말 없음\n\n본문\n' > "$f"
+id1="$(cd "$WS" && bash "$TARGET" ensure-id "$f" 2>/dev/null)"
+id2="$(cd "$WS" && bash "$TARGET" ensure-id "$f" 2>/dev/null)"
+check "재실행 시 같은 id (영속화 성공)" "$id2" "$id1"
+check "report-id 줄은 1개" "$(grep -c '^- report-id: ' "$f")" "1"
+(cd "$WS" && bash "$TARGET" set-issue "$f" "https://x/issues/9" >/dev/null 2>&1)
+out="$(cd "$WS" && bash "$TARGET" count-pending 2>/dev/null)"
+check "set-issue 후 전달 완료로 읽힌다" "$out" "0"
+
+echo "== 머리말 파싱은 본문 코드블록 인용을 자기 값으로 읽지 않는다 (Issue #21 부수) =="
+setup_workspace
+f="$(make_report "2026-08-12-1010-quote.md" legacy)"
+printf '\n```\n- report-id: 99999999999999-bbbbbb\n- upstream-issue: https://example.invalid/1\n```\n' >> "$f"
+out="$(cd "$WS" && bash "$TARGET" count-pending 2>/dev/null)"
+check "본문 인용 URL 을 전달 완료로 보지 않음" "$out" "1"
+id="$(cd "$WS" && bash "$TARGET" ensure-id "$f" 2>/dev/null)"
+[[ "$id" != "99999999999999-bbbbbb" ]] && ok "본문 인용 id 를 재사용하지 않음" || nok "본문 인용 id 재사용"
+check "새 id 는 머리말에 들어간다" "$(sed -n '1,/^$/p' "$f" | grep -c "^- report-id: ${id}\$")" "1"
+
 echo "== 발행 경로 (fake gh) =="
 
 setup_fake_gh() {
@@ -507,6 +548,19 @@ f="$(make_report "2026-08-12-2012-ghe.md")"
 run_dr publish "$f" --upstream "oss.navercorp.com/O/R" --yes >/dev/null 2>&1
 grep -q 'HOST=oss.navercorp.com' "$GH_LOG" && ok "GH_HOST 전달" || nok "GH_HOST 전달"
 
+# 인자 없는 `gh auth status` 는 등록된 **모든** host 를 점검하고 하나라도 실패하면 비-0 을
+# 낸다. 대상과 무관한 사내 host 의 VPN 미연결이 github.com 발행 전체를 막았다 (Issue #31).
+echo "-- 인증 검사는 대상 host 만 점검한다 (--hostname 전달, Issue #31) --"
+setup_workspace; setup_fake_gh
+f="$(make_report "2026-08-12-2018-authhost.md")"
+run_dr preview "$f" --upstream "O/R" >/dev/null 2>&1
+grep -q '^HOST=github.com ARGS=auth status --hostname github.com$' "$GH_LOG" \
+  && ok "github.com 대상: --hostname 전달" || nok "github.com 대상: --hostname 전달"
+setup_fake_gh
+run_dr preview "$f" --upstream "oss.navercorp.com/O/R" >/dev/null 2>&1
+grep -q 'ARGS=auth status --hostname oss.navercorp.com$' "$GH_LOG" \
+  && ok "GHE 대상: --hostname 전달" || nok "GHE 대상: --hostname 전달"
+
 echo "-- preview 는 대상·공개여부·경고·본문을 보여주고 아무것도 안 바꾼다 (AC 12·13) --"
 setup_workspace; setup_fake_gh
 f="$(make_report "2026-08-12-2013-pv.md")"
@@ -561,9 +615,12 @@ pad_to() {  # $1=file $2=목표 총 byte
   local cur need; cur="$(wc -c < "$1")"; need=$(( $2 - cur ))
   (( need > 0 )) && head -c "$need" /dev/zero | tr '\0' 'x' >> "$1"
 }
-probe() {   # $1=목표 총 byte $2=legacy|"" -> publish 종료 코드
+probe() {   # $1=목표 총 byte $2=legacy|dash|"" -> publish 종료 코드
   local target="$1" mode="${2:-}" ff
-  ff="$(make_report "2026-08-12-3003-probe-${target}-${mode:-normal}.md" $mode)"
+  ff="$(make_report "2026-08-12-3003-probe-${target}-${mode:-normal}.md" "$([[ "$mode" == "legacy" ]] && printf 'legacy')")"
+  if [[ "$mode" == "dash" ]]; then
+    sed -i.bak 's/^- report-id: .*$/- report-id: -/' "$ff"; rm -f "$ff.bak"
+  fi
   pad_to "$ff" "$target"
   run_dr publish "$ff" --upstream "O/R" --yes >/dev/null 2>&1
   printf '%s' $?
@@ -577,6 +634,10 @@ maxsize=$lo
 check "비-legacy 최대 크기(${maxsize}B)에서 발행 성공" "$(probe "$maxsize")" "0"
 check "1 byte 더하면 exit 6" "$(probe "$hi")" "6"
 check "같은 크기 legacy 는 exit 6 (증가분 반영)" "$(probe "$maxsize" legacy)" "6"
+# 값 없음 표기(`-`)도 발행 시 21자 id 로 치환되므로 같은 크기에서 한도를 넘는다.
+# `-` 를 그대로 검사값으로 쓰면 60 byte 과소 계산돼 한도 초과 본문이 발행된다
+# (final diff review Turn 002 F1).
+check "같은 크기 '-' 도 exit 6 (치환 증가분 반영)" "$(probe "$maxsize" dash)" "6"
 
 echo "-- 본문 초과 시 로컬·원격 모두 무변경 (Finding 2) --"
 setup_workspace; setup_fake_gh

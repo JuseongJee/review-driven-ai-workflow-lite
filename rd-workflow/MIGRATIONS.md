@@ -199,7 +199,7 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 1. promote가 task-state `source-fr`를 실제로 기록합니다 (`promote.sh`: `--source-fr` 인자 > `REQUEST.md ## Source FR` 추론 > `-`; `rd task guard --mode promote`: 인자 없으면 `-` 리셋).
 2. `pre_commit_archive_gate.sh`가 path 형식(백틱 포함) `Source FR`을 올바르게 해석합니다. **이전에는 path 형식에서 enforcement가 조용히 무력화되어 통과하던 커밋이, 이제 diff review 종결 + FR 미아카이브 상태에서 차단됩니다 (exit 2).**
 
-**대응**: 차단 메시지가 나오면 REQUEST 아카이브(FR status done 처리)를 먼저 실행한 뒤 커밋합니다. stale `source-fr` 정정은 `rd task set-source-fr <path|->`를 사용합니다.
+**대응**: 차단 메시지가 나오면 REQUEST 아카이브(FR status done 처리)를 먼저 실행한 뒤 커밋합니다. stale `source-fr` 정정은 `bash rd-workflow/scripts/rd task set-source-fr <path|->`를 사용합니다.
 
 ## M007: 게이트 정리 — 값어치를 증명하지 못한 hook 제거
 
@@ -531,7 +531,7 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 2. **task-state 에 필드 2개가 늘었습니다.**
    - `base-commit` — 작업 시작 커밋의 full OID. `promote.sh` 가 fr 브랜치 생성 시 기록합니다. promote 를 쓰지 않는 프로젝트는 `bash rd-workflow/scripts/rd task set-base <ref>` 로 1회 설정합니다(입력이 ref 여도 OID 로 저장). diff review 의 base 판정에 쓰입니다.
    - `review-session` — final diff review 세션 id 포인터. `prepare_review_pipeline.sh` 가 diff 세션 생성 시 기록하며, 발행 게이트는 **이 포인터가 가리키는 마커 하나만** 읽습니다.
-   두 필드는 `archive.sh` 의 metadata cleanup 이 baseline 으로 되돌립니다. 별도 마이그레이션 스크립트는 없습니다 — 위 경로(promote·`set-base`·diff 세션 생성)로 채워집니다. 다만 **promote 를 쓰지 않고 `--base` 도 주지 않으면 diff review 세션 생성이 `base 판정 입력이 없습니다` 로 실패**하므로, 그런 프로젝트는 첫 diff review 전에 `rd task set-base` 를 1회 실행해야 합니다.
+   두 필드는 `archive.sh` 의 metadata cleanup 이 baseline 으로 되돌립니다. 별도 마이그레이션 스크립트는 없습니다 — 위 경로(promote·`set-base`·diff 세션 생성)로 채워집니다. 다만 **promote 를 쓰지 않고 `--base` 도 주지 않으면 diff review 세션 생성이 `base 판정 입력이 없습니다` 로 실패**하므로, 그런 프로젝트는 첫 diff review 전에 `bash rd-workflow/scripts/rd task set-base` 를 1회 실행해야 합니다.
 3. **canonical Status 에 `아카이브 보류` 가 추가됐습니다.** 「리뷰 종결·발행 대기」이며 **완료가 아닙니다.** 전이는 `diff review 대기` → `아카이브 보류` → `완료` 이고, 리뷰 후 변경이 필요하면 `아카이브 보류` → `구현 중` 으로 되돌립니다. 프로젝트 `CLAUDE.md` 의 Task Tracking 절에 있는 Status 허용값 목록에도 이 값이 들어가야 합니다. `CLAUDE.md` 는 동기화 대상이라 템플릿 판을 그대로 받으면 함께 들어오지만, 프로젝트가 이 절을 손댄 상태라면 동기화 후 목록에 `아카이브 보류` 가 있는지 직접 확인하고 없으면 추가합니다.
 4. **마커 디렉터리 `rd-workflow-workspace/.lifecycle/review-seals/` 는 추적 대상입니다.** 마커는 커밋되어야 효력이 생기므로(게이트가 워킹트리가 아니라 판정 대상 commit 에서 읽습니다) 프로젝트 `.gitignore` 에 `.lifecycle/` 을 통째로 무시하는 규칙이 있으면 **제거해야 합니다.** 그대로 두면 정상 작업이 발행 시점에 `마커 없음` 으로 차단됩니다.
 5. **fr 브랜치 없이 기본 브랜치에서 작업하는 no-fr 모드가 생겼습니다.** task-state 의 `fr-branch` 가 canonical `null` 일 때만 진입하며(빈 문자열·공백·`main` 등은 malformed 로 차단), 기본 브랜치가 아니거나 detached HEAD 이면 차단됩니다. 기존 fr 경로는 그대로입니다.

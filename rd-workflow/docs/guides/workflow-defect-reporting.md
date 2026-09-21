@@ -12,17 +12,18 @@ rd-workflow 워크플로 템플릿을 사용하는 소비 프로젝트에서, �
 다음 중 하나에 해당하면 **rd-workflow 인프라 결함**입니다:
 
 - rd-workflow 산출물 문서(`rd-workflow/docs/`, 배포된 `CLAUDE.md`·`PROJECT_CONTEXT.md` 템플릿 등)의 오류·모순·누락
-- `rd-workflow/scripts/` 스크립트의 버그·오동작
+- `rd-workflow/scripts/` 스크립트의 버그·오동작 — 단 `{test,lint,typecheck,build}.sh` 는 소비 프로젝트가 자기 검증 명령으로 교체하도록 배포되는 파일이므로, **`TEMPLATE_STUB` 마커(파일 2행)가 남아 있는 템플릿 원본일 때만** 인프라입니다.
 - `rd-workflow/claude_skills/` skill 지침의 결함
 
 다음은 인프라 결함이 **아니며**, 기존 Intake대로 소비 프로젝트 FR로 등록합니다:
 
 - 소비 프로젝트 자신의 코드·설정·산출물 문제
 - 소비 프로젝트가 rd-workflow를 잘못 설정·사용한 경우 (설정 수정으로 해결)
+- 소비 프로젝트가 교체 완료한 `{test,lint,typecheck,build}.sh`(`TEMPLATE_STUB` 마커 없음)의 버그 — 경로가 `rd-workflow/scripts/` 아래라는 사실만으로 인프라로 분류하지 않습니다
 
 ### 경계 케이스 (conservative default)
 
-판별이 애매하거나 소비 프로젝트 문제와 인프라 결함이 동시에 의심되면 **보고 파일 생성을 우선**합니다 (인프라 신호를 소비 backlog에 묻지 않습니다). 소비 프로젝트 고유의 후속 작업이 분리 가능하면 그 부분만 별도 FR로 등록합니다. 완전히 뭉쳐 판별이 불가능하면 보고 파일 생성 쪽으로 기웁니다.
+판별이 애매하거나 소비 프로젝트 문제와 인프라 결함이 동시에 의심되면 **보고 파일 생성을 우선**합니다 (인프라 신호를 소비 backlog에 묻지 않습니다). 소비 프로젝트 고유의 후속 작업이 분리 가능하면 그 부분만 별도 FR로 등록합니다. 완전히 뭉쳐 판별이 불가능하면 보고 파일 생성 쪽으로 기웁니다. 다만 판별표가 **소비 프로젝트 저작물을 인프라로 지목하는 것으로 보이면**(대표적으로 `{test,lint,typecheck,build}.sh`), conservative default 를 적용하기 전에 파일 내용·`TEMPLATE_STUB` 마커·커밋 이력으로 소유권 실질을 먼저 확인합니다 — 경로만 보고 곧장 보고 파일을 만들지 않습니다.
 
 ## 보고 파일 규약
 
@@ -36,7 +37,7 @@ rd-workflow 워크플로 템플릿을 사용하는 소비 프로젝트에서, �
     - 발견일: YYYY-MM-DD
     - rd-workflow VERSION: <rd-workflow/VERSION 값>
     - 대상 산출물: <문제가 있는 파일·스크립트·skill 경로>
-    - report-id: <자동 생성 — defect_reports.sh ensure-id>
+    - report-id: -
     - upstream-issue: -
 
     ## 재현 맥락
@@ -47,6 +48,10 @@ rd-workflow 워크플로 템플릿을 사용하는 소비 프로젝트에서, �
 
     ## 기대 동작
     어떻게 동작해야 하는지
+
+`report-id` 와 `upstream-issue` 의 `-` 는 **아직 값이 없다**는 표기입니다. `report-id` 는 `ensure-id`(발행 시 자동 호출)가 `-` 를 실제 id 로 채우고, `upstream-issue` 는 발행 성공 시 Issue URL 로 채워집니다. `- report-id:` 줄 자체를 생략해도 같은 자리에 삽입됩니다.
+
+머리말은 **첫 빈 줄(또는 첫 `##` 헤더) 이전까지**입니다. 본문 코드블록 안에 이 스키마를 인용해도 그 줄은 머리말로 읽히거나 갱신되지 않습니다.
 
 ## 전달
 
