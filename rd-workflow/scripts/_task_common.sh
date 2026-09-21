@@ -729,6 +729,88 @@ task_capture_write() {
   printf '%s\n' "$dest"
 }
 
+# _task_request_is_empty_template <file> — REQUEST.md 에 **보존할 내용이 하나도 없음**을
+# 확인한다 (2026-09-05 FR — backup-request-empty-template-archive).
+#
+# 판정 방향이 중요하다. "핵심 몇 필드가 기본값처럼 보이는가" 를 보면 그 필드 밖에 적힌
+# 내용(제약만 먼저 적은 초안 등)과 placeholder `-` **뒤에** 덧붙인 내용을 놓쳐, 백업 없이
+# 덮어써지고 사용자는 "백업할 내용 없음" 이라는 거짓 안내를 받는다 (final diff review F1).
+# 그래서 반대로 간다 — **알려진 템플릿 뼈대를 모두 걷어내고 한 줄이라도 남으면 내용이
+# 있는 것으로 보고 백업 경로로 보낸다.** 판단할 수 없는 형식도 남으므로 자동으로 백업된다
+# (fail-safe 방향: 의심스러우면 보존).
+#
+# 제외는 **정본 템플릿에서 확인된 뼈대로 한정**한다. `^#` 같은 일반 패턴으로 제거하면
+# 사용자가 쓴 `### 소제목` 까지 함께 지워져 내용 부재가 증명되지 않는다 (F1 004 재현).
+# 그래서 섹션 헤더는 아래 목록과 **정확히 일치**할 때만 뼈대로 보고, 모르는 제목·항목은
+# 내용으로 취급한다. 템플릿에 새 섹션이 생기면 초기 템플릿이 "내용 있음" 으로 판정되어
+# 빈 백업이 다시 쌓이는데, 정본 템플릿을 그대로 넣는 회귀 단언이 그 어긋남을 잡는다.
+#
+# 뼈대: 빈 줄 / 아래 목록의 제목·섹션 헤더 / placeholder `-` 단독 / `- <키>: -` 형태의
+# 미작성 항목(Risk Tier 6줄) / 템플릿 기본 선택지 안내 두 줄 / HTML 주석.
+#
+# 주석은 **닫힘 뒤에 본문이 없을 때만** 버린다 — `<!-- 초안 --> 실제 요구사항` 처럼
+# 뒤에 붙은 본문은 렌더링되는 내용이다. 닫히지 않은 주석은 판정 불가이므로 내용으로
+# 본다 (fail-safe 방향: 의심스러우면 보존).
+#
+# return 0 = 보존할 내용 없음(건너뛰어도 됨), 1 = 내용 있음(백업 필요).
+_task_request_is_empty_template() {
+  local file="$1"
+  awk '
+    function tail_after_close(s,   p, rest) {
+      # **첫** 닫힘 뒤 잔여를 돌려준다. 마지막 닫힘까지 지우면
+      # `<!-- 초안 --> 본문 <!-- 확정 -->` 처럼 주석 **사이**에 있는 본문이 사라진다.
+      p = index(s, "-->")
+      if (p == 0) return ""
+      rest = substr(s, p + 3)
+      sub(/^[ \t]+/, "", rest); sub(/[ \t]+$/, "", rest)
+      return rest
+    }
+    BEGIN {
+      n = split("Task Type|Execution Path|User Goal|Change Description|Affected Area|" \
+                "Platform|Constraints|Acceptance Criteria|AC Bypass Reason|Risks|" \
+                "Risk Tier|Source FR", sec, "|")
+      for (i = 1; i <= n; i++) known["## " sec[i]] = 1
+      known["# Change Request"] = 1
+      # Risk Tier 의 미작성 항목은 정본 6개 키에 한정한다 — 일반 패턴으로 열면
+      # `- 허용되는 접두 문자: -` 같은 **내용**까지 미작성으로 삼킨다.
+      m = split("최종 등급|최초 등급|baseline HEAD|근거 신호|override·상향 이력|" \
+                "변경 파일 요약", rt, "|")
+      for (i = 1; i <= m; i++) rtkey["- " rt[i] ": -"] = 1
+    }
+    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    in_c {
+      # 정본의 주석 블록은 섹션을 넘지 않는다. 넘었다면 닫히지 않은 주석이라
+      # **뒤따르는 실제 내용까지 삼키는** 중이므로(다음 섹션의 값이 조용히 사라진다)
+      # 판정 불가로 보고 보존한다.
+      if (line in known) { found = 1; exit }
+      if (index(line, "-->") > 0) {
+        in_c = 0
+        if (tail_after_close(line) != "") { found = 1; exit }
+      }
+      next
+    }
+    line == "" { next }
+    line in known { cur = line; next }
+    line == "-" { next }
+    cur == "## Risk Tier" && (line in rtkey) { next }
+    cur == "## Task Type" && line == "new feature / change / bugfix / refactor" { next }
+    cur == "## Execution Path" && \
+      line == "small-task / existing-code-change / new-feature-or-large-task" { next }
+    substr(line, 1, 4) == "<!--" {
+      if (index(line, "-->") > 0) {
+        if (tail_after_close(line) != "") { found = 1; exit }
+        next
+      }
+      in_c = 1; next
+    }
+    { found = 1; exit }
+    END {
+      if (in_c) found = 1
+      exit found ? 1 : 0
+    }
+  ' "$file"
+}
+
 # SEC-01/02/05: REQUEST.md collision-safe 백업 (기존 3개 블록 대체). 차단 시 return 2 (fail-closed).
 task_backup_request() {
   local title="$1" orphan="${2:-0}"
@@ -745,6 +827,12 @@ task_backup_request() {
   if [[ -L "${_proot}/REQUEST.md" ]]; then
     echo "경고: REQUEST.md 가 symlink 입니다. 보안상 중단합니다." >&2
     return 2
+  fi
+  # 초기 템플릿(보존할 내용 0)이면 백업을 건너뛴다 — 호출부(skill 분기 1a/1b)가 실패로
+  # 오판해 중단하지 않도록 종료 코드는 0 을 유지한다.
+  if _task_request_is_empty_template "${_proot}/REQUEST.md"; then
+    echo "건너뜀 — REQUEST.md 가 초기 템플릿 상태입니다 (백업할 내용 없음)"
+    return 0
   fi
   assert_no_symlink_in_path "$dir" || return 2
   mkdir -p "$dir"
@@ -824,9 +912,12 @@ _task_section_exists() {
 # _task_section_write_list <section> <multiline-value> — `_task_section_write` 의 목록판.
 # 그 함수는 "첫 비어있지 않은 줄만 교체, 나머지 byte 보존" 계약이라 여러 줄 본문을
 # 표현할 수 없다(교체해도 두 번째 줄부터는 옛 값이 남는다) — Source FR 미러가 복수
-# 목록(change spec §2.3b)을 담아야 해서 신설한다. 섹션의 옛 본문 전체를 지우고 값의
-# 각 줄로 교체한다. 헤더 자체가 없으면 `_task_section_write` 와 같은 이유로 return 1
-# (임의 위치에 새 헤더를 만들지 않는다 — 부재는 baseline 이 아니라는 신호).
+# 목록(change spec §2.3b)을 담아야 해서 신설한다. 섹션의 옛 본문에서 값 줄은 버리고
+# 새 값으로 교체하되, **안내 주석(`<!-- ... -->`)은 보존해 값 뒤에 재배치한다** —
+# `## Status` 쪽(`_task_section_write`)은 첫 줄만 교체해 뒤따르는 주석이 자동 보존되는데
+# Source FR 쪽만 전체 교체라 주석이 함께 사라졌다 (2026-09-18 FR — task-mirror-write-
+# strips-source-fr-comments). 헤더 자체가 없으면 `_task_section_write` 와 같은 이유로
+# return 1 (임의 위치에 새 헤더를 만들지 않는다 — 부재는 baseline 이 아니라는 신호).
 _task_section_write_list() {
   local file="${project_root}/CURRENT_TASK.md" section="$1" value="$2" tmp
   if ! grep -q "^## ${section}\$" "$file" 2>/dev/null; then
@@ -841,18 +932,33 @@ _task_section_write_list() {
   # 갱신되고 미러만 안 된 partial state** 가 남는다 (2026-09-10 실측: 2건 이상을
   # 기존 섹션에 쓸 때 재현). 섹션이 없던 픽스처는 append 경로로 빠져 이 결함을
   # 가렸으므로 회귀 테스트는 **섹션이 이미 있는** 상태를 쓴다.
+  #
+  # 값이 baseline 과 같으면 이 재구성 결과가 원본과 byte-identical 하므로 (주석까지
+  # 그대로 재배치) `mv` 후에도 git diff 가 생기지 않는다 — 별도 short-circuit 없이
+  # 멱등성이 성립한다.
   _TSWL_VAL="$value" awk -v target="## ${section}" '
-    BEGIN { n = split(ENVIRON["_TSWL_VAL"], arr, "\n") }
+    BEGIN { n = split(ENVIRON["_TSWL_VAL"], arr, "\n"); cn=0 }
     $0 == target { print; in_s=1; printed=0; next }
+    in_s && /^<!--/ { cn++; cmt[cn]=$0; next }
     in_s && /^## / {
-      # 목록 뒤 빈 줄 1개를 유지한다 — baseline 서식(섹션 사이 빈 줄)을 보존하기
-      # 위함이다. 원본 본문의 빈 줄은 in_s 에서 버려지므로 여기서 다시 넣는다.
-      if (!printed) { for (i=1;i<=n;i++) print arr[i]; print ""; printed=1 }
+      # 값 뒤에 보존한 안내 주석을 재배치하고, 그 뒤 빈 줄 1개를 유지한다 —
+      # baseline 서식(섹션 사이 빈 줄)을 보존하기 위함이다.
+      if (!printed) {
+        for (i=1;i<=n;i++) print arr[i]
+        for (i=1;i<=cn;i++) print cmt[i]
+        print ""
+        printed=1
+      }
       in_s=0; print; next
     }
     in_s { next }
     { print }
-    END { if (in_s && !printed) { for (i=1;i<=n;i++) print arr[i] } }
+    END {
+      if (in_s && !printed) {
+        for (i=1;i<=n;i++) print arr[i]
+        for (i=1;i<=cn;i++) print cmt[i]
+      }
+    }
   ' "$file" > "$tmp" && mv "$tmp" "$file"
 }
 

@@ -302,7 +302,7 @@ compact 후에도 한계에 가까워지면:
      ```bash
      bash rd-workflow/scripts/rd task backup-request
      ```
-     실패(exit 2) 시 출력된 경고를 보고하고 중단한다.
+     실패(exit 2) 시 출력된 경고를 보고하고 중단한다. 출력이 `건너뜀 — REQUEST.md 가 초기 템플릿 상태입니다` (exit 0) 이면 보존할 내용이 없어 백업 파일을 만들지 않은 정상 경로이므로 그대로 진행한다.
 
   3. **같은 short-title 의 `request`/`spec`/`plan` stage 캡처를 `raw-captures/archive/` 로 이동**
      (`fr` stage 는 이동 안 함 — `/fr archive` 책임):

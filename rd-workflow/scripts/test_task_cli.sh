@@ -300,6 +300,90 @@ bash "$RD" task backup-request >/dev/null 2>&1; rc=$?
 cnt_a="$(ls "$TMP/rd-workflow-workspace/backlog/request-archive" | wc -l)"
 [[ "$rc" == 2 && "$cnt_b" == "$cnt_a" ]] && echo "ok: backup source symlink 차단" || { echo "FAIL: backup source symlink (rc=$rc)"; FAIL=1; }
 rm "$TMP/REQUEST.md"; mv "$TMP/real-request.md" "$TMP/REQUEST.md"
+# --- 빈 템플릿 백업 건너뛰기 (2026-09-05 FR) ---
+# 판정은 "보존할 내용이 하나도 없음" 을 확인하는 방향이어야 한다. 핵심 몇 필드만 보면
+# 그 밖에 적힌 내용과 placeholder 뒤에 덧붙인 내용을 놓쳐 원문이 백업 없이 사라진다
+# (final diff review F1). 아래 두 재현이 그 회귀를 고정한다.
+bk_cnt() { ls "$TMP/rd-workflow-workspace/backlog/request-archive" | wc -l; }
+
+# 실제 배포 초기 템플릿은 건너뛴다 — 손으로 만든 픽스처가 아니라 정본 파일을 쓴다
+# (정본이 없는 소비 프로젝트 배포본에서는 이 단언만 건너뛴다).
+TPL_SRC="$(cd "$(dirname "$RD")/../.." && pwd)/_ROOT_FILES/REQUEST.md"
+if [[ -f "$TPL_SRC" ]]; then
+  cp "$TPL_SRC" "$TMP/REQUEST.md"
+  cnt_b="$(bk_cnt)"; out_e="$(bash "$RD" task backup-request)"; rc=$?; cnt_a="$(bk_cnt)"
+  [[ "$rc" == 0 && "$cnt_b" == "$cnt_a" && "$out_e" == *건너뜀* ]] \
+    && echo "ok: 배포 초기 템플릿 정본은 건너뜀 (exit 0, 미생성, 알림)" \
+    || { echo "FAIL: 배포 초기 템플릿 정본 (rc=$rc, before=$cnt_b after=$cnt_a, out=$out_e)"; FAIL=1; }
+
+  # 정본 템플릿의 `## User Goal` 값만 바꿔, 뼈대 제외 규칙이 실제 내용까지 지우지
+  # 않는지 본다 (F1 004 재현). 일반 패턴(`^#` 전체 제외, 주석 줄 통째 제외)으로
+  # 고치면 아래 셋이 모두 "내용 없음" 으로 판정돼 원문이 백업 없이 사라졌다.
+  # 백업본이 원문과 byte-identical 한지까지 본다 — 부분 문자열 검사로는
+  # 잘린 백업을 통과시킬 수 있다.
+  goal_case() { # <라벨> <User Goal 에 넣을 본문>
+    GOAL_BODY="$2" awk '
+      $0 == "## User Goal" { print; pend=1; next }
+      pend && $0 == "-" { printf "%s\n", ENVIRON["GOAL_BODY"]; pend=0; next }
+      { print }
+    ' "$TPL_SRC" > "$TMP/REQUEST.md"
+    local out; out="$(bash "$RD" task backup-request)"
+    [[ -f "$out" ]] && cmp -s "$out" "$TMP/REQUEST.md" \
+      && echo "ok: $1" \
+      || { echo "FAIL: $1 ($out)"; FAIL=1; }
+  }
+  goal_case "하위 제목으로 쓴 요구사항도 백업된다" \
+    "### 기존 데이터를 보존하는 마이그레이션 구현"
+  goal_case "주석 닫힘 뒤 본문도 백업된다" \
+    "<!-- 초안 --> 기존 데이터를 보존하는 마이그레이션 구현"
+  goal_case "여러 줄 주석 닫힘 뒤 본문도 백업된다" \
+    "<!-- 초안
+--> 기존 데이터를 보존하는 마이그레이션 구현"
+  # 주석 **사이**의 본문 — 마지막 닫힘까지 지우면 사라진다
+  goal_case "주석 사이 본문도 백업된다" \
+    "<!-- 초안 --> 기존 데이터를 보존하는 마이그레이션 구현 <!-- 확정 -->"
+  goal_case "여러 줄 주석 사이 본문도 백업된다" \
+    "<!-- 초안
+--> 기존 데이터를 보존하는 마이그레이션 구현 <!-- 확정 -->"
+  # 정본 Risk Tier 키가 아닌 목록 항목은 값이 '-' 여도 내용이다
+  goal_case "모르는 목록 항목은 미작성으로 보지 않는다" \
+    "- 허용되는 접두 문자: -"
+  # 닫히지 않은 주석은 뒤따르는 섹션의 실제 내용을 삼킨다 — 판정 불가로 보존해야 한다
+  GOAL_BODY="<!-- 미완" awk '
+    $0 == "## User Goal" { print; pg=1; next }
+    pg && $0 == "-" { printf "%s\n", ENVIRON["GOAL_BODY"]; pg=0; next }
+    $0 == "## Constraints" { print; pc=1; next }
+    pc && $0 == "-" { print "- 기존 데이터는 삭제하지 않는다"; pc=0; next }
+    { print }
+  ' "$TPL_SRC" > "$TMP/REQUEST.md"
+  out_n="$(bash "$RD" task backup-request)"
+  [[ -f "$out_n" ]] && cmp -s "$out_n" "$TMP/REQUEST.md" \
+    && echo "ok: 미닫힘 주석이 삼킨 뒤 섹션 내용도 백업된다" \
+    || { echo "FAIL: 미닫힘 주석 뒤 내용이 백업되지 않았다 ($out_n)"; FAIL=1; }
+else
+  echo "skip: _ROOT_FILES/REQUEST.md 없음 — 배포 정본 기반 단언 생략"
+fi
+
+# F1 재현 ①: 핵심 3필드는 '-' 인데 Constraints 에만 내용이 있는 초안 → 원문 보존 필요
+printf '# Change Request\n\n## User Goal\n-\n\n## Change Description\n-\n\n## Constraints\n- 기존 데이터는 삭제하지 않는다\n\n## Acceptance Criteria\n-\n' > "$TMP/REQUEST.md"
+out_n="$(bash "$RD" task backup-request)"
+[[ -f "$out_n" ]] && grep -q '기존 데이터는 삭제하지 않는다' "$out_n" \
+  && echo "ok: 핵심 필드 밖(Constraints)의 내용도 백업된다" \
+  || { echo "FAIL: Constraints 만 작성된 초안이 백업되지 않았다 ($out_n)"; FAIL=1; }
+
+# F1 재현 ②: placeholder '-' 를 남긴 채 그 뒤에 내용을 덧붙인 경우 → 원문 보존 필요
+printf '# Change Request\n\n## User Goal\n-\n기존 데이터를 보존하는 마이그레이션 구현\n\n## Change Description\n-\n\n## Acceptance Criteria\n-\n' > "$TMP/REQUEST.md"
+out_n="$(bash "$RD" task backup-request)"
+[[ -f "$out_n" ]] && grep -q '마이그레이션 구현' "$out_n" \
+  && echo "ok: placeholder 뒤에 덧붙인 내용도 백업된다" \
+  || { echo "FAIL: placeholder 뒤 내용이 백업되지 않았다 ($out_n)"; FAIL=1; }
+
+# 핵심 필드에 정상 작성된 경우도 종전대로 아카이브된다
+printf '# Change Request\n\n## User Goal\n실제 목표\n\n## Change Description\n-\n\n## Acceptance Criteria\n-\n' > "$TMP/REQUEST.md"
+out_n="$(bash "$RD" task backup-request)"
+[[ -f "$out_n" ]] && grep -q '실제 목표' "$out_n" && echo "ok: 내용 있으면 정상 아카이브" \
+  || { echo "FAIL: 내용 있는 REQUEST 아카이브 ($out_n)"; FAIL=1; }
+printf '# Change Request\ncontent-1\n' > "$TMP/REQUEST.md"
 
 # --- archive-captures (SEC-07/17) ---
 CAPD="$TMP/rd-workflow-workspace/raw-captures"
@@ -588,6 +672,21 @@ bash "$RD" task set-source-fr "/etc/passwd" >/dev/null 2>&1 || true
 [[ "$(sfr_mirror)" == "$SRC_OK" ]] \
   && echo "ok: D12 계약 위반은 미러를 바꾸지 않는다" \
   || { echo "FAIL: D12 계약 위반 후 미러 값이 바뀌었다 ('$(sfr_mirror)')"; FAIL=1; }
+
+# 배포 템플릿처럼 값 줄 뒤에 안내 주석이 있는 미러에서, 값만 갱신되고 주석은 보존돼야
+# 한다 (2026-09-18 FR). 종전 픽스처는 주석이 없어 이 결함을 가렸다. 값이 baseline 으로
+# 되돌아오면 파일이 원본과 byte-identical 이어야 워킹트리에 diff 가 남지 않는다.
+mk_task_file "$TMP" "대기 중" "-"
+printf '# Current Task\n\n## Short Title\n-\n\n## Status\n대기 중\n\n## Source FR\n-\n<!-- 권위는 task-state. 변경은 rd task set-source-fr 경유 -->\n<!-- 복수면 한 줄에 1건씩 나열합니다 -->\n\n## Notes\n-\n' > "$TMP/CURRENT_TASK.md"
+cp "$TMP/CURRENT_TASK.md" "$TMP/mirror-baseline.md"
+bash "$RD" task set-source-fr "$SRC_OK" >/dev/null 2>&1
+[[ "$(grep -c '^<!--' "$TMP/CURRENT_TASK.md")" == "2" && "$(sfr_mirror)" == "$SRC_OK" ]] \
+  && echo "ok: 미러 쓰기가 안내 주석을 보존하고 값만 갱신한다" \
+  || { echo "FAIL: 미러 쓰기 후 주석 $(grep -c '^<!--' "$TMP/CURRENT_TASK.md") 개, 값 '$(sfr_mirror)'"; FAIL=1; }
+bash "$RD" task set-source-fr "-" >/dev/null 2>&1
+cmp -s "$TMP/CURRENT_TASK.md" "$TMP/mirror-baseline.md" \
+  && echo "ok: 값이 baseline 으로 돌아오면 파일이 원본과 동일하다 (멱등)" \
+  || { echo "FAIL: baseline 복귀 후에도 미러에 diff 가 남는다"; FAIL=1; }
 
 # guard promote write 분기: 인자 없음 → 리셋
 mk_task_file "$TMP" "대기 중" "-"
