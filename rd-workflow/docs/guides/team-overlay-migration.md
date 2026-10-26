@@ -749,7 +749,7 @@ fi
 - [ ] `git -C <소스디렉토리> status --porcelain` / `--ignored --porcelain` → 이관 전 목록과 같다
 - [ ] overlay 의 개인 문서(`PROJECT_CONTEXT.md`·`CLAUDE.md`·`rd-workflow-workspace/`) **내용**이 이관 전과 같다
 - [ ] overlay 에 심링크가 하나도 복사되지 않았다 (`find . -maxdepth 2 -type l`)
-- [ ] `.claude/settings.json` 과 `WORKING_WITH_AI.md` 가 있다
+- [ ] `.claude/settings.json`·`.claude/rules/rd-workflow/`·`WORKING_WITH_AI.md` 가 있다
 - [ ] 0단계 A-2 에서 고른 `EXTRA_PATHS`·`OLD_ONLY_MAP` 항목이 overlay 에 **내용 그대로** 있고, 소스에는 (팀 파일이 아닌 한) 남아 있지 않다
 - [ ] 6단계 5 의 ignore 검증이 통과했다
 

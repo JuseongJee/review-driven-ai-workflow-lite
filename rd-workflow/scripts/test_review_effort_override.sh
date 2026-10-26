@@ -304,7 +304,7 @@ echo "=== 호출자 환경 격리 ==="
 ISO="$TMP/iso"
 mkdir -p "$ISO/rd-workflow/scripts" "$ISO/rd-workflow/config" \
          "$ISO/rd-workflow/docs/flows" "$ISO/rd-workflow/docs/prompts/review" "$ISO/cap"
-for f in run_review_turn.sh review_common.sh adapter_codex.sh adapter_claude.sh; do
+for f in run_review_turn.sh review_common.sh review_wait.sh adapter_codex.sh adapter_claude.sh; do
   cp "${script_dir}/$f" "$ISO/rd-workflow/scripts/$f"
 done
 printf '기준\n' > "$ISO/rd-workflow/docs/prompts/review/request_review.md"

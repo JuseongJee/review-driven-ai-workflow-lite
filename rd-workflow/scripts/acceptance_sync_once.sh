@@ -16,6 +16,9 @@
 #   (B) dangling symlink   -> 링크 자체 보존 (`-e` 만 보면 "부재" 로 오판해 덮어씁니다)
 #   (C) 유효 symlink       -> 링크 정체성 + target 내용 보존 (역참조 덮어쓰기 방지)
 #
+#   (D) 프로젝트 소유 CLAUDE.md · .claude/rules/mine.md 보존 + 템플릿 소유 rules 폴더 미러
+#       (낡은 .claude/rules/rd-workflow/old.md 는 삭제, mine.md 와 CLAUDE.md 는 byte 동일)
+#
 # 절차는 sync_template.md 의 단계 순서를 그대로 따른다:
 #   1단계 sync_template.sh(clone) -> 4단계 마이그레이션 -> 5단계 복사 -> 5.1 -> 6단계 검증
 #
@@ -115,6 +118,13 @@ copy_into() { # $1=src dir  $2=dst dir
 # `-e` 가 거짓이므로 `-L` 을 함께 보지 않으면 "부재" 로 오판해 배포본으로 덮어씁니다.
 # 보존은 링크를 따라가지 않는 `mv` 로 옮겼다가 되돌리는 방식이라, 유효 symlink 도
 # 역참조되지 않고 링크 정체성과 target 내용이 그대로 남습니다.
+#
+# 분류 모사 (sync_template.md 2·3·5단계):
+#   - 보존: 루트 `CLAUDE.md` 는 workflow.json 과 같은 방식(판정 `[ -e ] || [ -L ]`,
+#     대피 후 복원)으로 보존합니다. 경로가 없으면 배포본이 그대로 들어옵니다.
+#   - 동기화 대상 + 삭제 후보 승인: `.claude/rules/rd-workflow/` 는 템플릿 소유라 clone 과
+#     같게 미러합니다 (3단계에서 사용자가 삭제 후보를 승인한 상태 — 템플릿에 없는 파일 삭제).
+#     `.claude/rules/` 의 그 밖 파일은 프로젝트 소유라 건드리지 않습니다.
 sync_copy_step() { # $1=clone  $2=proj  (실패하면 1 을 반환합니다)
   local clone="$1" proj="$2" base rc=0
   local cfg="$proj/rd-workflow/config/workflow.json" saved=""
@@ -123,6 +133,17 @@ sync_copy_step() { # $1=clone  $2=proj  (실패하면 1 을 반환합니다)
     if ! mv "$cfg" "$saved"; then
       echo "  보존 대상 대피 실패: $cfg" >&2; rc=1; saved=""
     fi
+  fi
+  local md="$proj/CLAUDE.md" md_saved=""
+  if [ -e "$md" ] || [ -L "$md" ]; then
+    md_saved="$proj/.CLAUDE.md.preserve.$$"
+    if ! mv "$md" "$md_saved"; then
+      echo "  보존 대상 대피 실패: $md" >&2; rc=1; md_saved=""
+    fi
+  fi
+  # rules 미러: clone 에 폴더가 있고 proj 가 비어 있지 않은 경로일 때만 폴더를 비운 뒤 다시 복사한다
+  if [[ -n "$proj" && -d "$clone/.claude/rules/rd-workflow" ]]; then
+    rm -rf "$proj/.claude/rules/rd-workflow"
   fi
   for base in $(cd "$clone" && ls -A | grep -v '^\.git$'); do
     if [[ -d "$clone/$base" ]]; then
@@ -139,6 +160,12 @@ sync_copy_step() { # $1=clone  $2=proj  (실패하면 1 을 반환합니다)
     rm -f "$cfg"
     if ! mv "$saved" "$cfg"; then
       echo "  보존 대상 복원 실패: $cfg" >&2; rc=1
+    fi
+  fi
+  if [[ -n "$md_saved" ]]; then
+    rm -f "$md"
+    if ! mv "$md_saved" "$md"; then
+      echo "  보존 대상 복원 실패: $md" >&2; rc=1
     fi
   fi
   return $rc
@@ -295,6 +322,12 @@ check "sync 5단계가 workflow.json 을 배포함" \
 check "배포된 workflow.json 의 default_execution_mode" \
   "$(json_str_value "$PROJ/rd-workflow/config/workflow.json" default_execution_mode)" "semi-auto"
 
+check "rules 폴더 존재" \
+  "$( [ -d "$PROJ/.claude/rules/rd-workflow" ] && echo yes || echo no )" "yes"
+check "rules 파일 목록이 clone 과 같음" \
+  "$( cd "$PROJ/.claude/rules/rd-workflow" 2>/dev/null && ls | sort | tr '\n' ' ' )" \
+  "$( cd "$CLONE/.claude/rules/rd-workflow" 2>/dev/null && ls | sort | tr '\n' ' ' )"
+
 echo "== 5.1: defect_report_upstream (sync 가 배포한 config) =="
 ( cd "$PROJ" && bash rd-workflow/scripts/defect_reports.sh set-upstream \
     "https://github.com/example/repo" ) > "$WORK/up.out" 2>&1
@@ -431,6 +464,31 @@ strip_upstream_line "$LNK/dotfiles/workflow.json" > "$WORK/symlink_target_after_
 check "C 5.1 이 추가한 것이 defect_report_upstream 줄뿐" \
   "$( cmp -s "$WORK/symlink_target_before.json" "$WORK/symlink_target_after_stripped.json" \
         && echo same || echo differ )" "same"
+
+echo "== 보존 시나리오 D: 프로젝트 소유 CLAUDE.md · rules/mine.md + rules 미러 =="
+# CLAUDE.md 는 프로젝트 소유라 5단계가 덮으면 안 되고, `.claude/rules/rd-workflow/` 는 템플릿
+# 소유라 clone 과 같아져야 합니다 (낡은 파일 삭제). `.claude/rules/` 의 그 밖 파일은 보존입니다.
+PRJ="$WORK/proj_owned"
+mkdir -p "$PRJ/.claude/rules/rd-workflow"
+printf '프로젝트 고유 문장 하나
+' > "$PRJ/CLAUDE.md"
+printf '프로젝트 고유 규칙
+' > "$PRJ/.claude/rules/mine.md"
+printf '낡은 템플릿 규칙
+' > "$PRJ/.claude/rules/rd-workflow/old.md"
+cp "$PRJ/CLAUDE.md" "$WORK/owned_claude_before.md"
+cp "$PRJ/.claude/rules/mine.md" "$WORK/owned_mine_before.md"
+sync_copy_step "$CLONE" "$PRJ"
+check "D 복사 종료코드 0" "$?" "0"
+check "D CLAUDE.md 가 byte-for-byte 동일" \
+  "$( cmp -s "$WORK/owned_claude_before.md" "$PRJ/CLAUDE.md" && echo same || echo differ )" "same"
+check "D rules/mine.md 가 byte-for-byte 동일" \
+  "$( cmp -s "$WORK/owned_mine_before.md" "$PRJ/.claude/rules/mine.md" && echo same || echo differ )" "same"
+check "D 낡은 rules/rd-workflow/old.md 삭제" \
+  "$( [ -e "$PRJ/.claude/rules/rd-workflow/old.md" ] && echo yes || echo no )" "no"
+check "D rules 폴더 목록이 clone 과 같음" \
+  "$( cd "$PRJ/.claude/rules/rd-workflow" 2>/dev/null && ls | sort | tr '\n' ' ' )" \
+  "$( cd "$CLONE/.claude/rules/rd-workflow" 2>/dev/null && ls | sort | tr '\n' ' ' )"
 
 # 임시 clone 정리 — 삭제 직전에 조건을 다시 확인한다. 이 지점에 오기까지 clone 부모의
 # 내용은 바뀌지 않지만(5단계는 clone 에서 읽기만 한다), 재귀 삭제 앞에서 존재 여부만 보고

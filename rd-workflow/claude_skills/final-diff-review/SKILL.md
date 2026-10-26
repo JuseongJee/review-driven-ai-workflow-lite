@@ -22,12 +22,14 @@ Execution rules:
 - If verification has not been run yet, run `bash rd-workflow/scripts/test.sh`, `bash rd-workflow/scripts/lint.sh`, `bash rd-workflow/scripts/typecheck.sh`, and `bash rd-workflow/scripts/build.sh` first when possible.
 - Draft the PR description with `rd-workflow/docs/PR_TEMPLATE.md`.
 - 세션 생성 전에 커밋 전 재분류(WORKFLOW.md 위험 등급 절) 를 끝내고 `REQUEST.md ## Risk Tier` 의 `- 최종 등급:` 이 확정되어 있어야 한다 — `prepare_review_pipeline.sh` 가 이 줄로 리뷰 effort 를 정한다.
+- **변이 결과표**: 세션 생성 전에 `rd-workflow/docs/guides/mutation-check.md` 「절차」로 이 변경의 필수 대상 단언 결과표를 만들고 Author 첫 턴에 싣는다. `full` 은 task 완료 보고의 행을 모으고, `standard` 는 diff 에서 필수 대상을 직접 식별한다(plan 은 쓰지 않는다). 필수 대상이 없으면 `필수 대상 없음 — 사유` 한 줄을 싣는다. `생존`·원복 `미확인` 행이 남은 채로 세션을 열지 않는다. 리뷰 중 고친 코드가 행의 대상·동작·실행 조건을 바꾸면 가이드 「갱신 규칙」대로 다음 Author 턴에 갱신 행을 싣는다.
 - Start the final diff review with `bash rd-workflow/scripts/prepare_review_pipeline.sh diff` and continue with `bash rd-workflow/scripts/run_review_turn.sh ...` until the session reaches `awaiting-user` or the latest Reviewer turn has no objections.
 - 독립 reviewer가 없어 self-review(claude)로 fallback될 때, 기본 정책 `self_review_policy=block`이면 일반 모드에서 차단된다. 독립 reviewer 없이 진행하려면 `RD_SELF_REVIEW_APPROVE=1`로 재실행하거나 `review-tools.json`에서 정책을 `warn`/`off`로 바꾼다.
 - Update `CURRENT_TASK.md` if the task status changes.
 
 Final output:
 - Verification status
+- 변이 결과표 요약 (`검증됨`·`생존`·`미검증` 개수, 또는 `필수 대상 없음 — 사유`)
 - PR summary status
 - final diff review session path
 - merge readiness or the exact user decision still needed

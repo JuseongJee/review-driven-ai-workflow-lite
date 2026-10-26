@@ -77,7 +77,7 @@ source "$SCRIPT_DIR/_lifecycle_common.sh"
 
 # 허용 경로 목록 — 개행 구분, 3개
 _lmp="$(lifecycle_metadata_paths)"
-assert_eq "$(printf '%s\n' "$_lmp" | wc -l | tr -d ' ')" "3" "lifecycle_metadata_paths 3행"
+assert_eq "$(printf '%s\n' "$_lmp" | wc -l | tr -d ' ')" "4" "lifecycle_metadata_paths 4행"
 # 순서 고정 계약 — 행 번호에 결속해 정확히 일치를 본다.
 # 포함 여부만 보면 순서가 뒤바뀌는 회귀를 놓친다 (Task 3·4 가 이 순서에 의존).
 assert_eq "$(printf '%s\n' "$_lmp" | sed -n 1p)" "rd-workflow-workspace/.lifecycle/task-state" "허용 경로 1행 = task-state"
@@ -789,6 +789,113 @@ printf 'a=1\r\n' > "$_lf_t";                      _rt_case pass  "CRLF 는 통�
 _rc=0; archive_publish_content_check "$_pc_repo" "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" "$(git -C "$_pc_repo" rev-parse HEAD)" >/dev/null 2>&1 || _rc=$?
 assert_eq "$_rc" "2" "존재하지 않는 기준선은 rc 2 git 오류"
 
+# ============================================================================
+# CURRENT_TASK.md 주석 줄 제외 비교 (mirror-comments-lost-in-promote-baseline)
+# — T1~T4: emit_current_task_baseline 이 Status·Source FR 안내 주석을 담게 되면서
+# archive_publish_content_check 의 CURRENT_TASK.md 케이스가 byte-hash 에서 주석 줄
+# 제외 비교로 바뀌었다. 이 케이스는 baseline_oid 인자를 쓰지 않고 항상
+# emit_current_task_baseline() 을 직접 호출해 기대값을 만들므로, 아래 각 케이스는
+# _pc_repo 의 CURRENT_TASK.md(발행 후보)만 바꿔 커밋하면 된다.
+# ============================================================================
+
+# T1 — 구 baseline(주석 없음) 호환: 수정 전 emit_current_task_baseline 의 실제 출력을
+# 독립 fixture 문자열로 고정한다(수정된 emitter를 되돌려 재생성하지 않는다).
+_old_baseline_fixture='# Current Task
+
+## Task
+-
+
+## Short Title
+-
+
+## Status
+대기 중
+
+## Request
+[REQUEST.md](REQUEST.md)
+
+## Source FR
+-
+
+## Spec
+-
+
+## Plan
+-
+
+## Branch / Worktree
+main
+
+## Output Files
+-
+
+## Next Step
+-
+
+## Notes
+-'
+(
+  cd "$_pc_repo"
+  printf '%s\n' "$_old_baseline_fixture" > CURRENT_TASK.md
+  git add -A && git commit -q -m "T1: 구 baseline(주석 없음) 으로 되돌림"
+) >/dev/null 2>&1
+_rc=0; archive_publish_content_check "$_pc_repo" "$_pc_base" "$(git -C "$_pc_repo" rev-parse HEAD)" >/dev/null 2>&1 || _rc=$?
+assert_eq "$_rc" "0" "T1: 주석 없는 구 baseline CURRENT_TASK.md 는 통과 (구 브랜치 호환)"
+
+# T2 — 신 baseline(주석 있음)에서 주석 줄만 변경/삭제해도 통과. 앞뒤 공백만 붙은
+# 완결 주석도 함께 검증한다(정상 경계).
+(
+  cd "$_pc_repo"
+  emit_current_task_baseline | sed 's/^<!-- 허용 상태값.*-->$/  <!-- 다른 문구로 바뀐 주석 -->  /' > CURRENT_TASK.md
+  git add -A && git commit -q -m "T2: Status 주석 문구 변경 + 앞뒤 공백"
+) >/dev/null 2>&1
+_rc=0; archive_publish_content_check "$_pc_repo" "$_pc_base" "$(git -C "$_pc_repo" rev-parse HEAD)" >/dev/null 2>&1 || _rc=$?
+assert_eq "$_rc" "0" "T2: 주석 줄 내용 변경(+앞뒤 공백)은 통과"
+(
+  cd "$_pc_repo"
+  emit_current_task_baseline | grep -v '^<!--' > CURRENT_TASK.md
+  git add -A && git commit -q -m "T2b: 주석 줄 전부 삭제"
+) >/dev/null 2>&1
+_rc=0; archive_publish_content_check "$_pc_repo" "$_pc_base" "$(git -C "$_pc_repo" rev-parse HEAD)" >/dev/null 2>&1 || _rc=$?
+assert_eq "$_rc" "0" "T2b: 주석 줄을 전부 삭제해도 통과"
+
+# T3 — 주석이 아닌 값(## Status 값 줄)을 바꾸면 차단 (본문 fail-closed)
+(
+  cd "$_pc_repo"
+  emit_current_task_baseline | sed 's/^대기 중$/구현 중/' > CURRENT_TASK.md
+  git add -A && git commit -q -m "T3: Status 값 변조"
+) >/dev/null 2>&1
+_rc=0; archive_publish_content_check "$_pc_repo" "$_pc_base" "$(git -C "$_pc_repo" rev-parse HEAD)" >/dev/null 2>&1 || _rc=$?
+assert_eq "$_rc" "1" "T3: 주석 아닌 Status 값 변조는 차단"
+
+# T4 — 혼합 줄(완결된 주석처럼 보이지만 본문/추가 주석이 딸린 줄)은 제외 대상이
+# 아니므로, baseline 에 없던 새 줄로 추가하면 차단돼야 한다. 탐욕 매칭으로
+# `_archive_strip_comment_lines` 의 mid 검사가 빠지면 이 두 케이스가 조용히
+# 통과한다(REQUEST review Turn 004 R1, spec/plan review Turn 002 R3).
+(
+  cd "$_pc_repo"
+  { emit_current_task_baseline; printf '<!-- 안내 --> 실제 본문 <!-- 안내 -->\n'; } > CURRENT_TASK.md
+  git add -A && git commit -q -m "T4a: 혼합 줄(본문 포함) 추가"
+) >/dev/null 2>&1
+_rc=0; archive_publish_content_check "$_pc_repo" "$_pc_base" "$(git -C "$_pc_repo" rev-parse HEAD)" >/dev/null 2>&1 || _rc=$?
+assert_eq "$_rc" "1" "T4a: <!-- 안내 --> 실제 본문 <!-- 안내 --> 형태의 새 줄은 차단"
+(
+  cd "$_pc_repo"
+  { emit_current_task_baseline; printf '<!-- a --><!-- b -->\n'; } > CURRENT_TASK.md
+  git add -A && git commit -q -m "T4b: 연속 완결 주석 두 개가 붙은 새 줄 추가"
+) >/dev/null 2>&1
+_rc=0; archive_publish_content_check "$_pc_repo" "$_pc_base" "$(git -C "$_pc_repo" rev-parse HEAD)" >/dev/null 2>&1 || _rc=$?
+assert_eq "$_rc" "1" "T4b: <!-- a --><!-- b --> 형태의 새 줄은 차단"
+
+# 복원 — 이후 블록(archive.sh 검사 배선 등)이 정상 CURRENT_TASK.md 를 전제하므로 되돌린다.
+(
+  cd "$_pc_repo"
+  emit_current_task_baseline > CURRENT_TASK.md
+  git add -A && git commit -q -m "T4 이후 정상 CURRENT_TASK.md 로 복구"
+) >/dev/null 2>&1
+_rc=0; archive_publish_content_check "$_pc_repo" "$_pc_base" "$(git -C "$_pc_repo" rev-parse HEAD)" >/dev/null 2>&1 || _rc=$?
+assert_eq "$_rc" "0" "T4 이후 복원 직후에는 통과"
+
 echo "== archive.sh 검사 배선·순서 불변식 =="
 _arch="$SCRIPT_DIR/archive.sh"
 _ln() { grep -n "$1" "$_arch" 2>/dev/null | head -1 | cut -d: -f1; }
@@ -1028,6 +1135,34 @@ _fix1_out="$( cd "$FIX1" && project_root="$FIX1" bash "$SCRIPT_DIR/promote.sh" -
 assert_eq "$(read_fix_source_fr "$FIX1" fix-infer)" "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" "promote: REQUEST 백틱 path 추론 기록"
 assert_eq "$(printf '%s' "$_fix1_out" | grep -c '다음 기동에 사용할 모델')" "1" "promote: 새 기동 시 모델 표시 줄이 정확히 한 번 나온다"
 
+# T5(단일 FR) — Status·Source FR 안내 주석 및 Source FR 후행 빈 줄이 promote 가 생성한
+# 실제 CURRENT_TASK.md 에 보존되는지 순서까지 확인한다(mirror-comments-lost-in-promote-baseline).
+_assert_status_comment_block() { # <file> <desc>
+  if awk '
+    BEGIN{state=0}
+    /^## Status$/{state=1; next}
+    state==1 && /^<!-- 허용 상태값 8종은 \.claude\/rules\/rd-workflow\/task-tracking\.md 참조\. 변경은 rd task set-status 경유 -->$/{state=2; next}
+    state==1 {next}
+    state==2 && /^$/{state=3; next}
+    state==3 && /^## Request$/{found=1}
+    END{exit(found?0:1)}
+  ' "$1"; then PASS=$((PASS+1)); echo "  PASS: $2"; else FAIL=$((FAIL+1)); echo "  FAIL: $2" >&2; fi
+}
+_assert_source_fr_comment_block() { # <file> <desc>
+  if awk '
+    BEGIN{state=0}
+    /^## Source FR$/{state=1; next}
+    state==1 && /^<!-- 권위는 rd-workflow-workspace\/\.lifecycle\/task-state\. 변경은 rd task set-source-fr 경유 -->$/{state=2; next}
+    state==1 {next}
+    state==2 && /^<!-- 복수\(묶은 작업\)이면 미러 쓰기가 자동으로 한 줄에 1건씩 나열합니다 — 여기 직접 목록을 적지 않습니다 -->$/{state=3; next}
+    state==3 && /^$/{state=4; next}
+    state==4 && /^## Spec$/{found=1}
+    END{exit(found?0:1)}
+  ' "$1"; then PASS=$((PASS+1)); echo "  PASS: $2"; else FAIL=$((FAIL+1)); echo "  FAIL: $2" >&2; fi
+}
+_assert_status_comment_block "$FIX1/CURRENT_TASK.md" "T5(단일): promote 생성 CURRENT_TASK.md 의 Status 안내 주석 + 후행 빈 줄 순서 보존"
+_assert_source_fr_comment_block "$FIX1/CURRENT_TASK.md" "T5(단일): promote 생성 CURRENT_TASK.md 의 Source FR 안내 주석 2줄 + 후행 빈 줄 순서 보존"
+
 FIX2="$TMPDIR_TEST/fix-none"
 mk_promote_fixture "$FIX2" "-"
 ( cd "$FIX2" && project_root="$FIX2" bash "$SCRIPT_DIR/promote.sh" --short-title fix-none --size small --no-worktree >/dev/null 2>&1 )
@@ -1166,7 +1301,11 @@ assert_eq "$(awk '$0=="## Task"{getline; print; exit}' "$FIX12/CURRENT_TASK.md")
 # 미러 '## Source FR' 섹션 본문(줄 단위 목록)을 읽는다 — 헤더 다음부터 다음 '## ' 헤더
 # 또는 EOF 까지의 비어있지 않은 줄 전부.
 read_fix_mirror_sfr() { # read_fix_mirror_sfr <CURRENT_TASK.md path>
-  awk '$0=="## Source FR"{f=1; next} f && /^## /{exit} f && NF{print}' "$1"
+  # emit_current_task_baseline 이 '## Source FR' 섹션에 안내 주석 2줄을 심은 뒤로는
+  # 그 주석 줄도 이 섹션의 "비어있지 않은 줄"에 포함된다 — 값 목록만 비교하려면
+  # 완결된 단일 주석 줄(<!-- ... -->)을 걸러낸다.
+  awk '$0=="## Source FR"{f=1; next} f && /^## /{exit} f && NF{print}' "$1" \
+    | grep -vE '^<!--.*-->$'
 }
 
 # --- 복수 승격: task-state 직렬화 1줄 · 미러 줄 단위 목록 ---
@@ -1183,6 +1322,8 @@ assert_eq "$(read_fix_source_fr "$FIX13" fix-multi)" \
 assert_eq "$(read_fix_mirror_sfr "$FIX13/CURRENT_TASK.md")" \
   "$(printf '%s\n%s' "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" "rd-workflow-workspace/backlog/items/2026-01-01-second.md")" \
   "promote: 복수 --source-fr → 미러는 줄 단위 목록 (저장 형식 '|' 미노출)"
+_assert_status_comment_block "$FIX13/CURRENT_TASK.md" "T5(복수): promote 생성 CURRENT_TASK.md 의 Status 안내 주석 + 후행 빈 줄 순서 보존"
+_assert_source_fr_comment_block "$FIX13/CURRENT_TASK.md" "T5(복수): promote 생성 CURRENT_TASK.md 의 Source FR 안내 주석 2줄 + 후행 빈 줄 순서 보존 (2건 FR)"
 
 # --- 순서만 다른 rerun → 성공 (거짓 거부 없음) ---
 ( cd "$FIX13" && git checkout -q main 2>/dev/null || true )
@@ -1820,6 +1961,86 @@ mk_session "20260310_000000_final-diff-review" "closed" "$(printf -- '<!-- 규�
 is_review_session_resolved "$RP/20260310_000000_final-diff-review" && rc=0 || rc=1
 assert_eq "$rc" "0" "resolved — 규약 주석 + 마커 (신규 템플릿 형태)"
 
+# (r)~(ae) 종결 경위 산문 허용 (review-closure-parser-and-delegation)
+# 판정 축은 라인의 순서가 아니라 구조다 — 리스트 항목 / 마커에 이어지는 줄 / 독립 문단.
+# 사유는 RD_REVIEW_UNRESOLVED_REASON 으로 전달되며, 구현 전에는 미정의이므로
+# ${VAR-<unset>} 로 읽는다 — 콜론 없는 형태라야 set -u 의 미정의 접근을 막으면서
+# 정의된 빈 문자열(성공 시의 값)은 그대로 보존한다. `:-` 를 쓰면 성공 케이스가
+# <unset> 으로 바뀌어 올바른 구현에서도 실패한다.
+oi_seq=0
+oi_case() { # oi_case <want_rc> <want_reason> <open_issues 본문> <desc> [status]
+  local want_rc="$1" want_reason="$2" body="$3" desc="$4" st="${5:-closed}" d rc
+  oi_seq=$((oi_seq+1))
+  d="$(printf '204101%02d_000000_final-diff-review' "$oi_seq")"
+  mk_session "$d" "$st" "$body" "markertask"
+  is_review_session_resolved "$RP/$d" && rc=0 || rc=1
+  assert_eq "$rc" "$want_rc" "$desc"
+  assert_eq "${RD_REVIEW_UNRESOLVED_REASON-<unset>}" "$want_reason" "$desc — 사유"
+}
+
+# 완화되는 형태 — 이번 변경의 목적. 회귀하면 기능이 없는 것과 같다.
+oi_case 0 "" "$(printf -- '- 없음\n\n리뷰어 턴이 없습니다. 어댑터 장애로 사용자가\n대체 인정해 종결했습니다.')" \
+  "resolved — 마커 + 빈 줄 + 경위 문단"
+oi_case 0 "" "$(printf -- '- 없음\n\n사용자 대체 인정으로 종결했습니다.')" \
+  "resolved — awaiting-user + 경위 문단" "awaiting-user"
+
+# 마커와 이의가 공존하면 순서를 가리지 않고 미종결이다.
+oi_case 1 "open-issues-unresolved:- [ ] 잔여 한계 3건 미반영" \
+  "$(printf -- '- 없음\n- [ ] 잔여 한계 3건 미반영')" "unresolved — 마커 다음 체크박스 이의"
+oi_case 1 "open-issues-unresolved:- [ ] 잔여 한계 3건 미반영" \
+  "$(printf -- '- [ ] 잔여 한계 3건 미반영\n- 없음')" "unresolved — 체크박스 이의 다음 마커"
+
+# 리스트 표기 다섯 가지를 각각 확인한다. **빈 줄 뒤에** 두는 것이 핵심이다 —
+# 마커 바로 다음 줄에 두면 리스트 인식이 깨져도 '마커에 이어지는 줄' 로 거부되어
+# 표기 누락 회귀가 가려진다 (spec/plan review 턴 002 R3).
+oi_case 1 "open-issues-unresolved:1) Linux 검증 실패 미해결" \
+  "$(printf -- '- 없음\n\n1) Linux 검증 실패 미해결')" "unresolved — 빈 줄 뒤 '1)' 이의"
+oi_case 1 "open-issues-unresolved:2. 잔여 이의 있음" \
+  "$(printf -- '- 없음\n\n2. 잔여 이의 있음')" "unresolved — 빈 줄 뒤 '2.' 이의"
+oi_case 1 "open-issues-unresolved:* 잔여 이의 있음" \
+  "$(printf -- '- 없음\n\n* 잔여 이의 있음')" "unresolved — 빈 줄 뒤 '*' 이의"
+oi_case 1 "open-issues-unresolved:+ 잔여 이의 있음" \
+  "$(printf -- '- 없음\n\n+ 잔여 이의 있음')" "unresolved — 빈 줄 뒤 '+' 이의"
+
+# 마커에 이어지는 줄 — 들여쓰기 유무 둘 다.
+oi_case 1 "open-issues-marker-continued:  단, Linux 검증 실패는 미해결입니다" \
+  "$(printf -- '- 없음\n  단, Linux 검증 실패는 미해결입니다')" "unresolved — 마커에 이어지는 줄 (들여쓰기)"
+oi_case 1 "open-issues-marker-continued:단, Linux 검증 실패는 미해결입니다" \
+  "$(printf -- '- 없음\n단, Linux 검증 실패는 미해결입니다')" "unresolved — 마커에 이어지는 줄 (들여쓰기 없음)"
+
+# 마커 앞 산문 — 빈 줄 유무 둘 다.
+oi_case 1 "open-issues-prose-before-marker:Linux 검증 실패는 아직 미해결입니다." \
+  "$(printf -- 'Linux 검증 실패는 아직 미해결입니다.\n- 없음')" "unresolved — 마커 앞 산문 (빈 줄 없음)"
+oi_case 1 "open-issues-prose-before-marker:Linux 검증 실패는 아직 미해결입니다." \
+  "$(printf -- 'Linux 검증 실패는 아직 미해결입니다.\n\n- 없음')" "unresolved — 마커 앞 산문 (빈 줄 있음)"
+
+# 마커 문법을 넓히지 않았음을 고정한다 — 셋 다 현행에서도 미종결이다.
+oi_case 1 "open-issues-prose-before-marker:-없음" "-없음" \
+  "unresolved — 기호 뒤 공백 없는 마커 (현행 유지)"
+oi_case 1 "open-issues-unresolved:- 없음。" "- 없음。" \
+  "unresolved — 전각 마침표 마커 (현행 유지)"
+
+# (af) 판정 프로그램 부재 → 미종결(1) + parser-missing 사유.
+# 「미해결 이슈가 있음」과 구별해야 한다 — 이 파일을 빠뜨린 fixture 에서 판정이 조용히
+# 미종결로 떨어지면, 「미종결이면 통과」인 archive gate 가 검사 없이 지나간다.
+PM_DIR="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패" >&2; exit 1; }
+mkdir -p "$PM_DIR/hooks" "$PM_DIR/sess"
+cp "$REPO_ROOT/rd-workflow/scripts/hooks/_guard_common.sh" "$PM_DIR/hooks/"
+cp "$REPO_ROOT/rd-workflow/scripts/_state_common.sh" "$PM_DIR/"
+printf '## Status\nclosed\n' > "$PM_DIR/sess/SESSION.md"
+printf '## Open Issues\n- 없음\n' > "$PM_DIR/sess/CHECKPOINT.md"
+PM_OUT="$(
+  project_root="$PM_DIR" bash -c '
+    source "$1/hooks/_guard_common.sh"
+    is_review_session_resolved "$1/sess" && echo "rc=0" || echo "rc=1 reason=$RD_REVIEW_UNRESOLVED_REASON"
+  ' _ "$PM_DIR" 2>/dev/null
+)"
+case "$PM_OUT" in
+  "rc=1 reason=parser-missing:"*) assert_eq "ok" "ok" "parser-missing — awk 부재는 미해결과 구별된다" ;;
+  *) assert_eq "$PM_OUT" "rc=1 reason=parser-missing:<경로>" "parser-missing — awk 부재는 미해결과 구별된다" ;;
+esac
+rm -r "$PM_DIR"
+
 # fr 세션 부재 시 빈 값 (다른 fr만 존재)
 printf '# Current Task\n\n## Short Title\nlonelytask\n' > "$GUARD_ROOT/CURRENT_TASK.md"
 # v2 2b: task-state도 함께 업데이트 (get_current_short_title이 task-state에서 읽음)
@@ -2059,6 +2280,9 @@ AG_REPO="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 
 [[ -n "$AG_REPO" && -d "$AG_REPO" ]] || { echo "test_lifecycle.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$AG_REPO/rd-workflow/scripts/hooks" "$AG_REPO/rd-workflow/scripts" "$AG_REPO/rd-workflow-workspace/handoffs/review_pipeline" "$AG_REPO/rd-workflow-workspace/backlog/items"
 cp "$REPO_ROOT/rd-workflow/scripts/hooks/_guard_common.sh" "$AG_REPO/rd-workflow/scripts/hooks/"
+# 판정 규칙이 담긴 awk 도 함께 복사한다. 누락하면 fixture 안의 판정이 항상 실패해
+# 종결 세션을 전제로 한 케이스가 게이트에 도달하지 못한 채 통과한다.
+cp "$REPO_ROOT/rd-workflow/scripts/hooks/_open_issues.awk" "$AG_REPO/rd-workflow/scripts/hooks/"
 cp "$REPO_ROOT/rd-workflow/scripts/hooks/pre_commit_archive_gate.sh" "$AG_REPO/rd-workflow/scripts/hooks/"
 # _guard_common.sh가 상위 디렉토리의 _state_common.sh를 source하므로 함께 복사 (v2 2b)
 cp "$REPO_ROOT/rd-workflow/scripts/_state_common.sh" "$AG_REPO/rd-workflow/scripts/"

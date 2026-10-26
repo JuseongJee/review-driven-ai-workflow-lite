@@ -213,6 +213,7 @@ case "$review_kind" in
     session_slug="$(derive_task_slug "$plan_path")-spec-plan-review"
     review_target="${spec_path}
 ${plan_path}"
+    # 변이 명세는 spec_review.md 의 FULL_ONLY 구획과 짝을 맞춥니다 (lite 는 plan 지점 미적용 — docs/guides/mutation-check.md).
     review_goal="\`rd-workflow/docs/prompts/review/spec_review.md\` 기준으로 과도한 설계, 빠진 엣지 케이스, 더 단순한 대안, 테스트 전략 누락, 플랫폼 리스크를 점검"
     ;;
   diff|diff-review|final-diff)
@@ -371,7 +372,7 @@ ${plan_path}"
     review_type="diff-review"
     session_slug="final-diff-review"
     review_target="${diff_target}"
-    review_goal="\`rd-workflow/docs/prompts/review/diff_review.md\` 기준으로 논리 버그, 회귀 위험, 성능 문제, 보안 문제, 유지보수성 저하, 불필요한 복잡성을 점검"
+    review_goal="\`rd-workflow/docs/prompts/review/diff_review.md\` 기준으로 논리 버그, 회귀 위험, 성능 문제, 보안 문제, 유지보수성 저하, 불필요한 복잡성, 변이 증거를 점검"
     ;;
   *)
     echo "알 수 없는 review-kind: ${review_kind}" >&2

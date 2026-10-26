@@ -21,11 +21,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 차단 가드의 테스트는 **실제 hook** 을 부르고 hook 은 자기 위치에서 project_root 를 도출하므로,
 # 그냥 두면 검증이 저장소의 차단 감사 로그에 쓴다 (실측: hooks 한 번에 28줄). 그러면 로그가
 # 테스트 잡음으로 채워져 「이 가드가 무엇을 막았나」를 볼 수 없다. 실행 동안 임시 경로로 돌린다.
+# 자신이 만든 임시 파일만 종료 때 지웁니다 — 호출자가 넘긴 값과 /dev/null 폴백은 지우지 않습니다.
+_SELFTEST_OWN_GBL=""
 if [ -z "${RD_GUARD_BLOCK_LOG:-}" ]; then
   RD_GUARD_BLOCK_LOG="$(mktemp -t rd-guard-block-log.XXXXXX 2>/dev/null)" \
+    && _SELFTEST_OWN_GBL=1 \
     || RD_GUARD_BLOCK_LOG="/dev/null"
   export RD_GUARD_BLOCK_LOG
 fi
+trap '[[ "${_SELFTEST_OWN_GBL:-}" == 1 ]] && rm -f "$RD_GUARD_BLOCK_LOG"' EXIT
 SELFTEST_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 SELFTEST_GROUPS_ALL="hooks review lifecycle skills build"
@@ -57,18 +61,21 @@ GROUP_EXCLUDED=()
 # 사용법: run_step <그룹> <consumer|dev-only> "<설명>" <명령...>
 #
 # 그룹은 사람이 실행 범위를 고르는 단위다 (hooks review lifecycle skills build).
+# 예약 그룹 `always` 는 어느 그룹을 골라도 도는 스텝이다 (mktemp 가드 대조 — 2026-10-22
+# selftest-false-fail-cleanup: 테스트 파일을 고친 작업이 자기 그룹만 돌려 자기가 넣은
+# 위반을 못 보던 재발 경로를 막는다).
 # 청중은 필수 인자다. 기본값을 두지 않는 이유 — `consumer` 기본값은 현상 유지라
 # 다음에 추가되는 정본 위생 검사가 또 소비처의 아카이브를 막고, `dev-only` 기본값은 새
 # 검사가 조용히 소비처 검증에서 빠진다. 필수 인자는 두 실패를 동시에 피한다.
 run_step() {
   local group="${1-}" audience="${2-}" desc
-  case " ${SELFTEST_GROUPS_ALL} " in
+  case " ${SELFTEST_GROUPS_ALL} always " in
     *" ${group} "*) shift ;;
     *)
       STEP_INDEX=$((STEP_INDEX + 1))
       echo ""
       echo "== 스텝 ${STEP_INDEX}: 그룹 선언 오류 =="
-      echo "  -> FAIL: 그룹이 없거나 허용값이 아닙니다: '${group}' (${SELFTEST_GROUPS_ALL} 중 하나여야 합니다)" >&2
+      echo "  -> FAIL: 그룹이 없거나 허용값이 아닙니다: '${group}' (${SELFTEST_GROUPS_ALL} always 중 하나여야 합니다)" >&2
       FAIL=1
       return 0
       ;;
@@ -94,7 +101,9 @@ run_step() {
     return 0
   fi
   # 그룹 필터 — 지정된 그룹이 있으면 그 밖의 스텝은 건너뛰고 기록한다.
-  if [[ -n "$SELFTEST_GROUPS" ]]; then
+  # `always` 는 예약 그룹이다 — 사용자 인자로 받지 않고(인자 파서에 없음), 어느 그룹을 골라도
+  # 통과한다. 청중 필터는 위에서 이미 적용했으므로 `consumer` 모드의 dev-only 는 그대로 빠진다.
+  if [[ -n "$SELFTEST_GROUPS" && "$group" != always ]]; then
     case " ${SELFTEST_GROUPS} " in
       *" ${group} "*) ;;
       *) GROUP_EXCLUDED+=("${STEP_INDEX}. [${group}] ${desc}"); return 0 ;;
@@ -146,59 +155,21 @@ syntax_check() {
 }
 
 SCAN_AWK="${SCRIPT_DIR}/_mktemp_scan.awk"
-# 2026-09-10 task-guard-source-fr-contract: guard·reset·fr-done·미러 회귀 픽스처가
-# 임시 트리를 9개 더 만듭니다 (120 → 129, final diff review F1~F6 회귀 픽스처 3개 포함).
-# 위반은 0 이고 증가분은 전부 테스트 픽스처입니다.
-# 2026-09-15 submodule-overlay-install-structure: overlay_branch_sync 3종 스크립트
-# 폐기로 test_overlay_branch_sync.sh 의 mktemp 지점 2개가 함께 사라졌습니다 (129 → 127).
-# 2026-09-16 worktree-parallel-agent-launch: worktree 병렬 착수 스위트가 임시 저장소를
-# 더 만듭니다 (127 → 134). 증가분은 신규 스위트 4종(test_tasks_index·test_session_launch·
-# test_tasks_list·test_archive_worktree)과 test_lifecycle.sh 의 추가 시나리오이고,
-# promote.sh 는 재설계로 1 줄었습니다. 위반은 0 입니다.
-# 2026-09-16 final diff review 턴 004: 색인 격리 회귀(test_tasks_index.sh 의 `OTHER`)를
-# 추가해 배포 트리의 mktemp -d 지점이 1개 늘었습니다 (134 → 135). 위반은 0 입니다.
-# 2026-09-18 mktemp-guard-and-build-verify-leak: test_session_launch.sh:168-169의 mktemp 가드
-# 관용구를 파일 내 다른 템플릿에 맞춰 정합했습니다. 이 수정 자체는 배포 트리의 mktemp -d
-# site 수를 바꾸지 않습니다(스캐너는 대입 줄만 세고 검증 줄은 세지 않음). 옛 상수 135는
-# 이 작업 이전부터 이미 stale했고, 정본 전체 실측은 137이었습니다(spec/plan review turn 002).
-# 그 +2는 바로 이 test_session_launch.sh:168-169의 두 mktemp -d 줄로, FR
-# session-handoff-contract-and-model이 추가한 뒤 135에 반영되지 않아 stale-but-correct
-# 상태로 137까지 넘어와 있었습니다. 이번 작업은 그 실측치로 상수를 맞추고 기존 위반
-# 2건을 0으로 해소했습니다.
-MKTEMP_SCAN_EXPECT_SHELL=137
-# 2026-09-14 publish-clone-failure-init-fallback: scripts/test_publish_remote_state.sh
-# 신설로 개발 트리의 mktemp -d 지점이 1개 늘었습니다 (49 → 50). 위반은 0 이고
-# 증가분은 테스트 픽스처입니다.
-# 2026-09-18 mktemp-guard-and-build-verify-leak: scripts/test_build_template.sh 의
-# 회귀 케이스 6d(`fx=`/`VERIFY_TMPDIR=`) 신설로 2개 늘었습니다 (50 → 52). 위반은
-# 0 이고 증가분은 테스트 픽스처입니다.
-# 2026-09-18 mktemp-guard-and-build-verify-leak(final review 수정, 최종): case 6d
-# 의 TMPDIR 오버라이드가 vacuous(BSD mktemp -d 는 템플릿 없는 호출에서 TMPDIR 을
-# 무시함)했던 근본 원인은 build_template.sh cmd_verify 자신의 mktemp -d 호출에
-# 템플릿이 없었던 것입니다. cmd_verify 를
-# `mktemp -d "${TMPDIR:-/tmp}/build_template.verify.XXXXXX"` 로 바꿔(bash 가
-# TMPDIR 을 템플릿 문자열에 직접 전개) BSD/GNU 무관하게 TMPDIR 오버라이드가 항상
-# 먹히게 했고, case 6d 는 다시 TMPDIR 격리 방식(`fx=`/`verify_tmpdir=`, 가드
-# 사이트 2개)으로 돌아왔습니다 — 시스템 공유 임시 디렉터리를 스캔하지 않아
-# 소유권 오판 위험도 없습니다. 50 → 52.
-MKTEMP_SCAN_EXPECT_DEV_SHELL=52
+# 2026-10-22 selftest-false-fail-cleanup: 배포 셸·파일·개발 셸·개발 파일 스텝의 「기대 후보 수」
+# 상수(MKTEMP_SCAN_EXPECT_SHELL/DEV_SHELL/FILE/DEV_FILE)와 그 갱신 이력을 걷어냈습니다.
+# 상수는 사람이 손으로 갱신해야 해서, 테스트 파일에 가드 사이트를 하나 더하는 정상 변경도
+# build 그룹을 FAIL 시켰고, 갱신을 놓친 채 작업이 이어지면 숫자가 조용히 어긋나 새 위반이
+# 들어와도 원래 빨간불과 구분되지 않았습니다. 지금은 「후보 0 이면 FAIL」(검사가 비어 있음)과
+# 「스캔한 파일 수 = 독립 열거한 *.sh 수」(파일군 대조)만 봅니다. 후보 수는 계약이 아닙니다.
+# snippet 은 고정 문서 2개의 구조 단언이라 사이트 수가 곧 계약이므로 정확 일치를 유지합니다.
 MKTEMP_SCAN_EXPECT_SNIPPET=2
-# spec §3.5 예측은 47(baseline 42 + archive.sh:196 1→4줄 +3 + test_integration.sh:314·359
-# 각 1→2줄 +2)이었지만 실측은 48입니다. 어긋난 쪽은 spec 의 baseline 42 입니다 —
-# 그 수동 집계가 defect_reports.sh:80(`_tmp_beside`)의 bare 호출 `mktemp "${dir}/..."`
-# (반환값을 함수 stdout 으로 흘리는 형태)을 빠뜨렸습니다. baseline 트리(de050196)를 실제로
-# 스캔하면 43 이고, 43 + 5 = 48 로 산식이 정확히 맞습니다(위반은 baseline 19 → 현재 0).
-# 위와 같은 픽스처 증가분 5 (48 → 53).
-# 2026-09-16 worktree-parallel-agent-launch: session_launch.sh 가 herdr 응답을 받는
-# 임시 파일 5개를 쓰고 test_integration.sh 가 1개 늘었습니다 (53 → 60). 위반은 0 입니다 —
-# 네 지점 모두 mktemp 실패를 함수의 상태 계약(failed / unknown) 안에서 끝냅니다.
-MKTEMP_SCAN_EXPECT_FILE=60
-MKTEMP_SCAN_EXPECT_DEV_FILE=1
 
 # `set -u` 하에서 참조가 중단되지 않도록 파일 스코프에서 먼저 정의합니다.
 _SCAN_SITES=""
 _SCAN_VIOLATIONS=""
 _SCAN_DETAIL=""
+# 파일군 대조 기대값. 호출부가 `_mktemp_scan_run` 직전에 세웁니다(빈 값 = 대조 안 함).
+_SCAN_FILES_EXPECTED=""
 
 # 표식 한 줄. 성공·실패·skip 모든 경로에서 반환 직전에 호출합니다.
 # $1=step $2=result $3=reason $4=files $5=sites $6=violations $7=ex_files $8=ex_sites
@@ -239,7 +210,29 @@ _mktemp_scan_raw() {
   return 0
 }
 
-# 공통 판정. $1=step $2=mode(dir|file) $3=기대 후보 수 $4=ex_files $5=ex_sites, 나머지는 검사할 파일들.
+# 스캔 루트 아래 `*.sh` 파일 수를 stdout 에 냅니다. rc≠0 = 열거 실패.
+# 스텝의 `find` 와 **별도 호출**이어야 합니다 — 스텝 쪽 열거나 걸러내기에 제외 규칙이 생겨도
+# 이 기준이 같이 바뀌지 않아야 `coverage-mismatch` 로 잡힙니다.
+_mktemp_scan_expected_files() {
+  local raw
+  raw="$(find "$1" -type f -name '*.sh')" || return 1
+  printf '%s\n' "$raw" | awk 'NF { c++ } END { print c + 0 }'
+}
+
+# 위반 보고 때 허용 형태를 안내합니다. 안내는 위반을 본 그 자리에 있어야 읽힙니다.
+# 문구 줄에 `mktemp -d` 가 들어 있어 스캐너가 후보로 세지 않도록 literal 마커를 답니다.
+_mktemp_scan_guide() {
+  if [[ "$1" == "file" ]]; then
+    printf '%s\n' "  허용 형태: 같은 줄 또는 다음 줄에 '|| <핸들러>' / 템플릿으로 표현할 수 없으면 줄 끝에 '# mktemp-scan: custom-handler'" >&2
+  else
+    printf '%s\n' '  허용 형태: ① x="$(mktemp -d)" || { …; exit N; }  (또는 return [N], N=1~255)' >&2   # mktemp-scan: literal
+    printf '%s\n' '            ② 2줄 템플릿 (_mktemp_scan.awk 머리 주석)' >&2
+    printf '%s\n' "            ③ 템플릿으로 표현할 수 없으면 줄 끝에 '# mktemp-scan: custom-handler'" >&2
+  fi
+}
+
+# 공통 판정. $1=step $2=mode(dir|file) $3=기대 후보 수(숫자 = 정확 일치, `nonzero` = 0 만 아니면 통과)
+# $4=ex_files $5=ex_sites, 나머지는 검사할 파일들.
 _mktemp_scan_run() {
   local step="$1" mode="$2" expect="$3" exf="$4" exs="$5"; shift 5
   local nfiles=$#
@@ -249,15 +242,26 @@ _mktemp_scan_run() {
     return 1
   fi
 
-  # reason 우선순위: scanner-error > missing-dir > missing-file > template-violation > count-mismatch
-  # (앞의 셋은 호출부가 먼저 처리합니다)
+  # reason 우선순위: scanner-error > coverage-mismatch > template-violation > empty-scope > count-mismatch(snippet 전용)
+  # (missing-dir·missing-file 은 호출부가 먼저 처리합니다)
+  if [[ -n "$_SCAN_FILES_EXPECTED" && "$nfiles" != "$_SCAN_FILES_EXPECTED" ]]; then
+    printf '  검사 파일 수 %s / 열거 %s — 제외 규칙이 생겼으면 의도인지 확인하십시오\n' "$nfiles" "$_SCAN_FILES_EXPECTED" >&2
+    _mktemp_scan_marker "$step" fail coverage-mismatch "$nfiles" "$_SCAN_SITES" "$_SCAN_VIOLATIONS" "$exf" "$exs"
+    return 1
+  fi
   if [[ "$_SCAN_VIOLATIONS" -gt 0 ]]; then
     [[ -n "$_SCAN_DETAIL" ]] && printf '%s\n' "$_SCAN_DETAIL" >&2
-    printf '  기대 후보 수 %s / 실제 %s\n' "$expect" "$_SCAN_SITES" >&2
+    _mktemp_scan_guide "$mode"
     _mktemp_scan_marker "$step" fail template-violation "$nfiles" "$_SCAN_SITES" "$_SCAN_VIOLATIONS" "$exf" "$exs"
     return 1
   fi
-  if [[ "$_SCAN_SITES" != "$expect" ]]; then
+  if [[ "$expect" == "nonzero" ]]; then
+    if [[ "$_SCAN_SITES" -eq 0 ]]; then
+      echo "  검사 대상 후보가 0 입니다 — 열거 경로를 확인하십시오" >&2
+      _mktemp_scan_marker "$step" fail empty-scope "$nfiles" "$_SCAN_SITES" "$_SCAN_VIOLATIONS" "$exf" "$exs"
+      return 1
+    fi
+  elif [[ "$_SCAN_SITES" != "$expect" ]]; then
     printf '  기대 후보 수 %s / 실제 %s — 의도적 변경이면 기대값을 갱신하십시오\n' "$expect" "$_SCAN_SITES" >&2
     _mktemp_scan_marker "$step" fail count-mismatch "$nfiles" "$_SCAN_SITES" "$_SCAN_VIOLATIONS" "$exf" "$exs"
     return 1
@@ -298,7 +302,12 @@ mktemp_guard_scan_shell() {
     keep+=("$f")
   done <<< "$raw"
 
-  _mktemp_scan_run shell dir "$MKTEMP_SCAN_EXPECT_SHELL" "$exf" "$exs" "${keep[@]}"
+  _SCAN_FILES_EXPECTED="$(_mktemp_scan_expected_files "${SCRIPT_DIR}")" || {
+    _mktemp_scan_marker shell fail scanner-error 0 0 0 0 0
+    echo "  파일군 기준 열거 실패 (find rc≠0)" >&2
+    return 1
+  }
+  _mktemp_scan_run shell dir nonzero "$exf" "$exs" "${keep[@]}"
 }
 
 # 스텝 — 개발 트리 저장소 루트의 `scripts/`. 배포 스캐너(`shell`)는 `${SCRIPT_DIR}` 하위만
@@ -333,7 +342,12 @@ mktemp_guard_scan_dev_shell() {
     keep+=("$f")
   done <<< "$raw"
 
-  _mktemp_scan_run dev-shell dir "$MKTEMP_SCAN_EXPECT_DEV_SHELL" 0 0 "${keep[@]}"
+  _SCAN_FILES_EXPECTED="$(_mktemp_scan_expected_files "$dir")" || {
+    _mktemp_scan_marker dev-shell fail scanner-error 0 0 0 0 0
+    echo "  파일군 기준 열거 실패 (find rc≠0)" >&2
+    return 1
+  }
+  _mktemp_scan_run dev-shell dir nonzero 0 0 "${keep[@]}"
 }
 
 # 스텝 — 파일 `mktemp` 약한 검사(배포 셸). 디렉터리 모드(`shell`)와 같은 범위를 보되
@@ -361,7 +375,12 @@ mktemp_guard_scan_file() {
     keep+=("$f")
   done <<< "$raw"
 
-  _mktemp_scan_run file file "$MKTEMP_SCAN_EXPECT_FILE" "$exf" "$exs" "${keep[@]}"
+  _SCAN_FILES_EXPECTED="$(_mktemp_scan_expected_files "${SCRIPT_DIR}")" || {
+    _mktemp_scan_marker file fail scanner-error 0 0 0 0 0
+    echo "  파일군 기준 열거 실패 (find rc≠0)" >&2
+    return 1
+  }
+  _mktemp_scan_run file file nonzero "$exf" "$exs" "${keep[@]}"
 }
 
 # 스텝 — 파일 `mktemp` 약한 검사(개발 트리). 배포 스캐너(`file`)는 `${SCRIPT_DIR}` 하위만
@@ -393,7 +412,12 @@ mktemp_guard_scan_dev_file() {
     keep+=("$f")
   done <<< "$raw"
 
-  _mktemp_scan_run dev-file file "$MKTEMP_SCAN_EXPECT_DEV_FILE" 0 0 "${keep[@]}"
+  _SCAN_FILES_EXPECTED="$(_mktemp_scan_expected_files "$dir")" || {
+    _mktemp_scan_marker dev-file fail scanner-error 0 0 0 0 0
+    echo "  파일군 기준 열거 실패 (find rc≠0)" >&2
+    return 1
+  }
+  _mktemp_scan_run dev-file file nonzero 0 0 "${keep[@]}"
 }
 
 # snippet 공통 — 부재 파일이 있어도 존재하는 파일은 실제로 스캔합니다.
@@ -430,6 +454,7 @@ _mktemp_scan_snippet() {
     printf '  없는 파일: %s\n' "${absent[*]}" >&2
     return 1
   fi
+  _SCAN_FILES_EXPECTED=""
   _mktemp_scan_run "$step" dir "$MKTEMP_SCAN_EXPECT_SNIPPET" 0 0 "${present[@]}"
 }
 
@@ -446,13 +471,10 @@ mktemp_guard_scan_canon_snippet() {
   _mktemp_scan_snippet canon-snippet "${root}/_ROOT_FILES/rd-workflow/claude_skills/tpl" fail
 }
 
-# 스캐너 판정 표본 — SUMMARY 계약 + 블록별 대조 + reason 우선순위.
-#
-# `_mktemp_scan_run` 에 넘기는 step 이름 `sample-priority` 는 REQUEST 의 세 step 값 밖이지만,
-# 그 표식은 명령 치환 안에 캡처되어 외부 스텝 표식으로 노출되지 않습니다 (Turn 004 확인).
+# 스캐너 판정 표본 — SUMMARY 계약 + 블록별 대조.
 mktemp_scan_sample_check() {
   local fx="${SCRIPT_DIR}/fixtures/mktemp_scan_samples.txt" rc=0
-  local exp got noviol both combined
+  local exp got noviol both
   [[ -f "$fx" ]] || { echo "  표본 파일이 없습니다: $fx" >&2; return 1; }
 
   # (a) SUMMARY 계약 + 총계. 단일성·3필드·숫자 검증은 `_mktemp_scan_raw` 가 단일 권위로
@@ -464,8 +486,8 @@ mktemp_scan_sample_check() {
   if [[ "$(awk -f "$SCAN_AWK" "$fx" | tail -1 | cut -f1)" != "SUMMARY" ]]; then
     echo "  SUMMARY 가 마지막 줄이 아닙니다" >&2; rc=1
   fi
-  if [[ "$_SCAN_SITES" != "12" || "$_SCAN_VIOLATIONS" != "11" ]]; then
-    echo "  표본 총계 불일치 — 기대 sites=12 violations=11, 실제 sites=${_SCAN_SITES} violations=${_SCAN_VIOLATIONS}" >&2
+  if [[ "$_SCAN_SITES" != "21" || "$_SCAN_VIOLATIONS" != "15" ]]; then
+    echo "  표본 총계 불일치 — 기대 sites=21 violations=15, 실제 sites=${_SCAN_SITES} violations=${_SCAN_VIOLATIONS}" >&2
     rc=1
   fi
 
@@ -493,28 +515,8 @@ mktemp_scan_sample_check() {
     rc=1
   fi
 
-  # (d) reason 우선순위 — 일부러 틀린 기대 건수를 주면 count-mismatch 가 아니라
-  #     template-violation 이 나와야 하고 두 상세가 모두 나와야 합니다.
-  #     stdout·stderr 를 **변수 하나로 결합 캡처**합니다 — 고정 /tmp 파일을 쓰지 않아
-  #     동시 실행 덮어쓰기·symlink truncate 위험이 없고, 새 mktemp 후보도 늘지 않습니다
-  #     (Turn 004 Finding 5-B).
-  combined="$(_mktemp_scan_run sample-priority dir 999 0 0 "$fx" 2>&1)"
-  case "$combined" in
-    *"reason=template-violation"*) ;;
-    *) echo "  우선순위 확인 실패 — 기대 reason=template-violation" >&2
-       printf '%s\n' "$combined" >&2; rc=1 ;;
-  esac
-  case "$combined" in
-    *"위반 "*) ;;
-    *) echo "  위반 상세가 출력되지 않았습니다" >&2; rc=1 ;;
-  esac
-  case "$combined" in
-    *"기대 후보 수 999"*) ;;
-    *) echo "  기대·실제 건수가 출력되지 않았습니다" >&2; rc=1 ;;
-  esac
-
   # ── 파일 모드(mode=file) 표본 — 디렉터리 모드와 같은 구조를 별도 표본 파일로 확인합니다.
-  # 기존 표본(`mktemp_scan_samples.txt`)의 총계 12/11 과 섞지 않습니다 — 그 계약은
+  # 기존 표본(`mktemp_scan_samples.txt`)의 디렉터리 모드 총계와 섞지 않습니다 — 그 계약은
   # 디렉터리 모드 전용이라 파일 모드 후보를 더하면 깨집니다.
   local ffx="${SCRIPT_DIR}/fixtures/mktemp_scan_file_samples.txt"
   local fexp fgot
@@ -548,30 +550,43 @@ mktemp_scan_sample_check() {
   return $rc
 }
 
-# is_nonblocking_status의 비차단 집합과 CLAUDE.md 허용 상태값 동기화 검증.
-# 루트 CLAUDE.md에 '대기 중'과 '완료'가 모두 존재해야 함.
-# _ROOT_FILES/CLAUDE.md는 존재하면 함께 확인, 없으면 skip.
+# task-tracking.md 의 허용 상태값 목록 줄(`Status 허용값` 으로 시작)을 출력한다. 없으면 빈 출력.
+# 상태값 대조는 이 줄 안의 백틱 값으로만 한다 — 파일 전체를 찾으면 설명 문단의 언급만으로 통과한다.
+_status_list_line() { # <task-tracking.md>
+  grep -m1 '^Status 허용값' "$1"
+}
+
+# is_nonblocking_status의 비차단 집합과 task-tracking.md 허용 상태값 동기화 검증.
+# 루트 .claude/rules/rd-workflow/task-tracking.md에 '대기 중'과 '완료'가 모두 존재해야 함.
+# _ROOT_FILES/.claude/rules/rd-workflow/task-tracking.md는 존재하면 함께 확인, 없으면 skip.
 nonblocking_status_drift_check() {
   local rc=0
   local root_dir
   root_dir="$(_hook_repo_root)"
 
-  # 루트 CLAUDE.md 는 필수, _ROOT_FILES 정본은 설치본에 없는 것이 정상이라 선택이다.
-  # 둘 다 선택으로 두면 루트 CLAUDE.md 가 통째로 사라져도 0건 검사로 통과한다.
-  local targets=() root_cm="${root_dir}/CLAUDE.md"
+  # 루트 task-tracking.md 는 필수, _ROOT_FILES 정본은 설치본에 없는 것이 정상이라 선택이다.
+  # 둘 다 선택으로 두면 루트 task-tracking.md 가 통째로 사라져도 0건 검사로 통과한다.
+  local targets=() root_cm="${root_dir}/.claude/rules/rd-workflow/task-tracking.md"
   [[ -f "$root_cm" ]] || { echo "  $root_cm: 필수 파일 부재" >&2; rc=1; }
   targets+=("$root_cm")
-  [[ -f "${root_dir}/_ROOT_FILES/CLAUDE.md" ]] && targets+=("${root_dir}/_ROOT_FILES/CLAUDE.md")
+  [[ -f "${root_dir}/_ROOT_FILES/.claude/rules/rd-workflow/task-tracking.md" ]] && targets+=("${root_dir}/_ROOT_FILES/.claude/rules/rd-workflow/task-tracking.md")
 
   local cm
   for cm in "${targets[@]}"; do
     [[ -f "$cm" ]] || continue
-    if ! grep -q '대기 중' "$cm"; then
-      echo "  $cm: '대기 중' 미발견 (비차단 집합 drift 의심)" >&2
+    local list_line
+    list_line="$(_status_list_line "$cm")"
+    if [[ -z "$list_line" ]]; then
+      echo "  $cm: 'Status 허용값' 목록 줄 미발견" >&2
+      rc=1
+      continue
+    fi
+    if [[ "$list_line" != *'`대기 중`'* ]]; then
+      echo "  $cm: 허용값 목록에 '대기 중' 미발견 (비차단 집합 drift 의심)" >&2
       rc=1
     fi
-    if ! grep -q '완료' "$cm"; then
-      echo "  $cm: '완료' 미발견 (비차단 집합 drift 의심)" >&2
+    if [[ "$list_line" != *'`완료`'* ]]; then
+      echo "  $cm: 허용값 목록에 '완료' 미발견 (비차단 집합 drift 의심)" >&2
       rc=1
     fi
   done
@@ -581,7 +596,7 @@ nonblocking_status_drift_check() {
 # LC-19 3자 일치 검증:
 #   TASK_CANONICAL_STATUSES (_task_common.sh 배열)
 #   STATE_CANONICAL_STATUSES (_state_common.sh 파이프 문자열)
-#   CLAUDE.md 허용 상태값 목록 (8종 각 항목이 존재해야 함)
+#   task-tracking.md 허용 상태값 목록 줄 (각 항목이 그 줄에 백틱 값으로 존재해야 함)
 canonical_status_triple_drift_check() {
   local rc=0
   local root_dir
@@ -628,21 +643,28 @@ EOF
 $state_statuses
 EOF
 
-  # CLAUDE.md 허용 상태값 목록 확인 (모든 대상 CLAUDE.md에서).
-  # 루트 CLAUDE.md 는 필수, _ROOT_FILES 정본은 설치본에 없는 것이 정상이라 선택이다.
-  # 둘 다 선택으로 두면 루트 CLAUDE.md 가 통째로 사라져도 0건 검사로 통과한다.
-  local targets=() root_cm="${root_dir}/CLAUDE.md"
+  # task-tracking.md 허용 상태값 목록 확인 (모든 대상 task-tracking.md에서).
+  # 루트 task-tracking.md 는 필수, _ROOT_FILES 정본은 설치본에 없는 것이 정상이라 선택이다.
+  # 둘 다 선택으로 두면 루트 task-tracking.md 가 통째로 사라져도 0건 검사로 통과한다.
+  local targets=() root_cm="${root_dir}/.claude/rules/rd-workflow/task-tracking.md"
   [[ -f "$root_cm" ]] || { echo "  $root_cm: 필수 파일 부재" >&2; rc=1; }
   targets+=("$root_cm")
-  [[ -f "${root_dir}/_ROOT_FILES/CLAUDE.md" ]] && targets+=("${root_dir}/_ROOT_FILES/CLAUDE.md")
+  [[ -f "${root_dir}/_ROOT_FILES/.claude/rules/rd-workflow/task-tracking.md" ]] && targets+=("${root_dir}/_ROOT_FILES/.claude/rules/rd-workflow/task-tracking.md")
 
   local cm
   for cm in "${targets[@]}"; do
     [[ -f "$cm" ]] || continue
+    local list_line
+    list_line="$(_status_list_line "$cm")"
+    if [[ -z "$list_line" ]]; then
+      echo "  LC-19 drift: ${cm} 에 'Status 허용값' 목록 줄이 없음" >&2
+      rc=1
+      continue
+    fi
     while IFS= read -r s; do
       [[ -z "$s" ]] && continue
-      if ! grep -qF "$s" "$cm"; then
-        echo "  LC-19 drift: '${s}' 가 ${cm} 에 없음" >&2
+      if [[ "$list_line" != *"\`${s}\`"* ]]; then
+        echo "  LC-19 drift: '${s}' 가 ${cm} 의 허용값 목록에 없음" >&2
         rc=1
       fi
     done <<EOF
@@ -694,6 +716,7 @@ autopilot_headless_entry_check() {
     grep -q 'RD_AUTOPILOT_FR' "$skill"           || { echo "  $skill: RD_AUTOPILOT_FR 미참조" >&2; rc=1; }
     grep -q 'RD_AUTOPILOT_OUTCOME_FILE' "$skill"  || { echo "  $skill: RD_AUTOPILOT_OUTCOME_FILE 미참조" >&2; rc=1; }
     grep -q 'queue-empty' "$skill"                || { echo "  $skill: queue-empty 미참조" >&2; rc=1; }
+    grep -q 'queue-blocked' "$skill"              || { echo "  $skill: queue-blocked 미참조" >&2; rc=1; }
     grep -q 'blocked:' "$skill"                   || { echo "  $skill: blocked:<reason> 미참조" >&2; rc=1; }
     grep -q '결과 대기 규율' "$skill"             || { echo "  $skill: 결과 대기 규율 절 미존재" >&2; rc=1; }
     grep -q 'run_in_background' "$skill"          || { echo "  $skill: run_in_background 금지 규율 미참조" >&2; rc=1; }
@@ -701,6 +724,12 @@ autopilot_headless_entry_check() {
     grep -q '600000' "$skill"                     || { echo "  $skill: timeout 최대치(600000ms) 미참조" >&2; rc=1; }
     grep -q 'WAIT_TIMEOUT' "$skill"                || { echo "  $skill: 어댑터 watchdog(WAIT_TIMEOUT) 중첩 타이머 규율 미참조" >&2; rc=1; }
     grep -q '진행 신호' "$skill"                   || { echo "  $skill: 긴 대기 진행 신호 규율 미참조" >&2; rc=1; }
+    # promote 직후 launch 결과 처리 — 무인 실행은 항상 none 이므로 이 세션이 worktree 로
+    # 이동해 이어가야 한다. 이 지시가 빠지면 기본 브랜치 체크아웃에 구현이 쌓인다
+    # (2026-09-24 batch-headless-promote-session-launch). 사람만 읽는 지시라 런타임
+    # 테스트로는 잡히지 않아 앵커로 고정한다.
+    grep -q '세션 기동 결과' "$skill"              || { echo "  $skill: promote 직후 launch 결과 처리 절 미존재" >&2; rc=1; }
+    grep -q 'resolve-launch' "$skill"              || { echo "  $skill: launch unknown 확정(resolve-launch) 지시 미존재" >&2; rc=1; }
   done
   # batch 국면 2 의 exit 40 복구 경로 — 진행 상태·사용자 안내 보존의 핵심이라 앵커로 고정한다.
   # 배포 사본은 필수, _ROOT_FILES 정본은 설치본에 없는 것이 정상이라 선택이다.
@@ -965,6 +994,18 @@ hook_path_reachability_check() {
     _hook_probe_settings "$settings" "$probe_base" || rc=1
   done < <(_hook_settings_targets)
   [[ -n "$probe_base" ]] && rm -rf "$probe_base"
+  return $rc
+}
+
+# 배포된 hook(rd-workflow/scripts/hooks/*.sh, `_`/`test_` 접두 제외)이 루트
+# .claude/settings.json 에 등록됐는지 역방향으로 대조한다(§2.5.2 도달 증명의 반대 방향).
+# 미등록은 신호 전용(exit 0), 검사 자체 실행 오류만 exit 2.
+root_settings_hook_registration_check() {
+  local root
+  root="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+  bash "${SCRIPT_DIR}/check_root_settings_hook_registration.sh" --root "$root"
+  local rc=$?
+  [[ "$rc" -ne 0 ]] && echo "  check_root_settings_hook_registration.sh: 검사 실행 오류 (rc=${rc})" >&2
   return $rc
 }
 
@@ -1276,6 +1317,92 @@ hook_target_existence_check() {
   return $rc
 }
 
+# skill 문서(rd-workflow/claude_skills/**/*.md)가 참조하는 저장소 상대 경로가
+# 빌드된 rd-workflow/ 트리에 실재하는지 확인한다. 경고는 check_skill_reference_existence.sh
+# 가 exit 0으로 신호만 내므로(hard fail 아님), 이 함수는 그 스크립트가 0이 아닌
+# 코드로 끝난 경우(2뿐 아니라 스크립트 부재로 인한 127 등도 포함)에만 self_test
+# 스텝을 실패로 판정한다(F4). find 실패도 파이프 뒤로 흘리지 않고 직접 캡처해
+# "일부라도 찾았으니 성공"으로 조용히 덮이지 않게 한다.
+skill_reference_existence_check() {
+  local rc=0 root md_dir md found=0 skref_rc
+  root="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+  md_dir="${root}/rd-workflow/claude_skills"
+  if [[ ! -d "$md_dir" ]]; then
+    echo "  $md_dir: 디렉터리 부재" >&2
+    return 1
+  fi
+  local find_out find_rc
+  find_out="$(find "$md_dir" -name '*.md' 2>&1)"; find_rc=$?
+  if [[ "$find_rc" -ne 0 ]]; then
+    echo "  $md_dir: find 실패 (rc=${find_rc}): ${find_out}" >&2
+    return 1
+  fi
+  if [[ -z "$find_out" ]]; then
+    echo "  $md_dir: 대상 markdown 0건" >&2
+    return 1
+  fi
+  while IFS= read -r md; do
+    [[ -z "$md" ]] && continue
+    found=$((found + 1))
+    bash "${SCRIPT_DIR}/check_skill_reference_existence.sh" "$md" --root "$root"
+    skref_rc=$?
+    [[ "$skref_rc" -ne 0 ]] && { echo "  $md: 검사 실행 오류 (rc=${skref_rc})" >&2; rc=1; }
+  done <<< "$(printf '%s\n' "$find_out" | sort)"
+  [[ "$found" -gt 0 ]] || { echo "  $md_dir: 대상 markdown 0건" >&2; rc=1; }
+  return $rc
+}
+
+# 활성 FR 상세 파일(rd-workflow-workspace/backlog/items/*.md)의 related files 가
+# 빌드된 rd-workflow/ 트리에 실재하는지 확인한다. skill_reference_existence_check()
+# 와 달리 대상 0건(백로그가 비어 있음)은 정상 상태이므로 실패로 취급하지 않는다
+# (spec D4 — 선례와의 유일한 판정 차이). 디렉터리 부재·find 실패·하위 스크립트의
+# 0이 아닌 종료는 그대로 실패로 잡는다.
+fr_related_files_existence_check() {
+  local rc=0 root items_dir it found=0 rc2
+  root="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+  items_dir="${root}/rd-workflow-workspace/backlog/items"
+  if [[ ! -d "$items_dir" ]]; then
+    echo "  $items_dir: 디렉터리 부재" >&2
+    return 1
+  fi
+  local find_out find_rc
+  find_out="$(find "$items_dir" -maxdepth 1 -name '*.md' 2>&1)"; find_rc=$?
+  if [[ "$find_rc" -ne 0 ]]; then
+    echo "  $items_dir: find 실패 (rc=${find_rc}): ${find_out}" >&2
+    return 1
+  fi
+  while IFS= read -r it; do
+    [[ -z "$it" ]] && continue
+    found=$((found + 1))
+    bash "${SCRIPT_DIR}/check_fr_related_files_existence.sh" "$it" --root "$root"
+    rc2=$?
+    [[ "$rc2" -ne 0 ]] && { echo "  $it: 검사 실행 오류 (rc=${rc2})" >&2; rc=1; }
+  done <<< "$(printf '%s\n' "$find_out" | sort)"
+  return $rc
+}
+
+# FUTURE_REQUESTS.md 인덱스와 items/ 상세 파일의 양방향 정합성을 검사한다. 스크립트가
+# 신호만 내고 항상 exit 0(불일치 건수와 무관)이므로 이 스텝은 검사 자체의 실행 오류
+# (exit 2)만 실패로 잡는다.
+fr_index_detail_consistency_check() {
+  local root
+  root="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+  bash "${SCRIPT_DIR}/check_fr_index_detail_consistency.sh" --root "$root"
+  local rc=$?
+  [[ "$rc" -ne 0 ]] && echo "  check_fr_index_detail_consistency.sh: 검사 실행 오류 (rc=${rc})" >&2
+  return $rc
+}
+
+# items/ 상세 파일의 관계 필드(depends-on·series·relates)와 인덱스 관계 컬럼·요약 앞머리의
+# 무결성을 검사한다. rc=1(위반)은 실패로 잡고, rc=2(검사 실행 오류)는 사유를 덧붙인다.
+fr_relations_validate_check() {
+  local root
+  root="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+  bash "${SCRIPT_DIR}/fr_relations.sh" validate --root "$root"
+  local rc=$?
+  [[ "$rc" -eq 2 ]] && echo "  fr_relations.sh: 검사 실행 오류 (rc=2)" >&2
+  return $rc
+}
 
 # ④ 전용 헬퍼 — 임시 설치본을 세우고 현재 구현과 변형(행 단위 계수) 구현의 판정을 대조한다.
 _hook_p6_regression_fixture() {
@@ -1348,13 +1475,16 @@ P6RPL
 # 통과한 것으로 오인한다. 안전장치 스크립트에서 이 우회 경로는 허용하지 않는다.
 if [[ -n "${RD_SELFTEST_CHECKER_ONLY:-}" ]]; then
   case "$RD_SELFTEST_CHECKER_ONLY" in
-    hook_path_reachability_check|hook_target_existence_check|hook_path_notation_regression_check) ;;
+    hook_path_reachability_check|hook_target_existence_check|hook_path_notation_regression_check|root_settings_hook_registration_check) ;;
     hook_selftest_contract_check|_hook_repo_root) ;;
     # 필수 대상 결손 회귀는 변형을 주입해 판별력을 확인해야 하므로 단독 실행 경로가 필요하다.
     required_target_regression_check) ;;
+    skill_reference_existence_check) ;;
+    fr_related_files_existence_check) ;;
+    fr_index_detail_consistency_check) ;;
     *)
       echo "[self_test] RD_SELFTEST_CHECKER_ONLY 허용값이 아닙니다: ${RD_SELFTEST_CHECKER_ONLY}" >&2
-      echo "  허용: hook_path_reachability_check | hook_target_existence_check | hook_path_notation_regression_check | hook_selftest_contract_check | required_target_regression_check | _hook_repo_root" >&2
+      echo "  허용: hook_path_reachability_check | hook_target_existence_check | hook_path_notation_regression_check | hook_selftest_contract_check | required_target_regression_check | _hook_repo_root | skill_reference_existence_check | fr_related_files_existence_check | fr_index_detail_consistency_check | root_settings_hook_registration_check" >&2
       exit 2
       ;;
   esac
@@ -1417,9 +1547,16 @@ run_step hooks consumer "archive gate 테스트 (test_pre_commit_archive_gate.sh
 run_step hooks consumer "background dispatch 차단 hook (test_headless_background_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_headless_background_gate.sh"
 run_step hooks consumer "가드 차단 계측 (test_guard_block_log.sh)" bash "${SCRIPT_DIR}/hooks/test_guard_block_log.sh"
 run_step lifecycle consumer "비차단 Status drift 검증 (nonblocking_status_drift_check)" nonblocking_status_drift_check
-run_step lifecycle consumer "LC-19 3자 일치 검증 (TASK/STATE/CLAUDE.md)" canonical_status_triple_drift_check
+run_step lifecycle consumer "LC-19 3자 일치 검증 (TASK/STATE/task-tracking.md)" canonical_status_triple_drift_check
 run_step lifecycle consumer "task CLI 단위 테스트" bash "${SCRIPT_DIR}/test_task_cli.sh"
+run_step lifecycle consumer "stage_metrics 계측 테스트 (test_stage_metrics.sh)" bash "${SCRIPT_DIR}/test_stage_metrics.sh"
 run_step skills consumer "install_claude_skills 단위 테스트" bash "${SCRIPT_DIR}/test_install_claude_skills.sh"
+run_step skills consumer "skill 참조 경로 실재 (skill_reference_existence_check)" skill_reference_existence_check
+run_step skills consumer "FR related files 실재 (fr_related_files_existence_check)" fr_related_files_existence_check
+run_step skills consumer "FR 인덱스/상세 정합성 (fr_index_detail_consistency_check)" fr_index_detail_consistency_check
+run_step skills consumer "FR 관계 무결성 (fr_relations_validate_check)" fr_relations_validate_check
+run_step skills consumer "FR 관계 헬퍼 테스트 (test_fr_relations.sh)" bash "${SCRIPT_DIR}/test_fr_relations.sh"
+run_step skills consumer "skill 참조 경로 검사 단위 테스트" bash "${SCRIPT_DIR}/test_skill_reference_existence.sh"
 run_step lifecycle consumer "lifecycle 단위 테스트 (test_lifecycle.sh)" bash "${SCRIPT_DIR}/lifecycle/test_lifecycle.sh"
 run_step lifecycle consumer "작업 색인 단위 테스트 (test_tasks_index.sh)" bash "${SCRIPT_DIR}/lifecycle/test_tasks_index.sh"
 run_step lifecycle consumer "세션 기동 단위 테스트 (test_session_launch.sh)" bash "${SCRIPT_DIR}/lifecycle/test_session_launch.sh"
@@ -1464,13 +1601,13 @@ defect_reports_test_check() {
 }
 run_step skills consumer "결함 보고 로컬 조작부 테스트 (test_defect_reports.sh)" defect_reports_test_check
 run_step build consumer "스크립트 구문 검사 (bash -n)" syntax_check
-run_step build consumer "mktemp 가드 대조 — 배포 셸" mktemp_guard_scan_shell
-run_step build dev-only "mktemp 가드 대조 — 개발 셸" mktemp_guard_scan_dev_shell
-run_step build consumer "mktemp 가드 대조 — 파일 mktemp (약한 검사)" mktemp_guard_scan_file
-run_step build dev-only "mktemp 가드 대조 — 개발 파일 mktemp (약한 검사)" mktemp_guard_scan_dev_file
-run_step build consumer "mktemp 가드 대조 — 설치본 snippet" mktemp_guard_scan_installed_snippet
-run_step build dev-only "mktemp 가드 대조 — 정본 snippet" mktemp_guard_scan_canon_snippet
-run_step build dev-only "mktemp 스캐너 판정 표본" mktemp_scan_sample_check
+run_step always consumer "mktemp 가드 대조 — 배포 셸" mktemp_guard_scan_shell
+run_step always dev-only "mktemp 가드 대조 — 개발 셸" mktemp_guard_scan_dev_shell
+run_step always consumer "mktemp 가드 대조 — 파일 mktemp (약한 검사)" mktemp_guard_scan_file
+run_step always dev-only "mktemp 가드 대조 — 개발 파일 mktemp (약한 검사)" mktemp_guard_scan_dev_file
+run_step always consumer "mktemp 가드 대조 — 설치본 snippet" mktemp_guard_scan_installed_snippet
+run_step always dev-only "mktemp 가드 대조 — 정본 snippet" mktemp_guard_scan_canon_snippet
+run_step always dev-only "mktemp 스캐너 판정 표본" mktemp_scan_sample_check
 run_step skills dev-only "autopilot SKILL lifecycle 정합 (promote/rollback 일원화)" autopilot_skill_lifecycle_check
 run_step skills dev-only "무인 진입 계약 정합 (autopilot_headless_entry_check)" autopilot_headless_entry_check
 run_step skills consumer "skill 호출 권한 판정표 (설치본)" skill_invocation_authority_check
@@ -1506,6 +1643,7 @@ test_publish_remote_state_check() {
 
 
 run_step hooks consumer "hook 경로 도달 증명 (hook_path_reachability_check)" hook_path_reachability_check
+run_step hooks consumer "루트 settings.json hook 등록 (root_settings_hook_registration_check)" root_settings_hook_registration_check
 run_step hooks consumer "hook 대상 실재 (hook_target_existence_check)" hook_target_existence_check
 run_step hooks consumer "차단 계측 규약 (guard_deny_convention_check)" guard_deny_convention_check
 run_step hooks dev-only "reason 인자 판정 회귀 (guard_deny_reason_detection_regression_check)" guard_deny_reason_detection_regression_check

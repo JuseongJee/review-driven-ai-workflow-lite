@@ -39,7 +39,7 @@
 |----|--------|--------|------|
 | `schema` | `1` | lifecycle | 파일 형식 버전 |
 | `short-title` | kebab-case slug \| `-` (sentinel) | `rd task set-status` / promote | LC-18: 단 한 번 설정, 이후 immutable |
-| `status` | canonical 9종 (아래 목록) | `rd task set-status` / guard | LC-19: 집합 불변 |
+| `status` | canonical 10종 (아래 목록) | `rd task set-status` / guard | LC-19: 집합 불변 |
 | `fr-branch` | `fr/<slug>` \| `null` | promote / archive | 활성 여부는 `!= null` 이 아니라 **ref 실재**로 판정 — 아래 'fr-branch 활성 판정' 참조 |
 | `worktree-path` | 절대 경로 \| `null` | promote / archive | worktree 미사용 시 `null` |
 | `source-fr` | `-`(sentinel) 또는 `\|` 로 구분한 backlog item path 목록(복수 가능) | promote / `rd task set-source-fr` / `rd task fr-done` | FR 출처 경로(들) — 저장은 `\|` 구분 한 줄(저장 전용 직렬화), 그 외 자리는 줄 단위 목록 — 아래 'source-fr 계약' 참조 |
@@ -48,13 +48,18 @@
 | `created-at` | `YYYY-MM-DD-HHMM` 형식 | promote | fr 활성 기간에만 기록; 비활성 시 부재 가능 |
 | `extensions.<ext-name>.<key>` | 자유 문자열 (개행 금지) | extension | 아래 규약 참조 |
 
-### canonical 9종 Status (LC-19)
+### stage_metrics.tsv — 상태 전이 시각 로그
+
+`task-state` 와 같은 `.lifecycle/` 아래, tracked append-only 로그다(`RD_RECORD_PATHS`·`lifecycle_metadata_paths()` 양쪽에 포함 — archive 시 실제로 커밋·병합되어 라운드를 넘어 값이 이어진다). 컬럼: `short_title`·`from_status`·`to_status`·`epoch`. `rd task metrics [--task <short-title>]` 로 회차별 단계 소요를 조회한다 — 기본 대상은 현재 작업, 소요는 그 상태에 머문 벽시계 경과 시간(재방문 시 확정 합계 + 진행 중 잠정을 함께 표시), 이 로그 도입 이전 구간은 "계측 이전 — 알 수 없음"으로 표시하고, 종료(archive)된 회차 결과는 고정된다.
+
+### canonical 10종 Status (LC-19)
 
 ```
 대기 중
 REQUEST review 대기
 spec/plan 작성 중
 spec/plan review 대기
+구현 대기
 구현 중
 검증 중
 diff review 대기
@@ -119,7 +124,9 @@ created-at=2026-07-05-1030
 
 - **저장 값 형식** (원소 단위): `-`(sentinel) 또는 repo-relative backlog item path (`rd-workflow-workspace/backlog/items/<파일>.md`). 절대경로·`..` 세그먼트·개행·legacy slug는 쓰기 거부 (`source_fr_validate` — `_state_common.sh` 단일 구현). **이 계약은 해석 계층이 넓어져도 바뀌지 않는다.**
 - **쓰기 검증은 전부-또는-전무다**: 입력 항목을 전부 정규화한 뒤 하나라도 해석 실패·파일 부재면 **아무것도 쓰지 않고** 실패한다. stderr 에 문제 항목을 전부 열거한다(첫 실패에서 멈추지 않는다 — 사람이 한 번에 고칠 수 있어야 한다). `-` 단독은 「값 없음」이며 다른 항목과 섞이면 거부한다.
-- **읽기 해석**: `REQUEST.md ## Source FR` 의 원문은 `source_fr_resolve`(`_state_common.sh` 단일 구현)가 각 유효 행을 canonical path 로 정규화한다(`source_fr_from_request_list` 가 모든 유효 행을 반환, 기존 `source_fr_from_request` 는 첫 행만 반환하는 단일 값 소비처용으로 남아 있다). 지원 표기는 canonical path · markdown 링크 `[텍스트](path)` · 괄호 병기 `slug (path)` · `slug — [상세](path)` 계열 · 위 형식 앞의 `- ` 리스트 접두 · `items/<파일>.md` 축약 · `YYYY-MM-DD slug` · `slug` 단독이다.
+- **읽기 해석**: `REQUEST.md ## Source FR` 의 원문은 `source_fr_resolve`(`_state_common.sh` 단일 구현)가 각 유효 행을 canonical path 로 정규화한다(`source_fr_from_request_list` 가 모든 유효 행을 반환, 기존 `source_fr_from_request` 는 첫 행만 반환하는 단일 값 소비처용으로 남아 있다). 지원 표기는 canonical path · markdown 링크 `[텍스트](path)` · 괄호 병기 `slug (path)` · `slug — [상세](path)` 계열 · 위 형식 앞의 `- ` 리스트 접두 · `items/<파일>.md` 축약 · `YYYY-MM-DD slug` · `slug` 단독 · **`YYYY-MM-DD slug — 경로`(이력 표기, 백틱으로 경로를 감싸도 되고 안 감싸도 된다)**이다.
+  - `YYYY-MM-DD slug — 경로` 표기는 단계 1(괄호 추출)보다 먼저 판정되므로 경로 안에 괄호가 있어도 안전하다. 백틱은 `source_fr_from_request`/`source_fr_from_request_list`가 이미 제거하므로 있어도 없어도 같은 결과를 낸다.
+  - **`- 항목:` / `- 상세:` 두 줄로 나눠 적는 레이블 표기는 지원하지 않는다.** `source_fr_from_request`의 "첫 유효행 1줄" 계약을 바꿔야 하는 별도 난이도의 변경이라, 2026-09-24 batch 결정에서 범위를 좁혔다(`source-fr-unsupported-notations` FR). 이 표기가 필요하면 위 지원 표기 중 하나로 한 줄에 다시 쓴다.
   - 괄호 계열에서 **레이블(괄호 앞부분)의 문법은 제한하지 않되 비어 있으면 거부**한다. 정확성은 괄호 안 target 의 형식·실존 검증이 보장하며, 레이블 문법을 고정하면 새 서술 변형마다 다시 실패하기 때문이다. 괄호 뒤에 `)` 와 공백 외의 문자가 남으면 거부한다.
   - **파일명 자체에 괄호가 있으면 링크·괄호 병기 표기를 쓰지 않는다.** `[텍스트](.../2026-04-04-a(b).md)` 는 마지막 괄호를 target 경계로 보는 규칙 때문에 해석되지 않는다. 이런 파일은 `rd-workflow-workspace/backlog/items/2026-04-04-a(b).md` 또는 `items/2026-04-04-a(b).md` 처럼 **경로를 그대로** 적는다 — 이 두 형식은 괄호 해석보다 먼저 판정되므로 파일명의 괄호가 문제되지 않는다.
   - slug 는 소문자 영숫자와 `-` 만 허용한다. `items/<slug>.md` 정확 일치를 먼저 보고, 없으면 `items/*-<slug>.md` 가 **유일하게** 매칭될 때만 채택한다. 0건·복수건은 거부한다.
@@ -233,7 +240,7 @@ extensions.<ext-name>.<key>=<value>
 2. `task-state` 부재, `CURRENT_TASK.md` 존재:
    - CURRENT_TASK.md의 `## Status` 섹션에서 Status를 추출합니다.
    - legacy alias `실행 중` → `구현 중` 자동 변환합니다.
-   - Status가 canonical 9종이 아니면 **fail-closed**: task-state를 만들지 않고 exit 3 + 복구 안내 메시지 출력(SEC-13).
+   - Status가 canonical 10종이 아니면 **fail-closed**: task-state를 만들지 않고 exit 3 + 복구 안내 메시지 출력(SEC-13).
    - `active-fr`(있으면)에서 fr-branch / worktree-path / short-title을 추출합니다.
    - 백업 저장: `.lifecycle/migration-backup/<YYYYMMDD-HHMMSS>/CURRENT_TASK.md` 및 `active-fr`
    - task-state 생성 후 active-fr 삭제(단일 트랜잭션 — 임시 파일 + mv).
@@ -249,7 +256,7 @@ rd-workflow-workspace/.lifecycle/migration-backup/<YYYYMMDD-HHMMSS>/
 
 ### 실패 시 복구
 
-1. `CURRENT_TASK.md`의 `## Status` 값을 canonical 9종 중 하나로 수정합니다.
+1. `CURRENT_TASK.md`의 `## Status` 값을 canonical 10종 중 하나로 수정합니다.
 2. task-state 파일이 잔존하면 삭제합니다(`rm rd-workflow-workspace/.lifecycle/task-state`).
 3. `bash rd-workflow/scripts/rd task status` 재실행 → 마이그레이션 재시도.
 

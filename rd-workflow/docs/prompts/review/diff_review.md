@@ -7,7 +7,9 @@
 - 보안 문제
 - 유지보수성 저하
 - 불필요한 복잡성
-- CLAUDE.md 비대화: 변경이 CLAUDE.md를 수정했다면 "이 문장을 삭제해도 실수가 발생하는가?" 원칙을 적용. 12000자 이하 유지 권장 (`check_claudemd_size.sh` 기준)
+- CLAUDE.md 비대화: 변경이 CLAUDE.md를 수정했다면 "이 문장을 삭제해도 실수가 발생하는가?" 원칙을 적용. `.claude/rules/` 합계도 12000자 이하 유지 권장 (`check_claudemd_size.sh` 기준)
+- CURRENT_TASK.md 정합: 커밋된 `CURRENT_TASK.md`가 HEAD 기준 현재 단계(Status·Spec·Plan·Next Step)와 일치하는가
+- 변이 증거: 이 변경이 새로 만들거나 바꾼 필수 대상 단언(부정 명제·회귀)의 결과표가 최신 Author 턴 기준으로 현재 diff 와 맞고, `검증됨` 행이 유효 증거 4조건을 지키는가. 결과표가 없거나, `검증됨` 행이 4조건을 어기거나, `생존`·원복 `미확인` 행이 있으면 이의. `미검증(사유)` 는 사유와 잔여 위험을 보고 수용 여부를 적는다(수용해도 검증 성공으로 세지 않는다). 직접 주입은 선택이며 작업 트리 밖 사본에서만 한다 (`rd-workflow/docs/guides/mutation-check.md`)
 
 출력
 - 잠재적 버그

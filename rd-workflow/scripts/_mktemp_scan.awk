@@ -12,9 +12,19 @@
 # 목록에서 뺍니다). 이스케이프·백슬래시 parity·인용 구간
 # 판정을 하지 않습니다 — 그 판정을 세 번 고쳤고 매번 새 false negative 가 나왔습니다.
 #
-# **아래 Step 4~6 으로 실제 실행 검증됐습니다** (BSD awk 20200816):
-#   표본 → SUMMARY 12 11 · 블록별 집합 일치 · 비위반 블록 교집합 없음
-#   정본 트리 → 변경 전 10건, promote.sh:456 마커 적용 시 그 파일 0건, 변경 후 8건
+# ── 디렉터리 모드(mode=dir) 허용 형태 ──────────────────────────────────
+# ① 같은 줄 종료 핸들러: x="$(mktemp -d)" || { …; exit N; }  (또는 `|| exit N`, return [N], N=1~255)
+# ② 2줄 템플릿: 1줄째 `|| { echo "<라벨>: 임시 디렉터리 생성 실패 (…)" >&2; exit N; }` +
+#    2줄째 `[[ -n "$x" && -d "$x" ]] || { echo "<라벨>: … 검증 실패 (…)" >&2; exit N; }`
+# ③ 줄에 `mktemp-scan: custom-handler` 마커 (위 후보 제외 ③)
+# `local`·`export` 로 시작하는 줄은 ①·② 어느 쪽도 인정하지 않습니다(decl-combined).
+# 2줄째 검증은 필수가 아닙니다 — 그 검증은 mktemp 가 rc 0 으로 빈 경로를 내는 경우를 막는데
+# 실재하는 실패 경로가 아닙니다. 막으려는 사고(실패를 놓쳐 빈 변수로 저장소 밖 경로를 만듦)는
+# rc 실패이고 종료 핸들러가 이를 막습니다. 그래서 ① 이 맞으면 다음 줄을 보지 않습니다.
+#
+# **판정 규칙은 fixtures/mktemp_scan_samples.txt 의 `#EXPECT:` 표본으로 실제 실행 검증됩니다**
+# (self_test.sh 「mktemp 스캐너 판정 표본」, BSD awk 20200816):
+#   표본 → SUMMARY 21 15 · 블록별 집합 일치 · 비위반 블록 교집합 없음
 #
 # ── 파일 모드(mode=file) ──────────────────────────────────────────────
 # 강한 템플릿 대조가 아니라 약한 검사입니다. 판정은 하나뿐입니다 — 후보 줄에도
@@ -35,6 +45,7 @@ BEGIN {
   MARKER = "mktemp" "-scan: literal"   # 선언적 제외 마커 ① — 이 줄의 mktemp -d 는 실행되지 않는 텍스트 (리터럴을 쪼개 자기참조 회피)
   MARKER2 = "mktemp" "-scan: custom-handler"   # 선언적 제외 마커 ② — 실행되지만 템플릿으로 표현할 수 없는 핸들러가 붙어 있음 (모드 공통 — 파일 모드도 재사용)
   A_MID  = "=\"" SUB NEEDLE
+  A_CLOSE = ")\" || "
   A_TAIL = ")\" || { echo \""
   A_MSG  = ": 임시 디렉터리 생성 실패 (" "mktemp" " rc≠0, TMPDIR='${TMPDIR:-}')\" >&2; "
   B_PRE  = "[[ -n \"$"
@@ -112,6 +123,7 @@ function resolve(second) {
   if (!pend) return
   pend = 0
   if (p_line ~ /^[ \t]*(local|export)[ \t]/) { report("decl-combined"); return }
+  if (oneline_ok(p_line)) return          # 같은 줄 종료 핸들러 — 다음 줄을 보지 않음
   if (second == "") { report("template-mismatch"); return }
   if (!template_ok(p_line, second)) report("template-mismatch")
 }
@@ -174,6 +186,37 @@ function has_file_call(line,   pos, i, p, after) {
     if (substr(line, p + length(MK), 3) != " -d") return 1
   }
   return 0
+}
+# 같은 줄 종료 핸들러 판정 (허용 형태 ①). 형태:
+#   <들여쓰기><식별자>="$(mktemp -d<인자>)" || <핸들러>
+# <인자> 는 없거나 ` "<따옴표 없는 문자열>"` 입니다(template_ok 와 같은 제약).
+# <핸들러> 는 `<종료문>` · `{ <종료문>; }` · `{ <본문>; <종료문>; }` 이고, 줄 끝(후행 공백 허용)까지
+# 일치해야 합니다. 종료문은 `exit N`·`return`·`return N`(N=1~255)이며 앞이 정확히 `{ ` 또는 `; ` 여야
+# 합니다 — 그래서 `true || exit 1` · `c && return 1` 처럼 조건부로 붙은 종료는 후보 문자열 자체가
+# 종료문과 달라 거부됩니다. <본문> 의 나머지는 검사하지 않습니다.
+function oneline_ok(a,   ia, ra, v, rest, p, args, h, inner, n, t) {
+  ia = indent_of(a)
+  if (ia == "TAB") return 0
+  ra = substr(a, length(ia) + 1)
+  v = head_ident(ra)
+  if (v == "") return 0
+  if (substr(ra, length(v) + 1, length(A_MID)) != A_MID) return 0
+  rest = substr(ra, length(v) + length(A_MID) + 1)
+  p = index(rest, A_CLOSE)
+  if (p == 0) return 0
+  args = substr(rest, 1, p - 1)
+  if (args != "" && args !~ /^ "[^"]*"$/) return 0
+  h = substr(rest, p + length(A_CLOSE))
+  sub(/[ \t]+$/, "", h)
+  if (substr(h, 1, 2) == "{ ") {
+    if (length(h) < 5 || substr(h, length(h) - 2) != TAIL) return 0
+    inner = substr(h, 3, length(h) - 5)
+    t = inner
+    while ((n = index(t, "; ")) > 0) t = substr(t, n + 2)   # 마지막 "; " 뒤 (없으면 "{ " 뒤 전체)
+  } else {
+    t = h
+  }
+  return (t == "return" || term_ok(t))
 }
 function template_ok(a, b,   ia, ib, ra, rb, v, args, label, term, want, p) {
   ia = indent_of(a); ib = indent_of(b)

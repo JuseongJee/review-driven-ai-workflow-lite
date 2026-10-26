@@ -157,8 +157,10 @@ rd_review_seal() {
   fi
 
   # 검사 1 — 세션 종결성 (`is_review_session_resolved` 재사용, §3.2)
+  # 실패 사유를 함께 보여준다. 종전에는 "종결되지 않았습니다" 뿐이라, 원인이
+  # Status 인지 Open Issues 인지 알려면 판정 awk 를 직접 읽어야 했다.
   if ! is_review_session_resolved "$session_path"; then
-    echo "review seal: 세션이 종결되지 않았습니다." >&2
+    echo "review seal: 세션이 종결되지 않았습니다 (${RD_REVIEW_UNRESOLVED_REASON:-사유 불명})." >&2
     return 1
   fi
 
@@ -397,6 +399,13 @@ usage() {
   archive-captures --stages <csv> [--title <slug>]         캡처를 raw-captures/archive/로 이동
   fr-register --slug <slug>                 등록 결과(인덱스 행·items·fr 캡처)를 기본 브랜치에 커밋 (skipped exit 3)
   set-base <ref>                            작업 시작 커밋 기록 (입력이 ref 여도 OID 로 저장)
+  metrics [--task <slug>]                   회차 단계별 소요 조회. 기본 대상은 현재
+                                           작업(short-title). 소요는 그 상태에 머문
+                                           벽시계 경과 시간(재방문 합산 + 방문 횟수),
+                                           진행 중 상태는 "진행 중(잠정)", 이 기능
+                                           도입 이전 구간은 "계측 이전 — 알 수 없음"
+                                           으로 표시. 종료(archive)된 회차는 결과가
+                                           고정(동결)된다.
 
 사용법: bash rd-workflow/scripts/rd review <subcommand>
   seal [--legacy-unverified <사유>] <session-path>
@@ -476,6 +485,41 @@ case "$cmd" in
     [[ -z "$ref" || $# -gt 0 ]] && { usage; exit 1; }
     state_write_base_commit "$ref" || exit 1
     printf 'base-commit=%s\n' "$(state_read_base_commit)"
+    ;;
+  metrics)
+    mt_task=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --task)
+          # 값 누락 가드(spec/plan review Turn 002 F5, Turn 004 F5 잔여). `rd` 는
+          # set -u 만 켜고 set -e 는 없어서, 값 없이 `shift 2` 가 실패하면 조용히
+          # 무시되고 $# 가 줄지 않아 이 while 이 같은 인자를 영원히 재검사하는
+          # hang 이 된다. **다음 토큰이 옵션처럼 보이는 경우(`-` 로 시작)도 값
+          # 누락으로 취급한다** — 그러지 않으면 `rd task metrics --task --help`
+          # 에서 `--help` 가 조회 대상 slug 로 잘못 소비된다(Turn 004 재현).
+          # `_task_common.sh` 의 `set-title` 이 이미 쓰는 `-?*)` 패턴과 같다.
+          case "${2-}" in
+            ""|-?*)
+              echo "rd task metrics: --task 에 값이 없습니다." >&2
+              exit 1 ;;
+          esac
+          mt_task="$2"; shift 2 ;;
+        -h|--help)
+          echo "usage: rd task metrics [--task <short-title>]"
+          echo "  기본 대상은 현재 작업(short-title). --task 로 다른(과거 archive 된) 회차를 조회한다."
+          echo "  소요는 그 상태에 머문 벽시계 경과 시간이며, 재방문 시 합산 + 방문 횟수로 보여준다."
+          echo "  진행 중 상태는 '진행 중(잠정)', 이 기능 도입 이전 구간은 '계측 이전 — 알 수 없음'."
+          echo "  종료(archive)된 회차의 결과는 조회 시점과 무관하게 고정(동결)된다."
+          exit 0 ;;
+        *)
+          echo "rd task metrics: 알 수 없는 인자: $1" >&2
+          exit 1 ;;
+      esac
+    done
+    if [[ -z "$mt_task" ]]; then
+      mt_task="$(state_read_field "short-title")"
+    fi
+    state_stage_metrics_report "$mt_task"
     ;;
   set-source-fr)
     # 위치 인자 반복(change spec §2.4b) — 옵션 파서를 추가하지 않는다.

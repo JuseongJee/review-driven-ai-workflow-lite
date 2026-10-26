@@ -31,6 +31,7 @@ Claude가 [setup_with_claude.md](setup_with_claude.md)를 읽고 설치 → 프�
 ├── CURRENT_TASK.md
 ├── WORKING_WITH_AI.md
 ├── .claude/settings.json
+├── .claude/rules/rd-workflow/    (전체 디렉토리)
 └── rd-workflow/                  (전체 디렉토리)
 ```
 

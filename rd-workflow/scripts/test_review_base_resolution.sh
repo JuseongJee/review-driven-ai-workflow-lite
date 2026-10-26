@@ -87,6 +87,9 @@ mk_repo() {
      "${RD_SRC}/scripts/rd" \
      "${d}/rd-workflow/scripts/" || return 1
   cp "${RD_SRC}/scripts/hooks/_guard_common.sh" "${d}/rd-workflow/scripts/hooks/" || return 1
+  # 판정 규칙이 담긴 awk 를 함께 복사한다. 누락하면 fixture 안에서 판정이 항상 실패해
+  # 정상 종결 세션의 seal 성공 케이스가 깨진다.
+  cp "${RD_SRC}/scripts/hooks/_open_issues.awk" "${d}/rd-workflow/scripts/hooks/" || return 1
   cp "${RD_SRC}/scripts/lifecycle/_lifecycle_common.sh" \
      "${RD_SRC}/scripts/lifecycle/slug.sh" \
      "${d}/rd-workflow/scripts/lifecycle/" || return 1
@@ -464,6 +467,7 @@ MARK="$(marker_path "$RS" "$SID")"
 seal "$RS" "${SS#${RS}/}"; rc=$?
 eq "$rc" "1" "검사 1: 미종결 세션 seal 실패"
 has "종결되지 않았습니다" "$(cat "${OUT}/seal.err")" "검사 1: 사유 안내"
+has "status:awaiting-author" "$(cat "${OUT}/seal.err")" "검사 1: 사유에 판정 유발 지점이 담긴다"
 
 # ⑥(b) 성공 경로의 재snapshot 은 **rename** 이어야 합니다 — 검증 뒤 두 필드를 순차적으로
 # in-place 수정하는 구현이라면 inode 가 그대로 남습니다.

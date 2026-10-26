@@ -27,11 +27,14 @@ source "${_TC_DIR}/lifecycle/slug.sh"
 source "${_TC_DIR}/lifecycle/_tasks_index.sh"
 source "${_TC_DIR}/lifecycle/session_launch.sh"
 
-# canonical 9종 (LC-19) — `_state_common.sh` 의 STATE_CANONICAL_STATUSES 와 **같은 집합**이어야
+# canonical 10종 (LC-19) — `_state_common.sh` 의 STATE_CANONICAL_STATUSES 와 **같은 집합**이어야
 # 합니다. 한쪽만 고치면 CLI 는 받아들이는데 권위 파일 검증이 거부하는 어긋난 중간 상태가
 # 생깁니다 (self_test 의 LC-19 3자 일치 검증이 이 어긋남을 잡습니다).
 # `아카이브 보류` 는 「리뷰 종결·발행 대기」입니다 (change-spec §4.1) — 완료가 아닙니다.
-TASK_CANONICAL_STATUSES=("대기 중" "REQUEST review 대기" "spec/plan 작성 중" "spec/plan review 대기" "구현 중" "검증 중" "diff review 대기" "아카이브 보류" "완료")
+# `구현 대기` 는 「spec/plan review 종결·구현 착수 대기」입니다 (change-spec
+# 2026-09-24-1836-task-status-no-implementation-pending) — spec/plan review 대기 도
+# 아니고 구현 중도 아닙니다.
+TASK_CANONICAL_STATUSES=("대기 중" "REQUEST review 대기" "spec/plan 작성 중" "spec/plan review 대기" "구현 대기" "구현 중" "검증 중" "diff review 대기" "아카이브 보류" "완료")
 
 task_status_canonical() {
   local s="$1" c
@@ -75,6 +78,9 @@ assert_no_symlink_in_path() {
 # '아카이브 보류'(change-spec §4.1)는 리뷰 종결과 발행 사이의 상태다. 'diff review 대기' 에서
 # 들어와 '완료' 로 나가며, '구현 중' 으로 되돌아갈 수도 있다 — 리뷰 후 변경이 필요해진 경우이고,
 # 그때는 보호 트리 해시 판정이 기존 종결을 무효로 만든다.
+# '구현 대기'(change-spec 2026-09-24-1836-task-status-no-implementation-pending)는 spec/plan
+# review 종결과 구현 착수 사이의 상태다. 'spec/plan review 대기' 에서 들어와 '구현 중' 으로
+# 나가며, 'spec/plan 작성 중' 으로 되돌아갈 수도 있다 — 리뷰 후 변경이 필요해진 경우다.
 task_transition_allowed() {
   local from="$1" to="$2"
   [[ "$to" == "대기 중" ]] && return 0
@@ -82,7 +88,8 @@ task_transition_allowed() {
     "대기 중→REQUEST review 대기"|"대기 중→구현 중"|\
     "REQUEST review 대기→spec/plan 작성 중"|\
     "spec/plan 작성 중→spec/plan review 대기"|\
-    "spec/plan review 대기→spec/plan 작성 중"|"spec/plan review 대기→구현 중"|\
+    "spec/plan review 대기→spec/plan 작성 중"|"spec/plan review 대기→구현 대기"|\
+    "구현 대기→구현 중"|"구현 대기→spec/plan 작성 중"|\
     "구현 중→spec/plan 작성 중"|\
     "구현 중→검증 중"|"검증 중→구현 중"|"검증 중→diff review 대기"|\
     "diff review 대기→구현 중"|"diff review 대기→완료"|\
@@ -95,7 +102,7 @@ task_transition_allowed() {
 task_set_status() {
   local to="$1" force="${2:-0}" from rc=0
   if ! task_status_canonical "$to"; then
-    echo "허용되지 않은 Status 값: ${to} (canonical 9종만 허용 — LC-19)" >&2
+    echo "허용되지 않은 Status 값: ${to} (canonical 10종만 허용 — LC-19)" >&2
     return 4
   fi
   from="$(task_read_status)" || {
@@ -108,7 +115,14 @@ task_set_status() {
     if [[ "$force" == "1" ]]; then
       echo "경고: 전이표 외 전이(${from} → ${to})를 --force로 수행합니다." >&2
     else
-      echo "전이표 위반: ${from} → ${to} (--force로 우회 가능)" >&2
+      local allowed="" cand
+      for cand in "${TASK_CANONICAL_STATUSES[@]}"; do
+        [[ "$cand" == "$from" ]] && continue
+        if [[ "$cand" == "대기 중" ]] || task_transition_allowed "$from" "$cand"; then
+          allowed="${allowed:+$allowed, }${cand}"
+        fi
+      done
+      echo "전이표 위반: ${from} → ${to}. 허용된 다음 상태: ${allowed:-없음} (그래도 강제 전이하려면 --force)" >&2
       return 4
     fi
   fi
@@ -128,6 +142,7 @@ task_set_status() {
     state_write_fields "status=${to}" || return 3
   fi
   _task_section_write "Status" "$to" || rc=$?
+  [[ "$rc" -eq 0 ]] && state_log_stage_transition "$(state_read_field "short-title")" "$from" "$to"
   return "$rc"
 }
 
@@ -909,7 +924,8 @@ _task_section_exists() {
   grep -q "^## ${1}\$" "${project_root}/CURRENT_TASK.md" 2>/dev/null
 }
 
-# _task_section_write_list <section> <multiline-value> — `_task_section_write` 의 목록판.
+# _task_section_write_list <section> <multiline-value> [target-file] — `_task_section_write` 의 목록판.
+# target-file 생략 시 기본 `${project_root}/CURRENT_TASK.md`.
 # 그 함수는 "첫 비어있지 않은 줄만 교체, 나머지 byte 보존" 계약이라 여러 줄 본문을
 # 표현할 수 없다(교체해도 두 번째 줄부터는 옛 값이 남는다) — Source FR 미러가 복수
 # 목록(change spec §2.3b)을 담아야 해서 신설한다. 섹션의 옛 본문에서 값 줄은 버리고
@@ -919,7 +935,7 @@ _task_section_exists() {
 # strips-source-fr-comments). 헤더 자체가 없으면 `_task_section_write` 와 같은 이유로
 # return 1 (임의 위치에 새 헤더를 만들지 않는다 — 부재는 baseline 이 아니라는 신호).
 _task_section_write_list() {
-  local file="${project_root}/CURRENT_TASK.md" section="$1" value="$2" tmp
+  local file="${3:-${project_root}/CURRENT_TASK.md}" section="$1" value="$2" tmp
   if ! grep -q "^## ${section}\$" "$file" 2>/dev/null; then
     echo "CURRENT_TASK.md 에 '## ${section}' 섹션이 없습니다 — 미러를 갱신할 수 없습니다." >&2
     echo "  확인: grep -n '^## ' '$file'" >&2

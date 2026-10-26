@@ -21,7 +21,11 @@ GitHub Issues를 로컬 FR로 가져온다. **GitHub 전제조건 검증 필수.
      - (c) 건너뜀
    - 유사 항목이 없으면 새 로컬 FR로 생성한다.
 6. 생성/연결 처리:
-   - **새 생성**: issue body에서 summary, kind 등을 추출하여 `items/YYYY-MM-DD-{short-title}.md` 생성. status는 GitHub의 status label에서 읽은 값을 사용한다 (`fr:validated` → `validated`). `FUTURE_REQUESTS.md` 인덱스에 행 추가 시 해당 status, 우선순위 기본값 `-`, GitHub 컬럼에 `owner/repo#N`을 사용. 상세 파일에도 `github-issue: owner/repo#N` 기록.
+   - **새 생성**: issue body에서 summary, kind 등을 추출하여 `items/YYYY-MM-DD-{short-title}.md` 생성. status는 GitHub의 status label에서 읽은 값을 사용한다 (`fr:validated` → `validated`). 상세 파일에도 `github-issue: owner/repo#N` 기록.
+
+     `FUTURE_REQUESTS.md` 인덱스 행은 **`fr/add.md` 6단계 「인덱스 행 추가」 절차를 그대로 수행해서** 넣는다 — 상세 파일 형식만이 아니라 6-a(헤더 이관)·6-b(행 조립)·6-c(요약 앞머리)를 전부 따른다. pull 로 들어오는 인덱스는 `… | 우선순위 | 상세 | GitHub |` 변형인 경우가 많으므로 **6-a 를 새 행 추가 전에 반드시 먼저 실행한다** — 이관 없이 행만 붙이면 헤더보다 칸이 한 개 많아져 종류·상태 컬럼이 통째로 밀린다. 6-a 의 awk 는 `우선순위` 칸 위치를 읽어 삽입하므로 이 변형에도 그대로 쓴다.
+
+     pull 이 채우는 값: 상태 = GitHub status label 에서 읽은 값, 우선순위 = `-`, 관계 = 상세의 `depends-on`·`series` 에서 옮긴 값(없으면 `-`), GitHub 컬럼 = `owner/repo#N`. 이관 후 컬럼 순서는 `날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 관계 | 상세 | GitHub` 다.
    - **연결**: 기존 상세 파일의 `github-issue: -` 값을 `github-issue: owner/repo#N`으로 변경하고, 인덱스의 GitHub 컬럼도 `owner/repo#N`으로 갱신한다. GitHub status label이 로컬 status와 다르면 로컬 상세 파일의 status와 인덱스 status 컬럼도 GitHub 값으로 갱신한다.
 7. 완료 메시지 출력: "pull 완료: 생성 N건, 연결 N건, 건너뜀 N건"
 
@@ -29,7 +33,7 @@ GitHub Issues를 로컬 FR로 가져온다. **GitHub 전제조건 검증 필수.
 
 - 대상은 status label(`fr:idea`, `fr:validated`, `fr:ready-for-request`) 중 하나 이상이 있는 open issues만. `fr:` 접두어만 있고 status label이 없는 issue는 무시한다.
 - **status label이 2개 이상인 issue**: 첫 번째로 발견된 status label을 사용하고 "status label이 복수입니다: {labels}" 경고를 출력한다.
-- 로컬 상세 파일 생성 시 `/fr add`의 상세 파일 형식을 따른다.
+- 로컬 상세 파일 생성 시 `/fr add`의 상세 파일 형식(`fr/add.md` 4단계)을 따르고, 인덱스 행 생성 시 `fr/add.md` 6단계 절차를 따른다. 두 참조는 별개다 — 상세 파일 형식만 따르고 6단계를 건너뛰지 않는다.
 - issue body 파싱이 불완전해도 최소한 summary(= issue title)와 status(= label에서 추출)는 기록한다.
 
 ### 결함 보고 흡수

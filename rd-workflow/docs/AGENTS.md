@@ -2,7 +2,7 @@
 
 이 문서는 Git 워크플로와 handoff 규칙만 다룹니다.
 
-AI 협업 기본 규칙은 프로젝트 루트의 `CLAUDE.md`를 기준으로 봅니다.
+AI 협업 기본 규칙은 프로젝트 루트의 `CLAUDE.md`와 `.claude/rules/rd-workflow/*.md`를 기준으로 봅니다.
 
 ## Git 워크플로 규칙
 
@@ -18,7 +18,7 @@ AI 협업 기본 규칙은 프로젝트 루트의 `CLAUDE.md`를 기준으로 �
   - 자세한 절차는 `rd-workflow/scripts/lifecycle/README.md` 참조.
 
 ### 커밋 규칙
-- 커밋 메시지 언어와 형식은 `CLAUDE.md`를 따릅니다.
+- 커밋 메시지 언어와 형식은 `.claude/rules/rd-workflow/commit.md`를 따릅니다.
 - 모든 커밋 메시지는 한글로 작성합니다.
 - 의미 있는 단위로 커밋합니다.
 

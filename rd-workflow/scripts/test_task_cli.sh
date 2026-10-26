@@ -32,14 +32,14 @@ $2
 -
 EOF
   # v2 2b: task-state도 함께 갱신 (task-state가 권위 소스 — 결정 1/3)
-  # canonical 9종이 아닌 값(손상 테스트용)은 task-state를 생성하지 않음
+  # canonical 10종이 아닌 값(손상 테스트용)은 task-state를 생성하지 않음
   local _ts_dir="$1/rd-workflow-workspace/.lifecycle"
   mkdir -p "$_ts_dir"
   # canonical 여부 판정: 기존 STATE_CANONICAL_STATUSES 파이프 문자열 사용 가능하지만
   # 함수 환경이 없으므로 직접 case 로 처리
   case "$2" in
     "대기 중"|"REQUEST review 대기"|"spec/plan 작성 중"|"spec/plan review 대기"|\
-    "구현 중"|"검증 중"|"diff review 대기"|"완료"|"실행 중")
+    "구현 대기"|"구현 중"|"검증 중"|"diff review 대기"|"완료"|"실행 중")
       # canonical 또는 legacy alias → task-state 생성
       local _ts_status="$2"
       # legacy alias '실행 중' → canonical '구현 중' 으로 정규화 (마이그레이션 계약)
@@ -71,9 +71,16 @@ mk_fr_items() {
       > "$root/rd-workflow-workspace/backlog/items/${rel}.md" || return 1
   done
 }
-TMP="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+# 모든 fixture 임시 트리를 이 루트 하위에 만들고 EXIT trap 을 한 번만 건다.
+# bash 의 `trap ... EXIT` 는 누적이 아니라 덮어쓰기라, fixture 마다 trap 을 새로 걸면
+# 마지막 것만 살아남고 그 앞의 트리는 어느 종료 경로에서도 회수되지 않는다.
+# 트리는 여전히 하나씩 따로 만들므로 fixture 간 격리는 그대로다.
+TMPROOT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 루트 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$TMPROOT" && -d "$TMPROOT" ]] || { echo "test_task_cli.sh: 임시 루트 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+trap 'rm -rf "$TMPROOT"' EXIT
+new_tmp() { mktemp -d "$TMPROOT/fixture.XXXXXXXX"; } # mktemp-scan: custom-handler — 값 반환 헬퍼, 호출부가 || 로 검사
+TMP="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$TMP" && -d "$TMP" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-trap 'rm -rf "$TMP"' EXIT
 export project_root="$TMP"
 mk_fr_items "$TMP" || { echo "test_task_cli.sh: FR items 픽스처 생성 실패" >&2; exit 1; }
 mk_task_file "$TMP" "구현 중" "my-task"
@@ -126,8 +133,8 @@ mk_task_file "$TMP" "실행 중" "x"
 t "alias 실행 중→완료 차단 (task-state='구현 중')" 4 "-" bash "$RD" task set-status "완료"
 
 # 전이표 전수 (8×8): 허용 목록 외 전부 차단인지 기계 검증
-ALLOWED="대기 중→REQUEST review 대기|대기 중→구현 중|REQUEST review 대기→spec/plan 작성 중|spec/plan 작성 중→spec/plan review 대기|spec/plan review 대기→spec/plan 작성 중|spec/plan review 대기→구현 중|구현 중→spec/plan 작성 중|구현 중→검증 중|검증 중→구현 중|검증 중→diff review 대기|diff review 대기→구현 중|diff review 대기→완료"
-STATUSES=("대기 중" "REQUEST review 대기" "spec/plan 작성 중" "spec/plan review 대기" "구현 중" "검증 중" "diff review 대기" "완료")
+ALLOWED="대기 중→REQUEST review 대기|대기 중→구현 중|REQUEST review 대기→spec/plan 작성 중|spec/plan 작성 중→spec/plan review 대기|spec/plan review 대기→spec/plan 작성 중|spec/plan review 대기→구현 대기|구현 대기→구현 중|구현 대기→spec/plan 작성 중|구현 중→spec/plan 작성 중|구현 중→검증 중|검증 중→구현 중|검증 중→diff review 대기|diff review 대기→구현 중|diff review 대기→완료"
+STATUSES=("대기 중" "REQUEST review 대기" "spec/plan 작성 중" "spec/plan review 대기" "구현 대기" "구현 중" "검증 중" "diff review 대기" "완료")
 for from in "${STATUSES[@]}"; do
   for to in "${STATUSES[@]}"; do
     [[ "$from" == "$to" ]] && continue
@@ -137,6 +144,20 @@ for from in "${STATUSES[@]}"; do
     [[ "$rc" == "$want" ]] && echo "ok: 전이 ${from}→${to} rc=$rc" || { echo "FAIL: 전이 ${from}→${to} rc=$rc want=$want"; FAIL=1; }
   done
 done
+
+# --- 연속 전이 스모크 (spec/plan review 턴 002 R2): fixture 재초기화 없이 저장값·미러 확인 ---
+mirror_status() { awk '/^## Status$/{getline; print; exit}' "$1/CURRENT_TASK.md"; }
+mk_task_file "$TMP" "spec/plan review 대기" "seq-task"
+t "연속 전이 1/2: spec/plan review 대기→구현 대기" 0 "-" bash "$RD" task set-status "구현 대기"
+t "task-state 저장값: 구현 대기" 0 "구현 대기" bash "$RD" task status
+[[ "$(mirror_status "$TMP")" == "구현 대기" ]] \
+  && echo "ok: CURRENT_TASK.md 미러 = 구현 대기" \
+  || { echo "FAIL: CURRENT_TASK.md 미러 불일치 (got '$(mirror_status "$TMP")')"; FAIL=1; }
+t "연속 전이 2/2: 구현 대기→구현 중 (재초기화 없이)" 0 "-" bash "$RD" task set-status "구현 중"
+t "task-state 저장값: 구현 중" 0 "구현 중" bash "$RD" task status
+[[ "$(mirror_status "$TMP")" == "구현 중" ]] \
+  && echo "ok: CURRENT_TASK.md 미러 = 구현 중" \
+  || { echo "FAIL: CURRENT_TASK.md 미러 불일치 (got '$(mirror_status "$TMP")')"; FAIL=1; }
 
 # --- golden fixture round-trip (REQUEST AC 2 baseline) ---
 for st in "${STATUSES[@]}"; do
@@ -286,11 +307,24 @@ rm "$TMP/rd-workflow-workspace/raw-captures"; mv "$TMP/real-captures" "$TMP/rd-w
 # --- backup-request (SEC-01/02/05) ---
 mk_task_file "$TMP" "완료" "bk-task"
 printf '# Change Request\ncontent-1\n' > "$TMP/REQUEST.md"
-out="$(bash "$RD" task backup-request)"
+# 백업 파일명은 분 단위(YYYY-MM-DD-HHMM)이고 `rd` 는 호출할 때마다 date 를 새로 읽는다.
+# 두 호출이 분 경계를 사이에 두면 이름이 애초에 겹치지 않아 충돌 처리(-2 접미사)가
+# 성립하지 않고 테스트만 거짓 실패한다. 아래 두 호출의 자식 프로세스에만 date 대역을
+# 놓아 파일명용 시각을 고정한다 — 프로덕션 파일명 규칙과 충돌 처리 로직은 바꾸지 않는다.
+_bk_real_date="$(command -v date)" || { echo "test_task_cli.sh: date 경로 확인 실패" >&2; exit 1; }
+BK_SHIM="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+cat > "$BK_SHIM/date" <<SHIM
+#!/usr/bin/env bash
+# 백업 파일명용 포맷만 고정 시각으로 답하고, 나머지 포맷은 실제 date 에 위임한다.
+if [[ "\${1:-}" == '+%Y-%m-%d-%H%M' ]]; then printf '2026-01-02-0304\n'; exit 0; fi
+exec "${_bk_real_date}" "\$@"
+SHIM
+chmod +x "$BK_SHIM/date"
+out="$(PATH="$BK_SHIM:$PATH" bash "$RD" task backup-request)"
 [[ -f "$out" ]] && grep -q 'content-1' "$out" && echo "ok: backup 생성" || { echo "FAIL: backup 생성"; FAIL=1; }
 case "$out" in */rd-workflow-workspace/backlog/request-archive/*-bk-task.md) echo "ok: backup 파일명" ;; *) echo "FAIL: backup 파일명 ($out)"; FAIL=1 ;; esac
-out2="$(bash "$RD" task backup-request)"
-[[ "$out2" == "${out%.md}-2.md" ]] && echo "ok: backup collision" || { echo "FAIL: backup collision ($out2)"; FAIL=1; }
+out2="$(PATH="$BK_SHIM:$PATH" bash "$RD" task backup-request)"
+[[ "$out2" == "${out%.md}-2.md" ]] && echo "ok: backup collision" || { echo "FAIL: backup collision (out=$out out2=$out2)"; FAIL=1; }
 out3="$(bash "$RD" task backup-request --orphan)"
 case "$out3" in *-orphan.md) echo "ok: backup orphan" ;; *) echo "FAIL: backup orphan ($out3)"; FAIL=1 ;; esac
 # REQUEST.md 자체가 symlink → exit 2 + 백업 미생성 (SEC-01/02)
@@ -424,9 +458,8 @@ EOF
 
 # --- TC-T1: rd task status — task-state 우선 ---
 echo "--- TC-T1: task status task-state 우선 ---"
-TMP2="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+TMP2="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$TMP2" && -d "$TMP2" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-trap 'rm -rf "$TMP2"' EXIT
 # task-state(status=검증 중) + CURRENT_TASK.md(status=구현 중): task-state 우선 보장
 mk_task_file "$TMP2" "구현 중" "foo"
 mk_task_state "$TMP2" "검증 중" "foo"
@@ -505,9 +538,8 @@ d_parse="$(printf '%s\n' "$out_guard4" | awk -F= '$1=="decision"{print $2}')"
 
 # --- TC-T5: 마이그레이션 통합 (task-state 부재 + legacy fixture → 첫 CLI 호출 자동 마이그레이션) ---
 echo "--- TC-T5: 마이그레이션 통합 ---"
-TMP3="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+TMP3="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$TMP3" && -d "$TMP3" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-trap 'rm -rf "$TMP3"' EXIT
 # legacy 환경: task-state 없이 CURRENT_TASK.md + active-fr만 존재
 mkdir -p "${TMP3}/rd-workflow-workspace/.lifecycle"
 cat > "${TMP3}/CURRENT_TASK.md" <<'CTEOF'
@@ -547,9 +579,8 @@ rc_mig=$?
 bk_cnt="$(find "${TMP3}/rd-workflow-workspace/.lifecycle/migration-backup" -name "CURRENT_TASK.md" 2>/dev/null | wc -l | tr -d ' ')"
 [[ "$bk_cnt" -ge 1 ]] && echo "ok: T5-d migration-backup 생성됨" || { echo "FAIL: T5-d migration-backup 없음"; FAIL=1; }
 # 손상 legacy(비canonical status) → exit 3 + task-state 미생성
-TMP4="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+TMP4="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$TMP4" && -d "$TMP4" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-trap 'rm -rf "$TMP4"' EXIT
 mk_task_file "$TMP4" "이상한값" "bad-task"
 env project_root="$TMP4" bash "$RD" task status >/dev/null 2>&1; rc_bad=$?
 [[ "$rc_bad" == "3" ]] && echo "ok: T5-e 손상 legacy → exit 3" || { echo "FAIL: T5-e 손상 legacy → exit $rc_bad (기대: 3)"; FAIL=1; }
@@ -560,9 +591,8 @@ env project_root="$TMP4" bash "$RD" task status >/dev/null 2>&1; rc_bad=$?
 # ===========================================================================
 
 echo "--- TC-FIX-1: fr-add guard + task-state 존재 + short-title 손상 → proceed-readonly ---"
-TMP_FIX="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+TMP_FIX="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$TMP_FIX" && -d "$TMP_FIX" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-trap 'rm -rf "$TMP_FIX"' EXIT
 # task-state 존재하지만 short-title 키 없는 손상 fixture (mk_task_file 대신 직접 생성)
 mkdir -p "${TMP_FIX}/rd-workflow-workspace/.lifecycle"
 cat > "${TMP_FIX}/rd-workflow-workspace/.lifecycle/task-state" <<'FIXEOF'
@@ -600,9 +630,8 @@ ts_title_fix="$(awk -F'=' '$1=="short-title"{sub(/^[^=]+=/,"");print;exit}' "${T
 [[ -z "$ts_title_fix" ]] && echo "ok: TC-FIX-1b short-title 갱신 없음 (write 금지)" || { echo "FAIL: TC-FIX-1b short-title이 갱신됨 (got='${ts_title_fix}')"; FAIL=1; }
 
 echo "--- TC-FIX-2: set-status 쓰기 실패 → exit 3 ---"
-TMP_FIX2="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+TMP_FIX2="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$TMP_FIX2" && -d "$TMP_FIX2" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-trap 'rm -rf "$TMP_FIX2"' EXIT
 mk_task_file "$TMP_FIX2" "구현 중" "fix2-task"
 # task-state를 읽기 전용으로 만들어 state_write_fields 실패 시나리오 시뮬레이션
 _ts_path_fix2="${TMP_FIX2}/rd-workflow-workspace/.lifecycle"
@@ -737,7 +766,7 @@ mv_mirror="$(awk '$0=="## Source FR"{f=1;next} f&&/^## /{exit} f&&NF{print}' "$T
 [[ "$mv_mirror" == "$mv_want" ]] && echo "ok: 복수 왕복 — 미러 줄 단위 목록" \
   || { echo "FAIL: 복수 왕복 미러 불일치 ('$mv_mirror' != '$mv_want')"; FAIL=1; }
 # --- final diff review F5 회귀: fr-done 의 FR 경로 검증 ---
-FD5="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+FD5="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$FD5" && -d "$FD5" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$FD5/proj/rd-workflow-workspace/backlog/items" "$FD5/proj/rd-workflow-workspace/.lifecycle"
 printf '# outside\n- status: idea\n' > "$FD5/outside.md"
@@ -770,7 +799,7 @@ grep -q '^- status: idea$' "$FD5/outside.md" \
   || { echo "FAIL: F5 손상 저장값이 프로젝트 밖 파일을 바꿨다"; FAIL=1; }
 
 # --- final diff review F1~F4 회귀 ---
-FDR="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+FDR="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$FDR" && -d "$FDR" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mk_fr_items "$FDR" || { echo "test_task_cli.sh: FR items 픽스처 생성 실패(FDR)" >&2; exit 1; }
 mkdir -p "$FDR/rd-workflow-workspace/.lifecycle"
@@ -831,7 +860,7 @@ fdr_f4="$(fdr_rd task guard --candidate y --mode promote --source-fr "$(printf '
 # BSD awk 는 `-v` 값에 개행이 있으면 죽고, 그러면 `awk ... && mv` 가 끊겨 권위만
 # 갱신되고 미러는 그대로인 partial state 가 남는다. 섹션이 없는 픽스처는 append
 # 경로로 빠져 이 결함을 가리므로, 여기서는 섹션이 있는 상태에서 확인한다.
-MW_ROOT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+MW_ROOT="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$MW_ROOT" && -d "$MW_ROOT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mk_fr_items "$MW_ROOT" || { echo "test_task_cli.sh: FR items 픽스처 생성 실패(MW_ROOT)" >&2; exit 1; }
 mkdir -p "$MW_ROOT/rd-workflow-workspace/.lifecycle"
@@ -880,9 +909,8 @@ printf '%s' "$rej_out" | grep -q "some-slug" && echo "ok: 거부 사유에 실�
   && echo "ok: 거부 시 미러 불변" || { echo "FAIL: 거부인데 미러가 바뀌었다"; FAIL=1; }
 
 # --- rd task fr-done (change spec §2.5.1·§2.5.2, 리뷰 F1·F2) ---
-FD_ROOT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+FD_ROOT="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$FD_ROOT" && -d "$FD_ROOT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-trap 'rm -rf "$FD_ROOT"' EXIT
 mkdir -p "$FD_ROOT/rd-workflow-workspace/.lifecycle" "$FD_ROOT/rd-workflow-workspace/backlog/items"
 fd_rd() { env project_root="$FD_ROOT" bash "$RD" "$@"; }
 
@@ -958,9 +986,8 @@ echo "$fd_out" | grep -q "행 부재" && echo "ok: fr-done 행 부재 보고" \
   || { echo "FAIL: 행 부재 보고 없음"; FAIL=1; }
 
 # fr-done <path>... 인자 지정 — task-state 없이도 동작 (발행 후 재시도 경로, §2.5.4)
-FD_ROOT2="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+FD_ROOT2="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$FD_ROOT2" && -d "$FD_ROOT2" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-trap 'rm -rf "$FD_ROOT" "$FD_ROOT2"' EXIT
 mkdir -p "$FD_ROOT2/rd-workflow-workspace/backlog/items"
 FD2_A="rd-workflow-workspace/backlog/items/2026-05-01-retry.md"
 printf '%s\n' "# fr item" "- status: idea" > "$FD_ROOT2/$FD2_A"
@@ -1008,7 +1035,7 @@ rt_make_bare() { # rt_make_bare <dir> — 마커 없는 배치
   cp "$SCRIPT_DIR/lifecycle/slug.sh" "$d/rd-workflow/scripts/lifecycle/"
 }
 
-RT_ROOT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+RT_ROOT="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$RT_ROOT" && -d "$RT_ROOT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 rt_make_root "$RT_ROOT"
 mk_task_file "$RT_ROOT" "구현 중" "roottest"
@@ -1037,7 +1064,7 @@ else
 fi
 
 # (4) 프로젝트 밖 cwd + 절대 경로 호출 = 성공 (AC 16)
-RT_OUT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+RT_OUT="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$RT_OUT" && -d "$RT_OUT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 t "root: 밖의 cwd 에서 절대 경로 호출이 성공한다" 0 "구현 중" \
   env -u project_root bash -c "cd '$RT_OUT' && bash '$RT_RD' task status"
@@ -1047,7 +1074,7 @@ t "root: PATH 경유 호출이 성공한다" 0 "구현 중" \
   env -u project_root PATH="$RT_ROOT/rd-workflow/scripts:$PATH" bash -c "cd '$RT_OUT' && rd task status"
 
 # (5) 마커 없는 배치 = 멈춤 + 파일 0개 생성 (AC 17)
-RT_BAD="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+RT_BAD="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$RT_BAD" && -d "$RT_BAD" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 rt_make_bare "$RT_BAD"
 rt_bad_out="$(env -u project_root bash "$RT_BAD/rd-workflow/scripts/rd" task status 2>&1)"; rt_bad_rc=$?
@@ -1062,7 +1089,7 @@ else
 fi
 
 # (6) 조상 경로 심볼릭 링크는 지원 (AC 18)
-RT_LINKBASE="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+RT_LINKBASE="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$RT_LINKBASE" && -d "$RT_LINKBASE" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 ln -s "$RT_ROOT" "$RT_LINKBASE/linked"
 t "root: 조상 경로 링크 경유가 동작한다" 0 "구현 중" \
@@ -1070,7 +1097,7 @@ t "root: 조상 경로 링크 경유가 동작한다" 0 "구현 중" \
 
 # (6-1) 실행 파일 자체가 링크 = 비지원, 명시적 오류 + 파일 0개 (AC 18)
 # 링크를 마커 밖에 두면 dirname 이 그 위치를 주므로 마커를 잃는다.
-RT_EXECLINK="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+RT_EXECLINK="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$RT_EXECLINK" && -d "$RT_EXECLINK" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 ln -s "$RT_RD" "$RT_EXECLINK/rd-link"
 rt_el_out="$(env -u project_root bash "$RT_EXECLINK/rd-link" task status 2>&1)"; rt_el_rc=$?
@@ -1085,7 +1112,7 @@ else
 fi
 
 # (7) 공백 포함 경로 (AC 18)
-RT_SP_BASE="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+RT_SP_BASE="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$RT_SP_BASE" && -d "$RT_SP_BASE" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 RT_SP="$RT_SP_BASE/has space"
 mkdir -p "$RT_SP"
@@ -1096,7 +1123,7 @@ t "root: 공백 포함 경로에서 동작한다" 0 "구현 중" \
 rm -rf "$RT_ROOT" "$RT_OUT" "$RT_BAD" "$RT_LINKBASE" "$RT_EXECLINK" "${RT_SP%/*}"
 
 # --- set-title (AC 8~12) ---
-ST_ROOT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+ST_ROOT="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$ST_ROOT" && -d "$ST_ROOT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$ST_ROOT/rd-workflow-workspace/.lifecycle"
 mk_task_file "$ST_ROOT" "대기 중" "-"
@@ -1165,7 +1192,7 @@ t "set-title: 대문자·공백을 정규화한다" 0 "-" st_rd task set-title "
 # CLI 가 "기록 성공" 을 보고하면서 미러는 계속 부재했다. 게다가 task-state 는 이미
 # 갱신된 뒤였으므로 partial state write 였다. 그래서 "실패한다" 만이 아니라
 # **"권위도 바뀌지 않았다"** 를 함께 단언한다.
-ST_NOSEC="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+ST_NOSEC="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$ST_NOSEC" && -d "$ST_NOSEC" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$ST_NOSEC/rd-workflow-workspace/.lifecycle"
 printf '# Current Task\n\n## Task\ntest\n\n## Status\n대기 중\n' > "$ST_NOSEC/CURRENT_TASK.md"
@@ -1190,10 +1217,9 @@ rm -rf "$ST_NOSEC"
 #
 # 허용: Status == 대기 중 AND fr-branch 비활성(§2.2) → short-title·source-fr 을 함께
 # sentinel 로 되돌린다(미러 포함). 거부: 그 외 — 어떤 상태도 바꾸지 않는다.
-RST_ROOT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+RST_ROOT="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$RST_ROOT" && -d "$RST_ROOT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mk_fr_items "$RST_ROOT" || { echo "test_task_cli.sh: FR items 픽스처 생성 실패(RST_ROOT)" >&2; exit 1; }
-trap 'rm -rf "$RST_ROOT"' EXIT
 mkdir -p "$RST_ROOT/rd-workflow-workspace/.lifecycle"
 rst_rd() { env project_root="$RST_ROOT" bash "$RD" "$@"; }
 rst_state() { awk -F= '$1=="short-title"{print $2}' "$RST_ROOT/rd-workflow-workspace/.lifecycle/task-state"; }
@@ -1226,10 +1252,9 @@ rst_out_force="$(rst_rd task set-title - --force 2>&1)"; rst_rc_force=$?
 
 # 거부 케이스: Status=대기 중 이지만 fr-branch 활성(ref 실재) — 제목 불일치(rename) 겸용
 # (테스트 ⑨) — 실제 git 저장소가 있어야 show-ref 판정이 의미를 가진다.
-RST_GIT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+RST_GIT="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$RST_GIT" && -d "$RST_GIT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mk_fr_items "$RST_GIT" || { echo "test_task_cli.sh: FR items 픽스처 생성 실패(RST_GIT)" >&2; exit 1; }
-trap 'rm -rf "$RST_ROOT" "$RST_GIT"' EXIT
 ( cd "$RST_GIT" && git init -q . && git commit --allow-empty -qm init -q && git branch fr/rename-live )
 mkdir -p "$RST_GIT/rd-workflow-workspace/.lifecycle"
 mk_task_file "$RST_GIT" "대기 중" "old-title"
@@ -1286,7 +1311,7 @@ rm -rf "$RST_GIT"
 # `_task_section_write` 가 섹션 부재를 실패로 바꾼 뒤부터, 선검사가 없으면 task-state 는
 # 새 값이고 미러는 그대로인 부분 갱신이 남는다. `task_read_status` 로는 못 잡는다 —
 # `get_task_status` 는 task-state 가 있으면 그것만 읽어 미러의 섹션 부재를 보지 못한다.
-ST_NOST="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+ST_NOST="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$ST_NOST" && -d "$ST_NOST" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$ST_NOST/rd-workflow-workspace/.lifecycle"
 printf '# Current Task\n\n## Task\ntest\n\n## Short Title\nx\n' > "$ST_NOST/CURRENT_TASK.md"
@@ -1313,7 +1338,7 @@ rm -rf "$ST_ROOT"
 # --- promote 호출 인자 정적 점검 (AC 7) ---
 # 임시 루트를 인자로 주므로 실제 저장소를 건드리지 않는다.
 CK="$SCRIPT_DIR/check_promote_call_args.sh"
-CK_ROOT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+CK_ROOT="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$CK_ROOT" && -d "$CK_ROOT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$CK_ROOT/rd-workflow/docs" "$CK_ROOT/rd-workflow-workspace/plans"
 
@@ -1367,7 +1392,7 @@ bash "$CK" "$CK_ROOT/does-not-exist-$$" >/dev/null 2>&1; ck_rc=$?
   || { echo "FAIL: check: 없는 root 를 exit $ck_rc 로 처리했다"; FAIL=1; }
 
 # (8) 점검 대상이 하나도 없으면 실패한다
-CK_EMPTY="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+CK_EMPTY="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$CK_EMPTY" && -d "$CK_EMPTY" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$CK_EMPTY/unrelated"
 printf 'bash rd-workflow/scripts/lifecycle/promote.sh --short-title x\n' > "$CK_EMPTY/unrelated/x.md"
@@ -1411,7 +1436,7 @@ bash "$CK" "$CK_ROOT" >/dev/null 2>&1; ck_rc=$?
 # 검사하지 않아 `joined` 가 비고 pipeline 이 0 으로 끝나서, 검사하지 못한 파일이
 # 깨끗한 것으로 처리됐다 — "점검 자체 실패는 exit 2" 계약과 어긋난다.
 # root 를 깨끗한 상태로 두고 읽기 불가 파일 하나만 넣어, exit 2 가 이 파일 때문임을 고립한다.
-CK_UNREAD="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+CK_UNREAD="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$CK_UNREAD" && -d "$CK_UNREAD" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$CK_UNREAD/rd-workflow/docs"
 printf 'bash rd-workflow/scripts/lifecycle/promote.sh --short-title x --size large\n' \
@@ -1435,7 +1460,7 @@ rm -rf "$CK_ROOT"
 # 판정 로직을 스크립트로 분리한 이유가 바로 이 회귀다 — 실제 SKILL.md 를 오염시켜
 # 확인하면 같은 작업의 다른 변경과 로컬 변경을 함께 날린다. fixture 로 시험한다.
 AP="$SCRIPT_DIR/check_autopilot_promote_contract.sh"
-AP_DIR="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+AP_DIR="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$AP_DIR" && -d "$AP_DIR" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 ap_write() { # ap_write <파일> — 계약을 만족하는 최소 SKILL.md
   cat > "$1" <<'APEOF'
@@ -1595,12 +1620,12 @@ rm -rf "$AP_DIR"
 #
 # 안내는 **stderr** 로 나갑니다 — `rd task status` 의 stdout 은 Status 값 한 줄이라는 기계
 # 계약이고, 이 파일이 그 계약을 정확히 비교합니다.
-G="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+G="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$G" && -d "$G" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 G="$(cd "$G" && pwd -P)"
 # CLI 출력 캡처 파일은 **저장소 밖**에 둡니다 — 안에 두면 `git add -A` 가 그 파일까지
 # 커밋해 보호 트리 해시가 바뀌고, 검증이 테스트 자신의 부산물 때문에 실패합니다.
-GT="$(mktemp -d)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+GT="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$GT" && -d "$GT" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 GUARD="${SCRIPT_DIR}/hooks/_guard_common.sh"
 (

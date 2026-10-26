@@ -8,7 +8,7 @@ REQUEST → 리뷰 → spec/plan → 실행 → 검증 → 최종 리뷰까지, 
 
 ## 전제 조건
 
-- [Claude Code](https://claude.ai/code) 설치 및 로그인
+- [Claude Code](https://claude.ai/code) 설치 및 로그인 (2.1.310 이상 — 그 미만은 `.claude/rules/` 하위 폴더 로드를 보장하지 않습니다)
 - [Superpowers](https://github.com/anthropics/claude-code-superpowers) 플러그인 설치
 
 ## 빠른 시작
@@ -71,7 +71,8 @@ AI가 필요한 파일을 가져온 뒤, 프로젝트에 대해 질문하면서 
 
 | 파일 | 역할 |
 |------|------|
-| `CLAUDE.md` | AI 실행 규칙 |
+| `CLAUDE.md` | 프로젝트 규칙 (프로젝트 소유 — sync 가 덮어쓰지 않음) |
+| `.claude/rules/rd-workflow/` | AI 실행 규칙 (템플릿 소유 — sync 가 덮어씀) |
 | `PROJECT_CONTEXT.md` | 프로젝트/도메인 메타데이터 |
 | `REQUEST.md` | 현재 작업 요청서 |
 | `CURRENT_TASK.md` | 진행 중인 작업 상태 |

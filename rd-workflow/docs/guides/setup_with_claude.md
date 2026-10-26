@@ -2,7 +2,7 @@
 
 이 문서는 Claude가 읽고 실행하는 설치 가이드입니다.
 
-사용자는 프로젝트 디렉토리에서 Claude Code를 열고 아래처럼만 말하면 됩니다.
+사용자는 프로젝트 디렉토리에서 Claude Code(2.1.310 이상)를 열고 아래처럼만 말하면 됩니다. 그 미만은 `.claude/rules/` 하위 폴더 로드를 보장하지 않습니다.
 
 ```text
 이 AI 워크플로 템플릿 적용해: <배포 repo URL>
@@ -28,6 +28,7 @@ git clone --depth 1 <배포 repo URL> /tmp/ai-workflow-lite-src
 
 복사 대상:
 - `CLAUDE.md`
+- `.claude/rules/rd-workflow/` (전체 디렉토리)
 - `REQUEST.md`
 - `PROJECT_CONTEXT.md`
 - `CURRENT_TASK.md`

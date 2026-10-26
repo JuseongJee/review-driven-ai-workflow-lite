@@ -561,11 +561,15 @@ mkdir -p "${RES_ITEMS}/2026-03-03-dir.md"
 : > "${RES_ITEMS}/2026-04-04-paren(x).md"
 : > "${RES_ITEMS}/2026-05-05-beta.md"
 : > "${RES_ITEMS}/2026-06-06-a|b.md"
+: > "${RES_ITEMS}/2026-04-19-pre-commit-hook-scoping.md"
+: > "${RES_ITEMS}/2026-05-11-overlay-branch-sync-hook.md"
 
 CANON="rd-workflow-workspace/backlog/items/2026-08-12-alpha.md"
 PAREN="rd-workflow-workspace/backlog/items/2026-04-04-paren(x).md"
 BETA="rd-workflow-workspace/backlog/items/2026-05-05-beta.md"
 PIPED="rd-workflow-workspace/backlog/items/2026-06-06-a|b.md"
+HIST1="rd-workflow-workspace/backlog/items/2026-04-19-pre-commit-hook-scoping.md"
+HIST2="rd-workflow-workspace/backlog/items/2026-05-11-overlay-branch-sync-hook.md"
 
 # --- 지원 표기 8종 (AC2) ---
 t_out "resolve: canonical 그대로" "$CANON" \
@@ -588,6 +592,47 @@ t_out "resolve: slug 단독 (glob)" "$CANON" \
   source_fr_resolve "alpha" "$RES_ROOT"
 t_out "resolve: slug 정확 일치 우선" "$CANON" \
   source_fr_resolve "2026-08-12-alpha" "$RES_ROOT"
+
+# --- ①형식(YYYY-MM-DD slug — 경로) — 실제 아카이브 이력 2건 회귀 (source-fr-unsupported-notations) ---
+t_out "resolve: ①형식(이력 pre-commit-hook-scoping)" "$HIST1" \
+  source_fr_resolve "2026-04-19 pre-commit-hook-scoping — \`${HIST1}\`" "$RES_ROOT"
+t_out "resolve: ①형식(이력 overlay-branch-sync-hook)" "$HIST2" \
+  source_fr_resolve "2026-05-11 overlay-branch-sync-hook — \`${HIST2}\`" "$RES_ROOT"
+
+# --- ①형식 경계 케이스 ---
+# 백틱 없음 — source_fr_from_request 가 실제로 넘기는 형태(백틱을 항상 제거)이므로
+# 반드시 성공해야 한다. 백틱 필수 설계는 실제 promote 경로에서 매칭하지 않는다.
+t_out "resolve: ①형식 백틱 없음(from_request 소비 형태) 성공" "$CANON" \
+  source_fr_resolve "2026-08-12 alpha — ${CANON}" "$RES_ROOT"
+# 경로에 괄호 포함 — 신규 표기 인식이 단계 1(괄호 추출)보다 먼저 실행되어 안전하다.
+t_out "resolve: ①형식 경로 내 괄호 — 단계1 우회로 성공" "$PAREN" \
+  source_fr_resolve "2026-04-04 paren-x — \`${PAREN}\`" "$RES_ROOT"
+# 백틱 2쌍 이상 — 안쪽에 백틱이 남아 벗기기 조건이 거짓, case 미매칭 → v 불변 → 거부.
+t "resolve: ①형식 백틱 2쌍 이상 거부" 1 \
+  source_fr_resolve "2026-04-19 pre-commit-hook-scoping — \`${CANON}\` 참고 \`추가\`" "$RES_ROOT"
+# 전체값 앞에 잔여 텍스트 — ^ 앵커 불일치로 v 불변, 기존 로직에서도 거부.
+t "resolve: ①형식 앞 잔여 텍스트 거부" 1 \
+  source_fr_resolve "메모: 2026-04-19 pre-commit-hook-scoping — \`${CANON}\`" "$RES_ROOT"
+
+# --- 기존 8종과 충돌 없음 회귀 확인 — em dash 뒤가 markdown 링크인 기존 표기 ---
+t_out "resolve: em dash + 상세 링크(기존 8종, ①형식과 비충돌 재확인)" "$CANON" \
+  source_fr_resolve "alpha — [상세](${CANON})" "$RES_ROOT"
+
+# --- ①형식 통합 케이스: REQUEST.md → source_fr_from_request(백틱 제거) → source_fr_resolve ---
+#     resolver 단위 호출(백틱 그대로)만으로 끝내지 않고, 실제 소비 경로를 그대로 재현한다.
+cat > "$REQ_FIX" <<REQEOF
+## Source FR
+2026-04-19 pre-commit-hook-scoping — \`${HIST1}\`
+REQEOF
+_sfr_int_raw="$(source_fr_from_request "$REQ_FIX")"
+t_out "resolve: ①형식 통합(from_request→resolve)" "$HIST1" \
+  source_fr_resolve "$_sfr_int_raw" "$RES_ROOT"
+
+# --- ②형식(- 항목: / - 상세: 2줄 레이블)은 미지원으로 확정 — 거부 확인 ---
+#     from_request 는 첫 유효행 1줄만 읽으므로, "- 항목: ..." 한 줄만으로도
+#     8종/①형식 어디에도 해당하지 않아 거부되는지 확인한다.
+t "resolve: ②형식(- 항목: 레이블) 거부" 1 \
+  source_fr_resolve "항목: source-fr-unsupported-notations" "$RES_ROOT"
 
 # --- 레이블은 문법을 제한하지 않는다 (spec §3.3 단계 1) ---
 t_out "resolve: 임의 레이블 허용" "$CANON" \
@@ -693,7 +738,7 @@ t_out "from_request: 주석 뒤 값 추출" "rd-workflow-workspace/backlog/items
 # source-fr 복수 표현 — resolve_list / join / split / 미러 집합 비교
 # final diff review F6 — 미러의 허용 표기('- ' 접두) 를 정규화하지 않으면 권위와
 # 같은 FR 인데도 다른 값으로 읽혀 정상 상태가 divergence 로 차단된다.
-_f6_dir="$(mktemp -d)" || { echo "test_state_common.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+_f6_dir="$(mktemp -d "$TMP/f6.XXXXXXXX")" || { echo "test_state_common.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$_f6_dir" && -d "$_f6_dir" ]] || { echo "test_state_common.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 printf '## Source FR\n- rd-workflow-workspace/backlog/items/2026-01-01-a.md\n-   rd-workflow-workspace/backlog/items/2026-02-02-b.md\n' > "$_f6_dir/mirror.md"
 _f6_read="$(source_fr_mirror_read "$_f6_dir/mirror.md")"

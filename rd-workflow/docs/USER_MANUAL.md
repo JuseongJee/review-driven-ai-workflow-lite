@@ -240,7 +240,8 @@ codex 의 추론 깊이는 `tools.codex.reasoning_effort`(리뷰 타입별로는
 
 ```
 프로젝트 루트/
-├── CLAUDE.md                    # AI 실행 규칙
+├── CLAUDE.md                    # 프로젝트 규칙 + rd-workflow 규칙 목차
+├── .claude/rules/rd-workflow/   # AI 실행 규칙
 ├── PROJECT_CONTEXT.md           # 프로젝트 메타데이터
 ├── REQUEST.md                   # 현재 작업 요청서
 ├── CURRENT_TASK.md              # 진행 상태
@@ -295,7 +296,7 @@ codex 의 추론 깊이는 `tools.codex.reasoning_effort`(리뷰 타입별로는
 
 | 상황 | 해결 |
 |------|------|
-| AI가 워크플로를 안 따름 | "CLAUDE.md 다시 읽고 워크플로대로 진행해" |
+| AI가 워크플로를 안 따름 | "CLAUDE.md 와 .claude/rules/rd-workflow/ 다시 읽고 워크플로대로 진행해" |
 | 등급이 과하게 잡힘 | "standard 로 내려서 진행해줘" 명시 (하향은 사용자만) |
 | 검증이 계속 FAIL | `test.sh`/`lint.sh`/`typecheck.sh` 설정과 PROJECT_CONTEXT.md 검증 명령 확인 |
 | 리뷰가 20턴 넘어도 끝나지 않음 | `awaiting-user`로 전환됨 — 직접 판단 후 진행 지시 |

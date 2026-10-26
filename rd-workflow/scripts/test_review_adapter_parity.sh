@@ -74,7 +74,7 @@ assert_no_real_cli() { # assert_no_real_cli <라벨>
 mkdir -p "$TMP/rd-workflow/scripts" "$TMP/rd-workflow/config" \
          "$TMP/rd-workflow/docs/flows" "$TMP/rd-workflow/docs/prompts/review" \
          "$TMP/sess/turns" "$TMP/cap"
-for f in run_review_turn.sh review_common.sh adapter_codex.sh adapter_claude.sh; do
+for f in run_review_turn.sh review_common.sh review_wait.sh adapter_codex.sh adapter_claude.sh; do
   cp "${script_dir}/$f" "$TMP/rd-workflow/scripts/$f"
 done
 

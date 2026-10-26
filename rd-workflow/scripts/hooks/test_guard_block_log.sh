@@ -294,8 +294,11 @@ done
 # 정본과 루트 양쪽을 본다 — 정본만 고치고 루트를 빠뜨리는 것이 이 저장소의 흔한 실수다.
 # 이 파일은 정본(`_ROOT_FILES/rd-workflow/scripts/hooks/`)과 루트 사본 양쪽에 존재하므로
 # HOOK_DIR 기준 상대 경로가 두 경우에 다르다. `.gitignore` 가 실제로 있는 후보만 본다.
+# 후보 아래에 `rd-workflow/` 가 있을 때만 이 프로젝트가 책임지는 `.gitignore` 로 본다 —
+# 중첩 저장소의 부모(남의 저장소) `.gitignore` 를 검사하던 거짓 실패 (GitHub #39).
 _gbl_bases=""
 for cand in "$HOOK_DIR/../../.." "$HOOK_DIR/../../../.." "$HOOK_DIR/../../../_ROOT_FILES" "$HOOK_DIR/../../../../_ROOT_FILES"; do
+  [[ -d "$cand/rd-workflow" ]] || continue
   [[ -f "$cand/.gitignore" ]] || continue
   cand="$(cd "$cand" && pwd)"
   case " $_gbl_bases " in *" $cand "*) continue ;; esac

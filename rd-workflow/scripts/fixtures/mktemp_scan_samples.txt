@@ -1,10 +1,12 @@
 #EXPECT: ok template-match
   ok_var="$(mktemp -d)" || { echo "sample_ok: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$ok_var" && -d "$ok_var" ]] || { echo "sample_ok: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
-#EXPECT: violation or-typo
+# 1줄째가 같은 줄 종료 핸들러라 통과 — 2줄째 검증은 2026-10-22 부터 필수 아님(spec 4.1)
+#EXPECT: ok or-typo
   v1="$(mktemp -d)" || { echo "v1: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
   [[ -n "$v1" || -d "$v1" ]] || { echo "v1: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-#EXPECT: violation empty-allowed
+# 1줄째가 같은 줄 종료 핸들러라 통과 — 2줄째 검증은 2026-10-22 부터 필수 아님(spec 4.1)
+#EXPECT: ok empty-allowed
   v2="$(mktemp -d)" || { echo "v2: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
   [[ -z "$v2" || -d "$v2" ]] || { echo "v2: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 #EXPECT: violation handler-removed
@@ -13,7 +15,8 @@
 #EXPECT: violation decl-combined
   local v4="$(mktemp -d)" || { echo "v4: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
   [[ -n "$v4" && -d "$v4" ]] || { echo "v4: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-#EXPECT: violation use-before-verify
+# 1줄째가 같은 줄 종료 핸들러라 통과 — 2줄째 검증은 2026-10-22 부터 필수 아님(spec 4.1)
+#EXPECT: ok use-before-verify
   v5="$(mktemp -d)" || { echo "v5: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
   mkdir -p "$v5/early"
   [[ -n "$v5" && -d "$v5" ]] || { echo "v5: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
@@ -23,6 +26,24 @@
 #EXPECT: violation command-prefix
   v7="$(command mktemp -d)" || { echo "v7: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
   [[ -n "$v7" && -d "$v7" ]] || { echo "v7: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+#EXPECT: ok oneline-return-bare
+  o1="$(mktemp -d)" || { fail "o1"; return; }
+#EXPECT: ok oneline-exit-template-arg
+  o2="$(mktemp -d "${TMPDIR:-/tmp}/a.XXXXXX")" || exit 1
+#EXPECT: violation oneline-or-true
+  w1="$(mktemp -d)" || true
+#EXPECT: violation oneline-no-terminator
+  w2="$(mktemp -d)" || { echo "w2" >&2; }
+#EXPECT: violation oneline-exit-no-number
+  w3="$(mktemp -d)" || { echo "w3" >&2; exit; }
+#EXPECT: violation oneline-semicolon-use
+  w4="$(mktemp -d)"; use "$w4"
+#EXPECT: violation oneline-handler-on-other-command
+  w5="$(mktemp -d)"; foo || exit 1
+#EXPECT: violation oneline-conditional-exit
+  w6="$(mktemp -d)" || { echo "w6" >&2; true || exit 1; }
+#EXPECT: violation oneline-conditional-return
+  w7="$(mktemp -d)" || { echo "w7" >&2; c && return 1; }
 #EXPECT: violation echo-substitution
   echo "$(mktemp -d)"
 #EXPECT: violation escaped-substitution

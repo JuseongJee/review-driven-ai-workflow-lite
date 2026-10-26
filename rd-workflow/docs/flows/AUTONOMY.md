@@ -4,7 +4,7 @@ autopilot 모드와 반자율(semi-auto) 모드가 공통으로 따르는 자율
 
 **적용 대상:**
 - autopilot 모드: `rd-workflow/claude_skills/autopilot/SKILL.md`가 이 문서를 참조한다. autopilot 특화 예외 게이트(§1 작업 선택·실행 모드 선택)는 SKILL.md에 있으며 이 문서보다 우선한다.
-- 반자율 모드: CLAUDE.md "실행 모드" 규칙이 이 문서를 참조한다. 착수 지시 이후부터 적용된다 (Intake 규칙은 유지 — 새 요청은 등급 판정 후 `light`·`standard` 는 즉시 진행, `full` 만 FR 등록 후 착수 지시 대기).
+- 반자율 모드: `.claude/rules/rd-workflow/core.md` "실행 모드" 규칙이 이 문서를 참조한다. 착수 지시 이후부터 적용된다 (Intake 규칙은 유지 — 새 요청은 등급 판정 후 `light`·`standard` 는 즉시 진행, `full` 만 FR 등록 후 착수 지시 대기).
 - 절대 규칙과 일반 모드의 20턴 review 규칙은 이 문서로 바뀌지 않는다.
 
 ## 절대 멈추지 않는다
@@ -20,7 +20,7 @@ autopilot 모드와 반자율(semi-auto) 모드가 공통으로 따르는 자율
   - 설계 대안 제시 + 승인 요청 → 추천안(recommended)을 선택, 없으면 REQUEST의 제약/AC와 가장 부합하는 옵션 선택, 우열이 서지 않으면 가장 단순한 옵션 선택 (단, PROJECT_CONTEXT.md의 필수 제약을 위반하는 옵션은 제외)
   - 추가 확인 질문 → 기존 컨텍스트로 판단, 판단 불가 시에만 멈춤 (판단 근거를 완료 보고서 "주요 결정" 테이블에 기록)
   - 모든 옵션이 필수 제약을 위반하거나 판단 근거가 전혀 없으면 멈추고 사용자에게 보고
-- writing-plans의 "execution choice" 질문을 따르지 않는다 — CLAUDE.md 실행 모드 규칙에 따라 자동 선택한다
+- writing-plans의 "execution choice" 질문을 따르지 않는다 — `.claude/rules/rd-workflow/core.md` 실행 모드 규칙에 따라 자동 선택한다
 
 ## 자율 판단 기준
 

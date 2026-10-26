@@ -554,19 +554,90 @@ resolve_target() {
   printf '%s\n' "$target"
 }
 
+# gh stderr 에서 credential 만 가립니다. **host·repo·scope 이름은 가리지 않습니다** —
+# 사용자가 직접 넣은 값이거나 권한 이름이고, 가리면 "어느 대상에서 왜 실패했는지" 를
+# 잃어 진단의 목적이 무너집니다. Authorization 은 scheme 과 값을 함께 가립니다 (줄 끝까지).
+_GH_MASK='s/gh[pousr]_[A-Za-z0-9]\{16,\}/***/g; s/github_pat_[A-Za-z0-9_]\{16,\}/***/g; s/[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]:.*/Authorization: ***/'
+
+# 실패한 gh 호출의 진단 블록을 stdout 으로 만듭니다.
+# **갈래 판정은 절단 전 전문에 대해 합니다** — gh 는 오류 요지를 먼저 쓰고 긴 usage 를
+# 뒤에 붙이므로, 절단한 조각에서 패턴을 찾으면 핵심과 힌트를 함께 잃습니다.
+# **힌트는 보조입니다** — gh 가 문구를 바꾸면 미분류로 떨어질 뿐 원문은 언제나 나갑니다.
+# **절단은 줄 경계에서만 합니다** — `${line:0:N}` 같은 슬라이스는 로케일에 따라 문자/byte
+# 로 갈려 `LC_ALL=C` 에서 한국어를 UTF-8 중간에서 자릅니다.
+_gh_diagnose() {
+  local host="$1" errfile="$2" argsum="$3"
+  local full lower hint="" masked_args line total shown=0 used=0 lbytes
+  full="$(sed "$_GH_MASK" "$errfile")"
+  masked_args="$(printf '%s' "$argsum" | sed "$_GH_MASK")"
+  lower="$(printf '%s' "$full" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in
+    *"unknown flag"*|*"unknown shorthand flag"*|*"unknown command"*|*"accepts at most"*|*"requires at least"*)
+      hint="명령 인자가 이 gh 버전의 문법과 맞지 않습니다 — 네트워크·권한 문제가 아닙니다." ;;
+    *"http 401"*|*"authentication"*|*"gh auth login"*|*"bad credentials"*)
+      hint="대상 host 인증 문제입니다 — gh auth status --hostname ${host} 로 확인하십시오." ;;
+    *"http 404"*|*"could not resolve to a"*|*"not found"*)
+      hint="대상 저장소를 찾을 수 없습니다 — 이름 오기 또는 접근 권한 부재입니다." ;;
+    *"dial tcp"*|*"no such host"*|*"connection refused"*|*"i/o timeout"*|*"tls handshake"*)
+      hint="네트워크로 host 에 닿지 못했습니다." ;;
+    *) hint="" ;;   # 미분류 — 확인되지 않은 원인을 단정하지 않습니다
+  esac
+  printf 'gh 오류: 호출 실패 (host=%s, 명령: gh %s)\n' "$host" "$masked_args"
+  [[ -n "$hint" ]] && printf '  진단: %s\n' "$hint"
+  if [[ -z "${full//[[:space:]]/}" ]]; then
+    printf '  gh 원문: (없음 — gh 가 오류를 남기지 않았습니다)\n'
+    return 0
+  fi
+  total="$(printf '%s\n' "$full" | wc -l | tr -d ' ')"
+  printf '  gh 원문:\n'
+  while IFS= read -r line; do
+    lbytes="$(printf '%s' "$line" | wc -c | tr -d ' ')"
+    # 첫 줄은 한도와 무관하게 전부 냅니다 — gh 는 오류의 요지를 첫 줄에 씁니다.
+    # 다만 그 byte 수는 누적에 **포함**합니다. 포함하지 않으면 실제 출력이 한도를
+    # 최대 두 배까지 넘습니다 (spec/plan review R7 후속).
+    if (( shown > 0 )); then
+      (( shown >= 20 )) && break
+      (( used + lbytes > 4000 )) && break
+    fi
+    used=$((used + lbytes))
+    printf '    %s\n' "$line"
+    shown=$((shown+1))
+  done <<< "$full"
+  (( total > shown )) && printf '    … (전체 %s줄 중 %s줄만 표시)\n' "$total" "$shown"
+  return 0
+}
+
+# **stderr 를 버리지 않습니다.** 성공하면 조용하고, 실패하면 원인 갈래를 알려줍니다.
+# 종료 상태와 stdout 은 변경 전과 동일합니다 — exit code 표와
+# search_matches() 의 "0건 vs 조회 실패" 계약이 여기에 걸려 있습니다.
 gh_run() {
   local host="$1"; shift
-  if [[ "$host" == "github.com" ]]; then
-    gh "$@"
-  else
-    GH_HOST="$host" gh "$@"
+  local errfile rc
+  errfile="$(mktemp "${TMPDIR:-/tmp}/rd-gh-err.XXXXXX" 2>/dev/null)" || errfile=""
+  if [[ -z "$errfile" || ! -f "$errfile" ]]; then
+    # 진단을 수집할 수 없습니다. 원문을 그대로 흘리면 마스킹을 우회해 credential 이
+    # 새고 성공 경로까지 시끄러워지므로, 변경 전처럼 억제하고 그 사실만 알립니다.
+    if [[ "$host" == "github.com" ]]; then gh "$@" 2>/dev/null; else GH_HOST="$host" gh "$@" 2>/dev/null; fi
+    rc=$?
+    (( rc != 0 )) && printf 'gh 오류: 호출 실패 (host=%s, 명령: gh %s) — 진단 원문을 수집하지 못했습니다 (임시 파일 생성 실패).\n' \
+        "$host" "$(printf '%s' "$*" | sed "$_GH_MASK")" >&2
+    return $rc
   fi
+  if [[ "$host" == "github.com" ]]; then
+    gh "$@" 2>"$errfile"
+  else
+    GH_HOST="$host" gh "$@" 2>"$errfile"
+  fi
+  rc=$?
+  (( rc != 0 )) && _gh_diagnose "$host" "$errfile" "$*" >&2
+  rm -f "$errfile"
+  return $rc
 }
 
 visibility_of() {
   local host="$1" repo="$2" out
   # gh repo view 는 저장소를 위치 인자로 받는다 (--repo 플래그는 존재하지 않는다).
-  out="$(gh_run "$host" repo view "$repo" --json visibility 2>/dev/null)" || return 1
+  out="$(gh_run "$host" repo view "$repo" --json visibility)" || return 1
   printf '%s\n' "$out" | sed -n 's/.*"visibility"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
 }
 
@@ -703,8 +774,8 @@ cmd_preview() {
     echo "오류: gh CLI 를 찾을 수 없습니다. https://cli.github.com/ 에서 설치하십시오." >&2
     return 4
   fi
-  if ! gh_run "$host" auth status --hostname "$host" >/dev/null 2>&1; then
-    echo "오류: '$host' 에 인증되지 않았습니다. 'gh auth login --hostname $host' 를 실행하십시오." >&2
+  if ! gh_run "$host" auth status --hostname "$host" >/dev/null; then
+    echo "오류: '$host' 인증 상태를 확인하지 못했습니다 (gh auth status 실패). 위 gh 진단을 보십시오 — 인증 문제라면 'gh auth login --hostname $host' 를 실행하십시오." >&2
     return 4
   fi
 
@@ -779,8 +850,8 @@ cmd_publish() {
     print_failure_hint "$file" "$retry_opts"
     return 4
   fi
-  if ! gh_run "$host" auth status --hostname "$host" >/dev/null 2>&1; then
-    echo "오류: '$host' 에 인증되지 않았습니다. 'gh auth login --hostname $host' 를 실행하십시오." >&2
+  if ! gh_run "$host" auth status --hostname "$host" >/dev/null; then
+    echo "오류: '$host' 인증 상태를 확인하지 못했습니다 (gh auth status 실패). 위 gh 진단을 보십시오 — 인증 문제라면 'gh auth login --hostname $host' 를 실행하십시오." >&2
     print_failure_hint "$file" "$retry_opts"
     return 4
   fi
@@ -856,7 +927,7 @@ cmd_publish() {
   # 조회 실패와 "0건" 을 반드시 분리한다. 실패를 0건으로 오인하면 기존 Issue 가 있어도
   # 새로 만들어 중복이 생긴다 (final diff review Finding 1).
   local search_out search_rc match_count
-  search_out="$(search_matches "$host" "$repo" "$id" 2>/dev/null)"; search_rc=$?
+  search_out="$(search_matches "$host" "$repo" "$id")"; search_rc=$?
   if [[ $search_rc -ne 0 ]]; then
     echo "오류: report-id $id 의 기존 Issue 조회에 실패했습니다 (gh issue list rc=$search_rc)." >&2
     echo "      중복 여부를 확인할 수 없어 발행하지 않았습니다 (fail-closed)." >&2
@@ -939,7 +1010,7 @@ EOF
   fi
 
   # 11. gh issue create (라벨 없이 1회만 — 재시도하지 않는다)
-  created_url="$(gh_run "$host" issue create --repo "$repo" --title "$title" --body-file "$tmp_body" 2>/dev/null)"
+  created_url="$(gh_run "$host" issue create --repo "$repo" --title "$title" --body-file "$tmp_body")"
   create_rc=$?
   rm -f "$tmp_body"
   if [[ $create_rc -ne 0 || -z "$created_url" ]]; then
@@ -950,7 +1021,7 @@ EOF
   created_url="$(printf '%s\n' "$created_url" | head -1)"
 
   # 12. 라벨 부착 (best-effort — 실패해도 발행 자체는 유지하되 조용히 넘어가지 않는다)
-  if ! gh_run "$host" issue edit "$created_url" --add-label defect-report >/dev/null 2>&1; then
+  if ! gh_run "$host" issue edit "$created_url" --add-label defect-report >/dev/null; then
     cat >&2 <<EOF
 전달 완료(라벨 미부착): $created_url
   라벨 defect-report 를 붙이지 못했습니다. 이 상태로는 정본 /fr pull 의 흡수 대상이

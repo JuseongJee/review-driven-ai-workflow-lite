@@ -3,7 +3,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TARGET="$SCRIPT_DIR/defect_reports.sh"
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 
 ok()   { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 nok()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; }
@@ -169,11 +169,19 @@ echo "== 발행 경로 (fake gh) =="
 
 setup_fake_gh() {
   FAKEBIN="$WS/fakebin"; mkdir -p "$FAKEBIN"
-  GH_LOG="$WS/gh-calls.log"; GH_BODY="$WS/gh-body.txt"
-  : > "$GH_LOG"; : > "$GH_BODY"
+  GH_LOG="$WS/gh-calls.log"; GH_BODY="$WS/gh-body.txt"; GH_ARGV="$WS/gh-argv.log"
+  : > "$GH_LOG"; : > "$GH_BODY"; : > "$GH_ARGV"
   cat > "$FAKEBIN/gh" <<'FAKE'
 #!/usr/bin/env bash
 printf 'HOST=%s ARGS=%s\n' "${GH_HOST:-github.com}" "$*" >> "$GH_LOG"
+# 인자 경계를 보존하는 대조용 로그. `$*` 는 공백으로 다시 나눌 수 없다 —
+# --jq 값 안의 `-->` 가 옵션으로 오인된다 (spec 2-B).
+if [[ -n "${GH_ARGV:-}" ]]; then
+  { printf '%s\037' "${GH_HOST:-github.com}"
+    for a in "$@"; do printf '%s\037' "$a"; done
+    printf '\n'; } >> "$GH_ARGV"
+fi
+[[ -n "${FAKE_GH_STDERR:-}" ]] && printf '%s\n' "$FAKE_GH_STDERR" >&2
 prev=""
 for a in "$@"; do
   [[ "$prev" == "--body-file" ]] && cat "$a" > "$GH_BODY"
@@ -223,6 +231,11 @@ FAKEMV
 if [[ -n "\${FAKE_MKTEMP_FAIL:-}" && \$# -eq 0 ]]; then
   echo "mktemp: 주입된 실패" >&2; exit 1
 fi
+if [[ -n "\${FAKE_MKTEMP_FAIL_GH:-}" ]]; then
+  for a in "\$@"; do
+    case "\$a" in *rd-gh-err*) echo "mktemp: 주입된 실패 (gh 캡처)" >&2; exit 1 ;; esac
+  done
+fi
 exec "$REAL_MKTEMP" "\$@"
 FAKEMK
   chmod +x "$FAKEBIN/mktemp"
@@ -253,7 +266,7 @@ exec /bin/cat "$@"
 FAKECAT
   chmod +x "$FAKEBIN/cat"
 }
-run_dr() { (cd "$WS" && PATH="$FAKEBIN:$PATH" GH_LOG="$GH_LOG" GH_BODY="$GH_BODY" \
+run_dr() { (cd "$WS" && PATH="$FAKEBIN:$PATH" GH_LOG="$GH_LOG" GH_ARGV="$GH_ARGV" GH_BODY="$GH_BODY" \
                        MV_COUNT="$MV_COUNT" CAT_COUNT="$CAT_COUNT" bash "$TARGET" "$@"); }
 
 # grep -c 는 0건일 때 '0' 을 출력하고 exit 1 을 반환한다. `|| echo 0` 을 붙이면
@@ -843,7 +856,6 @@ echo "== set-upstream: 줄 배치를 전제하지 않는다 (Turn 011 Finding 2)
 # python3 이 없는 환경에서는 JSON 파싱 검증만 건너뛴다 (production 과 같은 정책).
 # JSON 유효성 단언. **검사기가 없으면 조용히 통과시키지 않고 skip 으로 표시한다** —
 # 종전 구현은 python3 이 없으면 무조건 성공을 반환해, 검증되지 않은 사실을 "ok" 로 셌다.
-SKIP=0
 assert_json_valid() {  # $1=파일 $2=라벨
   if ! command -v python3 >/dev/null 2>&1; then
     SKIP=$((SKIP+1)); printf '  skip %s (python3 없음 — JSON 구조 검증 불가)\n' "$2"; return 0
@@ -1038,7 +1050,7 @@ else ok "PATH 에 python3 없음"; fi
 
 # NOPY 를 앞에 두어 python3 을 가리고, fake gh 는 뒤쪽 FAKEBIN 에서 잡는다.
 # (NOPY 의 cat·mv·mktemp 는 실물 심링크라 주입 대역이 끼어들지 않는다.)
-nopy_dr() { (cd "$WS" && PATH="$NOPY:$FAKEBIN" GH_LOG="$GH_LOG" GH_BODY="$GH_BODY" \
+nopy_dr() { (cd "$WS" && PATH="$NOPY:$FAKEBIN" GH_LOG="$GH_LOG" GH_ARGV="$GH_ARGV" GH_BODY="$GH_BODY" \
                         bash "$TARGET" "$@"); }
 
 out="$(nopy_dr set-upstream 'https://github.com/O/R.git' 2>&1)"; rc=$?
@@ -1079,5 +1091,410 @@ check "정상 값이어도 exit 2" "$rc" "2"
 check "gh 호출 0회" "$(wc -l < "$GH_LOG" | tr -d ' ')" "0"
 case "$err" in *--upstream*) ok "--upstream 진행 방법 안내";; *) nok "--upstream 안내 없음: [$err]";; esac
 
-printf '\n결과: pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
+echo "-- gh 실패 진단: 4갈래가 서로 구별되고 미분류는 원인을 단정하지 않는다 (AC 1·2) --"
+# **명령 치환 안에서 부르지 않는다.** 서브셸이면 setup_workspace 의 케이스 디렉터리
+# 변경과 rc 가 부모에 남지 않아 set -u 에서 스위트가 죽는다 (spec/plan review R9).
+# 결과는 부모 셸의 DIAG_ERR·DIAG_RC 에 남긴다.
+DIAG_ERR=""; DIAG_RC=0
+diag_run() {  # $1=주입할 stderr 원문 — 부모 셸에서 직접 호출한다
+  setup_workspace; setup_fake_gh
+  local f
+  f="$(make_report "2026-08-12-5001-diag.md")"
+  DIAG_ERR="$(FAKE_VISIBILITY=ERROR FAKE_GH_STDERR="$1" run_dr publish "$f" --upstream "O/R" --yes 2>&1 >/dev/null)"
+  DIAG_RC=$?   # 바로 앞 명령 치환의 rc = publish 의 rc
+}
+diag_case() {  # $1=주입 $2=있어야 할 문구 $3=이름
+  diag_run "$1"
+  check "$3: exit 3 유지" "$DIAG_RC" "3"
+  case "$DIAG_ERR" in *"$2"*) ok "$3: '$2' 도달";; *) nok "$3: '$2' 없음 — [$DIAG_ERR]";; esac
+}
+diag_case 'unknown flag: --repo'             '명령 인자가'      '문법 오류'
+diag_case 'HTTP 401: Bad credentials'        '인증 문제'        '인증 실패'
+diag_case 'HTTP 404: Not Found'              '찾을 수 없습니다'  '대상 없음'
+diag_case 'dial tcp: lookup x: no such host' '네트워크로'       '네트워크'
+
+echo "-- 미분류 오류는 원인을 단정하지 않고 원문만 낸다 (AC 2) --"
+diag_run 'something entirely new happened'; err="$DIAG_ERR"
+case "$err" in *"something entirely new happened"*) ok "미분류: 원문 도달";; *) nok "미분류: 원문 없음 — [$err]";; esac
+case "$err" in
+  *네트워크로*|*"인증 문제"*|*"명령 인자가"*|*"찾을 수 없습니다"*) nok "미분류인데 갈래를 단정함 — [$err]" ;;
+  *) ok "미분류: 갈래 단정 없음" ;;
+esac
+
+echo "-- 분류는 절단 전 전문 기준이고, 잘림은 표시된다 (AC 1) --"
+long_usage="unknown flag: --repo"
+for i in $(seq 1 40); do long_usage="${long_usage}
+usage line ${i}"; done
+diag_run "$long_usage"; err="$DIAG_ERR"
+case "$err" in *"명령 인자가"*) ok "긴 usage 뒤에도 문법 갈래 판정";; *) nok "절단 때문에 갈래를 놓침 — [$err]";; esac
+case "$err" in *"unknown flag: --repo"*) ok "핵심 원문 보존";; *) nok "핵심 원문 소실 — [$err]";; esac
+case "$err" in *"줄만 표시"*) ok "잘림 표시";; *) nok "잘렸는데 표시 없음 — [$err]";; esac
+
+echo "-- 누적 byte 한도가 첫 줄을 포함해 지켜진다 (R7 후속) --"
+# 첫 줄 3990 byte + 둘째 줄 100 byte → 첫 줄만 나오고 잘림 표시가 붙어야 한다.
+big1="$(printf 'A%.0s' $(seq 1 3990))"
+diag_run "${big1}
+$(printf 'B%.0s' $(seq 1 100))"
+case "$DIAG_ERR" in *"$big1"*) ok "한도 초과: 첫 줄은 보존";; *) nok "한도 초과: 첫 줄 소실";; esac
+case "$DIAG_ERR" in *BBBBBBBBBB*) nok "한도 초과: 둘째 줄이 한도를 넘겨 출력됨";; *) ok "한도 초과: 둘째 줄 생략";; esac
+case "$DIAG_ERR" in *"줄만 표시"*) ok "한도 초과: 잘림 표시";; *) nok "한도 초과: 잘림 표시 없음";; esac
+
+echo "-- 첫 줄 자체가 한도를 넘어도 첫 줄은 보존하고 잘림을 알린다 (R7 후속) --"
+huge="$(printf 'C%.0s' $(seq 1 5000))"
+diag_run "${huge}
+tail line"
+case "$DIAG_ERR" in *"$huge"*) ok "거대 첫 줄 보존";; *) nok "거대 첫 줄 소실";; esac
+case "$DIAG_ERR" in *"줄만 표시"*) ok "거대 첫 줄: 잘림 표시";; *) nok "거대 첫 줄: 잘림 표시 없음";; esac
+
+echo "-- 한국어 원문이 어느 로케일에서도 UTF-8 로 온전하다 (R7) --"
+# 500자를 훌쩍 넘는 한 줄. 문자·byte 슬라이스를 쓰면 LC_ALL=C 에서 마지막 문자가
+# UTF-8 중간에서 잘린다. 줄 경계 절단은 로케일과 무관하게 안전하다.
+kor_line="$(kor 400)"
+if ! command -v iconv >/dev/null 2>&1; then
+  SKIP=$((SKIP+1)); printf '  skip %s\n' "한국어 UTF-8 회귀 (iconv 없음)"
+fi
+for loc in "" "C"; do
+  command -v iconv >/dev/null 2>&1 || break
+  name="로케일=${loc:-기본}"
+  if [[ -n "$loc" ]]; then
+    setup_workspace; setup_fake_gh
+    f="$(make_report "2026-08-12-5006-kor.md")"
+    err="$(LC_ALL=C FAKE_VISIBILITY=ERROR FAKE_GH_STDERR="$kor_line" \
+           run_dr publish "$f" --upstream "O/R" --yes 2>&1 >/dev/null)"
+  else
+    diag_run "$kor_line"; err="$DIAG_ERR"
+  fi
+  # BSD(macOS) iconv 는 출력이 /dev/null 일 때 **대량 멀티바이트 입력에서** 유효한
+  # UTF-8 에도 "Inappropriate ioctl for device" 로 실패한다 (같은 조합에서 ASCII 는
+  # 통과하므로 입력 유효성과 무관한 환경 고유 결함이다). `wc -c` 를 한 단계 끼워
+  # 출력을 파이프로 만들면 피할 수 있고, 진짜 잘못된 byte 열은 `set -o pipefail`
+  # 아래에서 여전히 rc=1 로 전파된다 (실측 확인).
+  if printf '%s' "$err" | iconv -f UTF-8 -t UTF-8 2>/dev/null | wc -c >/dev/null; then
+    ok "$name: 출력이 유효한 UTF-8"
+  else
+    nok "$name: UTF-8 경계가 깨짐"
+  fi
+  case "$err" in *"$kor_line"*) ok "$name: 한국어 원문 보존";; *) nok "$name: 한국어 원문 손실";; esac
+done
+
+echo "-- 마스킹: credential 은 가리고 repo 이름은 남긴다 (AC 5) --"
+mask_case() {  # $1=주입 $2=사라져야 할 문자열 $3=이름
+  diag_run "$1"; local err="$DIAG_ERR"
+  case "$err" in *"$2"*) nok "$3: credential 노출 — [$err]";; *) ok "$3: 마스킹됨";; esac
+  case "$err" in *O/R*) ok "$3: repo 이름 보존";; *) nok "$3: repo 이름까지 가려짐 — [$err]";; esac
+}
+mask_case 'HTTP 401 using ghp_AAAAAAAAAAAAAAAAAAAA for O/R' 'ghp_AAAAAAAAAAAAAAAAAAAA' '토큰'
+mask_case 'O/R rejected; Authorization: Bearer SYNTHETIC_SECRET_VALUE' 'SYNTHETIC_SECRET_VALUE' 'Bearer'
+mask_case 'O/R rejected; authorization: Basic SYNTHETIC_BASE64_VALUE'  'SYNTHETIC_BASE64_VALUE' 'Basic'
+
+echo "-- 캡처 불가(mktemp 실패)에서도 credential 이 새지 않는다 (AC 5) --"
+setup_workspace; setup_fake_gh
+f="$(make_report "2026-08-12-5005-nocapture.md")"
+err="$(FAKE_MKTEMP_FAIL_GH=1 FAKE_VISIBILITY=ERROR \
+       FAKE_GH_STDERR='HTTP 401 using ghp_BBBBBBBBBBBBBBBBBBBB' \
+       run_dr publish "$f" --upstream "O/R" --yes 2>&1 >/dev/null)"; rc=$?
+check "캡처 불가에도 exit 3 유지" "$rc" "3"
+case "$err" in *ghp_BBBBBBBBBBBBBBBBBBBB*) nok "캡처 불가 경로에서 credential 노출 — [$err]";; *) ok "캡처 불가: credential 미노출";; esac
+case "$err" in *"수집하지 못했습니다"*) ok "캡처 불가: 사실을 알림";; *) nok "캡처 불가: 안내 없음 — [$err]";; esac
+
+echo "-- 성공 경로는 조용하다 (AC 4) --"
+setup_workspace; setup_fake_gh
+f="$(make_report "2026-08-12-5004-quiet.md")"
+err="$(FAKE_GH_STDERR='gh: a new release is available' \
+       run_dr publish "$f" --upstream "O/R" --yes 2>&1 >/dev/null)"
+check "성공 시 stderr 비어 있음" "$err" ""
+
+echo "-- 호출 지점별로 진단이 사용자 stderr 까지 도달하고 stdout 은 오염되지 않는다 (AC 3·8) --"
+# 갈래 × 지점을 곱하지 않는다 — 지점마다 대표 실패 하나로 리다이렉션 누락을 잡는다.
+# 기대 exit 는 defect_reports.sh 를 직접 읽어 확인한 실제 값이다(추측값 아님):
+#   auth 실패(778-779, 853-856) -> 4 / repo view 실패(785-786, 862-865) -> 3
+#   issue list 실패(933-936, fail-closed) -> 3 / issue create 실패(1019-1022) -> 9
+#   issue edit 실패(1035-1041) 는 best-effort 경고만 내고 발행 자체는 유지되어
+#   13 역기록이 성공하면 publish exit 는 0 이다(line 374 기존 테스트가 이미 이를 전제).
+# 임시 파일 생성 실패를 삼키지 않는다 (mktemp 가드 규약). 실패를 흘리면 빈 경로로
+# 리다이렉트해 저장소 밖에 쓰는 사고가 난다 — 같은 유형의 사고 이력이 있다.
+site_tmp() {  # stdout=임시 파일 경로
+  local t
+  t="$(mktemp)" || { echo "  FAIL 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$t" && -f "$t" ]] || { echo "  FAIL 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  printf '%s' "$t"
+}
+site_check() {  # $1=marker $2=기대 exit $3=이름 $4=out파일 $5=err파일 $6=rc
+  local marker="$1" want="$2" name="$3" out="$4" err="$5" rc="$6"
+  check "$name: exit $want" "$rc" "$want"
+  grep -q "$marker" "$err" && ok "$name: 진단이 사용자 stderr 에 도달" || nok "$name: 진단 소실 — [$(cat "$err")]"
+  grep -q "$marker" "$out" && nok "$name: 진단이 stdout 을 오염시킴" || ok "$name: stdout 미오염"
+}
+
+setup_workspace; setup_fake_gh
+f="$(make_report "2026-08-12-7001-site-auth.md")"
+out="$(site_tmp)" || exit 1; err="$(site_tmp)" || exit 1
+FAKE_AUTH=fail FAKE_GH_STDERR="SYNTHETIC_SITE_MARKER_auth_publish" \
+  run_dr publish "$f" --upstream "O/R" --yes >"$out" 2>"$err"; rc=$?
+site_check "SYNTHETIC_SITE_MARKER_auth_publish" 4 "auth-publish" "$out" "$err" "$rc"
+rm -f "$out" "$err"
+
+setup_workspace; setup_fake_gh
+f="$(make_report "2026-08-12-7002-site-repoview.md")"
+out="$(site_tmp)" || exit 1; err="$(site_tmp)" || exit 1
+FAKE_VISIBILITY=ERROR FAKE_GH_STDERR="SYNTHETIC_SITE_MARKER_repo_view" \
+  run_dr publish "$f" --upstream "O/R" --yes >"$out" 2>"$err"; rc=$?
+site_check "SYNTHETIC_SITE_MARKER_repo_view" 3 "repo-view" "$out" "$err" "$rc"
+rm -f "$out" "$err"
+
+setup_workspace; setup_fake_gh
+f="$(make_report "2026-08-12-7003-site-issuelist.md")"
+out="$(site_tmp)" || exit 1; err="$(site_tmp)" || exit 1
+FAKE_SEARCH=FAIL FAKE_GH_STDERR="SYNTHETIC_SITE_MARKER_issue_list" \
+  run_dr publish "$f" --upstream "O/R" --yes >"$out" 2>"$err"; rc=$?
+site_check "SYNTHETIC_SITE_MARKER_issue_list" 3 "issue-list" "$out" "$err" "$rc"
+rm -f "$out" "$err"
+
+setup_workspace; setup_fake_gh
+f="$(make_report "2026-08-12-7004-site-issuecreate.md")"
+out="$(site_tmp)" || exit 1; err="$(site_tmp)" || exit 1
+FAKE_CREATE=fail FAKE_GH_STDERR="SYNTHETIC_SITE_MARKER_issue_create" \
+  run_dr publish "$f" --upstream "O/R" --yes >"$out" 2>"$err"; rc=$?
+site_check "SYNTHETIC_SITE_MARKER_issue_create" 9 "issue-create" "$out" "$err" "$rc"
+rm -f "$out" "$err"
+
+setup_workspace; setup_fake_gh
+f="$(make_report "2026-08-12-7005-site-issueedit.md")"
+out="$(site_tmp)" || exit 1; err="$(site_tmp)" || exit 1
+FAKE_EDIT=fail FAKE_GH_STDERR="SYNTHETIC_SITE_MARKER_issue_edit" \
+  run_dr publish "$f" --upstream "O/R" --yes >"$out" 2>"$err"; rc=$?
+site_check "SYNTHETIC_SITE_MARKER_issue_edit" 0 "issue-edit" "$out" "$err" "$rc"
+rm -f "$out" "$err"
+
+echo "-- preview 경로의 auth status 도 진단을 낸다 (AC 3 — 별도 호출 지점) --"
+setup_workspace; setup_fake_gh
+f="$(make_report "2026-08-12-7006-site-preview.md")"
+# **`preview` 서브커맨드를 실제로 부른다.** `publish` 를 --yes 없이 부르면
+# cmd_publish() 의 auth 지점을 지날 뿐 cmd_preview() 의 별도 auth 지점에는
+# 닿지 않아, 그쪽 회귀를 놓친다 (final diff review F1).
+err="$(FAKE_AUTH=fail FAKE_GH_STDERR='SYNTHETIC_PREVIEW_MARKER' \
+       run_dr preview "$f" --upstream "O/R" 2>&1 >/dev/null)"; rc=$?
+check "preview: exit 4" "$rc" "4"
+case "$err" in *SYNTHETIC_PREVIEW_MARKER*) ok "preview: 진단 도달";; *) nok "preview: 진단 소실 — [$err]";; esac
+case "$err" in *"인증 상태를 확인하지 못했습니다"*) ok "preview: 원인을 단정하지 않음";; *) nok "preview: 메시지 미변경 — [$err]";; esac
+
+echo "-- L1: gh 호출 인자 형태 계약 (gh 불필요) --"
+# 옵션 이름 추출은 **현재 6개 호출 지점이 쓰는 형태로 한정한 명시적 계약**이다
+# (spec 2-B). 일반 CLI 파서가 아니다. `$*` 공백 분할과 `eval` 은 쓰지 않는다 —
+# --jq 값의 `-->` 가 옵션으로 오인된다.
+_argv_sub() {  # $1=레코드
+  local -a f; IFS=$'\037' read -r -a f <<< "$1"; printf '%s %s' "${f[1]:-}" "${f[2]:-}"
+}
+_argv_opts() {  # $1=레코드 -> 옵션 이름 (개행 구분)
+  local -a f; local i n; IFS=$'\037' read -r -a f <<< "$1"; n=${#f[@]}; i=1
+  while (( i < n )); do
+    case "${f[i]}" in
+      --*) printf '%s\n' "${f[i]%%=*}"
+           # 다음 토큰이 옵션이 아니면 이 옵션의 **값**이므로 건너뛴다.
+           if [[ "${f[i]}" != *=* ]] && (( i+1 < n )) && [[ -n "${f[i+1]}" && "${f[i+1]}" != --* ]]; then i=$((i+1)); fi ;;
+    esac
+    i=$((i+1))
+  done
+}
+_argv_positionals() {  # $1=레코드 -> 위치 인자 (서브커맨드 2개 제외)
+  local -a f; local i n; IFS=$'\037' read -r -a f <<< "$1"; n=${#f[@]}; i=3
+  while (( i < n )); do
+    case "${f[i]}" in
+      --*) if [[ "${f[i]}" != *=* ]] && (( i+1 < n )) && [[ -n "${f[i+1]}" && "${f[i+1]}" != --* ]]; then i=$((i+1)); fi ;;
+      "")  ;;
+      *)   printf '%s\n' "${f[i]}" ;;
+    esac
+    i=$((i+1))
+  done
+}
+_l1_fail() { [[ "$1" == report ]] && nok "L1: $2"; return 0; }
+_l1_need() {  # $1=옵션목록 $2=필요옵션 $3=서브커맨드 $4=mode
+  printf '%s\n' "$1" | grep -qx -- "$2" && return 0
+  _l1_fail "$4" "${3} 에 ${2} 가 없습니다"; return 1
+}
+
+gh_contract_l1() {  # $1=argv로그 $2=report|quiet -> 0 통과 / 1 위반
+  local log="$1" mode="$2" rec sub opts o seen="" bad=0
+  while IFS= read -r rec; do
+    [[ -n "$rec" ]] || continue
+    sub="$(_argv_sub "$rec")"; opts="$(_argv_opts "$rec")"
+    seen="${seen}[${sub}]"
+    case "$sub" in
+      "auth status") _l1_need "$opts" --hostname "$sub" "$mode" || bad=1 ;;
+      "repo view")
+        _l1_need "$opts" --json "$sub" "$mode" || bad=1
+        if printf '%s\n' "$opts" | grep -qx -- '--repo'; then
+          _l1_fail "$mode" "repo view 가 --repo 를 사용합니다 — 저장소는 위치 인자여야 합니다"; bad=1
+        fi
+        [[ -n "$(_argv_positionals "$rec")" ]] || { _l1_fail "$mode" "repo view 에 위치 인자(저장소)가 없습니다"; bad=1; } ;;
+      "issue list")   for o in --repo --state --search --json --jq; do _l1_need "$opts" "$o" "$sub" "$mode" || bad=1; done ;;
+      "issue create") for o in --repo --title --body-file;          do _l1_need "$opts" "$o" "$sub" "$mode" || bad=1; done ;;
+      "issue edit")   _l1_need "$opts" --add-label "$sub" "$mode" || bad=1 ;;
+    esac
+  done < "$log"
+  local s
+  for s in "auth status" "repo view" "issue list" "issue create" "issue edit"; do
+    case "$seen" in *"[${s}]"*) ;; *) _l1_fail "$mode" "호출 지점 미관측: ${s}"; bad=1 ;; esac
+  done
+  return $bad
+}
+
+echo "-- L1 전수: preview 와 publish 의 호출을 합쳐 6개 지점을 모두 본다 (AC 8) --"
+setup_workspace; setup_fake_gh
+f="$(make_report "2026-08-12-8001-l1.md")"
+PREVIEW_ARGV="$WS/argv-preview.log"; PUBLISH_ARGV="$WS/argv-publish.log"
+: > "$GH_ARGV"; run_dr preview "$f" --upstream "O/R" >/dev/null 2>&1; cp "$GH_ARGV" "$PREVIEW_ARGV"
+: > "$GH_ARGV"; run_dr publish "$f" --upstream "O/R" --yes >/dev/null 2>&1; cp "$GH_ARGV" "$PUBLISH_ARGV"
+ALL_ARGV="$WS/argv-all.log"; cat "$PREVIEW_ARGV" "$PUBLISH_ARGV" > "$ALL_ARGV"
+
+# preview 와 publish 각각이 독립적으로 auth status 를 부른다 — 두 개의 다른 호출 지점이다.
+check "preview 경로가 auth status 호출" "$(cut -d$'\037' -f2,3 "$PREVIEW_ARGV" | grep -c '^auth')" "1"
+check "publish 경로가 auth status 호출" "$(cut -d$'\037' -f2,3 "$PUBLISH_ARGV" | grep -c '^auth')" "1"
+
+if gh_contract_l1 "$ALL_ARGV" report; then ok "L1: 현재 호출이 인자 계약을 만족"; else nok "L1: 위반 있음 (위 항목 참조)"; fi
+
+echo "-- L2: 로그에 실제로 남은 옵션이 gh --help 에 존재하는가 (AC 7·9·10·11) --"
+# 검사 대상은 **기대값 표가 아니라 로그의 실제 옵션**이다. 기대값을 검사하면
+# "기대값 자체가 틀린 경우"(원 결함)를 그대로 놓친다.
+# 대조는 help 정의줄에서 뽑은 **옵션 이름 목록과의 고정 문자열 비교**다 (정규식 삽입 금지).
+REAL_GH="$(command -v gh || true)"
+REAL_GH_VER=""; [[ -n "$REAL_GH" ]] && REAL_GH_VER="$("$REAL_GH" --version 2>/dev/null | head -1)"
+CLI_CONTRACT_NOTE="미검증 (검사 미도달)"
+
+gh_contract_l2() {  # $1=argv로그 $2=report|quiet -> 0 통과 / 1 위반 / 2 미검증
+  local log="$1" mode="$2" rec sub opt cache tmp hrc bad=0 helpdir unver=""
+  [[ -n "$REAL_GH" ]] || { CLI_CONTRACT_NOTE="미검증 (gh 미설치)"; return 2; }
+  helpdir="$WS/ghhelp"
+  mkdir -p "$helpdir" || { CLI_CONTRACT_NOTE="미검증 (help 캐시 디렉터리 생성 실패)"; return 2; }
+  while IFS= read -r rec; do
+    [[ -n "$rec" ]] || continue
+    sub="$(_argv_sub "$rec")"
+    case "$sub" in [a-z]*" "[a-z]*) ;; *) continue ;; esac
+    cache="$helpdir/${sub// /_}"
+    if [[ ! -f "$cache" ]]; then
+      tmp="$helpdir/.help.tmp"; hrc=0
+      "$REAL_GH" ${sub} --help > "$tmp" 2>&1 || hrc=$?
+      if (( hrc != 0 )); then
+        # **중단하지 않습니다.** 이미 찾은 위반을 버리고 '미검증' 만 남기면 실제
+        # 계약 위반이 사용자 눈에서 사라집니다. 이 서브커맨드만 미검증으로 둡니다.
+        [[ -z "$unver" ]] && unver="gh ${sub} --help 실패 rc=${hrc}, ${REAL_GH_VER} — 원인: $(head -3 "$tmp" | tr '\n' ' ')"
+        rm -f "$tmp"; continue
+      fi
+      # 정의줄에서 **옵션 이름만** 뽑아 캐시한다. 성공한 출력만 캐시한다.
+      sed -nE 's/^[[:space:]]*(-[a-zA-Z], )?(--[a-zA-Z0-9][a-zA-Z0-9-]*).*/\2/p' "$tmp" > "${cache}.names"
+      mv "$tmp" "$cache"
+    fi
+    [[ -f "${cache}.names" ]] || continue
+    while IFS= read -r opt; do
+      [[ -n "$opt" ]] || continue
+      # **고정 문자열 전체 줄 비교.** 로그의 옵션을 정규식에 끼워 넣으면 문법 오류를
+      # 잡는 검사가 문법 오류 입력을 신뢰합니다 — `--j.on` 이 `--json` 에 일치합니다.
+      grep -qxF -- "$opt" "${cache}.names" || {
+        [[ "$mode" == report ]] && nok "L2: gh ${sub} 에 존재하지 않는 옵션 ${opt} (${REAL_GH_VER})"
+        bad=$((bad+1))
+      }
+    done <<< "$(_argv_opts "$rec")"
+  done < "$log"
+  if (( bad > 0 )); then
+    if [[ -n "$unver" ]]; then CLI_CONTRACT_NOTE="수행·실패 (${bad}건, ${REAL_GH_VER}; 일부 미검증: ${unver})"
+    else                       CLI_CONTRACT_NOTE="수행·실패 (${bad}건, ${REAL_GH_VER})"; fi
+    return 1
+  fi
+  if [[ -n "$unver" ]]; then CLI_CONTRACT_NOTE="미검증 (${unver})"; return 2; fi
+  CLI_CONTRACT_NOTE="수행·통과 (${REAL_GH_VER})"
+  return 0
+}
+
+gh_contract_l2 "$ALL_ARGV" report; l2_rc=$?
+case "$l2_rc" in
+  0) ok "L2: 로그의 모든 옵션이 gh --help 정의줄에 존재" ;;
+  1) : ;;   # nok 는 함수 안에서 기록했다
+  2) SKIP=$((SKIP+1)); printf '  skip %s\n' "L2 실제 CLI 계약 — ${CLI_CONTRACT_NOTE}" ;;
+esac
+
+echo "-- L2 대조: 접두사 오타와 정규식 메타문자가 통과하지 못한다 (R2 후속) --"
+# **help 를 새로 부르지 않는다.** 본 검사가 성공했을 때만 만드는 이름 목록을 재사용한다.
+# 다시 부르면 그 호출이 실패했을 때 도구 실행 불가를 계약 위반으로 보고하게 된다.
+L2_PROBE_NOTE=""
+l2_probe() {
+  local names="$WS/ghhelp/issue_list.names"
+  if [[ -s "$names" ]]; then
+    L2_PROBE_NOTE="ran"
+    grep -qxF -- '--json' "$names" && ok "L2 대조: 정상 --json 통과" || nok "L2 대조: 정상 --json 거부됨"
+    grep -qxF -- '--stat' "$names" && nok "L2 대조: 접두사 오타 --stat 통과함"  || ok "L2 대조: --stat 거부"
+    grep -qxF -- '--j.on' "$names" && nok "L2 대조: 정규식 --j.on 통과함"       || ok "L2 대조: --j.on 거부"
+  else
+    L2_PROBE_NOTE="$CLI_CONTRACT_NOTE"
+    SKIP=$((SKIP+1)); printf '  skip %s\n' "L2 대조 probe — ${CLI_CONTRACT_NOTE}"
+  fi
+}
+l2_probe
+
+echo "-- help 실행 불가는 계약 위반이 아니라 미검증이다 (R6 후속) --"
+FAKE_GH_BIN="$WS/fakegh/gh"; mkdir -p "$WS/fakegh"
+printf '#!/usr/bin/env bash\nif [[ "$*" == *--help* ]]; then echo "gh: synthetic help failure" >&2; exit 7; fi\nexec true\n' > "$FAKE_GH_BIN"
+chmod +x "$FAKE_GH_BIN"
+
+SAVED_GH="$REAL_GH"; SAVED_VER="$REAL_GH_VER"; SAVED_NOTE="$CLI_CONTRACT_NOTE"
+REAL_GH="$FAKE_GH_BIN"; REAL_GH_VER="gh synthetic"; rm -rf "$WS/ghhelp"
+gh_contract_l2 "$ALL_ARGV" quiet; inj_rc=$?
+fail_before="$FAIL"; skip_before="$SKIP"
+l2_probe
+fail_after="$FAIL"; skip_after="$SKIP"
+
+check "help 실패: gh_contract_l2 rc=2" "$inj_rc" "2"
+case "$CLI_CONTRACT_NOTE" in
+  *미검증*rc=7*) ok "help 실패: 요약이 미검증·원인을 담음" ;;
+  *) nok "help 실패: 요약이 미검증·원인을 담지 않음 — [$CLI_CONTRACT_NOTE]" ;;
+esac
+check "help 실패: probe 가 FAIL 을 늘리지 않음" "$fail_after" "$fail_before"
+check "help 실패: probe 가 SKIP 을 늘림"        "$skip_after" "$((skip_before+1))"
+case "$L2_PROBE_NOTE" in *rc=7*) ok "help 실패: probe skip 사유에 원인 포함";; *) nok "help 실패: probe skip 사유 부족 — [$L2_PROBE_NOTE]";; esac
+
+# 원래 환경으로 되돌리고 본 검사 기준 캐시·요약을 복원한다.
+REAL_GH="$SAVED_GH"; REAL_GH_VER="$SAVED_VER"; rm -rf "$WS/ghhelp"
+gh_contract_l2 "$ALL_ARGV" quiet >/dev/null 2>&1 || true
+
+echo "-- 회귀 fixture: 원 결함(gh repo view --repo)을 검사가 실제로 거부하는가 (AC 7) --"
+setup_workspace; setup_fake_gh
+BROKEN="$WS/defect_reports_broken.sh"
+cp "$TARGET" "$BROKEN"
+# 정본은 건드리지 않는다 — 사본에만 원 결함을 되돌린다.
+sed -i.bak 's|repo view "\$repo" --json visibility|repo view --repo "$repo" --json visibility|' "$BROKEN"
+rm -f "$BROKEN.bak"
+grep -q 'repo view --repo' "$BROKEN" && ok "fixture: 원 결함 주입됨" || nok "fixture: 주입 실패"
+
+f="$(make_report "2026-08-12-9001-regress.md")"
+BROKEN_ARGV="$WS/argv-broken.log"; : > "$GH_ARGV"
+( cd "$WS" && PATH="$FAKEBIN:$PATH" GH_LOG="$GH_LOG" GH_ARGV="$GH_ARGV" GH_BODY="$GH_BODY" \
+    MV_COUNT="$MV_COUNT" CAT_COUNT="$CAT_COUNT" bash "$BROKEN" publish "$f" --upstream "O/R" ) >/dev/null 2>&1
+( cd "$WS" && PATH="$FAKEBIN:$PATH" GH_LOG="$GH_LOG" GH_ARGV="$GH_ARGV" GH_BODY="$GH_BODY" \
+    MV_COUNT="$MV_COUNT" CAT_COUNT="$CAT_COUNT" bash "$BROKEN" publish "$f" --upstream "O/R" --yes ) >/dev/null 2>&1
+cp "$GH_ARGV" "$BROKEN_ARGV"
+
+# 같은 진입점, 서로 다른 입력 — 결과가 갈려야 한다.
+# 예상 실패는 quiet 로 돌려 스위트의 FAIL 카운터를 오염시키지 않는다.
+gh_contract_l1 "$ALL_ARGV" quiet;    l1_ok_rc=$?
+gh_contract_l1 "$BROKEN_ARGV" quiet; l1_bad_rc=$?
+check "L1: 정상 로그를 통과시킴" "$l1_ok_rc" "0"
+check "L1: 결함 로그를 거부함"   "$l1_bad_rc" "1"
+
+# **L2 거부는 정상 로그가 rc=0 일 때만 요구한다.** gh 설치 여부만 보고 요구하면
+# 도구를 못 돌린 상황(help 실패)이 계약 위반으로 보고된다 (R6 후속).
+gh_contract_l2 "$ALL_ARGV" quiet; l2_ok_rc=$?; l2_ok_note="$CLI_CONTRACT_NOTE"
+if (( l2_ok_rc == 0 )); then
+  ok "L2: 정상 로그를 통과시킴"
+  gh_contract_l2 "$BROKEN_ARGV" quiet; l2_bad_rc=$?
+  check "L2: 결함 로그를 거부함" "$l2_bad_rc" "1"
+elif (( l2_ok_rc == 2 )); then
+  SKIP=$((SKIP+1)); printf '  skip %s\n' "L2 회귀 — 정상 로그가 미검증(${l2_ok_note}). L1 의 거부는 위에서 검증됨"
+else
+  nok "L2: 정상 로그를 거부함 (${l2_ok_note})"
+fi
+# CLI_CONTRACT_NOTE 가 quiet 회귀(결함 로그)의 값으로 덮인 채 요약에 나가지 않도록
+# 정상 로그 기준 값을 되돌린다.
+CLI_CONTRACT_NOTE="$l2_ok_note"
+
+printf '\n실제 CLI 계약 검증: %s\n' "$CLI_CONTRACT_NOTE"
+printf '결과: pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ "$FAIL" -eq 0 ]]

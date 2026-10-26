@@ -18,7 +18,7 @@
     }
   },
   "overrides": {
-    "_comment": "spec-plan-review 의 high 는 paired 실험(2026-08-07, 결과 R3 사용자 예외 채택) 기반 잠정 권장값 — 정답표 검출 비열등(6/6 vs 5/6)·latency 12.6% 단축·토큰 절감. 롤백: 이 키 제거(종별) 또는 RD_REVIEW_EFFORT_OVERRIDE=0(전체). 근거: rd-workflow-workspace/reports/2026-08-07-2233-review-effort-tuning-experiment.md",
+    "_comment": "spec-plan-review 의 codex effort override(high)는 2026-09-30 실측 재평가 후 원복했습니다 — override 이후 spec-plan 의 리뷰어 턴 중앙값이 2→4로 늘어 대조 리뷰 종류(request 2→3)보다 컸고, diff review 이월 결함 비교(2/10 vs 2/10)로는 비열등을 입증하지 못했습니다. 다시 적용하려면 spec-plan-review.tools.codex.reasoning_effort 를 추가합니다(전체 해제는 RD_REVIEW_EFFORT_OVERRIDE=0). 근거: rd-workflow-workspace/reports/2026-09-30-review-effort-and-turn-cap-analysis.md",
     "diff-review": {
       "priority": ["codex"]
     },
@@ -26,13 +26,6 @@
       "tools": {
         "codex": {
           "reasoning_effort": "medium"
-        }
-      }
-    },
-    "spec-plan-review": {
-      "tools": {
-        "codex": {
-          "reasoning_effort": "high"
         }
       }
     }

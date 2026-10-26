@@ -55,11 +55,24 @@
 ### 국면 1 — 대화형 준비 (사람 있음)
 
 0. **slug resolve**: 각 입력 slug를 `bash rd-workflow/scripts/batch/batch_manifest.sh resolve-slug <slug>`로 확인합니다. exit≠0(미존재 또는 복수 매칭)이면 그 slug를 보고하고 batch를 시작하지 않습니다(전체 중단). 사용자 입력 오타·미존재를 준비 착수 전에 차단합니다.
-1. **선별(feasibility)**: 각 slug에 autopilot 적합성 기준(autopilot SKILL.md 단일 출처 — `/fr inspect`가 인용하는 것과 동일)을 적용해 가능/조건부/불가 판정합니다.
+1. **선별(feasibility)**: 각 slug에 대해 `bash rd-workflow/scripts/check_fr_related_files_existence.sh <해당 items 경로>`를 먼저 호출하고, 그 출력(비율 또는 `검사 대상 없음`)을 아래 적합성 판정과 선별 보고에 포함합니다. `exit 2`(스크립트 실행 오류)는 판정 불가로 보고하고 적합 판정의 근거로 쓰지 않습니다. 이 출력을 근거 중 하나로 삼아 각 slug에 autopilot 적합성 기준(autopilot SKILL.md 단일 출처 — `/fr inspect`가 인용하는 것과 동일)을 적용해 가능/조건부/불가 판정합니다.
    - 불가: 묶음에서 제외, manifest item `feasibility=excluded` + `state=skipped` + `exclude_reason` 기록. (선별 제외 invariant — `validate`가 `excluded ⟹ state=skipped`를 강제하고, `summary`는 이를 `excluded`로만 집계하여 `skipped`(실행 중 선행 blocked로 건너뛴 eligible)와 구분합니다.)
    - 조건부: 다음 단계에서 결정을 닫으면 승격, 못 닫으면 excluded.
 2. **brainstorming 보강**: 처리 가능한 각 FR에 대해, headless mode A가 자율로 못 닫을 **사람 결정**(제품 방향·외부 의존 채택 등)만 사용자와 대화로 확정하고 FR 상세(request seed/범위/제약)에 명시적으로 기록합니다. full brainstorming skill을 FR마다 호출하는 것이 아니라 경량 "결정 닫기"입니다.
-3. **의존/순서 확정**: 묶음의 인과관계를 분석해 실행 순서(order)와 의존 그래프(depends_on)를 사용자에게 제시·확정합니다. 자동 탐지가 아니라 사용자 확정입니다.
+3-0. **의존 초안 자동 제안**: 선별이 끝나면 `bash rd-workflow/scripts/fr_relations.sh batch-draft --root . --slugs "<slug> <slug> ..."` 를 실행합니다. 인자는 0단계에서 resolve 한 것과 같은 short-title slug 입니다. 출력은 `<short-title><TAB><분류><TAB><값>` 이며, 종료 코드로 먼저 분기합니다.
+
+   - `rc=2`: slug 를 해석하지 못했거나 실행이 불가능합니다. 자동 제안을 건너뛰고 기존 수동 확정(3단계)으로 진행하며 사유를 한 줄 보고합니다.
+   - `rc=1`: 관계 데이터에 결함이 있습니다 (`error` 분류). **초안을 확정하지 않습니다.** 해당 slug 와 사유를 보고하고 `bash rd-workflow/scripts/fr_relations.sh validate --root .` 로 고친 뒤 다시 실행하도록 안내합니다.
+   - `rc=0`: 세 분류를 그대로 사람에게 보입니다.
+
+   | 분류 | 처리 |
+   | --- | --- |
+   | `depends_on` | manifest 의 `depends_on` 초안입니다. 값은 이미 manifest 와 같은 short-title 이므로 그대로 씁니다. 사람은 확인하고 확정만 합니다 — 손으로 다시 입력하지 않습니다 |
+   | `external-satisfied` | 집합 밖이지만 완료된 선행입니다. manifest 에 넣지 않고 `외부 선행 충족: <stem>` 으로 보고만 합니다 |
+   | `external-unmet` | 집합 밖이고 미완인 선행입니다. manifest 에 넣으면 dangling 이 되므로 넣지 않습니다. 경고와 함께 선택지 3개를 제시합니다 — ① 그 선행을 집합에 추가 ② 해당 후속을 집합에서 제외 ③ 무시하고 진행. ③ 이면 그 결정과 대상 stem 을 manifest `notes` 에 한 줄 남깁니다 |
+
+   `external-unmet` 의 ③ 은 **정상 데이터에 대한 사람의 명시적 결정**이고 `rc=1` 의 `error` 는 **데이터 결함**입니다. 둘을 같은 경고로 묶지 않습니다.
+3. **의존/순서 확정**: 3-0 의 초안을 출발점으로 묶음의 인과관계를 분석해 실행 순서(order)와 의존 그래프(depends_on)를 사용자에게 제시·확정합니다. 자동 탐지가 아니라 사용자 확정입니다.
 4. **종료 정책 확정**: `push` / `merge` 중 1회 확인합니다. `none`은 지원하지 않습니다(archive를 하지 않아 완료 목표와 모순입니다). 확정값은 모든 FR에 일관 적용됩니다.
 5. **manifest 작성**: 위 결과를 `rd-workflow-workspace/.batch-manifest.json`에 기록하고 `bash rd-workflow/scripts/batch/batch_manifest.sh validate <manifest>`로 검증합니다(순환 의존·dangling·finish_policy 차단). **validate 통과 후에만** status를 `running`으로 전환합니다(tmp+mv 규율 — 호출 형식 참조). 이 전환이 국면 1 완료의 유일한 신호이며, `preparing`인 동안은 국면 2에 진입하지 않습니다.
 
@@ -134,7 +147,7 @@ manifest status가 `running`인 동안 반복합니다:
      `not-archived` 재시도 경로 — 1회 재시도 후 재발 시 `blocked` 처리(ralph와 동일 정책). **재시도 전에 재개 지점을 정리합니다**:
      1. 열린 리뷰 세션의 최신 Reviewer 턴이 `이의 없음` 이면 그 세션을 `awaiting-user` 로 종결 처리합니다 — 네 가지를 모두 갱신합니다.
         - `SESSION.md`: `Status=awaiting-user`, `Current Owner=User`
-        - `CHECKPOINT.md`: 현재 결론과 남은 쟁점. 미해결이 없으면 Open Issues 를 정확히 `- 없음` 한 줄로 적습니다 (그 외 산문 표기는 미해결로 판정됩니다)
+        - `CHECKPOINT.md`: 현재 결론과 남은 쟁점. 미해결이 없으면 Open Issues 첫 줄에 `- 없음` 을 적고, 종결 경위는 그 아래에 빈 줄로 띄워 문단으로 적습니다 (미해결 항목은 리스트로 적으며, 마커 앞이나 마커에 붙인 글은 미해결로 판정됩니다)
         - `USER_ACTION.md`: 사용자가 취할 다음 행동과 질문. **이 갱신을 빠뜨리면 Owner 는 User 인데 안내는 "확인이 필요한 단계가 아닙니다" 라고 말하는 모순 상태가 사용자에게 노출됩니다**
         - 리뷰 요약 report: `rd-workflow-workspace/reports/reviews/` 에 작성
         사람이 마무리를 승인하기 전에는 `closed` 로 전환하지 않습니다 (`rd-workflow/docs/flows/FILE_BASED_REVIEW_PIPELINE.md` 종료 규칙).

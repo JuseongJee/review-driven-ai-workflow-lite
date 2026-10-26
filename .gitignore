@@ -36,6 +36,8 @@ rd-workflow-workspace/.autopilot-outcome
 # 때문에 `git diff --check` 도 깨집니다).
 rd-workflow-workspace/handoffs/review_pipeline/*/.codex_output.log
 rd-workflow-workspace/handoffs/review_pipeline/*/.codex_output.*
+rd-workflow-workspace/handoffs/review_pipeline/*/.claude_output.log
+rd-workflow-workspace/handoffs/review_pipeline/*/.claude_output.*
 rd-workflow-workspace/handoffs/review_pipeline/*/.review_wait_status
 rd-workflow-workspace/handoffs/review_pipeline/*/.review_wait_status.*
 rd-workflow-workspace/handoffs/review_pipeline/*/.wait_timeout

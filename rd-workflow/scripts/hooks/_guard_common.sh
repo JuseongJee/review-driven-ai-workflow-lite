@@ -8,6 +8,12 @@
 # _state_common.sh는 project_root 검증 직후 source — $PWD fallback 불사용, project_root 보장 후 진입
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_state_common.sh"
 
+# 이 파일과 같은 디렉터리의 awk 프로그램을 찾기 위한 절대 경로.
+RD_GUARD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# is_review_session_resolved 가 실패 사유를 남기는 자리. 반환값 계약은 0/1 그대로이고
+# 호출자는 메시지를 만들 때만 이 값을 읽는다 (bash 3.2 — declare -g 를 쓰지 않는다).
+RD_REVIEW_UNRESOLVED_REASON=""
+
 # --- autopilot ---
 
 is_autopilot_active() {
@@ -83,30 +89,34 @@ get_latest_diff_review_dir() {
   printf '%s' "$latest"
 }
 
-# review 종결성.
-# 루프 진행 중(awaiting-author/reviewer/claude)=미종결. 루프 종료(awaiting-user/closed)+Open Issues 없음=종결.
-# "이슈 없음"은 canonical 마커(- 없음 | - None, 후행 마침표 1개·공백 허용, 라인 전체 매칭)가 최소 1개
-# 존재하고 그 외 내용 라인이 없을 때만 인정 (빈 줄·<!-- 시작 단일 라인 주석은 무시).
-# 그 외 산문·마커 뒤 후행 텍스트·empty/comment-only 섹션=이슈로 판정(fail-closed).
-# 표기 규약: FILE_BASED_REVIEW_PIPELINE.md.
-# SESSION/CHECKPOINT/Open Issues 섹션 부재=malformed=미종결(fail-closed, scope 확정 세션 한정).
-# return 0 = 종결, 1 = 미종결.
+# 리뷰 세션이 종결됐는지 판정한다. 0=종결, 1=미종결.
+# 루프 진행 중(awaiting-author/reviewer/claude)=미종결. 루프 종료(awaiting-user/closed)
+# + Open Issues 에 미해결 리스트 항목 없음=종결.
+# SESSION/CHECKPOINT/Open Issues 섹션 부재=malformed=미종결(fail-closed).
+# 실패 사유는 RD_REVIEW_UNRESOLVED_REASON 에 남긴다 — 호출자가 사람에게 무엇이
+# 걸렸는지 보여주기 위한 것이며 판정에는 쓰이지 않는다.
+# Open Issues 절의 판정 규칙은 _open_issues.awk 한 곳에만 둔다.
 is_review_session_resolved() {
-  local sf="${1}/SESSION.md" cp="${1}/CHECKPOINT.md" status=""
-  [[ -f "$sf" ]] || return 1
+  local sf="${1}/SESSION.md" cp="${1}/CHECKPOINT.md" status="" verdict=""
+  RD_REVIEW_UNRESOLVED_REASON=""
+  [[ -f "$sf" ]] || { RD_REVIEW_UNRESOLVED_REASON="session-missing"; return 1; }
   status="$(awk '$0=="## Status"{f=1;next} f&&/^## /{exit} f&&NF{sub(/^[ \t]+/,"");sub(/[ \t]+$/,"");print;exit}' "$sf")"
   case "$status" in
     awaiting-user|closed) ;;
-    *) return 1 ;;
+    *) RD_REVIEW_UNRESOLVED_REASON="status:${status}"; return 1 ;;
   esac
-  [[ -f "$cp" ]] || return 1
-  awk '/^## Open Issues/{print "y";exit}' "$cp" | grep -q y || return 1
-  local has_issues
-  # bad=비허용 내용 라인, m=canonical 마커. 빈 줄·<!-- 시작 주석은 무시.
-  # bad 발견 즉시 exit해도 END는 실행되므로 출력은 END 한 곳에서만 한다 (중복 "yes" 방지).
-  has_issues="$(awk '/^## Open Issues/{s=1;next} s&&/^## /{exit} !s{next} /^[ \t]*$/{next} /^<!--/{next} /^- (없음|None)\.?[ \t]*$/{m=1;next} {bad=1;exit} END{if(bad||!m)print "yes"}' "$cp")"
-  [[ "$has_issues" == "yes" ]] && return 1
-  return 0
+  [[ -f "$cp" ]] || { RD_REVIEW_UNRESOLVED_REASON="checkpoint-missing"; return 1; }
+  # 판정 프로그램 자체의 부재를 "미해결 이슈가 있다" 와 구별한다. 둘 다 미종결(1)이지만
+  # 원인이 전혀 다르다 — 후자는 문서를 고치면 되고, 전자는 배치가 깨진 것이다.
+  # 이 구별이 없으면 스크립트를 임시 디렉터리로 복사해 돌리는 테스트 fixture 에서 이
+  # 파일을 빠뜨렸을 때, 판정이 조용히 미종결로 떨어져 「미종결이면 통과」인 게이트가
+  # 검사 없이 지나간다. 실제로 구현 중 fixture 3곳에서 이 형태가 나왔다.
+  [[ -f "${RD_GUARD_DIR}/_open_issues.awk" ]] \
+    || { RD_REVIEW_UNRESOLVED_REASON="parser-missing:${RD_GUARD_DIR}/_open_issues.awk"; return 1; }
+  verdict="$(awk -f "${RD_GUARD_DIR}/_open_issues.awk" "$cp")"
+  [[ "$verdict" == "ok" ]] && return 0
+  RD_REVIEW_UNRESOLVED_REASON="${verdict:-open-issues-missing}"
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -575,7 +585,7 @@ is_shared_state_file() {
 # --- Stop hook 전용 헬퍼 ---
 
 # is_nonblocking_status <status>
-# 비차단 집합 단일 출처. CLAUDE.md 'CURRENT_TASK.md 허용 상태값' 참조.
+# 비차단 집합 단일 출처. .claude/rules/rd-workflow/task-tracking.md 의 '허용 상태값' 참조.
 # 인자가 빈값 / '대기 중' / '완료'면 return 0 (비차단=통과 대상), 아니면 return 1 (진행 중=차단 대상).
 is_nonblocking_status() {
   local s="$1"

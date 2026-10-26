@@ -40,8 +40,27 @@ raw_source_fr_list="$(source_fr_from_request_list "$request_file")"
 review_dir="$(get_latest_diff_review_dir)"
 [[ -z "$review_dir" ]] && exit 0
 
-# diff review가 아직 미종결이면 통과 (review_gate가 처리). 종결성 판정은 헬퍼로 통일.
-is_review_session_resolved "$review_dir" || exit 0
+# diff review 가 미종결이면 통과시킨다 — 이 시점은 아직 archive 단계가 아니다
+# (구현 중 iteration commit 등). 발행 자체의 차단은 `archive.sh` 가 부르는
+# `archive_review_precheck` 가 종결 마커로 수행한다.
+#   여기를 fail-closed 로 막지 않는 것이 계약이다. `archive.sh
+#   --force-skip-review-check` 로 사유를 남기고 발행하는 예외 종결 경로에는 종결
+#   마커가 없다. 커밋 단계에서 막으면 그 경로가 `archive.sh` 에 도달하지 못해,
+#   예외 종결의 사유를 audit log 에 남길 방법이 사라진다.
+#   단, 판정 프로그램 자체가 없어 판정하지 못한 경우는 조용히 지나가지 않는다.
+#   그 상태는 「아직 archive 단계가 아니다」가 아니라 「검사를 할 수 없었다」이고,
+#   여기서 exit 0 로 빠지면 아래 Source FR 검사가 통째로 생략된 사실이 아무 데도
+#   남지 않는다. 통과 정책은 그대로 두고 사실만 알린다.
+if ! is_review_session_resolved "$review_dir"; then
+  case "${RD_REVIEW_UNRESOLVED_REASON-}" in
+    parser-missing:*)
+      printf '[guard] 경고: 리뷰 종결 판정 프로그램이 없어 이 커밋의 Source FR 검사를 건너뜁니다.\n' >&2
+      printf '[guard]   찾은 경로: %s\n' "${RD_REVIEW_UNRESOLVED_REASON#parser-missing:}" >&2
+      printf '[guard]   rd-workflow 배치가 불완전합니다 — hooks 디렉터리에 _open_issues.awk 가 있는지 확인하세요.\n' >&2
+      ;;
+  esac
+  exit 0
+fi
 
 # --- 여기서부터가 archive 커밋 경로다 ---
 # 값이 있는데 해석에 실패하면 차단한다 (fail-closed).

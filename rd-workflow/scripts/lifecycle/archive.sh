@@ -566,8 +566,14 @@ if metadata_exists || [[ "$BRANCH_MODE" == "no-fr" ]]; then
   fi
 
   # 미러가 확정된 뒤에 권위를 정리한다 (위 순서 불변식).
+  _ARCHIVE_FROM_STATUS="$(state_read_field "status")"
   metadata_clear
   state_write_fields "short-title=-" "status=대기 중"
+  # 종료되는 회차($SLUG, 아직 '-'로 바뀌기 전 값)에 귀속시킨다(change-spec D4-3, D1).
+  # archive.sh 는 이미 cd "$PUBLISH_WT" 이후 _state_common.sh 를 source 했으므로
+  # TASK_STATE_PATH 는 이 시점에 PUBLISH_WT 를 가리킨다(별도 전환 불필요, :92,174 참조 —
+  # Task 4 의 실제 archive 스모크에서 커밋 위치를 git show 로 재확인한다).
+  state_log_stage_transition "$SLUG" "$_ARCHIVE_FROM_STATUS" "대기 중"
 
   # 이 커밋에 포함할 경로 — staging·판정·커밋이 **모두** 이 목록에서 나온다.
   # 단일 출처는 lifecycle_metadata_paths() 이고 얹힌 커밋 검사·발행 내용 검증도 같은
@@ -591,6 +597,13 @@ if metadata_exists || [[ "$BRANCH_MODE" == "no-fr" ]]; then
     case "$_lc_rel" in
       */active-fr)
         git ls-files --error-unmatch "$CURRENT_WT/$_lc_rel" >/dev/null 2>&1 || continue
+        ;;
+      */stage_metrics.tsv)
+        # best-effort 로그다 — 이 회차에서 로그가 한 번도 안 남았으면(최초 회차에서
+        # append 자체가 실패했거나, from==to 라 기록할 전이가 없었던 경우) 파일이
+        # 없을 수 있다. 존재하지 않는 pathspec 을 git add 에 넘기면 실패해 archive
+        # 전체가 중단된다(spec/plan review Turn 004 F1 잔여) — 존재할 때만 포함한다.
+        [[ -f "$CURRENT_WT/$_lc_rel" ]] || continue
         ;;
     esac
     _lc_paths+=( "$CURRENT_WT/$_lc_rel" )

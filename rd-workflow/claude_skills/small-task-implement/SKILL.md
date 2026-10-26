@@ -42,7 +42,7 @@ Typical user requests:
 3. **축약 REQUEST 작성**: `Task Type`·`Execution Path`·`User Goal`·`Change Description`·`Acceptance Criteria`·`Risk Tier`·`Source FR` 만 채우고 나머지는 `-`. `## Risk Tier` 는 `- 최종 등급: standard` 를 포함해 6항목을 **작성 즉시** 채웁니다(`-` 로 두지 않음 — 파서가 malformed 로 봅니다. 재분류 때 확인·갱신). 필요하면 `Change Description` 안에 한 문단 spec + 한 목록 plan 을 적습니다.
 4. **AC 확인**: Acceptance Criteria 가 비어 있거나(`-`) 모호하면 구현을 시작하지 않고 사용자에게 확인을 요청합니다.
 5. **구현**: 변경을 작고 직접적으로 유지합니다. 불필요한 구조·투기적 리팩터를 넣지 않습니다.
-6. **검증**: 고친 영역에 맞는 범위만. 제품 코드는 `bash rd-workflow/scripts/{test,lint,typecheck,build}.sh` (프로젝트가 교체한 경우), 워크플로 인프라는 해당 `self_test.sh` 그룹.
+6. **검증**: 고친 영역에 맞는 범위만. 제품 코드는 `bash rd-workflow/scripts/{test,lint,typecheck,build}.sh` (프로젝트가 교체한 경우), 워크플로 인프라는 해당 `self_test.sh` 그룹. 새로 만들거나 바꾼 필수 대상 단언(부정 명제·회귀)이 있으면 `rd-workflow/docs/guides/mutation-check.md` 「절차」로 변이를 확인하고 결과표를 남깁니다 — plan 은 쓰지 않으며, 결과표는 `/final-diff-review` 가 Author 첫 턴에 싣습니다.
 7. **커밋 전 재분류**: `git status --porcelain` + `git diff --name-only <baseline>..HEAD` 의 변경 집합을 신호표와 대조합니다. `full` 신호가 있으면 이 skill 을 멈추고 등급 상향을 한 줄로 알린 뒤 `/request-to-reviewed-plan` 으로 넘깁니다(브랜치 유지, spec/plan 정식 작성). 벗어나지 않으면 `## Risk Tier` 를 확정합니다.
 8. `CURRENT_TASK.md` 를 갱신하고 **`/final-diff-review` 로 넘깁니다. `standard` 는 이 단계를 건너뛰지 않습니다.**
 

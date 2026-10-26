@@ -32,6 +32,9 @@
 - status: idea
 - kind: {kind}
 - summary: {summary}
+- depends-on: {선행 FR 의 items 파일 stem(YYYY-MM-DD-short-title), 쉼표 구분. 없으면 "-"}
+- series: {시리즈에 속하면 "<name> #N/M", 아니면 생략}
+- relates: {참고 관계 stem, 쉼표 구분. 없으면 "-"}
 - why: {사용자 입력에서 추론, 없으면 "-"}
 - related context: {대화 맥락에서 추론, 없으면 "-"}
 - related files: {관련 파일, 없으면 "-"}
@@ -51,11 +54,64 @@
 
 6. `FUTURE_REQUESTS.md`의 `## 인덱스` 테이블 끝에 행 추가:
 
-```
-| {날짜} | {short-title} | {summary} | {kind} | idea | - | [상세](items/YYYY-MM-DD-{short-title}.md) |
-```
+   **이 6단계가 인덱스 행 추가의 정본 절차다.** 활성 인덱스에 행을 새로 넣는 경로는 `/fr add`·`/fr pull`(새 FR 생성)·`/fr status`(비활성 → 활성 복원) 셋이며, 셋 모두 아래 6-a → 6-b → 6-c 를 순서대로 그대로 수행한다. 어느 한 단계도 건너뛰지 않는다.
 
-컬럼 순서: 날짜 | 제목 | 요약 | **종류** | 상태 | 우선순위 | 상세. `종류` 값은 Step 2 에서 추론한 `kind` 를 그대로 사용한다. **셀 본문의 `|` 는 코드 스팬 안이라도 반드시 `\|` 로 이스케이프한다** — 이스케이프하지 않으면 GFM 이 그 자리에서 칸을 쪼개 표가 깨지고, `archive.sh` 의 인덱스 충돌 자동 병합(`merge_fr_index.sh`)이 그 행을 거부해 발행이 중단된다. 셸 코드를 인용할 때 특히 주의한다. GitHub 연동이 활성이면 아래 `GitHub 연동` 섹션의 절차로 GitHub 정보를 추가한다 (인덱스에 GitHub 컬럼이 별도로 있는 변형 형식을 쓰는 경우에만 해당).
+   **6-a. 헤더 이관 (행을 붙이기 전)** — `## 인덱스` 아래 첫 `|` 행에 `관계` 칸이 없으면 `관계` 이전 형식을 쓰던 기존 설치다. 이때는 헤더·구분선·기존 행을 먼저 한 번에 이관하고 그 뒤에 새 행을 붙인다. 아래 명령을 그대로 실행한다 — 헤더에 `관계` 가 이미 있으면 아무것도 바꾸지 않으므로 매번 실행해도 안전하다:
+
+   ```bash
+   INDEX=rd-workflow-workspace/backlog/FUTURE_REQUESTS.md
+   awk '
+   function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+   function ins(line, val,   head, tail) {
+     if (match(line, RX) == 0) return line
+     head = substr(line, 1, RSTART - 1); tail = substr(line, RSTART)
+     return head "|" val tail
+   }
+   /^## 인덱스/ { sec = 1 }
+   sec && /^\|/ {
+     n++
+     if (n == 1) {
+       if (index($0, "| 관계 |") > 0) skip = 1
+       else {
+         cnt = split($0, h, /\|/); pos = 0
+         for (i = 2; i < cnt; i++) if (trim(h[i]) == "우선순위") pos = i
+         if (pos == 0) { print "우선순위 칸을 찾지 못했습니다 — 이관을 중단합니다." > "/dev/stderr"; exit 3 }
+         RX = "\\|"
+         for (i = pos; i < cnt - 1; i++) RX = RX "[^|]*\\|"
+         RX = RX "[ \t]*$"
+       }
+     }
+     if (!skip) {
+       if (n == 1) { print ins($0, " 관계 "); next }
+       if (n == 2) { print ins($0, "------"); next }
+       print ins($0, " - "); next
+     }
+   }
+   { print }
+   ' "$INDEX" > "$INDEX.tmp" && mv "$INDEX.tmp" "$INDEX"
+   ```
+
+   `sed -i` 는 쓰지 않는다 — BSD sed 는 `-i` 뒤에 백업 확장자를 요구해 기본 macOS 에서 실패하고, 대상이 심링크면 실제 파일로 바꿔 놓는다.
+
+   이 명령은 헤더에서 `우선순위` 칸의 위치를 읽어 **그 바로 뒤**에 `관계` 칸을 넣고 기존 행의 `관계` 를 전부 `-` 로 채운다. 마지막 칸이 `상세` 인 기본 형식과 `상세 | GitHub` 변형 모두에서 같은 명령을 쓴다 — 삽입 지점을 줄 끝에서부터 세므로 요약 칸에 `\|` 가 섞여 있어도 밀리지 않는다. `우선순위` 칸이 없는 인덱스면 rc=3 으로 멈추므로, 그때는 이관을 멈추고 사용자에게 알린다. 실제 관계가 있는 기존 항목의 값은 이후 등록·편집에서 채운다. 같은 설치의 `FUTURE_REQUESTS.md` 머리말에 컬럼 순서가 적혀 있으면 그 문장도 함께 고친다.
+
+   **6-b. 행 조립** — 이관을 마친 뒤 새 행을 추가한다:
+
+   ```
+   | {날짜} | {short-title} | {요약} | {kind} | idea | - | {관계} | [상세](items/YYYY-MM-DD-{short-title}.md) |
+   ```
+
+   컬럼 순서: 날짜 | 제목 | 요약 | **종류** | 상태 | 우선순위 | **관계** | 상세. `상세 | GitHub` 변형이면 `… | 우선순위 | 관계 | 상세 | GitHub |` 로, `관계` 는 여기서도 `우선순위` 다음이다. `종류` 값은 Step 2 에서 추론한 `kind` 를 그대로 사용한다. **셀 본문의 `|` 는 코드 스팬 안이라도 반드시 `\|` 로 이스케이프한다** — 이스케이프하지 않으면 GFM 이 그 자리에서 칸을 쪼개 표가 깨지고, `archive.sh` 의 인덱스 충돌 자동 병합(`merge_fr_index.sh`)이 그 행을 거부해 발행이 중단된다. 셸 코드를 인용할 때 특히 주의한다. GitHub 연동이 활성이면 아래 `GitHub 연동` 섹션의 절차로 GitHub 정보를 추가한다 (인덱스에 GitHub 컬럼이 별도로 있는 변형 형식을 쓰는 경우에만 해당).
+
+   `관계` 값 형식은 `series:<name>#N/M; dep:<stem>,<stem>` 이고 관계가 없으면 `-` 이다. 상세 파일의 `depends-on`·`series` 와 정확히 일치해야 한다.
+
+   **6-c. 요약 앞머리 생성** — `관계` 가 `-` 가 아니면 **인덱스 행의 요약 칸 맨 앞**에 `**[<표시명> N/M · 선행: <short-title>]**` 앞머리를 붙인다. 상세 파일의 `- summary:` 는 그대로 두고 인덱스 행에만 붙인다. 조각은 다음과 같이 만든다:
+
+   - `<표시명> N/M`: 상세의 `- series:` 에서 옮긴다. `<표시명>` 은 그 시리즈를 사람이 알아보는 한국어 이름이고, 같은 시리즈의 다른 인덱스 행이 이미 쓰는 표시명이 있으면 그것을 그대로 재사용한다. 없으면 `series:` 의 `<name>` 을 쓴다. `N/M` 은 `series:` 의 번호를 그대로 옮긴다. 시리즈가 없으면 이 조각을 통째로 뺀다.
+   - `선행: <short-title>`: 상세의 `- depends-on:` 각 stem 에서 앞 11자(`YYYY-MM-DD-`)를 뗀 short-title 을 `·` 로 잇는다. `depends-on` 이 `-` 면 이 조각을 통째로 뺀다.
+   - 두 조각이 다 있으면 ` · ` 로 잇는다. 예: `**[리뷰품질 2/3 · 선행: review-finding-confidence-citation-gate]**`, 시리즈만이면 `**[리뷰품질 1/3]**`, 선행만이면 `**[선행: base-engine]**`.
+
+   이미 앞머리가 있는 요약을 옮겨 적을 때는 새로 만들지 않고 그대로 보존한다. 관계 칸·앞머리·상세 필드 셋 중 하나라도 어긋나면 `fr_relations.sh validate` 가 `self_test.sh skills` 에서 비-0 으로 막는다.
 
 6.5. **기본 브랜치 등록 커밋** — 등록 결과가 fr 브랜치와 함께 유실되지 않도록, 호출 브랜치와 무관하게 기본 브랜치에 커밋한다. **GitHub 연동이 활성이면 아래 `GitHub 연동` 절차(상세·인덱스 행에 issue 정보 반영)를 먼저 마친 뒤 한 번만 호출한다** — 등록 커밋 뒤에 행·상세를 고치면 기본 브랜치의 원본과 fr 브랜치의 수정본이 같은 경로에서 갈라져 archive 가 인덱스 단독 충돌로 처리하지 못한다(상세 add/add 충돌):
 

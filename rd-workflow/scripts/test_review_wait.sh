@@ -169,6 +169,21 @@ MOCK_EOF
   echo "$bin_dir"
 }
 
+# mock claude bin을 임시 디렉토리에 생성하고 PATH 앞에 추가하는 함수
+# 사용: setup_mock_claude <sandbox_dir> <script_body>
+setup_mock_claude() {
+  local sandbox="$1"
+  local body="$2"
+  local bin_dir="$sandbox/mock_bin_claude"
+  mkdir -p "$bin_dir"
+  cat > "$bin_dir/claude" <<MOCK_EOF
+#!/usr/bin/env bash
+$body
+MOCK_EOF
+  chmod +x "$bin_dir/claude"
+  echo "$bin_dir"
+}
+
 # ===========================================================================
 # 케이스 1: 정상 완료 — CHECKPOINT Suggested Next Owner = Reviewer여도 성공
 # ===========================================================================
@@ -331,12 +346,6 @@ run_case4() {
     pass "케이스 4b: adapter_codex.sh에 POLL_INTERVAL 잔존 없음"
   fi
 
-  # adapter_claude.sh에 폴링 루프 없음 (무변경 검증)
-  if grep -qE 'POLL_INTERVAL|while.*sleep|sleep.*POLL' "$ADAPTER_CLAUDE" 2>/dev/null; then
-    fail "케이스 4c: adapter_claude.sh에 폴링 루프 존재 (예상치 못한 변경)"
-  else
-    pass "케이스 4c: adapter_claude.sh에 폴링 루프 없음"
-  fi
 }
 
 # ===========================================================================
@@ -1660,23 +1669,19 @@ run_case23() {
 # 케이스 24: effective_cap 순수 함수 — fallback 불변식
 # ===========================================================================
 run_case24() {
-  # 어댑터를 source 하지 않고 함수만 꺼내 쓴다 (어댑터는 set -e + 즉시 실행 스크립트).
-  local fn
-  fn="$(sed -n '/^effective_cap() {/,/^}/p' "$ADAPTER")"
-  [ -n "$fn" ] || { fail "케이스 24: effective_cap 정의를 찾지 못함"; return; }
-
+  # 공용 엔진에서 직접 source 한다 (어댑터는 set -e + 즉시 실행 스크립트라 source 불가).
   local out rc=0
   # `set -e` 아래에서 명령 치환 대입을 가드 없이 두면, 추출한 함수가 비영 종료할 때
   # 케이스 FAIL 이 아니라 스위트 전체가 요약 없이 중단된다 — `|| true` 로 흡수하고
   # 이어지는 값 비교로 판정한다.
-  out="$(bash -c "$fn"'
-    effective_cap 7200 1 600
+  out="$(bash -c 'source "'"$SCRIPT_DIR"'/review_wait.sh"
+    rw_effective_cap 7200 1 600
     echo
-    effective_cap 7200 0 600
+    rw_effective_cap 7200 0 600
     echo
-    effective_cap 3 0 600
+    rw_effective_cap 3 0 600
     echo
-    effective_cap 60 0 4
+    rw_effective_cap 60 0 4
     echo' 2>/dev/null)" || rc=$?
 
   local expected="7200
@@ -1684,7 +1689,7 @@ run_case24() {
 3
 4"
   if [ "$rc" -ne 0 ]; then
-    fail "케이스 24: 추출한 effective_cap 실행이 비영 종료함 (rc=$rc) — 출력 [$out]"
+    fail "케이스 24: 추출한 rw_effective_cap 실행이 비영 종료함 (rc=$rc) — 출력 [$out]"
   elif [ "$out" = "$expected" ]; then
     pass "케이스 24: effective_cap — 정상=상한 / 고장=min(상한,천장) / 짧은 상한 보존"
   else
@@ -2389,6 +2394,578 @@ WRAPEOF
 }
 
 # ===========================================================================
+# 케이스 33 (V1): claude 유휴 임계 발동 → exit 124
+#   V4(d) 겸용 — TERM 을 무시하지 않는 리더는 즉시 죽어 watchdog 의 grace(3초)가 끝나기
+#   전에 부모가 watchdog 을 kill 한다. 그 취소 경로에서 타이머 자원이 남지 않는지 여기서
+#   함께 확인한다(전용 TMPDIR 로 절대 개수 0을 본다 — 케이스 14b 와 같은 근거).
+# ===========================================================================
+run_case33() {
+  local sandbox expected_turn mock_bin rc=0 output start elapsed leftover
+  sandbox="$(make_sandbox)"
+  mkdir -p "$sandbox/tmp"
+  expected_turn="$sandbox/turns/turn-001.md"
+  mock_bin="$(setup_mock_claude "$sandbox" "exec sleep 60")"
+
+  start=$(date +%s)
+  output="$(
+    TMPDIR="$sandbox/tmp" \
+    TOOL_BIN="$mock_bin/claude" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=3 \
+      bash "$ADAPTER_CLAUDE" 2>&1
+  )" || rc=$?
+  elapsed=$(( $(date +%s) - start ))
+
+  if [ "$rc" -eq 124 ] && echo "$output" | grep -q "유휴 임계"; then
+    pass "케이스 33: claude 유휴 임계 발동 → exit 124 (${elapsed}초)"
+  else
+    fail "케이스 33: 기대 rc=124 + '유휴 임계' — 실제 rc=$rc (${elapsed}초)"
+  fi
+
+  [ "$elapsed" -lt 15 ] \
+    && pass "케이스 33(보조1): 15초 이내 종료" \
+    || fail "케이스 33(보조1): ${elapsed}초 — 과도하게 오래 걸림"
+
+  leftover="$(leftover_watchdog_in "$sandbox/tmp")"
+  [ "$leftover" -eq 0 ] \
+    && pass "케이스 33(보조2, V4d): grace 도중 watchdog 취소 후 타이머 자원 잔존 없음" \
+    || fail "케이스 33(보조2, V4d): 타이머 자원 ${leftover}개 잔존"
+
+  # **디스크만으로 원인을 알 수 있어야 한다.** 진행 중 snapshot 은 정상·타임아웃 어느
+  # 경로에서나 같은 모습이라, 사유가 없으면 터미널 출력을 놓친 사용자는 무슨 일이
+  # 있었는지 알 수 없다. 이 실행은 첫 heartbeat(60초) 이전에 끝나므로 heartbeat 가
+  # 남긴 정보에 기댈 수도 없다.
+  if grep -q '^outcome: timeout: idle ' "$sandbox/.review_wait_status" 2>/dev/null; then
+    pass "케이스 33(보조3, R1): 상태 파일에 종료 사유(timeout: idle)가 남음"
+  else
+    fail "케이스 33(보조3, R1): 상태 파일에서 종료 사유를 찾지 못함 — 디스크만으로 원인 판별 불가"
+  fi
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 34 (V2): claude 절대 상한 발동 → exit 124 (유휴는 발동 불가하도록 계속 출력)
+# ===========================================================================
+run_case34() {
+  local sandbox expected_turn mock_bin rc=0 output
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001.md"
+  mock_bin="$(setup_mock_claude "$sandbox" "while :; do echo tick; sleep 1; done")"
+
+  output="$(
+    TOOL_BIN="$mock_bin/claude" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=4 RD_REVIEW_IDLE_TIMEOUT=60 \
+      bash "$ADAPTER_CLAUDE" 2>&1
+  )" || rc=$?
+
+  if [ "$rc" -eq 124 ] && echo "$output" | grep -q "유효 상한"; then
+    pass "케이스 34: claude 절대 상한 발동 → exit 124"
+  else
+    fail "케이스 34: 기대 rc=124 + '유효 상한' — 실제 rc=$rc"
+  fi
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 35 (V3): 정상 턴 전체 — 활동이 유휴 타이머를 갱신 / 헤더 삽입 / heartbeat 요약
+#   표시 / 안정 로그 존재 + log_preserved:yes + 실제 log_path_final / 실행 중에는
+#   안정 이름이 없었음(rendezvous 로 실행 중 시점을 확정 — 케이스 30 과 같은 기법)
+# ===========================================================================
+run_case35() {
+  local sandbox expected_turn mock_bin started go rc=0 log_final
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001.md"
+  started="$sandbox/mock_started"
+  go="$sandbox/mock_go"
+
+  mock_bin="$(setup_mock_claude "$sandbox" "
+echo '{\"type\":\"system\",\"subtype\":\"init\"}'
+printf 's' > '$started'
+while [ ! -f '$go' ]; do
+  echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Grep\"}]}}'
+  sleep 1
+done
+printf 'turn body\n' > '$expected_turn'
+exit 0
+")"
+
+  spawn_group "$sandbox/wrap.log" env \
+    TOOL_BIN="$mock_bin/claude" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=3 RD_REVIEW_HEARTBEAT=2 \
+    bash "$ADAPTER_CLAUDE"
+
+  local i
+  for i in $(seq 1 100); do
+    [ -f "$started" ] && break
+    sleep 0.1
+  done
+  if [ ! -f "$started" ]; then
+    fail "케이스 35: 전제 실패 — mock 이 시작되지 않아 실행 중 관측을 할 수 없음"
+    printf 'go' > "$go"; reap_group "$GROUP_PGID"; rm -rf "$sandbox"; return
+  fi
+
+  # 실행 중 — 안정 이름이 존재하지 않아야 한다 (산출물 수명 계약)
+  if [ ! -e "$sandbox/.claude_output.log" ] && [ ! -e "$sandbox/.review_wait_status" ]; then
+    pass "케이스 35a: 실행 중 안정 로그·상태 파일 모두 부재"
+  else
+    fail "케이스 35a: 실행 중에도 안정 산출물이 존재 (log=$([ -e "$sandbox/.claude_output.log" ] && echo 있음 || echo 없음), status=$([ -e "$sandbox/.review_wait_status" ] && echo 있음 || echo 없음))"
+  fi
+
+  # 유휴 임계(3초)보다 오래 살아서 활동 갱신을 증명한다
+  sleep 5
+  printf 'go' > "$go"
+  wait "$JOB" 2>/dev/null || rc=$?
+  reap_group "$GROUP_PGID"
+
+  [ "$rc" -eq 0 ] \
+    && pass "케이스 35b: 활동이 유휴 타이머를 갱신 — 정상 턴 exit 0 (124 아님)" \
+    || fail "케이스 35b: 기대 rc=0 — 실제 rc=$rc"
+
+  grep -q '⚠️ Self-Review Notice' "$expected_turn" 2>/dev/null \
+    && grep -q 'turn body' "$expected_turn" 2>/dev/null \
+    && pass "케이스 35c: self-review 헤더 삽입 + 원본 내용 보존" \
+    || fail "케이스 35c: 헤더 삽입 실패 또는 원본 내용 유실"
+
+  grep -q 'assistant: tool_use Grep' "$sandbox/wrap.log" 2>/dev/null \
+    && pass "케이스 35d: heartbeat 에 'assistant: tool_use Grep' 요약 표시" \
+    || fail "케이스 35d: heartbeat 요약 표시 누락"
+
+  log_final="$( { grep '^log_path_final: ' "$sandbox/.review_wait_status" 2>/dev/null || true; } | sed 's/^log_path_final: //' )"
+  if [ -f "$sandbox/.claude_output.log" ] \
+     && { grep -q '^log_preserved: yes' "$sandbox/.review_wait_status" 2>/dev/null; } \
+     && [ -n "$log_final" ] && [ -f "$log_final" ]; then
+    pass "케이스 35e: 안정 로그 존재 + log_preserved:yes + log_path_final 이 실재 경로"
+  else
+    fail "케이스 35e: 산출물 보존 계약 위반 — log_final='$log_final'"
+  fi
+
+  # 정상 경로도 사유를 남겨야 한다 — 타임아웃 상태 파일과 구별되지 않으면 사후 확인이
+  # 성립하지 않는다(진행 중 snapshot 은 경로를 빼면 어느 결말에서나 같다).
+  grep -q '^outcome: ok: ' "$sandbox/.review_wait_status" 2>/dev/null \
+    && pass "케이스 35f(R1): 상태 파일에 종료 사유(ok)가 남음" \
+    || fail "케이스 35f(R1): 정상 종료 사유가 상태 파일에 없음"
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 36 (V4): 자손 잔존 없음
+#   (a) TERM 무시 리더 — 어댑터 자체가 exit 124 로 회수 (외부 안전망 도달은 FAIL)
+#   (b) 리더만 0 종료 + 자손 생존 — 살아남은 자손이 **그룹 종료 전 발행·헤더 삽입 여부를
+#       직접 관측**한다 (TERM 을 무시해 grace 동안 생존하므로 관측 창이 확보된다)
+#   (c) pgid 미확보 + TERM 무시 리더 — 엔진 직접 하니스로 PID 회수만 확인
+#     (어댑터에 장애를 주입하지 않는다 — review_wait.sh 의 rw_watchdog_loop 을 직접 호출)
+# ===========================================================================
+run_case36a() {
+  local sandbox expected_turn mock_bin rc=0 waited cap survivors
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001.md"
+  # TERM 을 무시하는 리더 — trap '' 의 SIG_IGN 은 exec 뒤에도 유지된다(POSIX)
+  mock_bin="$(setup_mock_claude "$sandbox" "trap '' TERM; exec sleep 60")"
+  cap=20
+
+  spawn_group "$sandbox/wrap.log" env \
+    TOOL_BIN="$mock_bin/claude" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=2 \
+    bash "$ADAPTER_CLAUDE"
+
+  waited=0
+  while [ "$waited" -lt "$cap" ] && kill -0 "$JOB" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if kill -0 "$JOB" 2>/dev/null; then
+    fail "케이스 36a: 외부 안전망 ${cap}초에 도달 — 어댑터 자체 회수 실패"
+    reap_group "$GROUP_PGID"
+  else
+    wait "$JOB" 2>/dev/null || rc=$?
+    if [ "$rc" -eq 124 ]; then
+      pass "케이스 36a: TERM 무시 리더도 어댑터 자체 exit 124 로 회수 (${waited}초 이내)"
+    else
+      fail "케이스 36a: 기대 rc=124 — 실제 rc=$rc"
+    fi
+
+    sleep 0.5
+    survivors="$(group_size "$GROUP_PGID")"
+    [ "$survivors" -eq 0 ] \
+      && pass "케이스 36a(보조1): 그룹 소멸 확인" \
+      || fail "케이스 36a(보조1): 잔존 프로세스 ${survivors}개"
+
+    grep -q '⚠️ Self-Review Notice' "$expected_turn" 2>/dev/null \
+      && fail "케이스 36a(보조2): 타임아웃 경로에 헤더가 삽입됨" \
+      || pass "케이스 36a(보조2): 헤더 미삽입"
+
+    reap_group "$GROUP_PGID"
+  fi
+
+  rm -rf "$sandbox"
+}
+
+run_case36b() {
+  local sandbox expected_turn mock_bin rc=0 survivors
+  local stable_status stable_log sentinel
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001.md"
+  stable_status="$sandbox/.review_wait_status"
+  stable_log="$sandbox/.claude_output.log"
+  sentinel="$sandbox/saw-early-publish"
+
+  # 리더는 턴 파일을 만들고 즉시 0 으로 종료하지만, 같은 pgid 의 자손이 살아남아
+  # **그룹이 종료되기 전에 안정 산출물 발행이나 헤더 삽입이 일어났는지 직접 관측**한다.
+  #
+  # 이 관측이 이 케이스의 핵심이다. 이전 판본은 "턴 파일이 끝내 생기지 않았다" 로 순서를
+  # 증명하려 했지만, 그것은 아무도 턴 파일을 만들지 않았으므로 **순서와 무관하게 참**이라
+  # 순서 회귀(턴 파일 검사·발행을 cleanup 앞으로 옮기는 실수)를 전혀 탐지하지 못했다.
+  #
+  # 자손은 TERM 을 무시해 grace(기본 3초) 동안 살아남으므로 관측 창이 충분하다 —
+  # 동시에 escalation 의 KILL 이 자손까지 닿는지도 함께 확인된다.
+  mock_bin="$(setup_mock_claude "$sandbox" "printf '턴 본문\n' > '$expected_turn'
+(
+  trap '' TERM
+  while :; do
+    if [ -e '$stable_status' ] || [ -e '$stable_log' ] \
+       || grep -q 'Self-Review Notice' '$expected_turn' 2>/dev/null; then
+      : > '$sentinel'
+    fi
+    sleep 0.05
+  done
+) &
+exit 0")"
+
+  spawn_group "$sandbox/wrap.log" env \
+    TOOL_BIN="$mock_bin/claude" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=60 \
+    bash "$ADAPTER_CLAUDE"
+  wait "$JOB" 2>/dev/null || rc=$?
+
+  [ "$rc" -eq 0 ] \
+    && pass "케이스 36b: 리더 조기 종료·자손 생존 — 그룹 정리 후 정상 후처리 (exit 0)" \
+    || fail "케이스 36b: 기대 rc=0 — 실제 rc=$rc"
+
+  # **핵심 단언** — 자손이 살아 있는 동안 안정 산출물도 헤더도 나타나지 않아야 한다.
+  [ ! -e "$sentinel" ] \
+    && pass "케이스 36b(보조1): 그룹 종료 전 발행·헤더 삽입 없음 (자손이 직접 관측)" \
+    || fail "케이스 36b(보조1): 그룹이 살아 있는 동안 안정 산출물 또는 헤더가 관측됨 — 후처리 순서 위반"
+
+  grep -q 'Self-Review Notice' "$expected_turn" 2>/dev/null \
+    && pass "케이스 36b(보조2): 그룹 정리 뒤에는 헤더가 삽입됨" \
+    || fail "케이스 36b(보조2): 정상 경로인데 헤더가 삽입되지 않음"
+
+  survivors="$(group_size "$GROUP_PGID")"
+  [ "$survivors" -eq 0 ] \
+    && pass "케이스 36b(보조3): TERM 을 무시한 자손도 KILL 로 회수됨" \
+    || fail "케이스 36b(보조3): 자손 ${survivors}개 잔존"
+
+  reap_group "$GROUP_PGID"
+  rm -rf "$sandbox"
+}
+
+run_case36c() {
+  local leader_pid timer_dir marker_file wd_pid waited cap=10
+
+  # 실제 TERM 무시 리더를 백그라운드로 띄우고, pgid 를 확보하지 못한 것처럼(RW_TARGET_PGID='')
+  # 엔진에 직접 넘긴다 — 어댑터에는 아무 장애도 주입하지 않는다.
+  bash -c 'trap "" TERM; exec sleep 60' &
+  leader_pid=$!
+
+  timer_dir="$(mktemp -d)" || { fail "케이스 36c: 타이머 디렉터리 mktemp 실패"; kill "$leader_pid" 2>/dev/null; return; }
+  mkfifo "$timer_dir/timer"
+  exec 9<> "$timer_dir/timer"
+  marker_file="$(mktemp)" || { fail "케이스 36c: 마커 파일 mktemp 실패"; kill "$leader_pid" 2>/dev/null; rm -rf "$timer_dir"; return; }
+  exec 7>> "$marker_file"
+
+  (
+    source "$SCRIPT_DIR/review_wait.sh"
+    RW_TOOL_LABEL=claude
+    RW_TARGET_PGID=""
+    RW_TARGET_PID="$leader_pid"
+    RW_ABS_CAP=300
+    RW_OBSERVER_OK=0
+    RW_FALLBACK_CAP=2
+    RW_IDLE=60
+    RW_TICK=1
+    RW_HEARTBEAT=1000
+    RW_KILL_ESCALATE=1
+    RW_KILL_GRACE=1
+    RW_MARKER_FD=7
+    RW_TIMER_FD=9
+    RW_STATUS_FD_OPEN=0
+    RW_LOG_PATH=""
+    RW_STATUS_STREAM_PATH=""
+    RW_STATUS_FD=""
+    rw_watchdog_loop
+  ) &
+  wd_pid=$!
+
+  waited=0
+  while [ "$waited" -lt "$cap" ] && kill -0 "$leader_pid" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if kill -0 "$leader_pid" 2>/dev/null; then
+    fail "케이스 36c: 외부 안전망 ${cap}초에도 pgid 미확보 리더가 회수되지 않음"
+    kill -9 "$leader_pid" 2>/dev/null || true
+  else
+    pass "케이스 36c: pgid 미확보 상태에서도 리더가 외부 상한 전에 회수됨 (${waited}초 이내)"
+  fi
+
+  kill "$wd_pid" 2>/dev/null || true
+  wait "$wd_pid" 2>/dev/null || true
+  wait "$leader_pid" 2>/dev/null || true
+  { exec 9<&-; } 2>/dev/null || true
+  { exec 7>&-; } 2>/dev/null || true
+  rm -rf "$timer_dir"
+  rm -f "$marker_file"
+}
+
+# ===========================================================================
+# 케이스 37 (V5): 관측기 고장 — 엔진 직접 하니스 (어댑터에 장애 주입 없음)
+#   RW_OBSERVER_OK=0 RW_ABS_CAP=300 RW_FALLBACK_CAP=3 → 마커 세 필드 'cap 3 failed',
+#   약 3초에 발동
+# ===========================================================================
+run_case37() {
+  local dummy_pid timer_dir marker_file start elapsed marker reason rest cap observer
+
+  sleep 60 &
+  dummy_pid=$!
+  timer_dir="$(mktemp -d)" || { fail "케이스 37: 타이머 디렉터리 mktemp 실패"; kill "$dummy_pid" 2>/dev/null; return; }
+  mkfifo "$timer_dir/timer"
+  exec 9<> "$timer_dir/timer"
+  marker_file="$(mktemp)" || { fail "케이스 37: 마커 파일 mktemp 실패"; kill "$dummy_pid" 2>/dev/null; rm -rf "$timer_dir"; return; }
+  exec 7>> "$marker_file"
+  exec 6< "$marker_file"
+
+  start=$(date +%s)
+  (
+    source "$SCRIPT_DIR/review_wait.sh"
+    RW_TOOL_LABEL=claude
+    RW_TARGET_PGID=""
+    RW_TARGET_PID="$dummy_pid"
+    RW_ABS_CAP=300
+    RW_OBSERVER_OK=0
+    RW_FALLBACK_CAP=3
+    RW_IDLE=60
+    RW_TICK=1
+    RW_HEARTBEAT=1000
+    RW_KILL_ESCALATE=0
+    RW_MARKER_FD=7
+    RW_TIMER_FD=9
+    RW_STATUS_FD_OPEN=0
+    RW_LOG_PATH=""
+    RW_STATUS_STREAM_PATH=""
+    RW_STATUS_FD=""
+    rw_watchdog_loop
+  )
+  elapsed=$(( $(date +%s) - start ))
+
+  IFS= read -r marker <&6 || true
+  reason="${marker%% *}"; rest="${marker#* }"
+  cap="${rest%% *}"; observer="${rest##* }"
+
+  if [ "$reason" = cap ] && [ "$cap" = 3 ] && [ "$observer" = failed ]; then
+    pass "케이스 37: 관측기 고장 마커 세 필드 = 'cap 3 failed' (${elapsed}초)"
+  else
+    fail "케이스 37: 마커 기대 'cap 3 failed' — 실제 '[$marker]' (${elapsed}초)"
+  fi
+
+  if [ "$elapsed" -ge 2 ] && [ "$elapsed" -le 6 ]; then
+    pass "케이스 37(보조): 약 3초에 발동 (${elapsed}초)"
+  else
+    fail "케이스 37(보조): 발동 시각 이상 (${elapsed}초, 기대 2~6초)"
+  fi
+
+  kill "$dummy_pid" 2>/dev/null || true
+  wait "$dummy_pid" 2>/dev/null || true
+  { exec 9<&-; } 2>/dev/null || true
+  { exec 7>&-; } 2>/dev/null || true
+  { exec 6<&-; } 2>/dev/null || true
+  rm -rf "$timer_dir"
+  rm -f "$marker_file"
+}
+
+# ===========================================================================
+# 케이스 38 (V6): 실패 경로 — 턴 파일을 만든 뒤 exit 3 → 어댑터 exit 1, 헤더 미삽입
+# ===========================================================================
+run_case38() {
+  local sandbox expected_turn mock_bin rc=0
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001.md"
+  mock_bin="$(setup_mock_claude "$sandbox" "printf 'partial\n' > '$expected_turn'; exit 3")"
+
+  TOOL_BIN="$mock_bin/claude" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+  EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+  WAIT_TIMEOUT=30 RD_REVIEW_IDLE_TIMEOUT=20 \
+    bash "$ADAPTER_CLAUDE" >/dev/null 2>&1 || rc=$?
+
+  [ "$rc" -eq 1 ] \
+    && pass "케이스 38: 실패 종료(exit 3) → 어댑터 exit 1" \
+    || fail "케이스 38: 기대 rc=1 — 실제 rc=$rc"
+
+  grep -q '⚠️ Self-Review Notice' "$expected_turn" 2>/dev/null \
+    && fail "케이스 38(보조): 부분 턴 파일에 헤더가 삽입됨" \
+    || pass "케이스 38(보조): 헤더 미삽입 (부분 턴 파일을 성공으로 취급하지 않음)"
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 39 (V7): TERM 중단 → exit 143, 자손 없음, 헤더 미삽입, 보존 결과 남음
+#   INT 는 background job 이 무시 disposition 을 상속하므로(POSIX) 검증하지 않는다.
+# ===========================================================================
+run_case39() {
+  local sandbox expected_turn mock_bin rc=0 adapter_pid adapter_pgid survivors
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001.md"
+  mock_bin="$(setup_mock_claude "$sandbox" "exec sleep 60")"
+
+  spawn_group "$sandbox/wrap.log" env \
+    TOOL_BIN="$mock_bin/claude" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=60 \
+    bash "$ADAPTER_CLAUDE"
+  adapter_pid="$JOB"
+  adapter_pgid="$GROUP_PGID"
+
+  sleep 1
+  kill -TERM "$adapter_pid" 2>/dev/null || true
+  wait "$adapter_pid" 2>/dev/null || rc=$?
+
+  [ "$rc" -eq 143 ] \
+    && pass "케이스 39: TERM 수신 → exit 143" \
+    || fail "케이스 39: 기대 rc=143 — 실제 rc=$rc"
+
+  sleep 0.5
+  survivors="$(group_size "$adapter_pgid")"
+  [ "$survivors" -eq 0 ] \
+    && pass "케이스 39(보조1): TERM 후 자손 프로세스 없음" \
+    || fail "케이스 39(보조1): 잔존 프로세스 ${survivors}개"
+
+  grep -q '⚠️ Self-Review Notice' "$expected_turn" 2>/dev/null \
+    && fail "케이스 39(보조2): 신호 중단인데 헤더가 삽입됨" \
+    || pass "케이스 39(보조2): 헤더 미삽입"
+
+  if [ -f "$sandbox/.review_wait_status" ] && { grep -q '^log_preserved: ' "$sandbox/.review_wait_status" 2>/dev/null; }; then
+    pass "케이스 39(보조3): 신호 종료 후에도 상태 파일에 보존 결과 존재"
+  else
+    fail "케이스 39(보조3): 상태 파일 또는 보존 결과 누락"
+  fi
+
+  # 신호 경로도 사유를 남겨 진행 중 snapshot 이 최종 결과로 오인되지 않게 한다.
+  grep -q '^outcome: signal: SIGTERM ' "$sandbox/.review_wait_status" 2>/dev/null \
+    && pass "케이스 39(보조4, R1): 상태 파일에 종료 사유(signal: SIGTERM)가 남음" \
+    || fail "케이스 39(보조4, R1): 신호 종료 사유가 상태 파일에 없음"
+
+  reap_group "$adapter_pgid"
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 40 (V9): 표시 포맷터 경계 — 함수 단언 (통합 시나리오 아님)
+# ===========================================================================
+# ===========================================================================
+# 케이스 41 (R1 보완): CLI 가 exit 0 이지만 턴 파일을 만들지 않은 경우
+#   어댑터는 실패(exit 1)인데 최종 상태가 `ok` 로 남으면, 터미널 출력을 놓친 사용자가
+#   **턴 생성 실패와 성공을 디스크에서 구별하지 못한다.** CLI 종료 코드만으로 사유를
+#   확정하면 이 경로가 통째로 성공으로 기록된다.
+# ===========================================================================
+run_case41() {
+  local sandbox expected_turn mock_bin rc=0 output
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001.md"
+  mock_bin="$(setup_mock_claude "$sandbox" "echo '답변만 출력하고 턴 파일은 만들지 않는다'; exit 0")"
+
+  output="$(
+    TOOL_BIN="$mock_bin/claude" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=20 RD_REVIEW_IDLE_TIMEOUT=20 \
+      bash "$ADAPTER_CLAUDE" 2>&1
+  )" || rc=$?
+
+  [ "$rc" -eq 1 ] \
+    && pass "케이스 41: CLI exit 0 + 턴 파일 부재 → 어댑터 exit 1" \
+    || fail "케이스 41: 기대 rc=1 — 실제 rc=$rc"
+
+  if grep -q '^outcome: turn-missing: ' "$sandbox/.review_wait_status" 2>/dev/null; then
+    pass "케이스 41(보조1): 상태 파일이 턴 생성 실패를 사실대로 기록"
+  else
+    fail "케이스 41(보조1): outcome 이 turn-missing 이 아님 — 실제: $( { grep '^outcome: ' "$sandbox/.review_wait_status" 2>/dev/null || echo '(없음)'; } )"
+  fi
+
+  grep -q '^outcome: ok' "$sandbox/.review_wait_status" 2>/dev/null \
+    && fail "케이스 41(보조2): 어댑터 실패인데 상태 파일에 ok 로 남음" \
+    || pass "케이스 41(보조2): 실패 경로가 ok 로 기록되지 않음"
+
+  rm -rf "$sandbox"
+}
+
+run_case40() {
+  local long300 out harness claude_fmt_src
+
+  long300="$(printf 'A%.0s' $(seq 1 300))"
+
+  # ① 훅 미설정 + 300자 입력 → rw_display_line 이 원문 그대로 (codex 불변 조건)
+  harness="$(mktemp)" || { fail "케이스 40 ①: 하니스 mktemp 실패"; return; }
+  cat > "$harness" <<HARNESS_EOF
+#!/usr/bin/env bash
+source "$SCRIPT_DIR/review_wait.sh"
+unset RW_LINE_FORMATTER
+rw_display_line "$long300"
+HARNESS_EOF
+  out="$(bash "$harness")"
+  rm -f "$harness"
+
+  if [ "${#out}" -eq 300 ] && [ "$out" = "$long300" ]; then
+    pass "케이스 40a: 훅 미설정 시 rw_display_line 이 원문 그대로(300자 유지, codex 불변)"
+  else
+    fail "케이스 40a: 원문 훼손 — 길이 ${#out} (기대 300)"
+  fi
+
+  # ② claude 미분류 300자 입력 → claude_format_line 결과가 200자 이하이고 끝이 …
+  claude_fmt_src="$(sed -n '/^claude_format_line() {/,/^}/p' "$ADAPTER_CLAUDE")"
+  harness="$(mktemp)" || { fail "케이스 40 ②: 하니스 mktemp 실패"; return; }
+  {
+    echo '#!/usr/bin/env bash'
+    printf '%s\n' "$claude_fmt_src"
+    printf 'claude_format_line "%s"\n' "$long300"
+  } > "$harness"
+  out="$(bash "$harness")"
+  rm -f "$harness"
+
+  local len_ok=0 suffix_ok=0
+  [ "${#out}" -le 200 ] && len_ok=1
+  case "$out" in
+    *'…') suffix_ok=1 ;;
+  esac
+  if [ "$len_ok" -eq 1 ] && [ "$suffix_ok" -eq 1 ]; then
+    pass "케이스 40b: claude 미분류 300자 입력 → 200자 이하 + 말줄임(…) (실측 ${#out}자)"
+  else
+    fail "케이스 40b: 절단 계약 위반 — 길이 ${#out}, 말줄임=$([ "$suffix_ok" -eq 1 ] && echo 있음 || echo 없음)"
+  fi
+
+  # ③ tool_use 줄 → assistant: tool_use Grep
+  harness="$(mktemp)" || { fail "케이스 40 ③: 하니스 mktemp 실패"; return; }
+  {
+    echo '#!/usr/bin/env bash'
+    printf '%s\n' "$claude_fmt_src"
+    printf 'claude_format_line %q\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Grep"}]}}'
+  } > "$harness"
+  out="$(bash "$harness")"
+  rm -f "$harness"
+
+  [ "$out" = "assistant: tool_use Grep" ] \
+    && pass "케이스 40c: tool_use 줄 → 'assistant: tool_use Grep'" \
+    || fail "케이스 40c: 기대 'assistant: tool_use Grep' — 실제 '$out'"
+}
+
+# ===========================================================================
 # 실행
 # ===========================================================================
 echo "=== adapter_codex.sh 대기 계약·판정 단일화 테스트 ==="
@@ -2502,6 +3079,22 @@ echo ""
 
 run_case32
 
+echo ""
+echo "=== claude 대기 계약 행동 검증 (adapter-wait-contract Task 3) ==="
+echo ""
+
+run_case33
+run_case34
+run_case35
+run_case36a
+run_case36b
+run_case36c
+run_case37
+run_case38
+run_case39
+run_case40
+
+run_case41
 echo ""
 echo "=== 결과: PASS=$PASS FAIL=$FAIL ==="
 

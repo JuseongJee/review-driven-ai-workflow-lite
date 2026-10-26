@@ -26,6 +26,8 @@ trap 'rm -rf "$TMP"' EXIT
 TMP="$(cd "$TMP" && pwd -P)"
 
 # fixture: repo + worktree 2개(alpha/beta 즉시 체크아웃, gamma 는 나중에) + 각자 task-state
+# 스크립트 복사는 확장자 글롭이 아니라 디렉터리 단위로 한다 — 사유는 test_integration.sh
+# 의 setup_repo() 주석 참조. hook 이 읽는 `.awk` 프로그램이 조용히 빠지는 것을 막는다.
 ( cd "$TMP" && \
   git init -q -b main && \
   git config user.email test@example.com && \
@@ -42,8 +44,8 @@ TMP="$(cd "$TMP" && pwd -P)"
   fi && \
   mkdir -p rd-workflow/scripts/lifecycle rd-workflow/scripts/hooks rd-workflow-workspace/.lifecycle && \
   : > rd-workflow-workspace/.gitkeep && \
-  cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/lifecycle/*.sh rd-workflow/scripts/lifecycle/ && \
-  cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/hooks/*.sh rd-workflow/scripts/hooks/ && \
+  cp -R "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/lifecycle/. rd-workflow/scripts/lifecycle/ && \
+  cp -R "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/hooks/. rd-workflow/scripts/hooks/ && \
   cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_state_common.sh rd-workflow/scripts/ && \
   cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_task_common.sh rd-workflow/scripts/ && \
   cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/rd rd-workflow/scripts/ && \

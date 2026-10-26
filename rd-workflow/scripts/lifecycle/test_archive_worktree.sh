@@ -116,6 +116,38 @@ if [[ "$(sed -n '/^## Short Title/{n;p;q}' "$REPO/CURRENT_TASK.md")" == "-" ]]; 
 else
   fail "baseline 위치 — 기본 worktree 미초기화"
 fi
+
+# T6(mirror-comments-lost-in-promote-baseline, 필수) — archive.sh 가 실제로 재작성한
+# 기본 worktree의 CURRENT_TASK.md 파일을 emit_current_task_baseline 재호출 비교가
+# 아니라 독립 기대 문자열과 직접 비교한다. emitter 자체가 맞아도 이후 재작성 경로에서
+# 주석이 사라지는 회귀를 이 assertion 만이 잡는다.
+if awk '
+  BEGIN{state=0}
+  /^## Status$/{state=1; next}
+  state==1 && /^<!-- 허용 상태값 8종은 \.claude\/rules\/rd-workflow\/task-tracking\.md 참조\. 변경은 rd task set-status 경유 -->$/{state=2; next}
+  state==1 {next}
+  state==2 && /^$/{state=3; next}
+  state==3 && /^## Request$/{found=1}
+  END{exit(found?0:1)}
+' "$REPO/CURRENT_TASK.md"; then
+  pass "T6: archive.sh 재작성 CURRENT_TASK.md의 Status 안내 주석 독립 검증"
+else
+  fail "T6: archive.sh 재작성 CURRENT_TASK.md의 Status 안내 주석 누락"
+fi
+if awk '
+  BEGIN{state=0}
+  /^## Source FR$/{state=1; next}
+  state==1 && /^<!-- 권위는 rd-workflow-workspace\/\.lifecycle\/task-state\. 변경은 rd task set-source-fr 경유 -->$/{state=2; next}
+  state==1 {next}
+  state==2 && /^<!-- 복수\(묶은 작업\)이면 미러 쓰기가 자동으로 한 줄에 1건씩 나열합니다 — 여기 직접 목록을 적지 않습니다 -->$/{state=3; next}
+  state==3 && /^$/{state=4; next}
+  state==4 && /^## Spec$/{found=1}
+  END{exit(found?0:1)}
+' "$REPO/CURRENT_TASK.md"; then
+  pass "T6: archive.sh 재작성 CURRENT_TASK.md의 Source FR 안내 주석 독립 검증"
+else
+  fail "T6: archive.sh 재작성 CURRENT_TASK.md의 Source FR 안내 주석 누락"
+fi
 if [[ -z "$(git -C "$REPO/.worktrees/alpha" status --porcelain)" ]] \
   && [[ "$(git -C "$REPO/.worktrees/alpha" ls-files --stage)" == "$alpha_idx_before" ]]; then
   pass "호출 worktree(alpha)가 archive 로 더럽혀지지 않았다"

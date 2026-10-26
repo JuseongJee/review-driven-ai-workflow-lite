@@ -6,7 +6,8 @@
 
 | 파일 | 역할 |
 |------|------|
-| CLAUDE.md | AI 실행 규칙 |
+| CLAUDE.md | 프로젝트 규칙 + rd-workflow 규칙 목차 |
+| .claude/rules/rd-workflow/ | rd-workflow AI 실행 규칙 |
 | PROJECT_CONTEXT.md | 프로젝트/도메인 메타데이터 |
 | REQUEST.md | 현재 작업 요청서 |
 | CURRENT_TASK.md | 진행 중인 작업 상태 |
@@ -22,6 +23,7 @@
 | guides/setup_with_claude.md | Claude 실행 설치 가이드 (권장) |
 | [guides/team-overlay-fresh-install.md](guides/team-overlay-fresh-install.md) | 팀 프로젝트 개인 설치 (submodule 구조) |
 | [guides/team-overlay-migration.md](guides/team-overlay-migration.md) | 기존 설치를 submodule 구조로 이관 |
+| [guides/mutation-check.md](guides/mutation-check.md) | 변이 확인 규약 (새 부정 명제·회귀 단언의 FAIL 확인) |
 
 ## rd-workflow-workspace/
 

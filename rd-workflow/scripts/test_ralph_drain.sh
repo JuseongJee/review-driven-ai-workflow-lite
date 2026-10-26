@@ -22,9 +22,17 @@ echo $((i + 1)) > "$RD_STUB_COUNTER"
 if [ -n "${RD_STUB_ENVLOG:-}" ]; then
   echo "FR=${RD_AUTOPILOT_FR:-} MODE=${RD_AUTOPILOT_MODE:-} FINISH=${RD_FINISH_POLICY:-}" >> "$RD_STUB_ENVLOG"
 fi
-# blocked(20) 시 outcome 파일에 사유 기록 (supervisor 사유 수집 검증용)
-if [ "$code" = "20" ] && [ -n "${RD_AUTOPILOT_OUTCOME_FILE:-}" ]; then
-  echo "blocked:${RD_STUB_REASON:-review-50turn}" > "$RD_AUTOPILOT_OUTCOME_FILE"
+# blocked(20)·queue-blocked(31) 시 outcome 파일 기록.
+# 첫 줄은 토큰, RD_STUB_DETAIL 이 있으면 둘째 줄부터 대기 상세를 덧붙인다
+# (supervisor 의 사유 수집·대기 상세 전달 검증용).
+if [ -n "${RD_AUTOPILOT_OUTCOME_FILE:-}" ]; then
+  case "$code" in
+    20) printf '%s\n' "${RD_STUB_FIRST_LINE:-blocked:${RD_STUB_REASON:-review-50turn}}" > "$RD_AUTOPILOT_OUTCOME_FILE" ;;
+    31) printf '%s\n' "${RD_STUB_FIRST_LINE:-queue-blocked}" > "$RD_AUTOPILOT_OUTCOME_FILE" ;;
+  esac
+  case "$code" in
+    20|31) [ -n "${RD_STUB_DETAIL:-}" ] && printf '%s\n' "$RD_STUB_DETAIL" >> "$RD_AUTOPILOT_OUTCOME_FILE" ;;
+  esac
 fi
 exit "$code"
 STUBEOF
@@ -54,6 +62,8 @@ run_case() {
     echo "  ok [$name] exit $ec"
   fi
   LAST_OUT="$out"
+  LAST_INVOCATIONS="$(cat "$counter" 2>/dev/null || echo 0)"
+  [ -n "$LAST_INVOCATIONS" ] || LAST_INVOCATIONS=0
 }
 
 assert_contains() {
@@ -63,11 +73,64 @@ assert_contains() {
   esac
 }
 
+# wrapper 호출 횟수 단언 — 전역 실패의 "즉시 중단" 을 재는 수단이다.
+assert_invocations() {
+  if [ "${LAST_INVOCATIONS:-0}" = "$1" ]; then
+    echo "  ok [invocations] $1"
+  else
+    echo "  FAIL [invocations] 기대 $1, 실제 ${LAST_INVOCATIONS:-0}"; fail=1
+  fi
+}
+
+# 전체 출력에서 ralph_drain 요약 구역만 잘라낸다 (summarize 의 실제 마커 문자열).
+summary_section() {
+  printf '%s\n' "$LAST_OUT" | awk '/---- ralph_drain 요약 ----/{f=1} f'
+}
+
+# 대기 상세의 각 "행 전체" 가 요약 구역 안에 남았는지 본다. 전역 검색은 부족하다 —
+# wrapper 출력에만 상세가 있고 요약에는 없는 구현이 통과하기 때문이다.
+assert_detail_in_summary() {
+  local sec line
+  sec="$(summary_section)"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$sec" in
+      *"$line"*) echo "  ok [summary detail] ${line%%	*}" ;;
+      *) echo "  FAIL [summary detail] 요약 구역에 행 전체가 없음: [$line]"; fail=1 ;;
+    esac
+  done <<EOF
+$1
+EOF
+}
+
 echo "== ralph_drain 테스트 =="
 run_case "queue-empty 즉시" 0 "30";                          assert_contains "queue-empty"
 run_case "completed 후 종료" 0 "0 30";                       assert_contains "completed (누적 1)"
 run_case "blocked 후 종료" 0 "20 30";                        assert_contains "blocked: 1"
 run_case "blocked 사유 수집" 0 "20 30" RD_STUB_REASON=loop-guard; assert_contains "loop-guard"
+run_case "queue-blocked 즉시" 0 "31";                        assert_contains "의존 대기"
+
+# 전역 실패는 다음 FR 로 넘어가지 않고 즉시 중단한다.
+# stub 이 20 을 계속 돌려줘도 wrapper 호출은 1회여야 한다.
+run_case "relations-unavailable 즉시 중단" 1 "20 20 20" \
+  RD_STUB_FIRST_LINE=blocked:relations-unavailable
+assert_contains "relations-unavailable"
+assert_invocations 1
+
+# drain 의 최종 요약 구역에 대기 상세 2건이 "행 전체" 로 남는지 본다.
+DETAIL='alpha-task	대기(선행: lead-task)	선행 lead-task 완료 필요
+beta-task	오류(series)	fr_relations.sh validate 로 관계 데이터 수정'
+run_case "대기 상세가 요약에 실린다" 0 "31" RD_STUB_DETAIL="$DETAIL"
+assert_detail_in_summary "$DETAIL"
+
+# exit 20(전역 실패) 경로도 같은 방식으로 본다 — 진단 전달까지 함께 덮는다.
+# 고정 문구가 아니라 구별 가능한 실제 오류 메시지를 넣는다.
+ERRLINE='-	인덱스 파일 없음: /tmp/nonexistent/FUTURE_REQUESTS.md	fr_relations.sh validate --root . 로 원인 확인'
+run_case "전역 실패 진단이 요약에 실린다" 1 "20" \
+  RD_STUB_FIRST_LINE=blocked:relations-unavailable RD_STUB_DETAIL="$ERRLINE"
+assert_detail_in_summary "$ERRLINE"
+assert_contains "인덱스 파일 없음: /tmp/nonexistent/FUTURE_REQUESTS.md"
+
 run_case "harness-error 재시도 성공" 0 "40 30";              assert_contains "1회 재시도"
 run_case "harness-error 재발 중단" 1 "40 40";                assert_contains "harness-error 재발"
 run_case "non-progress 가드" 1 "10 10 10" RD_RALPH_NONPROGRESS_LIMIT=3; assert_contains "non-progress 가드"

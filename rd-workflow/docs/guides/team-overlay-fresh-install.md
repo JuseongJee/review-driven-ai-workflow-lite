@@ -108,7 +108,7 @@ git push -u origin main
 
 ```bash
 # 배포 자산이 다 왔는가
-ls .claude/settings.json WORKING_WITH_AI.md .gitignore CLAUDE.md PROJECT_CONTEXT.md
+ls .claude/settings.json .claude/rules/rd-workflow WORKING_WITH_AI.md .gitignore CLAUDE.md PROJECT_CONTEXT.md
 
 # submodule 이 등록되고 소스가 체크아웃되었는가
 git submodule status

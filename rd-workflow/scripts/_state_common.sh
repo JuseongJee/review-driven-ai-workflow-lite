@@ -552,12 +552,29 @@ _sfr_reject() {
 
 source_fr_resolve() {
   local raw="${1-}" root="${2:-.}"
-  local v label target rest cand slug hit count f fast
+  local v label target rest cand slug hit count f fast _sfr_p1
 
   # 단계 0 — 전처리: trim → 리스트 접두 1회 제거 → 재trim
   v="$(_sfr_trim "$raw")"
   if [[ "$v" == "- "* ]]; then v="$(_sfr_trim "${v#- }")"; fi
   if [[ -z "$v" || "$v" == "-" ]]; then printf ''; return 0; fi
+
+  # 단계 0.5 앞 — ①형식(YYYY-MM-DD slug — 경로) 봉투 벗기기.
+  # 단계 1(괄호 추출)보다 먼저 처리해야 경로 안 괄호가 오해석되지 않는다.
+  # em dash 뒤가 canonical/items 축약으로 보일 때만 가로채고, 아니면(예:
+  # 기존 8종의 "라벨 — [상세](canonical)") v 를 바꾸지 않는다 — em dash
+  # 뒤에 markdown 링크가 오는 기존 표기와 겹치지 않기 위한 안전장치다.
+  # from_request/from_request_list 가 백틱을 이미 제거하므로, 백틱 유무와
+  # 무관하게 성공해야 한다 — 백틱이 있으면 한 쌍만 벗기고, 없으면 그대로 쓴다.
+  if [[ "$v" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]+[a-z0-9][a-z0-9-]*\ —\ (.+)$ ]]; then
+    _sfr_p1="${BASH_REMATCH[1]}"
+    if [[ "$_sfr_p1" == \`*\` && "${_sfr_p1:1:${#_sfr_p1}-2}" != *'`'* ]]; then
+      _sfr_p1="${_sfr_p1#\`}"; _sfr_p1="${_sfr_p1%\`}"
+    fi
+    case "$_sfr_p1" in
+      "$_SFR_ITEMS_PREFIX"/*.md|items/*.md) v="$_sfr_p1" ;;
+    esac
+  fi
 
   # 단계 0.5 — canonical / items 축약 fast path (괄호 해석보다 먼저)
   #   저장 계약은 basename 에 '(' 를 허용한다. 이 경로가 없으면
@@ -668,8 +685,8 @@ source_fr_resolve() {
 # 이 목록에 항목을 더하는 것은 신뢰 경계를 넓히는 일입니다. `.lifecycle/` 을 통째로 넣지
 # 않고 archive 절차가 실제로 쓰는 3개 항목으로 좁힌 이유가 그것입니다 — 넓은 동적
 # 디렉터리를 제외하면 자동화의 입력이 되는 파일(설정·hook 입력·source 되는 조각)이
-# 나중에 들어와 신뢰 경계가 조용히 넓어집니다. 목록은 change-spec §3.1 의 11개 항목(디렉터리 7,
-# 파일 4)과 정확히 일치해야 하며, 바꾸려면 테스트 기대값(`hooks/test_pre_commit_archive_gate.sh` 의
+# 나중에 들어와 신뢰 경계가 조용히 넓어집니다. 목록은 change-spec §3.1 의 12개 항목(디렉터리 7,
+# 파일 5)과 정확히 일치해야 하며, 바꾸려면 테스트 기대값(`hooks/test_pre_commit_archive_gate.sh` 의
 # `record-paths 4b`)도 함께 고쳐야 합니다.
 #
 # `raw-captures/` 는 선행 spec(2026-09-05-1944 §2.1)이 「입력 원문」이라는 이유로
@@ -684,6 +701,7 @@ RD_RECORD_PATHS=(
   "rd-workflow-workspace/.lifecycle/task-state"
   "rd-workflow-workspace/.lifecycle/review-seals/"
   "rd-workflow-workspace/.lifecycle/review-skip-audit.log"
+  "rd-workflow-workspace/.lifecycle/stage_metrics.tsv"
   "rd-workflow-workspace/backlog/"
   "rd-workflow-workspace/raw-captures/"
   "rd-workflow-workspace/reports/completions/"
@@ -975,6 +993,170 @@ state_write_review_session() {
 }
 
 # ---------------------------------------------------------------------------
+# 상태 전이 시각 append-only 로그 (change-spec 2026-09-24-2310-stage-transition-timestamps D3)
+# ---------------------------------------------------------------------------
+
+# state_log_stage_transition <short_title> <from_status> <to_status> — 전이 시각을
+#   append-only 로그(stage_metrics.tsv)에 기록한다. from==to 는 기록하지 않는다
+#   (재기록 노이즈 방지, AC1/AC4 기준과 일치). 로그 경로는 TASK_STATE_PATH 와 같은
+#   디렉터리에 둔다 — promote.sh·archive.sh 가 다른 worktree 를 대상으로
+#   TASK_STATE_PATH 를 일시 전환하는 관례를 그대로 따라가 올바른 worktree 에
+#   기록되게 하기 위함이다(project_root 를 쓰면 promote.sh 호출 중 엉뚱한
+#   worktree 에 쓴다).
+#   best-effort — 실패해도 항상 return 0(전이 자체를 막지 않는다), 실패 시 stderr 경고.
+state_log_stage_transition() {
+  local short_title="${1-}" from="${2-}" to="${3-}"
+  [[ "$from" == "$to" ]] && return 0
+  local f
+  f="$(dirname "$TASK_STATE_PATH")/stage_metrics.tsv"
+  {
+    mkdir -p "$(dirname "$f")"
+    [[ -f "$f" ]] || printf '# short_title\tfrom_status\tto_status\tepoch\n' > "$f"
+    printf '%s\t%s\t%s\t%s\n' "$short_title" "$from" "$to" "$(date +%s)" >> "$f"
+  } 2>/dev/null || echo "경고: stage_metrics.tsv 기록 실패 — 이 전이(${short_title}: ${from}→${to})는 계측에 남지 않습니다." >&2
+  return 0
+}
+
+# state_stage_metrics_report <short_title> [log_file] [now_epoch] — 회차 요약을 사람이
+#   읽을 수 있는 형태로 출력한다(change-spec D5, spec/plan review Turn 002 F2/F3/F4 수정).
+#   대상이 비어 있거나 '-' 면 "현재 진행 중인 작업이 없습니다" 안내. 파일 부재/빈
+#   대상이면 "기록 없음" 안내. 항상 return 0. now_epoch 생략 시 date +%s(테스트에서
+#   고정 시각을 주입할 수 있도록 3번째 인자로 뺐다 — sleep 없는 결정적 테스트용).
+#
+#   회차 경계(F2): 순서대로 스캔하며 target 행을 현재 버퍼에 쌓는다. 다른
+#   short_title 행을 만나면, 버퍼가 비어있지 않았을 때만 "마지막으로 완결된 구간"으로
+#   보관(S_*)한 뒤 버퍼를 새로 시작한다. 스캔 종료 시 현재 버퍼가 비어있지 않으면
+#   그것을(파일 끝이 target 행으로 끝남 — 아직 열려 있을 수 있는 최신 구간) 쓰고,
+#   비어있으면 보관해 둔 구간(S_*)을 쓴다. "다른 short_title 을 만나는 즉시 버퍼를
+#   버리는" 예전 설계는 target 뒤에 다른 회차가 이어 붙으면 조회 결과가 사라진다.
+#   종료 판정: 마지막 행의 to_status 가 '대기 중' 이면 종료된 회차(동결, now 미사용).
+#   재방문(F3): 어떤 상태가 닫힌 방문과 열린(진행 중) 방문을 모두 가지면 확정 합계와
+#   잠정 경과를 함께 보여준다.
+#   무결성(F4): 닫힌 세그먼트뿐 아니라 열린 세그먼트도 epoch 형식·시간 역전(미래
+#   시각)을 검사한다. 어떤 상태의 유효 세그먼트가 하나도 없으면 "측정 불가"(0분이 아님).
+state_stage_metrics_report() {
+  local target="${1-}"
+  local f="${2:-$(dirname "$TASK_STATE_PATH")/stage_metrics.tsv}"
+  local now="${3:-$(date +%s)}"
+  if [[ -z "$target" || "$target" == "-" ]]; then
+    printf '현재 진행 중인 작업이 없습니다.\n'
+    return 0
+  fi
+  if [[ ! -f "$f" ]]; then
+    printf '기록 없음 — %s\n' "$f"
+    return 0
+  fi
+  awk -F'\t' -v target="$target" -v now="$now" '
+    /^#/ { next }
+    # F4 잔여(spec/plan review Turn 004) — epoch 컬럼이 잘린 행(NF==3)을 통째로
+    # 버리면 그 행이 나타내는 종료/전이 자체가 없었던 것처럼 처리돼, 이미 종료된
+    # 회차가 계속 "진행 중"으로 늘어난다(재현: 마지막 행의 epoch 만 잘린 경우).
+    # short_title/from/to 세 필드는 있는데 epoch 만 없는 행은 버퍼에 그대로
+    # 넣되 ep 를 빈 문자열로 남긴다 — 아래 무결성 검사가 숫자 형식 실패로 잡아
+    # "측정 불가"로 정직하게 표시하게 한다. 세 필드조차 없는 행(NF<3)만 판단
+    # 불가로 건너뛴다.
+    NF < 3 { next }
+    {
+      st=$1; from=$2; to=$3; ep=(NF >= 4 ? $4 : "")
+      # short_title 비교는 문자열로 고정한다 — awk 는 숫자 형태 문자열끼리
+      # (예: "001" 과 "1", "1e2" 와 "100") == 를 numeric-string 규칙으로
+      # 비교해 서로 다른 회차를 같은 회차로 섞는다(리뷰 F1, 실측 재현).
+      # 접미사를 붙여 강제로 문자열 비교로 만든다.
+      if ((st "\x1f") == (target "\x1f")) {
+        n++
+        A_from[n]=from; A_to[n]=to; A_ep[n]=ep
+      } else {
+        if (n > 0) {
+          # 현재 버퍼를 "마지막으로 완결된 구간"으로 보관 후 재시작
+          sn = n
+          for (j = 1; j <= sn; j++) { S_from[j]=A_from[j]; S_to[j]=A_to[j]; S_ep[j]=A_ep[j] }
+          n = 0
+        }
+      }
+    }
+    END {
+      if (n > 0) {
+        # 파일 끝이 target 구간으로 끝났다 — 이것을 쓴다(가장 최신, 열려 있을 수 있음)
+        use_n = n
+        for (j = 1; j <= use_n; j++) { U_from[j]=A_from[j]; U_to[j]=A_to[j]; U_ep[j]=A_ep[j] }
+      } else if (sn > 0) {
+        use_n = sn
+        for (j = 1; j <= use_n; j++) { U_from[j]=S_from[j]; U_to[j]=S_to[j]; U_ep[j]=S_ep[j] }
+      } else {
+        print "기록 없음 — 이 작업(" target ")의 전이가 로그에 없습니다"; exit
+      }
+
+      if (U_from[1] != "대기 중") {
+        print "계측 이전 구간 — 알 수 없음 (첫 기록 이전 상태 체류 시간 불명)"
+      }
+      closed = (U_to[use_n] == "대기 중") ? 1 : 0
+      segN = use_n - 1
+      ord_n = 0
+      open_label = ""
+
+      for (i = 1; i <= segN; i++) {
+        label = U_to[i]
+        bad = 0
+        if (U_ep[i] !~ /^[0-9]+$/ || U_ep[i+1] !~ /^[0-9]+$/) bad = 1
+        else if (U_ep[i+1] < U_ep[i]) bad = 1
+        if (U_to[i] != U_from[i+1]) bad = 1
+        visits[label]++
+        if (bad) { incomplete[label] = 1 }
+        else { total[label] += (U_ep[i+1] - U_ep[i]); validcount[label]++ }
+        if (!(label in order)) { ord_n++; order[label] = ord_n }
+      }
+
+      open_bad = 0
+      if (!closed) {
+        label = U_to[use_n]
+        visits[label]++
+        open_label = label
+        if (U_ep[use_n] !~ /^[0-9]+$/) open_bad = 1
+        else if (now + 0 < U_ep[use_n] + 0) open_bad = 1
+        if (!open_bad) open_dur = now - U_ep[use_n]
+        if (!(label in order)) { ord_n++; order[label] = ord_n }
+      }
+
+      printf "회차: %s (%s)\n", target, (closed ? "종료됨" : "진행 중")
+      for (k = 1; k <= ord_n; k++) {
+        for (label in order) {
+          if (order[label] != k) continue
+          line = "  " label ": " visits[label] "회"
+          if (label == open_label) {
+            if (open_bad) {
+              # 열린 세그먼트 자체는 측정 불가여도, 같은 상태를 이전에 닫힌 채로
+              # 방문한 확정 합계가 있으면 그 값은 계속 보여준다(F3 — 재방문 확정
+              # 합계를 열린 세그먼트 손상 때문에 지워서는 안 된다).
+              if (validcount[label] > 0) {
+                line = line ", 확정 " int(total[label]/60) "분 + 진행 중(측정 불가 — 시작 시각 손상)"
+              } else {
+                line = line ", 진행 중(측정 불가 — 시작 시각 손상)"
+              }
+            } else if (validcount[label] > 0) {
+              combined = total[label] + open_dur
+              line = line ", 확정 " int(total[label]/60) "분 + 진행 중 " int(open_dur/60) "분(잠정, 합계 " int(combined/60) "분)"
+            } else {
+              line = line ", 진행 중 " int(open_dur/60) "분(잠정)"
+            }
+          } else if (validcount[label] > 0) {
+            line = line ", 총 " int(total[label]/60) "분"
+          } else {
+            line = line ", 측정 불가"
+          }
+          # F4 잔여(spec/plan review Turn 004) — 닫힌 방문의 불완전 표시(incomplete)와
+          # 열린 세그먼트의 손상(open_bad)은 서로 다른 사실이다. 열린 세그먼트가
+          # 손상됐다고 닫힌 방문의 "(일부 구간 누락 가능)" 을 숨기면(이전 설계의 결함),
+          # 확정 합계가 실제로는 불완전한데도 완전한 값처럼 보인다. 무조건 함께 보여준다.
+          if (incomplete[label]) line = line " (일부 구간 누락 가능)"
+          print line
+        }
+      }
+    }
+  ' "$f"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # 마이그레이션 보조 함수 (state_ensure 전용 — _state_common.sh 내부)
 # ---------------------------------------------------------------------------
 
@@ -989,11 +1171,13 @@ _state_legacy_section() {
   ' "$file"
 }
 
-# canonical 9종 집합 (LC-19) — _state_common.sh 독자 정의 (guard_common.sh에 의존하지 않음)
+# canonical 10종 집합 (LC-19) — _state_common.sh 독자 정의 (guard_common.sh에 의존하지 않음)
 # 파이프(|) 구분 문자열. _state_status_canonical() 의 단일 진실 출처.
 # `아카이브 보류` 는 「리뷰 종결·발행 대기」입니다 (change-spec §4.1). 완료가 아니며,
 # 이 상태에서만 기록 커밋(제외 경로 한정)이 게이트를 통과합니다.
-STATE_CANONICAL_STATUSES="대기 중|REQUEST review 대기|spec/plan 작성 중|spec/plan review 대기|구현 중|검증 중|diff review 대기|아카이브 보류|완료"
+# `구현 대기` 는 「spec/plan review 종결·구현 착수 대기」입니다 (change-spec
+# 2026-09-24-1836-task-status-no-implementation-pending).
+STATE_CANONICAL_STATUSES="대기 중|REQUEST review 대기|spec/plan 작성 중|spec/plan review 대기|구현 대기|구현 중|검증 중|diff review 대기|아카이브 보류|완료"
 
 # _state_status_canonical <status> — return 0: canonical, 1: 비canonical
 # STATE_CANONICAL_STATUSES 변수를 단일 출처로 사용 (Bash 3.2 호환: IFS 분리 루프)
@@ -1040,7 +1224,7 @@ state_ensure() {
 
   # Status 비어있거나 비canonical → fail-closed (SEC-13)
   if [[ -z "$st" ]] || ! _state_status_canonical "$st"; then
-    echo "task-state 마이그레이션 실패: CURRENT_TASK.md ## Status ('${st:-<없음>}') 가 canonical 9종이 아닙니다." >&2
+    echo "task-state 마이그레이션 실패: CURRENT_TASK.md ## Status ('${st:-<없음>}') 가 canonical 10종이 아닙니다." >&2
     echo "CURRENT_TASK.md 의 Status 를 유효한 값으로 복구한 뒤 다시 실행하세요 (묵시적 초기화 금지 — SEC-13)." >&2
     return 3
   fi

@@ -17,6 +17,7 @@ source "$SCRIPT_DIR/slug.sh"
 source "$SCRIPT_DIR/_lifecycle_common.sh"
 source "$SCRIPT_DIR/_tasks_index.sh"
 source "$SCRIPT_DIR/session_launch.sh"
+source "$SCRIPT_DIR/../_task_common.sh"
 
 # ===========================================================================
 # promote.sh — 재설계 (task-4-brief). 이제 이 스크립트는 **기본 브랜치에 어떤 커밋도
@@ -63,7 +64,7 @@ if [[ -n "$SIZE_VAL" ]]; then
   esac
 elif [[ -n "$STATUS_VAL" ]]; then
   if ! _state_status_canonical "$STATUS_VAL"; then
-    echo "promote: --status 값이 canonical 9종이 아닙니다: '$STATUS_VAL'" >&2
+    echo "promote: --status 값이 canonical 10종이 아닙니다: '$STATUS_VAL'" >&2
     echo "  허용: ${STATE_CANONICAL_STATUSES//|/, }" >&2
     exit 1
   fi
@@ -611,40 +612,43 @@ if [[ "$NEED_CONTENT" -eq 1 ]]; then
 
   SFR_LIST="$(source_fr_split "${SOURCE_FR_VAL:--}" "$TARGET_DIR")"
   SFR_BODY="$(source_fr_mirror_body "$SFR_LIST")"
-  SFR_TMP="${TASK_FILE}.sfr.tmp"
-  if ! SFR_BODY="$SFR_BODY" awk '
-    BEGIN { n = split(ENVIRON["SFR_BODY"], arr, "\n") }
-    $0=="## Source FR" { print; sec=1; done=0; next }
-    /^## /             { if (sec && !done) { for (i=1;i<=n;i++) print arr[i]; done=1 } sec=0; print; next }
-    sec                { next }
-    { print }
-    END { if (sec && !done) { for (i=1;i<=n;i++) print arr[i] } }
-  ' "$TASK_FILE" > "$SFR_TMP"; then
-    rm -f "$SFR_TMP"
+  if ! _task_section_write_list "Source FR" "$SFR_BODY" "$TASK_FILE"; then
     echo "promote: CURRENT_TASK.md Source FR 갱신본 생성 실패 — 중단" >&2; exit 1
   fi
-  mv "$SFR_TMP" "$TASK_FILE"
 
   # task-state — TASK_STATE_PATH 를 이 worktree 로 잠시 돌려서 기존 helper 를 그대로 쓴다.
   _SAVED_TSP="$TASK_STATE_PATH"
   TASK_STATE_PATH="${TARGET_DIR}/rd-workflow-workspace/.lifecycle/task-state"
+  _PROMOTE_FROM_STATUS="$(state_read_field "status")"
   state_write_fields \
     "short-title=${SLUG}" "status=${STATUS_VAL}" "fr-branch=${TARGET_BRANCH}" \
     "worktree-path=${TARGET_DIR}" "source-fr=${SOURCE_FR_VAL:--}" \
     "created-at=$(date +%Y-%m-%d-%H%M)"
+  # 새 회차의 첫 전이는 이 worktree(TARGET_DIR)의 short-title(SLUG)에 귀속시킨다
+  # (change-spec D4-2) — TASK_STATE_PATH 가 아직 TARGET_DIR 을 가리키는 이 구간
+  # 안에서(복원 이전에) 호출한다. 복원 후 호출하면 promote.sh 를 부른 worktree 에
+  # 잘못 기록된다(spec/plan review 준비 Review Focus).
+  state_log_stage_transition "$SLUG" "$_PROMOTE_FROM_STATUS" "$STATUS_VAL"
   state_write_base_commit "$BASE_TIP" || {
     echo "promote: base-commit 을 기록하지 못했습니다 — diff review 의 base 자동 판정이 fr-branch 에만 의존합니다." >&2
   }
   TASK_STATE_PATH="$_SAVED_TSP"
 
+  # stage_metrics.tsv 는 best-effort 로 기록되므로(로그 실패해도 promote 자체는
+  # 계속돼야 한다) 존재할 때만 pathspec 목록에 추가한다 — 존재하지 않는 pathspec 을
+  # `git add` 에 넘기면 nonzero 로 실패해 `&&` 체인이 깨진다(change-spec D6-1).
+  _PROMOTE_COMMIT_PATHS=(CURRENT_TASK.md rd-workflow-workspace/.lifecycle/task-state)
+  [[ -f "${TARGET_DIR}/rd-workflow-workspace/.lifecycle/stage_metrics.tsv" ]] \
+    && _PROMOTE_COMMIT_PATHS+=(rd-workflow-workspace/.lifecycle/stage_metrics.tsv)
+
   ( cd "$TARGET_DIR" \
-    && git add CURRENT_TASK.md rd-workflow-workspace/.lifecycle/task-state \
-    && if ! git diff --cached --quiet -- CURRENT_TASK.md rd-workflow-workspace/.lifecycle/task-state; then
+    && git add "${_PROMOTE_COMMIT_PATHS[@]}" \
+    && if ! git diff --cached --quiet -- "${_PROMOTE_COMMIT_PATHS[@]}"; then
          # pathspec 을 반드시 붙인다. `--no-worktree` 착수는 사용자의 기존 체크아웃과
          # **index 를 공유**하므로, 경로 한정이 없으면 사용자가 미리 staged 해 둔 무관한
          # 파일이 lifecycle 착수 커밋에 딸려 들어가고 그의 index 에서도 사라진다.
          git commit -q -m "chore(lifecycle): ${SLUG} 작업 착수 — task-state·CURRENT_TASK 기록" \
-           -- CURRENT_TASK.md rd-workflow-workspace/.lifecycle/task-state
+           -- "${_PROMOTE_COMMIT_PATHS[@]}"
        fi )
 fi
 

@@ -26,7 +26,7 @@
 
 ## 수동 REQUEST archive 절차 (autopilot 미사용 흐름)
 
-archive 실행 주체는 Claude (CLAUDE.md 의 Task Tracking 섹션 규약). 사용자가 archive 트리거.
+archive 실행 주체는 Claude (`.claude/rules/rd-workflow/task-tracking.md` 의 Task Tracking 규약). 사용자가 archive 트리거.
 
 1. **REQUEST.md 복사:**
    ```bash

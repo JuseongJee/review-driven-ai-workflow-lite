@@ -171,8 +171,13 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 `
 
 1. **resume 우선**: `CURRENT_TASK.md` 에 미완 작업(Status ≠ `대기 중` 그리고 Short Title ≠ `-`)이 있으면 그 FR 을 재개한다 (§5 재사용). `RD_AUTOPILOT_FR` 이 다른 slug 를 가리켜도 resume 이 우선하며, 불일치는 outcome 요약에 한 줄 남긴다.
 2. else `RD_AUTOPILOT_FR=<slug>` → 그 FR 을 선택한다.
-3. else `RD_AUTOPILOT_FR=auto` → validated / ready-for-request 후보에서 priority 자동선택한다 (§1 정렬 규칙: P1→P2→P3→unranked, 동순위 날짜 오름차순).
-4. else (auto 인데 후보 없음) → outcome `queue-empty` 기록 후 종료한다.
+3. else `RD_AUTOPILOT_FR=auto` → `bash rd-workflow/scripts/fr_relations.sh auto-pick --root .` 를 실행하고 **첫 줄과 종료 코드**로 분기한다. 후보 집합 계산과 갈림 판정은 이 스크립트가 한다 — 여기서 다시 계산하지 않는다. `eligible` 은 **validated / ready-for-request 후보**(기존 화이트리스트 그대로, `blocked` 은 set-aside 라 제외)이고, `selectable` 은 그중 관계 판정이 `ready` 인 것이다.
+   - 첫 줄이 `unavailable` (rc=2): outcome `blocked:relations-unavailable` 을 기록하고 종료한다. 스크립트 출력의 둘째 줄 이후를 outcome 둘째 줄부터 그대로 옮긴다. 이 실패는 FR 을 고르기 전의 전역 실패이므로 `ralph_drain.sh` 가 즉시 중단하며, 일반 blocked 처럼 FR status 를 바꾸거나 `CURRENT_TASK` 를 초기화하지 않는다 — 대상 FR 이 없다.
+   - 첫 줄이 `select<TAB><stem>`: 그 FR 로 진행한다.
+   - 첫 줄이 `queue-empty`: outcome `queue-empty` 를 기록하고 종료한다.
+   - 첫 줄이 `queue-blocked`: outcome `queue-blocked` 를 기록하고, 스크립트 출력의 둘째 줄 이후를 outcome 둘째 줄부터 그대로 옮긴 뒤 종료한다.
+
+   outcome 둘째 줄 이후의 형식은 `<short-title><TAB><착수 상태><TAB><다음 조치>` 이며 `auto-pick` 이 만든 그대로다. 이 줄들이 `autopilot_headless.sh` 와 `ralph_drain.sh` 를 거쳐 사용자 요약에 실린다.
 
 모드는 `RD_AUTOPILOT_MODE` 가 미지정이면 등급 판정이 정한다(`full`→A, `standard`→B, `light` FR 은 B). 지정하면 사용자 override 로 취급한다. 이 두 게이트 이후부터는 AUTONOMY.md 자율 규칙을 그대로 적용한다.
 
@@ -186,6 +191,8 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 `
 | `resume` | 세션 한계 도달, CURRENT_TASK 저장, 잔여 작업 있음 |
 | `blocked:<reason>` | AUTONOMY 중단조건 도달. `<reason>` 은 하이픈 식별자(예: `review-50turn`, `debug-3fail`, `loop-guard`, `human-decision`) |
 | `queue-empty` | auto-pick 후보 없음 |
+| `queue-blocked` | 착수 가능 FR 없음 — 남은 FR 이 전부 의존 대기·확인 필요·관계 오류 |
+| `blocked:relations-unavailable` | `fr_relations.sh` 관계 판정이 rc=2 로 실패 — 판정 불가 |
 
 ### 중단조건 → blocked 매핑 (무인 특화)
 
@@ -202,11 +209,12 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 `
 ### 1. 작업 선택
 
 - `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md`를 읽는다
+- `bash rd-workflow/scripts/fr_relations.sh readiness --root .` 를 먼저 돌린다. `rc=2` 면 판정 없이 진행하되 "관계 판정 불가 — 의존 확인 없이 선택합니다" 를 경고로 보인다. `rc=0` 이면 status 화이트리스트를 통과한 `eligible` 중 판정이 `ready` 인 `selectable` 만 AskUserQuestion 목록에 올린다. 나머지는 목록 아래에 `대기 N건(선행 미완) · 확인 필요 M건(선행 dropped) · 오류 K건` 요약 줄과 각 사유로 보여 준다
 - `validated` 또는 `ready-for-request` 상태 항목만 후보로 제시한다
 - 후보가 없으면 `idea` 상태도 포함하되, 사용자에게 알린다
 - 후보 내에서 priority 순으로 정렬한다: P1 → P2 → P3 → unranked(priority가 `-`이거나 필드 없음). 동순위는 날짜 오름차순
 - priority는 후보 자격(status 게이트) 내에서의 정렬에만 사용한다. idea가 P1이라도 validated/ready-for-request 후보가 있으면 그쪽을 먼저 보여준다
-- 각 항목의 priority를 읽으려면 상세 파일(`items/*.md`)의 `priority` 필드를 확인한다. priority 읽기/fallback 규칙은 `/fr list`와 동일: 필드 없음/`-` → unranked, malformed 값 → unranked + 경고, 상세 파일 누락 → 건너뜀 + 경고
+- 각 항목의 priority 는 `FUTURE_REQUESTS.md` 인덱스의 우선순위 컬럼에서 읽는다 (권위는 인덱스다 — `/fr pri` 가 인덱스를 갱신한다). 상세 파일의 `priority` 필드는 선택 필드이며 대조용이다. 읽기/fallback 규칙은 `/fr list` 와 같다: 값 없음/`-` → unranked, malformed 값 → unranked + 경고, 상세 파일 누락 → 건너뜀 + 경고
 - **AskUserQuestion으로 목록을 보여주고 사용자가 선택한다** — 목록에 priority 컬럼을 포함하여 정렬 이유를 사용자에게 보여준다
 - 항목 선택 직후 등급을 판정해 실행 모드를 정한다 — "실행 모드" 섹션의 모드 결정 규칙을 따른다 (시작 보고 블록은 모드 A 는 여기서, 모드 B 는 §3 시작 계약 확인 직후 1회; 사용자는 이의 시만 변경)
 - **선택한 항목의 상세 파일 경로(`rd-workflow-workspace/backlog/items/<파일>.md`)를 기억한다.** 이 값이 §3 승격의 `--source-fr` 인자다. 이 단계가 유일한 producer이고, promote가 REQUEST.md보다 앞서므로 REQUEST 본문에서 추론할 수 없다.
@@ -260,13 +268,18 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
   - `large` 는 시작 상태 `대기 중`(다음 단계 `REQUEST review 대기` 로 `--force` 없이 전이), `small` 은 `구현 중` 이다.
   - **`--source-fr` 를 반드시 명시한다.** 이 호출은 REQUEST.md 작성보다 앞서므로 REQUEST 본문에서 Source FR 을 읽을 수 없다. 생략하면 baseline REQUEST 의 `-` 가 기록되어(또는 stale REQUEST 가 남아 있으면 이전 작업 경로가 기록되어) §6 archive 의 FR done 자동 처리가 무동작하거나 다른 FR 을 건드린다. 값은 §1 에서 기억한 그 경로다.
   - `<slug>`는 `CURRENT_TASK.md ## Short Title` 값이다(생략 시 promote.sh가 자동 추출).
-  - promote.sh가 `fr/<slug>` 브랜치 + task-state fr 필드 기록(commit) + CURRENT_TASK 갱신을 생성하고 fr 브랜치로 전환한다. 이는 §6 step 7 archive.sh가 요구하는 형식과 일치한다.
+  - promote.sh가 `fr/<slug>` 브랜치 + task-state fr 필드 기록(commit) + CURRENT_TASK 갱신을 생성한다. 이는 §6 step 7 archive.sh가 요구하는 형식과 일치한다. **브랜치는 별도 worktree 에 부착되며, 호출 세션의 체크아웃은 기본 브랜치에 그대로 남는다** — `git switch` 는 `--no-worktree` 분기에만 있다(`promote.sh` 8단계). 이어서 아래 `launch` 처리를 반드시 수행한다.
+- **promote 직후 `launch` 결과 처리 (건너뛰지 않는다)**: promote 는 마지막에 `promote: 세션 기동 결과 — <값>` 을 출력한다. 그 값에 따라 갈린다.
+  - `ok` — 이 세션은 여기서 멈춘다. 이후 단계는 기동된 세션이 진행한다.
+  - `none`·`failed` — 이 세션이 이어간다. **단 §4 로 넘어가기 전에 promote 출력의 `worktree <path>` 로 이동한다.** 이동하지 않으면 기본 브랜치 체크아웃에서 구현하게 되어, 작업이 fr 브랜치가 아닌 기본 브랜치에 쌓인다. `--no-worktree` 로 호출했을 때만 이동이 불필요하다(그 경우 promote 가 현재 체크아웃을 직접 전환한다).
+  - `unknown` — 이 세션도 아직 이어받지 않는다. `bash rd-workflow/scripts/rd task resolve-launch <slug>` 로 확정한 뒤에만 갈린다(살아 있으면 멈춤 / `failed` 로 확정되면 위 이동 후 진행).
+  - 무인(headless) 실행은 `autopilot_headless.sh` 가 `RD_CHILD_SESSION=1` 을 export 하므로 항상 `none` 이다. 즉 **무인 경로의 기본값이 「이동해서 이어가기」**다.
 - 구현 중 커밋은 이 `fr/<slug>` 브랜치에 쌓인다
 - 마무리 단계에서 merge/PR/cleanup 중 추천 옵션을 자동 선택한다
 
 ### 4. 자율 구현
 
-- **Superpowers가 사용 가능하면 반드시 사용한다:** `brainstorming` → `writing-plans` → CLAUDE.md 실행 모드 규칙에 따른 실행 모드. 사용 가능한데 건너뛰지 않는다.
+- **Superpowers가 사용 가능하면 반드시 사용한다:** `brainstorming` → `writing-plans` → `.claude/rules/rd-workflow/core.md` 실행 모드 규칙에 따른 실행 모드. 사용 가능한데 건너뛰지 않는다.
 - 테스트 실패, 빌드 에러 발생 시 `superpowers:systematic-debugging`으로 자율 디버깅한다
 - 디버깅 3회 실패 시 현재 상태를 보고하고 사용자에게 넘긴다
 - **model-strategy 적용**: `rd-workflow/config/model-strategy.json`이 존재하면 `subagent` 값을 읽어 subagent dispatch 시 Agent 도구의 `model` 파라미터로 전달한다. 파일 미존재/파싱 실패/키 누락/허용되지 않은 값(`opus`, `sonnet`, `haiku` 외) → 기본값 `"sonnet"`을 사용한다. 설정 형식 상세는 `/model-strategy` skill 참조.
@@ -322,12 +335,22 @@ compact 후에도 한계에 가까워지면:
 
   6. **fr stage capture archive**: Source FR 의 status 가 `done` 으로 변경되었으므로 `/fr archive` 를 호출하여 같은 short-title 의 `fr` stage 캡처를 `raw-captures/archive/` 로 이동한다. (autopilot REQUEST archive 에서 `request`/`spec`/`plan` 캡처는 3단계에서 이미 이동됨. `fr` stage 는 이 단계에서 `/fr archive` 에 위임)
 
-  7. **lifecycle 일괄 마무리**: 위 1–6단계(archive content commit)가 fr branch에서 완료된 후, 기본 브랜치로 switch 하고 아래 명령을 실행한다:
+  7. **lifecycle 일괄 마무리**: 위 1–6단계(archive content commit)가 fr branch에서 완료된 후 실행한다. **§3 에서 어느 경로로 왔는지에 따라 갈린다** — 두 경로를 섞으면 실행되지 않는다.
+
+     **(a) 별도 worktree 로 진행한 경우 (무인 실행의 기본):** 지금 있는 자리에서 `git checkout main` 을 하지 않는다. 기본 브랜치는 기본 worktree 가 이미 점유하고 있어 git 이 거부한다. 기본 worktree 로 **이동**한 뒤, 대상 작업을 `--task` 로 명시해 호출한다:
+     ```bash
+     cd "$(git rev-parse --path-format=absolute --git-common-dir)/.."   # 기본 worktree 루트
+     bash rd-workflow/scripts/lifecycle/archive.sh --task <slug>
+     ```
+     `--task` 를 붙이는 이유는 기본 worktree 의 `task-state` 가 baseline 이기 때문이다 — promote 가 작업 상태를 fr worktree 안에만 쓰므로, 인자가 없으면 archive 가 대상을 확정하지 못한다.
+
+     **(b) `--no-worktree` 로 진행한 경우:** 현재 체크아웃이 곧 작업 브랜치다. 기본 브랜치로 switch 한 뒤 인자 없이 호출한다:
      ```bash
      git checkout main  # 기본 브랜치 (master/trunk 프로젝트는 해당 브랜치 — workflow.json default_branch 참조)
      bash rd-workflow/scripts/lifecycle/archive.sh
      ```
-     `archive.sh` 가 merge + tag + push + branch/worktree 정리를 일괄 처리한다. 이 단계 실패 시 현재 상태를 보고하고 사용자에게 넘긴다.
+
+     `archive.sh` 가 merge + tag + push + branch/worktree 정리를 일괄 처리한다. 이 단계 실패 시 현재 상태를 보고하고 사용자에게 넘긴다. (a) 경로에서 호출자 worktree 와 로컬 fr 브랜치가 잔여로 남는 별개 사안은 FR `archive-caller-worktree-cleanup-stranded` 가 추적한다 — 이 단계의 책임이 아니다.
 
 **책임 경계**: `fr` stage 캡처는 `/fr archive` 책임이다. `request`/`spec`/`plan` stage 캡처는 REQUEST archive(autopilot 또는 수동) 책임이다.
 

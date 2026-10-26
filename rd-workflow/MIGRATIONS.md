@@ -103,7 +103,7 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 **실행 절차**:
 1. `bash rd-workflow/scripts/rd task status`를 1회 실행합니다.
 2. exit 0이고 `rd-workflow-workspace/.lifecycle/task-state`가 생성/존재하면 완료입니다. 마이그레이션이 수행되었다면(stderr 안내 출력) tracked 변경(active-fr 삭제·task-state 생성)을 다음 정규 커밋에 포함하라고 사용자에게 안내합니다.
-3. exit 3이면 `CURRENT_TASK.md`의 `## Status`를 canonical 9종 중 하나로 수동 복구한 뒤 재실행합니다. 복구 절차는 `rd-workflow/docs/guides/task-state-guide.md`의 "실패 시 복구"를 참조합니다.
+3. exit 3이면 `CURRENT_TASK.md`의 `## Status`를 canonical 10종 중 하나로 수동 복구한 뒤 재실행합니다. 복구 절차는 `rd-workflow/docs/guides/task-state-guide.md`의 "실패 시 복구"를 참조합니다.
 
 **주의**: 마이그레이션이 만든 변경은 자동 커밋하지 않습니다 ("다음 정규 커밋에 편승" 계약 — LC-20 archive clean 검증은 이 변경이 커밋된 상태를 전제합니다).
 
@@ -599,3 +599,52 @@ cat rd-workflow/config/workflow.json            # 내용과 default_execution_mo
 - **위 어디에도 해당하지 않는다면**(JSON 이 깨졌거나, 값이 허용 범위 밖이거나, 경로가 regular file 이 아니거나, 읽거나 확인할 수 없다면) — 판정 불가로 `manual` + 경고가 납니다. 경고에 적힌 원인·경로·복구 방법을 따라 고칩니다.
 
 판정 규칙의 전체 표와 경고 문구의 최소 정보는 `rd-workflow/docs/flows/AUTONOMY.md` 가 정본입니다.
+
+## M013: CLAUDE.md 프로젝트 소유 전환 · rules 분리
+
+**조건**: clone 에 `.claude/rules/rd-workflow/` 가 있고 프로젝트에 `CLAUDE.md` 가 있으면 항상 실행합니다. 분류기 결과가 할 일을 정합니다. `template`·`modified` 행이 있으면 절을 정리합니다. `abort`·`ambiguous` 행과 분류기 오류는 자동 편집 없이 5단계 보고에 넣습니다. 처리할 행이 없으면 편집 없이 보고만 합니다.
+
+**동작 변화**
+
+1. **`CLAUDE.md` 가 프로젝트 소유가 됩니다.** 동기화 대상에서 빠지고 보존 대상이 됩니다. 경로가 없으면 배포본이 새로 놓이고, 있으면 5단계 복사가 손대지 않습니다.
+2. **템플릿 규칙이 `.claude/rules/rd-workflow/{core,task-tracking,writing-style,efficiency,commit}.md` 로 옮겨 갑니다.** 이 폴더는 템플릿 소유라 동기화가 통째로 템플릿과 같게 맞춥니다. 폴더 안에서 템플릿에 없는 파일은 삭제 후보입니다. `.claude/rules/` 의 그 밖 파일은 프로젝트 소유이며 보존합니다.
+3. **기존 프로젝트의 `CLAUDE.md` 에 남은 템플릿 규칙 절은 이 항목이 정리합니다.** 그대로 두면 같은 규칙이 `CLAUDE.md` 와 rules 에서 두 벌로 로드됩니다.
+
+**적용 시점**: 동기화 후(6단계, M004 와 같은 자리). rules 가 먼저 배치된 뒤에 `CLAUDE.md` 의 절을 걷어냅니다. 그래서 중간에 끊겨도 규칙이 빠지는 창이 없습니다. 끊긴 경우 최악의 상태는 "두 벌 로드" 입니다.
+
+**지원 하한**: Claude Code 2.1.310 이상. 그 미만은 프로젝트 rules 하위 폴더 로드를 보장하지 않습니다. 버전 검사를 코드로 넣지 않았습니다. 실측이 한 버전뿐이라 하한을 단정할 근거가 없기 때문입니다.
+
+**git 추적 확인**: 프로젝트 `.gitignore` 가 `.claude/` 를 가리면 rules 가 커밋되지 않아 다른 clone 에서 규칙이 통째로 빠집니다. 동기화 후 `git check-ignore -v .claude/rules/rd-workflow/core.md` 가 아무것도 출력하지 않는지 확인합니다. 출력이 있으면 출력이 가리키는 `.gitignore` 줄을 사용자에게 보여 주고 고치는 방법을 안내합니다. 그 줄이 `.claude/` 또는 `.claude` 처럼 폴더 전체를 가리키면 Git 은 그 아래를 예외로 다시 포함하지 않습니다. 이때는 그 줄을 `.claude/*` 로 바꾸고 다음 줄에 `!.claude/rules/` 를 넣습니다. 그러면 `.claude/` 의 다른 파일은 계속 무시되고 rules 만 추적됩니다. 고친 뒤 같은 명령을 다시 실행해 출력이 없는지 확인합니다.
+
+**분류기** `rd-workflow/scripts/claudemd_rules_migrate.sh` (읽기 전용):
+
+```bash
+bash rd-workflow/scripts/claudemd_rules_migrate.sh classify <project CLAUDE.md> <임시 clone 경로>
+```
+
+- 프로젝트 `CLAUDE.md` 를 `##` 절 단위로 나눕니다. `###` 이하는 상위 `##` 절에 속합니다. 첫 `##` 앞의 본문(제목 줄 제외)은 `(서두)` 절로 취급합니다.
+- 출력은 절마다 한 줄 TSV `class<TAB>start<TAB>end<TAB>heading<TAB>dest` 입니다. `start`·`end` 는 그 절의 첫 줄(제목 줄)과 마지막 줄 번호(1부터)이고, `dest` 는 rules 파일 basename 또는 `-` 입니다. 마지막 줄은 `index<TAB>present|missing` 입니다(`## rd-workflow 규칙` 목차 유무).
+- 종료코드는 0(정상), 2(사용법 오류), 1(입력 부재·읽기/비교 오류)입니다.
+- fence 줄(앞 공백 0~3칸 뒤 ```` ``` ```` 또는 `~~~` 로 시작하는 줄)이 하나라도 있으면 `abort<TAB>fence-present` 한 줄만 냅니다. 이 경우 어떤 절도 분류하지 않고 파일 전체를 보존합니다.
+- class 는 다섯입니다.
+  - `keep` — 새 템플릿 `CLAUDE.md` 에도 있는 제목(`## 언어` 등), 또는 제목 다음 줄에 `<!-- rd-workflow:project-override -->` 표식이 있는 절. 손대지 않습니다.
+  - `template` — 현재 또는 과거 템플릿의 같은 제목 절과 본문이 정확히 같은 절(구버전 미수정 포함). 걷어냅니다. `dest` 는 그 절이 옮겨 간 rules 파일입니다.
+  - `modified` — 어느 판의 템플릿 제목과 같지만 본문이 어느 판과도 다른 절. 사용자에게 묻습니다.
+  - `project` — 어느 판의 템플릿에도 없는 제목. 손대지 않습니다.
+  - `ambiguous` — 같은 제목이 반복된 절. 손대지 않고 사용자에게 보고합니다.
+
+**실행 절차** (Claude 가 수행):
+
+1. 분류기를 clone 의 사본으로 실행합니다(clone 이 권위 — M000 과 같은 원칙). 종료코드가 0 이 아니면 그 자리에서 절차를 멈추고, 아무것도 바꾸지 않은 채 오류를 보고합니다.
+2. `abort` 면 자동 편집을 하지 않습니다. 사유(fence 포함 파일)와 다음 행동(사용자가 절 목록과 diff 를 보고 직접 정리한 뒤 sync 재실행)을 보고하고 4·5단계로 갑니다.
+3. **결정을 먼저 모읍니다.** 시작할 때 `CLAUDE.md` 사본(결정 기준본)을 scratch 에 저장합니다. `modified` 절마다 프로젝트 판과 현재 rules 판의 diff 를 보여 주고 셋 중 하나를 고르게 합니다. 결정은 제목으로 기록합니다(`ambiguous` 를 뺀 제목은 파일 안에서 유일합니다). 이 단계에서는 파일을 바꾸지 않습니다.
+   - 템플릿 채택 → 절을 지웁니다.
+   - 프로젝트 판 유지 → 절을 남기고 제목 다음 줄에 `<!-- rd-workflow:project-override -->` 표식을 넣습니다. 다음 sync 의 분류기는 이 절을 `keep` 으로 봅니다. 이 절과 rules 판이 함께 로드되므로, 사용자가 절 첫 줄에 대체 대상을 적도록 안내합니다.
+   - 보류 → 원문 그대로 둡니다. 다음 sync 에 다시 묻습니다.
+   - 사용자 답을 받기 전에는 그 절을 바꾸지 않습니다.
+   - **편집 시작 직전에 결정 기준본과 현재 `CLAUDE.md` 를 `cmp -s` 로 비교합니다.** 다르면 사용자가 본 diff 와 지금 본문이 다를 수 있으므로 모은 결정을 모두 버립니다. "결정을 받는 동안 `CLAUDE.md` 가 바뀌어 다시 묻습니다" 라고 사유를 알리고 3단계를 처음부터 다시 합니다.
+   - **편집은 한 번에 하나씩, 매번 재분류한 범위로 합니다.** 분류기를 실행해 현재 출력의 첫 처리 대상(`template` 절, 또는 결정이 "템플릿 채택"·"프로젝트 판 유지" 인 `modified` 절)을 고르고 그 절의 현재 `start`·`end` 로 한 번 편집합니다. 그리고 다시 분류합니다. 처리 대상이 없을 때까지 반복합니다. 이전 출력의 줄 번호를 재사용하지 않으므로, 앞 절 삭제·표식 삽입·사용자 대기 중 파일 변경이 있어도 범위가 어긋나지 않습니다. 반복 중에도 분류기 종료코드가 0 이 아니면 즉시 멈추고 보고합니다.
+4. `index missing` 이면 clone 의 `CLAUDE.md` 에서 `## rd-workflow 규칙` 절을 복사해 파일 끝에 붙입니다.
+5. 분류기를 다시 실행해 결과를 9단계 완료 보고에 넣습니다. 보고에는 걷어낸 절, 유지(override)한 절, 보류한 절, `ambiguous` 절, `abort` 사유, 분류기 오류, 다음 행동을 적습니다. 보류 절이 있으면 "이 절과 rules 판이 두 벌로 로드되는 상태" 임을 적습니다.
+
+**재실행 성질**: 걷어낸 절은 더 이상 분류되지 않습니다. override 절은 `keep` 입니다. 보류 절만 다시 `modified` 로 나옵니다. 모든 절을 정리한 프로젝트에서 다시 실행하면 `template`·`modified` 행이 0 이고 `CLAUDE.md` 는 바뀌지 않습니다.

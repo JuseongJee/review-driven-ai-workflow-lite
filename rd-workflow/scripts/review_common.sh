@@ -469,6 +469,7 @@ Session execution contract:
 - REVIEW_TYPE: ${review_type}
 - TURN_LIMIT: ${turn_limit} total turns
 - THIS_TURN_NUMBER: ${next_turn_number}
+- Project rules: CLAUDE.md and .claude/rules/rd-workflow/*.md (not inlined — read them from disk when a finding depends on a project rule).
 
 Review target:
 ${review_target}

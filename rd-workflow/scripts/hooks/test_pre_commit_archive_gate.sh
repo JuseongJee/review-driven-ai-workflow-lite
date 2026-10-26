@@ -46,7 +46,15 @@ make_fixture() {
   cp "$GUARD_COMMON" "$fixture/rd-workflow/scripts/hooks/_guard_common.sh"
   cp "$STATE_COMMON" "$fixture/rd-workflow/scripts/_state_common.sh"
   # 스캐너를 함께 복사한다. 누락하면 폴백 경로로 테스트되어 새 판정을 검사하지 못한다.
-  [[ -f "$HOOK_DIR/_commit_scan.awk" ]] && cp "$HOOK_DIR/_commit_scan.awk" "$fixture/rd-workflow/scripts/hooks/"
+  # **조건부(`[[ -f ]] &&`)로 두지 않는다.** 파일이 없어도 복사를 건너뛴 채 테스트가
+  # 통과해 버린다 — hook 이 `scan_command_commit` 에서 폴백 판정으로 흡수하기 때문이다.
+  # 이 스크립트에는 `set -e` 가 없으므로 실패도 명시적으로 중단시킨다.
+  cp "$HOOK_DIR/_commit_scan.awk" "$fixture/rd-workflow/scripts/hooks/" \
+    || { echo "test_pre_commit_archive_gate.sh: _commit_scan.awk 복사 실패 (HOOK_DIR='$HOOK_DIR')" >&2; return 1; }
+  # 판정 규칙이 담긴 awk 도 함께 복사한다. 누락하면 fixture 안의 판정이 항상 실패해
+  # 종결 세션을 전제로 한 케이스가 게이트에 도달하지 못한 채 통과한다.
+  cp "$HOOK_DIR/_open_issues.awk" "$fixture/rd-workflow/scripts/hooks/" \
+    || { echo "test_pre_commit_archive_gate.sh: _open_issues.awk 복사 실패 (HOOK_DIR='$HOOK_DIR')" >&2; return 1; }
   mkdir -p "$fixture/rd-workflow-workspace/.lifecycle"
   cat > "$fixture/rd-workflow-workspace/.lifecycle/task-state" <<'TSEOF'
 schema=1
@@ -213,7 +221,12 @@ make_multi_fixture() {
   cp "$HOOK_SOURCE" "$fixture/rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"
   cp "$GUARD_COMMON" "$fixture/rd-workflow/scripts/hooks/_guard_common.sh"
   cp "$STATE_COMMON" "$fixture/rd-workflow/scripts/_state_common.sh"
-  [[ -f "$HOOK_DIR/_commit_scan.awk" ]] && cp "$HOOK_DIR/_commit_scan.awk" "$fixture/rd-workflow/scripts/hooks/"
+  cp "$HOOK_DIR/_commit_scan.awk" "$fixture/rd-workflow/scripts/hooks/" \
+    || { echo "test_pre_commit_archive_gate.sh: _commit_scan.awk 복사 실패 (HOOK_DIR='$HOOK_DIR')" >&2; return 1; }
+  # 판정 규칙이 담긴 awk 도 함께 복사한다. 누락하면 fixture 안의 판정이 항상 실패해
+  # 종결 세션을 전제로 한 케이스가 게이트에 도달하지 못한 채 통과한다.
+  cp "$HOOK_DIR/_open_issues.awk" "$fixture/rd-workflow/scripts/hooks/" \
+    || { echo "test_pre_commit_archive_gate.sh: _open_issues.awk 복사 실패 (HOOK_DIR='$HOOK_DIR')" >&2; return 1; }
   mkdir -p "$fixture/rd-workflow-workspace/.lifecycle"
   cat > "$fixture/rd-workflow-workspace/.lifecycle/task-state" <<'TSEOF'
 schema=1
@@ -560,6 +573,7 @@ expected_record_paths="$(printf '%s\n' \
   "REQUEST.md" \
   "rd-workflow-workspace/.lifecycle/review-seals/" \
   "rd-workflow-workspace/.lifecycle/review-skip-audit.log" \
+  "rd-workflow-workspace/.lifecycle/stage_metrics.tsv" \
   "rd-workflow-workspace/.lifecycle/task-state" \
   "rd-workflow-workspace/backlog/" \
   "rd-workflow-workspace/handoffs/review_pipeline/" \
@@ -572,7 +586,7 @@ actual_record_paths="$(sc_run "$FX" "$FX" "$FX" 'printf "%s\n" "${RD_RECORD_PATH
 # 목록에 항목을 더하려면 반드시 여기 기대값도 고쳐야 하므로, 제외 확대가 diff 에 두 번
 # 나타나 리뷰어 눈에 띕니다. 「구현 상수를 그대로 베낀 기대값」 금지 규칙의 예외이며,
 # 자동 생성으로 바꾸면 tripwire 로서의 목적이 사라집니다.
-assert_eq "record-paths 4b: RD_RECORD_PATHS 가 change-spec §3.1 의 11개 항목과 정확히 일치" \
+assert_eq "record-paths 4b: RD_RECORD_PATHS 가 change-spec §3.1 의 12개 항목과 정확히 일치" \
   "$expected_record_paths" "$actual_record_paths"
 
 # 목록 밖 `.lifecycle/` 파일은 보호 대상이어야 합니다 — 바꾸면 해시가 바뀝니다.
@@ -581,6 +595,28 @@ printf 'hook input v2\n' > "$FX/rd-workflow-workspace/.lifecycle/hook-input.sh"
 git -C "$FX" add -A >/dev/null 2>&1
 git -C "$FX" commit -qm lifecycle-other >/dev/null 2>&1
 assert_ne "record-paths 4c: 목록 밖 .lifecycle/ 파일 변경은 해시를 바꿈" "$h_before" "$(hash_of "$FX" HEAD)"
+cleanup_fixture
+
+# === parser-missing: 판정 프로그램이 없으면 통과하되 사실을 알린다 ===
+# 이 hook 은 미종결이면 exit 0 으로 통과하는데, 판정 프로그램이 없어 판정하지 못한 경우도
+# 같은 경로로 빠진다. 그대로 두면 아래 Source FR 검사가 통째로 생략된 사실이 아무 데도
+# 남지 않는다. 통과 정책은 그대로 두고 경고만 관측되는지 확인한다.
+# Source FR 은 실재하지 않는 경로로 둔다 — 파서가 있으면 해석 실패로 차단(exit 2)되고,
+# 파서가 없으면 그 검사에 도달조차 못 한다. 두 상태의 차이가 이 케이스의 관찰 대상이다.
+FX="$(make_fixture "rd-workflow-workspace/backlog/items/2026-01-01-nonexistent.md" "__NONE__" "-")" \
+  || { echo "FAIL: parser-missing fixture 생성"; FAIL=$((FAIL+1)); }
+_current_fixture="$FX"
+rm -f "$FX/rd-workflow/scripts/hooks/_open_issues.awk"
+run_hook "$FX"
+assert_eq "parser-missing: 통과 정책은 유지 (exit 0)" "0" "$_hook_last_exit"
+case "$_hook_last_err" in
+  *"Source FR 검사를 건너뜁니다"*) assert_eq "parser-missing: 검사 생략 사실을 알린다" "1" "1" ;;
+  *) assert_eq "parser-missing: 검사 생략 사실을 알린다" "경고 있음" "경고 없음 (stderr='${_hook_last_err}')" ;;
+esac
+case "$_hook_last_err" in
+  *"_open_issues.awk"*) assert_eq "parser-missing: 찾은 경로를 보여준다" "1" "1" ;;
+  *) assert_eq "parser-missing: 찾은 경로를 보여준다" "경로 있음" "경로 없음" ;;
+esac
 cleanup_fixture
 
 echo ""

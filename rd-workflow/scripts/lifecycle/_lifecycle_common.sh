@@ -121,6 +121,7 @@ lifecycle_metadata_paths() {
 rd-workflow-workspace/.lifecycle/task-state
 CURRENT_TASK.md
 rd-workflow-workspace/.lifecycle/active-fr
+rd-workflow-workspace/.lifecycle/stage_metrics.tsv
 PATHS
 }
 
@@ -366,6 +367,28 @@ _archive_strip_owned() {
   done
 }
 
+# _archive_strip_comment_lines — stdin에서 "완결된 단일 주석 줄"만 제거한다.
+# 완결 기준(mirror-comments-lost-in-promote-baseline REQUEST Change Description 3항):
+# 앞뒤 공백을 뺀 줄이 `<!--`로 시작해 `-->`로 끝나고, 그 사이(마지막 `-->` 앞부분)에
+# `-->`가 다시 나타나지 않아야 한다. 두 번째 조건이 없으면 "<!-- a --> 본문 <!-- b -->"
+# 같은 혼합 줄도 탐욕 매칭으로 통째로 제거돼, 주석 뒤에 몰래 붙인 본문까지 비교에서
+# 빠져나간다(REQUEST review Turn 004 R1).
+_archive_strip_comment_lines() {
+  local line trimmed mid
+  while IFS= read -r line; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ "$trimmed" == "<!--"*"-->" ]]; then
+      mid="${trimmed#<!--}"
+      mid="${mid%-->}"
+      if [[ "$mid" != *"-->"* ]]; then
+        continue
+      fi
+    fi
+    printf '%s\n' "$line"
+  done
+}
+
 # _archive_blob_oid <repo_root> <rev> <path> — stdout = blob OID
 #   rc 0 = 존재, 1 = **경로 부재**(정상적인 발견 실패), 2 = **git 실행 오류**
 #
@@ -494,32 +517,52 @@ archive_publish_content_check() {
     case "$rel" in
 
       CURRENT_TASK.md)
-        # **byte 단위 비교다.** `$(git show ...)` 로 받아 문자열 비교하면 bash 가 trailing
-        # newline 을 소거해, 끝에 빈 줄을 더하거나 지운 커밋이 "일치" 로 통과한다.
-        # blob 해시는 내용을 그대로 반영하므로 그 구멍이 없다.
-        # baseline 생성도 파이프로 잇지 않는다 — emit_current_task_baseline 의 실패가
-        # hash-object 의 정상 종료로 소거되면 "빈 내용의 해시" 를 기대값으로 삼게 된다.
+        # **주석 줄 제외 비교다.** `emit_current_task_baseline` 에 안내 주석(Status·
+        # Source FR)을 추가하면서, 구 baseline(주석 없음)으로 이미 promote 된 진행
+        # 중 브랜치가 이 게이트에서 막히지 않도록 주석 줄만 비교에서 제외한다
+        # (mirror-comments-lost-in-promote-baseline REQUEST — 2026-09-24 batch 준비
+        # 사용자 확정 결정). 주석 아닌 줄은 여전히 byte 단위로 비교한다 — fail-closed
+        # 원칙은 유지된다.
+        #
+        # raw 파일로 먼저 받고 각 단계 rc 를 확인한다(task-state 케이스와 동일 이유) —
+        # `git show ... | filter` 형태로 파이프를 이으면 pipefail 미설정 상태에서
+        # git 실패가 filter 의 정상 종료로 소거된다.
         #
         # 이 호출은 emit_current_task_baseline 이 **정적 heredoc** 이라는 전제에 기대고
         # 있다 — $root 를 인자로 넘기지 않는다. 이후 이 함수가 repo 상태를 읽도록 바뀌면
         # 기대값이 호출자의 cwd 를 따라가는 잠재 결함이 되므로, 그때는 $root 기준으로
         # 다시 설계해야 한다 (Minor M4).
         emit_current_task_baseline > "$td/want.raw" || { rm -rf "$td"; return 2; }
-        want="$(git -C "$root" hash-object --stdin < "$td/want.raw" 2>/dev/null)" || { rm -rf "$td"; return 2; }
-        got="$(_archive_blob_oid "$root" "$publish" "$rel")"; rc=$?
+        p_oid="$(_archive_blob_oid "$root" "$publish" "$rel")"; rc=$?
         if [[ "$rc" -eq 2 ]]; then rm -rf "$td"; return 2; fi
         if [[ "$rc" -eq 1 ]]; then
           printf 'archive:   발행 후보에 %s 가 없습니다\n' "$rel" >&2
-          blocked=1
-        elif [[ "$want" != "$got" ]]; then
-          printf 'archive:   %s 가 baseline 상태가 아닙니다 (blob %s != 기대 %s)\n' \
-            "$rel" "${got:0:8}" "${want:0:8}" >&2
           blocked=1
         else
           # blob 이 같아도 mode 가 다를 수 있다 — tree entry mode 를 따로 본다 (F2)
           _archive_assert_regular_mode "$root" "$publish" "$rel"; rc=$?
           if [[ "$rc" -eq 2 ]]; then rm -rf "$td"; return 2; fi
-          [[ "$rc" -eq 0 ]] || blocked=1
+          if [[ "$rc" -ne 0 ]]; then
+            blocked=1
+          else
+            _archive_cat_blob "$root" "$p_oid" "$td/pub.raw" || { rm -rf "$td"; return 2; }
+            if ! _archive_regular_text "$td/want.raw"; then
+              printf 'archive:   baseline 생성 결과가 정규 텍스트가 아닙니다 — 대조할 수 없습니다 (emit_current_task_baseline 결함 의심)\n' >&2
+              rm -rf "$td"; return 2
+            fi
+            if ! _archive_regular_text "$td/pub.raw"; then
+              printf 'archive:   발행 후보의 %s 가 정규 텍스트가 아닙니다 (빈 파일·NUL 포함·LF 미종단)\n' "$rel" >&2
+              blocked=1
+            else
+              _archive_strip_comment_lines < "$td/want.raw" > "$td/want" || { rm -rf "$td"; return 2; }
+              _archive_strip_comment_lines < "$td/pub.raw" > "$td/pub" || { rm -rf "$td"; return 2; }
+              if ! cmp -s "$td/want" "$td/pub"; then
+                printf 'archive:   %s 가 baseline 상태가 아닙니다 (주석 줄 제외 비교)\n' "$rel" >&2
+                diff "$td/want" "$td/pub" 2>/dev/null | sed 's/^/archive:     /' >&2
+                blocked=1
+              fi
+            fi
+          fi
         fi
         ;;
 
@@ -577,6 +620,47 @@ archive_publish_content_check() {
           printf 'archive:   %s 가 archive 소유 키 밖에서 달라졌습니다\n' "$rel" >&2
           printf 'archive:     소유 키: %s\n' "$(lifecycle_owned_state_keys)" >&2
           diff "$td/base" "$td/pub" 2>/dev/null | sed 's/^/archive:     /' >&2
+          blocked=1
+        fi
+        ;;
+
+      */stage_metrics.tsv)
+        # append-only 불변식 — 기준선(baseline) 내용은 발행 후보(publish) 내용의
+        # 접두(prefix)여야 한다(기존 바이트는 손대지 않고 뒤에만 추가). task-state 의
+        # "소유 키만 바뀜" 검사도, CURRENT_TASK.md 의 "완전히 같음" 검사도 이 파일에는
+        # 맞지 않는다 — 이 파일은 매 라운드 새 행이 늘어나는 것이 정상이기 때문이다.
+        #
+        # F7(spec/plan review Turn 004 신규) — baseline 부재는 "접두 비교를 생략"하는
+        # 조건일 뿐, "mode 검사를 생략"하는 조건이 아니다. 최초 회차(baseline 에 이
+        # 파일이 없음)에서도 발행 후보가 symlink·실행 파일이면 차단해야 한다.
+        b_oid="$(_archive_blob_oid "$root" "$baseline" "$rel")"; rc=$?
+        if [[ "$rc" -eq 2 ]]; then rm -rf "$td"; return 2; fi
+        _sm_base_missing=0
+        [[ "$rc" -eq 1 ]] && _sm_base_missing=1
+        p_oid="$(_archive_blob_oid "$root" "$publish" "$rel")"; rc=$?
+        if [[ "$rc" -eq 2 ]]; then rm -rf "$td"; return 2; fi
+        if [[ "$rc" -eq 1 ]]; then
+          if [[ "$_sm_base_missing" -eq 0 ]]; then
+            printf 'archive:   %s 가 발행 후보에서 사라졌습니다(append-only 로그는 삭제될 수 없습니다)\n' "$rel" >&2
+            blocked=1
+          fi
+          # baseline 도 publish 도 없음 — 로그가 아직 한 번도 안 남은 best-effort
+          # 상태다. 검사할 것이 없으므로 통과.
+          continue
+        fi
+        # 발행 후보에 파일이 있으면 baseline 유무와 무관하게 mode 를 검사한다(F7).
+        _archive_assert_regular_mode "$root" "$publish" "$rel"; rc=$?
+        if [[ "$rc" -eq 2 ]]; then rm -rf "$td"; return 2; fi
+        if [[ "$rc" -ne 0 ]]; then blocked=1; continue; fi
+        if [[ "$_sm_base_missing" -eq 1 ]]; then
+          # 기준선에 없음(최초 로그) — 접두 비교할 불변식이 없으므로 통과.
+          continue
+        fi
+        _archive_cat_blob "$root" "$b_oid" "$td/sm_base.raw" || { rm -rf "$td"; return 2; }
+        _archive_cat_blob "$root" "$p_oid" "$td/sm_pub.raw" || { rm -rf "$td"; return 2; }
+        _sm_base_bytes="$(wc -c < "$td/sm_base.raw" | tr -d ' ')"
+        if ! head -c "$_sm_base_bytes" "$td/sm_pub.raw" | cmp -s - "$td/sm_base.raw"; then
+          printf 'archive:   %s 가 append-only 불변식을 위반했습니다(기존 내용이 바뀌거나 삭제됨)\n' "$rel" >&2
           blocked=1
         fi
         ;;
@@ -815,12 +899,15 @@ emit_current_task_baseline() {
 
 ## Status
 대기 중
+<!-- 허용 상태값 8종은 .claude/rules/rd-workflow/task-tracking.md 참조. 변경은 rd task set-status 경유 -->
 
 ## Request
 [REQUEST.md](REQUEST.md)
 
 ## Source FR
 -
+<!-- 권위는 rd-workflow-workspace/.lifecycle/task-state. 변경은 rd task set-source-fr 경유 -->
+<!-- 복수(묶은 작업)이면 미러 쓰기가 자동으로 한 줄에 1건씩 나열합니다 — 여기 직접 목록을 적지 않습니다 -->
 
 ## Spec
 -

@@ -1,0 +1,5 @@
+# 루트 .claude/settings.json 에 의도적으로 등록하지 않는 hook 목록.
+# 형식: <hook-basename>|<사유>  (한 줄에 하나, '#' 시작 줄과 빈 줄은 무시)
+#
+# 현재는 모든 실 hook(rd-workflow/scripts/hooks/ 아래 `_`/`test_` 접두 제외)이
+# 루트 settings.json 에 등록돼 있어 예외가 없다.
