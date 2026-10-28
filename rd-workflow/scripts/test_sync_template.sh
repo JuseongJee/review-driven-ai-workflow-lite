@@ -123,9 +123,9 @@ check "https .git 및 /"   "$(PU 'https://github.com/JuseongJee/review-driven-ai
 check "ssh scp .git"      "$(PU 'git@github.com:JuseongJee/review-driven-ai-workflow.git')"      "JuseongJee/review-driven-ai-workflow"
 check "ssh scp bare"      "$(PU 'git@github.com:JuseongJee/review-driven-ai-workflow')"          "JuseongJee/review-driven-ai-workflow"
 check "lite https"        "$(PU 'https://github.com/JuseongJee/review-driven-ai-workflow-lite.git')" "JuseongJee/review-driven-ai-workflow-lite"
-check "GHE https"         "$(PU 'https://oss.navercorp.com/jay-jee/review-driven-ai-workflow.git')"  "oss.navercorp.com/jay-jee/review-driven-ai-workflow"
-check "GHE ssh"           "$(PU 'git@oss.navercorp.com:jay-jee/review-driven-ai-workflow.git')"      "oss.navercorp.com/jay-jee/review-driven-ai-workflow"
-check "GHE lite ssh"      "$(PU 'git@oss.navercorp.com:jay-jee/review-driven-ai-workflow-lite.git')" "oss.navercorp.com/jay-jee/review-driven-ai-workflow-lite"
+check "GHE https"         "$(PU 'https://ghes.navercorp.com/jay-jee/review-driven-ai-workflow.git')"  "ghes.navercorp.com/jay-jee/review-driven-ai-workflow"
+check "GHE ssh"           "$(PU 'git@ghes.navercorp.com:jay-jee/review-driven-ai-workflow.git')"      "ghes.navercorp.com/jay-jee/review-driven-ai-workflow"
+check "GHE lite ssh"      "$(PU 'git@ghes.navercorp.com:jay-jee/review-driven-ai-workflow-lite.git')" "ghes.navercorp.com/jay-jee/review-driven-ai-workflow-lite"
 
 echo "== --print-upstream: credential 제거 =="
 out="$(PU 'https://someuser:ghp_secrettoken@github.com/O/R.git')"

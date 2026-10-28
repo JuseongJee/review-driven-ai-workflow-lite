@@ -518,7 +518,7 @@ done
 echo "-- 3 세그먼트 GHE 대상은 정상 통과한다 (과잉 거부 방지) --"
 setup_workspace; setup_fake_gh
 f="$(make_report "2026-08-12-2017-ghe-ok.md")"
-run_dr publish "$f" --upstream "oss.navercorp.com/O/R" --yes >/dev/null 2>&1; rc=$?
+run_dr publish "$f" --upstream "ghes.navercorp.com/O/R" --yes >/dev/null 2>&1; rc=$?
 check "exit 0" "$rc" "0"
 
 echo "-- 설정 없으면 보류 (AC 22) --"
@@ -558,8 +558,8 @@ check "파일 절단 없음" "$(wc -c < "$f")" "$size_before"
 echo "-- GHE 대상이면 GH_HOST 가 전달된다 --"
 setup_workspace; setup_fake_gh
 f="$(make_report "2026-08-12-2012-ghe.md")"
-run_dr publish "$f" --upstream "oss.navercorp.com/O/R" --yes >/dev/null 2>&1
-grep -q 'HOST=oss.navercorp.com' "$GH_LOG" && ok "GH_HOST 전달" || nok "GH_HOST 전달"
+run_dr publish "$f" --upstream "ghes.navercorp.com/O/R" --yes >/dev/null 2>&1
+grep -q 'HOST=ghes.navercorp.com' "$GH_LOG" && ok "GH_HOST 전달" || nok "GH_HOST 전달"
 
 # 인자 없는 `gh auth status` 는 등록된 **모든** host 를 점검하고 하나라도 실패하면 비-0 을
 # 낸다. 대상과 무관한 사내 host 의 VPN 미연결이 github.com 발행 전체를 막았다 (Issue #31).
@@ -570,8 +570,8 @@ run_dr preview "$f" --upstream "O/R" >/dev/null 2>&1
 grep -q '^HOST=github.com ARGS=auth status --hostname github.com$' "$GH_LOG" \
   && ok "github.com 대상: --hostname 전달" || nok "github.com 대상: --hostname 전달"
 setup_fake_gh
-run_dr preview "$f" --upstream "oss.navercorp.com/O/R" >/dev/null 2>&1
-grep -q 'ARGS=auth status --hostname oss.navercorp.com$' "$GH_LOG" \
+run_dr preview "$f" --upstream "ghes.navercorp.com/O/R" >/dev/null 2>&1
+grep -q 'ARGS=auth status --hostname ghes.navercorp.com$' "$GH_LOG" \
   && ok "GHE 대상: --hostname 전달" || nok "GHE 대상: --hostname 전달"
 
 echo "-- preview 는 대상·공개여부·경고·본문을 보여주고 아무것도 안 바꾼다 (AC 12·13) --"
