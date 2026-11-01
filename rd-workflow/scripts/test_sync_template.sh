@@ -343,6 +343,9 @@ J
   # `implementation_gate.sh` 를 Edit·Write 두 matcher 에 등록하므로 command 축으로 보면
   # 정상 구성이 중복으로 잡힙니다.
   M8_TPL="${SCRIPT_DIR}/../../.claude/settings.json"
+  # 템플릿 정본 저장소에서는 루트 settings.json 이 루트 전용 hook 을 더 가져 소비 프로젝트의
+  # 구성과 다릅니다. 소비 프로젝트가 받는 정본(_ROOT_FILES)이 있으면 그쪽을 기준으로 합니다.
+  [[ -f "${SCRIPT_DIR}/../../_ROOT_FILES/.claude/settings.json" ]] && M8_TPL="${SCRIPT_DIR}/../../_ROOT_FILES/.claude/settings.json"
   if [[ ! -f "$M8_TPL" ]]; then
     ok "템플릿 settings.json 없음 — 종단 검증 건너뜀 (설치본)"
   else

@@ -443,6 +443,10 @@ pending_case "gate 1d: 같은 커밋에서 FR→done + 보호 경로 staged → 
   2 "git commit -m archive" \
   'printf "code v2\n" > src/app.sh && git add -A' \
   "기록 경로 밖의 파일"
+pending_case "gate 1d-2: 같은 차단 안내가 검증 중 전이를 알림" \
+  2 "git commit -m archive" \
+  'printf "code v2\n" > src/app.sh && git add -A' \
+  "검증 중"
 # guard-block-reason-identifier: 이 분기(아카이브 보류 + FR 전부 done/dropped 인데 기록
 # 경로 밖 변경이 있는 경우)가 실제로 유발됐을 때 기대한 reason 값이 감사 로그에 기록되는지
 # 값 대응 검증. (gate 1b 는 FR 미완료라 incomplete-source-fr 이 대신 유발되므로 여기서 본다.)
@@ -461,6 +465,45 @@ pending_case "gate 1f: 빈 index + git commit <보호파일> → 차단" \
   2 "git commit src/app.sh -m x" \
   'printf "code v2\n" > src/app.sh' \
   "기록 경로 밖의 파일"
+git -C "$FX" reset --hard -q HEAD >/dev/null 2>&1
+
+# --- gate 2: 리뷰 종결 뒤 Status 별 판정 (구현 중·검증 중만 통과) ---
+# 없으면 새는 실수: 허용 Status 열거가 의도보다 넓거나 좁아집니다 (외부 검증 대기 중 작업물
+# 커밋이 막히거나, seal 전 구간·발행 뒤·알 수 없는 값까지 열립니다). FR 은 미완료(idea),
+# 보호 파일(src/app.sh)이 staged 입니다. 비용: hook 실행 8회, 1초 미만.
+status_case() { # <이름> <Status> <기대 exit> [stderr 부분문자열]
+  git -C "$FX" reset --hard -q HEAD >/dev/null 2>&1
+  set_fr_status idea
+  set_state_status "$FX" "$2"
+  printf 'code v2\n' > "$FX/src/app.sh"
+  git -C "$FX" add -A >/dev/null 2>&1
+  run_hook "$FX"
+  local ok=1
+  [[ "$_hook_last_exit" == "$3" ]] || ok=0
+  if [[ -n "${4:-}" ]]; then
+    case "$_hook_last_err" in *"${4}"*) ;; *) ok=0 ;; esac
+  fi
+  if [[ "$ok" == 1 ]]; then
+    echo "[PASS] $1"
+    PASS=$((PASS + 1))
+  else
+    echo "[FAIL] $1 — expected exit=$3 actual=$_hook_last_exit err=[${_hook_last_err}]" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+status_case "gate 2a: 구현 중 + 보호 파일 staged + FR 미완료 → 통과 + 안내" "구현 중" 0 "리뷰 종결 뒤 작업이 다시 열린"
+status_case "gate 2b: 검증 중 + 보호 파일 staged + FR 미완료 → 통과 + 안내" "검증 중" 0 "리뷰 종결 뒤 작업이 다시 열린"
+status_case "gate 2c: diff review 대기 + 보호 파일 staged → 차단" "diff review 대기" 2
+status_case "gate 2d: 완료 + 보호 파일 staged → 차단" "완료" 2
+status_case "gate 2e: 대기 중 + 보호 파일 staged → 차단" "대기 중" 2
+status_case "gate 2f: 아카이브 보류 + 보호 파일 staged + FR 미완료 → 차단 + 검증 중 전이 안내" "아카이브 보류" 2 'rd task set-status "검증 중"'
+# 같은 호출의 stderr 에 「지금 아카이브하라」 는 틀린 안내가 없어야 한다 (외부 검증 대기 중 발행 유도 방지).
+case "$_hook_last_err" in
+  *"REQUEST 아카이브를 먼저 실행하세요"*) echo "[FAIL] gate 2f-2: 아카이브 보류 + FR 미완료 차단에 「REQUEST 아카이브를 먼저」 안내가 섞임" >&2; FAIL=$((FAIL + 1)) ;;
+  *) echo "[PASS] gate 2f-2: 아카이브 보류 + FR 미완료 차단에 「REQUEST 아카이브를 먼저」 안내 없음"; PASS=$((PASS + 1)) ;;
+esac
+status_case "gate 2g: 빈 Status + 보호 파일 staged → 차단 (fail-closed)" "" 2
+status_case "gate 2h: 검증 중 뒤에 공백이 붙은 값 → 차단 (정확 일치)" "검증 중 " 2
 git -C "$FX" reset --hard -q HEAD >/dev/null 2>&1
 
 # 트리 해시: archive content commit 은 해시를 바꾸지 않습니다.

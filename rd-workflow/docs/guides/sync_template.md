@@ -92,6 +92,93 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
   - 단, `.claude/rules/rd-workflow/` 는 템플릿 소유라 보존하지 않고 동기화 대상입니다. `.claude/rules/` 의 그 밖 파일은 프로젝트 소유이며 보존합니다
   - 단, `.claude/settings.json`의 hook 등록 목록과 `.gitignore`의 워크플로 관리 라인은 M003 마이그레이션이 **부재 항목만 추가**하고, 템플릿 유래 stale hook 등록(존재하지 않는 스크립트를 가리키는 항목)은 M005 마이그레이션이 제거합니다 (통째 동기화 아님 — 4단계 참조)
 
+### 2.1 파일군별 전파 정책 표
+
+이 표는 전체 sync 가 끝난 뒤의 결과를 파일군별로 보여 줍니다. 5단계 복사만이 아니라 마이그레이션이 바꾸는 내용도 `수정·삭제 가능성` 열에 적습니다.
+
+정책 값은 네 가지입니다.
+
+- `덮어쓰기` — 템플릿 내용으로 맞춥니다. 템플릿에 없는 파일은 삭제 후보입니다.
+- `부재 항목 머지` — 부재한 항목이나 라인만 추가합니다.
+- `부재 시 생성` — 경로가 없을 때만 배포본을 둡니다. 경로가 있으면 5단계 복사가 건드리지 않습니다.
+- `미전파` — 프로젝트 고유 파일, 휘발 상태, 작업 산출물입니다. sync 가 건드리지 않습니다.
+
+경로 패턴은 정확한 경로이거나 `/` 로 끝나는 디렉토리 prefix 입니다. 한 파일이 여러 행에 걸리면 더 긴 패턴이 이깁니다.
+
+| 경로 패턴 | 정책 | 전파 수단 | 수정·삭제 가능성 |
+| --- | --- | --- | --- |
+| `rd-workflow/scripts/` | 덮어쓰기 | 2절 동기화 대상, 5단계 복사 | 템플릿에 없는 파일은 3단계 확인 뒤 삭제합니다. |
+| `rd-workflow/scripts/build.sh` | 미전파 | 2절 보존 목록 | 프로젝트별 명령이 들어 있어 덮어쓰지도 지우지도 않습니다. |
+| `rd-workflow/scripts/test.sh` | 미전파 | 2절 보존 목록 | 프로젝트별 명령이 들어 있어 덮어쓰지도 지우지도 않습니다. |
+| `rd-workflow/scripts/lint.sh` | 미전파 | 2절 보존 목록 | 프로젝트별 명령이 들어 있어 덮어쓰지도 지우지도 않습니다. |
+| `rd-workflow/scripts/typecheck.sh` | 미전파 | 2절 보존 목록 | 프로젝트별 명령이 들어 있어 덮어쓰지도 지우지도 않습니다. |
+| `rd-workflow/docs/` | 덮어쓰기 | 2절 동기화 대상, 5단계 복사 | 템플릿에 없는 파일은 3단계 확인 뒤 삭제합니다. |
+| `rd-workflow/claude_skills/` | 덮어쓰기 | 2절 동기화 대상, 5단계 복사 | extension 으로 설치된 스킬(예: verify, design-review)은 삭제 후보에서 제외하고 보존합니다. 그 스킬의 최신본은 8단계가 다시 설치합니다. |
+| `rd-workflow/extensions/` | 덮어쓰기 | 5단계 복사, 8단계 재설치의 원본 (full 전용) | 템플릿에 없는 파일은 삭제 후보입니다. |
+| `rd-workflow/config/extensions.json.example` | 덮어쓰기 | 2절 동기화 대상 (설정 예제 파일, full 전용) | 없음. |
+| `rd-workflow/config/loop-guard.json.example` | 덮어쓰기 | 2절 동기화 대상 (설정 예제 파일, full 전용) | 없음. |
+| `rd-workflow/config/model-strategy.json.example` | 덮어쓰기 | 2절 동기화 대상 (설정 예제 파일, full 전용) | 없음. |
+| `rd-workflow/config/review-tools.json.example` | 덮어쓰기 | 2절 동기화 대상 (설정 예제 파일) | 없음. |
+| `rd-workflow/config/workflow.json.example` | 덮어쓰기 | 2절 동기화 대상 (설정 예제 파일) | 없음. |
+| `rd-workflow/config/extensions.json` | 미전파 | 2절 보존 목록 | 설치된 extension 이력입니다. 8단계가 읽고 다시 씁니다. |
+| `rd-workflow/config/review-tools.json` | 미전파 | 2절 보존 목록 | 프로젝트별 리뷰 도구 설정입니다. |
+| `rd-workflow/config/verification.json` | 미전파 | 2절 보존 목록 | 프로젝트별 검증 설정입니다. 8.6 절의 verify preset 머지가 verifier 단위로 수정합니다. |
+| `rd-workflow/config/workflow.json` | 부재 시 생성 | 2절 보존 목록, 5단계 복사 | 5.1 절이 `defect_report_upstream` 키 하나만, 값이 비어 있을 때에 한해 씁니다. 다른 키와 경로 종류는 바뀌지 않습니다. |
+| `rd-workflow/MIGRATIONS.md` | 덮어쓰기 | 5단계 복사 | 없음. |
+| `rd-workflow/VERSION` | 덮어쓰기 | 6단계 복사 | 없음. |
+| `.claude/rules/rd-workflow/` | 덮어쓰기 | 2절 동기화 대상, 5단계 복사, M013 | 템플릿에 없는 파일은 삭제 후보입니다. 이 폴더 밖의 `.claude/rules/` 파일은 프로젝트 소유이며 보존합니다. |
+| `.claude/settings.json` | 부재 항목 머지 | M005, M008, M003 | 템플릿 유래인데 가리키는 스크립트가 없어진 hook 등록은 제거됩니다(M005). 옛 표기 command 는 새 표기로 바뀌고 같은 group 안의 중복 등록은 접힙니다(M008). permissions 와 프로젝트 고유 hook 은 보존됩니다. |
+| `.claudeignore` | 미전파 | 2절 보존 목록의 프로젝트 고유 설정 파일 | 없음. |
+| `.gitignore` | 부재 항목 머지 | M003 | 부재한 라인만 파일 끝에 추가합니다. 기존 라인은 바꾸지 않습니다. |
+| `WORKING_WITH_AI.md` | 덮어쓰기 | 2절 동기화 대상, 5단계 복사 | 없음. |
+| `CLAUDE.md` | 부재 시 생성 | 2절 보존 목록, 5단계 복사 | 조건에 해당하는 기존 프로젝트는 M013 이 템플릿 규칙 절을 정리합니다. |
+| `README.md` | 미전파 | 2절 보존 목록 | 없음. |
+| `PROJECT_CONTEXT.md` | 미전파 | 2절 보존 목록 | 없음. |
+| `REQUEST.md` | 미전파 | 2절 보존 목록 | 없음. |
+| `CURRENT_TASK.md` | 미전파 | 2절 보존 목록 | 없음. |
+| `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` | 미전파 | 2절 보존 목록 | 없음. |
+| `rd-workflow-workspace/backlog/FUTURE_REQUESTS_PARKED.md` | 미전파 | 2절 보존 목록 | 없음. |
+| `rd-workflow-workspace/backlog/request-archive/` | 미전파 | 2절 보존 목록 | 아카이브 파일을 덮어쓰거나 지우지 않습니다. |
+| `rd-workflow-workspace/backlog/request-archive/README.md` | 덮어쓰기 | 5단계 복사 | 없음. |
+| `rd-workflow-workspace/backlog/items/README.md` | 덮어쓰기 | 5단계 복사 (lite 전용) | 없음. |
+| `rd-workflow-workspace/specs/` | 미전파 | 2절 보존 목록 | 작업 산출물을 덮어쓰거나 지우지 않습니다. |
+| `rd-workflow-workspace/specs/base/README.md` | 덮어쓰기 | 5단계 복사 | 없음. |
+| `rd-workflow-workspace/specs/changes/README.md` | 덮어쓰기 | 5단계 복사 | 없음. |
+| `rd-workflow-workspace/plans/` | 미전파 | 2절 보존 목록 | 작업 산출물을 덮어쓰거나 지우지 않습니다. |
+| `rd-workflow-workspace/plans/README.md` | 덮어쓰기 | 5단계 복사 | 없음. |
+| `rd-workflow-workspace/handoffs/` | 미전파 | 2절 보존 목록 | 작업 내용물을 덮어쓰거나 지우지 않습니다. |
+| `rd-workflow-workspace/.lifecycle/` | 미전파 | 실행 중에 생기는 상태 | sync 가 읽지도 쓰지도 않습니다. |
+| `rd-workflow-workspace/raw-captures/` | 미전파 | Raw Capture 마이그레이션 절 | capture 본문은 입력 원문이라 덮어쓰거나 지우지 않습니다. |
+| `rd-workflow-workspace/raw-captures/README.md` | 덮어쓰기 | 5단계 복사 | 없음. |
+| `rd-workflow-workspace/reports/` | 미전파 | 프로젝트의 보고서 산출물 | 보고서를 덮어쓰거나 지우지 않습니다. |
+| `rd-workflow-workspace/reports/tier-log.md` | 미전파 | 프로젝트 기록 | `light` 마감 때마다 행이 쌓이는 기록이라 덮어쓰지 않습니다. |
+| `rd-workflow-workspace/reports/autopilot/.gitkeep` | 덮어쓰기 | 5단계 복사 (full 전용) | 없음. |
+| `rd-workflow-workspace/reports/completions/.gitkeep` | 덮어쓰기 | 5단계 복사 (full 전용) | 없음. |
+| `rd-workflow-workspace/reports/reviews/.gitkeep` | 덮어쓰기 | 5단계 복사 (full 전용) | 없음. |
+| `rd-workflow-workspace/reports/workflow-defects/.gitkeep` | 덮어쓰기 | 5단계 복사 | 없음. |
+| `rd-workflow-workspace/reports/completions/README.md` | 덮어쓰기 | 5단계 복사 (lite 전용) | 없음. |
+| `rd-workflow-workspace/reports/reviews/README.md` | 덮어쓰기 | 5단계 복사 (lite 전용) | 없음. |
+| `rd-workflow-workspace/reports/verifications/README.md` | 덮어쓰기 | 5단계 복사 (lite 전용) | 없음. |
+
+어느 행에도 걸리지 않는 경로는 미분류입니다. 새 파일군을 만들면 이 표에 행을 추가합니다.
+
+표는 full 산출물을 기준으로 합니다. `full 전용` 표시는 lite 산출물에 그 파일이 없다는 뜻이고, `lite 전용` 표시는 lite 산출물에만 있다는 뜻입니다.
+
+### 2.2 설치 범위 밖 파일의 내용 drift — 검토 결론
+
+검토 질문은 다음과 같습니다. `.claude/settings.json` 처럼 `rd-workflow/` 밖에 있어 템플릿과 어긋날 수 있는 파일의 drift 를 자동으로 잡는 수단이 필요합니까.
+
+결론: 자동 감지 수단을 지금은 채택하지 않습니다. 이유는 둘입니다.
+
+1. 감지를 session_start hook 에 두면, hook 이 무력화된 환경에서는 경고도 뜨지 않습니다. 감지 대상과 감지 수단이 같은 파일에 걸려 있습니다.
+2. 이 템플릿에는 소비 프로젝트 목록이 없습니다. 개발 쪽에서 설치본의 상태를 읽거나 강제로 전파할 수 없습니다. 전파는 각 프로젝트가 `/tpl update` 를 실행해야 닿습니다.
+
+대신 아래 「기존 설치본 1회성 백필」 절의 읽기 전용 점검을 hook 에 의존하지 않는 수동 경로로 둡니다.
+
+남는 위험은 `/tpl update` 를 하지 않는 설치본이 계속 낡은 상태로 남는다는 점입니다. 그 설치본이 몇 개인지 개발 쪽에서 알 수 없습니다.
+
+재검토 조건은 소비 프로젝트에서 hook 무력화나 정책 drift 가 실제로 관측되는 경우입니다. 그때 감지 수단(버전 가시성, 점검 스크립트 배포)을 별도 작업으로 다룹니다.
+
 ### 3. 사용자 확인
 
 분류 결과를 사용자에게 보여주고 확인을 받습니다.
@@ -633,6 +720,87 @@ manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
 - Skill 재설치 결과 (설치/건너뛴 수)
 - Extension 자동 재설치 결과 (자동 재설치/신규 설치/건너뛴 수)
 - Verify Preset 머지 결과 요약 (추가/보존/업데이트된 verifier, 변경된 criteria) — verify preset이 자동 재설치된 경우에만
+
+## 기존 설치본 1회성 백필
+
+대상은 한 번도 `/tpl update` 를 하지 않았거나 오래전 버전에 머문 설치본입니다.
+
+절차는 `/tpl update` 를 한 번 실행하는 것입니다. M000 부터 M005, M008, M003 까지 이 가이드의 순서대로 처리됩니다. 별도 수작업이나 스크립트는 없습니다. 옛 표기 hook command 의 정규화와 같은 group 안 중복 정리는 M008 이 맡습니다.
+
+### 적용 확인 (읽기 전용 점검)
+
+점검은 파일을 바꾸지 않습니다. hook 에 의존하지 않으므로 hook 이 무력화된 환경에서도 프로젝트 루트에서 직접 실행할 수 있습니다.
+
+문제로 보고하는 경우는 둘입니다.
+
+- hook command 가 옛 표기 `bash rd-workflow/scripts/hooks/` 로 시작합니다.
+- 같은 event, 같은 matcher group 안에 command 가 같은 항목이 둘 이상 있습니다.
+
+다른 event 나 다른 group 에 같은 command 가 있는 경우와, `command` 가 없거나 문자열이 아닌 항목은 정상으로 봅니다.
+
+출력과 exit code 는 다음과 같습니다.
+
+| 상황 | 출력 | exit |
+| --- | --- | --- |
+| 문제 없음 | `OK` 한 줄 | 0 |
+| 문제 있음 | 문제마다 `문제: <종류> <event> <command>` 한 줄 | 1 |
+| `.claude/settings.json` 없음 | `해당 없음: .claude/settings.json 없음` | 0 |
+| 깨진 JSON 또는 schema 오류 | `오류: <사유>` | 2 |
+
+판정에 실패한 경우에는 `OK` 를 출력하지 않습니다.
+
+```bash
+python3 -c '
+import json, sys
+p = ".claude/settings.json"
+OLD = "bash rd-workflow/scripts/hooks/"
+try:
+    with open(p, encoding="utf-8") as f:
+        cfg = json.load(f)
+except FileNotFoundError:
+    print("해당 없음: .claude/settings.json 없음")
+    sys.exit(0)
+except Exception as e:
+    print("오류: " + str(e))
+    sys.exit(2)
+def bad(msg):
+    print("오류: " + msg)
+    sys.exit(2)
+if not isinstance(cfg, dict):
+    bad("최상위가 객체가 아닙니다")
+hooks = cfg.get("hooks", {})
+if not isinstance(hooks, dict):
+    bad("hooks 가 객체가 아닙니다")
+problems = []
+for event, groups in hooks.items():
+    if not isinstance(groups, list):
+        bad("%s 가 배열이 아닙니다" % event)
+    for g in groups:
+        if not isinstance(g, dict):
+            bad("%s 의 group 이 객체가 아닙니다" % event)
+        items = g.get("hooks", [])
+        if not isinstance(items, list):
+            bad("%s 의 group.hooks 가 배열이 아닙니다" % event)
+        seen = set()
+        for h in items:
+            if not isinstance(h, dict):
+                bad("%s 의 hook 항목이 객체가 아닙니다" % event)
+            c = h.get("command")
+            if not isinstance(c, str):
+                continue
+            if c.startswith(OLD):
+                problems.append("문제: 옛표기 %s %s" % (event, c))
+            if c in seen:
+                problems.append("문제: 중복 %s %s" % (event, c))
+            seen.add(c)
+if problems:
+    print("\n".join(problems))
+    sys.exit(1)
+print("OK")
+'
+```
+
+`문제:` 줄이 나오면 `/tpl update` 를 실행하거나, 마이그레이션 M008 을 직접 실행합니다.
 
 ## Raw Capture 마이그레이션 (기존 프로젝트)
 

@@ -425,7 +425,9 @@ chk $? "실패 시 전달한 effort 값을 알려줌"
 grep -q 'RD_REVIEW_EFFORT_OVERRIDE=0' "$ISO/err_e"
 chk $? "실패 시 kill switch 복구 경로를 안내함"
 grep -q 'review-tools.json' "$ISO/err_e"
-chk $? "실패 시 키 제거 복구 경로를 안내함"
+chk $? "effort 값 확인 안내"
+! grep -q '제거' "$ISO/err_e"
+chk $? "영구 변경(제거) 지시 부재"
 
 # ============================================================
 # 5) B·C 인라인 상태 표시 (AC 23) — 부모 표시와 프롬프트 식별자가 정확히 일치해야 한다

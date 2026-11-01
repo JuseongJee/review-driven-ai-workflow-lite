@@ -4,7 +4,7 @@
 # 살아있는 Claude 세션(fr/batch.md) 소관이며, 이 스크립트는 규칙의 단일 출처(SSOT)입니다.
 # bash 3.2 호환: 연관배열(declare -A) 미사용. 인덱스 배열·문자열 누적·jq만 사용.
 # 서브커맨드: validate | next | set-state | skip-dependents | restore-dependents | summary |
-#             verify-done | archive-state | resolve-slug
+#             verify-done | archive-state | resolve-slug | resolve-task
 set -uo pipefail
 
 die2() { echo "batch_manifest: $1" >&2; exit 2; }
@@ -225,29 +225,95 @@ cmd_summary() {
   ' "$mf"
 }
 
+# --- items 파일 탐색: <slug> 의 items 파일 경로를 stdout 으로. 없으면 rc 1 ---
+_fr_items_file() {
+  local slug="$1"
+  local items_dir="${RD_BATCH_ITEMS_DIR:-rd-workflow-workspace/backlog/items}"
+  local f base
+  for f in "$items_dir"/*-"$slug".md; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+    [[ "$base" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-${slug}\.md$ ]] && { printf '%s\n' "$f"; return 0; }
+  done
+  return 1
+}
+
+# --- request-archive 파일의 `## Source FR` 절 유효 항목을 한 줄씩 출력 ---
+# 주석(<!-- ... -->, 여러 줄·인라인 포함)은 먼저 걷어낸다 — 주석 안 예시 경로는 증거가 아니다.
+# 절은 다음 `## ` 헤딩 직전까지. `- ` 접두·앞뒤 공백을 떼고 빈 줄과 `-`(FR 없음 표식)는 버린다.
+_source_fr_entries() {
+  awk '
+    {
+      line = $0; out = ""
+      while (length(line) > 0) {
+        if (inc) {
+          i = index(line, "-->")
+          if (i == 0) { line = "" } else { line = substr(line, i + 3); inc = 0 }
+        } else {
+          i = index(line, "<!--")
+          if (i == 0) { out = out line; line = "" }
+          else { out = out substr(line, 1, i - 1); line = substr(line, i + 4); inc = 1 }
+        }
+      }
+    }
+    out ~ /^## / { insec = (out ~ /^## Source FR[ \t\r]*$/); next }
+    insec {
+      sub(/^[ \t]+/, "", out); sub(/[ \t\r]+$/, "", out)
+      sub(/^-[ \t]+/, "", out); sub(/[ \t]+$/, "", out)
+      if (out == "" || out == "-") next
+      print out
+    }
+  ' "$1"
+}
+
+# --- <fr_file> 을 Source FR 로 기재한 archive 의 작업 이름(SHORT_TITLE)을 중복 없이 출력 ---
+# 파일명은 YYYY-MM-DD-HHMM-<작업 이름>.md 만 보고, 항목은 전체 문자열이 정확히 같을 때만 인정한다
+# (앞 `./` 만 정규화). 부분·접두·유사 slug 는 일치가 아니다.
+_archive_tasks_for_fr() {
+  local fr_file="$1"
+  local arch_dir="${RD_BATCH_ARCHIVE_DIR:-rd-workflow-workspace/backlog/request-archive}"
+  local want="${fr_file#./}" f base task e seen=" "
+  for f in "$arch_dir"/*.md; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+    [[ "$base" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}-([a-z0-9-]+)\.md$ ]] || continue
+    task="${BASH_REMATCH[1]}"
+    case "$seen" in *" ${task} "*) continue ;; esac
+    while IFS= read -r e; do
+      if [ "${e#./}" = "$want" ]; then seen="${seen}${task} "; printf '%s\n' "$task"; break; fi
+    done < <(_source_fr_entries "$f")
+  done
+}
+
 # --- verify-done: FR 완료 ground truth (exit code 무관 사실 검증) ---
+# archive 증거는 파일명이 아니라 request-archive 의 `## Source FR` 일치다.
 cmd_verify_done() {
   local slug="${1:-}"
   [ -n "$slug" ] || die2 "slug 인자가 필요합니다"
   [[ "$slug" =~ ^[a-z0-9-]+$ ]] || die2 "비정규 slug: '${slug}' (허용: ^[a-z0-9-]+$)"
-  local items_dir="${RD_BATCH_ITEMS_DIR:-rd-workflow-workspace/backlog/items}"
-  local arch_dir="${RD_BATCH_ARCHIVE_DIR:-rd-workflow-workspace/backlog/request-archive}"
-  local f base fr_file=""
-  for f in "$items_dir"/*-"$slug".md; do
-    [ -e "$f" ] || continue
-    base="$(basename "$f")"
-    [[ "$base" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-${slug}\.md$ ]] && { fr_file="$f"; break; }
-  done
-  [ -n "$fr_file" ] || { echo "verify-done: items 파일 없음: ${slug}" >&2; return 1; }
+  local fr_file
+  fr_file="$(_fr_items_file "$slug")" || { echo "verify-done: items 파일 없음: ${slug}" >&2; return 1; }
   local status
   status="$(awk '/^- status:/{gsub(/^- status:[[:space:]]*/,"");print;exit}' "$fr_file")"
   [ "$status" = "done" ] || { echo "verify-done: status=${status} (≠done): ${slug}" >&2; return 1; }
-  for f in "$arch_dir"/*-"$slug".md; do
-    [ -e "$f" ] || continue
-    base="$(basename "$f")"
-    [[ "$base" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}-${slug}\.md$ ]] && return 0
-  done
-  echo "verify-done: archive 파일 없음: ${slug}" >&2; return 1
+  [ -n "$(_archive_tasks_for_fr "$fr_file")" ] && return 0
+  echo "verify-done: archive 파일 없음(Source FR 일치 없음): ${slug}" >&2; return 1
+}
+
+# --- resolve-task: FR slug → 작업 이름(SHORT_TITLE). 1개 rc0 / 0개 rc1 / 2개 이상 rc4 (이 서브커맨드 전용) ---
+cmd_resolve_task() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die2 "slug 인자가 필요합니다"
+  [[ "$slug" =~ ^[a-z0-9-]+$ ]] || die2 "비정규 slug: '${slug}' (허용: ^[a-z0-9-]+$)"
+  local fr_file
+  fr_file="$(_fr_items_file "$slug")" || { echo "resolve-task: items 파일 없음: ${slug}" >&2; return 1; }
+  local tasks n
+  tasks="$(_archive_tasks_for_fr "$fr_file")"
+  n="$(printf '%s' "$tasks" | grep -c .)"
+  if [ "$n" -eq 1 ]; then printf '%s\n' "$tasks"; return 0; fi
+  if [ "$n" -eq 0 ]; then echo "resolve-task: archive 증거 없음: ${slug}" >&2; return 1; fi
+  echo "resolve-task: 작업 이름을 확정할 수 없습니다: ${slug} — 후보: $(printf '%s' "$tasks" | tr '\n' ' ')" >&2
+  return 4
 }
 
 # --- resolve-slug: items 에서 <slug> 를 정확히 1개로 resolve (오타/미존재 착수 전 차단) ---
@@ -317,11 +383,22 @@ cmd_archive_state() {
     _as_emit unknown "$policy" "-" "default-ref-missing"; return 0
   fi
 
-  local fr_ref="refs/heads/fr/${slug}"
+  # 작업 이름(SHORT_TITLE) 확정 — git 증거 조회(merge grep·tag glob·fr ref)에만 쓴다.
+  # verify-done 은 FR slug 를 그대로 쓴다. 증거 없음(rc 1)은 발행 전이거나 이름=slug 인
+  # 구형이므로 slug 로 폴백하고, 복수 후보(rc 4)는 판정 불가로 보존한다.
+  local task trc
+  task="$(cmd_resolve_task "$slug" 2>/dev/null)"; trc=$?
+  case "$trc" in
+    0) ;;
+    4) _as_emit unknown "$policy" "-" "task-ambiguous"; return 0 ;;
+    *) task="$slug" ;;
+  esac
+
+  local fr_ref="refs/heads/fr/${task}"
   local merge_oid=""
 
   # --- merge 판정 (tag 유무와 무관해야 한다 — merge 직후 tag 전에 죽는 경우가 있다) ---
-  merge_oid="$(git log "$default_branch" --grep="^merge: ${slug} " --format=%H -n1 2>/dev/null)"
+  merge_oid="$(git log "$default_branch" --grep="^merge: ${task} " --format=%H -n1 2>/dev/null)"
   # **fr 브랜치가 기본 브랜치의 ancestor 라는 사실은 merge 의 증거가 아니다.**
   # promote 직후에는 두 tip 이 같아 ancestor 조건이 참이므로, 구현·archive 를 한 번도
   # 하지 않은 작업이 "merge 됐으나 발행 미완" 으로 오판정된다 (이후 기본 브랜치만
@@ -333,7 +410,7 @@ cmd_archive_state() {
   # 실제 merge 를 모두 잡는다 (인덱스 충돌 해결 경로의 재커밋도 같은 메시지다).
   if [ -z "$merge_oid" ]; then
     local anytag
-    anytag="$(git tag --list "fr/*/${slug}" 2>/dev/null | head -1)"
+    anytag="$(git tag --list "fr/*/${task}" 2>/dev/null | head -1)"
     if [ -n "$anytag" ] && git merge-base --is-ancestor "$anytag" "$default_branch" 2>/dev/null; then
       merge_oid="$(git rev-list -n1 "$anytag" 2>/dev/null)"
     fi
@@ -351,8 +428,8 @@ cmd_archive_state() {
   # tag 선택 — 같은 slug 에 tag 가 여럿일 수 있다 (같은 slug 로 두 번째 작업 등).
   # 이번 merge 커밋을 조상으로 갖는 tag 중 생성 시각이 가장 늦은 것을 고른다.
   local tag="" any_tag="" t
-  any_tag="$(git tag --list "fr/*/${slug}" 2>/dev/null | head -1)"
-  for t in $(git tag --list "fr/*/${slug}" --sort=-creatordate 2>/dev/null); do
+  any_tag="$(git tag --list "fr/*/${task}" 2>/dev/null | head -1)"
+  for t in $(git tag --list "fr/*/${task}" --sort=-creatordate 2>/dev/null); do
     if git merge-base --is-ancestor "$merge_oid" "$t" 2>/dev/null; then tag="$t"; break; fi
   done
 
@@ -378,14 +455,14 @@ cmd_archive_state() {
     if ! ls_out="$(git ls-remote origin \
           "refs/heads/${default_branch}" \
           "refs/tags/${tag:-__none__}" \
-          "refs/heads/fr/${slug}" 2>/dev/null)"; then
+          "refs/heads/fr/${task}" 2>/dev/null)"; then
       _as_emit unknown "$policy" "${missing:--}" "remote-unreachable"; return 0
     fi
 
     local remote_head remote_tag remote_fr
     remote_head="$(printf '%s\n' "$ls_out" | awk -v r="refs/heads/${default_branch}" '$2==r{print $1; exit}')"
     remote_tag="$(printf '%s\n' "$ls_out"  | awk -v r="refs/tags/${tag}" '$2==r{print $1; exit}')"
-    remote_fr="$(printf '%s\n' "$ls_out"   | awk -v r="refs/heads/fr/${slug}" '$2==r{print $1; exit}')"
+    remote_fr="$(printf '%s\n' "$ls_out"   | awk -v r="refs/heads/fr/${task}" '$2==r{print $1; exit}')"
 
     if [ -z "$remote_head" ]; then
       _as_miss "remote-branch"
@@ -431,5 +508,6 @@ case "$cmd" in
   verify-done) cmd_verify_done "$@" ;;
   archive-state) cmd_archive_state "$@" ;;
   resolve-slug) cmd_resolve_slug "$@" ;;
-  *) die2 "알 수 없는 서브커맨드: '${cmd}' (validate|next|set-state|skip-dependents|restore-dependents|summary|verify-done|archive-state|resolve-slug)" ;;
+  resolve-task) cmd_resolve_task "$@" ;;
+  *) die2 "알 수 없는 서브커맨드: '${cmd}' (validate|next|set-state|skip-dependents|restore-dependents|summary|verify-done|archive-state|resolve-slug|resolve-task)" ;;
 esac

@@ -5,8 +5,7 @@
 #           SELF_REVIEW_WARNING (default: true)
 #
 # codex 와 같은 대기 계약(review_wait.sh 공유)을 쓴다. codex 와 다른 것은 호출 형태
-# (stream-json 활동 신호)·표시 포맷터(claude_format_line)·last-message 부재·
-# TERM 무시 리더에 대한 kill escalation(RW_KILL_ESCALATE) 뿐이다.
+# (stream-json 활동 신호)·표시 포맷터(claude_format_line)·last-message 부재 뿐이다.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,7 +55,7 @@ RW_IDLE="$(rw_resolve_idle "$DEFAULT_IDLE")"
 RW_FALLBACK_CAP="$(rw_resolve_tunable RD_REVIEW_OBSERVER_FALLBACK_CAP 600)"
 RW_HEARTBEAT="$(rw_resolve_tunable RD_REVIEW_HEARTBEAT 60)"
 RW_LINE_FORMATTER=claude_format_line
-RW_KILL_ESCALATE=1          # TERM 을 무시하는 리더도 유한 시간에 회수한다 (codex 는 켜지 않음)
+RW_KILL_ESCALATE=1          # TERM 을 무시하는 리더도 유한 시간에 회수한다
 RW_KILL_GRACE=3
 
 if [ "$RW_IDLE" -gt 0 ] && [ "$RW_IDLE" -gt "$RW_ABS_CAP" ]; then
@@ -185,6 +184,8 @@ RW_LOG_FD=5
 
 claude_pid=""
 claude_pgid=""
+# cleanup 의 writer 종료 증거 조회(rw_group_state)가 spawn 전에도 set -u 에서 죽지 않도록 미리 정의한다.
+RW_TARGET_PID=""
 watchdog_pid=""
 cleanup_done=0
 group_dead=1
@@ -232,7 +233,7 @@ cleanup() {
 
   # --- 산출물 발행 (안정 이름) — process group 종료 확인 후 1회 ---
   group_dead=1
-  local log_ok=no log_reason="" log_recovery=""
+  local log_ok=no log_reason="" log_recovery="" rw_gs=""
   if [ -n "$claude_pgid" ] && rw_group_alive "$claude_pgid"; then
     group_dead=0
   fi
@@ -296,7 +297,12 @@ cleanup() {
   fi
 
   if [ "$group_dead" -eq 1 ]; then
-    if rw_publish_final_status "$log_ok" "$log_reason" "$log_recovery"; then
+    # 종료를 증명했는지만 상태 파일에 남긴다(발행 조건은 위 group_dead 게이트 그대로).
+    # pgid 확보에 실패했어도(리더가 즉시 종료) 리더 pid 가 곧 pgid(set -m)이므로 그 그룹의 구성원 유무를 ps 로 확인한다.
+    # verified 가 아니면(ps 실패·alive 경합) unverified 로 쓴다.
+    rw_gs="$(rw_group_state "${claude_pgid:-$RW_TARGET_PID}")"
+    [ "$rw_gs" = verified ] || rw_gs=unverified
+    if RW_GROUP_STATE="$rw_gs" rw_publish_final_status "$log_ok" "$log_reason" "$log_recovery"; then
       rm -f "$status_stream" 2>/dev/null || true
     else
       echo "알림: 대기 상태를 안정 경로(${RW_STATUS_FILE})로 발행하지 못했습니다." >&2

@@ -115,14 +115,32 @@ run_step() {
     STEP_DURATIONS+=(0)
     return 0
   fi
-  local _t0=$SECONDS elapsed
+  local _t0=$SECONDS elapsed rc _wdir _errf _donef _w _hit
   echo ""
   echo "== ${desc} =="
-  if "$@"; then
-    elapsed=$((SECONDS - _t0))
+  # 미정의 헬퍼를 호출한 테스트 스크립트는 FAIL 변수 누적으로 판정해 rc 0 으로 끝날 수 있다.
+  # 그때도 bash 는 stderr 에 `...: command not found` 를 남기므로, stderr 를 원래 채널로 흘리면서
+  # 사본을 받아 종료 후 그 줄을 찾는다. 대상은 전역 변수를 바꾸는 함수일 수 있어 파이프 좌변(서브셸)
+  # 이 아니라 현재 셸에서 실행한다. bash 3.2 는 프로세스 치환 종료를 wait 할 수 없으므로, tee 가
+  # 끝난 뒤에만 생기는 표식(_donef, 처음에는 없음)을 기다린다. rc 는 기존 if 문맥 그대로 받는다.
+  _wdir="$(mktemp -d)" || { echo "  -> FAIL: 스텝 stderr 감시용 임시 디렉터리를 만들 수 없습니다: ${desc}" >&2; FAIL=1; return; }
+  _errf="${_wdir}/stderr"
+  _donef="${_wdir}/tee-done"
+  : > "$_errf"
+  if "$@" 2> >(tee -a "$_errf" >&2; : > "$_donef"); then rc=0; else rc=$?; fi
+  _w=0
+  while [[ ! -e "$_donef" && $_w -lt 100 ]]; do
+    sleep 0.05
+    _w=$((_w + 1))
+  done
+  [[ -e "$_donef" ]] || echo "  경고: stderr 사본 기록 완료를 5초 안에 확인하지 못했습니다(미정의 명령 검사가 불완전할 수 있음): ${desc}" >&2
+  _hit="$(grep -m1 ': command not found$' "$_errf" || true)"
+  rm -rf "$_wdir"
+  elapsed=$((SECONDS - _t0))
+  [[ -z "$_hit" ]] || echo "  -> 미정의 명령 호출 검출: ${_hit}" >&2
+  if [[ "$rc" -eq 0 && -z "$_hit" ]]; then
     echo "  -> PASS: ${desc} (${elapsed}s)"
   else
-    elapsed=$((SECONDS - _t0))
     echo "  -> FAIL: ${desc} (${elapsed}s)" >&2
     FAIL=1
   fi
@@ -721,7 +739,7 @@ autopilot_headless_entry_check() {
     grep -q '결과 대기 규율' "$skill"             || { echo "  $skill: 결과 대기 규율 절 미존재" >&2; rc=1; }
     grep -q 'run_in_background' "$skill"          || { echo "  $skill: run_in_background 금지 규율 미참조" >&2; rc=1; }
     grep -q 'resume' "$skill"                     || { echo "  $skill: resume 토큰 미참조" >&2; rc=1; }
-    grep -q '600000' "$skill"                     || { echo "  $skill: timeout 최대치(600000ms) 미참조" >&2; rc=1; }
+    grep -q 'BASH_DEFAULT_TIMEOUT_MS' "$skill"    || { echo "  $skill: wrapper timeout 상향(BASH_DEFAULT_TIMEOUT_MS) 미참조" >&2; rc=1; }
     grep -q 'WAIT_TIMEOUT' "$skill"                || { echo "  $skill: 어댑터 watchdog(WAIT_TIMEOUT) 중첩 타이머 규율 미참조" >&2; rc=1; }
     grep -q '진행 신호' "$skill"                   || { echo "  $skill: 긴 대기 진행 신호 규율 미참조" >&2; rc=1; }
     # promote 직후 launch 결과 처리 — 무인 실행은 항상 none 이므로 이 세션이 worktree 로
@@ -1212,6 +1230,7 @@ guard_deny_convention_check() {
         # 근거여야 합니다 (계측이 귀찮다는 것은 근거가 아닙니다).
         case "${f##*/}" in
           session_start.sh) : ;;               # 세션 시작 안내 — 차단 없음
+          _compact_hint.sh) : ;;               # session_start.sh 가 source 하는 압축 안내 함수 — 차단 없음
           *) echo "  ${rel}: guard_deny 호출이 없습니다 — 차단 가드가 아니면 이 예외 목록에 추가하십시오" >&2; rc=1 ;;
         esac
       else
@@ -1539,12 +1558,14 @@ run_step hooks consumer "implementation_gate hook (test_implementation_gate.sh)"
 run_step review consumer "리뷰 프롬프트 인라인 계약 (test_review_prompt_inline.sh)" bash "${SCRIPT_DIR}/test_review_prompt_inline.sh"
 run_step review consumer "reasoning effort override (test_review_effort_override.sh)" bash "${SCRIPT_DIR}/test_review_effort_override.sh"
 run_step review consumer "리뷰 턴 계측 계약 (test_review_metrics.sh)" bash "${SCRIPT_DIR}/test_review_metrics.sh"
+run_step review consumer "리뷰 턴 신호·보존 안내 (test_review_turn_signal.sh)" bash "${SCRIPT_DIR}/test_review_turn_signal.sh"
 run_step review consumer "어댑터 프롬프트 parity (test_review_adapter_parity.sh)" bash "${SCRIPT_DIR}/test_review_adapter_parity.sh"
 run_step review consumer "diff review base 판정·seal 계약 (test_review_base_resolution.sh)" bash "${SCRIPT_DIR}/test_review_base_resolution.sh"
 run_step lifecycle consumer "state 단위 테스트 (test_state_common.sh)" bash "${SCRIPT_DIR}/test_state_common.sh"
 run_step hooks consumer "guard state fixture (test_guard_state.sh)" bash "${SCRIPT_DIR}/hooks/test_guard_state.sh"
 run_step hooks consumer "archive gate 테스트 (test_pre_commit_archive_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_pre_commit_archive_gate.sh"
 run_step hooks consumer "background dispatch 차단 hook (test_headless_background_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_headless_background_gate.sh"
+run_step hooks consumer "압축 뒤 안내 (test_session_start_compact.sh)" bash "${SCRIPT_DIR}/hooks/test_session_start_compact.sh"
 run_step hooks consumer "가드 차단 계측 (test_guard_block_log.sh)" bash "${SCRIPT_DIR}/hooks/test_guard_block_log.sh"
 run_step lifecycle consumer "비차단 Status drift 검증 (nonblocking_status_drift_check)" nonblocking_status_drift_check
 run_step lifecycle consumer "LC-19 3자 일치 검증 (TASK/STATE/task-tracking.md)" canonical_status_triple_drift_check
@@ -1557,6 +1578,7 @@ run_step skills consumer "FR 인덱스/상세 정합성 (fr_index_detail_consist
 run_step skills consumer "FR 관계 무결성 (fr_relations_validate_check)" fr_relations_validate_check
 run_step skills consumer "FR 관계 헬퍼 테스트 (test_fr_relations.sh)" bash "${SCRIPT_DIR}/test_fr_relations.sh"
 run_step skills consumer "skill 참조 경로 검사 단위 테스트" bash "${SCRIPT_DIR}/test_skill_reference_existence.sh"
+run_step skills consumer "FR related files 검사 단위 테스트" bash "${SCRIPT_DIR}/test_fr_related_files_existence.sh"
 run_step lifecycle consumer "lifecycle 단위 테스트 (test_lifecycle.sh)" bash "${SCRIPT_DIR}/lifecycle/test_lifecycle.sh"
 run_step lifecycle consumer "작업 색인 단위 테스트 (test_tasks_index.sh)" bash "${SCRIPT_DIR}/lifecycle/test_tasks_index.sh"
 run_step lifecycle consumer "세션 기동 단위 테스트 (test_session_launch.sh)" bash "${SCRIPT_DIR}/lifecycle/test_session_launch.sh"
@@ -1613,6 +1635,8 @@ run_step skills dev-only "무인 진입 계약 정합 (autopilot_headless_entry_
 run_step skills consumer "skill 호출 권한 판정표 (설치본)" skill_invocation_authority_check
 run_step skills dev-only "skill 호출 권한 판정표 (정본)" skill_invocation_canon_check
 run_step skills consumer "무인 wrapper 매핑 테스트 (test_autopilot_headless.sh)" bash "${SCRIPT_DIR}/test_autopilot_headless.sh"
+run_step skills consumer "재개 후보 helper 테스트 (test_resume_candidates.sh)" bash "${SCRIPT_DIR}/batch/test_resume_candidates.sh"
+run_step skills consumer "무인 wrapper 경과 시간 상한 테스트 (test_autopilot_headless_timecap.sh)" bash "${SCRIPT_DIR}/test_autopilot_headless_timecap.sh"
 run_step skills dev-only "phase 병렬 규약 문서 정합 (plan_parallel_phase_check)" plan_parallel_phase_check
 # dev-only 인 이유: 점검 대상에 `scripts/` 가 있고 배포본에는 그 디렉터리가 없다.
 # 루트는 `_hook_repo_root` 로 구한다 — `SELFTEST_ROOT` 는 정본 레이아웃에서
@@ -1628,6 +1652,10 @@ build_verify_check() {
 }
 test_build_template_check() {
   local t="${SCRIPT_DIR}/../../scripts/test_build_template.sh"
+  if [[ -f "$t" ]]; then bash "$t"; else echo "  (skip: dev repo 아님)"; fi
+}
+test_root_mirror_drift_gate_check() {
+  local t="${SCRIPT_DIR}/hooks/test_root_mirror_drift_gate.sh"
   if [[ -f "$t" ]]; then bash "$t"; else echo "  (skip: dev repo 아님)"; fi
 }
 # 배포 미러 계약(체크섬 미러 + VERSION 검증). publish.sh 도 dev repo 전용이라 설치본에서는 skip.
@@ -1650,6 +1678,7 @@ run_step hooks dev-only "reason 인자 판정 회귀 (guard_deny_reason_detectio
 run_step build dev-only "프로젝트 루트 계산 양쪽 레이아웃 (root_dir_layout_check)" root_dir_layout_check
 run_step build dev-only "템플릿 build 검증 (build_template.sh verify)" build_verify_check
 run_step build dev-only "템플릿 빌더 단위 테스트 (test_build_template.sh)" test_build_template_check
+run_step build dev-only "루트 정본 drift 가드 테스트 (test_root_mirror_drift_gate.sh)" test_root_mirror_drift_gate_check
 run_step build dev-only "배포 미러 계약 (test_publish_mirror.sh)" test_publish_mirror_check
 run_step build dev-only "publish 원격 상태 판정 회귀 (test_publish_remote_state.sh)" test_publish_remote_state_check
 claudemd_size_check() {
@@ -1657,6 +1686,7 @@ claudemd_size_check() {
   if [[ -f "$checker" ]]; then bash "$checker"; else echo "  (skip: check_claudemd_size.sh 없음 — lite 산출물)"; fi
 }
 run_step build consumer "CLAUDE.md 크기 제한 (check_claudemd_size.sh)" claudemd_size_check
+run_step review consumer "검증 증거 래퍼 (test_verify_record.sh)" bash "${SCRIPT_DIR}/test_verify_record.sh"
 
 
 # 청중 제외 요약 — `consumer` 모드에서 무엇이 빠졌는지 사용자에게 보입니다.

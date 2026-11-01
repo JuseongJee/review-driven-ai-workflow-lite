@@ -315,6 +315,59 @@ rd_seal_verify() {
   return 0
 }
 
+# rd_seal_evidence_check <cur_tree_hash> — seal 직전 새 검증 증거 검사 (verify_record.sh 가 쓴 파일).
+#
+#   return 0 — 증거가 통과(exit-code=0)이고 tree-hash 가 현재 보호 트리 해시와 같음.
+#   return 1 — 거부. `RD_EVIDENCE_FAIL_KIND`(missing|malformed|not-pass|hash-mismatch) 와
+#              `RD_EVIDENCE_FAIL_MSG`(다음에 칠 명령을 포함한 안내문) 를 채웁니다. fail-closed:
+#              파일이 깨졌거나 키가 하나라도 없으면 통과가 아닙니다.
+# 환경변수 우회 경로는 없습니다. 증거를 못 만드는 변경은 archive.sh --force-skip-review-check 로 갑니다.
+RD_EVIDENCE_REL="rd-workflow-workspace/.lifecycle/review-seals/verify-evidence"
+RD_EVIDENCE_FAIL_KIND=""
+RD_EVIDENCE_FAIL_MSG=""
+rd_seal_evidence_check() {
+  local cur="${1-}" f="${project_root}/${RD_EVIDENCE_REL}" k v e_cmd e_exit e_hash
+  RD_EVIDENCE_FAIL_KIND=""; RD_EVIDENCE_FAIL_MSG=""
+  local hint="bash rd-workflow/scripts/verify_record.sh -- <검증 명령>"
+  if [[ -z "$cur" ]]; then
+    RD_EVIDENCE_FAIL_KIND="malformed"
+    RD_EVIDENCE_FAIL_MSG="review seal: 현재 트리 해시가 비어 있어 증거를 대조할 수 없습니다 — 판정 불가로 차단합니다."
+    return 1
+  fi
+  if [[ ! -f "$f" ]]; then
+    RD_EVIDENCE_FAIL_KIND="missing"
+    RD_EVIDENCE_FAIL_MSG="review seal: 이 트리의 검증 증거가 없습니다 — \`${hint}\` 으로 검증을 돌린 뒤 다시 seal 하십시오 (이 저장소는 \`self_test.sh <그룹>\`)."
+    return 1
+  fi
+  for k in schema command exit-code tree-hash head recorded-at; do
+    v="$(_rd_kv_get "$f" "$k")"
+    if [[ -z "$v" ]]; then
+      RD_EVIDENCE_FAIL_KIND="malformed"
+      RD_EVIDENCE_FAIL_MSG="review seal: 검증 증거 파일이 손상되었습니다 (필수 키 '${k}' 없음) — \`${hint}\` 으로 다시 돌린 뒤 seal 하십시오."
+      return 1
+    fi
+  done
+  if [[ "$(_rd_kv_get "$f" schema)" != "1" ]]; then
+    RD_EVIDENCE_FAIL_KIND="malformed"
+    RD_EVIDENCE_FAIL_MSG="review seal: 검증 증거의 schema 를 알 수 없습니다 — \`${hint}\` 으로 다시 돌린 뒤 seal 하십시오."
+    return 1
+  fi
+  e_cmd="$(_rd_kv_get "$f" command)"
+  e_exit="$(_rd_kv_get "$f" exit-code)"
+  e_hash="$(_rd_kv_get "$f" tree-hash)"
+  if [[ "$e_exit" != "0" ]]; then
+    RD_EVIDENCE_FAIL_KIND="not-pass"
+    RD_EVIDENCE_FAIL_MSG="review seal: 이 트리의 검증 증거가 통과가 아닙니다 (exit-code=${e_exit}) — \`${hint}\` 으로 검증을 통과시킨 뒤 다시 seal 하십시오."
+    return 1
+  fi
+  if [[ "$e_hash" != "$cur" ]]; then
+    RD_EVIDENCE_FAIL_KIND="hash-mismatch"
+    RD_EVIDENCE_FAIL_MSG="review seal: 검증 증거가 현재 트리와 다릅니다 (증거 ${e_hash:0:8} ≠ 현재 ${cur:0:8}) — 리뷰 중 코드가 바뀌었습니다. 검증을 다시 돌리십시오: \`bash rd-workflow/scripts/verify_record.sh -- ${e_cmd}\`"
+    return 1
+  fi
+  return 0
+}
+
 # _rd_seal_legacy_warning — legacy 마커 지속 고지 (§3.3 Finding 5).
 # 통과할 때마다 냅니다 — 생성 시점 1회 고지로는 나중에 실행하는 사람이 알 수 없습니다.
 _rd_seal_legacy_warning() {
@@ -386,12 +439,13 @@ archive_review_precheck() {
     return 0
   fi
 
-  printf 'archive: 종결 마커 검증 실패 — %s\n' "$fail_msg" >&2
   if [[ "$force_skip" != "1" ]]; then
+    printf 'archive: 종결 마커 검증 실패 — %s\n' "$fail_msg" >&2
     printf 'archive: review 미종결 (마커 없음 또는 무효). --force-skip-review-check "<사유>"로만 우회 가능.\n' >&2
     return 1
   fi
   if [[ -z "$reason" ]]; then
+    printf 'archive: 종결 마커 검증 실패 — %s\n' "$fail_msg" >&2
     printf 'archive: --force-skip-review-check 사유 필수\n' >&2
     return 1
   fi
@@ -402,14 +456,100 @@ archive_review_precheck() {
   local audit_dir
   audit_dir="$(dirname "$audit_log")"
   if ! mkdir -p "$audit_dir" 2>/dev/null; then
+    printf 'archive: 종결 마커 검증 실패 — %s\n' "$fail_msg" >&2
     printf 'archive: audit 디렉터리를 만들 수 없습니다 (%s) — 우회 사유를 남길 수 없어 차단합니다.\n' "$audit_dir" >&2
     return 1
   fi
   if ! printf '%s | %s | %s | %s\n' "$(date '+%Y-%m-%d %H:%M')" "$slug" "$reason" "${audit_ref:-<세션없음>}" >> "$audit_log" 2>/dev/null; then
+    printf 'archive: 종결 마커 검증 실패 — %s\n' "$fail_msg" >&2
     printf 'archive: audit log 기록에 실패했습니다 (%s) — 우회 사유를 남길 수 없어 차단합니다.\n' "$audit_log" >&2
     return 1
   fi
-  printf 'archive: WARNING — review 검증 우회 (사유: %s). audit log 기록.\n' "$reason" >&2
+  printf 'archive: WARNING — review 검증 우회 (사유: %s; 종결 마커 상태: %s). audit log 기록.\n' "$reason" "$fail_msg" >&2
+  return 0
+}
+
+# archive_status_precheck <allow 0|1> <reason> <slug> <audit_log> [fr_ref]
+#
+# 발행 대상 커밋의 task-state `status` 가 `아카이브 보류` 인지 검사합니다. 외부 검증을
+# 기다리는 작업(`검증 중` 등)이나 리뷰를 마치지 않은 작업이 seal 우회와 겹쳐 발행되는 것을
+# push 전에 막는 게이트입니다. `archive_review_precheck`(seal 검사)와 **서로 독립**입니다 —
+# 한쪽 우회 플래그가 다른 쪽 판정을 바꾸지 않고, 각각 fail-closed 입니다.
+#
+# 판독 대상은 `archive_review_precheck` 와 같습니다: fr 모드는 fr tip, no-fr 은 HEAD.
+# 워킹트리를 읽지 않습니다(「fr 에 커밋 → 기본 브랜치로 switch → archive.sh」 표준 흐름).
+# 허용값은 `아카이브 보류` 정확 일치뿐이고, 판독 불가(파일·키 없음, 대상 커밋 없음)는 차단입니다.
+# 우회(allow=1)는 사유가 필수이고 audit 로그에 `[status:<값>]` 로 남깁니다. 기록(mkdir·append)
+# 실패는 차단입니다 — 사유가 남지 않는 우회 발행은 허용하지 않습니다.
+#
+# return 0=진행, 1=차단.
+RD_ARCHIVE_STATUS_OK="아카이브 보류"
+archive_status_precheck() {
+  local allow="$1" reason="$2" slug="$3" audit_log="$4" fr_ref="${5:-}"
+  local mode="" target="" status="" root="" tmp="" shown=""
+
+  if [[ -z "$fr_ref" ]]; then
+    fr_ref="$(state_read_field "fr-branch")"
+  fi
+  if mode="$(rd_branch_mode "$fr_ref" 2>/dev/null)"; then
+    if [[ "$mode" == "fr" ]]; then
+      target="$(rd_resolve_commit_oid "$fr_ref" 2>/dev/null)" || target=""
+    else
+      target="$(rd_resolve_commit_oid "HEAD" 2>/dev/null)" || target=""
+    fi
+  fi
+  if [[ -n "$target" ]] && root="$(rd_repo_root)"; then
+    tmp="$(mktemp "${TMPDIR:-/tmp}/rd-status-state.XXXXXX")" || tmp=""  # 실패하면 status 가 비어 판독 불가로 차단된다
+    if [[ -n "$tmp" ]]; then
+      if git -C "$root" show "${target}:${RD_SEAL_REL_STATE}" > "$tmp" 2>/dev/null; then
+        status="$(_rd_kv_get "$tmp" "status")"
+      fi
+      rm -f "$tmp"
+    fi
+  fi
+
+  [[ "$status" == "$RD_ARCHIVE_STATUS_OK" ]] && return 0
+
+  shown="${status:-<판독 불가>}"
+  if [[ "$allow" != "1" ]]; then
+    if [[ "$mode" == "no-fr" && "$status" == "대기 중" ]]; then
+      # no-fr 의 metadata cleanup 커밋은 Status 를 `대기 중` 으로 되돌립니다. 이 상태의
+      # 재실행은 push 실패 같은 부분 성공 뒤의 복구입니다.
+      printf "archive: HEAD 는 이미 cleanup 이후 상태('대기 중')입니다 — 부분 성공 뒤 재실행으로 보입니다.\n" >&2
+      printf 'archive: 이어서 발행하려면 --force-skip-review-check "<사유>" 와 --allow-status-mismatch "<사유>" 를 함께 주십시오 (각각 audit 기록).\n' >&2
+      # 최초 발행인데 Status 를 아직 옮기지 않은 경우도 같은 값이므로 일반 전이 순서를 함께 안내한다.
+      printf 'archive: 최초 발행인데 Status 가 아직 옮겨지지 않은 것이라면 다음 순서로 옮기십시오:\n' >&2
+      printf 'archive:   1. rd task set-status "diff review 대기"\n' >&2
+      printf 'archive:   2. final diff review 종결 → rd review seal <세션>\n' >&2
+      printf 'archive:   3. rd task set-status "아카이브 보류" 후 task-state 를 커밋\n' >&2
+    else
+      printf "archive: Status 검사 실패 — 발행 대상 커밋의 Status 는 '%s' 입니다 ('%s' 만 발행할 수 있습니다).\n" "$shown" "$RD_ARCHIVE_STATUS_OK" >&2
+      printf 'archive: 외부 검증 대기·미완료 작업의 발행을 막기 위한 검사입니다. 다음 순서로 옮기십시오:\n' >&2
+      printf 'archive:   1. rd task set-status "diff review 대기"   (현재 '"'"'검증 중'"'"' 이면 검증을 마친 뒤)\n' >&2
+      printf 'archive:   2. final diff review 종결 → rd review seal <세션>\n' >&2
+      printf 'archive:   3. rd task set-status "아카이브 보류" 후 task-state 를 커밋\n' >&2
+      printf 'archive: 이 검사만 건너뛰려면 --allow-status-mismatch "<사유>" (audit 기록)\n' >&2
+    fi
+    return 1
+  fi
+  if [[ -z "$reason" ]]; then
+    printf "archive: Status 검사 실패 — 발행 대상 커밋의 Status 는 '%s' 입니다.\n" "$shown" >&2
+    printf 'archive: --allow-status-mismatch 사유 필수\n' >&2
+    return 1
+  fi
+  local audit_dir
+  audit_dir="$(dirname "$audit_log")"
+  if ! mkdir -p "$audit_dir" 2>/dev/null; then
+    printf "archive: Status 검사 실패 — 발행 대상 커밋의 Status 는 '%s' 입니다.\n" "$shown" >&2
+    printf 'archive: audit 디렉터리를 만들 수 없습니다 (%s) — 우회 사유를 남길 수 없어 차단합니다.\n' "$audit_dir" >&2
+    return 1
+  fi
+  if ! printf '%s | %s | [status:%s] %s | %s\n' "$(date '+%Y-%m-%d %H:%M')" "$slug" "$shown" "$reason" "<세션없음>" >> "$audit_log" 2>/dev/null; then
+    printf "archive: Status 검사 실패 — 발행 대상 커밋의 Status 는 '%s' 입니다.\n" "$shown" >&2
+    printf 'archive: audit log 기록에 실패했습니다 (%s) — 우회 사유를 남길 수 없어 차단합니다.\n' "$audit_log" >&2
+    return 1
+  fi
+  printf "archive: WARNING — Status 검사 우회 (사유: %s; 발행 대상 Status: %s). audit log 기록.\n" "$reason" "$shown" >&2
   return 0
 }
 
@@ -443,29 +583,6 @@ archive_publish_rebind_check() {
     return 1
   fi
   return 0
-}
-
-# archive/종결 신호 검출 (review-gate-iteration-commit).
-# review 미종결 분기에서 사용 — 신호 있으면 차단(B1), 없으면 iteration commit 허용(A1).
-# return 0 = archive 신호 있음(차단), 1 = 없음(허용).
-commit_has_archive_signal() {
-  # AS1: 이번 commit 에 staged 된 request-archive/ 파일 '추가'(--diff-filter=A).
-  #   untracked stale 파일·삭제·rename 은 제외 → A1(iteration 허용) 보존.
-  if git -C "$project_root" diff --cached --name-only --diff-filter=A 2>/dev/null \
-       | grep -qE 'rd-workflow-workspace/backlog/request-archive/'; then
-    return 0
-  fi
-  # AS2: task-state baseline reset (status=대기 중, short-title=-).
-  #   표준 atomic archive 는 commit 직전 disk 에서 task-state 를 reset 하므로
-  #   commit 호출 방식(commit / commit -a / 단일 Bash add && commit)과 무관하게 잡힌다.
-  #   task-state 부재 시 legacy fallback(get_task_status·get_current_short_title)으로 동작.
-  local _status _short
-  _status="$(get_task_status)"
-  _short="$(get_current_short_title)"
-  if [[ "$_status" == "대기 중" && "$_short" == "-" ]]; then
-    return 0
-  fi
-  return 1
 }
 
 # normalize_lexical_path <path>

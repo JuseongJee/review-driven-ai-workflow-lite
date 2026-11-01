@@ -211,7 +211,7 @@ run_promote "$REPO" --short-title test-foo --size small --no-worktree >/dev/null
 # 새 계약: 기본 브랜치로 되돌아온 시점의 기본 worktree 는 baseline 이므로(task-state 가
 # 어느 작업도 대표하지 않는다) 대상을 `--task` 로 명시해야 한다 (spec D13).
 ( cd "$REPO" && git switch main -q && \
-  bash rd-workflow/scripts/lifecycle/archive.sh --task test-foo --no-remote --force-skip-review-check "통합 테스트 fixture" ) >/dev/null
+  bash rd-workflow/scripts/lifecycle/archive.sh --task test-foo --no-remote --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" ) >/dev/null
 
 ( cd "$REPO" && ! git rev-parse --verify fr/test-foo >/dev/null 2>&1 ) && pass "archive: branch 삭제" || fail "archive: branch 잔존"
 ( cd "$REPO" && git tag --list "fr/*/test-foo" | grep -q . ) && pass "archive: tag 존재" || fail "archive: tag 부재"
@@ -273,7 +273,7 @@ run_promote "$REPO" --short-title test-pre --no-worktree --status "구현 중" >
   emit_current_task_baseline > CURRENT_TASK.md )
 ( cd "$REPO" && git add REQUEST.md CURRENT_TASK.md && git commit -q -m "archive content (미러 baseline 포함)" )
 if out="$( cd "$REPO" && git switch main -q && \
-     bash rd-workflow/scripts/lifecycle/archive.sh --task test-pre --no-remote --force-skip-review-check "통합 테스트 fixture" 2>&1 )"; then
+     bash rd-workflow/scripts/lifecycle/archive.sh --task test-pre --no-remote --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" 2>&1 )"; then
   pass "scenario 1b: 이미 baseline 인 미러에서 archive 성공"
 else
   fail "scenario 1b: archive 실패 — $out"
@@ -521,7 +521,7 @@ run_promote "$REPO" --short-title test-baz --size small --no-worktree >/dev/null
 
 # 미push 상태에서 archive 재호출 (publish 실패 후 rerun 시뮬레이션)
 # metadata 가 위에서 제거되어 short-title 매칭 불가 → precheck 는 force-skip 으로 통과시키고 push 멱등성만 검증.
-( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch fr/test-baz --force-skip-review-check "통합 테스트 fixture" ) >/dev/null 2>&1 || true
+( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch fr/test-baz --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" ) >/dev/null 2>&1 || true
 
 # 검증: bare mirror에 push 됐는가
 ( cd "$REPO" && git ls-remote origin refs/heads/main 2>/dev/null | grep -q . ) && pass "rerun: main pushed" || fail "rerun: main 미push"
@@ -719,7 +719,7 @@ run_promote "$REPO" --short-title test-master --size small --no-worktree >/dev/n
   && pass "master-promote: metadata 기록" || fail "master-promote: metadata 부재"
 # fr branch 위 작업 commit 후 master로 돌아가 archive (review-check는 fixture라 force-skip)
 ( cd "$REPO" && git commit -q --allow-empty -m "work" )
-( cd "$REPO" && git switch master -q && bash rd-workflow/scripts/lifecycle/archive.sh --task test-master --force-skip-review-check "통합 테스트 fixture" >/dev/null 2>&1 ) \
+( cd "$REPO" && git switch master -q && bash rd-workflow/scripts/lifecycle/archive.sh --task test-master --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" >/dev/null 2>&1 ) \
   && pass "master-archive: exit 0" || fail "master-archive: 실패"
 _tag11="$(cd "$REPO" && git tag --list "fr/*/test-master" | head -1)"
 ( [[ -n "$_tag11" ]] && cd "$REPO" && git merge-base --is-ancestor "$_tag11" master 2>/dev/null ) \
@@ -782,7 +782,7 @@ run_promote "$REPO" --short-title test-behind --size small --no-worktree >/dev/n
 
 rc12=0
 ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-behind \
-    --force-skip-review-check "통합 테스트 fixture" ) >/dev/null 2>&1 || rc12=$?
+    --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" ) >/dev/null 2>&1 || rc12=$?
 [[ "$rc12" -eq 0 ]] && pass "behind-upstream: exit 0" || fail "behind-upstream: exit=$rc12"
 ( cd "$REPO" && ! git rev-parse --verify fr/test-behind >/dev/null 2>&1 ) \
   && pass "behind-upstream: 로컬 브랜치 삭제" || fail "behind-upstream: 로컬 브랜치 잔존"
@@ -824,7 +824,7 @@ HOOK
 chmod +x "$REPO/.git/hooks/post-commit"
 
 out13="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-absent \
-    --force-skip-review-check "통합 테스트 fixture" ) 2>&1 )" && rc13=0 || rc13=$?
+    --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" ) 2>&1 )" && rc13=0 || rc13=$?
 [[ "$rc13" -eq 0 ]] && pass "no-op: exit 0" || fail "no-op: exit=$rc13"
 [[ "$out13" != *"CLEANUP-PENDING"* ]] \
   && pass "no-op: 요약 블록 없음 (로컬·원격 정상 부재)" || fail "no-op: 정상 부재가 잔여로 기록됨"
@@ -845,7 +845,7 @@ run_promote "$REPO" --short-title test-localonly --size small --no-worktree >/de
 ( cd "$REPO" && git switch main -q )
 rc13b=0
 ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-localonly --no-remote \
-    --force-skip-review-check "통합 테스트 fixture" ) >/dev/null 2>&1 || rc13b=$?
+    --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" ) >/dev/null 2>&1 || rc13b=$?
 [[ "$rc13b" -eq 0 ]] && pass "local-only: exit 0 (원격 미시도)" || fail "local-only: exit=$rc13b"
 ( cd "$REPO" && ! git rev-parse --verify fr/test-localonly >/dev/null 2>&1 ) \
   && pass "local-only: 로컬 브랜치 삭제" || fail "local-only: 로컬 브랜치 잔존"
@@ -874,7 +874,7 @@ HOOK
 chmod +x "$REPO/.git/hooks/post-commit"
 
 out13c="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-childref --no-remote \
-    --force-skip-review-check "통합 테스트 fixture" ) 2>&1 )" && rc13c=0 || rc13c=$?
+    --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" ) 2>&1 )" && rc13c=0 || rc13c=$?
 [[ "$rc13c" -eq 0 ]] && pass "child-ref: exit 0" || fail "child-ref: exit=$rc13c"
 [[ "$out13c" == *"로컬 브랜치"*"없음"* ]] \
   && pass "child-ref: 정상 부재로 판정 (하위 ref 를 대상으로 오인하지 않음)" || fail "child-ref: 부재 분기 미도달"
@@ -915,7 +915,7 @@ HOOK
 chmod +x "$REPO/.git/hooks/post-commit"
 
 out14="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-unmerged \
-    --force-skip-review-check "통합 테스트 fixture" ) 2>&1 )" && rc14=0 || rc14=$?
+    --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" ) 2>&1 )" && rc14=0 || rc14=$?
 [[ "$rc14" -ne 0 ]] && pass "unmerged: non-zero 종료" || fail "unmerged: exit 0 (위반 미검출)"
 ( cd "$REPO" && git rev-parse --verify fr/test-unmerged >/dev/null 2>&1 ) \
   && pass "unmerged: 로컬 ref 보존" || fail "unmerged: 로컬 ref 삭제됨"
@@ -947,7 +947,7 @@ mkdir -p "$REPO/rd-workflow-workspace/.lifecycle"
 printf 'verify-fail::test-wtfail::test=2\n' > "$REPO/rd-workflow-workspace/.lifecycle/loop-state"
 
 out14b="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-wtfail \
-    --force-skip-review-check "통합 테스트 fixture" ) 2>&1 )" && rc14b=0 || rc14b=$?
+    --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" ) 2>&1 )" && rc14b=0 || rc14b=$?
 [[ "$rc14b" -eq 0 ]] && pass "wt-fail: exit 0 유지 (일반 cleanup 실패)" || fail "wt-fail: exit=$rc14b"
 [[ "$out14b" == *"CLEANUP-PENDING"* ]] && pass "wt-fail: 요약 블록 출력" || fail "wt-fail: 요약 블록 부재"
 [[ "$out14b" == *"[worktree]"* ]] && pass "wt-fail: worktree 항목 기록" || fail "wt-fail: worktree 항목 누락"
@@ -980,7 +980,7 @@ run_promote "$REPO" --short-title test-conflict --size small --no-worktree >/dev
   && RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit -q -am "main edit" )
 rc14c=0
 ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-conflict --no-remote \
-    --force-skip-review-check "통합 테스트 fixture" ) >/dev/null 2>&1 || rc14c=$?
+    --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" ) >/dev/null 2>&1 || rc14c=$?
 [[ "$rc14c" -ne 0 ]] && pass "core-fail: merge conflict non-zero" || fail "core-fail: exit 0"
 ( cd "$REPO" && git rev-parse --verify fr/test-conflict >/dev/null 2>&1 ) \
   && pass "core-fail: fr branch 보존" || fail "core-fail: fr branch 삭제됨"
@@ -1004,7 +1004,7 @@ ALIEN15="$( cd "$REPO" && git commit-tree "$(git rev-parse HEAD^{tree})" \
 ( cd "$REPO" && git switch main -q )
 
 out15="$( ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-rdrift \
-    --force-skip-review-check "통합 테스트 fixture" ) 2>&1 )" && rc15=0 || rc15=$?
+    --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" ) 2>&1 )" && rc15=0 || rc15=$?
 [[ "$rc15" -ne 0 ]] && pass "remote-drift: non-zero 종료" || fail "remote-drift: exit 0"
 ( cd "$REPO" && git ls-remote origin refs/heads/fr/test-rdrift 2>/dev/null | grep -q . ) \
   && pass "remote-drift: 원격 ref 보존" || fail "remote-drift: 원격 ref 삭제됨"
@@ -1108,7 +1108,7 @@ for _br in main master; do
   install_blocking_pre_commit "$REPO"
   arc=0
   ( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-hba \
-      --force-skip-review-check "통합 테스트 fixture" ) >/dev/null 2>&1 || arc=$?
+      --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" ) >/dev/null 2>&1 || arc=$?
   [[ "$arc" -eq 0 ]] \
     && pass "hook-block/$_br archive: exit 0" || fail "hook-block/$_br archive: exit=$arc"
   # AC5 직접 oracle — 기대 커밋이 기본 브랜치 이력에 실제로 존재하는지 본다.
@@ -1150,7 +1150,7 @@ _hookcond_case() {  # _hookcond_case <기본 브랜치> <slug>
   ( cd "$repo" && echo "ar" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" )
   ( cd "$repo" && git switch "$br" -q )
   out="$( cd "$repo" && bash rd-workflow/scripts/lifecycle/archive.sh --task "$slug" --no-remote \
-      --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || rc=$?
+      --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" 2>&1 )" || rc=$?
   printf '%s\t%s\t%s\n' "$repo" "$rc" "${out//$'\n'/ }"
 }
 
@@ -1254,7 +1254,7 @@ sa_rc=0
 # LC_ALL=C 고정: 아래 oracle 이 git 의 영문 오류 메시지를 판정에 쓰므로,
 # 번역 locale 환경에서 거짓 실패하지 않도록 실행 locale 을 못박는다.
 sa_out="$( cd "$REPO" && LC_ALL=C bash rd-workflow/scripts/lifecycle/archive.sh --task test-stga \
-    --force-dirty --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || sa_rc=$?
+    --force-dirty --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" 2>&1 )" || sa_rc=$?
 # 중단 사유까지 확인한다 — rc != 0 만 보면 archive 가 다른 이유로 실패해도 통과해
 # 통제군보다 약한 oracle 이 된다.
 [[ "$sa_rc" -ne 0 ]] && printf '%s' "$sa_out" | out_has "would be overwritten by merge" \
@@ -1295,7 +1295,7 @@ MS_UNREL="rd-workflow-workspace/.lifecycle/unrelated_zzfx.log"
 ( cd "$REPO" && echo "user work" > "$MS_UNREL" && git add "$MS_UNREL" )
 ms_rc=0
 ms_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-mskip \
-    --force-dirty --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || ms_rc=$?
+    --force-dirty --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" 2>&1 )" || ms_rc=$?
 [[ "$ms_rc" -eq 0 ]] \
   && pass "staged/archive-mergeskip: rc=0" || fail "staged/archive-mergeskip: rc=$ms_rc — $ms_out"
 ( cd "$REPO" && git log main --oneline -10 | out_has "archive test-mskip metadata 정리" ) \
@@ -1334,7 +1334,7 @@ run_promote "$REPO" --short-title test-legacy --size small --no-worktree >/dev/n
 install_blocking_pre_commit "$REPO"
 lg_rc=0
 lg_out="$( cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-legacy \
-    --force-skip-review-check "통합 테스트 fixture" 2>&1 )" || lg_rc=$?
+    --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" 2>&1 )" || lg_rc=$?
 [[ "$lg_rc" -eq 0 ]] \
   && pass "legacy: archive rc=0" || fail "legacy: archive rc=$lg_rc — $lg_out"
 ( cd "$REPO" && git log main -1 --diff-filter=D --name-only --format= | out_has "active-fr" ) \
@@ -1367,7 +1367,7 @@ run_promote "$REPO" --short-title test-nested --no-worktree --status "구현 중
   && git switch main -q )
 main_before="$( cd "$REPO" && git rev-parse HEAD )"
 nst_out="$( cd "$REPO/rd-workflow/scripts/lifecycle" && bash ./archive.sh --no-remote \
-    --force-skip-review-check "통합 테스트 fixture" 2>&1 )" \
+    --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" 2>&1 )" \
   && fail "nested/archive: 하위 디렉터리 호출이 rc 0" \
   || pass "nested/archive: 하위 디렉터리 호출 거부"
 printf '%s' "$nst_out" | out_has "저장소 루트에서 실행하십시오" \
@@ -1794,6 +1794,53 @@ assert_eq "$(cd "$PROJECT_ROOT" && git status --porcelain | LC_ALL=C sort)" "$PR
 
 rm -rf "$PR1" "$PR2" "$PR4" "$PR5" "$PR7"
 
+# D12(s) — resume 의 source-fr 정정 안내는 출력 그대로 실행해도 대상 worktree 만 바꾼다.
+# 안내의 2) 줄은 promote 를 부른 기본 체크아웃에서 실행되므로, `(cd <대상> && …)` 로 묶이지
+# 않으면 기본 체크아웃의 task-state 가 바뀐다. 경로에 공백을 넣어 `%q` 인코딩도 함께 본다.
+PR8="$(setup_repo)"; pr_prepare "$PR8"
+PR8_SFR_NEW="rd-workflow-workspace/backlog/items/2026-02-02-y.md"
+printf '# y\n- status: idea\n' > "$PR8/$PR8_SFR_NEW"
+( cd "$PR8" && git add -A && git commit -qm "pr8 second item" >/dev/null 2>&1 || true )
+PR8_WT="$TMPROOT/pr8 wt"
+run_promote "$PR8" --short-title pr8 --worktree-path "$PR8_WT" --size large >/dev/null 2>&1
+pr8_hash() { printf '%s %s' "$(git hash-object "$PR8/CURRENT_TASK.md")" \
+  "$(git hash-object "$PR8/rd-workflow-workspace/.lifecycle/task-state")"; }
+pr8_wt_auth() { awk -F= '$1=="source-fr"{sub(/^[^=]+=/,"");print;exit}' \
+  "$PR8_WT/rd-workflow-workspace/.lifecycle/task-state"; }
+pr8_wt_mirror() { awk '$0=="## Source FR"{f=1;next} f && /^[^#]/{print;exit}' "$PR8_WT/CURRENT_TASK.md"; }
+assert_eq "$([[ -d "$PR8_WT" ]] && echo yes || echo no)" "yes" "promote D12(s): 사전 조건(공백 경로 worktree 생성)"
+PR8_A="$(pr8_hash)"
+( cd "$PR8" && git worktree remove --force "$PR8_WT" >/dev/null 2>&1 || true )
+
+# 3) 점유된 부착 경로 — 색인 경로 경고 분기
+mkdir -p "$PR8_WT"
+pr8o_out="$(run_promote "$PR8" --short-title pr8 --source-fr "$PR8_SFR_NEW" --size large 2>&1)" || true
+rmdir "$PR8_WT" 2>/dev/null || true
+[[ "$pr8o_out" == *"이미 있습니다"* && "$pr8o_out" == *"등록된 경로"* ]] && rc8=0 || rc8=1
+assert_eq "$rc8" "0" "promote D12(s)(3): 점유된 경로 경고가 등록된 경로 분기를 알린다"
+
+# 4) 안내 캡처
+pr8_out="$(run_promote "$PR8" --short-title pr8 --source-fr "$PR8_SFR_NEW" --size large 2>&1)" \
+  && pr8_rc=0 || pr8_rc=$?
+assert_eq "$pr8_rc" "1" "promote D12(s)(4): 다른 --source-fr 는 거부된다"
+# 5) 출력 시점 불변
+assert_eq "$(pr8_hash)" "$PR8_A" "promote D12(s)(5): 안내 출력은 기본 체크아웃을 바꾸지 않는다"
+# 6) 안내 1) 수행 — --source-fr 를 뺀 같은 명령
+run_promote "$PR8" --short-title pr8 --worktree-path "$PR8_WT" --size large >/dev/null 2>&1 \
+  && pr8r_rc=0 || pr8r_rc=$?
+assert_eq "$pr8r_rc" "0" "promote D12(s)(6): 안내 1) 재실행이 worktree 를 다시 붙인다"
+# 7) 2) 줄 추출·실행 — promote 를 부른 기본 체크아웃에서
+pr8_cmd="$(printf '%s\n' "$pr8_out" | sed -n 's/^    2) //p')"
+[[ "$pr8_cmd" == "(cd "* ]] && rc8=0 || rc8=1
+assert_eq "$rc8" "0" "promote D12(s)(7): 2) 줄이 (cd 로 시작하는 단일 명령이다"
+( cd "$PR8" && bash -c "$pr8_cmd" ) >/dev/null 2>&1 || true
+# 8) 기본 체크아웃 불변, 대상 worktree 만 변경
+assert_eq "$(pr8_hash)" "$PR8_A" "promote D12(s)(8): 2) 실행이 기본 체크아웃을 바꾸지 않는다"
+assert_eq "$(pr8_wt_auth)" "$PR8_SFR_NEW" "promote D12(s)(8): 대상 worktree 의 source-fr 권위가 새 값"
+assert_eq "$(pr8_wt_mirror)" "$PR8_SFR_NEW" "promote D12(s)(8): 대상 worktree 의 source-fr 미러가 새 값"
+( cd "$PR8" && git worktree remove --force "$PR8_WT" >/dev/null 2>&1 || true )
+rm -rf "$PR8"
+
 
 echo "== scenario 20: 얹힌 커밋 검사 =="
 
@@ -1827,7 +1874,7 @@ arc_setup() {  # arc_setup <slug>
 arc_archive() {  # arc_archive <repo> [추가 인자...]
   local repo="$1"; shift
   ( cd "$repo" && bash rd-workflow/scripts/lifecycle/archive.sh --no-remote \
-      --force-skip-review-check "통합 테스트 fixture" "$@" 2>&1 )
+      --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" "$@" 2>&1 )
 }
 
 # arc_assert_block_notice — 사전 발행 차단의 사용자 안내 요건을 kind 별로 단언한다.
@@ -2074,12 +2121,108 @@ out="$(cd "$REPO" && bash rd-workflow/scripts/rd task fr-register --slug reg-a 2
   && printf '# other-x\n' > rd-workflow-workspace/backlog/items/2026-02-03-other-x.md && git add -A && git commit -q -m "docs: FR 등록 — other-x" && git switch -q fr/test-reg )
 # archive content commit
 ( cd "$REPO" && echo "# archived" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" )
-arc_out="$( cd "$REPO" && git switch -q main && bash rd-workflow/scripts/lifecycle/archive.sh --task test-reg --no-remote --force-skip-review-check "통합 테스트 fixture" 2>&1 )" \
+arc_out="$( cd "$REPO" && git switch -q main && bash rd-workflow/scripts/lifecycle/archive.sh --task test-reg --no-remote --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" 2>&1 )" \
   && pass "s21: archive.sh 완료 (인덱스 충돌 자동 해결)" || fail "s21: archive 실패 — $arc_out"
 [[ "$arc_out" == *"행 집합 병합으로 해결"* ]] && pass "s21: 행 집합 병합 안내 출력" || fail "s21: 병합 안내 없음"
 ( cd "$REPO" && [[ "$(grep -c '| reg-a |' "$_IDX")" == 1 && "$(grep -c '| other-x |' "$_IDX")" == 1 ]] ) && pass "s21: 인덱스 행 reg-a 1·other-x 1 (중복 없음)" || fail "s21: 행 수 — $(cd "$REPO" && cat "$_IDX")"
 ( cd "$REPO" && [[ -f rd-workflow-workspace/backlog/items/2026-02-02-reg-a.md && -f rd-workflow-workspace/raw-captures/2026-02-02-fr-reg-a.md ]] ) && pass "s21: 상세 1·캡처 1 존재" || fail "s21: 상세/캡처 부재"
 ( cd "$REPO" && [[ -z "$(git status --porcelain | grep -v review-skip-audit.log)" && "$(git worktree list | wc -l | tr -d ' ')" == 1 && ! "$(git for-each-ref --format='%(refname)')" == *"fr/test-reg"* ]] ) && pass "s21: clean + 임시 worktree·브랜치 없음" || fail "s21: 잔존 — $(cd "$REPO" && git status --porcelain; git for-each-ref)"
+rm -rf "$REPO"
+
+# === Scenario sm23~sm25 (change spec 의 s23~s25): stage_metrics.tsv 병합 충돌 자동 해소 (change spec 2026-10-29-1800-stage-metrics-merge-conflict) ===
+#
+# **시간 예산 사유** (절대 규칙 ③): 각 실행은 promote + 커밋 몇 개 + archive 한 번으로 s21 과 같은
+# 수 초이고 s24 는 3회 반복이다. 「실제 git merge 충돌 → stage 추출 → merge-file → 병합 커밋」 이어 붙인
+# 구간은 단위로 쪼개면 시험되지 않는다(9회 사람 손이 들던 지점). 형식 검증은 한 awk 를 공유하므로
+# 변형을 시나리오로 늘리지 않고 s24 반복으로 처리한다.
+
+# sm_fixture <slug> <variant> — archive 직전 fixture. fr 와 main 이 stage_metrics.tsv(_SM)·FUTURE_REQUESTS.md(_IDX)
+#   끝에 서로 다른 행을 추가해 둘 다 충돌한다. archive 는 main 에서 fr 를 병합하므로 ours=main, theirs=fr.
+#   variant: ok | row3(main 에 3필드 행 추가) | hdrdup(main 끝에 헤더 줄 추가) | nohdr(main 의 첫 줄 헤더 삭제)
+#            | other(ok + conflict.txt 충돌)
+sm_fixture() {
+  local slug="$1" variant="$2" d idx sm
+  idx="rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
+  sm="rd-workflow-workspace/.lifecycle/stage_metrics.tsv"
+  d="$(setup_repo)"
+  (
+    cd "$d"
+    mkdir -p rd-workflow-workspace/backlog/items rd-workflow-workspace/.lifecycle
+    printf '# FR\n\n## 인덱스\n\n| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |\n|---|---|---|---|---|---|---|\n' > "$idx"
+    printf '# short_title\tfrom_status\tto_status\tepoch\nbase-t\t대기 중\t구현 중\t100\n' > "$sm"
+    echo base > conflict.txt
+    git add -A && git commit -q -m "fixture 초기"
+  ) >/dev/null 2>&1
+  run_promote "$d" --short-title "$slug" --no-worktree --size small >/dev/null 2>&1
+  (
+    cd "$d"
+    printf 'fr-t\tA\tB\t200\nfr-t\tB\tC\t201\n' >> "$sm"
+    printf '| 2026-02-02 | fr-row | s | tooling | idea | - | [상세](items/fr-row.md) |\n' >> "$idx"
+    echo fr-side > conflict.txt
+    git add -A && git commit -q -m "fr 쪽 추가"
+    echo "# archived" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content"
+    git switch -q main
+    printf 'main-t\tX\tY\t300\nmain-t\tY\tZ\t301\n' >> "$sm"
+    printf '| 2026-02-03 | main-row | s | tooling | idea | - | [상세](items/main-row.md) |\n' >> "$idx"
+    case "$variant" in
+      row3)   printf 'main-t\tX\t300\n' >> "$sm" ;;
+      hdrdup) printf '# short_title\tfrom_status\tto_status\tepoch\n' >> "$sm" ;;
+      nohdr)  tail -n +2 "$sm" > "$sm.tmp" && mv "$sm.tmp" "$sm" ;;  # sed -i 는 GNU·BSD 문법이 달라 쓰지 않는다
+      other)  echo main-side > conflict.txt ;;
+    esac
+    RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit -q -am "main 쪽 추가"
+  ) >/dev/null 2>&1
+  echo "$d"
+}
+
+SM_REL="rd-workflow-workspace/.lifecycle/stage_metrics.tsv"
+IDX_REL="rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
+
+echo "== scenario sm23: stage_metrics.tsv·FUTURE_REQUESTS.md 동시 충돌 → archive 자동 해소 =="
+REPO="$(sm_fixture test-sm ok)"
+sm_out="$(cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-sm --no-remote --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" 2>&1)" && sm_rc=0 || sm_rc=$?
+[[ "$sm_rc" -eq 0 ]] && pass "sm23: archive.sh exit 0" || fail "sm23: archive 실패 rc=$sm_rc — $sm_out"
+[[ "$sm_out" == *"stage_metrics.tsv 충돌을 줄 합집합으로 해결"* && "$sm_out" == *"FUTURE_REQUESTS.md 충돌을 행 집합 병합으로 해결"* ]] \
+  && pass "sm23: 해소 안내 2줄" || fail "sm23: 안내 누락 — $sm_out"
+(
+  cd "$REPO"
+  [[ "$(grep -c '^fr-t' "$SM_REL")" == 2 && "$(grep -c '^main-t' "$SM_REL")" == 2 && "$(grep -c '^base-t' "$SM_REL")" == 1 ]] \
+    && [[ "$(grep -c '^# short_title' "$SM_REL")" == 1 ]] && [[ -z "$(awk -F'\t' '!/^#/ && NF!=4' "$SM_REL")" ]]
+) && pass "sm23: 양쪽 행 각 1번·헤더 1개·전부 4필드" || fail "sm23: 행 보존 실패 — $(cat "$REPO/$SM_REL")"
+(
+  cd "$REPO"
+  _ml="$(grep -n '^main-t' "$SM_REL" | tail -1 | cut -d: -f1)"; _ff="$(grep -n '^fr-t' "$SM_REL" | head -1 | cut -d: -f1)"
+  _fl="$(grep -n '^fr-t' "$SM_REL" | tail -1 | cut -d: -f1)"; _mf="$(grep -n '^main-t' "$SM_REL" | head -1 | cut -d: -f1)"
+  [[ $((_ml - _mf)) -eq 1 && $((_fl - _ff)) -eq 1 && "$_ml" -lt "$_ff" ]] \
+    && grep -n '^main-t' "$SM_REL" | sed -n 1p | grep -q 'X.Y.300' && grep -n '^fr-t' "$SM_REL" | sed -n 1p | grep -q 'A.B.200'
+) && pass "sm23: 작업별 블록 연속·내부 순서·main 블록 끝 < fr 블록 시작" || fail "sm23: 순서 위반 — $(cat "$REPO/$SM_REL")"
+( cd "$REPO" && [[ "$(grep -c '| fr-row |' "$IDX_REL")" == 1 && "$(grep -c '| main-row |' "$IDX_REL")" == 1 ]] ) \
+  && pass "sm23: 인덱스 행 fr-row 1·main-row 1" || fail "sm23: 인덱스 행 수"
+( cd "$REPO" && [[ -z "$(git status --porcelain | grep -v review-skip-audit.log)" ]] ) \
+  && pass "sm23: clean" || fail "sm23: 잔존 — $(cd "$REPO" && git status --porcelain)"
+rm -rf "$REPO"
+
+echo "== scenario sm24: stage_metrics.tsv 형식 위반 → 두 파일 모두 무반영으로 중단 =="
+for sm_v in row3 hdrdup nohdr; do
+  REPO="$(sm_fixture "test-smbad" "$sm_v")"
+  sm_out="$(cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-smbad --no-remote --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" 2>&1)" && sm_rc=0 || sm_rc=$?
+  [[ "$sm_rc" -ne 0 ]] && pass "sm24($sm_v): exit≠0" || fail "sm24($sm_v): exit 0 (형식 위반이 반영됨)"
+  [[ "$sm_out" == *"stage_metrics.tsv 형식 오류:"* && "$sm_out" == *"merge 실패 — conflict resolve 후 재실행"* ]] \
+    && pass "sm24($sm_v): 형식 오류 사유 + 표준 중단 문구" || fail "sm24($sm_v): 사유 출력 없음 — $sm_out"
+  ( cd "$REPO" && grep -q '^<<<<<<<' "$SM_REL" && grep -q '^<<<<<<<' "$IDX_REL" \
+      && [[ "$(git ls-files -u | cut -f2 | sort -u | grep -c -e "$SM_REL" -e "$IDX_REL")" == 2 ]] ) \
+    && pass "sm24($sm_v): 두 파일 모두 표식·unmerged stage 유지" || fail "sm24($sm_v): 일부 반영됨 — $(cd "$REPO" && git status --short)"
+  ( cd "$REPO" && git merge --abort ) >/dev/null 2>&1 || true
+  rm -rf "$REPO"
+done
+
+echo "== scenario sm25: stage_metrics.tsv + 다른 파일 동시 충돌 → 자동 해소 없이 중단 =="
+REPO="$(sm_fixture test-smother other)"
+sm_out="$(cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-smother --no-remote --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" 2>&1)" && sm_rc=0 || sm_rc=$?
+[[ "$sm_rc" -ne 0 ]] && pass "sm25: exit≠0" || fail "sm25: exit 0"
+( cd "$REPO" && grep -q '^<<<<<<<' "$SM_REL" && [[ "$(git log -1 --format=%P | wc -w | tr -d ' ')" == 1 ]] ) \
+  && pass "sm25: stage_metrics.tsv 무반영·병합 커밋 없음" || fail "sm25: 일부 반영됨 — $(cd "$REPO" && git status --short)"
+( cd "$REPO" && git merge --abort ) >/dev/null 2>&1 || true
 rm -rf "$REPO"
 
 # === Scenario 22: 정상 경로 E2E (fr 모드) + 권위 tree (change spec §4.2·§3.3.1) ===
@@ -2096,6 +2239,7 @@ echo "== scenario 22: 정상 경로 E2E + 권위 tree =="
 add_review_scripts() {
   cp "$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/prepare_review_pipeline.sh" "$1/rd-workflow/scripts/"
   cp "$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/init_review_pipeline.sh" "$1/rd-workflow/scripts/"
+  cp "$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/verify_record.sh" "$1/rd-workflow/scripts/"
 }
 # close_session <session-dir> — Status=closed + Open Issues=`- 없음` (정상 종결 형태)
 close_session() {
@@ -2128,7 +2272,8 @@ E2E_SES="$(latest_diff_session "$REPO")"
   && pass "e2e: task-state review-session 포인터 기록" || fail "e2e: 포인터 미기록"
 
 close_session "$E2E_SES"
-( cd "$REPO" && bash rd-workflow/scripts/rd review seal "$E2E_SES" >/dev/null 2>&1 ) \
+( cd "$REPO" && bash rd-workflow/scripts/verify_record.sh -- true >/dev/null 2>&1 \
+  && bash rd-workflow/scripts/rd review seal "$E2E_SES" >/dev/null 2>&1 ) \
   && pass "e2e: seal 성공 (리뷰된 head == 현재 트리)" || fail "e2e: seal 실패"
 for _st in "검증 중" "diff review 대기" "아카이브 보류"; do
   ( cd "$REPO" && bash rd-workflow/scripts/rd task set-status "$_st" >/dev/null 2>&1 ) \
@@ -2210,7 +2355,8 @@ BARE23="$(mk_bare 23)"
   && pass "no-fr: base-commit 으로 diff 세션 생성" || fail "no-fr: 세션 생성 실패"
 NOFR_SES="$(latest_diff_session "$REPO")"
 close_session "$NOFR_SES"
-( cd "$REPO" && bash rd-workflow/scripts/rd review seal "$NOFR_SES" >/dev/null 2>&1 ) \
+( cd "$REPO" && bash rd-workflow/scripts/verify_record.sh -- true >/dev/null 2>&1 \
+  && bash rd-workflow/scripts/rd review seal "$NOFR_SES" >/dev/null 2>&1 ) \
   && pass "no-fr: seal 성공 (branch-mode=no-fr)" || fail "no-fr: seal 실패"
 ( grep -q '^branch-mode=no-fr$' "$REPO/rd-workflow-workspace/.lifecycle/review-seals/$(basename "$NOFR_SES").seal" \
   && grep -q '^fr-branch=null$' "$REPO/rd-workflow-workspace/.lifecycle/review-seals/$(basename "$NOFR_SES").seal" ) \

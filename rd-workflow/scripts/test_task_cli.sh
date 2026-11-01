@@ -501,6 +501,13 @@ out_force_err="$(env project_root="$TMP2" bash "$RD" task set-status "완료" --
 rc_force=$?
 [[ "$rc_force" == "0" ]] && echo "ok: T3-d --force 우회 exit 0" || { echo "FAIL: T3-d --force 우회 exit $rc_force"; FAIL=1; }
 [[ -n "$out_force_err" ]] && echo "ok: T3-e --force stderr 경고 있음" || { echo "FAIL: T3-e --force stderr 경고 없음"; FAIL=1; }
+# 아카이브 보류→검증 중 (외부 검증 대기). mk_task_file 은 아카이브 보류를 canonical 로 보지 않아
+# task-state 를 지우므로 미러 → 권위 상태 순서로 만든다.
+mk_task_file "$TMP2" "구현 중" "ts-task"
+mk_task_state "$TMP2" "아카이브 보류" "ts-task"
+t "T3-f 허용 전이: 아카이브 보류→검증 중" 0 "-" env project_root="$TMP2" bash "$RD" task set-status "검증 중"
+ts_status_f="$(awk -F'=' '$1=="status"{sub(/^[^=]+=/,"");print;exit}' "${TMP2}/rd-workflow-workspace/.lifecycle/task-state")"
+[[ "$ts_status_f" == "검증 중" ]] && echo "ok: T3-g 아카이브 보류→검증 중 task-state 갱신됨" || { echo "FAIL: T3-g task-state 미갱신 (got='${ts_status_f}')"; FAIL=1; }
 
 # --- TC-T4: rd task guard — task-state 기반 판정 + 뷰 미러 ---
 echo "--- TC-T4: guard task-state 기반 ---"
@@ -1429,6 +1436,18 @@ bash "$CK" "$CK_ROOT" >/dev/null 2>&1; ck_rc=$?
 [[ "$ck_rc" == "1" ]] && echo "ok: check: 제외 규칙이 안내 예시 판정을 무력화하지 않았다" \
   || { echo "FAIL: check: 제외 규칙이 안내 예시 위반을 놓쳤다 (exit $ck_rc)"; FAIL=1; }
 
+# (12b) 설명 문장 속 promote.sh 언급은 실행 예시가 아니다 — 오탐 회귀.
+# 앞의 resume_candidates.sh 실행과 뒤의 설명 문장 `promote.sh` 가 한 줄에 있어도 걸리면 안 된다.
+# (12) 가 남긴 still_bad.md 때문에 CK_ROOT 는 exit 1 이므로 별도 임시 root 를 쓴다.
+CK_PROSE="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$CK_PROSE" && -d "$CK_PROSE" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+mkdir -p "$CK_PROSE/rd-workflow/docs"
+printf '%s\n' '1. `bash rd-workflow/scripts/batch/resume_candidates.sh` 를 실행한다. `promote.sh` 는 작업 상태를 쓴다' \
+  > "$CK_PROSE/rd-workflow/docs/prose.md"
+bash "$CK" "$CK_PROSE" >/dev/null 2>&1 && echo "ok: check: 설명 문장 속 promote.sh 언급을 오탐하지 않는다" \
+  || { echo "FAIL: check: 설명 문장 속 promote.sh 언급을 위반으로 오탐했다"; FAIL=1; }
+rm -rf "$CK_PROSE"
+
 # (13) 파일을 읽지 못하면 exit 2 다 — "위반 0건" 으로 소실되지 않는다
 #      (final diff review Finding 5)
 #
@@ -1698,6 +1717,11 @@ GSESS
 
 g_seal() { # g_seal <session-path> [옵션...] — rd review seal
   local sp="$1"; shift
+  # seal 은 현재 트리의 검증 증거를 요구합니다 — HEAD 트리에 대한 통과 증거를 먼저 깝니다.
+  local h; h="$( ( project_root="$G"; source "${SCRIPT_DIR}/_state_common.sh"; rd_protected_tree_hash HEAD ) )"
+  mkdir -p "$G/rd-workflow-workspace/.lifecycle/review-seals"
+  printf 'schema=1\ncommand=true\nexit-code=0\ntree-hash=%s\nhead=%s\nrecorded-at=2026-10-29-0000\n' \
+    "$h" "$(git -C "$G" rev-parse HEAD)" > "$G/rd-workflow-workspace/.lifecycle/review-seals/verify-evidence"
   ( cd "$G" && project_root="$G" bash "$RD" review seal "$@" "${sp#$G/}" ) >/dev/null 2>&1
 }
 

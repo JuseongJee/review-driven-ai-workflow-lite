@@ -52,6 +52,8 @@
 
 `task-state` 와 같은 `.lifecycle/` 아래, tracked append-only 로그다(`RD_RECORD_PATHS`·`lifecycle_metadata_paths()` 양쪽에 포함 — archive 시 실제로 커밋·병합되어 라운드를 넘어 값이 이어진다). 컬럼: `short_title`·`from_status`·`to_status`·`epoch`. `rd task metrics [--task <short-title>]` 로 회차별 단계 소요를 조회한다 — 기본 대상은 현재 작업, 소요는 그 상태에 머문 벽시계 경과 시간(재방문 시 확정 합계 + 진행 중 잠정을 함께 표시), 이 로그 도입 이전 구간은 "계측 이전 — 알 수 없음"으로 표시하고, 종료(archive)된 회차 결과는 고정된다.
 
+병렬 작업을 연달아 발행해 `stage_metrics.tsv` 가 `main` 병합에서 충돌하면 `archive.sh` 가 줄 합집합(`git merge-file --union`)으로 해소합니다. 합친 결과의 첫 줄이 정확한 헤더가 아니거나, 헤더가 두 번 이상 나오거나, 탭 4필드가 아닌 행(빈 줄 포함)이 있으면 해소하지 않고 충돌 상태로 멈춥니다. `FUTURE_REQUESTS.md` 와 함께 충돌해도 둘을 모두 해소하며, 그 밖의 파일이 섞이면 멈춥니다.
+
 ### canonical 10종 Status (LC-19)
 
 ```
@@ -69,15 +71,18 @@ diff review 대기
 
 `아카이브 보류` 의 의미는 「**리뷰 종결·발행 대기**」이며 **완료가 아닙니다.** final diff review 가 종결되고 종결 마커(`rd review seal`)를 만든 뒤, `archive.sh` 로 발행하기 전까지의 구간입니다. 이 상태에서만 `pre_commit_archive_gate.sh` 가 archive 기록 커밋(REQUEST 아카이브·FR done·completion report 등 워크플로 기록 경로만 바꾸는 커밋)을 통과시킵니다.
 
-전이는 세 가지입니다 (`_task_common.sh` 의 전이표가 단일 출처입니다).
+전이는 네 가지입니다 (`_task_common.sh` 의 전이표가 단일 출처입니다).
 
 ```
 diff review 대기 → 아카이브 보류      리뷰 종결 후 진입
 아카이브 보류   → 완료                 발행 완료
 아카이브 보류   → 구현 중              리뷰 후 변경이 필요해 되돌아감
+아카이브 보류   → 검증 중              외부 검증을 기다리며 작업물을 커밋하는 경로
 ```
 
 되돌아가면 보호 경로가 바뀌므로 기존 마커의 트리 해시가 어긋나고, 재리뷰·재seal 없이는 다시 발행할 수 없습니다.
+
+외부 검증 대기 절차는 `아카이브 보류` → `검증 중` → 작업물 커밋 → 검증 후 `검증 중` → `diff review 대기` → (보호 트리가 바뀌었으면 재seal) → `아카이브 보류` → 발행입니다. 이미 작성돼 워킹트리에 있던 파일을 그대로 커밋하면 seal 의 보호 트리 해시는 바뀌지 않고, 보호 트리 내용을 바꾸면 재seal 이 필요합니다. `archive.sh` 는 Status 를 읽지 않으므로 대기 중 `archive.sh` 를 돌리지 않는 것은 절차이고 기계적 차단은 없습니다.
 
 **게이트가 보는 것은 index 만이 아닙니다.** hook 은 커밋 명령이 실행되기 **전**에 돌므로, `git commit -a`·`git commit <경로>` 처럼 커밋 집합을 명령 실행 중에 만드는 형태에서는 index 가 비어 있습니다. 그래서 판정 대상은 **index ∪ 워킹트리(추적 파일)** 이고, 보류 상태에서 기록 경로 밖의 파일이 **수정되어 있기만 해도** 커밋이 막힙니다. 코드 변경이 필요해진 것이므로 복구 경로는 상태를 되돌리는 것입니다: `bash rd-workflow/scripts/rd task set-status "구현 중"`.
 
@@ -135,7 +140,7 @@ created-at=2026-07-05-1030
 - **해석 실패 시**: 값이 있는데 정규화할 수 없으면 **조용히 `-` 로 기록하지 않는다.**
   - `lifecycle/promote.sh`: non-zero 로 중단한다. 이 지점은 `metadata_write` 직전이라 어떤 상태도 바뀌지 않으며, REQUEST 를 고쳐 재실행하면 된다.
   - `lifecycle/promote.sh` 의 `--dry-run` 도 같은 판정을 낸다. 해석은 read-only 라 dry-run 조기 종료보다 먼저 수행하며, 사전 점검이 성공을 알리고 실제 실행만 실패하는 반대 신호를 만들지 않는다.
-  - `hooks/pre_commit_archive_gate.sh`: archive 커밋을 차단한다(exit 2), 미완료 항목을 전부 열거한다. 표기가 어긋났다는 이유로 게이트를 건너뛰지 않는다. 단 이 차단은 **diff review 세션이 종결된 뒤(= archive 커밋 경로)에만** 적용한다 — 세션이 없거나 미종결이면 그 커밋은 아직 archive 단계가 아니므로(구현 중 iteration commit 등) 통과시킨다. **이 게이트는 마감 누락의 최종 보장이 아니다** — REQUEST 부재·Source FR 공백·`아카이브 보류` 기록 커밋은 통과한다(정규 마감이 지나는 경로). 실제로 막는 것은 「Source FR 이 남아 있는 REQUEST 로 아카이브 커밋을 시도하는 경우」 하나이며, 이 범위 안에서 1건만 보던 것을 전부 보게 하는 것이 이번 변경의 값이다.
+  - `hooks/pre_commit_archive_gate.sh`: archive 커밋을 차단한다(exit 2), 미완료 항목을 전부 열거한다. 표기가 어긋났다는 이유로 게이트를 건너뛰지 않는다. 단 이 차단은 **diff review 세션이 종결된 뒤(= archive 커밋 경로)에만** 적용한다 — 세션이 없거나 미종결이면 그 커밋은 아직 archive 단계가 아니므로(구현 중 iteration commit 등) 통과시킨다. **이 게이트는 마감 누락의 최종 보장이 아니다** — REQUEST 부재·Source FR 공백·`아카이브 보류` 기록 커밋은 통과한다(정규 마감이 지나는 경로). 세션 종결 뒤 Status `구현 중`·`검증 중` 의 커밋도 허용하고 그 밖의 Status 는 종전대로 막는다. 실제로 막는 것은 「Source FR 이 남아 있는 REQUEST 로 아카이브 커밋을 시도하는 경우」 하나이며, 이 범위 안에서 1건만 보던 것을 전부 보게 하는 것이 이번 변경의 값이다.
 - **직접 주는 값은 엄격하다**: `rd task set-source-fr` · `rd task guard --source-fr` · `promote.sh --source-fr` 는 원소마다 canonical path 또는 `-` 만 받으며 **해석을 적용하지 않는다.** 비대칭인 이유는 — REQUEST 본문은 사람·AI 가 자유 서술로 쓰는 문서의 일부라 표기가 발산하지만, 직접 주는 값은 호출자가 형식을 아는 인터페이스이므로 관대화가 오히려 오류를 감춘다.
 - **기록 시점**:
   - `rd task guard --mode promote`: `--source-fr <path> ...` 인자값(반복 가능), 인자 없으면 **`-` 리셋** (이전 작업 stale 값 차단). guard 시점의 REQUEST.md는 작성 전이므로 추론하지 않는다.
@@ -207,6 +212,9 @@ created-at=2026-07-05-1030
 |--------|------|-----|------|
 | **durable** | `task-state` | tracked (promote 커밋) | `rd task` CLI + `_state_common.sh` 단일 구현 |
 | **volatile** | `loop-state` | gitignored | `_lifecycle_common.sh` helper 단일 구현 (`loop_state_record` / `loop_guard_check`) |
+| **volatile (표식)** | `<git common dir>/rd-workflow/autopilot-driver.<slug>` | 추적 안 함 | `autopilot_driver.sh` (`begin`·`end`·`check`) |
+
+표식은 `begin` 부터 `end` 까지 살아 있습니다. 값은 그 작업의 `created-at` 이고, 현재 task-state 의 값과 다르면 무시합니다(같은 slug 를 재사용한 새 작업의 옛 표식을 걸러냅니다). `launch=ok` 로 자식 세션이 이어가는 작업은 호출 세션이 대상 worktree 의 스크립트로 `begin` 을 대신 쓰며, 자식이 autopilot 절차를 따르지 않으면 `end` 가 실행되지 않습니다. 이처럼 비정상 종료나 인계로 표식이 남을 수 있으므로, 표식을 근거로 한 안내 문구에는 조건(「autopilot 이 이 작업을 맡고 있었다면」)을 담아 남은 표식이 있어도 무해하게 합니다.
 
 task-state와 loop-state를 물리적으로 통합하지 않는 이유:
 

@@ -99,6 +99,7 @@ autopilot 모드와 반자율(semi-auto) 모드가 공통으로 따르는 자율
 | autopilot | 50 | `1` | 자동 진행 |
 
 **종결 마커(seal)와 발행 승인**:
+- spec/plan 구간의 Status 전이(`REQUEST review 대기` → `spec/plan 작성 중` → `spec/plan review 대기` → `구현 대기` → `구현 중`)는 `request-to-reviewed-plan`·`implement-reviewed-plan` SKILL.md 의 절차대로 **묻지 않고 진행한다.** `아카이브 보류` 전이와 마찬가지로 되돌릴 수 있는 로컬 작업이다. 구현 착수 때 spec/plan review 종결 증거(`## Notes` 의 종결 기록과 현재 spec/plan 해시 비교)가 무효이면 그 skill 이 구현 없이 중단하고 재리뷰를 안내한다. 기록만 없는 기존 작업에 한해 사용자가 "리뷰 이후 spec/plan 이 바뀌지 않았다" 를 확인하면 진행할 수 있으며, 이 확인은 사람만 내릴 수 있는 판단이므로 자율 모드가 스스로 하지 않는다(중단 조건 3). 리뷰가 없거나 수렴하지 않았으면 확인으로 대신하지 않고 재리뷰로 보낸다.
 - final diff review 가 `이의 없음` 으로 종결되면 `rd review seal <세션 경로>` → `rd task set-status "아카이브 보류"` → archive 기록 커밋(seal 파일 포함) 까지는 **묻지 않고 진행한다.** 이 셋은 되돌릴 수 있는 로컬 작업이다.
 - **`archive.sh` 호출 직전에 1회 묻는다.** 사용자 승인 전에는 `archive.sh` 를 호출하지 않는다. 승인 이후의 merge·tag·push 만 중단 조건 6의 예외 ①(정규 archive lifecycle)에 포함된다.
 - 승인 질문에는 실제 효과를 드러낸다. 표시값의 의미는 현행 `archive.sh` 와 일치시킨다 — 지금 확정할 수 있는 것만 확정값으로 적고, 확정할 수 없는 것은 그렇게 적는다.
@@ -161,6 +162,14 @@ autopilot 모드와 반자율(semi-auto) 모드가 공통으로 따르는 자율
 5. brainstorming에서 모든 옵션이 필수 제약을 위반하거나 판단 근거가 전혀 없는 경우
 6. **파괴적·비가역 작업** — 데이터 삭제, 외부 배포·공개 릴리즈 발행, 권한/계정 변경 등은 자율 진행하지 않고 멈춘다. **예외 두 가지**: ① **사용자 승인 이후** 현재 FR의 정규 archive lifecycle(`archive.sh`)에서 수행되는 merge·tag·push — 「종결 마커(seal)와 발행 승인」 절의 승인을 받은 뒤의 단계다. **승인 자체는 이 조건의 일반 규칙을 따라 반드시 묻는다.** ② `light` 등급 마감의 기본 브랜치 커밋 1개 직후 push — 원격 모드이고, 시작 보고 블록의 `push 예정` 필드에 `light` 마감 push 를 적었고, 커밋 전 재분류가 `light` 를 확정한 경우에 한한다(WORKFLOW.md 시작 계약·마감 상태 계약). 시작 계약 4항이 ahead 를 감지해 `push 예정` 을 보류로 적었으면 사용자의 명시 채택 없이는 이 push 도 하지 않고 "미push" 로 인계한다. 실패하면 push 를 재시도하지 않고 종료 보고에 "미push" 로 넘긴다. 그 밖의 lifecycle script 밖 push·배포·릴리즈·삭제는 착수 지시가 있어도 항상 중단 대상이다.
 
+8. **FR 경과 시간 상한** — 무인(headless) 실행에만 적용한다. 기준은 `autopilot_headless.sh` 호출 1회의 경과 시간이고, 기본 상한은 240분이다. 상한은 환경변수 `RD_FR_WALL_MINUTES` > `loop-guard.json` 의 `wall_minutes` 키(분 단위 정수) > 기본값 순으로 정하며, `0` 은 상한 없음이다. 대화형 autopilot·반자율에는 적용하지 않는다. 무인에서는 `awaiting-user` 대신 outcome `blocked:time-cap` 을 기록한다.
+
 ## 무인(headless) 모드 outcome 매핑
 
-무인 진입(autopilot SKILL.md "무인 진입" 섹션)에서는 위 중단조건에 도달해도 사람을 기다릴 수 없다. 따라서 `awaiting-user` 로 멈춰 대기하는 대신, outcome 토큰 `blocked:<reason>` 을 `$RD_AUTOPILOT_OUTCOME_FILE` 에 기록하고 종료한다(중단조건 도달 시 skill 은 해당 FR status 를 `blocked` 로 기록하고 `CURRENT_TASK.md` 를 `대기 중`/Short Title `-` 로 reset 한다 — 보존 상태는 FR 의 blocked 항목이 든다. 상세는 autopilot SKILL.md "중단조건 → blocked 매핑"). 정상 완주는 `completed`, 세션 한계는 `resume`, 큐 빔은 `queue-empty` 다. wrapper `rd-workflow/scripts/autopilot_headless.sh` 가 이를 exit code(0/10/20/30/40)로 매핑한다. exit code 해석은 front-end(ralph/batch) 소관이다.
+무인 진입(autopilot SKILL.md "무인 진입" 섹션)에서는 위 중단조건에 도달해도 사람을 기다릴 수 없다. 따라서 `awaiting-user` 로 멈춰 대기하는 대신, outcome 토큰 `blocked:<reason>` 을 `$RD_AUTOPILOT_OUTCOME_FILE` 에 기록하고 종료한다(중단조건 도달 시 skill 은 해당 FR status 를 `blocked` 로 기록한다. fr 브랜치가 활성인 작업의 `CURRENT_TASK.md`·task-state 는 reset 하지 않고 보존하며, 재개 후보 제외는 FR 의 blocked 항목이 맡는다. 상세는 autopilot SKILL.md "중단조건 → blocked 매핑"). 정상 완주는 `completed`, 세션 한계는 `resume`, 큐 빔은 `queue-empty` 다. wrapper `rd-workflow/scripts/autopilot_headless.sh` 가 이를 exit code(0/10/20/30/40)로 매핑한다. exit code 해석은 front-end(ralph/batch) 소관이다.
+
+**재개 판정과 `blocked:resume-undetermined`**: 무인 진입은 새 작업을 고르기 전에 진행 중인 fr 작업이 있는지 `rd-workflow/scripts/batch/resume_candidates.sh` 로 판정한다. 출처는 tasks 색인(`<git-common-dir>/rd-workflow/tasks.local`)과 각 worktree 의 `task-state` 이며 메인 `CURRENT_TASK.md` 가 아니다. 판정은 읽기 전용이다. `launch=ok`(대화형 세션 기동 이력)·`완료`·정리 대기·worktree 부재·source FR 이 `blocked` 인 작업은 후보가 아니다. 생존·소유를 확인할 수 없는 작업(`launch` 가 `unknown`·`launching`·빈 값, 단계 판정 불가, 색인과 작업 파일 불일치, 색인 읽기 실패)이 있고 검증된 후보가 없으면 새 FR 을 고르지 않고 outcome `blocked:resume-undetermined` 로 멈춘다. FR status 와 `CURRENT_TASK.md` 는 바꾸지 않는다(대상 FR 이 없는 전역 실패). 재개 대상·제외 사유·다음 조치는 outcome 둘째 줄 이후에 남고 wrapper 가 이를 출력한다. exit code 표(0/10/20/30/40)는 바뀌지 않는다.
+
+**claude 종료 코드 보존**: wrapper 는 `claude -p` 의 종료 코드를 보존해 stderr 에 `claude 종료 코드=<N>` 으로 남긴다. outcome 토큰이 있으면 종료 코드와 무관하게 토큰대로 매핑한다. outcome 이 비었거나 판독 불가여서 exit 40 이 될 때만 요약 줄에 비정상 종료(코드 N)·신호 종료·정상 종료(0)인데 outcome 미기록·종료 코드 확인 불가를 구분해 붙인다. exit code 표와 40 의 재시도 정책은 바뀌지 않는다.
+
+**wrapper 가 직접 기록하는 blocked**: 중단조건 8 은 skill 이 아니라 wrapper 가 판정한다. 상한에 도달하면 wrapper 가 후손 프로세스까지 회수하고 outcome 을 `blocked:time-cap` 으로 기록한다. 회수에 실패하면 `blocked:time-cap-unreaped` 를 기록하며, 유예 시간+5초+폴링 오차 안에 반환한다. 상한 전에 `completed` 가 이미 기록됐으면 회수 성공 시 `completed` 를 유지하고, 회수 실패 시 `time-cap-unreaped` 가 우선한다. wrapper 는 `CURRENT_TASK.md`·FR·리뷰 세션 파일을 쓰지 않는다. outcome 둘째 줄 이후에 진단(경과·상한·상한 출처·작업 상태·열린 리뷰 세션·잔여 프로세스)만 남긴다. exit code 표(0/10/20/30/40)는 바뀌지 않는다.

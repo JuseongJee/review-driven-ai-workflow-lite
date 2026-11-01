@@ -2,9 +2,14 @@
 # session_start.sh — 세션 시작 시 환경 확인
 set -euo pipefail
 
+# SessionStart 훅 입력(JSON)을 읽는다. 닫히지 않는 stdin 에서도 1초 뒤 진행한다.
+hook_input=""
+[[ -t 0 ]] || IFS= read -r -t 1 -d '' hook_input || true
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd "${script_dir}/../../.." && pwd)"
 source "${script_dir}/_guard_common.sh"
+source "${script_dir}/_compact_hint.sh"
 
 PROJECT_CONTEXT="${project_root}/PROJECT_CONTEXT.md"
 
@@ -29,6 +34,8 @@ if [[ -f "$task_file" ]]; then
 
   echo ""
   echo "[hooks] 현재 작업: ${task} (${status})"
+
+  compact_hint_emit "$hook_input" "$status" "$(state_read_field short-title)" "$project_root"
 fi
 
 # --- diff-review 누락 경고 (Layer 2) ---

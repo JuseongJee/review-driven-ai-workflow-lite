@@ -117,7 +117,224 @@ ${slug}
   return 0
 }
 
-[[ "$REBUILD" -eq 1 ]] && _tl_rebuild
+if [[ "$REBUILD" -eq 1 ]]; then
+  _tl_rebuild || echo "tasks_list: --rebuild 락을 얻지 못해 재구성을 건너뜁니다." >&2
+fi
+
+# ---------------------------------------------------------------------------
+# 정리 대기 행 지연 정리 — state=cleanup-pending 행마다 남은 것(worktree 등록·로컬 브랜치)을
+# 안전할 때만 지우고 색인 행을 지운다. 발행이 끝났는데 호출자 worktree 때문에 archive.sh 가
+# 지우지 못한 잔여(skipped-self)가 주 대상이다. 아무것도 안 남은 낡은 행은 예전처럼 행만 지운다.
+# 행이 있을 때만 락을 잡고, 못 잡으면 색인을 바꾸지 않고 목록만 보여준다(rc 0). 판정은 락을
+# 얻은 뒤 행마다 한다. 결과는 PRUNED_NOTE(낡은 행) 와 SWEEP_NOTES(정리됨·보류·부분 실패)로 모아
+# 출력 끝에 낸다. 보류·부분 실패는 실제로 남은 것이 있는 행에서만 낸다.
+# ---------------------------------------------------------------------------
+PRUNED_NOTE=""
+# 파괴적 정리(worktree·브랜치 삭제)는 기본 체크아웃에서 부른 `rd task list` 에서만 한다 — 다른 작업
+# worktree 에서 목록만 보려던 호출이 발행 끝난 다른 작업의 worktree 를 지우지 않게 한다. 기본 체크아웃은
+# 공유 .git 의 부모 디렉터리다(`archive.sh` Step -1 과 같은 기준). 판정 실패는 기본 체크아웃이 아닌 것으로 본다.
+_tl_is_default_checkout() {
+  local common main here
+  common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  [[ "$common" == /* ]] || return 1
+  main="$(cd "$(dirname "$common")" 2>/dev/null && pwd -P)" || return 1
+  here="$(pwd -P)" || return 1
+  [[ "$main" == "$here" ]]
+}
+if _tl_is_default_checkout; then _TL_DEFAULT_CHECKOUT=1; else _TL_DEFAULT_CHECKOUT=0; fi
+
+SWEEP_NOTES=""
+_SWEEP_REMOVED=0
+_SWEEP_NAMES=""
+
+_tl_note() { SWEEP_NOTES="${SWEEP_NOTES}${1}"$'\n'; }
+_tl_hold() { _tl_note "정리 보류: ${1} — ${2}. 재시도: ${3}"; }  # <slug> <사유> <재시도 안내>
+_tl_fail() { _tl_note "정리 부분 실패: ${1} — ${2}. 복구: ${3}"; }  # <slug> <사유> <복구 명령>
+
+# <fr> 브랜치를 체크아웃한 worktree 등록을 "<경로><TAB><locked 0|1>" 줄로 낸다. rc 1: 조회 실패.
+_tl_branch_regs() {
+  local out
+  out="$(git worktree list --porcelain 2>/dev/null)" || return 1
+  printf '%s\n' "$out" | awk -v ref="branch refs/heads/$1" '
+    BEGIN { RS = ""; FS = "\n" }
+    { p = ""; l = 0; m = 0
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^worktree /) p = substr($i, 10)
+        else if ($i == ref) m = 1
+        else if ($i == "locked" || $i ~ /^locked /) l = 1
+      }
+      if (m) print p "\t" l }'
+}
+
+# 발행 증거가 cleanup-pending 인지. 아니면 rc 1 이고 판정값을 _TL_EV 에 둔다.
+_tl_evidence_ok() {  # <slug> <oid>
+  _TL_EV="$(tasks_publish_evidence "$1" "$2" "$DEFAULT_BRANCH" "$REMOTE_MODE")"
+  [[ "$_TL_EV" == "cleanup-pending" ]]
+}
+
+_tl_sweep_one() {  # <slug>
+  local slug="$1" fr wt oid regs nregs rp lk rn wn st orc oid2 err
+  local again="원인을 해소한 뒤 rd task list 를 다시 실행"
+  fr="$(tasks_index_get "$slug" fr-branch 2>/dev/null)" || fr=""
+  [[ -z "$fr" ]] && fr="fr/${slug}"
+  wt="$(tasks_index_get "$slug" worktree-path 2>/dev/null)" || wt=""
+
+  # 1) 상태 수집
+  oid="$(git rev-parse --verify --quiet "refs/heads/${fr}^{commit}" 2>/dev/null)" || oid=""
+  if ! regs="$(_tl_branch_regs "$fr")"; then
+    _tl_hold "$slug" "worktree 목록을 조회하지 못함" "$again"; return 0
+  fi
+  nregs=0
+  [[ -n "$regs" ]] && nregs="$(printf '%s\n' "$regs" | grep -c '')"
+
+  # 2) 아무것도 안 남음 — 행만 지운다
+  if [[ -z "$oid" && "$nregs" -eq 0 && ( -z "$wt" || ! -d "$wt" ) ]]; then
+    if tasks_index_remove "$slug" >/dev/null 2>&1; then
+      _SWEEP_REMOVED=$((_SWEEP_REMOVED + 1))
+      if [[ -n "$_SWEEP_NAMES" ]]; then _SWEEP_NAMES="${_SWEEP_NAMES}, ${slug}"; else _SWEEP_NAMES="$slug"; fi
+    else
+      echo "tasks_list: 낡은 정리 대기 기록 삭제 실패: ${slug}" >&2
+    fi
+    return 0
+  fi
+
+  # 2b) 남은 것이 있는데 기본 체크아웃이 아니면 삭제하지 않는다
+  if [[ "$_TL_DEFAULT_CHECKOUT" -ne 1 ]]; then
+    _tl_hold "$slug" "기본 체크아웃이 아닌 worktree 에서 실행되어 삭제하지 않음" "기본 체크아웃에서 rd task list 를 실행"
+    return 0
+  fi
+
+  # 3) 발행 증거
+  if [[ -z "$oid" ]]; then
+    _tl_hold "$slug" "브랜치 ${fr} 는 없는데 worktree 흔적이 남아 발행 증거를 판정할 수 없음" "남은 흔적을 직접 확인(git worktree list, ${wt:--})한 뒤 정리"
+    return 0
+  fi
+  if ! _tl_evidence_ok "$slug" "$oid"; then
+    _tl_hold "$slug" "발행 증거가 ${_TL_EV} 라 지우지 않음" "발행을 마치거나 원인을 해소한 뒤 rd task list 를 다시 실행"
+    return 0
+  fi
+
+  # 4) worktree 등록 — 정확히 1건이어야 하고 모든 검사를 통과해야 지운다
+  if [[ "$nregs" -gt 1 ]]; then
+    _tl_hold "$slug" "같은 브랜치를 체크아웃한 worktree 가 ${nregs}건" "git worktree list 로 확인해 직접 정리"
+    return 0
+  fi
+  if [[ "$nregs" -eq 1 ]]; then
+    rp="${regs%%$'\t'*}"; lk="${regs##*$'\t'}"
+    rn="$(cd "$rp" 2>/dev/null && pwd -P)" || rn=""
+    wn=""
+    if [[ -n "$wt" ]]; then wn="$(cd "$wt" 2>/dev/null && pwd -P)" || wn=""; fi
+    if [[ -z "$rn" || -z "$wn" || "$rn" != "$wn" ]]; then
+      _tl_hold "$slug" "worktree 경로 불일치 (등록: ${rp}, 기록: ${wt:--})" "git worktree list 로 확인해 직접 정리"
+      return 0
+    fi
+    if [[ "$lk" == "1" ]]; then
+      _tl_hold "$slug" "worktree 가 locked 상태" "git worktree unlock ${rp} 뒤 rd task list 를 다시 실행"
+      return 0
+    fi
+    if ! st="$(git -C "$rn" -c status.showUntrackedFiles=normal status --porcelain 2>/dev/null)"; then
+      _tl_hold "$slug" "worktree 상태를 조회하지 못함" "$again"
+      return 0
+    fi
+    if [[ -n "$st" ]]; then
+      _tl_hold "$slug" "미커밋 변경이 있음 ($(printf '%s\n' "$st" | grep -c '')건)" "${rp} 의 변경을 커밋하거나 버린 뒤 rd task list 를 다시 실행"
+      return 0
+    fi
+    orc=0; tasks_path_occupied "$rn" || orc=$?
+    if [[ "$orc" -eq 0 ]]; then
+      _tl_hold "$slug" "점유 — 세션이 ${rp} 안에 있음" "그 세션을 닫거나 worktree 를 나온 뒤 rd task list 를 다시 실행"
+      return 0
+    elif [[ "$orc" -ne 1 ]]; then
+      _tl_hold "$slug" "점유 판정불가(${TASKS_OCCUPIED_REASON:-알 수 없음})" "lsof 를 확인한 뒤 rd task list 를 다시 실행"
+      return 0
+    fi
+    if ! err="$(git worktree remove "$rn" 2>&1)"; then
+      _tl_fail "$slug" "worktree 제거 실패 (${err//$'\n'/ })" "git worktree remove ${rp}"
+      return 0
+    fi
+  fi
+
+  # 5) 로컬 브랜치 — 등록 0건과 증거를 다시 확인하고, 읽은 oid 일 때만 지운다(expected-old)
+  if ! regs="$(_tl_branch_regs "$fr")" || [[ -n "$regs" ]]; then
+    _tl_hold "$slug" "worktree 등록이 남아 있거나 조회하지 못함" "$again"
+    return 0
+  fi
+  oid2="$(git rev-parse --verify --quiet "refs/heads/${fr}^{commit}" 2>/dev/null)" || oid2=""
+  if [[ "$oid2" != "$oid" ]] || ! _tl_evidence_ok "$slug" "$oid"; then
+    _tl_hold "$slug" "판정 뒤 브랜치 ${fr} 가 바뀌었거나 발행 증거가 ${_TL_EV:-바뀜}" "$again"
+    return 0
+  fi
+  if ! err="$(git update-ref -d "refs/heads/${fr}" "$oid" 2>&1)"; then
+    _tl_fail "$slug" "로컬 브랜치 ${fr} 삭제 거부 (${err//$'\n'/ })" "브랜치 tip 을 확인한 뒤 rd task list 를 다시 실행하거나 git branch -D ${fr}"
+    return 0
+  fi
+
+  # 6) 둘 다 없음을 확인한 뒤에만 색인 행을 지운다
+  if git rev-parse --verify --quiet "refs/heads/${fr}" >/dev/null 2>&1 \
+     || ! regs="$(_tl_branch_regs "$fr")" || [[ -n "$regs" ]]; then
+    _tl_fail "$slug" "삭제 뒤 브랜치 또는 worktree 등록이 남아 있음" "git worktree list·git branch 로 확인"
+    return 0
+  fi
+  if ! tasks_index_remove "$slug" >/dev/null 2>&1; then
+    _tl_fail "$slug" "색인 행 삭제 실패" "rd task list --rebuild 뒤 다시 실행"
+    return 0
+  fi
+  if [[ "$nregs" -eq 1 ]]; then
+    _tl_note "정리됨: ${slug} — worktree·로컬 브랜치 제거, 색인 행 삭제"
+  else
+    _tl_note "정리됨: ${slug} — 로컬 브랜치 제거, 색인 행 삭제"
+  fi
+}
+
+_tl_sweep_pending() {
+  local slug st candidates="" total=0 remaining marker mpid
+  while IFS= read -r slug; do
+    [[ -z "$slug" ]] && continue
+    st="$(tasks_index_get "$slug" state 2>/dev/null)" || st=""
+    if [[ "$st" == "cleanup-pending" ]]; then
+      candidates="${candidates}${slug}
+"
+      total=$((total + 1))
+    fi
+  done < <(tasks_index_all_slugs 2>/dev/null)
+  [[ -z "$candidates" ]] && return 0
+
+  # 락은 행 하나의 판정~삭제 구간에만 잡는다. 발행(archive.sh)이 락을 기다리는 중이면
+  # (archive-waiting 표지의 pid 가 살아 있음) 행 사이에서 양보한다 — 연속 재획득 기아 방지.
+  marker="$(tasks_shared_dir 2>/dev/null)/archive-waiting"
+  remaining="$total"
+  while IFS= read -r slug; do
+    [[ -z "$slug" ]] && continue
+    mpid="$(cat "$marker" 2>/dev/null || true)"
+    case "$mpid" in
+      ''|*[!0-9]*) ;;
+      *)
+        if kill -0 "$mpid" 2>/dev/null; then
+          echo "tasks_list: 낡은 정리 대기 기록 정리를 양보함 — 발행 대기 중 (남은 ${remaining}건)" >&2
+          break
+        fi
+        ;;
+    esac
+    if ! tasks_lock_acquire "tasks-list-prune" "-"; then
+      echo "tasks_list: 낡은 정리 대기 기록 정리를 건너뜀 — 락을 얻지 못했습니다 (남은 ${remaining}건)" >&2
+      break
+    fi
+    # 락을 얻은 뒤 행을 다시 판정한다 — 그 사이 다른 실행이 행을 바꿨을 수 있다.
+    st="$(tasks_index_get "$slug" state 2>/dev/null)" || st=""
+    if [[ "$st" == "cleanup-pending" ]]; then
+      _tl_sweep_one "$slug"
+    fi
+    tasks_lock_release || true
+    remaining=$((remaining - 1))
+  done <<< "$candidates"
+
+  if [[ "$_SWEEP_REMOVED" -ge 1 ]]; then
+    PRUNED_NOTE="정리: 낡은 정리 대기 기록 ${_SWEEP_REMOVED}건 삭제 (${_SWEEP_NAMES})"
+  fi
+  return 0
+}
+
+_tl_sweep_pending
 
 # ---------------------------------------------------------------------------
 # 발행 증거 판정 (spec D8) — merge 여부는 발행 완료의 증거가 아니다.
@@ -182,7 +399,7 @@ _tl_launch_action() {  # <slug> <launch-raw> <wt>
 # ---------------------------------------------------------------------------
 # 본문 출력
 # ---------------------------------------------------------------------------
-SLUGS="$(tasks_index_slugs 2>/dev/null)" || SLUGS=""
+SLUGS="$(tasks_index_all_slugs 2>/dev/null)" || SLUGS=""
 
 MAIN_ROWS=""
 PUBLISH_ROWS=""
@@ -267,6 +484,8 @@ done <<< "$SLUGS"
 
 if [[ "$ANY" -eq 0 ]]; then
   printf '진행 중인 작업이 없습니다.\n'
+  [[ -n "$PRUNED_NOTE" ]] && printf '%s\n' "$PRUNED_NOTE"
+  [[ -n "$SWEEP_NOTES" ]] && printf '%s' "$SWEEP_NOTES"
   exit 0
 fi
 
@@ -279,4 +498,12 @@ if [[ -n "$PUBLISH_ROWS" ]]; then
   printf '\n정리 대기 / 발행 확인 필요 (재기동 대상이 아닙니다)\n'
   printf '작업\t상태\t다음 행동\t-\n'
   printf '%b' "$PUBLISH_ROWS" | column -t -s $'\t' 2>/dev/null || printf '%b' "$PUBLISH_ROWS"
+fi
+
+if [[ -n "$PRUNED_NOTE" ]]; then
+  printf '\n%s\n' "$PRUNED_NOTE"
+fi
+
+if [[ -n "$SWEEP_NOTES" ]]; then
+  printf '\n%s' "$SWEEP_NOTES"
 fi

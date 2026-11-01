@@ -16,6 +16,11 @@ set -uo pipefail
 ROOT="${1:-.}"
 TARGETS="_ROOT_FILES rd-workflow scripts CLAUDE.md"
 FIND_MARKER="__FIND_FAILED__"
+# 실행 예시 판정 (change spec §2): `bash` 직후(옵션 토큰은 건너뜀) 같은 토큰이
+# promote.sh 로 끝나야 실행 예시로 본다. 토큰은 공백과 셸 구분자(; | & < > ( ))에서 끊긴다.
+# 한계: `bash -c "… promote.sh"` 처럼 사이에 다른 단어가 끼는 호출과 공백이 든 인용 경로는
+# 잡지 않는다. 활성 자료에 없고, 지원하려면 따옴표 짝을 해석하는 셸 파서가 필요하다.
+PROMOTE_CALL_RE='(^|[^[:alnum:]_./-])bash[[:space:]]+(-[^[:space:];|&<>()]+[[:space:]]+)*[^[:space:];|&<>()]*promote\.sh([^[:alnum:]_./-]|$)'
 
 if [[ ! -d "$ROOT" ]]; then
   echo "check_promote_call_args: 점검 루트가 디렉터리가 아닙니다: '$ROOT'" >&2
@@ -79,11 +84,8 @@ for tgt in $TARGETS; do
       continue
     fi
     printf '%s\n' "$joined" | while IFS= read -r logical; do
-      # 실행 형태만 본다 — `bash <경로>promote.sh` 형태
-      case "$logical" in
-        *bash*promote.sh*) ;;
-        *) continue ;;
-      esac
+      # 실행 형태만 본다 — `bash <경로>promote.sh` 형태 (PROMOTE_CALL_RE)
+      [[ "$logical" =~ $PROMOTE_CALL_RE ]] || continue
       # usage 문자열은 대상이 아니다
       case "$logical" in
         *usage:*) continue ;;

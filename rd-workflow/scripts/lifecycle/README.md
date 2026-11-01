@@ -98,8 +98,13 @@ bash rd-workflow/scripts/lifecycle/archive.sh \
   [--no-remote] \
   [--force-dirty] \
   [--force-skip-review-check <사유>] \
+  [--allow-status-mismatch <사유>] \
   [--dry-run]
 ```
+
+**Status 검사:** 발행 대상 커밋(fr 모드는 fr tip, no-fr 은 HEAD)의 task-state `status` 가 `아카이브 보류` 가 아니면 seal 검사보다 먼저 거부합니다(merge·push 전). `--allow-status-mismatch <사유>` 는 이 검사만 건너뛰며 사유가 필수이고 audit 로그에 `[status:<값>]` 로 남습니다. `--force-skip-review-check` 와 서로를 우회하지 않습니다.
+
+**락 대기:** 점유자가 `tasks-list-prune`(`rd task list` 의 지연 정리)이면 `RD_ARCHIVE_LOCK_WAIT_MAX` 초(기본 60, `0` 이면 대기 안 함) 안에서 기다립니다. 다른 점유자는 즉시 중단합니다.
 
 **호출 위치:** 기본 브랜치 worktree only.
 호출 전에 archive content commit

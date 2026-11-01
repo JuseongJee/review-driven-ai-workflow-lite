@@ -899,7 +899,7 @@ emit_current_task_baseline() {
 
 ## Status
 대기 중
-<!-- 허용 상태값 8종은 .claude/rules/rd-workflow/task-tracking.md 참조. 변경은 rd task set-status 경유 -->
+<!-- 허용 상태값은 .claude/rules/rd-workflow/task-tracking.md 참조. 변경은 rd task set-status 경유 -->
 
 ## Request
 [REQUEST.md](REQUEST.md)

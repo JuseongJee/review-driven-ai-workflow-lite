@@ -48,7 +48,7 @@
 - `Source FR`이 `-`가 아니면 아카이브 기록 커밋 단계에서 `bash rd-workflow/scripts/rd task fr-done`을 호출한다. `fr-done`이 묶은 FR 전부의 `items/` status와 인덱스 행 status를 함께 `done`으로 바꾸고, **인덱스 행 삭제는 `/fr archive`가 그 status를 보고 수행**한다(연결이 끊기면 `/fr archive`가 0건으로 끝나 FR이 활성으로 남는다). `fr-done`이 실패해도 발행은 계속하고, 출력을 completion report의 「FR 정리 결과」 절로 옮겨 발행 결과와 분리 보고한다(재시도 대상은 아카이브된 REQUEST 사본의 `## Source FR`에서 회수, 상세는 `fr/archive.md`).
 - `PROJECT_CONTEXT.md`의 `auto_completion_report: true`면 자동으로, 아니면 "작업 요약 report를 남길까요?" 질문 후 `rd-workflow-workspace/reports/completions/YYYY-MM-DD-HHMM-작업명.md`에 report를 쓴다.
 - **완전 마감 후 `/clear` 안내 (필수)**: 아카이브 완료 + 산출물 손실 없음 확인(remote-mode는 push까지, local-only는 commit·merge까지) 후 마지막 응답에 `/clear` 가능 여부를 반드시 한 줄 명시한다. 사용자가 추가 FR 등록 의사를 보이면 등록을 먼저 처리한 뒤 안내한다. **herdr 환경(`HERDR_ENV=1`)이고 이번 아카이브로 worktree 를 정리했다면, 같은 응답에 그 작업의 herdr tab이 이제 사라진 worktree 를 가리키니 직접 닫아 달라는 안내를 함께 포함한다** (AI 는 자신이 만들지 않은 tab을 닫을 수 없다).
-- **큰 작업 lifecycle**: ① fr branch에서 archive content commit(REQUEST.md 비우기, archive 파일 생성, FR done 처리, completion report) — `CURRENT_TASK.md` 미러는 `archive.sh`가 baseline으로 되돌리므로 사람이 하지 않는다. ② 기본 브랜치로 switch 후 `bash rd-workflow/scripts/lifecycle/archive.sh` 호출 (merge + tag + push + branch/worktree 정리 일괄).
+- **큰 작업 lifecycle**: ① fr branch에서 archive content commit(REQUEST.md 비우기, archive 파일 생성, FR done 처리, completion report) — `CURRENT_TASK.md` 미러는 `archive.sh`가 baseline으로 되돌리므로 사람이 하지 않는다. ② 기본 브랜치로 switch 후 `bash rd-workflow/scripts/lifecycle/archive.sh` 호출 (merge + tag + push + branch/worktree 정리 일괄). 작업 worktree 안에서 호출하면 호출자 worktree·로컬 브랜치는 보존되고 정리 대기가 되며, 기본 체크아웃의 `rd task list` 가 안전할 때 지연 정리한다.
 
 ## 절대 규칙 (모든 skill에 공통 적용)
 

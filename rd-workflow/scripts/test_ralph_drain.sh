@@ -117,6 +117,14 @@ run_case "relations-unavailable 즉시 중단" 1 "20 20 20" \
 assert_contains "relations-unavailable"
 assert_invocations 1
 
+# resume-undetermined 도 전역 실패다 — 즉시 중단하고 사유·상세를 요약에 남긴다.
+RDETAIL='-	재개 후보 판정 불가	resume_candidates.sh 출력 확인'
+run_case "resume-undetermined 즉시 중단" 1 "20 20 20" \
+  RD_STUB_FIRST_LINE=blocked:resume-undetermined RD_STUB_DETAIL="$RDETAIL"
+assert_contains "재개 판정 불가 (resume-undetermined)"
+assert_invocations 1
+assert_detail_in_summary "$RDETAIL"
+
 # drain 의 최종 요약 구역에 대기 상세 2건이 "행 전체" 로 남는지 본다.
 DETAIL='alpha-task	대기(선행: lead-task)	선행 lead-task 완료 필요
 beta-task	오류(series)	fr_relations.sh validate 로 관계 데이터 수정'

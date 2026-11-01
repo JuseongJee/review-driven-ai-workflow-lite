@@ -231,6 +231,17 @@ exit 0
     fail "케이스 1: 정상 완료 기대 exit 0, .turn_ready 생성 — rc=$rc, turn_ready=$([ -f "$sandbox/.turn_ready" ] && echo exists || echo missing)"
   fi
 
+  # `.turn_ready` 는 디버깅용 마커라 버전관리 대상이 아니다 — ignore 패턴이 빠지면 리뷰 세션 커밋에 딸려 들어간다.
+  # `git check-ignore` 는 개발 머신의 `.git/info/exclude` 에도 걸려 패턴 부재를 못 잡으므로 파일 내용을 직접 본다.
+  local repo_root
+  if repo_root="$(git -C "$(dirname "$ADAPTER")" rev-parse --show-toplevel 2>/dev/null)" && [ -f "$repo_root/.gitignore" ]; then
+    if grep -qxF 'rd-workflow-workspace/handoffs/review_pipeline/*/.turn_ready' "$repo_root/.gitignore"; then
+      pass "케이스 1(ignore): .gitignore 에 .turn_ready 패턴이 있음"
+    else
+      fail "케이스 1(ignore): .gitignore 에 .turn_ready 패턴이 없음 — 리뷰 세션 커밋에 유입됨"
+    fi
+  fi
+
   rm -rf "$sandbox"
 }
 
@@ -2727,6 +2738,54 @@ run_case36c() {
 }
 
 # ===========================================================================
+# 케이스 36d: codex TERM 무시 리더 — 어댑터 자체가 exit 124 로 회수
+#   codex 는 set -m 으로 mock 을 어댑터와 **다른 process group** 에 띄운다. 그래서 36a 의
+#   어댑터 그룹 소멸 검사는 mock 생존을 보지 못한다 — 단언은 "외부 상한 전에 rc=124" 하나이고,
+#   안전망 정리만 mock 그룹(pid 파일의 PID 가 곧 pgid)까지 대상으로 한다.
+# ===========================================================================
+run_case36d() {
+  local sandbox expected_turn mock_bin mock_pid_file mock_pid rc=0 waited cap=20
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001.md"
+  mock_pid_file="$sandbox/mock_bin/codex.pid"
+  # TERM 을 무시하는 리더 — trap '' 의 SIG_IGN 은 exec 뒤에도 유지된다(POSIX)
+  mock_bin="$(setup_mock "$sandbox" "echo \$\$ > \"$mock_pid_file\"; trap '' TERM; exec sleep 60")"
+
+  spawn_group "$sandbox/wrap.log" env \
+    TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=2 \
+    bash "$ADAPTER"
+
+  waited=0
+  while [ "$waited" -lt "$cap" ] && kill -0 "$JOB" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if kill -0 "$JOB" 2>/dev/null; then
+    fail "케이스 36d: 외부 안전망 ${cap}초에 도달 — 어댑터 자체 회수 실패"
+    reap_group "$GROUP_PGID"
+  else
+    wait "$JOB" 2>/dev/null || rc=$?
+    if [ "$rc" -eq 124 ]; then
+      pass "케이스 36d: codex TERM 무시 리더도 어댑터 자체 exit 124 로 회수 (${waited}초 이내)"
+    else
+      fail "케이스 36d: 기대 rc=124 — 실제 rc=$rc"
+    fi
+  fi
+
+  # mock 그룹 정리 — pid 파일의 PID 가 자기 그룹의 리더(pgid == pid)일 때만 회수한다
+  mock_pid=""
+  [ -f "$mock_pid_file" ] && mock_pid="$(cat "$mock_pid_file" 2>/dev/null)"
+  if [ -n "$mock_pid" ] && [ "$(own_pgid "$mock_pid")" = "$mock_pid" ]; then
+    reap_group "$mock_pid"
+  fi
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
 # 케이스 37 (V5): 관측기 고장 — 엔진 직접 하니스 (어댑터에 장애 주입 없음)
 #   RW_OBSERVER_OK=0 RW_ABS_CAP=300 RW_FALLBACK_CAP=3 → 마커 세 필드 'cap 3 failed',
 #   약 3초에 발동
@@ -2966,6 +3025,206 @@ HARNESS_EOF
 }
 
 # ===========================================================================
+# 케이스 42 (spec §6 개정 1): rw_group_state 단위 — 종료 증거 판정
+#   pgid 빈 값 / ps rc≠0 / ps rc=0 + 빈 출력 / 구성원 있음 / 구성원 없음
+#   ps shim 은 PATH 앞의 sandbox 디렉터리에만 둔다(실제 ps 는 건드리지 않는다).
+# ===========================================================================
+run_case42() {
+  local sandbox shim_fail shim_empty self_pg got
+  sandbox="$(make_sandbox)" || { fail "케이스 42: sandbox 생성 실패"; return; }
+  shim_fail="$sandbox/shim_fail"; shim_empty="$sandbox/shim_empty"
+  mkdir -p "$shim_fail" "$shim_empty"
+  printf '#!/bin/sh\nexit 1\n' > "$shim_fail/ps"
+  printf '#!/bin/sh\nexit 0\n' > "$shim_empty/ps"
+  chmod +x "$shim_fail/ps" "$shim_empty/ps"
+  self_pg="$(own_pgid $$)"
+
+  got="$(source "$SCRIPT_DIR/review_wait.sh"; rw_group_state "")"
+  [ "$got" = unverified ] && pass "케이스 42a: pgid 빈 값 → unverified" || fail "케이스 42a: 기대 unverified — 실제 '$got'"
+
+  got="$(PATH="$shim_fail:$PATH"; source "$SCRIPT_DIR/review_wait.sh"; rw_group_state "$self_pg")"
+  [ "$got" = unverified ] && pass "케이스 42b: ps rc≠0 → unverified" || fail "케이스 42b: 기대 unverified — 실제 '$got'"
+
+  got="$(PATH="$shim_empty:$PATH"; source "$SCRIPT_DIR/review_wait.sh"; rw_group_state "$self_pg")"
+  [ "$got" = unverified ] && pass "케이스 42c: ps rc=0 + 빈 출력 → unverified" || fail "케이스 42c: 기대 unverified — 실제 '$got'"
+
+  got="$(source "$SCRIPT_DIR/review_wait.sh"; rw_group_state "$self_pg")"
+  [ "$got" = alive ] && pass "케이스 42d: 구성원 있음 → alive" || fail "케이스 42d: 기대 alive — 실제 '$got'"
+
+  got="$(source "$SCRIPT_DIR/review_wait.sh"; rw_group_state 99999999)"
+  [ "$got" = verified ] && pass "케이스 42e: 구성원 없음 → verified" || fail "케이스 42e: 기대 verified — 실제 '$got'"
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 43 (spec §6 개정 1, A1·A2): 어댑터가 발행하는 .review_wait_status 의 writer_group 줄
+#   한 하니스를 도구(codex·claude)로 매개변수화한다.
+#   A1 = ps 가 실패하는 PATH shim + mock 즉시 exit 1 → writer_group: unverified
+#   A2 = 정상 ps + mock 즉시 exit 1 → writer_group: verified
+#   A3 = 정상 동작하되 항상 「리더 그룹 구성원 없음」 목록을 돌려주는 ps shim → pgid 확보는 실패(빈 값)하지만
+#        어댑터가 리더 pid 로 그룹을 조회해 verified 를 낸다. A2 는 경쟁에서 이기면 pgid 가 채워져 이 폴백을
+#        밟지 못하므로(변이 M24·M25 가 A2 만으로는 생존했다), A3 이 폴백 경로를 결정적으로 강제한다.
+# ===========================================================================
+writer_group_harness() {  # $1=codex|claude $2=A1|A2 $3=기대 값
+  local tool="$1" mode="$2" want="$3" sandbox mock_bin shim adapter rc=0 got body
+  sandbox="$(make_sandbox)" || { fail "케이스 43 ${mode}(${tool}): sandbox 생성 실패"; return; }
+  body="exit 1"
+  if [ "$tool" = codex ]; then
+    mock_bin="$(setup_mock "$sandbox" "$body")"; adapter="$ADAPTER"
+    write_session "$sandbox" "Reviewer" "awaiting-reviewer"
+  else
+    mock_bin="$(setup_mock_claude "$sandbox" "$body")"; adapter="$ADAPTER_CLAUDE"
+  fi
+  shim="$sandbox/shim"; mkdir -p "$shim"
+  if [ "$mode" = A1 ]; then
+    printf '#!/bin/sh\nexit 1\n' > "$shim/ps"; chmod +x "$shim/ps"
+  elif [ "$mode" = A3 ]; then
+    printf '#!/bin/sh\nprintf "  PID  PGID\\n    1     1\\n"\n' > "$shim/ps"; chmod +x "$shim/ps"
+  fi
+  PATH="$shim:$PATH" \
+  TOOL_BIN="$mock_bin/$tool" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+  EXPECTED_TURN_FILE="$sandbox/turns/turn-001.md" PROJECT_ROOT="$sandbox" \
+  WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=60 \
+    bash "$adapter" >/dev/null 2>&1 || rc=$?
+  got="$(grep '^writer_group:' "$sandbox/.review_wait_status" 2>/dev/null || true)"
+  if [ "$got" = "writer_group: $want" ]; then
+    pass "케이스 43 ${mode}(${tool}): 발행된 상태 파일에 'writer_group: ${want}' (rc=$rc)"
+  else
+    fail "케이스 43 ${mode}(${tool}): 기대 'writer_group: ${want}' — 실제 '${got}' (rc=$rc)"
+  fi
+  rm -rf "$sandbox"
+}
+
+run_case43() {
+  local t
+  for t in codex claude; do
+    writer_group_harness "$t" A1 unverified
+    writer_group_harness "$t" A2 verified
+    writer_group_harness "$t" A3 verified
+  done
+}
+
+# ===========================================================================
+# 케이스 44 (final diff review 턴 004 F2): 리더 pid 폴백이 spawn 전·pgid 확보 중 cleanup 을 깨지 않는다
+#   (a) spawn 전 부분 초기화 실패(mkfifo 실패 shim): cleanup 이 `RW_TARGET_PID: unbound variable` 로 죽지 않는다.
+#   (b) pgid 확보 중 SIGTERM(ps shim 이 진입을 표시하고 대기 뒤 실패): 신호 종료 코드 143 이 보존되고 unbound 오류가 없다.
+#   (c) trap 설치 후·spawn 전 SIGTERM(결정적): 테스트 전용 BASH_ENV 가 DEBUG trap 을 걸어, 어댑터가 spawn 직전의
+#       `set -m` 을 실행하려는 순간 자기 자신에게 SIGTERM 을 보낸다 → 143 보존·unbound 오류 없음. 이 창은 외부 명령이
+#       없어 시간으로 맞출 수 없으므로 DEBUG 계측으로 강제한다(final diff review 턴 006 F3, 변이 M27·M28 의 목표).
+#   codex·claude 양쪽에 같은 하니스를 쓴다.
+# ===========================================================================
+init_guard_harness() {  # $1=codex|claude $2=a|b|c
+  local tool="$1" mode="$2" sandbox mock_bin shim adapter rc=0 err marker pid i
+  sandbox="$(make_sandbox)" || { fail "케이스 44${mode}(${tool}): sandbox 생성 실패"; return; }
+  if [ "$tool" = codex ]; then
+    mock_bin="$(setup_mock "$sandbox" "sleep 20")"; adapter="$ADAPTER"
+    write_session "$sandbox" "Reviewer" "awaiting-reviewer"
+  else
+    mock_bin="$(setup_mock_claude "$sandbox" "sleep 20")"; adapter="$ADAPTER_CLAUDE"
+  fi
+  shim="$sandbox/shim"; mkdir -p "$shim"; err="$sandbox/adapter.err"; marker="$sandbox/ps-entered"
+  if [ "$mode" = c ]; then
+    local benv="$sandbox/debug_env.sh"
+    printf '%s\n' "trap 'if [[ \"\$BASH_COMMAND\" == \"set -m\" ]]; then trap - DEBUG; kill -TERM \$\$; fi' DEBUG" > "$benv"
+    BASH_ENV="$benv" TOOL_BIN="$mock_bin/$tool" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+      EXPECTED_TURN_FILE="$sandbox/turns/turn-001.md" PROJECT_ROOT="$sandbox" \
+      WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=60 \
+      bash "$adapter" >/dev/null 2>"$err" || rc=$?
+    if [ "$rc" -eq 143 ] && ! grep -q 'unbound variable' "$err"; then
+      pass "케이스 44c(${tool}): trap 설치 후·spawn 전 SIGTERM 에서 143 보존·unbound 오류 없음"
+    else
+      fail "케이스 44c(${tool}): 기대 rc=143·unbound 없음 — rc=$rc, $(grep -m1 'unbound' "$err" || echo '(unbound 없음)')"
+    fi
+  elif [ "$mode" = a ]; then
+    printf '#!/bin/sh\nexit 1\n' > "$shim/mkfifo"; chmod +x "$shim/mkfifo"
+    PATH="$shim:$PATH" TOOL_BIN="$mock_bin/$tool" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+      EXPECTED_TURN_FILE="$sandbox/turns/turn-001.md" PROJECT_ROOT="$sandbox" \
+      WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=60 \
+      bash "$adapter" >/dev/null 2>"$err" || rc=$?
+    if [ "$rc" -eq 1 ] && ! grep -q 'unbound variable' "$err"; then
+      pass "케이스 44a(${tool}): spawn 전 실패에서 cleanup 이 정상 완료 (rc=1, unbound 오류 없음)"
+    else
+      fail "케이스 44a(${tool}): 기대 rc=1·unbound 없음 — rc=$rc, $(grep -m1 'unbound' "$err" || echo '(unbound 없음)')"
+    fi
+  else
+    printf '#!/bin/sh\n: > "%s"\nsleep 3\nexit 1\n' "$marker" > "$shim/ps"; chmod +x "$shim/ps"
+    PATH="$shim:$PATH" TOOL_BIN="$mock_bin/$tool" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+      EXPECTED_TURN_FILE="$sandbox/turns/turn-001.md" PROJECT_ROOT="$sandbox" \
+      WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=60 \
+      bash "$adapter" >/dev/null 2>"$err" &
+    pid=$!
+    for i in $(seq 1 100); do [ -e "$marker" ] && break; sleep 0.05; done
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || rc=$?
+    if [ "$rc" -eq 143 ] && ! grep -q 'unbound variable' "$err"; then
+      pass "케이스 44b(${tool}): pgid 확보 중 SIGTERM 에서 143 보존·unbound 오류 없음"
+    else
+      fail "케이스 44b(${tool}): 기대 rc=143·unbound 없음 — rc=$rc, $(grep -m1 'unbound' "$err" || echo '(unbound 없음)')"
+    fi
+  fi
+  rm -rf "$sandbox"
+}
+
+# 케이스 45: 타임아웃 기록 진행 표시 — 관측한 파일 상태별로 서로 다른 문구, 원인·위치 단정 금지
+# 세 상태 모두 WAIT_TIMEOUT=2 로 타임아웃시킨다 (mock 은 sleep 30).
+# mock 본문 $2 를 실행한 뒤 sleep 한다. 출력을 전역 C45_OUT 에 담는다.
+run_case45_one() {
+  local sandbox mock_bin expected_turn
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  write_session "$sandbox" "Reviewer" "awaiting-reviewer"
+  write_checkpoint "$sandbox" "Author"
+  # CHECKPOINT mtime 을 과거로 고정해 「이전 턴의 기록」 상태를 만든다
+  touch -t 200001010000 "$sandbox/CHECKPOINT.md"
+  mock_bin="$(setup_mock "$sandbox" "$1; exec sleep 30")"
+  C45_OUT="$(
+    TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE="/dev/null"     EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" WAIT_TIMEOUT=2       bash "$ADAPTER" 2>&1
+  )" || true
+  rm -rf "$sandbox"
+}
+
+run_case45() {
+  local none turn_only both turn="\$EXPECTED_TURN_FILE" ck="\$SESSION_PATH/CHECKPOINT.md"
+  run_case45_one ':'
+  none="$(echo "$C45_OUT" | grep '^기록 진행:' || true)"
+  run_case45_one "echo x > \"$turn\""
+  turn_only="$(echo "$C45_OUT" | grep '^기록 진행:' || true)"
+  # 미래 시각으로 만들어 시작 기준 파일보다 확실히 새롭게 한다 (mtime 해상도 의존 제거)
+  run_case45_one "echo x > \"$turn\"; touch -t 203001010000 \"$ck\""
+  both="$(echo "$C45_OUT" | grep '^기록 진행:' || true)"
+
+  if [ -n "$none" ] && [ -n "$turn_only" ] && [ -n "$both" ] \
+     && [ "$none" != "$turn_only" ] && [ "$turn_only" != "$both" ] && [ "$none" != "$both" ]; then
+    pass "케이스 45a: 기록 상태 세 가지의 표시가 서로 다름"
+  else
+    fail "케이스 45a: 표시가 비었거나 같음 — none=[$none] turn=[$turn_only] both=[$both]"
+  fi
+  # 기록이 없다고 기록 경로가 정상이라고 단정하지 않는다
+  if echo "$none" | grep -q '실패했을 수 있' && ! echo "$none" | grep -q '기록 경로 문제는 아님'; then
+    pass "케이스 45b: 기록 없음 표시가 원인을 단정하지 않음"
+  else
+    fail "케이스 45b: 기록 없음 표시가 원인을 단정함 — [$none]"
+  fi
+  # 기록이 모두 끝났어도 타임아웃일 수 있으므로 SESSION 갱신 전 중단을 단정하지 않는다
+  if echo "$both" | grep -q 'SESSION.md 는 이 표시가 확인하지 않' && ! echo "$both" | grep -q 'SESSION.md 갱신 전'; then
+    pass "케이스 45c: 기록 완료 관측 표시가 SESSION 미확인을 밝히고 중단 위치를 단정하지 않음"
+  else
+    fail "케이스 45c: 표시가 SESSION 상태를 단정함 — [$both]"
+  fi
+}
+
+run_case44() {
+  local t m
+  for t in codex claude; do
+    for m in a b c; do
+      init_guard_harness "$t" "$m"
+    done
+  done
+}
+
+
+# ===========================================================================
 # 실행
 # ===========================================================================
 echo "=== adapter_codex.sh 대기 계약·판정 단일화 테스트 ==="
@@ -3089,12 +3348,28 @@ run_case35
 run_case36a
 run_case36b
 run_case36c
+run_case36d
 run_case37
 run_case38
 run_case39
 run_case40
 
 run_case41
+
+echo ""
+echo "=== writer 종료 증거 계약 (spec §6 개정 1) ==="
+echo ""
+
+run_case42
+run_case43
+run_case44
+
+echo ""
+echo "=== 타임아웃 기록 진행 표시 ==="
+echo ""
+
+run_case45
+
 echo ""
 echo "=== 결과: PASS=$PASS FAIL=$FAIL ==="
 

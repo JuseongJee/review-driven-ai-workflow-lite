@@ -223,10 +223,27 @@ cat > "$PROJ/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md" <<'FR'
 
 ## 인덱스
 
-| 날짜 | 제목 |
-|------|------|
-| 2026-01-01 | sample-item |
+| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 관계 | 상세 |
+|------|------|------|------|------|----------|------|------|
+| 2026-01-01 | sample-item | acceptance fixture 용 샘플 항목입니다. | feature | idea | P3 | - | [상세](items/2026-01-01-sample-item.md) |
 FR
+# 인덱스 행과 짝이 되는 상세 파일을 두어 fixture 를 인덱스·상세가 일치하는 상태로 구성합니다 (없어도 consumer 는 FAIL 하지 않습니다 — 정합성 검사는 신호 전용).
+mkdir -p "$PROJ/rd-workflow-workspace/backlog/items"
+cat > "$PROJ/rd-workflow-workspace/backlog/items/2026-01-01-sample-item.md" <<'ITEM'
+# 2026-01-01 sample-item
+- status: idea
+- kind: feature
+- summary: acceptance fixture 용 샘플 항목입니다.
+- depends-on: -
+- relates: -
+- why: fixture 인덱스 행과 짝을 맞춥니다.
+- related context: -
+- related files: -
+- not now because: fixture 입니다.
+- revisit when: -
+- github-issue: -
+- request seed: -
+ITEM
 
 echo "== before: 결함이 실제로 재현되는지 =="
 # 통과가 의미를 갖도록 "원래 실패했다" 를 먼저 단언한다 (M008 검증의 대조군 E3 과 같은 역할)

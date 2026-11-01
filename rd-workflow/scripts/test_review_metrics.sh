@@ -286,6 +286,121 @@ sess="$TMP/other"; mk_full_session "$sess"
 rc="$(run_with_mock_adapter "$sess" 'exit 7')"
 [ "$rc" = "1" ] && pass "일반 실패: 부모가 1 로 매핑" || fail "일반 실패: 기대 1 — 실제 $rc"
 grep -q 'RD_REVIEW_EFFORT_OVERRIDE=0' "$TMP/last_err.txt"; chk $? "일반 실패: effort 복구 안내 보존 (기타 non-zero 경로 약화 금지)"
+! grep -q '제거' "$TMP/last_err.txt"; chk $? "일반 실패: 영구 변경(제거) 지시 없음"
+grep -q '^세션: (나)' "$TMP/last_err.txt"; chk $? "일반 실패: 상태 파일 없음 → 세션 (나)"
+
+# ---------------------------------------------------------------------------
+# 일반 실패 진단 통합 (원인·세션 분리). mock 어댑터가 로그·상태 파일을 만든 뒤 exit 1.
+# 판정 경계는 함수 층이 보고, 여기서는 처방·세션 표시가 부모 출력에 연결되는지만 본다.
+# ---------------------------------------------------------------------------
+mk_log_body() { # $1=로그 끝 오류 줄 $2=상태 파일 발행 여부(1|0) — 본문 + 빈 줄 + 오류 줄 + 푸터
+  local body='printf "본문 한 줄\n\n%s\ntokens used\n1,234\n" "'"$1"'" > "${SESSION_PATH}/.codex_output.log"'
+  [ "${2:-1}" = "1" ] && body="$body"$'\n''printf "done\nwriter_group: verified\n" > "${SESSION_PATH}/.review_wait_status"'
+  printf '%s\nexit 1' "$body"
+}
+CAP_LINE='ERROR: Selected model is at capacity. Please try a different model.'
+NOEFF_VARIANT_LINE="error: unknown variant 'foo' in config"
+
+# T1: 용량 부족 + 상태 파일 + 정상 세션
+sess="$TMP/t1"; mk_full_session "$sess"
+rc="$(run_with_mock_adapter "$sess" "$(mk_log_body "$CAP_LINE" 1)")"
+eq "$rc" "1" "T1: 부모 종료 1"
+grep -q '^어댑터 실행 실패: codex\.$' "$TMP/last_err.txt"; chk $? "T1: 첫 줄 실패 도구 표시"
+grep -q '원인(로그 끝 오류 줄 기준):.*용량' "$TMP/last_err.txt"; chk $? "T1: 용량 원인 라벨"
+grep -q '재시도' "$TMP/last_err.txt"; chk $? "T1: 재시도 처방"
+! grep -q 'RD_REVIEW_EFFORT_OVERRIDE=0' "$TMP/last_err.txt"; chk $? "T1: effort 복구 안내 부재"
+! grep -q '오염되었을 수 있으므로' "$TMP/last_err.txt"; chk $? "T1: 오염 문구 부재"
+! grep -q '제거' "$TMP/last_err.txt"; chk $? "T1: 영구 변경(제거) 지시 부재"
+grep -q '^세션: (가)' "$TMP/last_err.txt"; chk $? "T1: 세션 (가)"
+
+# T3: effort 전달 + effort 키 없는 unknown variant
+sess="$TMP/t3"; mk_full_session "$sess"
+rc="$(run_with_mock_adapter "$sess" "$(mk_log_body "$NOEFF_VARIANT_LINE" 1)")"
+eq "$rc" "1" "T3: 부모 종료 1"
+grep -q '원인 불명' "$TMP/last_err.txt"; chk $? "T3: 원인 불명 표시"
+! grep -q 'effort 거부' "$TMP/last_err.txt"; chk $? "T3: effort 거부 확정 문구 부재"
+grep -q 'RD_REVIEW_EFFORT_OVERRIDE=0' "$TMP/last_err.txt" && grep -q 'review-tools.json' "$TMP/last_err.txt"; chk $? "T3: 포괄 안내(일회성 무력화 + 값 확인) 존재"
+! grep -q '제거' "$TMP/last_err.txt"; chk $? "T3: 영구 변경(제거) 지시 부재"
+
+# T4: 끝 블록 안의 구분 불가 인용 두 변형
+sess="$TMP/t4a"; mk_full_session "$sess"
+rc="$(run_with_mock_adapter "$sess" "$(mk_log_body "$CAP_LINE" 1)")"
+grep -q '원인(로그 끝 오류 줄 기준)' "$TMP/last_err.txt"; chk $? "T4(capacity 인용): 출처 표시 라벨"
+! grep -q 'RD_REVIEW_EFFORT_OVERRIDE' "$TMP/last_err.txt"; chk $? "T4(capacity 인용): 설정 변경 처방 부재"
+! grep -q '제거' "$TMP/last_err.txt"; chk $? "T4(capacity 인용): 영구 변경(제거) 지시 부재"
+sess="$TMP/t4b"; mk_full_session "$sess"
+rc="$(run_with_mock_adapter "$sess" "$(mk_log_body "error: invalid value for '-c model_reasoning_effort': unknown variant 'x'" 1)")"
+grep -q '원인(로그 끝 오류 줄 기준)' "$TMP/last_err.txt"; chk $? "T4(effort 인용): 출처 표시 라벨"
+! grep -q '제거' "$TMP/last_err.txt"; chk $? "T4(effort 인용): 영구 변경(제거) 지시 부재"
+
+# T6: 상태 파일 없음 + 턴 파일 일부 존재
+sess="$TMP/t6"; mk_full_session "$sess"
+rc="$(run_with_mock_adapter "$sess" 'printf "작성 중\n" > "${SESSION_PATH}/turns/002_reviewer.md"
+exit 1')"
+eq "$rc" "1" "T6: 부모 종료 1"
+grep -q '^세션: (나)' "$TMP/last_err.txt"; chk $? "T6: 세션 (나)"
+grep -q '턴 파일: 존재' "$TMP/last_err.txt"; chk $? "T6: 관측 줄에 턴 파일 존재"
+! grep -q '재실행하면 이어집니다' "$TMP/last_err.txt"; chk $? "T6: 재실행 보장 문구 부재"
+
+# T7: 로그 부재 + 상태 파일 + 세션 불변
+sess="$TMP/t7"; mk_full_session "$sess"
+rc="$(run_with_mock_adapter "$sess" 'printf "done\nwriter_group: verified\n" > "${SESSION_PATH}/.review_wait_status"
+exit 1')"
+grep -q '원인 불명' "$TMP/last_err.txt"; chk $? "T7: 원인 불명"
+grep -q 'RD_REVIEW_EFFORT_OVERRIDE=0' "$TMP/last_err.txt"; chk $? "T7: 포괄 안내 존재"
+grep -q '^세션: (가)' "$TMP/last_err.txt"; chk $? "T7: 세션 (가)"
+! grep -q '제거' "$TMP/last_err.txt"; chk $? "T7: 영구 변경(제거) 지시 부재"
+
+# T8: 이전 턴의 stale 로그·상태 파일 → 부모 사전 정리
+sess="$TMP/t8"; mk_full_session "$sess"
+printf '본문\n\n%s\ntokens used\n9\n' "$CAP_LINE" > "$sess/.codex_output.log"
+printf 'done\nwriter_group: verified\n' > "$sess/.review_wait_status"
+rc="$(run_with_mock_adapter "$sess" 'exit 1')"
+eq "$rc" "1" "T8: 부모 종료 1"
+grep -q '원인 불명' "$TMP/last_err.txt"; chk $? "T8: 이전 capacity 로그를 읽지 않고 원인 불명"
+! grep -q '용량' "$TMP/last_err.txt"; chk $? "T8: 이전 원인 미표시"
+grep -q '^세션: (나)' "$TMP/last_err.txt"; chk $? "T8: 이전 상태 파일을 증거로 쓰지 않고 (나)"
+
+# T8b: 이전 턴 stale 이 있어도 이번 실행이 새로 발행하면 정상 진단 (사전 정리가 없으면 stale 표시로 진단이 후퇴한다)
+sess="$TMP/t8b"; mk_full_session "$sess"
+printf '본문\n\n%s\ntokens used\n9\n' "$CAP_LINE" > "$sess/.codex_output.log"
+printf 'old\n' > "$sess/.review_wait_status"
+rc="$(run_with_mock_adapter "$sess" "$(mk_log_body 'ERROR: rate limit exceeded, retry later' 1)")"
+eq "$rc" "1" "T8b: 부모 종료 1"
+grep -q '원인(로그 끝 오류 줄 기준):.*rate limit' "$TMP/last_err.txt"; chk $? "T8b: 이번 실행의 로그를 원인으로 읽음"
+! grep -q '용량' "$TMP/last_err.txt"; chk $? "T8b: 이전 턴 원인 미표시"
+grep -q '^세션: (가)' "$TMP/last_err.txt"; chk $? "T8b: 이번 실행이 발행한 상태 파일로 (가)"
+
+# T9: stale 삭제 불가(로그 경로가 디렉터리) + 새 유효 상태 파일 + 정상 세션
+sess="$TMP/t9"; mk_full_session "$sess"
+mkdir -p "$sess/.codex_output.log"
+rc="$(run_with_mock_adapter "$sess" 'printf "done\nwriter_group: verified\n" > "${SESSION_PATH}/.review_wait_status"
+exit 1')"
+eq "$rc" "1" "T9: 부모 종료 1"
+grep -q '원인 불명' "$TMP/last_err.txt"; chk $? "T9: 원인 불명"
+grep -q '^세션: (나)' "$TMP/last_err.txt"; chk $? "T9: 삭제 불가 표시 시 writer 종료 미확인 (나)"
+
+# T11: 어댑터가 종료를 증명하지 못하고(unverified) 발행 + 세션 불변 → (나), 재실행 보장 문구 부재
+sess="$TMP/t11"; mk_full_session "$sess"
+rc="$(run_with_mock_adapter "$sess" 'printf "done\nwriter_group: unverified\n" > "${SESSION_PATH}/.review_wait_status"
+exit 1')"
+eq "$rc" "1" "T11: 부모 종료 1"
+grep -q '^세션: (나)' "$TMP/last_err.txt"; chk $? "T11: unverified 발행은 종료 미확인 → 세션 (나)"
+! grep -q '재실행하면 이어집니다' "$TMP/last_err.txt"; chk $? "T11: 재실행 보장 문구 부재"
+grep -q 'writer 종료: 미확인' "$TMP/last_err.txt"; chk $? "T11: 관측 줄에 writer 종료 미확인"
+
+# T10: 4원인 처방 연결
+t10_check() { # $1=이름 $2=오류 줄 $3=처방 문구
+  sess="$TMP/t10_$1"; mk_full_session "$sess"
+  run_with_mock_adapter "$sess" "$(mk_log_body "$2" 1)" >/dev/null
+  grep -q "$3" "$TMP/last_err.txt"; chk $? "T10($1): 처방 '$3'"
+  ! grep -q 'RD_REVIEW_EFFORT_OVERRIDE' "$TMP/last_err.txt"; chk $? "T10($1): effort 안내 부재"
+  ! grep -q '제거' "$TMP/last_err.txt"; chk $? "T10($1): 영구 변경(제거) 지시 부재"
+}
+t10_check capacity "$CAP_LINE" '재시도'
+t10_check rate 'ERROR: rate limit exceeded, too many requests' '재시도'
+t10_check auth 'ERROR: unauthorized: not logged in' '로그인'
+t10_check model 'ERROR: model not found: gpt-x' '모델 지정'
 
 # ---------------------------------------------------------------------------
 # 137(SIGKILL) — cleanup 을 보장하지 못하는 신호 (final diff review 턴 004 Important 2)
@@ -335,5 +450,84 @@ chk $? "137(SIGKILL): 프로세스 종료 확인 전 재실행 금지 안내"
 
 # 자손 정리 — 소유가 확인된 pid 만 종료한다
 [ -n "$kill_child" ] && kill -9 "$kill_child" 2>/dev/null || true
+
+echo "=== 원인·세션 판정 함수 ==="
+(
+  set +e
+  source "${script_dir}/review_common.sh"
+  set -euo pipefail
+  D="$TMP/fn"; mkdir -p "$D"
+  # 실측 로그 끝 블록 형태: 본문 + 빈 줄 + ERROR 줄 + tokens used + 숫자 줄
+  mk_codex_log() { # $1=파일 $2=끝 오류 줄 [$3=앞쪽 본문에 넣을 줄]
+    { printf 'exec\n'; [ -n "${3:-}" ] && printf '%s\n' "$3"; printf 'some model output\ncodex\nwork done\n\n%s\ntokens used\n12,345\n' "$2"; } > "$1"
+  }
+  cls() { classify_adapter_failure_cause "$1" "$2"; }
+
+  mk_codex_log "$D/effort.log" "error: invalid value for '-c model_reasoning_effort': unknown variant 'x'"
+  eq "$(cls "$D/effort.log" codex)" "confirmed effort" "F-effort: effort 키+거부 문구 → confirmed effort"
+  mk_codex_log "$D/variant.log" "error: unknown variant 'foo' in config"
+  eq "$(cls "$D/variant.log" codex)" "unknown " "F-variant: effort 키 없는 unknown variant → unknown"
+  mk_codex_log "$D/cap.log" "ERROR: Selected model is at capacity. Please try a different model."
+  eq "$(cls "$D/cap.log" codex)" "confirmed capacity" "F-capacity"
+  mk_codex_log "$D/rate.log" "ERROR: Rate limit exceeded, retry later"
+  eq "$(cls "$D/rate.log" codex)" "confirmed ratelimit" "F-rate"
+  mk_codex_log "$D/auth.log" "ERROR: Not logged in. Please run login"
+  eq "$(cls "$D/auth.log" codex)" "confirmed auth" "F-auth"
+  mk_codex_log "$D/model.log" "ERROR: model not found: gpt-xyz"
+  eq "$(cls "$D/model.log" codex)" "confirmed model" "F-model"
+  { printf 'body\n\n'; printf 'ERROR: Selected model is at capacity.\nERROR: Rate limit exceeded\ntokens used\n5\n'; } > "$D/multi.log"
+  eq "$(cls "$D/multi.log" codex)" "candidates capacity,ratelimit" "F-multi: 끝 블록의 두 원인 → candidates 병기"
+  mk_codex_log "$D/qmid.log" "ERROR: something unrelated failed" "ERROR: Selected model is at capacity. (본문 인용)"
+  # 앞쪽 인용은 블록 밖: 끝 블록에 다른 내용만 있고, 그 앞에 비-ERROR 줄이 끼어 있어야 한다
+  eq "$(cls "$D/qmid.log" codex)" "unknown " "F-quote-mid: 블록 밖 앞쪽 capacity 인용은 세지 않음"
+  mk_codex_log "$D/qblk-cap.log" "ERROR: Selected model is at capacity."
+  eq "$(cls "$D/qblk-cap.log" codex)" "confirmed capacity" "F-quote-block(capacity): 형식상 구분 불가 → confirmed capacity"
+  mk_codex_log "$D/qblk-eff.log" "ERROR: invalid value for model_reasoning_effort: unknown variant 'q'"
+  eq "$(cls "$D/qblk-eff.log" codex)" "confirmed effort" "F-quote-block(effort): 형식상 구분 불가 → confirmed effort"
+
+  { printf '{"type":"assistant","message":"ERROR: model is at capacity"}\n'; printf '{"type":"result","is_error":true,"result":"API Error: rate limit reached"}\n'; } > "$D/claude.log"
+  if command -v jq >/dev/null 2>&1; then
+    eq "$(cls "$D/claude.log" claude)" "confirmed ratelimit" "F-claude: 어시스턴트 본문 줄 무시, result 오류 줄만"
+  else
+    pass "F-claude: jq 없음 — 건너뜀"
+  fi
+  NOJQ="$TMP/nojq-bin"; mkdir -p "$NOJQ"
+  for t in tail awk grep cat; do ln -sf "$(command -v $t)" "$NOJQ/$t"; done
+  # errexit+pipefail 을 실제로 켠 새 bash 에서 호출한다 (명령 치환 안에서는 errexit 가 꺼져 jq 실패 흡수를 검증하지 못한다)
+  nojq_out="$(PATH="$NOJQ" "$BASH" -c 'set -euo pipefail; source "$1"; classify_adapter_failure_cause "$2" claude' _ "${script_dir}/review_common.sh" "$D/claude.log")"; nojq_rc=$?
+  eq "$nojq_out|$nojq_rc" "unknown |0" "F-nojq: jq 부재에도 unknown·rc 0 (부모 생존)"
+
+  eq "$(cls "$D/none.log" codex)" "unknown " "F-absent: 로그 부재 → unknown"
+  ln -sf "$D/cap.log" "$D/link.log"
+  eq "$(cls "$D/link.log" codex)" "unknown " "F-symlink: symlink 로그 → unknown"
+  eq "$(cls "" codex)" "unknown " "F-stale: STALE_UNCLEARED 빈 경로 → unknown"
+
+  # S-*: assess_session_safety
+  mk_sess() { # $1=파일 $2=Owner $3=Status
+    printf '# Review Session\n\n## Status\n%s\n\n## Current Owner\n%s\n\n## Turn Limit\n20\n' "$3" "$2" > "$1"
+  }
+  mk_sess "$D/s_ok.md" Reviewer awaiting-reviewer
+  mk_sess "$D/s_own.md" Author awaiting-reviewer
+  mk_sess "$D/s_sta.md" Reviewer awaiting-author
+  # 종료 확인은 상태 파일의 `writer_group: verified` 줄이 있을 때만 인정한다(spec §6).
+  printf 'log_preserved: yes\nwriter_group: verified\n' > "$D/wait_status"; ln -sf "$D/wait_status" "$D/wait_link"
+  printf 'log_preserved: yes\nwriter_group: unverified\n' > "$D/wait_unverified"
+  printf 'log_preserved: yes\noutcome: cli-failed\n' > "$D/wait_nomarker"
+  : > "$D/turn_exists.md"
+  s1() { assess_session_safety "$@" | head -n 1; }
+  eq "$(s1 "$D/s_ok.md" "$D/nope.md" "$D/none_status")" "manual" "S-없음: 상태 파일 없음 → manual"
+  eq "$(s1 "$D/s_ok.md" "$D/nope.md" "$D/wait_link")" "manual" "S-symlink: symlink 상태 파일 → manual"
+  eq "$(s1 "$D/s_ok.md" "$D/turn_exists.md" "$D/wait_status")" "anomaly" "S-턴 파일 존재 → anomaly"
+  eq "$(s1 "$D/s_own.md" "$D/nope.md" "$D/wait_status")" "anomaly" "S-Owner 만 불일치 → anomaly"
+  eq "$(s1 "$D/s_sta.md" "$D/nope.md" "$D/wait_status")" "anomaly" "S-Status 만 불일치 → anomaly"
+  eq "$(s1 "$D/s_ok.md" "$D/nope.md" "$D/wait_status")" "ok" "S-정상 → ok"
+  eq "$(s1 "$D/s_ok.md" "$D/nope.md" "")" "manual" "S-빈 경로 → manual"
+  eq "$(s1 "$D/s_ok.md" "$D/nope.md" "$D/wait_unverified")" "manual" "S-unverified: writer_group: unverified → manual"
+  eq "$(s1 "$D/s_ok.md" "$D/nope.md" "$D/wait_nomarker")" "manual" "S-nomarker: writer_group 줄 없음(옛 형식) → manual"
+  eq "$(s1 "$D/s_ok.md" "$D/nope.md" "$D/wait_status")" "ok" "S-verified: writer_group: verified + 턴 파일 부재 + 세션 정상 → ok"
+  eq "$(assess_session_safety "$D/s_ok.md" "$D/nope.md" "$D/wait_status" | sed -n 2p)" "턴 파일: 부재, Current Owner='Reviewer', Status='awaiting-reviewer', writer 종료: 확인" "S-관측 줄 형식"
+  exit "$FAIL"
+) || fail "판정 함수 파트 실패 (서브셸 rc 전파)"
+
 
 [ "$FAIL" -eq 0 ] && echo "OK" || { echo "FAILED"; exit 1; }

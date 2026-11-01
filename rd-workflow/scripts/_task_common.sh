@@ -78,6 +78,7 @@ assert_no_symlink_in_path() {
 # '아카이브 보류'(change-spec §4.1)는 리뷰 종결과 발행 사이의 상태다. 'diff review 대기' 에서
 # 들어와 '완료' 로 나가며, '구현 중' 으로 되돌아갈 수도 있다 — 리뷰 후 변경이 필요해진 경우이고,
 # 그때는 보호 트리 해시 판정이 기존 종결을 무효로 만든다.
+# '아카이브 보류→검증 중' 은 외부 검증 대기다. 돌아올 때는 '검증 중→diff review 대기→아카이브 보류'.
 # '구현 대기'(change-spec 2026-09-24-1836-task-status-no-implementation-pending)는 spec/plan
 # review 종결과 구현 착수 사이의 상태다. 'spec/plan review 대기' 에서 들어와 '구현 중' 으로
 # 나가며, 'spec/plan 작성 중' 으로 되돌아갈 수도 있다 — 리뷰 후 변경이 필요해진 경우다.
@@ -94,7 +95,7 @@ task_transition_allowed() {
     "구현 중→검증 중"|"검증 중→구현 중"|"검증 중→diff review 대기"|\
     "diff review 대기→구현 중"|"diff review 대기→완료"|\
     "diff review 대기→아카이브 보류"|"아카이브 보류→완료"|\
-    "아카이브 보류→구현 중") return 0 ;;
+    "아카이브 보류→구현 중"|"아카이브 보류→검증 중") return 0 ;;
   esac
   return 1
 }
@@ -237,9 +238,14 @@ task_resolve_target() {
 
   cwd_real="$(cd "${project_root}" 2>/dev/null && pwd -P)" || cwd_real=""
 
+  # 진행 중 작업 집합(정리 대기 제외) — 「여러 건」 판정과 0건 fallback 이 쓴다.
   local slugs
   slugs="$(tasks_index_slugs 2>/dev/null)" || slugs=""
-  if [[ -n "$cwd_real" && -n "$slugs" ]]; then
+  # cwd 탐색은 정리 대기 행까지 본다 — 정리 대기 worktree 안에서 부른 호출이 다른 진행 중
+  # 작업으로 조용히 대체되지 않게 하려는 것이다.
+  local cwd_candidates
+  cwd_candidates="$(tasks_index_all_slugs 2>/dev/null)" || cwd_candidates=""
+  if [[ -n "$cwd_real" && -n "$cwd_candidates" ]]; then
     while IFS= read -r s; do
       [[ -z "$s" ]] && continue
       wt_path="$(tasks_index_get "$s" worktree-path 2>/dev/null)" || wt_path=""
@@ -252,7 +258,7 @@ task_resolve_target() {
         cwd_slug="$s"
         break
       fi
-    done <<< "$slugs"
+    done <<< "$cwd_candidates"
   fi
 
   local target_slug=""
@@ -262,6 +268,12 @@ task_resolve_target() {
       echo "경고: 현재 worktree 의 작업(${cwd_slug})이 아니라 다른 작업(${explicit})을 대상으로 합니다." >&2
     fi
   elif [[ -n "$cwd_slug" ]]; then
+    # 정리 대기(발행 끝, worktree 정리만 남음) worktree 는 작업 대상이 아니다. 다른 작업으로
+    # 대체하지 않고 read·write 모두 명시적 대상 선택을 요구한다(진행 중 작업 수와 무관).
+    if [[ "$(tasks_index_get "$cwd_slug" state 2>/dev/null)" == "cleanup-pending" ]]; then
+      echo "이 worktree 의 작업('${cwd_slug}')은 발행을 마치고 정리 대기 상태입니다 — 다른 작업을 대신 고르지 않습니다. --task <slug> 로 대상을 지정하세요." >&2
+      return 1
+    fi
     target_slug="$cwd_slug"
   else
     local count=0 only=""
@@ -459,7 +471,10 @@ task_resolve_launch() {
         echo "resolve-launch: 인계는 전달하지 못했습니다 — 세션 화면에서 직접 지시해 주십시오 (생존 확정은 유효합니다)." >&2
         if [[ -n "$wt" ]]; then
           echo "  인계 문구:" >&2
-          session_handoff_text "$slug" "${_req:-<worktree>/REQUEST.md}" "$wt" >&2
+          local _hf=""
+          _hf="$(session_handoff_file_path "$wt")" || _hf=""
+          [[ -n "$_hf" && -f "$_hf" ]] || _hf=""
+          session_handoff_text "$slug" "${_req:-<worktree>/REQUEST.md}" "$wt" "$_hf" >&2
           echo "" >&2
         fi
       fi

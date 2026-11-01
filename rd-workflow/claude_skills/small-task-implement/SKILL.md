@@ -17,6 +17,7 @@ Typical user requests:
 
 1. **시작 계약 확인** (WORKFLOW.md 시작 계약 5항, 순서 그대로): `Status = 대기 중` → switch 전에 현재 브랜치·clean 선확인(dirty 면 상태 변경 없이 중단 — 이미 기본 브랜치이고 사용자가 전부 채택을 명시한 경우만 예외) → 필요 시 기본 브랜치 checkout 후 clean 재확인 → `bash rd-workflow/scripts/lifecycle/start_preflight.sh` 실행 — exit 0(synchronized·등록 커밋만 ahead 인 자동 채택·local-only)이면 진행, exit 10 은 인계(사용자가 ahead 커밋 발행을 명시 채택하면 진행하고 `## Risk Tier` 이력에 기록) → baseline HEAD 기록 → **시작 보고 블록 1회 출력** — 필드는 WORKFLOW.md 위험 등급 절의 정본 목록을 그대로 상속하고(`실행 모드: <모드> (출처: <출처>)` 포함), 여기서 값이 정해지는 것은 둘뿐입니다: `push 예정` = `archive.sh 경유`(채택한 ahead 커밋 수 병기), `미병합 브랜치 FR 후보` = preflight 출력 줄 그대로.
 2. **fr 브랜치 승격**: `bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug> --size small --source-fr <items 경로 또는 ->`. short-title 은 promote 가 기록하므로 이 skill 은 `CURRENT_TASK.md ## Short Title` 을 read-only 로만 씁니다. raw-capture 와 3-way 분기는 하지 않습니다.
+   `--source-fr -`(FR 없는 요청)이면 사용자 원문을 `rd-workflow/docs/guides/promote-handoff.md` 형식 인계 파일의 `## 확정 결정` 첫 항목으로 그대로 적고 `--handoff <file>` 로 **반드시** 넘깁니다. FR 이 있을 때만 promote 호출 전에 사용자와 확정한 결정이 있으면 같은 형식으로 파일을 쓰고 `--handoff <file>` 로 넘기며, 결정이 없으면 생략합니다.
 
 > **주의:** 위 2단계 직후 `launch=ok` 면 이 세션은 여기서 멈춘다 — 3단계부터는 기동된
 > 세션이 진행한다. `launch=unknown` 이면 이 세션도 아직 이어받지 않는다 —
@@ -27,17 +28,8 @@ Typical user requests:
 > 를 만들 뿐 현재 세션의 작업 디렉터리를 바꾸지 않으므로, 이동하지 않고 3단계를 진행하면
 > 원래 디렉터리(대개 기본 브랜치)의 파일을 건드리게 된다.
 >
-> **알려진 한계:** `--source-fr -`(FR 없는 자연어 요청)로 herdr 환경에서
-> `launch=ok` 가 된 경우 — 위 2단계 직후 곧바로든, `launch=unknown` 을
-> `resolve-launch` 로 확정해 `ok` 가 된 경우든 동일하게 — 기동된 세션은 slug·경로만
-> 인계받고 원래 사용자 요구사항은 모른다. 이 skill 은 raw-capture 를 하지 않으므로(위
-> 2단계) 인계 문구만으로는 3단계(축약 REQUEST 작성)를 수행할 수 없다. 이 한계는 FR
-> `small-task-implement-handoff-content-gap` 로 별도 추적한다(session-handoff-
-> contract-and-model final-diff-review 결정 — 재현 조건이 herdr+FR 없음으로 좁고,
-> 해소하려면 raw-capture·인계 문구 확장 등 새 데이터 흐름 설계가 필요해 별도 FR 로
-> 분리했다). 그 전까지는 이 조합에서 **호출 세션이 멈추기 전에** 원 요구사항을
-> 기동된 세션에 직접 붙여넣거나(`herdr agent prompt`), 기동된 세션 화면에서 사람이
-> 직접 원 요구사항을 입력해야 한다.
+> **FR 없는 요청의 인계:** `--source-fr -` 이면 기동된 세션이 사용자 원문을 알 수 없으므로,
+> 사용자 원문을 인계 파일 `## 확정 결정` 의 첫 항목으로 그대로 적고 `--handoff` 로 넘깁니다(필수).
 
 3. **축약 REQUEST 작성**: `Task Type`·`Execution Path`·`User Goal`·`Change Description`·`Acceptance Criteria`·`Risk Tier`·`Source FR` 만 채우고 나머지는 `-`. `## Risk Tier` 는 `- 최종 등급: standard` 를 포함해 6항목을 **작성 즉시** 채웁니다(`-` 로 두지 않음 — 파서가 malformed 로 봅니다. 재분류 때 확인·갱신). 필요하면 `Change Description` 안에 한 문단 spec + 한 목록 plan 을 적습니다.
 4. **AC 확인**: Acceptance Criteria 가 비어 있거나(`-`) 모호하면 구현을 시작하지 않고 사용자에게 확인을 요청합니다.

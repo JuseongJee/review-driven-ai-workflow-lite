@@ -146,10 +146,90 @@ out="$(bash "$SCRIPT_DIR/tasks_list.sh" --rebuild)"
   && pass "과거 tag 는 새 tip 의 발행 증거가 아니다" || fail "tag 계보 검증"
 
 # 9) 기존 cleanup-pending 행은 rebuild 가 덮어쓰지 않고 보존한다 (원격 정리만 실패한 잔여)
+git -C "$TMP" branch fr/delta main   # branch 가 남은 행만 보존 대상이다 (낡은 행은 list 가 지운다)
 tasks_index_upsert delta state=cleanup-pending published-at=2026-09-15-1900
 bash "$SCRIPT_DIR/tasks_list.sh" --rebuild >/dev/null
 [[ "$(tasks_index_get delta state)" == "cleanup-pending" ]] \
   && pass "rebuild 가 기존 정리 대기 행을 보존한다" || fail "cleanup-pending 보존"
+
+# ---------------------------------------------------------------------------
+# 낡은 정리 대기 행 정리 (A~F) — state=cleanup-pending AND fr branch 없음 AND worktree 디렉터리 없음
+# ---------------------------------------------------------------------------
+_has_row() { [[ -n "$(tasks_index_all_slugs | grep -x "$1" || true)" ]]; }
+git -C "$TMP" branch fr/brn main
+mkdir -p "$TMP/.worktrees/pthdir"
+tasks_index_upsert stale1 state=cleanup-pending published-at=2026-10-01-1000
+tasks_index_upsert stale2 fr-branch=fr/stale2 worktree-path="$TMP/.worktrees/gone" state=cleanup-pending
+tasks_index_upsert brn state=cleanup-pending published-at=2026-10-02-1000
+tasks_index_upsert pth state=cleanup-pending worktree-path="$TMP/.worktrees/pthdir"
+rc=0; out="$(bash "$SCRIPT_DIR/tasks_list.sh" 2>"$TMP/err")" || rc=$?
+# A1
+if [[ "$rc" -eq 0 ]] && ! _has_row stale1 && ! _has_row stale2 \
+   && [[ -z "$(grep -v '^정리:' <<<"$out" | grep -e stale1 -e stale2 || true)" ]]; then
+  pass "A1 낡은 정리 대기 행은 색인에서 삭제되고 목록에서 빠진다"
+else
+  fail "A1 낡은 행이 색인에 남음 (rc=$rc)"
+fi
+# A2
+grep -qxF '정리: 낡은 정리 대기 기록 2건 삭제 (stale1, stale2)' <<<"$out" \
+  && pass "A2 정리 안내가 정확한 건수·slug 로 나온다" || fail "A2 정리 안내 없음/불일치: $(grep '^정리:' <<<"$out" || true)"
+# B
+if _has_row brn && [[ "$(tasks_index_get brn state)" == "cleanup-pending" ]] \
+   && [[ -n "$(grep brn <<<"$out" | grep "정리 대기" || true)" ]]; then
+  pass "B branch 가 남은 정리 대기 행은 보존되고 정리 대기로 표시된다"
+else
+  fail "B branch 가 남은 행이 삭제됨"
+fi
+# C
+_has_row pth && pass "C worktree 디렉터리가 남은 정리 대기 행은 보존된다" || fail "C 경로가 남은 행이 삭제됨"
+# F
+rc=0; out="$(bash "$SCRIPT_DIR/tasks_list.sh" 2>/dev/null)" || rc=$?
+if [[ "$rc" -eq 0 && -z "$(grep '^정리:' <<<"$out" || true)" ]]; then
+  pass "F 삭제할 행이 없으면 정리 안내가 없다"
+else
+  fail "F 삭제 0건인데 정리 안내 출력"
+fi
+# E — 락 점유(살아 있는 pid) / owner pid 가 죽은 불확실 케이스. 색인 불변 + 목록 표시 + rc 0 + stderr 안내
+_lockdir="$(tasks_shared_dir)/tasks.lock"
+tasks_index_upsert stale4 state=cleanup-pending
+for _mode in alive dead; do
+  mkdir -p "$_lockdir"
+  if [[ "$_mode" == alive ]]; then _pid=$$; else _pid=999999; fi
+  printf 'pid=%s\ncmd=other\nslug=x\nstarted-at=2026-10-29-1000\n' "$_pid" > "$_lockdir/owner"
+  for _opt in "" "--rebuild"; do
+    _before="$(cat "$(tasks_index_path)")"
+    rc=0; out="$(bash "$SCRIPT_DIR/tasks_list.sh" $_opt 2>"$TMP/err")" || rc=$?
+    if [[ "$rc" -eq 0 && "$(cat "$(tasks_index_path)")" == "$_before" && "$out" == *"brn"* ]] \
+       && grep -q "낡은 정리 대기 기록 정리를 건너뜀" "$TMP/err"; then
+      pass "E 락 점유($_mode) 중 list ${_opt:-일반}: 색인 불변·목록 표시·rc 0·안내"
+    else
+      fail "E 락 점유($_mode) 중 list ${_opt:-일반}: rc=$rc 색인변경/목록/안내 확인 필요: $(cat "$TMP/err")"
+    fi
+  done
+  rm -rf "$_lockdir"
+done
+# D1 — 락이 풀린 뒤 --rebuild 에서도 낡은 행이 삭제된다 (stale4)
+rc=0; out="$(bash "$SCRIPT_DIR/tasks_list.sh" --rebuild 2>/dev/null)" || rc=$?
+[[ "$rc" -eq 0 ]] && ! _has_row stale4 && grep -qF '정리: 낡은 정리 대기 기록 1건 삭제 (stale4)' <<<"$out" \
+  && pass "D1 --rebuild 에서도 낡은 정리 대기 행이 삭제된다" || fail "D1 --rebuild 후 낡은 행이 색인에 남음 (rc=$rc)"
+# D2 — rebuild 가 살아 있는 정리 대기 행의 state·published-at 을 보존한다
+[[ "$(tasks_index_get brn state)" == "cleanup-pending" && "$(tasks_index_get brn published-at)" == "2026-10-02-1000" ]] \
+  && pass "D2 --rebuild 가 branch 가 남은 정리 대기 행의 state·published-at 을 보존한다" \
+  || fail "D2 state 가 덮어써짐: $(tasks_index_get brn state)"
+# A3 — 정리 대기 stale 행만 있어 목록이 비는 저장소: 빈 안내와 정리 줄이 함께 나온다
+MINI="$TMP/mini-empty"; mkdir -p "$MINI"  # $TMP 아래라 종료 trap 이 함께 지운다
+( cd "$MINI" && git init -q -b main && git config user.email t@example.com && git config user.name t \
+  && git commit -q --allow-empty -m init )
+rc=0; out="$( cd "$MINI" && project_root="$MINI" bash -c 'source "$1/_tasks_index.sh"; tasks_index_upsert only-stale state=cleanup-pending; tasks_index_upsert only-stale2 state=cleanup-pending; bash "$1/tasks_list.sh"' _ "$SCRIPT_DIR" 2>/dev/null )" || rc=$?
+if [[ "$rc" -eq 0 && "$out" == *"진행 중인 작업이 없습니다"* ]] \
+   && grep -qxF '정리: 낡은 정리 대기 기록 2건 삭제 (only-stale, only-stale2)' <<<"$out"; then
+  pass "A3 목록이 비는 경우에도 빈 안내와 정리 줄이 함께 나온다"
+else
+  fail "A3 빈 목록에서 안내 없음 (rc=$rc): $out"
+fi
+rm -rf "$MINI"
+for _s in stale1 stale2 brn pth; do tasks_index_remove "$_s"; done
+git -C "$TMP" branch -D fr/brn >/dev/null
 
 # ---------------------------------------------------------------------------
 # set-status 대상 선택 (spec D4)
@@ -196,8 +276,8 @@ export HERDR_ENV=1
 STUB_DEAD="$TMP/.stub-dead"; mkdir -p "$STUB_DEAD"
 cat > "$STUB_DEAD/herdr" <<'EOS'
 #!/usr/bin/env bash
-echo '{"result":{"agents":[]}}'
-exit 0
+echo '{"error":{"code":"agent_not_found","message":"agent target not found"},"id":"cli:agent:get"}' >&2
+exit 1
 EOS
 chmod +x "$STUB_DEAD/herdr"
 STUB="$STUB_DEAD"
@@ -236,7 +316,7 @@ cat > "$STUB_ALIVE/herdr" <<EOS
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$STUB_ALIVE/calls.log"
 if [[ "\$1 \$2" == "agent get" ]]; then
-  echo '{"result":{"agents":[{"cwd":"$REPO/.worktrees/alpha"}]}}'
+  echo '{"result":{"agent":{"cwd":"$REPO/.worktrees/alpha"},"type":"agent_info"}}'
 fi
 exit 0
 EOS
@@ -446,7 +526,7 @@ bash "$SCRIPT_DIR/tasks_list.sh" --rebuild >/dev/null
 # 않고 nonzero 로 끝나야 한다(final diff review 지적).
 # ---------------------------------------------------------------------------
 for _s in alpha beta gamma delta epsilon legacy pending; do tasks_index_remove "$_s"; done
-[[ -z "$(tasks_index_slugs)" ]] || fail "fixture 전제 실패: 색인 행이 남아 있다"
+[[ -z "$(tasks_index_all_slugs)" ]] || fail "fixture 전제 실패: 색인 행이 남아 있다"
 before_baseline="$(cat "$REPO/rd-workflow-workspace/.lifecycle/task-state" 2>/dev/null || printf '')"
 if out="$( cd "$REPO" && bash rd-workflow/scripts/rd task set-status "구현 중" 2>&1 )"; then
   fail "색인 0건 + 기본 브랜치인데 baseline 을 대상으로 전이가 성공했다"
@@ -455,6 +535,267 @@ else
   [[ "$out" == *"진행 중인 작업이 없습니다"* ]] \
     && [[ "$after_baseline" == "$before_baseline" ]] \
     && pass "색인 0건 + 기본 브랜치는 baseline 을 대상 삼지 않는다 (AC 4)" || fail "AC4 baseline 보호"
+fi
+
+# ---------------------------------------------------------------------------
+# 정리 대기 행 지연 정리 (S1~S9) — 발행 증거가 있고 worktree 가 깨끗·비점유·미잠금일 때만
+# worktree·로컬 브랜치·색인 행을 지운다. 하나라도 어긋나면 전부 보존하고 사유를 출력한다.
+# 기본 브랜치가 main 이고 origin 이 없어 local-only 증거(merge + 계보가 맞는 tag)를 쓴다.
+# ---------------------------------------------------------------------------
+_SW_T0=$SECONDS
+# <slug>: fr/<slug> 브랜치 + worktree + merge·tag(발행 증거) + cleanup-pending 행
+_sw_mk() {
+  git -C "$TMP" branch "fr/$1" main
+  git -C "$TMP" worktree add -q "$TMP/.worktrees/$1" "fr/$1"
+  git -C "$TMP/.worktrees/$1" commit -q --allow-empty -m "$1 work"
+  git -C "$TMP" merge --no-ff -q "fr/$1" -m "merge: $1"
+  git -C "$TMP" tag -a "fr/20261029-1200/$1" -m "archive: $1" "$(git -C "$TMP" rev-parse HEAD)"
+  tasks_index_upsert "$1" fr-branch="fr/$1" worktree-path="$TMP/.worktrees/$1" state=cleanup-pending
+}
+_sw_reg() { git -C "$TMP" worktree list --porcelain | grep -qxF "worktree $TMP/.worktrees/$1"; }
+_sw_br()  { git -C "$TMP" rev-parse --verify --quiet "refs/heads/fr/$1" >/dev/null; }
+_sw_all_kept() { _sw_reg "$1" && _sw_br "$1" && _has_row "$1"; }
+_sw_all_gone() { ! _sw_reg "$1" && ! _sw_br "$1" && ! _has_row "$1"; }
+_sw_run() { bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true; }
+_sw_cleanup() {  # 보존된 fixture 를 강제로 치운다(다음 케이스에 영향 없게)
+  git -C "$TMP" worktree unlock "$TMP/.worktrees/$1" 2>/dev/null || true
+  git -C "$TMP" worktree remove --force "$TMP/.worktrees/$1" 2>/dev/null || true
+  git -C "$TMP" branch -D "fr/$1" >/dev/null 2>&1 || true
+  tasks_index_remove "$1"
+}
+
+# S1 정상 — 행이 전부 사라져 목록이 비어도 결과 줄이 출력된다
+_sw_mk s1
+out="$(_sw_run)"
+if _sw_all_gone s1 && grep -qxF '정리됨: s1 — worktree·로컬 브랜치 제거, 색인 행 삭제' <<<"$out" \
+   && [[ "$out" == *"진행 중인 작업이 없습니다"* ]]; then
+  pass "S1 증거 + 깨끗한 비점유 worktree 는 worktree·브랜치·행이 모두 정리되고 줄이 나온다"
+else
+  fail "S1 정리 실패: $out"
+fi
+
+# S2 점유 — worktree 안에서 sleep 이 CWD 를 잡고 있으면 보존한다
+_sw_mk s2
+( cd "$TMP/.worktrees/s2" && exec sleep 30 ) & _sw_pid=$!
+sleep 0.5
+out="$(_sw_run)"
+kill "$_sw_pid" 2>/dev/null || true; wait "$_sw_pid" 2>/dev/null || true
+if _sw_all_kept s2 && grep -E '^정리 보류: s2 — ' <<<"$out" | grep -q '점유' \
+   && grep -E '^정리 보류: s2 ' <<<"$out" | grep -q '재시도: '; then
+  pass "S2 점유된 worktree 는 보존되고 점유 사유와 재시도 안내가 나온다"
+else
+  fail "S2 점유 보존 실패: $out"
+fi
+_sw_cleanup s2
+
+# S3 tip 어긋남 — 발행 뒤 fr 브랜치에 새 커밋이 생기면 보존한다
+_sw_mk s3
+git -C "$TMP/.worktrees/s3" commit -q --allow-empty -m "s3 발행 뒤 추가"
+out="$(_sw_run)"
+if _sw_all_kept s3 && grep -E '^정리 보류: s3 — ' <<<"$out" | grep -q 'in-progress'; then
+  pass "S3 발행 뒤 새 커밋이 있으면 보존되고 증거 판정값이 나온다"
+else
+  fail "S3 tip 어긋남 보존 실패: $out"
+fi
+_sw_cleanup s3
+
+# S4 미커밋 — untracked 파일 하나여도 보존하고, git 의 거부(부분 실패)에 기대지 않는다
+_sw_mk s4
+printf 'wip\n' > "$TMP/.worktrees/s4/wip.txt"
+out="$(_sw_run)"
+if _sw_all_kept s4 && grep -E '^정리 보류: s4 — ' <<<"$out" | grep -q '미커밋' \
+   && ! grep -q '^정리 부분 실패' <<<"$out"; then
+  pass "S4 미커밋 파일이 있으면 보류 줄과 함께 보존되고 부분 실패는 나지 않는다"
+else
+  fail "S4 미커밋 보존 실패: $out"
+fi
+_sw_cleanup s4
+
+# S5 재시도 — worktree 만 먼저 사라진 상태(브랜치·행 잔존)는 브랜치와 행을 지우고, 다시 돌려도 불변이다
+_sw_mk s5
+git -C "$TMP" worktree remove "$TMP/.worktrees/s5"
+out="$(_sw_run)"
+if _sw_all_gone s5 && grep -qxF '정리됨: s5 — 로컬 브랜치 제거, 색인 행 삭제' <<<"$out"; then
+  pass "S5 worktree 만 먼저 제거된 행은 브랜치와 행이 정리된다"
+else
+  fail "S5 재시도 정리 실패: $out"
+fi
+_sw_before="$(cat "$(tasks_index_path)"; git -C "$TMP" for-each-ref refs/heads)"
+out2="$(_sw_run)"
+_sw_after="$(cat "$(tasks_index_path)"; git -C "$TMP" for-each-ref refs/heads)"
+if [[ "$_sw_before" == "$_sw_after" ]] && ! grep -q '^정리' <<<"$out2"; then
+  pass "S5 두 번째 실행은 출력·상태가 변하지 않는다(멱등)"
+else
+  fail "S5 멱등 실패: $out2"
+fi
+
+# S5b 경로 불일치 — 행의 worktree-path 가 실제 등록 경로와 다르면 보존한다
+_sw_mk s5b
+mkdir -p "$TMP/.worktrees/other-s5b"
+tasks_index_upsert s5b worktree-path="$TMP/.worktrees/other-s5b"
+out="$(_sw_run)"
+if _sw_all_kept s5b && grep -E '^정리 보류: s5b — ' <<<"$out" | grep -q '경로 불일치'; then
+  pass "S5b 행 경로와 등록 경로가 다르면 보존되고 경로 불일치 사유가 나온다"
+else
+  fail "S5b 경로 불일치 보존 실패: $out"
+fi
+_sw_cleanup s5b
+
+# S7a lsof 실패 — 조회 실패는 rc 2
+STUB_LSOF="$TMP/.stub-lsof"; mkdir -p "$STUB_LSOF"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$STUB_LSOF/lsof"; chmod +x "$STUB_LSOF/lsof"
+rc=0; ( PATH="$STUB_LSOF:$PATH"; tasks_path_occupied "$TMP" ) || rc=$?
+[[ "$rc" -eq 2 ]] && pass "S7a lsof 조회가 실패하면 점유 판정은 rc 2" || fail "S7a rc=$rc (기대 2)"
+
+# S7b 권한 제한 — 조회는 성공했지만 살아 있는 내 계정 pid 하나가 lsof 출력에서 빠지면 rc 2
+# ps·lsof 를 모두 스텁으로 고정한다 — 실제 프로세스 목록의 일시적 읽기 불가가 결과를 가리지 못하게 한다.
+# 대상은 어느 프로세스의 CWD 도 아닌 빈 디렉터리다($TMP 는 이 테스트 셸의 CWD 라 점유(rc 0)로 읽힌다).
+mkdir -p "$TMP/.s7b-empty"
+rc=0
+( sleep 30 & _spid=$!
+  ps() { printf '%s S sleep\n%s S bash\n' "$_spid" "$$"; }
+  lsof() { printf 'p%s\nn/\n' "$$"; }
+  TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
+  kill "$_spid" 2>/dev/null; exit "$_r" ) || rc=$?
+[[ "$rc" -eq 2 ]] && pass "S7b 살아 있는 내 계정 pid 의 CWD 를 못 읽었으면 rc 2" || fail "S7b rc=$rc (기대 2)"
+
+# S7d CWD 경로 읽기 실패 — `p<pid>` 는 있어도 `n` 줄이 오류 설명이면 읽은 것으로 치지 않아 rc 2
+# 모든 pid 가 `p` 줄은 있으므로, rc 2 는 오직 경로 검증 때문에 나온다(ps·lsof 스텁 고정).
+rc=0
+( sleep 30 & _spid=$!
+  ps() { printf '%s S sleep\n' "$_spid"; }
+  lsof() { printf 'p%s\nn/proc/%s/cwd (readlink: Permission denied)\n' "$_spid" "$_spid"; }
+  TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
+  kill "$_spid" 2>/dev/null; exit "$_r" ) || rc=$?
+[[ "$rc" -eq 2 ]] && pass "S7d pid 는 있으나 CWD 경로를 못 읽었으면 rc 2" || fail "S7d rc=$rc (기대 2)"
+
+# S7e ps 실패 — 대조 근거가 없으면 비점유로 흘리지 않고 rc 2
+rc=0
+( ps() { return 1; }
+  lsof() { printf 'p%s\nn/\n' "$$"; }
+  TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty" ) || rc=$?
+[[ "$rc" -eq 2 ]] && pass "S7e ps 조회가 실패하면 점유 판정은 rc 2" || fail "S7e rc=$rc (기대 2)"
+
+# S7f ps 는 성공했지만 출력이 비어 있음 — 유효한 pid 행이 없으면 대조 근거가 없으므로 rc 2
+rc=0
+( ps() { return 0; }
+  lsof() { printf 'p%s\nn/\n' "$$"; }
+  TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty" ) || rc=$?
+[[ "$rc" -eq 2 ]] && pass "S7f ps 출력이 비어 있으면 점유 판정은 rc 2" || fail "S7f rc=$rc (기대 2)"
+
+# S7c 판정불가 보류 — lsof 가 실패하면 worktree 를 지우지 않고 다음 행동을 안내한다
+_sw_mk s7c
+out="$(PATH="$STUB_LSOF:$PATH" _sw_run)"
+if _sw_all_kept s7c && grep -E '^정리 보류: s7c — ' <<<"$out" | grep -q '점유 판정불가' \
+   && grep -E '^정리 보류: s7c ' <<<"$out" | grep -q 'lsof'; then
+  pass "S7c 점유 판정불가는 보존되고 lsof 확인 안내가 나온다"
+else
+  fail "S7c 판정불가 보존 실패: $out"
+fi
+_sw_cleanup s7c
+
+# S8 locked — git worktree lock 한 worktree 는 보존한다
+_sw_mk s8
+git -C "$TMP" worktree lock "$TMP/.worktrees/s8"
+out="$(_sw_run)"
+if _sw_all_kept s8 && grep -E '^정리 보류: s8 — ' <<<"$out" | grep -q 'locked'; then
+  pass "S8 locked worktree 는 보존되고 locked 사유가 나온다"
+else
+  fail "S8 locked 보존 실패: $out"
+fi
+_sw_cleanup s8
+
+# S9 기본 체크아웃이 아닌 worktree 에서 부른 rd task list 는 파괴적 정리를 하지 않는다
+_sw_mk s9
+git -C "$TMP" worktree add -q -b host-s9 "$TMP/.worktrees/host-s9"
+out="$( cd "$TMP/.worktrees/host-s9" && project_root="$TMP/.worktrees/host-s9" bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true )"
+if _sw_all_kept s9 && grep -E '^정리 보류: s9 — ' <<<"$out" | grep -q '기본 체크아웃'; then
+  pass "S9 기본 체크아웃이 아닌 worktree 의 목록 조회는 정리하지 않고 기본 체크아웃 안내를 낸다"
+else
+  fail "S9 비기본 체크아웃 보존 실패: $out"
+fi
+git -C "$TMP" worktree remove --force "$TMP/.worktrees/host-s9" 2>/dev/null || true
+git -C "$TMP" branch -D host-s9 >/dev/null 2>&1 || true
+_sw_cleanup s9
+
+# S6 원격 — 접근할 수 없는 origin 이면 원격 증거를 확인할 수 없어 보존한다(local-only 증거는 충족)
+_sw_mk s6
+git -C "$TMP" remote add origin "$TMP/.no-such-origin"
+out="$(_sw_run)"
+git -C "$TMP" remote remove origin
+if _sw_all_kept s6 && grep -E '^정리 보류: s6 — ' <<<"$out" | grep -q 'needs-verify'; then
+  pass "S6 원격 증거를 확인할 수 없으면 보존되고 needs-verify 사유가 나온다"
+else
+  fail "S6 원격 보존 실패: $out"
+fi
+_sw_cleanup s6
+printf '  (S1~S9 소요 %d초)\n' "$((SECONDS - _SW_T0))"
+
+# T6·T6b — _tl_sweep_pending 은 행마다 락을 잡고 풀며, 발행 대기 표지가 살아 있으면 양보한다.
+#   함수만 추출해 별도 임시 저장소에서 스텁과 함께 돌린다(이 저장소·공유 락과 무관).
+T6DIR="$TMP/t6repo"; mkdir -p "$T6DIR"
+git -C "$T6DIR" init -q
+cat >"$TMP/t6run.sh" <<'T6EOF'
+set -u
+SD="$1"; MODE="$2"; export SD
+cd "$3"; export project_root="$3"
+source "$SD/_tasks_index.sh"
+LOG="$3/events.log"; : >"$LOG"
+tasks_index_upsert r1 state=cleanup-pending
+tasks_index_upsert r2 state=cleanup-pending
+eval "$(sed -n '/^_tl_sweep_pending() {/,/^}/p' "$SD/tasks_list.sh")"
+_SWEEP_REMOVED=0; _SWEEP_NAMES=""; PRUNED_NOTE=""
+_tl_note() { :; }
+_probe() {
+  bash -c 'source "$SD/_tasks_index.sh"; tasks_lock_acquire probe x 2>/dev/null || exit 1; tasks_lock_release; exit 0'
+}
+_n=0
+_tl_sweep_one() {
+  _n=$((_n + 1)); echo "start $_n" >>"$LOG"
+  if _probe; then echo free >>"$LOG"; else echo busy >>"$LOG"; fi
+  echo "end $_n" >>"$LOG"
+}
+eval "$(declare -f tasks_lock_release | sed '1s/tasks_lock_release/_orig_release/')"
+tasks_lock_release() {
+  local r=0; _orig_release || r=$?
+  if _probe; then echo free_after_release >>"$LOG"; fi
+  return $r
+}
+case "$MODE" in
+  lock) ;;
+  live) sleep 30 & P=$!; echo "$P" >"$(tasks_shared_dir)/archive-waiting" ;;
+  dead) true & P=$!; wait "$P"; echo "$P" >"$(tasks_shared_dir)/archive-waiting" ;;
+esac
+_tl_sweep_pending 2>"$3/sweep.err"
+echo "calls=$_n" >>"$LOG"
+[[ "$MODE" == live ]] && kill "$P" 2>/dev/null
+exit 0
+T6EOF
+bash "$TMP/t6run.sh" "$SCRIPT_DIR" lock "$T6DIR"
+_ev="$(tr '\n' ',' <"$T6DIR/events.log")"
+if [[ ",$_ev" != *,free,* ]]; then
+  pass "T6 행 처리 중에는 락이 잡혀 있다 (probe 가 모두 busy)"
+else
+  fail "T6 행 처리 중 락이 비어 있음: $_ev"
+fi
+if [[ "$_ev" == "start 1,busy,end 1,free_after_release,start 2,busy,end 2,free_after_release,calls=2," ]]; then
+  pass "T6 행 사이마다 락이 풀린다 (end 1 과 start 2 사이 해제)"
+else
+  fail "T6 행 단위 해제 순서가 다름: $_ev"
+fi
+rm -f "$T6DIR/events.log"
+bash "$TMP/t6run.sh" "$SCRIPT_DIR" live "$T6DIR"
+if grep -q '^calls=0$' "$T6DIR/events.log" && grep -q '양보함' "$T6DIR/sweep.err"; then
+  pass "T6b 표지 pid 가 살아 있으면 정리를 양보한다 (처리 0회·양보함 문구)"
+else
+  fail "T6b 양보하지 않음: $(tr '\n' ',' <"$T6DIR/events.log") $(cat "$T6DIR/sweep.err")"
+fi
+rm -f "$T6DIR/events.log" "$T6DIR/.git/rd-workflow/archive-waiting"
+bash "$TMP/t6run.sh" "$SCRIPT_DIR" dead "$T6DIR"
+if grep -q '^calls=2$' "$T6DIR/events.log" && ! grep -q '양보함' "$T6DIR/sweep.err"; then
+  pass "T6b 표지 pid 가 죽어 있으면 무시하고 2건 모두 처리한다"
+else
+  fail "T6b stale 표지를 무시하지 않음: $(tr '\n' ',' <"$T6DIR/events.log") $(cat "$T6DIR/sweep.err")"
 fi
 
 printf 'tasks_list: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"

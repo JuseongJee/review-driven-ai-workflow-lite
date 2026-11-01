@@ -1141,7 +1141,7 @@ _assert_status_comment_block() { # <file> <desc>
   if awk '
     BEGIN{state=0}
     /^## Status$/{state=1; next}
-    state==1 && /^<!-- 허용 상태값 8종은 \.claude\/rules\/rd-workflow\/task-tracking\.md 참조\. 변경은 rd task set-status 경유 -->$/{state=2; next}
+    state==1 && /^<!-- 허용 상태값은 \.claude\/rules\/rd-workflow\/task-tracking\.md 참조\. 변경은 rd task set-status 경유 -->$/{state=2; next}
     state==1 {next}
     state==2 && /^$/{state=3; next}
     state==3 && /^## Request$/{found=1}
@@ -1244,6 +1244,12 @@ else
   FAIL=$((FAIL+1)); echo "  FAIL: promote rerun: 거부 사유가 source-fr 불일치가 아님(공백 테스트 재발 의심)" >&2
   echo "    --- stderr ---" >&2; sed 's/^/    /' "$FIX9_ERR" >&2
 fi
+if grep -qF -- "(cd $(printf %q "$FIX9") && bash rd-workflow/scripts/rd task set-source-fr" "$FIX9_ERR"; then
+  PASS=$((PASS+1)); echo "  PASS: promote rerun: --no-worktree 정정 안내가 현재 체크아웃에 묶인다"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL: promote rerun: --no-worktree 정정 안내가 현재 체크아웃에 묶이지 않음" >&2
+  echo "    --- stderr ---" >&2; sed 's/^/    /' "$FIX9_ERR" >&2
+fi
 assert_eq "$(read_fix_source_fr "$FIX9" fix-rerun-diff)" "rd-workflow-workspace/backlog/items/2026-01-01-fix.md" "promote rerun: 거부 후 값 불변"
 assert_eq "$(cd "$FIX9" && git status --porcelain | grep -c "task-state" || true)" "0" "promote rerun: task-state dirty 없음 (거부)"
 
@@ -1335,6 +1341,61 @@ assert_eq "$rc13" "0" "promote rerun: 순서만 다른 --source-fr 는 집합 �
 assert_eq "$(read_fix_source_fr "$FIX13" fix-multi)" \
   "rd-workflow-workspace/backlog/items/2026-01-01-fix.md|rd-workflow-workspace/backlog/items/2026-01-01-second.md" \
   "promote rerun: 순서만 다른 값 재지정은 no-op (저장값 불변)"
+
+# --- 정리 대기 행은 진행 중 작업으로 세지 않는다 (tasks-index-cleanup-pending-accumulation) ---
+# G: 정리 대기 2건 + 진행 중 1건 → task_resolve_target 이 「여러 건」 없이 진행 중 1건을 돌려준다
+FIXG="$TMPDIR_TEST/fix-pending-resolve"
+mk_promote_fixture "$FIXG" "-"
+_g_out="$( cd "$FIXG" && project_root="$FIXG" bash -c '
+  source "$1/_tasks_index.sh"; source "$1/../_task_common.sh"
+  tasks_index_upsert pend1 fr-branch=fr/pend1 state=cleanup-pending
+  tasks_index_upsert pend2 fr-branch=fr/pend2 state=cleanup-pending
+  tasks_index_upsert live1 fr-branch=fr/live1 checkout=no
+  task_resolve_target read' _ "$SCRIPT_DIR" 2>&1 )" || true
+assert_eq "$_g_out" "$(printf 'ref\tfr/live1')" "정리 대기 행 2건이 있어도 진행 중 1건이 대상이다 (여러 건 오판 없음)"
+# H: promote --no-worktree 는 정리 대기 행(no-worktree=yes)이 있어도 거부하지 않는다
+FIXH="$TMPDIR_TEST/fix-pending-nowt"
+mk_promote_fixture "$FIXH" "-"
+( cd "$FIXH" && project_root="$FIXH" bash -c 'source "$1/_tasks_index.sh"; tasks_index_upsert old-nw fr-branch=fr/old-nw state=cleanup-pending no-worktree=yes' _ "$SCRIPT_DIR" )
+_h_rc=0
+_h_out="$( cd "$FIXH" && project_root="$FIXH" bash "$SCRIPT_DIR/promote.sh" --short-title new-nw --size small --no-worktree 2>&1 )" || _h_rc=$?
+assert_eq "$_h_rc" "0" "promote --no-worktree 는 정리 대기 행을 진행 중 --no-worktree 로 세지 않는다"
+
+# --- 정리 대기 worktree 안에서 --task 없이 대상을 구하면 다른 작업으로 대체하지 않고 거부한다 (task-resolve-cleanup-pending-target) ---
+# 실제 git worktree 가 필요하다(cwd 판정이 fr/<slug> 체크아웃을 확인한다). <live 수>만큼 진행 중 worktree 를 둔다.
+_pend_fixture() {  # <dir> <live 수> — <dir>/wt-pend(정리 대기), <dir>/wt-live1.. (진행 중)
+  local d="$1" n="$2" i
+  git init -q -b main "$d/main" && git -C "$d/main" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+  git -C "$d/main" branch fr/pend && git -C "$d/main" worktree add -q "$d/wt-pend" fr/pend
+  mkdir -p "$d/wt-pend/rd-workflow-workspace"
+  ( cd "$d/wt-pend" && project_root="$d/wt-pend" bash -c 'source "$1/_tasks_index.sh"
+    tasks_index_upsert pend fr-branch=fr/pend worktree-path="$2/wt-pend" state=cleanup-pending' _ "$SCRIPT_DIR" "$d" )
+  for ((i = 1; i <= n; i++)); do
+    git -C "$d/main" branch "fr/live$i" && git -C "$d/main" worktree add -q "$d/wt-live$i" "fr/live$i"
+    mkdir -p "$d/wt-live$i/rd-workflow-workspace"
+    ( cd "$d/wt-pend" && project_root="$d/wt-pend" bash -c 'source "$1/_tasks_index.sh"
+      tasks_index_upsert "live$3" fr-branch="fr/live$3" worktree-path="$2/wt-live$3"' _ "$SCRIPT_DIR" "$d" "$i" )
+  done
+}
+_pend_resolve() {  # <dir> <op> [task] → "rc=<n> out=<stdout> err=<정리 대기·--task·여러 건 포함 여부>"
+  local d="$1" op="$2" task="${3:-}" out err rc=0
+  err="$d/err.txt"
+  out="$( cd "$d/wt-pend" && project_root="$d/wt-pend" bash -c 'source "$1/_tasks_index.sh"; source "$1/../_task_common.sh"
+    task_resolve_target "$2" "$3"' _ "$SCRIPT_DIR" "$op" "$task" 2>"$err" )" || rc=$?
+  local flags=""
+  grep -q '정리 대기' "$err" && flags+="pending "
+  grep -q -- '--task' "$err" && flags+="task-hint "
+  grep -q '여러 건' "$err" && flags+="multi "
+  printf 'rc=%s out=[%s] err=[%s]' "$rc" "$out" "${flags% }"
+}
+FIXI1="$TMPDIR_TEST/fix-pend-cwd-1"; mkdir -p "$FIXI1"; _pend_fixture "$FIXI1" 1
+assert_eq "$(_pend_resolve "$FIXI1" write)" "rc=1 out=[] err=[pending task-hint]" "I1: 정리 대기 cwd + 진행 중 1건 → write 는 거부하고 다른 작업 경로를 내지 않는다"
+assert_eq "$(_pend_resolve "$FIXI1" read)" "rc=1 out=[] err=[pending task-hint]" "I1: 정리 대기 cwd + 진행 중 1건 → read 도 거부한다"
+FIXI0="$TMPDIR_TEST/fix-pend-cwd-0"; mkdir -p "$FIXI0"; _pend_fixture "$FIXI0" 0
+FIXI2="$TMPDIR_TEST/fix-pend-cwd-2"; mkdir -p "$FIXI2"; _pend_fixture "$FIXI2" 2
+assert_eq "$(_pend_resolve "$FIXI0" write)" "rc=1 out=[] err=[pending task-hint]" "I2: 진행 중 0건이어도 자기 자신으로 fallback 하지 않고 정리 대기 거부"
+assert_eq "$(_pend_resolve "$FIXI2" read)" "rc=1 out=[] err=[pending task-hint]" "I2: 진행 중 2건이어도 「여러 건」 이 아니라 정리 대기 거부"
+assert_eq "$(_pend_resolve "$FIXI1" write live1 | sed "s#$FIXI1#F#")" "rc=0 out=[F/wt-live1] err=[]" "I3: --task 명시는 막지 않는다 (다른 작업 경고 후 진행)"
 
 # --- 손상된 대상 worktree task-state 의 복구 안내가 목록 전체를 담는가 ---
 # ('실행하고 그대로 검증' 은 rd task set-source-fr 의 복수 positional 지원(T2, 동시
@@ -2238,43 +2299,6 @@ assert_eq "$_rb_rc" "2" "재결속 — 발행 대상 해시 계산 실패는 판
 project_root="$_rb_saved_root"; TASK_STATE_PATH="$_rb_saved_ts"
 rm -rf "$RB_REPO"
 
-# commit_has_archive_signal (review-gate-iteration-commit)
-echo "== commit_has_archive_signal =="
-SIG_REPO="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-[[ -n "$SIG_REPO" && -d "$SIG_REPO" ]] || { echo "test_lifecycle.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-git -C "$SIG_REPO" init -q
-git -C "$SIG_REPO" config user.email t@t && git -C "$SIG_REPO" config user.name t
-mkdir -p "$SIG_REPO/rd-workflow-workspace/backlog/request-archive" "$SIG_REPO/rd-workflow-workspace/.lifecycle"
-printf '# Current Task\n\n## Status\n구현 중\n\n## Short Title\nsigtask\n' > "$SIG_REPO/CURRENT_TASK.md"
-# v2 2b: task-state 격리 — TASK_STATE_PATH를 SIG_REPO 기반으로 재설정
-TASK_STATE_PATH="$SIG_REPO/rd-workflow-workspace/.lifecycle/task-state"
-# task-state 초기값: 구현 중, short-title=sigtask (비-baseline)
-printf 'schema=1\nshort-title=sigtask\nstatus=구현 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' > "$TASK_STATE_PATH"
-ARCH="rd-workflow-workspace/backlog/request-archive/2026-05-24-0000-sigtask.md"
-# 신호 없음: 비-baseline + staged archive 없음 → 1(허용)
-( project_root="$SIG_REPO"; TASK_STATE_PATH="$SIG_REPO/rd-workflow-workspace/.lifecycle/task-state"; commit_has_archive_signal ) && rc=0 || rc=1
-assert_eq "$rc" "1" "archive_signal — 신호 없음 → 1(허용)"
-# AS1 경계: untracked stale archive 파일(add 안 함) → 1(허용, false-positive 방지)
-printf 'x\n' > "$SIG_REPO/$ARCH"
-( project_root="$SIG_REPO"; TASK_STATE_PATH="$SIG_REPO/rd-workflow-workspace/.lifecycle/task-state"; commit_has_archive_signal ) && rc=0 || rc=1
-assert_eq "$rc" "1" "archive_signal — AS1 untracked stale archive → 1(허용)"
-# AS1: staged 추가 → 0(차단)
-git -C "$SIG_REPO" add "$ARCH"
-( project_root="$SIG_REPO"; TASK_STATE_PATH="$SIG_REPO/rd-workflow-workspace/.lifecycle/task-state"; commit_has_archive_signal ) && rc=0 || rc=1
-assert_eq "$rc" "0" "archive_signal — AS1 staged request-archive 추가 → 0(차단)"
-# AS1 경계: 기존 archive 파일 삭제(staged D) → 1(허용, 추가 아님)
-git -C "$SIG_REPO" commit -q -m seed
-git -C "$SIG_REPO" rm -q "$ARCH"
-( project_root="$SIG_REPO"; TASK_STATE_PATH="$SIG_REPO/rd-workflow-workspace/.lifecycle/task-state"; commit_has_archive_signal ) && rc=0 || rc=1
-assert_eq "$rc" "1" "archive_signal — request-archive 삭제(staged D) → 1(허용)"
-# AS2: task-state baseline(status=대기 중, short-title=-) → 0(차단)
-# v2 2b: task-state가 권위 소스 — CURRENT_TASK.md 변경과 함께 task-state도 베이스라인으로 설정
-printf '# Current Task\n\n## Status\n대기 중\n\n## Short Title\n-\n' > "$SIG_REPO/CURRENT_TASK.md"
-printf 'schema=1\nshort-title=-\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' > "$TASK_STATE_PATH"
-( project_root="$SIG_REPO"; TASK_STATE_PATH="$SIG_REPO/rd-workflow-workspace/.lifecycle/task-state"; commit_has_archive_signal ) && rc=0 || rc=1
-assert_eq "$rc" "0" "archive_signal — AS2 task-state baseline → 0(차단)"
-rm -rf "$SIG_REPO"
-
 echo "== archive_gate hook exit code =="
 AG_REPO="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$AG_REPO" && -d "$AG_REPO" ]] || { echo "test_lifecycle.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
@@ -2379,7 +2403,7 @@ mk_aud_repo() { # mk_aud_repo <경로> — fr 브랜치 + 로컬 bare remote 를
 run_aud_archive() { # run_aud_archive <경로> — rc 를 stdout 에 낸다
   local r="$1" rc=0
   ( cd "$r" && env -u project_root -u TASK_STATE_PATH -u STATE_MIGRATION_BACKUP_DIR \
-      bash "$ARCHIVE_SH" --force-skip-review-check "긴급 발행" \
+      bash "$ARCHIVE_SH" --force-skip-review-check "긴급 발행" --allow-status-mismatch "테스트" \
   ) >/dev/null 2>&1 || rc=$?
   printf '%s' "$rc"
 }
@@ -3039,6 +3063,130 @@ rl_race_token="$(cd "$RLREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_
   && pass "launch-token 불일치 시 기동 결과를 기록하지 않는다(경쟁자 예약 보존)" \
   || fail "token 불일치 보호 실패: launch=$rl_race_launch token=$rl_race_token"
 
+# --- 결과 기록 락 재시도 (spec D5) — 일시 경합은 재시도로 기록하고, 지속 경합은 ok 를 단정하지 않는다 ---
+# promote 가 예약 단계에서 락을 이미 쥐었다 놓은 뒤이므로, 점유는 기동 대역이 **락 밖
+# 기동 구간에서** 만든다(그래야 12단계 결과 기록 락만 경합한다). 점유자는 살아 있는
+# pid 를 owner 에 적은 락 디렉터리다(tasks_lock_acquire 가 rc=1 로 본다).
+RL_LOCKDIR="$(cd "$RLREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_shared_dir')/tasks.lock"
+RL_STUB_HOLD="$RLREPO/stub-hold.sh"
+cat > "$RL_STUB_HOLD" <<STUBEOF
+#!/usr/bin/env bash
+# \$RL_HOLD_SECS 초 동안 락을 점유한다. 점유 sleep 의 pid 는 \$RL_HOLD_PID 파일에 남긴다.
+mkdir "$RL_LOCKDIR"
+nohup sleep "\$RL_HOLD_SECS" >/dev/null 2>&1 &
+printf '%s\n' "\$!" > "\$RL_HOLD_PID"
+printf 'pid=%s\ncmd=hold\nslug=x\nstarted-at=t\n' "\$!" > "$RL_LOCKDIR/owner"
+printf 'ok\n'
+STUBEOF
+chmod +x "$RL_STUB_HOLD"
+# L1 — 약 1초 점유 뒤 해제한다. 락 디렉터리를 먼저 지우고 점유 sleep 을 죽인다 —
+# 순서가 거꾸로면 점유자가 죽은 락이 rc=2(불확실)로 보여 재시도 대상이 아니게 된다.
+cat > "$RLREPO/stub-hold-release.sh" <<STUBEOF
+#!/usr/bin/env bash
+RL_HOLD_SECS=30 RL_HOLD_PID="$RLREPO/hold.pid" bash "$RL_STUB_HOLD"
+( sleep 1; rm -r "$RL_LOCKDIR"; kill "\$(cat "$RLREPO/hold.pid")" ) >/dev/null 2>&1 &
+STUBEOF
+chmod +x "$RLREPO/stub-hold-release.sh"
+out="$(RD_LAUNCH_STUB="$RLREPO/stub-hold-release.sh" bash "$RLREPO/rd-workflow/scripts/lifecycle/promote.sh" \
+    --short-title lockl1 --size large --source-fr - 2>&1)" || true
+rl_l1="$(cd "$RLREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get lockl1 launch')"
+[[ "$rl_l1" == "ok" && "$out" == *"세션 기동 결과 — ok"* ]] \
+  && pass "일시 락 경합은 재시도로 기록한다(L1)" || fail "L1: 일시 경합 재시도 — launch=$rl_l1: $out"
+kill "$(cat "$RLREPO/hold.pid")" 2>/dev/null || true   # 해제 프로세스가 못 죽였을 때를 대비한 정리
+sleep 0.5; rm -rf "$RL_LOCKDIR"
+
+# L2 — 계속 점유 → 기록 포기, 요약에 ok 를 내지 않고 복구 명령을 보인다(약 5초).
+out="$(RL_HOLD_SECS=60 RL_HOLD_PID="$RLREPO/hold.pid" RD_LAUNCH_STUB="$RL_STUB_HOLD" \
+    bash "$RLREPO/rd-workflow/scripts/lifecycle/promote.sh" --short-title lockl2 --size large --source-fr - 2>&1)" || true
+kill "$(cat "$RLREPO/hold.pid")" 2>/dev/null || true
+rm -rf "$RL_LOCKDIR"
+rl_l2="$(cd "$RLREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get lockl2 launch')"
+[[ "$rl_l2" == "launching" && "$out" == *"상태 기록 미완료"* && "$out" == *"resolve-launch lockl2"* \
+  && "$out" != *"세션 기동 결과 — ok"* ]] \
+  && pass "지속 락 경합이면 기록 미완료로 알리고 ok 를 단정하지 않는다(L2)" || fail "L2: 지속 경합 요약 — launch=$rl_l2: $out"
+
+# --- --handoff (확정 결정 인계 파일) — 기록 시점·재호출 보호·재시도·사전 검증 ---
+# 대역이 **기동 호출 시점에** worktree 의 handoff.md 를 복사해 둔다. 기록이 기동보다
+# 늦으면 대역이 빈손으로 돌아가 seen-handoff 가 원본과 달라진다(FR 본질: 기동 후 보강).
+RL_STUB_HANDOFF="$RLREPO/stub-handoff.sh"
+cat > "$RL_STUB_HANDOFF" <<STUBEOF
+#!/usr/bin/env bash
+rm -f "$RLREPO/seen-handoff"
+cp "\$1/rd-workflow-workspace/.lifecycle/handoff.md" "$RLREPO/seen-handoff" 2>/dev/null || true
+printf 'ok\n'
+STUBEOF
+chmod +x "$RL_STUB_HANDOFF"
+HAND1_WT="$RLREPO/.worktrees/hand1"
+HAND1_FILE="$HAND1_WT/rd-workflow-workspace/.lifecycle/handoff.md"
+
+# T1 — 기록이 기동보다 먼저이고 내용이 원본과 같다.
+printf 'D1: 결정\n' > "$RLREPO/h.md"
+if out="$(RD_LAUNCH_STUB="$RL_STUB_HANDOFF" bash "$RLREPO/rd-workflow/scripts/lifecycle/promote.sh" \
+    --short-title hand1 --size large --source-fr - --handoff "$RLREPO/h.md" 2>&1)" \
+  && cmp -s "$RLREPO/seen-handoff" "$RLREPO/h.md" \
+  && [[ "$out" == *"인계 기록 — ok"* ]]; then
+  pass "--handoff 기록이 기동보다 먼저이고 내용이 원본과 같다(T1)"
+else
+  fail "T1: 기록이 기동보다 먼저 — 대역이 기동 시점에 원본과 같은 인계 파일을 보지 못했다: $out"
+fi
+
+# T3 — 살아 있는 worktree + 미확정 기동(unknown) 에 다른 내용으로 재호출 → 거부·파일 불변.
+(cd "$RLREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_upsert hand1 launch=unknown')
+printf 'D1: 바뀐 결정\n' > "$RLREPO/h2.md"
+if out="$(RD_LAUNCH_STUB="$RL_STUB_HANDOFF" bash "$RLREPO/rd-workflow/scripts/lifecycle/promote.sh" \
+    --short-title hand1 --size large --source-fr - --handoff "$RLREPO/h2.md" 2>&1)"; then
+  fail "T3: 파일 불변 — 미확정 세션이 있는데 재호출이 성공했다: $out"
+elif cmp -s "$HAND1_FILE" "$RLREPO/h.md" \
+  && [[ "$out" == *"resolve-launch hand1"* ]] \
+  && [[ "$out" != *"이미 진행 중입니다"* ]]; then
+  pass "미확정 세션이 있으면 --handoff 재호출을 거부하고 기존 인계 파일을 보존한다(T3)"
+else
+  fail "T3: 파일 불변 — 기존 인계 파일 또는 안내 문구가 기대와 다르다: $out"
+fi
+
+# T3b — 기동 실패(failed) 뒤 다른 내용으로 재호출 → 교체 후 기동(D12 복구 경로).
+(cd "$RLREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_upsert hand1 launch=failed')
+if out="$(RD_LAUNCH_STUB="$RL_STUB_HANDOFF" bash "$RLREPO/rd-workflow/scripts/lifecycle/promote.sh" \
+    --short-title hand1 --size large --source-fr - --handoff "$RLREPO/h2.md" 2>&1)" \
+  && cmp -s "$HAND1_FILE" "$RLREPO/h2.md" \
+  && cmp -s "$RLREPO/seen-handoff" "$RLREPO/h2.md"; then
+  pass "기동 실패 뒤 --handoff 재호출이 인계 파일을 교체하고 기동한다(T3b)"
+else
+  fail "T3b: 재호출이 교체한다 — 살아 있는 worktree 의 인계 파일이 새 내용으로 바뀌지 않았다: $out"
+fi
+
+# T3c — 인계 파일 자리에 디렉터리가 남아 있으면 mv 가 그 안으로 옮기고 성공한다.
+# 그대로 두면 "ok" 를 내고 기동하지만 고정 경로에는 파일이 없다(FR 본질 재현).
+(cd "$RLREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_upsert hand1 launch=failed')
+rm -f "$HAND1_FILE" && mkdir "$HAND1_FILE"
+if out="$(RD_LAUNCH_STUB="$RL_STUB_HANDOFF" bash "$RLREPO/rd-workflow/scripts/lifecycle/promote.sh" \
+    --short-title hand1 --size large --source-fr - --handoff "$RLREPO/h.md" 2>&1)" \
+  || [[ "$out" == *"인계 기록 — ok"* ]] \
+  || [[ "$(cd "$RLREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get hand1 launch')" =~ ^(launching|ok)$ ]]; then
+  fail "T3c: 일반 파일 아닌 인계 자리 거부 — 디렉터리 자리에 기록을 성공으로 쳤다: $out"
+else
+  pass "인계 파일 자리가 디렉터리면 기록 실패로 끝내고 기동하지 않는다(T3c)"
+fi
+rm -rf "$HAND1_FILE" && cp "$RLREPO/h2.md" "$HAND1_FILE"
+
+# T4 — 입력 부재는 브랜치·worktree 를 만들기 전에 중단한다.
+if out="$(RD_LAUNCH_STUB="$RL_STUB_HANDOFF" bash "$RLREPO/rd-workflow/scripts/lifecycle/promote.sh" \
+    --short-title hand2 --size large --source-fr - --handoff "$RLREPO/없음.md" 2>&1)"; then
+  fail "T4: 브랜치·worktree 부재 — 없는 인계 파일로 착수가 성공했다: $out"
+elif [[ -z "$(git -C "$RLREPO" branch --list fr/hand2)" && ! -e "$RLREPO/.worktrees/hand2" ]]; then
+  pass "--handoff 입력 부재는 브랜치·worktree 생성 전에 중단한다(T4)"
+else
+  fail "T4: 브랜치·worktree 부재 — 검증 전에 브랜치 또는 worktree 가 만들어졌다: $out"
+fi
+# 빈 값(`--handoff "$F"` 에서 F 가 빔)을 "인계 없음" 으로 받으면 결정이 조용히 사라진다.
+if out="$(RD_LAUNCH_STUB="$RL_STUB_HANDOFF" bash "$RLREPO/rd-workflow/scripts/lifecycle/promote.sh" \
+    --short-title hand3 --size large --source-fr - --handoff "" 2>&1)" \
+  || [[ -n "$(git -C "$RLREPO" branch --list fr/hand3)" || -e "$RLREPO/.worktrees/hand3" ]]; then
+  fail "T4: 빈 --handoff 값 거부 — 빈 값으로 착수가 진행됐다: $out"
+else
+  pass "--handoff 빈 값은 브랜치·worktree 생성 전에 중단한다(T4)"
+fi
+
 # --- D2: reinit_noattach 는 등록된 worktree 경로를 대상으로 삼는다 ---
 # (2026-09 final diff review D2) TARGET_DIR 선택이 NEED_ATTACH 로만 게이트돼 있으면
 # worktree 는 이미 살아 있고 내용만 미초기화인 상태(reinit_noattach, NEED_ATTACH=0)
@@ -3056,6 +3204,28 @@ if [[ -f "$D2_CUSTOM/rd-workflow-workspace/.lifecycle/task-state" ]] \
   pass "reinit_noattach 는 실제 등록된 worktree(WT_ALIVE_PATH)를 대상 삼는다(D2)"
 else
   fail "D2: 명시 경로로 이미 살아 있는 worktree 의 대상 경로 유실"
+fi
+
+# --- D2b: reinit_noattach + --no-worktree 는 거부한다 ---
+# worktree 가 이미 살아 있는 작업에 --no-worktree 를 주면 현재 체크아웃(main)이 작업 자리로
+# 취급돼 착수 기록 커밋이 기본 브랜치에 생긴다. 상태 변경 없이 거부하고 --no-worktree 를
+# 빼라고 안내해야 한다. RLREPO 를 재사용한다(checkout 은 main).
+git -C "$RLREPO" branch fr/eps main
+git -C "$RLREPO" worktree add "$RLREPO/eps-wt" fr/eps >/dev/null
+D2B_MAIN_BEFORE="$(git -C "$RLREPO" rev-list --count main)"
+D2B_RC=0
+D2B_OUT="$(bash "$RLREPO/rd-workflow/scripts/lifecycle/promote.sh" --short-title eps --size large --source-fr - --no-worktree 2>&1)" || D2B_RC=$?
+D2B_MAIN_AFTER="$(git -C "$RLREPO" rev-list --count main)"
+[[ "$D2B_RC" -eq 1 ]] \
+  && pass "reinit_noattach + --no-worktree 는 rc 1 로 거부한다(D2b)" \
+  || fail "D2b: rc == 1 아님(rc=$D2B_RC): $D2B_OUT"
+[[ "$D2B_MAIN_BEFORE" == "$D2B_MAIN_AFTER" ]] \
+  && pass "거부 시 main 커밋 수 불변(D2b)" \
+  || fail "D2b: main 커밋 수 불변 아님($D2B_MAIN_BEFORE -> $D2B_MAIN_AFTER)"
+if [[ "$D2B_OUT" == *"--no-worktree 를 빼고"* && "$D2B_OUT" == *"eps-wt"* ]]; then
+  pass "거부 안내에 --no-worktree 제거와 worktree 경로가 있다(D2b)"
+else
+  fail "D2b: 안내 문구 누락: $D2B_OUT"
 fi
 
 # --- D3: session_probe 의 unknown 을 dead 로 취급하지 않는다 ---
@@ -3287,6 +3457,238 @@ if ( cd "$RBREPO" && env -u HERDR_ENV bash rd-workflow/scripts/lifecycle/promote
 else
   fail "F6: launch=ok 를 --force 로도 취소하지 못했다"
 fi
+
+echo "== promote.sh 문서 이관 =="
+CREPO="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패 (문서 이관)" >&2; exit 1; }
+[[ -n "$CREPO" && -d "$CREPO" ]] || { echo "test_lifecycle.sh: 임시 디렉터리 경로 검증 실패 (문서 이관)" >&2; exit 1; }
+CREPO="$(cd "$CREPO" && pwd -P)"
+_ast_cleanup+=("$CREPO")
+mkdir -p "$CREPO/rd-workflow"
+cp -R "$SCRIPT_DIR/.." "$CREPO/rd-workflow/scripts"
+git -C "$CREPO" init -q -b main
+git -C "$CREPO" config user.email t@t && git -C "$CREPO" config user.name t
+mkdir -p "$CREPO/rd-workflow-workspace/.lifecycle" "$CREPO/rd-workflow-workspace/backlog/items" \
+  "$CREPO/rd-workflow-workspace/specs/changes" "$CREPO/rd-workflow-workspace/plans"
+printf '.worktrees/\n' > "$CREPO/.gitignore"
+emit_current_task_baseline > "$CREPO/CURRENT_TASK.md"
+printf 'schema=1\nshort-title=-\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\nbase-commit=null\nreview-session=null\n' \
+  > "$CREPO/rd-workflow-workspace/.lifecycle/task-state"
+printf '# Change Request\n\n## Source FR\n-\n' > "$CREPO/REQUEST.md"
+: > "$CREPO/rd-workflow-workspace/specs/changes/.gitkeep"
+: > "$CREPO/rd-workflow-workspace/plans/.gitkeep"
+printf 'fr\n' > "$CREPO/rd-workflow-workspace/backlog/items/2026-01-01-other-fr.md"
+git -C "$CREPO" add -A && git -C "$CREPO" commit -q -m seed
+
+C_SPEC="rd-workflow-workspace/specs/changes"
+C_PLAN="rd-workflow-workspace/plans"
+cpromote() { bash "$CREPO/rd-workflow/scripts/lifecycle/promote.sh" "$@"; }
+c_mkreq() { printf '# Change Request\n\n## Source FR\n-\n\n## Goal\n%s\n' "$1" > "$CREPO/REQUEST.md"; }
+
+# ---- T1 ----
+c_mkreq t1
+printf 'spec-t1\n' > "$CREPO/$C_SPEC/2026-10-29-1530-ct1-change-spec.md"
+printf 'plan-t1\n' > "$CREPO/$C_PLAN/2026-10-29-1600-ct1-plan.md"
+printf 'bar\n' > "$CREPO/$C_PLAN/2026-10-29-1600-ct1-bar-plan.md"
+printf 'other\n' > "$CREPO/$C_PLAN/2026-10-29-1600-other-plan.md"
+printf 'u\n' > "$CREPO/unrelated.txt"; git -C "$CREPO" add unrelated.txt
+c_out="$(cpromote --short-title ct1 --size large --source-fr - 2>&1)" || true
+CT="$CREPO/.worktrees/ct1"
+[[ "$c_out" == *"문서 이관 — 3건 → fr/ct1"* ]] && pass "T1 요약 줄(3건)" || fail "T1 요약 줄: $c_out"
+[[ "$(printf '%s\n' "$c_out" | grep -c '원본 정리: 완료')" -eq 3 ]] && pass "T1 원본 정리 완료 3줄" || fail "T1 원본 정리 3줄"
+if git -C "$CT" show HEAD:REQUEST.md 2>/dev/null | grep -q '^t1$' \
+   && [[ "$(git -C "$CT" show "HEAD:$C_SPEC/2026-10-29-1530-ct1-change-spec.md")" == "spec-t1" ]] \
+   && [[ "$(git -C "$CT" show "HEAD:$C_PLAN/2026-10-29-1600-ct1-plan.md")" == "plan-t1" ]]; then
+  pass "T1 T HEAD 에 REQUEST·spec·plan"
+else fail "T1 T HEAD 내용"; fi
+if cmp -s "$CREPO/REQUEST.md" <(git -C "$CREPO" show main:REQUEST.md) \
+   && [[ ! -e "$CREPO/$C_SPEC/2026-10-29-1530-ct1-change-spec.md" && ! -e "$CREPO/$C_PLAN/2026-10-29-1600-ct1-plan.md" ]]; then
+  pass "T1 P 의 REQUEST 는 템플릿, 이관 파일은 정리됨"
+else fail "T1 P 정리"; fi
+if [[ -f "$CREPO/$C_PLAN/2026-10-29-1600-ct1-bar-plan.md" && -f "$CREPO/$C_PLAN/2026-10-29-1600-other-plan.md" \
+      && ! -e "$CT/$C_PLAN/2026-10-29-1600-ct1-bar-plan.md" && ! -e "$CT/$C_PLAN/2026-10-29-1600-other-plan.md" ]]; then
+  pass "T1 -bar·slug 없는 plan 은 P 에 남고 T 에 없음"
+else fail "T1 귀속 배제"; fi
+[[ "$(git -C "$CREPO" diff --cached --name-only)" == "unrelated.txt" ]] && pass "T1 무관 staged 보존" || fail "T1 staged 보존"
+c_n="$(git -C "$CT" rev-list --count main..HEAD)"
+c_msgs="$(git -C "$CT" log --format=%s main..HEAD | grep -c '기획 문서 이관' || true)"
+[[ "$c_msgs" -eq 1 ]] && pass "T1 이관 커밋 정확히 1개 (main 대비 ${c_n}개)" || fail "T1 이관 커밋 수 $c_msgs"
+# 후보 없는 새 slug — 이관 커밋 없음, 기본 브랜치 대비 커밋 수는 ct1 보다 1 적음
+c_out="$(cpromote --short-title ct1b --size large --source-fr - 2>&1)" || true
+[[ "$c_out" == *"문서 이관 — 대상 없음"* ]] && pass "T1 후보 없음 요약" || fail "T1 후보 없음 요약: $c_out"
+[[ "$(git -C "$CREPO/.worktrees/ct1b" rev-list --count main..HEAD)" -eq $((c_n - 1)) ]] \
+  && pass "T1 후보 없는 호출은 이관 커밋 없음" || fail "T1 후보 없음 커밋 수"
+# 양방향 배제 — slug ct1-bar 착수에서 ct1 plan 이 이관되지 않음
+git -C "$CREPO" reset -q unrelated.txt; rm -f "${CREPO:?}/unrelated.txt"
+printf 'plan-t1-again\n' > "$CREPO/$C_PLAN/2026-10-29-1600-ct1-plan.md"
+c_out="$(cpromote --short-title ct1-bar --size large --source-fr - 2>&1)" || true
+[[ "$c_out" == *"문서 이관 — 1건 → fr/ct1-bar"* ]] \
+  && [[ -f "$CREPO/$C_PLAN/2026-10-29-1600-ct1-plan.md" && ! -e "$CREPO/.worktrees/ct1-bar/$C_PLAN/2026-10-29-1600-ct1-plan.md" ]] \
+  && pass "T1 slug ct1-bar 가 ct1 plan 을 이관하지 않음(양방향)" || fail "T1 양방향 배제: $c_out"
+rm -f "${CREPO:?}/$C_PLAN/2026-10-29-1600-ct1-plan.md" "${CREPO:?}/$C_PLAN/2026-10-29-1600-ct1-bar-plan.md" "${CREPO:?}/$C_PLAN/2026-10-29-1600-other-plan.md"
+
+# ---- T2 (--no-worktree) ----
+c_mkreq t2
+printf 'spec-t2\n' > "$CREPO/$C_SPEC/2026-10-29-1530-ct2-change-spec.md"
+c_out="$(cpromote --short-title ct2 --size large --source-fr - --no-worktree 2>&1)" || true
+[[ "$c_out" == *"문서 이관 — 2건 → fr/ct2"* ]] && pass "T2 inplace 요약" || fail "T2 요약: $c_out"
+[[ "$c_out" != *"원본 정리"* ]] && pass "T2 원본 정리 줄 없음" || fail "T2 원본 정리 줄"
+if [[ "$(git -C "$CREPO" show "HEAD:$C_SPEC/2026-10-29-1530-ct2-change-spec.md" 2>/dev/null)" == "spec-t2" ]] \
+   && [[ -f "$CREPO/$C_SPEC/2026-10-29-1530-ct2-change-spec.md" ]] && grep -q '^t2$' "$CREPO/REQUEST.md"; then
+  pass "T2 커밋되고 working tree 에 남음"
+else fail "T2 커밋·working tree"; fi
+git -C "$CREPO" switch -q main
+
+# ---- T3 (거부: tracked 수정 / staged REQUEST / Source FR 불일치) ----
+git -C "$CREPO" reset -q --hard main
+printf 'tracked-old\n' > "$CREPO/$C_SPEC/2026-10-29-1530-ct3a-change-spec.md"
+git -C "$CREPO" add -A && git -C "$CREPO" commit -q -m "seed ct3a spec"
+printf 'tracked-new\n' > "$CREPO/$C_SPEC/2026-10-29-1530-ct3a-change-spec.md"
+c_out="$(cpromote --short-title ct3a --size large --source-fr - 2>&1)" || true
+if [[ "$c_out" == *"건너뜀 $C_SPEC/2026-10-29-1530-ct3a-change-spec.md: tracked 수정"* ]] \
+   && [[ "$(cat "$CREPO/$C_SPEC/2026-10-29-1530-ct3a-change-spec.md")" == "tracked-new" ]] \
+   && [[ "$(git -C "$CREPO/.worktrees/ct3a" show "HEAD:$C_SPEC/2026-10-29-1530-ct3a-change-spec.md")" == "tracked-old" ]]; then
+  pass "T3 tracked 수정은 건너뜀 + P 유지"
+else fail "T3 tracked 수정: $c_out"; fi
+git -C "$CREPO" checkout -q -- .
+c_mkreq t3b; git -C "$CREPO" add REQUEST.md
+c_out="$(cpromote --short-title ct3b --size large --source-fr - 2>&1)" || true
+if [[ "$c_out" == *"건너뜀 REQUEST.md: REQUEST.md 가 staged 상태"* ]] && grep -q '^t3b$' "$CREPO/REQUEST.md" \
+   && ! git -C "$CREPO/.worktrees/ct3b" show HEAD:REQUEST.md 2>/dev/null | grep -q '^t3b$'; then
+  pass "T3 staged REQUEST 건너뜀 + P 유지"
+else fail "T3 staged REQUEST: $c_out"; fi
+git -C "$CREPO" reset -q --hard main
+printf '# Change Request\n\n## Source FR\n`rd-workflow-workspace/backlog/items/2026-01-01-other-fr.md`\n\n## Goal\nt3c\n' > "$CREPO/REQUEST.md"
+c_out="$(cpromote --short-title ct3c --size large --source-fr - 2>&1)" || true
+if [[ "$c_out" == *"건너뜀 REQUEST.md"*"귀속 불확실"* ]] && grep -q '^t3c$' "$CREPO/REQUEST.md" \
+   && ! git -C "$CREPO/.worktrees/ct3c" show HEAD:REQUEST.md 2>/dev/null | grep -q '^t3c$'; then
+  pass "T3 Source FR 불일치 REQUEST 건너뜀 + P 유지"
+else fail "T3 Source FR 불일치: $c_out"; fi
+git -C "$CREPO" reset -q --hard main
+
+# ---- T4 (재실행 ①③ + skip-only) ----
+cpromote --short-title ct4 --size large --source-fr - >/dev/null 2>&1
+CT4="$CREPO/.worktrees/ct4"; F4="$C_SPEC/2026-10-29-1530-ct4-change-spec.md"
+printf 'v1\n' > "$CREPO/$F4"
+c_out="$(cpromote --short-title ct4 --size large --source-fr - 2>&1)" || true
+if [[ "$(git -C "$CT4" show "HEAD:$F4" 2>/dev/null)" == "v1" && ! -e "$CREPO/$F4" && "$c_out" == *"이관 완료: $F4"* ]]; then
+  pass "T4 재실행 ① 이관 + P 정리"
+else fail "T4 ①: $c_out"; fi
+n4="$(git -C "$CT4" rev-list --count HEAD)"
+printf 'v1\n' > "$CREPO/$F4"
+c_out="$(cpromote --short-title ct4 --size large --source-fr - 2>&1)" || true
+if [[ "$(git -C "$CT4" rev-list --count HEAD)" -eq "$n4" && ! -e "$CREPO/$F4" ]]; then
+  pass "T4 ③ 커밋 수 불변 + P 정리"
+else fail "T4 ③: $c_out"; fi
+printf 'v2\n' > "$CREPO/$F4"
+if c_out="$(cpromote --short-title ct4 --size large --source-fr - 2>&1)"; then c_rc=0; else c_rc=$?; fi
+if [[ "$c_rc" -eq 1 && "$c_out" == *"이관 보류 — $F4: 대상에 다른 내용"* && "$(cat "$CREPO/$F4")" == "v2" ]]; then
+  pass "T4 skip-only duplicate: exit 1 + 이관 보류 + P 유지"
+else fail "T4 skip-only rc=$c_rc: $c_out"; fi
+rm -f "${CREPO:?}/$F4"
+
+# ---- T5 (분류 ②) ----
+cpromote --short-title ct5 --size large --source-fr - >/dev/null 2>&1
+CT5="$CREPO/.worktrees/ct5"; F5="$C_SPEC/2026-10-29-1530-ct5-change-spec.md"
+c_mkreq t5
+printf 'spec-t5\n' > "$CREPO/$F5"
+printf 'spec-t5\n' > "$CT5/$F5"
+cp "$CREPO/REQUEST.md" "$CT5/REQUEST.md"
+# 대상(T)의 무관한 staged 변경은 이관 커밋에 딸려 들어가지 않고 staged 로 남아야 한다(경로 한정 커밋).
+printf 'y\n' > "$CT5/t5-unrelated.txt"; git -C "$CT5" add t5-unrelated.txt
+c_out="$(cpromote --short-title ct5 --size large --source-fr - 2>&1)" || true
+if [[ "$(git -C "$CT5" show "HEAD:$F5" 2>/dev/null)" == "spec-t5" ]] && git -C "$CT5" show HEAD:REQUEST.md 2>/dev/null | grep -q '^t5$' \
+   && [[ ! -e "$CREPO/$F5" ]] && cmp -s "$CREPO/REQUEST.md" <(git -C "$CREPO" show main:REQUEST.md); then
+  pass "T5 W==S 커밋만(②) — T HEAD 에 존재 + P 정리"
+else fail "T5: $c_out"; fi
+if ! git -C "$CT5" cat-file -e "HEAD:t5-unrelated.txt" 2>/dev/null \
+   && [[ "$(git -C "$CT5" diff --cached --name-only)" == "t5-unrelated.txt" ]]; then
+  pass "T5 대상의 무관한 staged 는 이관 커밋에 포함되지 않고 staged 유지"
+else fail "T5 대상 staged 보존: $(git -C "$CT5" diff --cached --name-only | tr '\n' ' ')"; fi
+git -C "$CREPO" reset -q --hard main
+
+# ---- T6 (이관 실패 → exit 4) ----
+cpromote --short-title ct6 --size large --source-fr - >/dev/null 2>&1
+CT6="$CREPO/.worktrees/ct6"; R6="rd-workflow-workspace/raw-captures/2026-10-29-spec-ct6.md"
+printf 'x\n' > "$CT6/t-unrelated.txt"; git -C "$CT6" add t-unrelated.txt
+blob6="$(git -C "$CT6" rev-parse :t-unrelated.txt)"
+rm -rf "${CT6:?}/rd-workflow-workspace/raw-captures"; printf 'file\n' > "$CT6/rd-workflow-workspace/raw-captures"
+mkdir -p "$CREPO/rd-workflow-workspace/raw-captures"; printf 'cap\n' > "$CREPO/$R6"
+if c_out="$(cpromote --short-title ct6 --size large --source-fr - 2>&1)"; then c_rc=0; else c_rc=$?; fi
+if [[ "$c_rc" -eq 4 && "$c_out" == *"착수 성공 · 문서 이관 실패"* && -f "$CREPO/$R6" && "$c_out" != *"세션 기동 결과"* \
+      && "$(git -C "$CT6" rev-parse :t-unrelated.txt)" == "$blob6" ]]; then
+  pass "T6 exit 4 + 실패 문구 + 원본 유지 + 기동 안 함 + 무관 staged 불변"
+else fail "T6 rc=$c_rc: $c_out"; fi
+rm -f "${CT6:?}/rd-workflow-workspace/raw-captures"
+if c_out="$(cpromote --short-title ct6 --size large --source-fr - 2>&1)"; then
+  [[ ! -e "$CREPO/$R6" && "$(git -C "$CT6" show "HEAD:$R6" 2>/dev/null)" == "cap" ]] \
+    && pass "T6 장애 제거 후 재실행으로 이관 완료" || fail "T6 재실행 결과: $c_out"
+else fail "T6 재실행 실패: $c_out"; fi
+
+# ---- T7 (대상 index 보호) ----
+cpromote --short-title ct7 --size large --source-fr - >/dev/null 2>&1
+CT7="$CREPO/.worktrees/ct7"; F7="$C_SPEC/2026-10-29-1530-ct7-change-spec.md"
+printf 'staged-other\n' > "$CT7/$F7"; git -C "$CT7" add "$F7"
+blob7="$(git -C "$CT7" rev-parse ":$F7")"
+printf 'S\n' > "$CT7/$F7"; printf 'S\n' > "$CREPO/$F7"
+if c_out="$(cpromote --short-title ct7 --size large --source-fr - 2>&1)"; then c_rc=0; else c_rc=$?; fi
+if [[ "$c_rc" -eq 1 && "$c_out" == *"이관 보류"*"staged"* && "$(git -C "$CT7" rev-parse ":$F7")" == "$blob7" \
+      && -z "$(git -C "$CT7" ls-tree HEAD -- "$F7")" && -f "$CREPO/$F7" ]]; then
+  pass "T7 target staged 보호: exit 1 + 이관 보류 + index 불변 + HEAD 에 없음 + P 유지"
+else fail "T7 rc=$c_rc: $c_out"; fi
+rm -f "${CREPO:?}/$F7"
+
+# ---- T8 (대상 경로가 디렉터리 — 부재로 오인해 안의 사용자 파일을 커밋하지 않는다) ----
+git -C "$CREPO" reset -q --hard main
+cpromote --short-title ct8 --size large --source-fr - >/dev/null 2>&1
+CT8="$CREPO/.worktrees/ct8"; P8="$C_PLAN/2026-10-29-1600-ct8-plan.md"
+mkdir -p "$CT8/$P8"; printf 'mine\n' > "$CT8/$P8/user.txt"
+printf 'plan-t8\n' > "$CREPO/$P8"
+if c_out="$(cpromote --short-title ct8 --size large --source-fr - 2>&1)"; then c_rc=0; else c_rc=$?; fi
+if [[ "$c_rc" -eq 1 && "$c_out" == *"일반 파일이 아님"* && -z "$(git -C "$CT8" ls-tree -r HEAD --name-only | grep 'ct8-plan')" \
+      && -f "$CT8/$P8/user.txt" && -z "$(git -C "$CT8" diff --cached --name-only)" && -f "$CREPO/$P8" ]]; then
+  pass "T8 디렉터리 충돌: 이관 보류 + 사용자 파일 미커밋 + index 불변 + P 유지"
+else fail "T8 rc=$c_rc: $c_out"; fi
+rm -f "${CREPO:?}/$P8"
+
+# ---- T9 (--no-worktree 이관 커밋이 실제 훅에 거부된 뒤 같은 명령 재실행으로 복구) ----
+git -C "$CREPO" reset -q --hard main
+# --no-worktree 는 동시에 하나만 허용하므로 T2 의 ct2 를 먼저 정리한다.
+bash "$CREPO/rd-workflow/scripts/lifecycle/promote_rollback.sh" --task ct2 >/dev/null 2>&1 || true
+c_mkreq t9
+F9="$C_SPEC/2026-10-29-1530-ct9-change-spec.md"; printf 'spec-t9\n' > "$CREPO/$F9"
+printf '#!/bin/sh\nif git diff --cached --name-only | grep -q "ct9-change-spec"; then echo blocked >&2; exit 1; fi\n' > "$CREPO/.git/hooks/pre-commit"
+chmod +x "$CREPO/.git/hooks/pre-commit"
+if c_out="$(cpromote --short-title ct9 --size large --source-fr - --no-worktree 2>&1)"; then c_rc=0; else c_rc=$?; fi
+if [[ "$c_rc" -eq 4 && "$c_out" == *"착수 성공 · 문서 이관 실패"* && -f "$CREPO/$F9" && -z "$(git -C "$CREPO" diff --cached --name-only)" ]]; then
+  pass "T9 훅 거부: exit 4 + 실패 문구 + 원본 유지 + index 비움"
+else fail "T9 1차 rc=$c_rc: $c_out"; fi
+rm -f "$CREPO/.git/hooks/pre-commit"
+if c_out="$(cpromote --short-title ct9 --size large --source-fr - --no-worktree 2>&1)"; then c_rc=0; else c_rc=$?; fi
+if [[ "$c_rc" -eq 0 && "$(git -C "$CREPO" show "HEAD:$F9" 2>/dev/null)" == "spec-t9" ]] && git -C "$CREPO" show HEAD:REQUEST.md 2>/dev/null | grep -q '^t9$'; then
+  pass "T9 원인 제거 뒤 같은 명령 재실행으로 이관 완료(--no-worktree)"
+else fail "T9 재실행 rc=$c_rc: $c_out"; fi
+git -C "$CREPO" switch -q main
+
+# ---- T10 (다른 worktree 의 작업을 기본 체크아웃에서 --no-worktree 로 재호출 — 기본 브랜치에 커밋하지 않는다) ----
+git -C "$CREPO" reset -q --hard main
+( cd "$CREPO" && bash rd-workflow/scripts/rd task resolve-launch ct9 --assume-ended >/dev/null 2>&1 || true )
+bash "$CREPO/rd-workflow/scripts/lifecycle/promote_rollback.sh" --task ct9 >/dev/null 2>&1 || true
+cpromote --short-title ct10 --size large --source-fr - >/dev/null 2>&1
+P10="$C_PLAN/2026-10-29-1600-ct10-plan.md"; printf 'plan-t10\n' > "$CREPO/$P10"
+main10="$(git -C "$CREPO" rev-parse main)"; fr10="$(git -C "$CREPO" rev-parse fr/ct10)"
+if c_out="$(cpromote --short-title ct10 --size large --source-fr - --no-worktree 2>&1)"; then c_rc=0; else c_rc=$?; fi
+if [[ "$c_rc" -eq 1 && "$c_out" == *"이미 진행 중"* && "$c_out" != *"문서 이관 —"* \
+      && "$(git -C "$CREPO" rev-parse main)" == "$main10" && "$(git -C "$CREPO" rev-parse fr/ct10)" == "$fr10" \
+      && "$(git -C "$CREPO" symbolic-ref --short HEAD)" == "main" && -f "$CREPO/$P10" ]]; then
+  pass "T10 다른 worktree 작업의 --no-worktree 재호출: 거부 + main·fr HEAD 불변 + 원본 유지 + 거짓 성공 표시 없음"
+else fail "T10 rc=$c_rc: $c_out"; fi
+rm -f "${CREPO:?}/$P10"
+
+# ---- T11 은 제거했습니다 — 미초기화 fr worktree 가 따로 살아 있을 때 기본 체크아웃의 --no-worktree 는
+# reinit_noattach + --no-worktree 라 D2b 가 착수 전에 거부하고 main 커밋 수 불변까지 같은 조합으로
+# 확인합니다. 같은 사실을 다른 fixture 로 다시 보는 중복이라 두지 않습니다. ----
+git -C "$CREPO" switch -q main 2>/dev/null || true
+git -C "$CREPO" reset -q --hard main
 
 if [[ "$(trap -p EXIT)" == *_suite_on_exit* ]]; then
   PASS=$((PASS+1)); echo "  PASS: 조용한 중단 센티넬(EXIT trap)이 스위트 끝까지 유지됨"

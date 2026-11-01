@@ -200,18 +200,73 @@ JSON
 out=$(bash "$H" summary "$TMP/strand.json")
 expect_out "summary: pending/running 카운터(stranded 집계)" "completed=0 skipped=0 blocked=0 excluded=0 pending=2 running=1" "$out"
 
-# --- verify-done ---
+# --- verify-done / resolve-task ---
+# 증거는 request-archive 파일의 `## Source FR` 절이다 (파일명 일치는 증거가 아님).
 ITEMS="$TMP/items"; ARCH="$TMP/arch"; mkdir -p "$ITEMS" "$ARCH"
 printf '# 2026-07-01 foo\n- status: done\n' > "$ITEMS/2026-07-01-foo.md"
 printf '# 2026-07-02 bar\n- status: validated\n' > "$ITEMS/2026-07-02-bar.md"
+printf '# 2026-07-01 foo-bar\n- status: done\n' > "$ITEMS/2026-07-01-foo-bar.md"
+vd() { RD_BATCH_ITEMS_DIR="$ITEMS" RD_BATCH_ARCHIVE_DIR="$ARCH" bash "$H" verify-done "$1" 2>/dev/null; }
+rt() { RD_BATCH_ITEMS_DIR="$ITEMS" RD_BATCH_ARCHIVE_DIR="$ARCH" bash "$H" resolve-task "$1" 2>/dev/null; }
+clear_arch() { rm -f "$ARCH"/*; }
+# arch <파일명> <본문 줄...> — `## Source FR` 절 아래에 줄을 그대로 적는다
+arch() { local n="$1"; shift; { printf '# REQUEST\n\n## Source FR\n\n'; printf '%s\n' "$@"; } > "$ARCH/$n"; }
+FOO="$ITEMS/2026-07-01-foo.md"; FOOBAR="$ITEMS/2026-07-01-foo-bar.md"; BAR="$ITEMS/2026-07-02-bar.md"
+
+arch 2026-07-01-1200-renamed-task.md "- $FOO"
+vd foo; expect_code "verify-done: 이름≠slug + Source FR 일치(- 접두) → 0" 0 $?
+out=$(rt foo); rc=$?
+expect_code "resolve-task: 1개 → 0" 0 "$rc"
+expect_out "resolve-task: 작업 이름 출력" "renamed-task" "$out"
+vd foo-bar; expect_code "verify-done: 다른 FR(foo-bar) 은 증거 없음 → 1" 1 $?
+
+clear_arch
+arch 2026-07-01-1200-bundle-task.md "- $FOO" "$FOOBAR"
+vd foo; expect_code "verify-done: 묶음 archive — foo → 0" 0 $?
+vd foo-bar; expect_code "verify-done: 묶음 archive — foo-bar(접두 없는 줄) → 0" 0 $?
+
+clear_arch
+arch 2026-07-01-1200-pm.md "- $FOOBAR"
+vd foo; expect_code "verify-done: 유사 slug(foo-bar 만 기재) → 1" 1 $?
+vd foo-bar; expect_code "verify-done: 유사 slug 반대(foo-bar) → 0" 0 $?
+
+clear_arch
+arch 2026-07-01-1200-cm.md "<!-- 예시:" "- $FOO" "-->" "- -"
+vd foo; expect_code "verify-done: 여러 줄 주석 속 경로만 → 1" 1 $?
+arch 2026-07-01-1200-cm.md "<!-- 예시 - $FOO -->" "-"
+vd foo; expect_code "verify-done: 한 줄 주석 속 경로만 → 1" 1 $?
+
+clear_arch
+arch 2026-07-01-1200-os.md "-" "" "## Change Description" "- $FOO"
+vd foo; expect_code "verify-done: 다른 절의 경로만 → 1" 1 $?
+
+clear_arch
+printf '# REQUEST\n\n## Change Description\n- %s\n' "$FOO" > "$ARCH/2026-07-01-1200-nosec.md"
+vd foo; expect_code "verify-done: Source FR 절 누락 → 1" 1 $?
+
+clear_arch
+arch 2026-07-01-1200-dash.md "-"
+vd foo; expect_code "verify-done: 값 - → 1" 1 $?
+arch 2026-07-01-1200-dash.md ""
+vd foo; expect_code "verify-done: 빈 값 → 1" 1 $?
+
+clear_arch
 : > "$ARCH/2026-07-01-1200-foo.md"
-RD_BATCH_ITEMS_DIR="$ITEMS" RD_BATCH_ARCHIVE_DIR="$ARCH" bash "$H" verify-done foo
-expect_code "verify-done: done+archive → 0" 0 $?
-RD_BATCH_ITEMS_DIR="$ITEMS" RD_BATCH_ARCHIVE_DIR="$ARCH" bash "$H" verify-done bar
-expect_code "verify-done: status≠done → 1" 1 $?
-rm "$ARCH/2026-07-01-1200-foo.md"
-RD_BATCH_ITEMS_DIR="$ITEMS" RD_BATCH_ARCHIVE_DIR="$ARCH" bash "$H" verify-done foo
-expect_code "verify-done: archive 없음 → 1" 1 $?
+vd foo; expect_code "verify-done: 파일명만 일치(빈 파일) → 1" 1 $?
+
+clear_arch
+arch 2026-07-02-1200-bar.md "- $BAR"
+vd bar; expect_code "verify-done: 유효 archive + status≠done → 1" 1 $?
+
+clear_arch
+rt foo >/dev/null; expect_code "resolve-task: 증거 없음 → 1" 1 $?
+arch 2026-07-01-1200-name-a.md "- $FOO"
+arch 2026-07-03-1300-name-b.md "- $FOO"
+out=$(rt foo); rc=$?
+expect_code "resolve-task: 서로 다른 이름 2개 → 4" 4 "$rc"
+expect_out "resolve-task: 복수 후보는 stdout 비움" "" "$out"
+vd foo; expect_code "verify-done: 복수 후보여도 증거 있음 → 0" 0 $?
+clear_arch
 
 # --- resolve-slug ---
 RD_BATCH_ITEMS_DIR="$ITEMS" bash "$H" resolve-slug foo >/dev/null

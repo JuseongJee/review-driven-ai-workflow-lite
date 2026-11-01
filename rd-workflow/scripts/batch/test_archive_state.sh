@@ -9,8 +9,11 @@ BM="$DIR/batch_manifest.sh"
 PASS=0
 FAIL=0
 WORK=""
+# SLUG 는 FR slug(인자), TASK 는 작업 이름(SHORT_TITLE) — 둘이 달라야 git 증거 조회가
+# 작업 이름을 쓰는지 가려진다. branch·merge 메시지·tag·archive 파일명은 모두 TASK 로 만든다.
 SLUG="probe-task"
-TAG="fr/2026-09-09/${SLUG}"
+TASK="probe-work"
+TAG="fr/2026-09-09/${TASK}"
 
 cleanup() { if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf "$WORK"; WORK=""; fi; }
 trap cleanup EXIT INT TERM
@@ -57,26 +60,27 @@ setup() {
   mkdir -p rd-workflow-workspace/backlog/items rd-workflow-workspace/backlog/request-archive
   printf '%s\n' "# 2026-09-09 ${SLUG}" "- status: done" \
     > "rd-workflow-workspace/backlog/items/2026-09-09-${SLUG}.md"
-  printf '%s\n' "# archive" \
-    > "rd-workflow-workspace/backlog/request-archive/2026-09-09-1200-${SLUG}.md"
+  SRC_FR="rd-workflow-workspace/backlog/items/2026-09-09-${SLUG}.md"
+  printf '%s\n' "# archive" "" "## Source FR" "" "- ${SRC_FR}" \
+    > "rd-workflow-workspace/backlog/request-archive/2026-09-09-1200-${TASK}.md"
 
   echo base > base.txt
   git add -A && git commit -q -m "chore: base"
   BASE_OID="$(git rev-parse HEAD)"
 
-  git checkout -q -b "fr/${SLUG}"
+  git checkout -q -b "fr/${TASK}"
   echo work > work.txt
   git add -A && git commit -q -m "feat: work"
   git checkout -q main
-  git merge -q --no-ff "fr/${SLUG}" -m "merge: ${SLUG} (autopilot 완료)"
+  git merge -q --no-ff "fr/${TASK}" -m "merge: ${TASK} (autopilot 완료)"
 
   # metadata cleanup commit = 발행 커밋 (archive.sh 의 PUBLISH_OID 자리)
   echo meta > meta.txt
-  git add -A && git commit -q -m "chore(lifecycle): archive ${SLUG} metadata 정리"
+  git add -A && git commit -q -m "chore(lifecycle): archive ${TASK} metadata 정리"
   PUBLISH_OID="$(git rev-parse HEAD)"
 
   # archive.sh 는 annotated tag 를 만든다
-  git tag -a "$TAG" "$PUBLISH_OID" -m "archive: ${SLUG}"
+  git tag -a "$TAG" "$PUBLISH_OID" -m "archive: ${TASK}"
   TAG_OID="$(git rev-parse "$TAG")"
 
   printf '%s' '{"finish_policy":"push","status":"running","items":[]}'  > mf-push.json
@@ -90,6 +94,12 @@ setup || { echo "fixture 생성 실패" >&2; exit 1; }
 line="$(bash "$BM" archive-state mf-push.json "no-such-slug" 2>/dev/null | head -n1)"
 case "$line" in *state=not-archived*) ok ;; *) bad "5 merge 근거 없음 — 실제 '$line'" ;; esac
 
+# 13) 같은 FR 을 Source FR 로 가진 archive 가 서로 다른 이름으로 둘 — 이름 확정 불가
+printf '%s\n' "# archive" "" "## Source FR" "" "- ${SRC_FR}" \
+  > "rd-workflow-workspace/backlog/request-archive/2026-09-10-1300-other-work.md"
+check "13 archive 후보 2개(push)" mf-push.json unknown "" "task-ambiguous"
+rm -f "rd-workflow-workspace/backlog/request-archive/2026-09-10-1300-other-work.md"
+
 # 12) verify-done 미충족
 printf '%s\n' "# 2026-09-09 ${SLUG}" "- status: validated" \
   > "rd-workflow-workspace/backlog/items/2026-09-09-${SLUG}.md"
@@ -102,7 +112,7 @@ git tag -d "$TAG" >/dev/null 2>&1
 check "3 tag 없음(push)" mf-push.json incomplete-archive "tag"
 # annotated tag object 는 생성 시각을 포함하므로 재생성하면 OID 가 바뀐다.
 # TAG_OID 를 갱신하지 않으면 초 경계를 넘는 순간 케이스 1 이 스스로 mismatch 를 만든다.
-git tag -a "$TAG" "$PUBLISH_OID" -m "archive: ${SLUG}"
+git tag -a "$TAG" "$PUBLISH_OID" -m "archive: ${TASK}"
 TAG_OID="$(git rev-parse "$TAG")"
 
 # 4) 로컬 fr 브랜치 잔존
@@ -112,7 +122,7 @@ check "4 로컬 fr 브랜치 잔존(push)" mf-push.json incomplete-archive "loca
 #    ls-remote 줄 수 비교로는 읽기 호출 여부도, 같은 개수의 ref 변경도 검출하지 못한다.
 #    대신 "접근 불가능한 origin 에서도 complete 가 나온다" 로 확인한다 — 조회한다면
 #    unknown(remote-unreachable) 로 떨어지므로, complete 자체가 비조회의 증거다.
-git branch -q -D "fr/${SLUG}"
+git branch -q -D "fr/${TASK}"
 GOOD_URL="$(git remote get-url origin)"
 git remote set-url origin "$WORK/remote/does-not-exist.git"
 check "6 접근 불가 origin 에서도 complete(merge)" mf-merge.json complete
@@ -127,9 +137,9 @@ git push -q origin "${TAG_OID}:refs/tags/${TAG}"
 check "1 전 단계 완료(push)" mf-push.json complete
 
 # 11) 원격 fr 브랜치 잔존
-git push -q origin "${PUBLISH_OID}:refs/heads/fr/${SLUG}"
+git push -q origin "${PUBLISH_OID}:refs/heads/fr/${TASK}"
 check "11 원격 fr 브랜치 잔존(push)" mf-push.json incomplete-archive "remote-fr-branch"
-git push -q origin --delete "fr/${SLUG}" >/dev/null 2>&1
+git push -q origin --delete "fr/${TASK}" >/dev/null 2>&1
 
 # 8) 원격 tag 가 다른 OID (F3) — 이름만 보면 complete 로 오판된다
 git push -q origin ":refs/tags/${TAG}"

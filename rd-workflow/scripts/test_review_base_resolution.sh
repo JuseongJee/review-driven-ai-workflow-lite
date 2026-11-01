@@ -85,6 +85,7 @@ mk_repo() {
      "${RD_SRC}/scripts/_state_common.sh" \
      "${RD_SRC}/scripts/_task_common.sh" \
      "${RD_SRC}/scripts/rd" \
+     "${RD_SRC}/scripts/verify_record.sh" \
      "${d}/rd-workflow/scripts/" || return 1
   cp "${RD_SRC}/scripts/hooks/_guard_common.sh" "${d}/rd-workflow/scripts/hooks/" || return 1
   # 판정 규칙이 담긴 awk 를 함께 복사한다. 누락하면 fixture 안에서 판정이 항상 실패해
@@ -229,8 +230,20 @@ reviewer_turn() { # reviewer_turn <repo> <session-dir> [PATH prepend] — author
     >"${OUT}/turn.out" 2>"${OUT}/turn.err"
 }
 
+# put_evidence <repo> [exit-code] — 현재 HEAD 트리에 대한 증거 파일을 직접 깝니다 (래퍼 우회).
+# 기존 seal 케이스는 증거 검사가 대상이 아니므로 seal() 이 기본으로 이것을 먼저 깝니다.
+put_evidence() {
+  local repo="$1" ec="${2:-0}" h oid
+  h="$( ( project_root="$repo"; export project_root; source "${repo}/rd-workflow/scripts/_state_common.sh"; rd_protected_tree_hash HEAD ) )"
+  oid="$(git -C "$repo" rev-parse HEAD)"
+  mkdir -p "${repo}/rd-workflow-workspace/.lifecycle/review-seals"
+  printf 'schema=1\ncommand=true\nexit-code=%s\ntree-hash=%s\nhead=%s\nrecorded-at=2026-10-29-0000\n' \
+    "$ec" "$h" "$oid" > "${repo}/rd-workflow-workspace/.lifecycle/review-seals/verify-evidence"
+}
+
 seal() { # seal <repo> [args...] — rd review seal 실행. 출력은 $OUT/seal.{out,err}
   local repo="$1"; shift
+  [ -n "${SEAL_NO_EVIDENCE:-}" ] || put_evidence "$repo"
   ( cd "$repo" && bash rd-workflow/scripts/rd review seal "$@" ) \
     >"${OUT}/seal.out" 2>"${OUT}/seal.err"
 }
@@ -469,6 +482,28 @@ eq "$rc" "1" "검사 1: 미종결 세션 seal 실패"
 has "종결되지 않았습니다" "$(cat "${OUT}/seal.err")" "검사 1: 사유 안내"
 has "status:awaiting-author" "$(cat "${OUT}/seal.err")" "검사 1: 사유에 판정 유발 지점이 담긴다"
 
+# 검사 1 안내 (AC4) — 거부 사유 종류별로 복구 안내가 달라야 합니다. 상태·CHECKPOINT 를 잠시 바꿔 확인하고 원복합니다.
+cp "${SS}/CHECKPOINT.md" "${OUT}/checkpoint-keep.md"
+seal_hint_case() { # seal_hint_case <Open Issues 본문> — closed 세션으로 만들고 seal 을 시도
+  set_session_state "$SS" "closed" "Author"
+  printf '# Review Checkpoint\n\n## Open Issues\n%s\n\n## Suggested Next Owner\nAuthor\n' "$1" > "${SS}/CHECKPOINT.md"
+  seal "$RS" "${SS#${RS}/}"
+}
+seal_hint_case '없음. 이의 없음.'; rc=$?
+HINT="$(cat "${OUT}/seal.err")"
+eq "$rc" "1" "검사 1 안내: 형식 위반 거부"
+has "읽힌 값: 없음. 이의 없음." "$HINT" "검사 1 안내(형식): 실제로 읽힌 값을 보인다"
+has "기대 형식: CHECKPOINT.md 의 'Open Issues' 첫 줄이 정확히 '- 없음'" "$HINT" "검사 1 안내(형식): 기대 형식을 보인다"
+has "이의가 모두 해소된 경우에만" "$HINT" "검사 1 안내(형식): 복구는 이의 해소를 전제로 한다"
+has "빈 줄 아래 문단" "$HINT" "검사 1 안내(형식): 설명 배치(빈 줄 아래 문단)를 안내한다"
+seal_hint_case '- [ ] 잔여 한계 3건 미반영'; rc=$?
+HINT="$(cat "${OUT}/seal.err")"
+eq "$rc" "1" "검사 1 안내: 실제 미해결 이의 거부"
+has "리뷰를 재개해 해소" "$HINT" "검사 1 안내(미해결): 리뷰 재개를 안내한다"
+case "$HINT" in *"이의를 지우"*|*"지우고"*) fail "검사 1 안내(미해결): 이의 삭제를 권하면 안 된다" ;; *) pass "검사 1 안내(미해결): 이의 삭제를 권하지 않는다" ;; esac
+cp "${OUT}/checkpoint-keep.md" "${SS}/CHECKPOINT.md"
+set_session_state "$SS" "awaiting-author" "Author"
+
 # ⑥(b) 성공 경로의 재snapshot 은 **rename** 이어야 합니다 — 검증 뒤 두 필드를 순차적으로
 # in-place 수정하는 구현이라면 inode 가 그대로 남습니다.
 INODE_BEFORE="$(file_inode "${SS}/SESSION.md")"
@@ -592,7 +627,7 @@ close_session "$SP3"
 seal "$RP3" "${SP3#${RP3}/}"; rc=$?
 eq "$rc" "1" "② reviewed OID 없는 세션에 일반 seal → 실패"
 has "--legacy-unverified 를 쓰십시오" "$(cat "${OUT}/seal.err")" "② 사유 안내 (legacy 경로 제시)"
-eq "$(ls "${RP3}/rd-workflow-workspace/.lifecycle/review-seals" 2>/dev/null | wc -l | tr -d ' ')" "0" \
+eq "$(ls "${RP3}/rd-workflow-workspace/.lifecycle/review-seals" 2>/dev/null | grep -vc '^verify-evidence$')" "0" \
   "② 실패한 seal 은 마커를 만들지 않음"
 
 # legacy 전환 — 사유를 audit 에 남기고 verified=legacy-unverified 로 기록합니다.
@@ -827,6 +862,71 @@ else
   eq "$(seal_field "$(marker_path "$R7" "$(basename "$S7")")" verified)" "yes" \
     "⑦ SHA-256: verified=yes"
 fi
+
+# --- seal evidence ---
+# seal 은 이 트리의 새 검증 증거(verify_record.sh)를 요구합니다. seal() 헬퍼의 자동 증거를 끄고
+# (SEAL_NO_EVIDENCE) 증거 파일을 직접 조작해 거부 경로를 봅니다.
+echo "=== 12. seal 새 검증 증거 요구 ==="
+RV="$(mk_repo)" || { echo "  FAIL  seal evidence: fixture 생성 실패"; exit 1; }
+BV="$(git -C "$RV" rev-parse HEAD)"
+commit_code "$RV" ev1
+state_set "$RV" base-commit "$BV"
+prep "$RV"; rc=$?
+eq "$rc" "0" "seal evidence: 세션 생성"
+SV="$(session_dir "$RV")"
+reviewer_turn "$RV" "$SV"; rc=$?
+eq "$rc" "0" "seal evidence: reviewer 턴 성공"
+close_session "$SV"
+EVF="${RV}/rd-workflow-workspace/.lifecycle/review-seals/verify-evidence"
+MKV="$(marker_path "$RV" "$(basename "$SV")")"
+export SEAL_NO_EVIDENCE=1
+
+# (a) 증거 없음
+rm -f "$EVF"
+seal "$RV" "${SV#${RV}/}"; rc=$?
+eq "$rc" "1" "(a) 증거 없음: seal 거부"
+has "verify_record.sh --" "$(cat "${OUT}/seal.err")" "(a) 증거 없음: 증거 만드는 명령을 안내"
+[ -f "$MKV" ] && fail "(a) 거부 시 마커 미생성" || pass "(a) 거부 시 마커 미생성"
+
+# (b) 증거 exit-code=1
+put_evidence "$RV" 1
+seal "$RV" "${SV#${RV}/}"; rc=$?
+eq "$rc" "1" "(b) 증거 exit-code=1: seal 거부"
+
+# (c) 증거 tree-hash 불일치
+put_evidence "$RV" 0
+CUR8="$(kv_get() { awk -F'=' -v k="$2" '$1==k{sub(/^[^=]+=/,"");print;exit}' "$1"; }; kv_get "$EVF" tree-hash | cut -c1-8)"
+sed -i 's/^tree-hash=.*/tree-hash=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/; s/^command=.*/command=bash x.sh --y/' "$EVF"
+seal "$RV" "${SV#${RV}/}"; rc=$?
+eq "$rc" "1" "(c) 증거 트리 불일치: seal 거부"
+has "증거 deadbeef ≠ 현재 ${CUR8}" "$(cat "${OUT}/seal.err")" "(c) 증거 앞 8자 ≠ 현재 앞 8자 표기"
+has "verify_record.sh -- bash x.sh --y" "$(cat "${OUT}/seal.err")" "(c) 증거의 command 로 재실행 안내"
+
+# (d) schema 키만 빠진 증거 — 나머지는 유효해도 거부
+put_evidence "$RV" 0
+sed -i '/^schema=/d' "$EVF"
+seal "$RV" "${SV#${RV}/}"; rc=$?
+eq "$rc" "1" "(d) schema 키 누락: seal 거부"
+has "손상" "$(cat "${OUT}/seal.err")" "(d) malformed 안내"
+
+# (e) 래퍼로 만든 증거 → seal 성공, 마커 tree-hash == 증거 tree-hash
+rm -f "$EVF"
+( cd "$RV" && bash rd-workflow/scripts/verify_record.sh -- true ) >"${OUT}/vr.out" 2>&1; rc=$?
+eq "$rc" "0" "(e) 래퍼로 증거 생성"
+seal "$RV" "${SV#${RV}/}"; rc=$?
+eq "$rc" "0" "(e) 래퍼 증거로 seal 성공"
+eq "$(seal_field "$MKV" tree-hash)" "$(seal_field "$EVF" tree-hash)" "(e) 마커 tree-hash == 증거 tree-hash"
+
+# (f) --legacy-unverified 는 증거 없이 통과 (회귀)
+RL="$(mk_repo)" || { echo "  FAIL  seal evidence legacy: fixture 생성 실패"; exit 1; }
+commit_code "$RL" lg
+prep "$RL" "git -C sub diff main...HEAD"; rc=$?
+SL="$(session_dir "$RL")"
+close_session "$SL"
+rm -f "${RL}/rd-workflow-workspace/.lifecycle/review-seals/verify-evidence"
+seal "$RL" --legacy-unverified "증거 면제 회귀" "${SL#${RL}/}"; rc=$?
+eq "$rc" "0" "(f) legacy 세션: 증거 없이 seal 성공"
+unset SEAL_NO_EVIDENCE
 
 if [ "$FAIL" = 0 ]; then
   echo "test_review_base_resolution: ALL PASS"

@@ -21,6 +21,13 @@ err="$(HERDR_ENV=1 RD_CHILD_SESSION=1 session_launch /tmp/wt alpha REQUEST.md 2>
 cmd="$(session_launch_command /tmp/wt alpha)"
 [[ "$cmd" == *"/tmp/wt"* ]] && pass "수동 명령에 worktree 경로 포함" || fail "수동 명령"
 
+# 3-1) 인계 문구 — 인계 파일 인자가 없으면 현행 바이트와 같고, 있으면 확정 결정 줄이 끝 줄 앞에 붙는다
+[[ "$(session_handoff_text a /r /w)" == "$(printf '작업(FR): %s\nREQUEST: %s\nWorktree: %s\n이 작업을 이어서 진행해 주십시오.' a /r /w)" ]] \
+  && pass "3인자 출력이 현행과 같다" || fail "3인자 출력이 현행과 같다: $(session_handoff_text a /r /w)"
+_ht="$(session_handoff_text a /r /w /w/h.md)"
+[[ "$_ht" == *"확정 결정: /w/h.md — 먼저 읽고 시작하십시오."* && "${_ht##*$'\n'}" == "이 작업을 이어서 진행해 주십시오." ]] \
+  && pass "4인자는 경로 줄을 더한다" || fail "4인자는 경로 줄을 더한다: $_ht"
+
 # 4) 상태별 문구가 호출 세션의 거취를 담는다 (AC1). unknown 은 failed/none 과 다른
 #    분기임을 명시적으로 검증한다(F1 재발 방지).
 [[ "$(session_launch_status_hint ok tab7)" == *"멈춥니다"* && "$(session_launch_status_hint ok tab7)" == *"tab7"* ]] \
@@ -52,7 +59,7 @@ case "\$1 \$2" in
     echo '{"result":{"root_pane":{"pane_id":"wX:p9","tab_id":"wX:t9"},"tab":{"tab_id":"wX:t9"}}}' ;;
   "agent start") printf '%s' '${_start_body}'; exit $2 ;;
   "agent prompt") exit $3 ;;
-  "agent get") echo '{"result":{"agents":[]}}' ;;
+  "agent get") echo '{"error":{"code":"agent_not_found","message":"x"}}' >&2; exit 1 ;;
   "tab close") exit 0 ;;
 esac
 STUBEOF
@@ -133,6 +140,21 @@ create_call="$(grep '^tab create' "$STUB/calls.log" || true)"
 [[ "$create_call" == *"--label $long_slug"* ]] \
   && pass "이름을 줄여도 tab label 에는 전체 slug 가 남는다" || fail "긴 slug label: $create_call"
 
+# 5d) 인계 전달 — 인계 파일이 있을 때만 문구에 확정 결정 줄이 실린다 (여러 줄 문구라
+#     calls.log 전체를 본다)
+mkdir -p "$TMP/wt/rd-workflow-workspace/.lifecycle"
+_hf="$TMP/wt/rd-workflow-workspace/.lifecycle/handoff.md"
+make_stub 0 0 0
+PATH="$STUB:$PATH" HERDR_ENV=1 session_handoff_deliver alpha "$TMP/wt" "$TMP/wt/REQUEST.md" || true
+grep -q '확정 결정' "$STUB/calls.log" \
+  && fail "인계 파일 없으면 확정 결정 줄 없음" || pass "인계 파일 없으면 확정 결정 줄 없음"
+make_stub 0 0 0
+: > "$_hf"
+PATH="$STUB:$PATH" HERDR_ENV=1 session_handoff_deliver alpha "$TMP/wt" "$TMP/wt/REQUEST.md" || true
+grep -qF "확정 결정: $_hf" "$STUB/calls.log" \
+  && pass "deliver 문구에 인계 경로" || fail "deliver 문구에 인계 경로: $(cat "$STUB/calls.log")"
+rm -f "$_hf"
+
 # 6) 조회 실패는 unknown 이다 (세션 부재로 단정하지 않는다)
 cat > "$STUB/herdr" <<'STUBEOF'
 #!/usr/bin/env bash
@@ -158,11 +180,11 @@ elapsed=$((SECONDS-start))
 # 8) 살아 있는 세션이 다른 작업을 맡고 있으면 대상 불일치로 본다
 cat > "$STUB/herdr" <<'STUBEOF'
 #!/usr/bin/env bash
-[[ "$1 $2" == "agent get" ]] && { echo '{"result":{"agents":[{"cwd":"/other/wt"}]}}'; exit 0; }
+[[ "$1 $2" == "agent get" ]] && { echo '{"result":{"agent":{"cwd":"/other/wt"},"type":"agent_info"}}'; exit 0; }
 STUBEOF
 chmod +x "$STUB/herdr"
 out="$(PATH="$STUB:$PATH" HERDR_ENV=1 session_probe alpha /tmp/wt 2>/dev/null)"
-[[ "$out" != "alive" ]] && pass "대상 불일치 세션을 alive 로 보지 않는다" || fail "대상 불일치"
+[[ "$out" == "dead" ]] && pass "대상 불일치 세션은 dead 다(다른 작업의 세션)" || fail "대상 불일치: $out"
 
 # 13) resolve-launch 의 alive 확정도 호출 세션 거취(멈춤) 문구를 낸다.
 TMP_RL="$(mktemp -d)" || { echo "test_session_launch.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
@@ -221,7 +243,7 @@ _leak="$(
 cat > "$STUB/herdr" <<'STUBEOF'
 #!/usr/bin/env bash
 case "$1 $2" in
-  "agent get") echo '{"result":{"agents":[{"cwd":"'"$PWD"'"}]}}' ;;
+  "agent get") echo '{"result":{"agent":{"cwd":"'"$PWD"'"},"type":"agent_info"}}' ;;
   "agent prompt") exit 0 ;;
 esac
 STUBEOF
@@ -235,6 +257,25 @@ rl_out="$(cd "$TMP_RL" && PATH="$STUB:$PATH" HERDR_ENV=1 project_root="$TMP_RL" 
 [[ "$rl_out" == *"멈춥니다"* ]] \
   && pass "resolve-launch(alive 확정)가 호출 세션 거취(멈춤) 문구를 출력한다" \
   || fail "resolve-launch alive 출력에 거취 문구 없음: $rl_out"
+# 13-1) agent prompt 가 실패하면 수동 안내 문구에도 인계 파일 경로가 실린다
+cat > "$STUB/herdr" <<'STUBEOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "agent get") echo '{"result":{"agent":{"cwd":"'"$PWD"'"},"type":"agent_info"}}' ;;
+  "agent prompt") exit 1 ;;
+esac
+STUBEOF
+chmod +x "$STUB/herdr"
+: > "$TMP_RL/rd-workflow-workspace/.lifecycle/handoff.md"
+# 앞 확정으로 launch=ok 가 됐으므로 다시 unknown 으로 되돌린다
+(cd "$TMP_RL" && project_root="$TMP_RL" bash -c 'source "'"$SCRIPT_DIR"'/../_task_common.sh" && tasks_index_upsert rl-alpha launch=unknown') \
+  || fail "13-1 fixture 되돌리기 실패"
+rl_out="$(cd "$TMP_RL" && PATH="$STUB:$PATH" HERDR_ENV=1 project_root="$TMP_RL" bash -c '
+  source "'"$SCRIPT_DIR"'/../_task_common.sh" || exit 1
+  task_resolve_launch rl-alpha
+' 2>&1)" || true
+[[ "$rl_out" == *"$TMP_RL/rd-workflow-workspace/.lifecycle/handoff.md"* ]] \
+  && pass "resolve-launch 수동 문구에 인계 경로" || fail "resolve-launch 수동 문구에 인계 경로: $rl_out"
 rm -rf "$TMP_RL" "$TMP_RL2"
 
 # 14) session_launch_model_valid — 별칭·구체 id 는 허용, 형식 밖 값은 anchored 검증으로 거부한다
@@ -400,6 +441,68 @@ printf '{"session_model": "bad value"}' > "$TMP/wt/rd-workflow/config/model-stra
 err="$(session_launch_command "$TMP/wt" alpha 2>&1 >/dev/null)"
 [[ -n "$err" ]] && pass "session_launch_command 가 잘못된 설정 경고를 stderr 로 낸다" || fail "경고가 사라짐"
 rm -rf "$TMP/wt/rd-workflow"
+
+# 8-1) session_probe 판정표 (spec D3) — 실제 herdr 응답 스키마(2026-10-29 실측)로 검사한다.
+#      성공은 stdout 의 단수 `result.agent`, 실패는 stderr 의 `{"error":{"code":..}}` + rc=1 이다.
+probe_case() {  # <이름> <기대> <rc> <stdout> <stderr> [<worktree>]
+  local _name="$1" _want="$2" _rc="$3" _so="$4" _se="$5" _wt="${6-}"
+  printf '%s' "$_so" > "$STUB/get.out"; printf '%s' "$_se" > "$STUB/get.err"
+  cat > "$STUB/herdr" <<STUBEOF
+#!/usr/bin/env bash
+[[ "\$1 \$2" == "agent get" ]] || exit 0
+cat "$STUB/get.out"; cat "$STUB/get.err" >&2; exit $_rc
+STUBEOF
+  chmod +x "$STUB/herdr"
+  local _got; _got="$(PATH="$STUB:$PATH" HERDR_ENV=1 session_probe alpha $_wt 2>/dev/null)"
+  [[ "$_got" == "$_want" ]] && pass "probe: $_name → $_want" || fail "probe: $_name — 기대 $_want, 실제 $_got"
+}
+OKJ='{"id":"x","result":{"agent":{"agent":"claude","cwd":"/w/a","foreground_cwd":"/zz"},"type":"agent_info"}}'
+probe_case "A1 cwd 일치" alive 0 "$OKJ" "" /w/a
+probe_case "A2 worktree 생략(유효 응답)" alive 0 "$OKJ" ""
+probe_case "A3 cwd 불일치" dead 0 "$OKJ" "" /w/other
+probe_case "A4 구조화 agent_not_found" dead 1 "" '{"error":{"code":"agent_not_found","message":"m"},"id":"x"}'
+probe_case "A5 다른 오류 코드" unknown 1 "" '{"error":{"code":"internal_error","message":"agent_not_found?"}}'
+probe_case "(a) 잘린 JSON(정상 패턴 잔존)" unknown 0 '{"result":{"agent":{"cwd":"/w/a"}' "" /w/a
+probe_case "(b) 다른 위치의 agent" unknown 0 '{"result":{"agent":null},"metadata":{"agent":{"cwd":"/w/a"}}}' "" /w/a
+probe_case "(c) cwd 가 숫자" unknown 0 '{"result":{"agent":{"cwd":7}}}' "" /w/a
+probe_case "(d) worktree 있는데 cwd 누락" unknown 0 '{"result":{"agent":{"name":"x"}}}' "" /w/a
+probe_case "(e) 잘린 오류 JSON" unknown 1 "" '{"error":{"code":"agent_not_found"'
+probe_case "(f) error.code 가 객체" unknown 1 "" '{"error":{"code":{"agent_not_found":1}}}'
+probe_case "agents 배열(옛 스키마)은 알 수 없는 응답" unknown 0 '{"result":{"agents":[{"cwd":"/w/a"}]}}' "" /w/a
+# P) python3 가 없으면 유효 응답도 확정하지 않는다
+(
+  command() { if [[ "${1-}" == "-v" && "${2-}" == "python3" ]]; then return 1; fi; builtin command "$@"; }
+  printf '%s' "$OKJ" > "$STUB/get.out"; : > "$STUB/get.err"
+  got="$(PATH="$STUB:$PATH" HERDR_ENV=1 session_probe alpha /w/a 2>/dev/null)"
+  [[ "$got" == "unknown" ]] && exit 0 || { echo "python3 부재 판정: $got" >&2; exit 1; }
+) && pass "probe: P python3 부재 → unknown" || fail "probe: P python3 부재는 unknown 이어야 한다"
+
+# 8-2) agent start 의 오류 JSON 은 stderr 로 나온다(실측). stderr-only 여도 판정이 같아야 한다.
+mk_start_stub() {  # <stderr-json> <rc>
+  printf '%s' "$1" > "$STUB/start.err"
+  : > "$STUB/calls.log"
+  cat > "$STUB/herdr" <<STUBEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$STUB/calls.log"
+case "\$1 \$2" in
+  "tab create") echo '{"result":{"root_pane":{"pane_id":"wX:p9","tab_id":"wX:t9"},"tab":{"tab_id":"wX:t9"}}}' ;;
+  "agent start") cat "$STUB/start.err" >&2; exit $2 ;;
+  "agent prompt") exit 0 ;;
+  "tab close") exit 0 ;;
+esac
+STUBEOF
+  chmod +x "$STUB/herdr"
+}
+mk_start_stub '{"error":{"code":"agent_not_ready","message":"blocked"}}' 1
+out="$(PATH="$STUB:$PATH" HERDR_ENV=1 RD_CHILD_SESSION= session_launch /tmp/wt alpha REQUEST.md 2>/dev/null)"
+[[ "$out" == "unknown" ]] && pass "start: S1 stderr 로만 낸 agent_not_ready 는 unknown" || fail "start: S1 판정: $out"
+grep -q '^tab close' "$STUB/calls.log" && fail "start: S1 blocked 세션의 tab 을 닫았다" || pass "start: S1 blocked 세션의 tab 은 닫지 않는다"
+mk_start_stub '{"error":{"code":"agent_pane_not_found","message":"pane gone"}}' 1
+err="$(PATH="$STUB:$PATH" HERDR_ENV=1 RD_CHILD_SESSION= session_launch /tmp/wt alpha REQUEST.md 2>&1 >"$TMP/launch.out")"
+out="$(cat "$TMP/launch.out")"
+[[ "$out" == "failed" ]] && pass "start: S2 다른 오류 코드(rc=1)는 failed" || fail "start: S2 판정: $out"
+[[ "$err" == *"agent start 응답(rc=1)"*"agent_pane_not_found"* ]] \
+  && pass "start: S3 실패 응답 본문을 stderr 로 남긴다" || fail "start: S3 진단 출력 없음: $err"
 
 printf 'session_launch: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

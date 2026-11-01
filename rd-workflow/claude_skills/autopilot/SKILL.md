@@ -119,27 +119,27 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 `
 
 ### 결과 대기 규율 (백그라운드 금지)
 
-무인 분기의 필수 제약이다 (위 AskUserQuestion 금지와 같은 층위). 이 규율은 Claude Code headless 실행 환경의 도구 계약(`timeout` 최대치, 장시간 명령의 자동 백그라운드 이관)에 근거하므로, 다른 harness 로 이 템플릿을 운용하는 경우에는 동일 동작이 보장되지 않는다.
+무인 분기의 필수 제약이다 (위 AskUserQuestion 금지와 같은 층위). 이 규율은 Claude Code headless 실행 환경의 도구 계약(Bash `timeout` 기본값·상한, timeout 도달 시 자동 백그라운드 이관)에 근거하므로, 다른 harness 로 이 템플릿을 운용하는 경우에는 동일 동작이 보장되지 않는다.
 
-**갈림길은 "명령이 오래 걸리는가" 가 아니라 "누가 백그라운드를 시작했는가" 다.**
+**자멸의 직접 원인은 "세션이 스스로 백그라운드를 시작했는가" 다.** harness 자동 이관은 명령이 timeout 에 닿을 때만 일어난다. 이관되면 재진입은 하지만 이관된 명령이 백그라운드 시간 제한(약 10분)에 걸리면 결과를 잃으므로, wrapper 가 timeout 을 올려 이관 자체를 피한다.
 
 | 백그라운드 시작 주체 | 결과 |
 |---|---|
 | 세션이 스스로 `run_in_background: true` 로 던짐 | **자멸** — 응답을 내는 순간 프로세스가 종료되어 결과를 수령할 주체가 사라진다. outcome 이 빈 채 남아 wrapper 가 `harness-error`(exit 40) 로 매핑한다 |
-| foreground 명령이 시간 초과로 harness 가 자동 이관 | **정상** — 완료 알림으로 재진입한다 |
+| foreground 명령이 시간 초과로 harness 가 자동 이관 | **이관 뒤 재진입은 동작하나, 이관된 명령은 백그라운드 시간 제한(`-p` 텍스트 프롬프트 기준 약 10분)에 걸려 결과 없이 중단된다** — 실측(2026-10-29, Claude Code 2.1.312): 150초 명령은 120초에 이관된 뒤 완료 알림으로 정상 완주, 750초 명령은 이관 뒤 `[killed]` 로 끝나 `outcome` 이 빈 채 남는다. 12분짜리 `self_test` 가 이 경로로 죽은 것이 FR `headless-verification-exceeds-bash-timeout` 의 원인이다. 이관 자체를 피해야 하며 wrapper 가 timeout 을 올려 준다 |
 
 1. **결과가 필요한 명령을 `run_in_background: true` 로 시작하지 않는다.** 리뷰 턴 실행, 빌드, 검증 스크립트, subagent dispatch 가 모두 해당한다. 결과를 쓰지 않고 던져두기만 하는 명령에만 백그라운드를 쓴다.
 
-   이 금지는 산문 규율이 아니라 **`headless_background_gate.sh` PreToolUse hook 으로 강제됩니다.** `RD_AUTOPILOT_FR` 이 설정된 세션에서 `run_in_background: true` Bash 호출은 exit 2 로 차단되며, 차단 메시지가 foreground 대안(`timeout` 최대치)과 리뷰 턴의 `WAIT_TIMEOUT` 조정법을 함께 제시합니다. hook 은 positive 감지에만 차단하므로(파싱 불가·필드 부재는 통과) 정상 호출을 막지 않습니다.
-2. **긴 명령도 foreground 로 건다.** `timeout` 을 최대치인 `600000ms` 로 지정하고, 그보다 오래 걸리면 harness 의 자동 백그라운드 이관에 맡긴다. 스스로 백그라운드를 선택하지 않는다.
+   이 금지는 산문 규율이 아니라 **`headless_background_gate.sh` PreToolUse hook 으로 강제됩니다.** `RD_AUTOPILOT_FR` 이 설정된 세션에서 `run_in_background: true` Bash 호출은 exit 2 로 차단되며, 차단 메시지가 foreground 대안(`timeout` 인자 생략 또는 유효 값 이하)과 리뷰 턴의 `WAIT_TIMEOUT` 조정법을 함께 제시합니다. hook 은 positive 감지에만 차단하므로(파싱 불가·필드 부재는 통과) 정상 호출을 막지 않습니다.
+2. **긴 명령도 foreground 로 건다.** wrapper 가 자식 세션에 `BASH_DEFAULT_TIMEOUT_MS`(기본 7500000)를 올려 주므로 **Bash 호출의 `timeout` 인자는 생략하는 것이 기본이다.** 지정하지 않는다 — 세션은 유효 상한(호출자가 정한 `BASH_DEFAULT_TIMEOUT_MS`)을 볼 수 없어서, 지정한 값이 상한을 넘으면 잘리고 기본값보다 낮으면 오히려 이관을 앞당긴다(wrapper 의 값 출력 줄은 호출자 터미널로 나가며 세션 컨텍스트에 들어오지 않는다). 소요가 유효 값을 넘을 것 같아도 세션은 자기 env 를 바꿀 수 없다. 아래 4항대로 outcome 에 `resume` 을 기록하고 중단 이유에 필요한 timeout 을 적어 정상 종료하면, 사람 또는 호출자가 `BASH_DEFAULT_TIMEOUT_MS` 를 올려 재개한다. 스스로 백그라운드를 선택하지 않는다.
 
-   **명령 자체에 watchdog 이 있으면 안쪽을 바깥보다 크게 잡는다.** `run_review_turn.sh` 의 어댑터는 두 축으로 대기한다 — 유휴 임계 `RD_REVIEW_IDLE_TIMEOUT`(기본 600초)과 절대 상한 `WAIT_TIMEOUT`(기본 7200초). **codex 가 출력을 내는 동안에는 유휴 타이머가 계속 갱신되므로, 정상 진행 중인 턴이 상한 전에 잘리지 않는다.** 따라서 종전처럼 `WAIT_TIMEOUT` 을 매번 올려 걸 필요가 없다.
+   **명령 자체에 watchdog 이 있으면 바깥(Bash 대기)을 안쪽 watchdog 보다 크게 잡는다.** 바깥이 먼저 끝나면 안쪽 watchdog 이 동작하기 전에 명령이 이관된다. 기본값 7500000ms(7500초)는 `WAIT_TIMEOUT` 기본 7200초보다 크므로 기본 설정에서는 안쪽이 먼저 동작한다. `WAIT_TIMEOUT` 을 올리려면 바깥(`BASH_DEFAULT_TIMEOUT_MS`)도 호출자가 함께 올려야 한다 — 세션 안에서는 바꿀 수 없으므로 올려야 할 때는 위 `resume` 경로를 쓴다. `run_review_turn.sh` 의 어댑터는 두 축으로 대기한다 — 유휴 임계 `RD_REVIEW_IDLE_TIMEOUT`(기본 600초)과 절대 상한 `WAIT_TIMEOUT`(기본 7200초). **codex 가 출력을 내는 동안에는 유휴 타이머가 계속 갱신되므로, 정상 진행 중인 턴이 상한 전에 잘리지 않는다.** 따라서 종전처럼 `WAIT_TIMEOUT` 을 매번 올려 걸 필요가 없다.
 
    ```bash
    bash rd-workflow/scripts/run_review_turn.sh <session-path>
    ```
 
-   기본값으로 충분하다. 대상이 유난히 크거나 이전 회차가 상한에서 끊겼다면 그때만 `WAIT_TIMEOUT` 을 올린다.
+   기본값으로 충분하다. 대상이 유난히 크거나 이전 회차가 상한에서 끊겼다면 그때만 `WAIT_TIMEOUT` 을 올리되, 바깥 Bash 대기가 그보다 크게 유지되는지 먼저 확인한다(유지되지 않으면 올리지 말고 `resume` 경로를 쓴다).
 3. **소요 시간으로 자기 판단하지 않는다.** 리뷰 종류별 실측 소요는 편차가 크다.
 
    | 리뷰 종류 | 실측 소요 |
@@ -152,7 +152,7 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 `
 4. **세션 수명이 다하면 백그라운드로 도망가지 않는다.** `CURRENT_TASK.md` 에 진행 상태를 저장한 뒤 outcome 에 `resume` 을 기록하고 정상 종료한다. 재개에 필요한 세 정보 — **중단 이유 / 도달 단계 / 다음 재개 지점** — 를 두 곳에 남긴다.
    - `CURRENT_TASK.md` — §5 의 기존 항목(완료된 단계, 현재 단계와 남은 작업, 열린 리뷰 세션 경로, 다음 세션에서 이어갈 명령)으로 충족한다.
    - outcome 파일의 **2줄 이후** 요약. **첫 줄은 토큰 전용이다** — wrapper 가 `head -n1` 로 첫 줄만 읽으므로, 첫 줄에 요약을 섞으면 토큰 판독이 깨져 `harness-error` 로 오분류된다.
-5. **긴 foreground 에 들어가기 전에 무엇을 기다리는지 남긴다.** 최대 600초의 무응답 구간은 겉보기에 정체와 구별되지 않는다. 무인 세션에는 화면을 보는 사람이 없으므로 파일이 유일한 관찰 지점이다. 명령 실행 **직전** `CURRENT_TASK.md` Notes 에 진행 신호 한 줄을 기록하고, 복귀 후 같은 줄을 결과로 갱신한다.
+5. **긴 foreground 에 들어가기 전에 무엇을 기다리는지 남긴다.** 수백 초 이상 이어지는 무응답 구간은 겉보기에 정체와 구별되지 않는다. 무인 세션에는 화면을 보는 사람이 없으므로 파일이 유일한 관찰 지점이다. 명령 실행 **직전** `CURRENT_TASK.md` Notes 에 진행 신호 한 줄을 기록하고, 복귀 후 같은 줄을 결과로 갱신한다.
 
    ```
    waiting: final diff review 턴 003 / run_review_turn.sh / started 17:42
@@ -169,7 +169,13 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 `
 
 ### 무인 분기 작업 선택 (§1 게이트 대체)
 
-1. **resume 우선**: `CURRENT_TASK.md` 에 미완 작업(Status ≠ `대기 중` 그리고 Short Title ≠ `-`)이 있으면 그 FR 을 재개한다 (§5 재사용). `RD_AUTOPILOT_FR` 이 다른 slug 를 가리켜도 resume 이 우선하며, 불일치는 outcome 요약에 한 줄 남긴다.
+1. **resume 우선**: `bash rd-workflow/scripts/batch/resume_candidates.sh` 를 실행하고 **첫 줄과 종료 코드**로 분기한다. 후보 계산은 이 스크립트가 한다 — 여기서 다시 계산하지 않는다. 출처는 메인 `CURRENT_TASK.md` 가 아니라 tasks 색인과 각 worktree 의 `task-state` 다(`promote.sh` 는 작업 상태를 fr worktree 에 쓰고 메인 파일은 baseline 으로 둔다). 읽기 전용이다.
+   - 첫 줄이 `select<TAB><slug><TAB><worktree>`: 그 worktree 로 이동해 그 FR 을 재개한다 (§5 재사용). `RD_AUTOPILOT_FR=auto`(또는 미지정)이면 스크립트가 고른 후보가 대상이고, `RD_AUTOPILOT_FR=<slug>` 이면 스크립트가 그 slug 만 `select` 한다 — batch 는 요청한 FR 의 결과를 그 FR 에 적용하므로 다른 작업을 재개하면 요청 FR 이 실행되지 않은 채 blocked 로 오판되기 때문이다. 명시 slug 가 후보가 아니면 스크립트가 `none` 을 내고 다른 후보는 `skip` 줄(`명시 FR <slug> 지정 중`)로만 보고한다.
+   - `select` 로 그 worktree 로 이동해 재개한 직후 `bash rd-workflow/scripts/autopilot_driver.sh begin` 을 실행한다.
+   - 첫 줄이 `none`: 2·3항으로 내려간다.
+   - 첫 줄이 `undetermined` (rc=3): `RD_AUTOPILOT_FR` 값과 무관하게(`auto` 든 명시 slug 든) 새 작업을 시작하지 않는다. outcome `blocked:resume-undetermined` 를 기록하고 스크립트 출력의 둘째 줄 이후를 outcome 둘째 줄부터 그대로 옮긴 뒤 종료한다. 생존·소유를 확인할 수 없는 작업을 가로채지 않으려는 것이다. 이 실패는 FR 을 고르기 전의 전역 실패이므로 `ralph_drain.sh` 가 즉시 중단하며, FR status 를 바꾸거나 `CURRENT_TASK` 를 초기화하지 않는다 — 대상 FR 이 없다.
+   - 어느 경우든 outcome 둘째 줄 이후에 `재개: <slug> <worktree> (<선택 이유>)` 줄과 스크립트의 `skip` 줄(제외 사유·다음 조치)을 적는다. 첫 줄은 토큰 전용이다.
+   - 후보가 여럿이면(`auto` 일 때) `RD_AUTOPILOT_FR` 과 같은 slug 를 먼저, 없으면 색인 순서 첫 후보를 스크립트가 고른다. `launch=ok`(대화형 세션을 기동한 적 있음) 작업은 후보가 아니다 — 사용자의 대화형 작업을 가로채지 않는다. 세션이 끝났다면 `rd task resolve-launch <slug> --assume-ended` 로 풀 수 있다.
 2. else `RD_AUTOPILOT_FR=<slug>` → 그 FR 을 선택한다.
 3. else `RD_AUTOPILOT_FR=auto` → `bash rd-workflow/scripts/fr_relations.sh auto-pick --root .` 를 실행하고 **첫 줄과 종료 코드**로 분기한다. 후보 집합 계산과 갈림 판정은 이 스크립트가 한다 — 여기서 다시 계산하지 않는다. `eligible` 은 **validated / ready-for-request 후보**(기존 화이트리스트 그대로, `blocked` 은 set-aside 라 제외)이고, `selectable` 은 그중 관계 판정이 `ready` 인 것이다.
    - 첫 줄이 `unavailable` (rc=2): outcome `blocked:relations-unavailable` 을 기록하고 종료한다. 스크립트 출력의 둘째 줄 이후를 outcome 둘째 줄부터 그대로 옮긴다. 이 실패는 FR 을 고르기 전의 전역 실패이므로 `ralph_drain.sh` 가 즉시 중단하며, 일반 blocked 처럼 FR status 를 바꾸거나 `CURRENT_TASK` 를 초기화하지 않는다 — 대상 FR 이 없다.
@@ -193,6 +199,7 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 `
 | `queue-empty` | auto-pick 후보 없음 |
 | `queue-blocked` | 착수 가능 FR 없음 — 남은 FR 이 전부 의존 대기·확인 필요·관계 오류 |
 | `blocked:relations-unavailable` | `fr_relations.sh` 관계 판정이 rc=2 로 실패 — 판정 불가 |
+| `blocked:resume-undetermined` | 재개 후보 판정 불가 — 생존·소유를 확인할 수 없는 작업만 있음(전역 실패, 대상 FR 없음) |
 
 ### 중단조건 → blocked 매핑 (무인 특화)
 
@@ -200,11 +207,14 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 `
 
 1. `blocked:<reason>` outcome 을 `$RD_AUTOPILOT_OUTCOME_FILE` 에 기록한다.
 2. 해당 FR 의 status 를 `blocked` 로 기록한다 (FUTURE_REQUESTS.md 인덱스 status 컬럼 + `items/` 상세 파일 status, 상세에 중단 사유 한 줄 병기). auto-pick 화이트리스트(validated/ready-for-request)가 이 FR 을 자동 제외한다.
-3. `CURRENT_TASK.md` 를 초기화한다 — Status `대기 중`, Short Title `-` (rd task set-status 경유). 이로써 다음 iteration 의 resume-우선 규칙이 같은 FR 을 재개하지 않는다.
+3. **fr 브랜치가 활성인 작업은 worktree 유무와 무관하게 `CURRENT_TASK.md`·task-state 를 초기화하지 않고 그대로 둔다.** `task_reset_title` 은 worktree 가 아니라 task-state 의 fr ref 활성 여부로 거부하고(작업 이름은 archive 까지 유지), 활성 작업은 중단 시점 작업물의 증거이기 때문이다. `Status`·`launch`·Short Title 이 남아도 정상이다. 초기화(Status `대기 중`, Short Title `-`)는 `rd task set-title -` 를 호출해 `task_reset_title` 의 허용 판정(Status `대기 중` 이고 fr-branch 비활성)에 맡기고, 거부되면 보존으로 처리한다. `--force` 로 우회하지 않는다.
+4. 다음 iteration 이 이 작업을 재개하지 않는 근거는 2번에서 기록한 FR status `blocked` 이다. `resume_candidates.sh` 3b 가 그 worktree 사본의 `blocked` 를 읽어 후보에서 빼고, 제외 사유(`FR blocked: <fr-slug> (<items 경로>)`)와 복원·폐기 안내를 `skip` 줄로 출력한다. 중단 사유는 FR 의 blocked 항목에 남는다.
 
-이 처리로 "보존해야 할 상태"가 CURRENT_TASK 에서 FR 의 blocked 항목(사유 포함)으로 옮겨간다. exit 20 이후 처리(다음 FR 이동 / continue-on-failure)는 front-end 소관이다.
+작업(worktree)은 자동으로 폐기하지 않는다. 정리는 사용자가 한다 — 복원은 그 worktree 에서 `/fr status <slug> validated`, 폐기는 `promote_rollback.sh` 다. exit 20 이후 처리(다음 FR 이동 / continue-on-failure)는 front-end 소관이다.
 
 ## Execution Rules
+
+autopilot 이 이 작업을 맡는 동안 `bash rd-workflow/scripts/autopilot_driver.sh begin` 으로 실행 주체 표식을 둔다(압축 뒤 SessionStart 훅이 이 표식으로 이 파일의 해당 절을 다시 읽으라고 안내한다). blocked·awaiting-user·사용자 인계로 멈출 때는 `bash rd-workflow/scripts/autopilot_driver.sh end` 를 실행한다. `begin` 이 실패(exit 2)해도 autopilot 은 중단하지 않고 `CURRENT_TASK.md ## Notes` 에 `driver 표식 미기록: <사유>` 한 줄을 남긴 채 계속한다(표식은 안내용 보조 장치다).
 
 ### 1. 작업 선택
 
@@ -253,6 +263,7 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
 ### 3. fr 브랜치 승격 (promote)
 
 - **FR 등록 커밋 직후** — 모드 A·B 공통이며 REQUEST.md 작성보다 **앞**이다. 실제 실행이 이 순서이고(`lifecycle/README.md` 규약과 일치), 종전 서술("모드 A는 spec/plan review 통과 후")은 실행과 어긋나 2026-08-21 에 정정했다. **기본 브랜치 worktree에서** 호출한다:
+- **확정 결정 인계**: promote 호출 전에 사용자와 확정한 결정이 있으면 `rd-workflow/docs/guides/promote-handoff.md` 형식으로 파일을 쓰고 아래 명령에 `--handoff <file>` 을 덧붙여 넘긴다. 결정이 없으면 생략한다.
   모드 A (큰 작업):
   ```bash
   bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug> --size large \
@@ -270,8 +281,8 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
   - `<slug>`는 `CURRENT_TASK.md ## Short Title` 값이다(생략 시 promote.sh가 자동 추출).
   - promote.sh가 `fr/<slug>` 브랜치 + task-state fr 필드 기록(commit) + CURRENT_TASK 갱신을 생성한다. 이는 §6 step 7 archive.sh가 요구하는 형식과 일치한다. **브랜치는 별도 worktree 에 부착되며, 호출 세션의 체크아웃은 기본 브랜치에 그대로 남는다** — `git switch` 는 `--no-worktree` 분기에만 있다(`promote.sh` 8단계). 이어서 아래 `launch` 처리를 반드시 수행한다.
 - **promote 직후 `launch` 결과 처리 (건너뛰지 않는다)**: promote 는 마지막에 `promote: 세션 기동 결과 — <값>` 을 출력한다. 그 값에 따라 갈린다.
-  - `ok` — 이 세션은 여기서 멈춘다. 이후 단계는 기동된 세션이 진행한다.
-  - `none`·`failed` — 이 세션이 이어간다. **단 §4 로 넘어가기 전에 promote 출력의 `worktree <path>` 로 이동한다.** 이동하지 않으면 기본 브랜치 체크아웃에서 구현하게 되어, 작업이 fr 브랜치가 아닌 기본 브랜치에 쌓인다. `--no-worktree` 로 호출했을 때만 이동이 불필요하다(그 경우 promote 가 현재 체크아웃을 직접 전환한다).
+  - `ok` — 이 세션은 여기서 멈춘다. 이후 단계는 기동된 세션이 진행한다. **멈추기 전에** promote 출력의 `worktree <path>` 에 있는 스크립트로 이 세션이 표식을 대신 둔다: `bash <path>/rd-workflow/scripts/autopilot_driver.sh begin`. 인계 문구는 자식 세션에 이 skill 의 지시를 전달하지 않으므로 자식의 호출에 기대지 않는다(자식이 autopilot 절차를 따르지 않으면 `end` 가 실행되지 않아 표식이 남을 수 있고, 그 한계는 조건 문구 안내로 허용한다).
+  - `none`·`failed` — 이 세션이 이어간다. **단 §4 로 넘어가기 전에 promote 출력의 `worktree <path>` 로 이동한다.** 이동하지 않으면 기본 브랜치 체크아웃에서 구현하게 되어, 작업이 fr 브랜치가 아닌 기본 브랜치에 쌓인다. `--no-worktree` 로 호출했을 때만 이동이 불필요하다(그 경우 promote 가 현재 체크아웃을 직접 전환한다). 이동한 직후(`unknown` 을 `failed` 로 확정해 이어가는 경우 포함) `bash rd-workflow/scripts/autopilot_driver.sh begin` 을 실행한다.
   - `unknown` — 이 세션도 아직 이어받지 않는다. `bash rd-workflow/scripts/rd task resolve-launch <slug>` 로 확정한 뒤에만 갈린다(살아 있으면 멈춤 / `failed` 로 확정되면 위 이동 후 진행).
   - 무인(headless) 실행은 `autopilot_headless.sh` 가 `RD_CHILD_SESSION=1` 을 export 하므로 항상 `none` 이다. 즉 **무인 경로의 기본값이 「이동해서 이어가기」**다.
 - 구현 중 커밋은 이 `fr/<slug>` 브랜치에 쌓인다
@@ -283,7 +294,7 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
 - 테스트 실패, 빌드 에러 발생 시 `superpowers:systematic-debugging`으로 자율 디버깅한다
 - 디버깅 3회 실패 시 현재 상태를 보고하고 사용자에게 넘긴다
 - **model-strategy 적용**: `rd-workflow/config/model-strategy.json`이 존재하면 `subagent` 값을 읽어 subagent dispatch 시 Agent 도구의 `model` 파라미터로 전달한다. 파일 미존재/파싱 실패/키 누락/허용되지 않은 값(`opus`, `sonnet`, `haiku` 외) → 기본값 `"sonnet"`을 사용한다. 설정 형식 상세는 `/model-strategy` skill 참조.
-- **subagent git 안전**: subagent dispatch 시 `rd-workflow/docs/guides/subagent-git-safety.md`의 Subagent Git 안전 문구를 dispatch prompt에 포함한다 (공유 워킹트리에서 git checkout/switch/branch/worktree 전환 금지, read-only git만 허용). read-only 탐색/리뷰 subagent는 `isolation: "worktree"` 격리를 권장한다.
+- **subagent git 안전**: subagent dispatch 시 `rd-workflow/docs/guides/subagent-git-safety.md`의 Subagent Git 안전 문구를 dispatch prompt에 포함한다 (공유 워킹트리에서 git checkout/switch/branch/worktree 전환 금지, read-only git만 허용). read-only 탐색/리뷰 subagent는 `isolation: "worktree"` 격리를 권장한다. 다단계이거나 파괴적 상태를 만드는 task 는 같은 문서 1-2 의 진행 기록 문구도 dispatch prompt 에 포함한다.
 - **phase 병렬 실행**: plan이 phase(파일 비중첩 task 그룹)를 표현하면 phase 내 task 구현자를 병렬 dispatch하고, barrier 후 **orchestrator(실행 세션 본체)가 커밋**한다. 검증은 phase barrier 후 1회 실행한다. 절차 전체는 `rd-workflow/docs/guides/plan-parallel-phases.md`를 따른다. phase 미표현 plan은 순차 실행으로 degrade한다.
 
 ### 5. 세션 한계 대응
@@ -337,6 +348,8 @@ compact 후에도 한계에 가까워지면:
 
   7. **lifecycle 일괄 마무리**: 위 1–6단계(archive content commit)가 fr branch에서 완료된 후 실행한다. **§3 에서 어느 경로로 왔는지에 따라 갈린다** — 두 경로를 섞으면 실행되지 않는다.
 
+     `archive.sh` 호출 직전에 `bash rd-workflow/scripts/autopilot_driver.sh end` 를 실행해 실행 주체 표식을 지운다(아래 (a)·(b) 공통).
+
      **(a) 별도 worktree 로 진행한 경우 (무인 실행의 기본):** 지금 있는 자리에서 `git checkout main` 을 하지 않는다. 기본 브랜치는 기본 worktree 가 이미 점유하고 있어 git 이 거부한다. 기본 worktree 로 **이동**한 뒤, 대상 작업을 `--task` 로 명시해 호출한다:
      ```bash
      cd "$(git rev-parse --path-format=absolute --git-common-dir)/.."   # 기본 worktree 루트
@@ -350,7 +363,7 @@ compact 후에도 한계에 가까워지면:
      bash rd-workflow/scripts/lifecycle/archive.sh
      ```
 
-     `archive.sh` 가 merge + tag + push + branch/worktree 정리를 일괄 처리한다. 이 단계 실패 시 현재 상태를 보고하고 사용자에게 넘긴다. (a) 경로에서 호출자 worktree 와 로컬 fr 브랜치가 잔여로 남는 별개 사안은 FR `archive-caller-worktree-cleanup-stranded` 가 추적한다 — 이 단계의 책임이 아니다.
+     `archive.sh` 가 merge + tag + push + branch/worktree 정리를 일괄 처리한다. 이 단계 실패 시 현재 상태를 보고하고 사용자에게 넘긴다. (a) 경로에서 호출자 worktree 와 로컬 fr 브랜치는 보존되어 정리 대기가 되고, 기본 체크아웃의 `rd task list` 가 안전할 때 지연 정리한다 — 이 단계의 책임이 아니다.
 
 **책임 경계**: `fr` stage 캡처는 `/fr archive` 책임이다. `request`/`spec`/`plan` stage 캡처는 REQUEST archive(autopilot 또는 수동) 책임이다.
 

@@ -123,6 +123,28 @@ sec "$P6" 'NOT inlined' | grep -q 'request_review.md'; [ $? -ne 0 ]
 chk $? "턴012 missing 이 disk-read 목록에 나타나지 않음"
 mv "$TMP/req.bak" "$TMP/rd-workflow/docs/prompts/review/request_review.md"
 
+echo "=== 케이스 7: 응답 언어·종결 형식 지시 (상한 100 = 규범 전부 fallback) ==="
+CFG="$TMP/rd-workflow/config/workflow.json"; mkdir -p "$TMP/rd-workflow/config"
+lang_of() { # lang_of <config 본문 | -> : 설정 파일을 만들고 request-review 프롬프트의 응답 언어를 출력
+  if [ "$1" = "-" ]; then rm -f "$CFG"; else printf '%s\n' "$1" > "$CFG"; fi
+  gen "$TMP/p7.txt" request-review 100
+  sed -n 's/^Response language: .* in \(.*\)\. Keep code.*/\1/p' "$TMP/p7.txt"
+}
+[ "$(lang_of -)" = "한국어" ];                                                  chk $? "AC1 설정 파일 부재 → 한국어"
+[ "$(lang_of '{"review_response_language": "English"}')" = "English" ];        chk $? "AC2 설정 값이 응답 언어 지시에 반영됨"
+[ "$(lang_of '{"review_response_language": ""}')" = "한국어" ];                 chk $? "AC1 빈 값 → 한국어"
+[ "$(lang_of '{"review_response_language": "Eng\"lish"}')" = "한국어" ];       chk $? "AC1 이스케이프(\)가 든 값 → 한국어"
+rm -f "$CFG"
+for rt in request-review spec-plan-review diff-review project-context-review; do
+  gen "$TMP/p7_$rt.txt" "$rt" 100
+  grep -qF 'write the first line of the section as exactly "- 없음"' "$TMP/p7_$rt.txt"
+  chk $? "AC3 ($rt) (a) 첫 줄 '- 없음' 지시가 fallback 에서도 전달됨"
+done
+grep -qF 'after one blank line, as a separate paragraph' "$TMP/p7_request-review.txt"
+chk $? "AC3 (b) 마커 아래 빈 줄 뒤 독립 문단 지시"
+grep -qF 'do not write "- 없음". Keep each open objection as a list item' "$TMP/p7_request-review.txt"
+chk $? "AC3 (c) 미해결 이의는 리스트 유지 지시"
+
 echo
 if [ "$FAIL" -eq 0 ]; then echo "test_review_prompt_inline: ALL PASS"; else echo "test_review_prompt_inline: FAILED"; fi
 exit "$FAIL"

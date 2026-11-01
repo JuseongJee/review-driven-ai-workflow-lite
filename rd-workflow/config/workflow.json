@@ -1,4 +1,5 @@
 {
   "default_execution_mode": "semi-auto",
-  "stale_behind_threshold": 20
+  "stale_behind_threshold": 20,
+  "review_response_language": "한국어"
 }

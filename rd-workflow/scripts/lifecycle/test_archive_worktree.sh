@@ -91,7 +91,7 @@ echo "== archive.sh — 작업 worktree 호출(재실행) =="
 alpha_idx_before="$(git -C "$REPO/.worktrees/alpha" ls-files --stage)"
 
 # 작업 worktree 안에서 호출해도 merge·tag 가 기본 브랜치에 이뤄진다.
-if out="$( cd "$REPO/.worktrees/alpha" && bash "$ARCHIVE_SH" --force-skip-review-check "테스트" 2>&1 )"; then
+if out="$( cd "$REPO/.worktrees/alpha" && bash "$ARCHIVE_SH" --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )"; then
   pass "작업 worktree 에서 호출한 archive 가 rc=0 으로 끝난다"
 else
   fail "작업 worktree 호출 archive — 실패: $out"
@@ -124,7 +124,7 @@ fi
 if awk '
   BEGIN{state=0}
   /^## Status$/{state=1; next}
-  state==1 && /^<!-- 허용 상태값 8종은 \.claude\/rules\/rd-workflow\/task-tracking\.md 참조\. 변경은 rd task set-status 경유 -->$/{state=2; next}
+  state==1 && /^<!-- 허용 상태값은 \.claude\/rules\/rd-workflow\/task-tracking\.md 참조\. 변경은 rd task set-status 경유 -->$/{state=2; next}
   state==1 {next}
   state==2 && /^$/{state=3; next}
   state==3 && /^## Request$/{found=1}
@@ -155,23 +155,36 @@ else
   fail "호출 worktree(alpha) 오염됨"
 fi
 
-# 발행 후 그 작업은 '진행 중' 이 아니라 '정리 대기' 로 보인다 (rebuild 해도 되살아나지 않는다).
-out="$( cd "$REPO" && bash "$RD_SH" task list --rebuild 2>&1 )"
-if [[ "$out" == *"정리 대기"* && "$out" == *"alpha"* ]]; then
-  pass "발행 완료(alpha)는 정리 대기로 유지된다"
-else
-  fail "정리 대기 유지 실패 — 목록: $out"
-fi
-# 위 출력만으로는 archive.sh 가 실제로 state=cleanup-pending 을 색인에 기록했는지 증명하지
-# 못한다 — alpha 는 merge+tag 가 이미 끝나 tasks_publish_evidence 의 동적 판정만으로도
-# 같은 "정리 대기" 문구가 나오기 때문이다(정적 기록이 아예 안 됐어도 이 assert 는 PASS
-# 한다). 색인 값을 직접 읽어 기록 자체를 증명한다(리뷰 지적).
+# archive 가 실제로 state=cleanup-pending 을 색인에 기록했는지 직접 증명한다. 목록 출력만으로는
+# 증명되지 않는다 — alpha 는 merge+tag 가 이미 끝나 tasks_publish_evidence 의 동적 판정만으로도
+# 같은 "정리 대기" 문구가 나오기 때문이다(리뷰 지적). 지연 정리가 행을 지우기 전에 읽는다.
 alpha_state="$( cd "$REPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get alpha state' 2>/dev/null )" || alpha_state=""
 alpha_publish_tag="$( cd "$REPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get alpha publish-tag' 2>/dev/null )" || alpha_publish_tag=""
 if [[ "$alpha_state" == "cleanup-pending" && -n "$alpha_publish_tag" ]]; then
   pass "archive 가 색인에 state=cleanup-pending·publish-tag 를 직접 기록했다"
 else
   fail "색인 기록 증명 실패 — state='$alpha_state' publish-tag='$alpha_publish_tag'"
+fi
+
+# 호출자 worktree 에 미커밋 변경이 있으면 지연 정리는 보류하고, 발행 완료 작업은 rebuild 해도
+# '진행 중' 으로 되살아나지 않고 정리 대기로 유지된다.
+: > "$REPO/.worktrees/alpha/dirty.tmp"
+out="$( cd "$REPO" && bash "$RD_SH" task list --rebuild 2>&1 )"
+if [[ "$out" == *"정리 대기"* && "$out" == *"alpha"* && "$out" == *"정리 보류: alpha"* && -d "$REPO/.worktrees/alpha" ]]; then
+  pass "발행 완료(alpha)는 미커밋 변경이 있으면 정리 대기로 유지되고 지연 정리는 보류된다"
+else
+  fail "정리 대기 유지·보류 실패 — 목록: $out"
+fi
+
+# 변경을 치우면 기본 체크아웃의 rd task list 가 호출자 worktree·로컬 브랜치·색인 행을 정리한다.
+rm -f "$REPO/.worktrees/alpha/dirty.tmp"
+out="$( cd "$REPO" && bash "$RD_SH" task list 2>&1 )"
+if [[ "$out" == *"정리됨: alpha"* && ! -d "$REPO/.worktrees/alpha" ]] \
+  && ! git -C "$REPO" rev-parse --verify --quiet fr/alpha >/dev/null \
+  && [[ -z "$( cd "$REPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get alpha state' 2>/dev/null )" ]]; then
+  pass "호출자 worktree(alpha)는 변경이 없어지면 rd task list 가 worktree·브랜치·색인 행을 지연 정리한다"
+else
+  fail "호출자 worktree 지연 정리 실패 — 목록: $out"
 fi
 
 echo "== archive.sh — 제3 worktree에서 --task 로 대상 지정 =="
@@ -181,7 +194,7 @@ echo "== archive.sh — 제3 worktree에서 --task 로 대상 지정 =="
 # 캡처해 둔 commit OID 의 main 조상 여부로 한다(ref 삭제와 무관하게 유효하다).
 delta_tip_before="$(git -C "$REPO" rev-parse fr/delta)"
 before_caller="$(git -C "$REPO/.worktrees/beta" ls-files --stage)"
-if out="$( cd "$REPO/.worktrees/beta" && bash "$ARCHIVE_SH" --task delta --force-skip-review-check "테스트" 2>&1 )"; then
+if out="$( cd "$REPO/.worktrees/beta" && bash "$ARCHIVE_SH" --task delta --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )"; then
   pass "beta(호출자)에서 --task delta 호출이 rc=0 으로 끝난다"
 else
   fail "beta→delta 호출 실패: $out"
@@ -210,7 +223,7 @@ git -C "$REPO" commit -q -m "구현: nw"
 ( cd "$REPO" && git add -A && git commit -q -m "진행: 아카이브 보류" )
 nw_tip_before="$(git -C "$REPO" rev-parse fr/nw)"
 ( cd "$REPO" && git switch -q main )
-if out="$( cd "$REPO" && bash "$ARCHIVE_SH" --task nw --force-skip-review-check "테스트" 2>&1 )"; then
+if out="$( cd "$REPO" && bash "$ARCHIVE_SH" --task nw --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )"; then
   pass "D13 — --task nw 호출이 rc=0 으로 끝난다"
 else
   fail "D13 — --task nw 호출 실패: $out"
@@ -241,7 +254,7 @@ gamma_idx_before="$(git -C "$REPO/.worktrees/gamma" ls-files --stage)"
 gamma_launch_before="$( cd "$REPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get gamma launch' )"
 
 gamma_rc=0
-gamma_out="$( cd "$REPO/.worktrees/gamma" && bash "$ARCHIVE_SH" --force-skip-review-check "테스트" 2>&1 )" || gamma_rc=$?
+gamma_out="$( cd "$REPO/.worktrees/gamma" && bash "$ARCHIVE_SH" --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )" || gamma_rc=$?
 if [[ "$gamma_rc" -ne 0 ]]; then
   pass "launching 예약 중인 작업은 archive 가 nonzero 로 거부한다"
 else
@@ -309,7 +322,7 @@ sealed-at=2026-09-16-0000
 SEAL
 # sed -i.bak + rm 은 BSD(macOS)·GNU 양립 형태다(spec D9 — 신규 코드는 BSD 비호환 금지,
 # test_task_cli.sh:1014-1016 와 같은 관례). `sed -i '...' f` 는 macOS stock sed 에서 실패한다.
-sed -i.bak "s/^review-session=.*/review-session=${EPS_SID}/" "$REPO/.worktrees/eps/rd-workflow-workspace/.lifecycle/task-state"
+sed -i.bak -e "s/^review-session=.*/review-session=${EPS_SID}/" -e 's/^status=.*/status=아카이브 보류/' "$REPO/.worktrees/eps/rd-workflow-workspace/.lifecycle/task-state"
 rm -f "$REPO/.worktrees/eps/rd-workflow-workspace/.lifecycle/task-state.bak"
 git -C "$REPO/.worktrees/eps" add -A
 git -C "$REPO/.worktrees/eps" commit -q -m "review: eps seal"
@@ -332,7 +345,7 @@ fi
 # branch-mode·fr-branch 불일치 검사가 막는지를 보기 위함이다).
 mkdir -p "$REPO/.worktrees/zeta/rd-workflow-workspace/.lifecycle/review-seals"
 printf '%s\n' "$EPS_SEAL_CONTENT" > "$REPO/.worktrees/zeta/rd-workflow-workspace/.lifecycle/review-seals/${EPS_SID}.seal"
-sed -i.bak "s/^review-session=.*/review-session=${EPS_SID}/" "$REPO/.worktrees/zeta/rd-workflow-workspace/.lifecycle/task-state"
+sed -i.bak -e "s/^review-session=.*/review-session=${EPS_SID}/" -e 's/^status=.*/status=아카이브 보류/' "$REPO/.worktrees/zeta/rd-workflow-workspace/.lifecycle/task-state"
 rm -f "$REPO/.worktrees/zeta/rd-workflow-workspace/.lifecycle/task-state.bak"
 git -C "$REPO/.worktrees/zeta" add -A
 git -C "$REPO/.worktrees/zeta" commit -q -m "review: eps seal 도용 시도(테스트)"
@@ -368,6 +381,51 @@ else
   fail "AC17 — 거부인데 zeta 상태가 오염됨"
 fi
 
+echo "== archive.sh — D3 발행 대상 Status 검사 (T7) =="
+
+# fr tip Status 가 '구현 중' 인 작업 — 실제 작업 커밋이 있어 merge 가 기본 브랜치 HEAD 를
+# 전진시킨다(Status 검사가 merge 뒤로 밀리면 「HEAD 불변」 단언이 잡는다).
+# 모든 호출에 --force-skip-review-check 를 줘서 seal 게이트가 먼저 막지 않게 한다 —
+# 아래 케이스가 보는 것은 Status 게이트 하나다.
+bash "$PROMOTE_SH" --short-title stg --size large --source-fr -
+printf 'work-stg\n' > "$REPO/.worktrees/stg/src-stg.txt"
+git -C "$REPO/.worktrees/stg" add -A
+git -C "$REPO/.worktrees/stg" commit -q -m "구현: stg"
+stg_tip_status="$(git -C "$REPO" show fr/stg:rd-workflow-workspace/.lifecycle/task-state | sed -n 's/^status=//p')"
+[[ "$stg_tip_status" != "아카이브 보류" ]] && pass "T7: fixture 의 fr tip Status 는 '$stg_tip_status' 이다(아카이브 보류 아님)" \
+  || fail "T7: fixture 가 이미 아카이브 보류다 — 시험이 성립하지 않는다"
+stg_main_before="$(git -C "$REPO" rev-parse main)"
+
+stg_rc=0; stg_out="$( cd "$REPO/.worktrees/stg" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" 2>&1 )" || stg_rc=$?
+[[ "$stg_rc" -ne 0 ]] && pass "T7: Status=구현 중 + force 만 → rc≠0" || fail "T7: Status 검사 없이 발행됨 — $stg_out"
+[[ "$stg_out" == *"Status 검사 실패"* && "$stg_out" == *"rd task set-status"* ]] \
+  && pass "T7: 거부 안내에 'Status 검사 실패' 와 rd task set-status 순서가 있다" || fail "T7: 거부 안내 누락 — $stg_out"
+[[ "$stg_out" == *"'$stg_tip_status'"* ]] && pass "T7: 안내가 대상 Status 값을 보여준다" || fail "T7: Status 값 누락 — $stg_out"
+[[ "$(git -C "$REPO" rev-parse main)" == "$stg_main_before" ]] \
+  && pass "T7: 거부 후 기본 브랜치 HEAD 불변(merge 전 차단)" || fail "T7: 거부인데 기본 브랜치 HEAD 가 전진했다"
+git -C "$REPO" merge-base --is-ancestor fr/stg main 2>/dev/null \
+  && fail "T7: 거부인데 fr/stg 가 merge 됐다" || pass "T7: 거부 후 fr/stg 미merge"
+
+# 독립성 — --allow-status-mismatch 만으로는 seal 검사를 우회하지 못한다.
+stg_rc=0; stg_out="$( cd "$REPO/.worktrees/stg" && bash "$ARCHIVE_SH" --no-remote --allow-status-mismatch "테스트" 2>&1 )" || stg_rc=$?
+[[ "$stg_rc" -ne 0 && "$stg_out" == *"종결 마커 검증 실패"* && "$stg_out" == *"--force-skip-review-check"* ]] \
+  && pass "T7: allow 만 → Status 는 통과하고 seal 검사가 거부한다(독립성)" || fail "T7: 독립성 위반 rc=$stg_rc — $stg_out"
+[[ "$stg_out" != *"Status 검사 실패"* ]] && pass "T7: allow 만 → Status 거부 문구 없음" || fail "T7: allow 를 줬는데 Status 가 거부했다 — $stg_out"
+[[ "$(git -C "$REPO" rev-parse main)" == "$stg_main_before" ]] && pass "T7: seal 거부 후에도 HEAD 불변" || fail "T7: HEAD 전진"
+
+# 사유 없는 --allow-status-mismatch 는 거부
+stg_rc=0; stg_out="$( cd "$REPO/.worktrees/stg" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" --allow-status-mismatch 2>&1 )" || stg_rc=$?
+[[ "$stg_rc" -ne 0 && "$stg_out" == *"--allow-status-mismatch 사유 필수"* ]] \
+  && pass "T7: 사유 없는 --allow-status-mismatch → 거부" || fail "T7: 사유 없는 우회가 통과/오문구 rc=$stg_rc — $stg_out"
+[[ "$(git -C "$REPO" rev-parse main)" == "$stg_main_before" ]] && pass "T7: 사유 없음 거부 후 HEAD 불변" || fail "T7: HEAD 전진"
+
+# 두 플래그가 모두 있으면 통과하고 audit 에 [status:<값>] 가 남는다
+stg_rc=0; stg_out="$( cd "$REPO/.worktrees/stg" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" --allow-status-mismatch "상태검사 우회 테스트" 2>&1 )" || stg_rc=$?
+[[ "$stg_rc" -eq 0 ]] && pass "T7: 두 플래그 → 발행 통과" || fail "T7: 두 플래그인데 실패 rc=$stg_rc — $stg_out"
+git -C "$REPO" merge-base --is-ancestor fr/stg main 2>/dev/null && pass "T7: 두 플래그 → fr/stg 가 main 에 merge 됐다" || fail "T7: merge 누락"
+grep -qF "[status:$stg_tip_status] 상태검사 우회 테스트" "$REPO/rd-workflow-workspace/.lifecycle/review-skip-audit.log" \
+  && pass "T7: audit 에 [status:$stg_tip_status] 와 사유가 남는다" || fail "T7: audit 줄 누락"
+
 echo "== archive.sh — 인자 없이 호출해도 재실행 경로가 죽지 않는다 (bash 3.2 빈 배열) =="
 
 # 이 Task 의 대표 사용 경로는 인자 0개 호출이다(CLAUDE.md·claude_skills 안내가 일관되게
@@ -380,6 +438,11 @@ bash "$PROMOTE_SH" --short-title noarg --size large --source-fr -
 printf 'work-noarg\n' > "$REPO/.worktrees/noarg/src-noarg.txt"
 git -C "$REPO/.worktrees/noarg" add -A
 git -C "$REPO/.worktrees/noarg" commit -q -m "구현: noarg"
+# Status 게이트가 seal 검사 앞에 있으므로, review precheck 까지 가려면 fr tip Status 가 보류여야 한다.
+sed -i.bak 's/^status=.*/status=아카이브 보류/' "$REPO/.worktrees/noarg/rd-workflow-workspace/.lifecycle/task-state"
+rm -f "$REPO/.worktrees/noarg/rd-workflow-workspace/.lifecycle/task-state.bak"
+git -C "$REPO/.worktrees/noarg" add -A
+git -C "$REPO/.worktrees/noarg" commit -q -m "status: 아카이브 보류(noarg)"
 
 noarg_rc=0
 noarg_out="$( cd "$REPO/.worktrees/noarg" && bash "$ARCHIVE_SH" 2>&1 )" || noarg_rc=$?
@@ -410,7 +473,7 @@ printf 'work-remotecheck\n' > "$REPO/.worktrees/remotecheck/src-remotecheck.txt"
 git -C "$REPO/.worktrees/remotecheck" add -A
 git -C "$REPO/.worktrees/remotecheck" commit -q -m "구현: remotecheck"
 
-if out="$( cd "$REPO/.worktrees/remotecheck" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" 2>&1 )"; then
+if out="$( cd "$REPO/.worktrees/remotecheck" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )"; then
   pass "origin 있음 + --no-remote 마감이 rc=0 으로 끝난다"
 else
   fail "origin 있음 + --no-remote 마감 실패: $out"
@@ -465,7 +528,7 @@ lock_wait=0
 while [[ ! -d "$LOCK_DIR" && "$lock_wait" -lt 50 ]]; do sleep 0.1; lock_wait=$((lock_wait+1)); done
 
 lock_rc=0
-lock_out="$( cd "$REPO/.worktrees/lockcase" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" 2>&1 )" || lock_rc=$?
+lock_out="$( cd "$REPO/.worktrees/lockcase" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )" || lock_rc=$?
 kill "$LOCK_HOLDER_PID" 2>/dev/null || true
 wait "$LOCK_HOLDER_PID" 2>/dev/null || true
 # 죽은 점유자의 락은 자동 회수되지 않는다(설계) — 테스트가 직접 치운다.
@@ -487,15 +550,317 @@ fi
   && pass "재시도 방법을 안내한다 (AC 14)" || fail "재시도 안내 누락: $lock_out"
 
 # 정상 경로에서 락이 끝까지 해제되는지 — 남으면 다음 lifecycle 명령이 전부 막힌다.
-if out="$( cd "$REPO/.worktrees/lockcase" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" 2>&1 )"; then
+if out="$( cd "$REPO/.worktrees/lockcase" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )"; then
   [[ ! -d "$LOCK_DIR" ]] && pass "정상 마감 뒤 락이 남지 않는다 (F7)" || fail "마감 뒤 tasks.lock 잔존"
 else
   fail "락 회수 뒤 재시도한 마감이 실패했다: $out"
 fi
 
 # 실패 경로에서도 해제된다 — 여기서는 대상 브랜치가 없어 조기 중단하는 호출을 쓴다.
-( cd "$REPO" && bash "$ARCHIVE_SH" --task nosuchtask --no-remote --force-skip-review-check "테스트" >/dev/null 2>&1 ) || true
+( cd "$REPO" && bash "$ARCHIVE_SH" --task nosuchtask --no-remote --force-skip-review-check "테스트" --allow-status-mismatch "테스트" >/dev/null 2>&1 ) || true
 [[ ! -d "$LOCK_DIR" ]] && pass "중단 경로에서도 락이 해제된다 (F7)" || fail "중단 경로에서 tasks.lock 잔존"
+
+echo "== archive content 감지 =="
+
+# Step 2 의 archive content 감지는 「기본 브랜치 이후 커밋 전체에 request-archive/*.md 추가가 있는가」 를
+# 본다. 마지막 커밋만 보면 아카이브 사본 뒤의 정리 커밋 때문에 거짓 경고가 나고,
+# REQUEST.md·CURRENT_TASK.md 변경을 신호로 치면 경고가 영영 나지 않는다.
+cd_archive_dir="rd-workflow-workspace/backlog/request-archive"
+cd_commit() {  # <slug> <파일> <내용> <메시지> — fr worktree 에 파일 하나를 커밋한다
+  mkdir -p "$(dirname "$REPO/.worktrees/$1/$2")"
+  printf '%s\n' "$3" >> "$REPO/.worktrees/$1/$2"
+  git -C "$REPO/.worktrees/$1" add -A
+  git -C "$REPO/.worktrees/$1" commit -q -m "$4"
+}
+
+# ok1: 작업 → 아카이브 사본 추가 → 사본과 무관한 후속 커밋 (AC1)
+bash "$PROMOTE_SH" --short-title ok1 --size large --source-fr -
+cd_commit ok1 src-ok1.txt work "구현: ok1"
+cd_commit ok1 "$cd_archive_dir/2026-10-29-0000-ok1.md" archived "archive: ok1"
+cd_commit ok1 src-ok1.txt followup "정리: ok1"
+ok1_out="$( cd "$REPO/.worktrees/ok1" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )" || true
+[[ "$ok1_out" != *"미감지"* ]] \
+  && pass "ok1 미감지 없음 — 아카이브 사본 뒤 후속 커밋이 있어도 거짓 경고가 없다" \
+  || fail "ok1 미감지 경고가 났다: $ok1_out"
+
+# ok1 재실행: fr 브랜치가 이미 기본 브랜치에 병합된 상태 — 빈 범위를 신호 없음으로 읽지 않는다
+ok1b_out="$( cd "$REPO/.worktrees/ok1" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )" || true
+[[ "$ok1b_out" == *"감지를 건너뜁니다 (fr 브랜치가 이미 기본 브랜치에 병합됨)"* ]] \
+  && pass "ok1 재실행 건너뜁니다 있음" || fail "ok1 재실행 — 건너뜀 문구 없음: $ok1b_out"
+[[ "$ok1b_out" != *"미감지"* ]] \
+  && pass "ok1 재실행 미감지 없음" || fail "ok1 재실행 — 거짓 미감지 경고: $ok1b_out"
+
+# miss1: REQUEST.md·CURRENT_TASK.md 만 바뀐 커밋 — 진짜 누락이므로 경고한다 (AC2)
+bash "$PROMOTE_SH" --short-title miss1 --size large --source-fr -
+cd_commit miss1 src-miss1.txt work "구현: miss1"
+cd_commit miss1 REQUEST.md edited "request: miss1"
+cd_commit miss1 CURRENT_TASK.md edited "task: miss1"
+miss1_out="$( cd "$REPO/.worktrees/miss1" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )" || true
+[[ "$miss1_out" == *"기본 브랜치 이후 커밋 전체에 archive content(request-archive/*.md 추가) 미감지"* ]] \
+  && pass "miss1 미감지 경고 있음" || fail "miss1 미감지 경고 누락: $miss1_out"
+
+# 우회가 성립한 발행은 실패 줄을 먼저 내지 않고, 한 줄에 사유와 마커 상태를 함께 알린다 (AC3·AC4)
+for _bp in ok1 miss1; do
+  eval "_bp_out=\$${_bp}_out"
+  [[ "$_bp_out" != *"종결 마커 검증 실패"* ]] \
+    && pass "$_bp 우회 성립 — 종결 마커 검증 실패 줄 없음" || fail "$_bp 우회 성립인데 실패 줄이 났다: $_bp_out"
+  [[ "$_bp_out" == *"검증 우회 (사유: 테스트; 종결 마커 상태:"* ]] \
+    && pass "$_bp 우회 경고에 종결 마커 상태 포함" || fail "$_bp 우회 경고 문구 누락: $_bp_out"
+done
+
+# nobase1: 기본 브랜치를 못 얻으면 감지를 못 했다고 알리고, 마지막 커밋 판정으로 돌아가지 않는다 (AC2b)
+bash "$PROMOTE_SH" --short-title nobase1 --size large --source-fr -
+cd_commit nobase1 src-nobase1.txt work "구현: nobase1"
+# archive.sh 는 기본 체크아웃으로 재실행되므로 기본 브랜치 설정은 기본 체크아웃(main)에 둔다.
+# promote 가 끝난 뒤에 넣는다 — promote 도 get_default_branch 를 쓴다.
+mkdir -p "$REPO/rd-workflow/config"
+printf '{"default_branch": "no-such-branch"}\n' > "$REPO/rd-workflow/config/workflow.json"
+git -C "$REPO" add rd-workflow/config/workflow.json
+git -C "$REPO" commit -q -m "config: nobase1 기본 브랜치를 없는 이름으로"
+nobase1_out="$( cd "$REPO/.worktrees/nobase1" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )" || true
+[[ "$nobase1_out" == *"감지를 수행하지 못했습니다"* ]] \
+  && pass "nobase1 감지를 수행하지 못했습니다 있음" || fail "nobase1 — 판정 불가 문구 누락: $nobase1_out"
+[[ "$nobase1_out" != *"미감지"* ]] \
+  && pass "nobase1 미감지 없음" || fail "nobase1 — 판정 불가인데 미감지 경고: $nobase1_out"
+
+# --- merge output ---
+echo "== archive.sh — git merge 출력: 성공은 보존, 자동 해소 성공은 보류, 해소 불가는 노출 =="
+
+# 앞 구획(nobase1)이 기본 브랜치를 없는 이름으로 바꿔 두었으므로 되돌린다.
+printf '{"default_branch": "main"}\n' > "$REPO/rd-workflow/config/workflow.json"
+git -C "$REPO" add rd-workflow/config/workflow.json
+git -C "$REPO" commit -q -m "config: 기본 브랜치 복구"
+
+mo_sm="rd-workflow-workspace/.lifecycle/stage_metrics.tsv"
+mo_hdr=$'# short_title\tfrom_status\tto_status\tepoch'
+# 충돌 시나리오가 쓰는 stage_metrics.tsv 를 형식이 맞는 기준 상태로 맞춘다 (3-way 에 공통 조상이 필요).
+printf '%s\nmo-base\t대기 중\t구현 중\t100\n' "$mo_hdr" > "$REPO/$mo_sm"
+printf 'base\n' > "$REPO/x.txt"
+git -C "$REPO" add -A
+RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "mo: 기준 stage_metrics"
+
+# mo_diverge <slug> <main-sm-row> [x]  — fr 와 main 이 stage_metrics.tsv 끝에 서로 다른 행을 추가한다.
+#   세 번째 인자 x 가 있으면 x.txt 도 양쪽에서 다르게 바꿔 함께 충돌시킨다.
+mo_diverge() {
+  local slug="$1" mrow="$2" withx="${3:-}"
+  bash "$PROMOTE_SH" --short-title "$slug" --size large --source-fr - >/dev/null 2>&1
+  printf '%s\t대기 중\t구현 중\t200\n' "$slug" >> "$REPO/.worktrees/$slug/$mo_sm"
+  [[ -z "$withx" ]] || printf 'fr-side\n' > "$REPO/.worktrees/$slug/x.txt"
+  printf 'work-%s\n' "$slug" > "$REPO/.worktrees/$slug/src-$slug.txt"
+  git -C "$REPO/.worktrees/$slug" add -A
+  git -C "$REPO/.worktrees/$slug" commit -q -m "구현: $slug"
+  printf '%b' "$mrow" >> "$REPO/$mo_sm"
+  [[ -z "$withx" ]] || printf 'main-side\n' > "$REPO/x.txt"
+  git -C "$REPO" add -A
+  RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main 쪽 추가: $slug"
+}
+mo_archive() {  # <slug> — 출력은 mo_out, 종료코드는 mo_rc
+  mo_rc=0
+  mo_out="$( cd "$REPO/.worktrees/$1" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )" || mo_rc=$?
+}
+
+# 케이스 1 — 충돌 없는 merge 는 git 이 낸 출력이 그대로 보존된다.
+bash "$PROMOTE_SH" --short-title mo1 --size large --source-fr - >/dev/null 2>&1
+printf 'work-mo1\n' > "$REPO/.worktrees/mo1/src-mo1.txt"
+git -C "$REPO/.worktrees/mo1" add -A
+git -C "$REPO/.worktrees/mo1" commit -q -m "구현: mo1"
+mo_clone="$(mktemp -d)" || { echo "mktemp 실패" >&2; exit 1; }
+[[ -n "$mo_clone" && -d "$mo_clone" ]] || { echo "mktemp 경로 검증 실패" >&2; exit 1; }
+_ast_cleanup+=("$mo_clone")
+git clone -q "$REPO" "$mo_clone/c" 2>/dev/null
+git -C "$mo_clone/c" config user.email t@t && git -C "$mo_clone/c" config user.name t
+mo_expect="$(git -C "$mo_clone/c" merge --no-ff -m x origin/fr/mo1 2>&1)"
+mo_expect="${mo_expect%%$'\n'*}"   # 첫 줄 (파이프+head 는 pipefail 에서 SIGPIPE 를 낸다)
+mo_archive mo1
+if [[ "$mo_rc" -eq 0 && -n "$mo_expect" && "$mo_out" == *"$mo_expect"* ]]; then
+  pass "mo1: 충돌 없는 merge 의 git 출력('$mo_expect')이 보존된다"
+else
+  fail "mo1: git merge 출력 누락 — rc=$mo_rc expect='$mo_expect' out: $mo_out"
+fi
+
+# 케이스 2 — stage_metrics.tsv 단독 충돌의 자동 해소 성공은 git 의 실패 출력을 내지 않는다.
+mo_diverge mo2 'mo2-main\t대기 중\t구현 중\t300\n'
+mo_archive mo2
+[[ "$mo_rc" -eq 0 ]] && pass "mo2: 자동 해소 발행이 rc=0 이다" || fail "mo2: rc=$mo_rc — $mo_out"
+[[ "$mo_out" == *"줄 합집합으로 해결했습니다"* ]] \
+  && pass "mo2: 해소 안내가 있다" || fail "mo2: 해소 안내 누락 — $mo_out"
+if [[ "$mo_out" != *"Automatic merge failed"* && "$mo_out" != *"자동 병합이 실패했습니다"* && "$mo_out" != *"CONFLICT"* ]]; then
+  pass "mo2: 해소 성공 출력에 git 실패 문구가 없다"
+else
+  fail "mo2: git 실패 문구가 새어 나왔다 — $mo_out"
+fi
+
+# 케이스 3 — stage_metrics.tsv 와 x.txt 동시 충돌은 멈추고 git 출력(CONFLICT)을 낸다.
+mo_diverge mo3 'mo3-main\t대기 중\t구현 중\t300\n' x
+mo_archive mo3
+[[ "$mo_rc" -ne 0 ]] && pass "mo3: 해소 불가 충돌은 rc≠0 이다" || fail "mo3: rc=0 — $mo_out"
+# 로케일을 건드리지 않으므로 git 출력의 언어에 의존하지 않고, git 만 내는 충돌 파일명 줄(x.txt)로 본다.
+[[ "$mo_out" == *"x.txt"* ]] \
+  && pass "mo3: 해소 불가 시 git 의 충돌 출력(x.txt 줄)을 낸다" || fail "mo3: git 충돌 출력 누락 — $mo_out"
+git -C "$REPO" merge --abort >/dev/null 2>&1 || true
+
+# 케이스 3b — stage_metrics.tsv 형식 오류(_sm_stop 경로)도 git 출력을 낸다.
+mo_diverge mo3b 'mo3b-main\t대기 중\t300\n'
+mo_archive mo3b
+[[ "$mo_rc" -ne 0 ]] && pass "mo3b: 형식 오류 충돌은 rc≠0 이다" || fail "mo3b: rc=0 — $mo_out"
+# archive 자신의 문구는 경로 없이 "stage_metrics.tsv" 만 쓰므로, 전체 경로 줄은 git 출력에서만 온다.
+[[ "$mo_out" == *"$mo_sm"* && "$mo_out" == *"형식 오류"* ]] \
+  && pass "mo3b: _sm_stop 경로가 사유와 git 출력을 함께 낸다" || fail "mo3b: git 출력/사유 누락 — $mo_out"
+git -C "$REPO" merge --abort >/dev/null 2>&1 || true
+
+# CURRENT_TASK.md 충돌 (FR publish-path-interruptions D1) — fr 는 `대기 중` 줄을 `아카이브 보류` 로, main 은 같은 줄을 `구현 중` 으로 바꾼다.
+# mo_ct_diverge <slug> [sm|x]  — 케이스 사이에 main 의 CURRENT_TASK.md 를 `대기 중` 기준으로 되돌려 둔 뒤 시작한다.
+mo_ct_diverge() {
+  local slug="$1" extra="${2:-}"
+  if ! grep -qx '대기 중' "$REPO/CURRENT_TASK.md"; then
+    sed -i 's/^구현 중$/대기 중/' "$REPO/CURRENT_TASK.md"
+    git -C "$REPO" add -A
+    RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main: CURRENT_TASK 기준 복구 ($slug)"
+  fi
+  if [[ "$extra" == sm ]]; then  # 앞 케이스(mo3b)가 main 에 남긴 형식 오류 행을 기준 상태로 되돌린다
+    printf '%s\nmo-base\t대기 중\t구현 중\t100\n' "$mo_hdr" > "$REPO/$mo_sm"
+    git -C "$REPO" add -A
+    RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main: stage_metrics 기준 복구 ($slug)" || true
+  fi
+  bash "$PROMOTE_SH" --short-title "$slug" --size large --source-fr - >/dev/null 2>&1
+  sed -i 's/^대기 중$/아카이브 보류/' "$REPO/.worktrees/$slug/CURRENT_TASK.md"
+  printf 'work-%s\n' "$slug" > "$REPO/.worktrees/$slug/src-$slug.txt"
+  [[ "$extra" != sm ]] || printf '%s\t대기 중\t구현 중\t200\n' "$slug" >> "$REPO/.worktrees/$slug/$mo_sm"
+  [[ "$extra" != x ]] || printf 'fr-side-%s\n' "$slug" > "$REPO/.worktrees/$slug/x.txt"
+  git -C "$REPO/.worktrees/$slug" add -A
+  git -C "$REPO/.worktrees/$slug" commit -q -m "구현: $slug"
+  sed -i 's/^대기 중$/구현 중/' "$REPO/CURRENT_TASK.md"
+  [[ "$extra" != sm ]] || printf '%s-main\t대기 중\t구현 중\t300\n' "$slug" >> "$REPO/$mo_sm"
+  [[ "$extra" != x ]] || printf 'main-side-%s\n' "$slug" > "$REPO/x.txt"
+  git -C "$REPO" add -A
+  RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main: $slug"
+}
+
+# T1 — CURRENT_TASK.md 단독 충돌은 main 쪽으로 해소된다.
+mo_ct_diverge ct1
+mo_archive ct1
+[[ "$mo_rc" -eq 0 ]] && pass "T1: CURRENT_TASK.md 단독 충돌 발행이 rc=0 이다" || fail "T1: rc=$mo_rc — $mo_out"
+[[ "$mo_out" == *"CURRENT_TASK.md 충돌을 main 쪽으로 해결했습니다"* ]] \
+  && pass "T1: 해소 안내가 있다" || fail "T1: 해소 안내 누락 — $mo_out"
+grep -qx '대기 중' "$REPO/CURRENT_TASK.md" \
+  && pass "T1: 발행 뒤 main 의 CURRENT_TASK.md 가 기준 상태(대기 중)다" || fail "T1: CURRENT_TASK.md 에 '대기 중' 줄 없음"
+
+# T2 — stage_metrics.tsv 충돌과 함께여도 둘 다 해소된다.
+mo_ct_diverge ct2 sm
+mo_archive ct2
+[[ "$mo_rc" -eq 0 ]] && pass "T2: CURRENT_TASK.md + stage_metrics.tsv 충돌 발행이 rc=0 이다" || fail "T2: rc=$mo_rc — $mo_out"
+[[ "$mo_out" == *"CURRENT_TASK.md 충돌을 main 쪽"* && "$mo_out" == *"stage_metrics.tsv 충돌을 줄 합집합으로 해결했습니다"* ]] \
+  && pass "T2: 두 해소 안내가 모두 있다" || fail "T2: 해소 안내 누락 — $mo_out"
+
+# T3 — 허용 집합 밖 파일(x.txt)이 함께 충돌하면 멈춘다.
+mo_ct_diverge ct3 x
+mo_archive ct3
+[[ "$mo_rc" -ne 0 ]] && pass "T3: 허용 밖 파일이 섞인 충돌은 rc≠0 이다" || fail "T3: rc=0 — $mo_out"
+[[ "$mo_out" == *"x.txt"* ]] \
+  && pass "T3: git 충돌 출력(x.txt 줄)을 낸다" || fail "T3: git 충돌 출력 누락 — $mo_out"
+[[ "$mo_out" != *"충돌은 해결했으나"* && "$mo_out" != *"병합 결과 반영 실패"* && "$mo_out" != *"해결했습니다"* ]] \
+  && pass "T3: 자동 해소 분기에 들어가지 않는다" || fail "T3: 허용 밖 파일이 섞였는데 자동 해소를 시도했다 — $mo_out"
+git -C "$REPO" merge --abort >/dev/null 2>&1 || true
+
+# T1b — main 이 CURRENT_TASK.md 를 삭제하고 fr 이 수정한 delete/modify 충돌은 stage 2 가 없어 멈춘다.
+if ! grep -qx '대기 중' "$REPO/CURRENT_TASK.md" 2>/dev/null; then
+  git -C "$REPO" checkout -q HEAD -- CURRENT_TASK.md 2>/dev/null || true
+  sed -i 's/^구현 중$/대기 중/' "$REPO/CURRENT_TASK.md"
+  git -C "$REPO" add -A
+  RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main: CURRENT_TASK 기준 복구 (ct1b)" || true
+fi
+bash "$PROMOTE_SH" --short-title ct1b --size large --source-fr - >/dev/null 2>&1
+sed -i 's/^대기 중$/아카이브 보류/' "$REPO/.worktrees/ct1b/CURRENT_TASK.md"
+printf 'work-ct1b\n' > "$REPO/.worktrees/ct1b/src-ct1b.txt"
+git -C "$REPO/.worktrees/ct1b" add -A
+git -C "$REPO/.worktrees/ct1b" commit -q -m "구현: ct1b"
+git -C "$REPO" rm -q CURRENT_TASK.md
+RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main: CURRENT_TASK 삭제 (ct1b)"
+mo_archive ct1b
+[[ "$mo_rc" -ne 0 ]] && pass "T1b: main 이 삭제한 CURRENT_TASK.md 충돌은 rc≠0 이다" || fail "T1b: rc=0 — $mo_out"
+[[ "$mo_out" == *"CURRENT_TASK.md main 쪽 버전이 없어"* ]] \
+  && pass "T1b: stage 2 부재 사유로 멈춘다" || fail "T1b: 멈춤 사유 누락 — $mo_out"
+git -C "$REPO" merge --abort >/dev/null 2>&1 || true
+
+# T8 — no-fr 에서 cleanup 커밋 이후 push 가 실패한 뒤의 재실행 (D3)
+#
+# cleanup 커밋은 Status 를 '대기 중' 으로, short-title 을 '-' 로 되돌린다. 재실행은 두
+# 게이트(Status·seal)를 각각 자기 플래그로만 우회할 수 있어야 하고, 한 플래그만으로는
+# 완료되지 않아야 한다. 최초 실패를 cleanup 이후로 만들기 위해 로컬 bare 원격의
+# pre-receive hook 이 push 를 거부한다.
+echo "== archive.sh — D3 no-fr cleanup 이후 재실행 (T8) =="
+NF="$(mktemp -d)" || { echo "mktemp 실패" >&2; exit 1; }
+NF="$(cd "$NF" && pwd -P)"
+_ast_cleanup+=("$NF")
+NFR="$NF/w"; NFO="$NF/o.git"
+mkdir -p "$NFR/rd-workflow"
+cp -R "$SCRIPT_DIR/.." "$NFR/rd-workflow/scripts"
+git -C "$NFR" init -q -b main
+git -C "$NFR" config user.email t@t && git -C "$NFR" config user.name t
+mkdir -p "$NFR/rd-workflow-workspace/.lifecycle" "$NFR/rd-workflow-workspace/backlog/items"
+cp "$SCRIPT_DIR/../../../.gitignore" "$NFR/.gitignore"
+bash -c "source '$SCRIPT_DIR/_lifecycle_common.sh'; emit_current_task_baseline" > "$NFR/CURRENT_TASK.md"
+printf 'schema=1\nshort-title=-\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\nbase-commit=null\nreview-session=null\n' \
+  > "$NFR/rd-workflow-workspace/.lifecycle/task-state"
+printf '# Change Request\n\n## Source FR\n-\n' > "$NFR/REQUEST.md"
+git -C "$NFR" add -A && git -C "$NFR" commit -q -m seed
+git init -q --bare "$NFO"
+git -C "$NFR" remote add origin "$NFO"
+git -C "$NFR" push -q origin main
+( cd "$NFR" && bash rd-workflow/scripts/rd task set-title nofr \
+  && bash rd-workflow/scripts/rd task set-base HEAD \
+  && bash rd-workflow/scripts/rd task set-status "구현 중" ) >/dev/null 2>&1
+printf 'code\n' > "$NFR/src.txt"
+git -C "$NFR" add -A && git -C "$NFR" commit -q -m "구현"
+nf_archive() {  # <인자...> — 출력은 nf_out, 종료코드는 nf_rc
+  nf_rc=0
+  nf_out="$( cd "$NFR" && bash rd-workflow/scripts/lifecycle/archive.sh "$@" 2>&1 )" || nf_rc=$?
+}
+nf_task_field() { sed -n "s/^$1=//p" "$NFR/rd-workflow-workspace/.lifecycle/task-state"; }
+
+printf '#!/bin/sh\necho "pre-receive 거부(테스트)" >&2\nexit 1\n' > "$NFO/hooks/pre-receive"
+chmod +x "$NFO/hooks/pre-receive"
+
+# 최초 발행: 유효 seal 도 보류 Status 도 없는 fixture 라 두 플래그가 모두 필요하다.
+nf_archive --force-skip-review-check "테스트" --allow-status-mismatch "테스트"
+[[ "$nf_rc" -ne 0 && "$nf_out" == *"main push 실패"* && "$nf_out" == *"pre-receive 거부(테스트)"* ]] \
+  && pass "T8: 최초 발행이 push 거부(pre-receive)로 실패한다" || fail "T8: 최초 실패 양상이 다르다 rc=$nf_rc — $nf_out"
+[[ "$(git -C "$NFR" log -1 --format=%s)" == *"archive nofr metadata 정리"* && "$(nf_task_field status)" == "대기 중" && "$(nf_task_field short-title)" == "-" ]] \
+  && pass "T8: 실패 시점에 cleanup 커밋이 이미 있다(Status=대기 중, short-title=-)" || fail "T8: cleanup 이후 실패가 아니다 — $(git -C "$NFR" log -1 --format=%s)"
+[[ "$(git -C "$NFO" rev-parse main)" != "$(git -C "$NFR" rev-parse main)" ]] \
+  && pass "T8: 원격 main 은 아직 cleanup 커밋을 받지 못했다" || fail "T8: 원격이 이미 따라왔다"
+
+# 재실행 — short-title 이 '-' 이면 slug 단계가 먼저 set-title 을 요구한다. 이 단계는 이 줄기의 변경이 아니다.
+nf_archive
+[[ "$nf_rc" -ne 0 && "$nf_out" == *"rd task set-title"* ]] \
+  && pass "T8: cleanup 직후(short-title=-) 재실행은 set-title 안내로 멈춘다(기존 동작)" || fail "T8: 예상 밖 rc=$nf_rc — $nf_out"
+( cd "$NFR" && bash rd-workflow/scripts/rd task set-title nofr ) >/dev/null 2>&1
+
+# 미커밋 상태(HEAD 의 short-title 은 '-')로도 같은 안내에 닿는다 — 판독은 워킹트리가 아니라 HEAD.
+nf_archive --force-dirty
+[[ "$nf_rc" -ne 0 && "$nf_out" == *"cleanup 이후 상태"* ]] \
+  && pass "T8: HEAD(short-title=-, 대기 중) 재실행 → cleanup 이후 안내" || fail "T8: cleanup 안내 누락 rc=$nf_rc — $nf_out"
+
+git -C "$NFR" add -A && git -C "$NFR" commit -q -m "chore: set-title 복구"
+nf_head_before="$(git -C "$NFR" rev-parse HEAD)"
+
+nf_archive
+[[ "$nf_rc" -ne 0 && "$nf_out" == *"cleanup 이후 상태"* && "$nf_out" == *"--force-skip-review-check"* && "$nf_out" == *"--allow-status-mismatch"* ]] \
+  && pass "T8: 플래그 없음 → cleanup 이후 안내와 두 플래그 이름" || fail "T8: 플래그 없음 안내 누락 rc=$nf_rc — $nf_out"
+nf_archive --force-skip-review-check "테스트"
+[[ "$nf_rc" -ne 0 && "$nf_out" == *"cleanup 이후 상태"* && "$nf_out" != *"종결 마커 검증 실패"* ]] \
+  && pass "T8: force 만 → 같은 cleanup 안내로 거부(seal 우회가 Status 를 우회하지 않는다)" || fail "T8: force 만 — rc=$nf_rc — $nf_out"
+nf_archive --allow-status-mismatch "테스트"
+[[ "$nf_rc" -ne 0 && "$nf_out" == *"종결 마커 검증 실패"* && "$nf_out" != *"cleanup 이후 상태"* ]] \
+  && pass "T8: allow 만 → Status 통과 후 seal 검사 문구로 거부" || fail "T8: allow 만 — rc=$nf_rc — $nf_out"
+[[ "$(git -C "$NFR" rev-parse HEAD)" == "$nf_head_before" ]] \
+  && pass "T8: 거부된 재실행은 HEAD 를 바꾸지 않는다" || fail "T8: 거부인데 HEAD 가 바뀌었다"
+
+rm -f "$NFO/hooks/pre-receive"
+nf_archive --force-skip-review-check "테스트" --allow-status-mismatch "테스트"
+[[ "$nf_rc" -eq 0 ]] && pass "T8: 두 플래그(hook 제거) → 재실행이 완료된다" || fail "T8: 두 플래그인데 실패 rc=$nf_rc — $nf_out"
+[[ "$(git -C "$NFO" rev-parse main)" == "$(git -C "$NFR" rev-parse main)" ]] \
+  && pass "T8: 원격 main 이 로컬 main 을 따라왔다" || fail "T8: push 되지 않았다"
 
 echo "== 결과: PASS=$PASS FAIL=$FAIL =="
 DONE=1

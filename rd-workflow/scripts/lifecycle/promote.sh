@@ -27,7 +27,7 @@ source "$SCRIPT_DIR/../_task_common.sh"
 # 작업의 착수가 첫 번째의 기본 브랜치 커밋 때문에 막히지 않는다.
 # ===========================================================================
 
-DRY_RUN=0; SHORT_TITLE=""; WORKTREE_PATH=""; NO_WORKTREE=0; STATUS_VAL=""; SIZE_VAL=""; SOURCE_FR_ARGS=""; SOURCE_FR_ARG_FAIL=0
+DRY_RUN=0; SHORT_TITLE=""; WORKTREE_PATH=""; NO_WORKTREE=0; STATUS_VAL=""; SIZE_VAL=""; SOURCE_FR_ARGS=""; SOURCE_FR_ARG_FAIL=0; HANDOFF_SRC=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --short-title) SHORT_TITLE="$2"; shift 2 ;;
@@ -43,8 +43,13 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "promote: --source-fr 에 값이 없습니다." >&2; exit 1; }
       source_fr_check_direct_arg "$2" "$project_root" || SOURCE_FR_ARG_FAIL=1
       SOURCE_FR_ARGS="${SOURCE_FR_ARGS:+${SOURCE_FR_ARGS}$'\n'}$2"; shift 2 ;;
+    --handoff)
+      # 빈 값을 "인계 없음" 으로 받지 않는다 — `--handoff "$F"` 에서 F 가 비면 결정이
+      # 조용히 사라지고, D9 가 기존 인계 파일까지 지운다.
+      [[ $# -ge 2 && -n "$2" ]] || { echo "promote: --handoff 에 값이 없습니다 — 확정 결정을 적은 인계 파일 경로를 지정하세요." >&2; exit 1; }
+      HANDOFF_SRC="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
-    -h|--help) echo "usage: promote.sh --short-title <slug> (--size large|small | --status <canonical>) [--worktree-path <path>] [--no-worktree] [--source-fr <path|-> (반복 지정 가능)] [--dry-run]"; exit 0 ;;
+    -h|--help) echo "usage: promote.sh --short-title <slug> (--size large|small | --status <canonical>) [--worktree-path <path>] [--no-worktree] [--source-fr <path|-> (반복 지정 가능)] [--handoff <file>] [--dry-run]"; exit 0 ;;
     *) echo "promote: unknown arg: $1" >&2; exit 1 ;;
   esac
 done
@@ -72,6 +77,30 @@ else
   echo "promote: 시작 상태를 지정하세요 — --size large (큰 작업) 또는 --size small (작은 작업)." >&2
   echo "  복구·마이그레이션 목적으로 특정 단계로 진입하려면 --status <canonical> 를 쓰세요." >&2
   exit 1
+fi
+
+# --handoff 입력 검증 (change spec D5) — 브랜치·worktree 를 만들기 전에 끝낸다. 기록
+# 단계(10단계)에서 처음 실패하면 이미 만든 브랜치·worktree 가 남는다. 원인마다 문구를
+# 나눠 사람이 무엇을 고칠지 바로 알게 한다. 통과하면 절대 경로로 바꿔 둔다 — 아래에서
+# `cd "$project_root"` 하므로 상대 경로는 다른 파일을 가리키게 된다.
+HANDOFF_MAX_BYTES=65536
+if [[ -n "$HANDOFF_SRC" ]]; then
+  if [[ -d "$HANDOFF_SRC" ]]; then
+    echo "promote: --handoff 값이 디렉터리입니다: '${HANDOFF_SRC}' — 인계 파일 하나를 지정하세요." >&2; exit 1
+  elif [[ ! -e "$HANDOFF_SRC" ]]; then
+    echo "promote: --handoff 파일이 없습니다: '${HANDOFF_SRC}'" >&2; exit 1
+  elif [[ ! -f "$HANDOFF_SRC" ]]; then
+    echo "promote: --handoff 값이 일반 파일이 아닙니다: '${HANDOFF_SRC}'" >&2; exit 1
+  elif [[ ! -r "$HANDOFF_SRC" ]]; then
+    echo "promote: --handoff 파일을 읽을 수 없습니다: '${HANDOFF_SRC}' — 권한을 확인하세요." >&2; exit 1
+  elif [[ ! -s "$HANDOFF_SRC" ]]; then
+    echo "promote: --handoff 파일이 비어 있습니다: '${HANDOFF_SRC}' — 확정 결정을 적은 뒤 다시 실행하세요." >&2; exit 1
+  fi
+  _handoff_bytes="$(wc -c < "$HANDOFF_SRC" | tr -d '[:space:]')"
+  if [[ "$_handoff_bytes" -gt "$HANDOFF_MAX_BYTES" ]]; then
+    echo "promote: --handoff 파일이 너무 큽니다: ${_handoff_bytes} 바이트 (상한 ${HANDOFF_MAX_BYTES}) — 결정 목록만 남기고 줄이세요." >&2; exit 1
+  fi
+  HANDOFF_SRC="$(cd "$(dirname "$HANDOFF_SRC")" && pwd -P)/$(basename "$HANDOFF_SRC")"
 fi
 
 # --source-fr 명시 인자 검증·해석 (사용자 명시 오류는 hard error). 부작용 없음.
@@ -198,7 +227,9 @@ fi
 # 넘어가 버린다 — 그 worktree 를 관리 진입점으로 쓰던 작업이 사라진다.
 if [[ "$NO_WORKTREE" -eq 1 ]]; then
   _cur_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)" || _cur_branch=""
-  if [[ "$_cur_branch" != "$DEFAULT_BRANCH" ]]; then
+  # 이 작업 자신의 fr 브랜치는 통과시킨다 — `--no-worktree` 이관이 중간에 실패한 뒤 같은
+  # 명령 재실행(문서 이관 복구)이 이 가드에 막히지 않게 한다. 다른 작업의 체크아웃 보호는 그대로다.
+  if [[ "$_cur_branch" != "$DEFAULT_BRANCH" && "$_cur_branch" != "$TARGET_BRANCH" ]]; then
     echo "promote: --no-worktree 는 기본 브랜치(${DEFAULT_BRANCH}) 체크아웃에서만 허용합니다 (현재: ${_cur_branch:-detached})." >&2
     echo "  다른 작업의 worktree 안에서 --no-worktree 를 쓰면 그 worktree 의 체크아웃이 통째로 넘어갑니다." >&2
     exit 1
@@ -217,6 +248,233 @@ if [[ "$NO_WORKTREE" -eq 1 ]]; then
     fi
   done < <(tasks_index_slugs 2>/dev/null || true)
 fi
+
+# ---------------------------------------------------------------------------
+# 문서 이관 (change spec D1~D12) — 호출 체크아웃(P)에 미커밋으로 있는 이 작업의
+# REQUEST·spec·plan·raw-capture·spec/plan review 세션을 fr worktree(T)에 커밋한다.
+# _promote_carry_scan 은 읽기 전용 분류이고 _promote_carry_docs 가 복사·커밋·정리를 한다.
+# 판정 순서는 spec D5 를 따른다. bash 3.2 호환(연관 배열·mapfile 없음, 빈 배열은 ${a[@]+...}).
+# ---------------------------------------------------------------------------
+_CARRY_ROWS=""   # 한 행 = 분류<TAB>상대경로<TAB>사유 (분류: carry1|carry2|done3|skip)
+_CARRY_STAGED=()
+_CARRY_TMP=""
+_CARRY_T=""
+
+_carry_row() {  # <분류> <rel> <사유>
+  _CARRY_ROWS="${_CARRY_ROWS}${1}"$'\t'"${2}"$'\t'"${3}"$'\n'
+  return 0
+}
+
+# D2 — 날짜·시각 접두가 고정 폭이라 slug 가 다른 작업의 이름과 부분 일치하지 않는다.
+_carry_name_ok() {  # <rel>
+  local rel="$1" rest base re="" ws="rd-workflow-workspace"
+  case "$rel" in
+    "$ws"/specs/base/*|"$ws"/specs/changes/*)
+      rest="${rel#"$ws"/specs/*/}"; [[ "$rest" != */* ]] || return 1
+      re="^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}-${SLUG}-(spec|change-spec)\.md$"; base="$rest" ;;
+    "$ws"/plans/*)
+      rest="${rel#"$ws"/plans/}"; [[ "$rest" != */* ]] || return 1
+      re="^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}-${SLUG}-plan\.md$"; base="$rest" ;;
+    "$ws"/raw-captures/*)
+      rest="${rel#"$ws"/raw-captures/}"; [[ "$rest" != */* ]] || return 1
+      re="^[0-9]{4}-[0-9]{2}-[0-9]{2}-(request|spec|plan)-${SLUG}\.md$"; base="$rest" ;;
+    "$ws"/handoffs/review_pipeline/*/*)
+      rest="${rel#"$ws"/handoffs/review_pipeline/}"
+      re="^[0-9]{8}_[0-9]{6}_[0-9]{4}-${SLUG}-spec-plan-review$"; base="${rest%%/*}" ;;
+    *) return 1 ;;
+  esac
+  [[ "$base" =~ $re ]]
+}
+
+# D3 — REQUEST.md 는 이름으로 귀속할 수 없어 Source FR 집합이 작업의 것과 같을 때만 후보다.
+# 작업 쪽 값은 항상 T 의 task-state 에서 읽는다(duplicate 분기 시점에는 NEED_CONTENT·
+# SOURCE_FR_VAL 이 미초기화다). 둘 다 값 없음이면 빈 목록끼리라 같다고 판정된다.
+_carry_request_matches() {  # <P> <T>
+  local P="$1" T="$2" s_list w_raw w_list
+  s_list="$(source_fr_resolve_list "$(source_fr_from_request_list "$P/REQUEST.md")" "$P" 2>/dev/null)" || return 1
+  w_raw="$(awk -F'=' '$1=="source-fr"{sub(/^[^=]+=/,""); print; exit}' \
+    "$T/rd-workflow-workspace/.lifecycle/task-state" 2>/dev/null || true)"
+  w_list="$(source_fr_split "${w_raw:--}" "$P")"
+  source_fr_mirror_set_equal "$s_list" "$w_list"
+}
+
+_promote_carry_scan() {  # <T>
+  _CARRY_ROWS=""
+  local P T mode="worktree" rel ws="rd-workflow-workspace" cands="" c blocked_why="" _p_branch=""
+  P="$(cd "$project_root" && pwd -P)"
+  T="$(cd "$1" && pwd -P)"
+  if [[ "$NO_WORKTREE" -eq 1 ]]; then
+    # inplace 는 T 가 곧 P 이고 P 의 실제 HEAD 가 이 작업의 fr 브랜치일 때만 뜻이 있다. T==P 만으로는
+    # 부족하다 — 미초기화 fr worktree 가 따로 살아 있는 reinit_noattach 에서는 TARGET_DIR 이 P(기본
+    # 브랜치)로 잡혀 P 의 파일을 기본 브랜치에 커밋하게 된다. 쓰기 전에 브랜치를 확인한다.
+    _p_branch="$(git -C "$P" symbolic-ref --quiet --short HEAD 2>/dev/null)" || _p_branch=""
+    if [[ "$T" == "$P" && "$_p_branch" == "$TARGET_BRANCH" ]]; then
+      mode="inplace"
+    else
+      # 조용히 돌아가면 사용자는 문서가 왜 fr 에 없는지 알 수 없다 — 후보마다 사유와 복구 경로를 보인다.
+      mode="blocked"
+      blocked_why="--no-worktree 인데 이 체크아웃이 이 작업의 브랜치(${TARGET_BRANCH})가 아님(현재: ${_p_branch:-detached}) — 기본 브랜치에 커밋하지 않고 보류합니다. 그 작업의 worktree(${T}) 안에서 문서를 옮기거나 --no-worktree 없이 다시 실행하십시오"
+    fi
+  elif [[ "$T" == "$P" ]]; then
+    return 0   # D8 — 작업 worktree 안에서의 재호출
+  fi
+
+  local -a roots=("$ws/specs" "$ws/plans" "$ws/raw-captures" "$ws/handoffs/review_pipeline")
+  while IFS= read -r -d '' rel; do
+    if _carry_name_ok "$rel"; then cands="${cands}${rel}"$'\n'; fi
+  done < <(git -C "$P" ls-files -z --others --exclude-standard -- "${roots[@]}")
+  while IFS= read -r -d '' rel; do
+    if _carry_name_ok "$rel"; then _carry_row skip "$rel" "tracked 수정 — 지원하지 않는 상태"; fi
+  done < <(git -C "$P" diff --name-only -z HEAD -- "${roots[@]}")
+
+  if ! git -C "$P" diff --quiet HEAD -- REQUEST.md 2>/dev/null; then
+    if git -C "$P" diff --cached --quiet -- REQUEST.md && ! git -C "$P" diff --quiet -- REQUEST.md && [[ -f "$P/REQUEST.md" ]]; then
+      if _carry_request_matches "$P" "$T"; then
+        cands="${cands}REQUEST.md"$'\n'
+      else
+        _carry_row skip REQUEST.md "REQUEST.md 의 Source FR 이 이 작업과 일치하지 않거나 해석할 수 없음 — 귀속 불확실"
+      fi
+    else
+      _carry_row skip REQUEST.md "REQUEST.md 가 staged 상태"
+    fi
+  fi
+
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    if [[ "$mode" == "blocked" ]]; then _carry_row skip "$c" "$blocked_why"; continue; fi
+    if [[ "$mode" == "inplace" ]]; then _carry_row carry2 "$c" ""; continue; fi
+    _carry_classify "$P" "$T" "$c"
+  done <<< "$cands"
+  return 0
+}
+
+# D5 — 분류 순서: ③ 정리만 → (index 보호) → ② 커밋만 → ① 복사 후 커밋 → ④ 건너뜀.
+_carry_classify() {  # <P> <T> <rel>
+  local P="$1" T="$2" rel="$3" hex=0 wex=0 h_eq_s=0 w_eq_s=0 h_tpl=0 w_tpl=0 is_req=0
+  [[ "$rel" == "REQUEST.md" ]] && is_req=1
+  # 일반 파일이 아닌 기존 경로(디렉터리·링크)는 부재가 아니다 — 복사하면 mv 가 그 안으로 들어가
+  # 경로 한정 add·commit 이 안의 사용자 파일까지 담는다.
+  if [[ ( -e "$T/$rel" || -L "$T/$rel" ) && ( ! -f "$T/$rel" || -L "$T/$rel" ) ]]; then
+    _carry_row skip "$rel" "대상 경로가 일반 파일이 아님(디렉터리·링크)"; return 0
+  fi
+  if git -C "$T" cat-file -e "HEAD:$rel" 2>/dev/null; then hex=1; fi
+  if [[ -f "$T/$rel" ]]; then wex=1; fi
+  if [[ "$hex" -eq 1 ]] && git -C "$T" show "HEAD:$rel" 2>/dev/null | cmp -s - "$P/$rel"; then h_eq_s=1; fi
+  if [[ "$h_eq_s" -eq 1 ]]; then _carry_row done3 "$rel" ""; return 0; fi
+  # 대상 index 보호 — index 에 staged 내용이 있으면 S 와 같아도 쓰지 않는다(실패 시 reset 이
+  # 사용자 staged 를 지우지 않게 index==HEAD 인 경로만 쓰기 대상으로 삼는다).
+  if ! git -C "$T" diff --cached --quiet -- "$rel" 2>/dev/null; then
+    _carry_row skip "$rel" "대상 index 에 staged 내용 있음"; return 0
+  fi
+  if [[ "$wex" -eq 1 ]] && cmp -s "$T/$rel" "$P/$rel"; then w_eq_s=1; fi
+  if [[ "$is_req" -eq 1 ]]; then
+    if [[ "$hex" -eq 1 ]] && cmp -s <(git -C "$T" show "HEAD:$rel" 2>/dev/null) <(git -C "$P" show "${DEFAULT_BRANCH}:REQUEST.md" 2>/dev/null); then h_tpl=1; fi
+    if [[ "$wex" -eq 1 ]] && cmp -s "$T/$rel" <(git -C "$P" show "${DEFAULT_BRANCH}:REQUEST.md" 2>/dev/null); then w_tpl=1; fi
+  fi
+  if [[ "$w_eq_s" -eq 1 ]] && { [[ "$hex" -eq 0 ]] || [[ "$h_tpl" -eq 1 ]]; }; then
+    _carry_row carry2 "$rel" ""; return 0
+  fi
+  if { [[ "$hex" -eq 0 && "$wex" -eq 0 ]]; } || { [[ "$h_tpl" -eq 1 ]] && { [[ "$wex" -eq 0 ]] || [[ "$w_tpl" -eq 1 ]]; }; }; then
+    _carry_row carry1 "$rel" ""; return 0
+  fi
+  _carry_row skip "$rel" "대상에 다른 내용"
+  return 0
+}
+
+_carry_actionable() {
+  case "$_CARRY_ROWS" in
+    carry1$'\t'*|carry2$'\t'*|done3$'\t'*|*$'\n'carry1$'\t'*|*$'\n'carry2$'\t'*|*$'\n'done3$'\t'*) return 0 ;;
+  esac
+  return 1
+}
+
+# D11 — 이번 호출이 git add 한 경로만 index 에서 되돌린다(경로 없는 reset 은 사용자 staged 를 지운다).
+_carry_fail() {  # <원인>
+  [[ -n "$_CARRY_TMP" ]] && rm -f "$_CARRY_TMP"
+  if [[ "${#_CARRY_STAGED[@]}" -gt 0 ]]; then
+    git -C "$_CARRY_T" reset -q -- "${_CARRY_STAGED[@]}" 2>/dev/null || true
+  fi
+  echo "promote: 착수 성공 · 문서 이관 실패 — $1" >&2
+  echo "  복구: 같은 명령을 다시 실행하십시오(원본은 그대로입니다)." >&2
+  exit 4
+}
+
+_promote_carry_docs() {  # <T>
+  _promote_carry_scan "$1"
+  if [[ -z "$_CARRY_ROWS" ]]; then
+    echo "promote: 문서 이관 — 대상 없음"
+    return 0
+  fi
+  local P T mode="worktree" cls rel why n=0 tmp hash="커밋 없음" files_out="" clean_out="" d
+  local -a adds=()
+  P="$(cd "$project_root" && pwd -P)"
+  T="$(cd "$1" && pwd -P)"
+  _CARRY_T="$T"; _CARRY_STAGED=(); _CARRY_TMP=""
+  [[ "$NO_WORKTREE" -eq 1 ]] && mode="inplace"
+
+  # ① 복사 (D9 — 같은 디렉터리 임시 파일 경유 cp → cmp → mv)
+  while IFS=$'\t' read -r cls rel why; do
+    [[ "$cls" == "carry1" ]] || continue
+    mkdir -p "$(dirname "$T/$rel")" 2>/dev/null || _carry_fail "디렉터리를 만들지 못했습니다: $(dirname "$rel")"
+    tmp="$(mktemp "$T/$rel.carry.XXXXXX" 2>/dev/null)" || _carry_fail "임시 파일을 만들지 못했습니다: $rel"
+    _CARRY_TMP="$tmp"
+    cp "$P/$rel" "$tmp" 2>/dev/null || _carry_fail "복사 실패: $rel"
+    cmp -s "$P/$rel" "$tmp" || _carry_fail "복사본이 원본과 다릅니다: $rel"
+    # 분류 뒤에 그 자리가 디렉터리가 됐으면 mv 가 안쪽으로 들어가므로 이동하지 않는다.
+    [[ ! -d "$T/$rel" ]] || _carry_fail "대상 경로가 디렉터리입니다: $rel"
+    mv "$tmp" "$T/$rel" 2>/dev/null || _carry_fail "이동 실패: $rel"
+    _CARRY_TMP=""
+  done <<< "$_CARRY_ROWS"
+
+  # 커밋 (경로 한정 — 사용자의 무관한 staged 변경을 건드리지 않는다)
+  while IFS=$'\t' read -r cls rel why; do
+    case "$cls" in carry1|carry2) adds+=("$rel") ;; esac
+  done <<< "$_CARRY_ROWS"
+  if [[ "${#adds[@]}" -gt 0 ]]; then
+    git -C "$T" add -- "${adds[@]}" >/dev/null 2>&1 || _carry_fail "git add 실패"
+    _CARRY_STAGED=("${adds[@]}")
+    git -C "$T" commit -q -m "chore(lifecycle): ${SLUG} 기획 문서 이관 — REQUEST·spec·plan" -- "${adds[@]}" >/dev/null 2>&1 \
+      || _carry_fail "git commit 실패"
+    hash="$(git -C "$T" rev-parse --short HEAD)"
+  fi
+
+  # 원본 정리 (D10 — worktree 모드, 정리 직전 HEAD blob 과 원본이 같을 때만)
+  while IFS=$'\t' read -r cls rel why; do
+    case "$cls" in
+      carry1|carry2|done3) n=$((n + 1)); files_out="${files_out}  이관 완료: ${rel}"$'\n' ;;
+      skip)
+        files_out="${files_out}  건너뜀: ${rel} — ${why}"$'\n'
+        echo "promote: 경고 — 건너뜀 ${rel}: ${why}" >&2
+        continue ;;
+      *) continue ;;
+    esac
+    [[ "$mode" == "worktree" ]] || continue
+    if ! git -C "$T" show "HEAD:$rel" 2>/dev/null | cmp -s - "$P/$rel"; then
+      clean_out="${clean_out}  원본 정리: 보존(정리 직전 원본이 바뀜): ${rel}"$'\n'; continue
+    fi
+    if [[ "$rel" == "REQUEST.md" ]]; then
+      if git -C "$P" checkout -- REQUEST.md 2>/dev/null; then
+        clean_out="${clean_out}  원본 정리: 완료: ${rel}"$'\n'
+      else
+        clean_out="${clean_out}  원본 정리: 보존(정리 실패): ${rel}"$'\n'
+      fi
+    elif rm -f "$P/$rel" 2>/dev/null && [[ ! -e "$P/$rel" ]]; then
+      d="$(dirname "$P/$rel")"
+      while [[ "$d" == "$P/rd-workflow-workspace/handoffs/review_pipeline/"* ]] && rmdir "$d" 2>/dev/null; do
+        d="$(dirname "$d")"
+      done
+      clean_out="${clean_out}  원본 정리: 완료: ${rel}"$'\n'
+    else
+      clean_out="${clean_out}  원본 정리: 보존(정리 실패): ${rel}"$'\n'
+    fi
+  done <<< "$_CARRY_ROWS"
+
+  echo "promote: 문서 이관 — ${n}건 → ${TARGET_BRANCH} (${hash})"
+  printf '%s' "$files_out"
+  printf '%s' "$clean_out"
+  return 0
+}
+
 
 # ---------------------------------------------------------------------------
 # 4. D11 판정표 — 현재 상태를 확정한다 (읽기 전용, 색인을 쓰지 않는다).
@@ -327,7 +585,39 @@ if [[ "$DECISION" == "resume" ]]; then
     if ! source_fr_mirror_set_equal "$SOURCE_FR_RESOLVED_LIST" "$_committed_sfr_list"; then
       echo "promote: '${SLUG}' 는 이미 초기화된 작업이라 --source-fr 로 값을 바꾸지 않습니다 (상태 변경 없음)." >&2
       echo "  committed=${_committed_sfr:--}, 인자=${SOURCE_FR_JOINED:--}" >&2
-      echo "  정정하려면: 그 worktree 를 부착한 뒤 bash rd-workflow/scripts/rd task set-source-fr <path>..." >&2
+      # `set-source-fr` 는 cwd 의 task-state 를 고친다. promote 를 부른 체크아웃에서 그대로
+      # 실행하면 대상이 아닌 쪽이 바뀌므로, 안내는 부착 경로로 cd 하는 한 줄 명령으로 준다.
+      # 부착 경로는 재실행(NEED_ATTACH=1)의 대상 결정(아래 TARGET_DIR)과 같은 우선순위로
+      # 구한다 — 색인 경로가 있으면 다른 --worktree-path 는 재실행이 거부하므로 색인이 먼저다.
+      _att_idx="$(tasks_index_get "$SLUG" worktree-path 2>/dev/null)" || _att_idx=""
+      [[ "$_att_idx" == "null" ]] && _att_idx=""
+      if [[ "$NO_WORKTREE" -eq 1 ]]; then _att="$project_root"
+      elif [[ -n "$_att_idx" ]]; then _att="$_att_idx"
+      elif [[ -n "$WORKTREE_PATH" ]]; then _att="$WORKTREE_PATH"
+      else _att="${WORKTREE_ROOT_BASE}/${SLUG}"
+      fi
+      # 그대로 실행되는 명령이어야 하므로 경로·값은 %q 로 인코딩한다 (공백·특수문자 대비).
+      _sfr_args=""
+      while IFS= read -r _v; do
+        [[ -n "$_v" ]] && _sfr_args+="$(printf '%q ' "$_v")"
+      done <<< "$SOURCE_FR_RESOLVED_LIST"
+      _step1_note=""
+      if [[ "$NO_WORKTREE" -ne 1 && -n "$_att_idx" && -n "$WORKTREE_PATH" && "$WORKTREE_PATH" != "$_att_idx" ]]; then
+        _step1_note=" (색인 경로와 다른 --worktree-path 는 뺍니다 — 등록된 작업의 경로 이동은 지원하지 않습니다)"
+      fi
+      echo "  정정하려면 (순서대로):" >&2
+      echo "    1) --source-fr 를 뺀 같은 명령으로 promote 를 다시 실행합니다 — 그 작업의 worktree 를 ${_att} 에 다시 붙입니다.${_step1_note}" >&2
+      echo "    2) (cd $(printf '%q' "$_att") && bash rd-workflow/scripts/rd task set-source-fr ${_sfr_args% })" >&2
+      echo "    3) 그 worktree 에서 변경을 커밋합니다." >&2
+      # 부착 경로가 이미 있으면 재실행이 거기에 붙일 수 없다. 다른 경로를 권하지 않는다 —
+      # 2) 가 _att 에 고정돼 있어 점유 폴더(다른 작업의 체크아웃일 수 있음)를 고치게 된다.
+      if [[ "$NO_WORKTREE" -ne 1 && -e "$_att" ]]; then
+        if [[ -n "$_att_idx" ]]; then
+          echo "  ※ ${_att} 가 이미 있습니다 — 이 작업에 등록된 경로라 다른 경로로 옮길 수 없습니다. 그 폴더가 남은 폴더인지 확인해 정리한 뒤 1) 을 실행하십시오." >&2
+        else
+          echo "  ※ ${_att} 가 이미 있습니다 — 남은 폴더이거나 다른 작업이 쓰는 폴더일 수 있습니다. 확인해 정리한 뒤 1) 을 실행하십시오." >&2
+        fi
+      fi
       exit 1
     fi
   fi
@@ -376,12 +666,29 @@ case "$DECISION" in
     exit 1
     ;;
   duplicate)
-    echo "promote: '${SLUG}' 는 이미 진행 중입니다 (fr-branch=${TARGET_BRANCH}) — 아무것도 바꾸지 않습니다." >&2
-    echo "  다음 중 하나를 선택하세요:" >&2
-    echo "    1) 그 작업을 계속 진행합니다: bash rd-workflow/scripts/rd task list" >&2
-    echo "    2) 세션 기동을 다시 확인합니다: bash rd-workflow/scripts/rd task resolve-launch ${SLUG}" >&2
-    echo "    3) 그 작업을 archive 한 뒤 다시 시작합니다." >&2
-    exit 1
+    # D12 — 인계 재시도 경로. 이 분기는 위 판정 뒤에 오므로 divergent·ambiguous·
+    # published 는 이미 걸러졌다. `--handoff` 가 없으면 아래 기존 종료를 그대로 탄다.
+    # `--no-worktree` 는 이 경로를 약속하지 않는다(D12) — TARGET_DIR 가 project_root 로
+    # 정해져 다른 곳에 살아 있는 worktree 대신 기본 체크아웃에 기록·기동하게 된다.
+    # 그 복구 수단은 D4 의 수동 cp 안내다.
+    if [[ -n "$HANDOFF_SRC" && "$NO_WORKTREE" -eq 0 ]]; then
+      DECISION=handoff_retry
+    elif [[ -n "$WT_ALIVE_PATH" ]] && _promote_carry_scan "$WT_ALIVE_PATH" && _carry_actionable; then
+      # 이관 중단 뒤 같은 명령 재실행(AC8) — 이관 가능한 문서가 남아 있으면 이어받는다.
+      DECISION=carry_retry
+    else
+      # 이관할 것이 없거나 skip 뿐이면 현행 거부를 유지하되, 보류 사유를 먼저 보여 준다.
+      while IFS=$'\t' read -r _cls _crel _cwhy; do
+        [[ "$_cls" == "skip" ]] || continue
+        echo "promote: 문서 이관 보류 — ${_crel}: ${_cwhy}" >&2
+      done <<< "$_CARRY_ROWS"
+      echo "promote: '${SLUG}' 는 이미 진행 중입니다 (fr-branch=${TARGET_BRANCH}) — 아무것도 바꾸지 않습니다." >&2
+      echo "  다음 중 하나를 선택하세요:" >&2
+      echo "    1) 그 작업을 계속 진행합니다: bash rd-workflow/scripts/rd task list" >&2
+      echo "    2) 세션 기동을 다시 확인합니다: bash rd-workflow/scripts/rd task resolve-launch ${SLUG}" >&2
+      echo "    3) 그 작업을 archive 한 뒤 다시 시작합니다." >&2
+      exit 1
+    fi
     ;;
   ambiguous)
     echo "promote: '${SLUG}' 의 소유권을 확인할 수 없습니다(fr 브랜치의 task-state 가 다른 작업을 가리킵니다) — 아무것도 바꾸지 않습니다." >&2
@@ -390,8 +697,20 @@ case "$DECISION" in
     ;;
 esac
 
+# reinit_noattach(worktree 는 이미 살아 있고 내용만 미초기화)에서 --no-worktree 는 거부한다.
+# --no-worktree 는 현재 체크아웃을 작업 자리로 쓰는 옵션이라 TARGET_DIR 이 project_root(기본
+# 브랜치)가 되고, 착수 기록 커밋이 기본 브랜치에 생긴다. 상태를 바꾸기 전에 막는다
+# (--dry-run 도 같은 신호로 거부한다).
+if [[ "$NO_WORKTREE" -eq 1 && "$DECISION" == "reinit_noattach" ]]; then
+  echo "promote: '${SLUG}' 의 worktree 가 이미 $(printf '%q' "$WT_ALIVE_PATH") 에 있어 --no-worktree 를 쓸 수 없습니다 (상태 변경 없음)." >&2
+  echo "  --no-worktree 는 현재 체크아웃을 이 작업 자리로 쓰는 옵션인데, 이 작업은 위 worktree 에서 진행 중입니다. 기록이 기본 브랜치에 만들어지는 것을 막기 위해 거부합니다." >&2
+  echo "  --no-worktree 를 빼고 다시 실행하십시오 — 착수 기록이 그 worktree 의 fr 브랜치에 만들어집니다." >&2
+  exit 1
+fi
+
 # ---------------------------------------------------------------------------
-# 여기부터는 mutating 결정(fresh · reinit · reinit_noattach · resume) 이다.
+# 여기부터는 mutating 결정(fresh · reinit · reinit_noattach · resume) 과, 아무것도 만들지
+# 않고 10단계로만 가는 handoff_retry(D12) 다.
 # ---------------------------------------------------------------------------
 NEED_BRANCH=0; NEED_ATTACH=0; NEED_CONTENT=0
 case "$DECISION" in
@@ -399,6 +718,9 @@ case "$DECISION" in
   reinit)          NEED_BRANCH=0; NEED_ATTACH=1; NEED_CONTENT=1 ;;
   reinit_noattach) NEED_BRANCH=0; NEED_ATTACH=0; NEED_CONTENT=1 ;;
   resume)          NEED_BRANCH=0; NEED_ATTACH=1; NEED_CONTENT=0 ;;
+  # D12 — 브랜치·worktree·task-state 를 건드리지 않고 10단계(보호·기록·기동)로 간다.
+  handoff_retry)   NEED_BRANCH=0; NEED_ATTACH=0; NEED_CONTENT=0 ;;
+  carry_retry)     NEED_BRANCH=0; NEED_ATTACH=0; NEED_CONTENT=0 ;;
 esac
 
 # I3 — 색인에 이미 등록된 worktree-path 를 우선한다. 인자 없이 재실행했는데 등록이
@@ -486,6 +808,10 @@ _promote_on_exit() {
   # 둔 값)를 밀어내고 그 nonzero 로 덮어쓴다** — 실측: `echo 완료` 로 정상 종료(rc=0)
   # 했는데도 이 트랩 때문에 최종 rc 가 1 이 됐다. `if` 로 감싸고 마지막에 `return 0`
   # 을 명시해 트랩 자신의 종료 상태가 실제 rc 에 영향을 주지 않게 한다.
+  # 인계 파일 기록(10단계) 도중 끊기면 대상 디렉터리에 임시 파일이 남는다 — 지운다.
+  if [[ -n "${_HANDOFF_TMP:-}" ]]; then
+    rm -f "$_HANDOFF_TMP"
+  fi
   if [[ "${LOCK_HELD:-0}" -eq 1 ]]; then
     tasks_lock_release
     LOCK_HELD=0
@@ -652,7 +978,22 @@ if [[ "$NEED_CONTENT" -eq 1 ]]; then
        fi )
 fi
 
+# D9 — 낡은 인계 파일 정리. 새로 작업 내용을 쓴 호출인데 --handoff 가 없으면, 같은
+# 체크아웃에 남은 이전 작업의 handoff.md 를 지운다(--no-worktree 는 기본 체크아웃을
+# 재사용한다). 그대로 두면 새 세션이 이전 작업의 결정을 읽는다. 지우지 못하면 기동
+# 전에 중단한다.
+if [[ "$NEED_CONTENT" -eq 1 && -z "$HANDOFF_SRC" ]]; then
+  _stale_handoff="$(session_handoff_file_path "$TARGET_DIR")"
+  if [[ -e "$_stale_handoff" ]] && ! rm -f "$_stale_handoff"; then
+    echo "promote: 이전 작업의 인계 파일을 지우지 못했습니다: ${_stale_handoff} — 직접 지운 뒤 같은 명령을 다시 실행하세요." >&2
+    exit 1
+  fi
+fi
+
 _STEP789_DONE=1
+
+# 9.5 문서 이관 — 착수 커밋 직후, 색인·기동 판정 전. 실패하면 exit 4 로 기동 없이 멈춘다.
+_promote_carry_docs "$TARGET_DIR"
 
 # 10. 색인에 행 추가 + 기동 판정 (AC 7 — 이미 진행 중일 수 있는 기존 launch 값을 먼저
 #     본다. 그러지 않으면 worktree 등록만 잃은 살아 있는 세션 위에 새 세션이 덧붙는다
@@ -682,6 +1023,64 @@ case "$_EXISTING_LAUNCH" in
     esac
     ;;
 esac
+
+# 인계 파일 기록 (change spec D2~D4) — 기동 판정 **직후, 색인 upsert 직전**, 락 안에서
+# 한다. 기동 뒤에 쓰면 새 세션이 결정 없이 출발한다(FR 본질). 색인 upsert 뒤에 쓰면
+# 기록 실패가 launch=launching 을 남겨 재시도를 막는다. 그래서 여기서 실패하면 색인을
+# 건드리지 않은 채 exit 1 한다(락은 EXIT 트랩이 푼다).
+#   D3 — 기동을 건너뛸 사유가 있으면(살아 있거나 미확정인 세션) 그 세션이 읽고 있을
+#   파일을 바꾸지 않는다. 판정을 복제하지 않고 위 _SKIP_LAUNCH_REASON 을 그대로 쓴다.
+#   D4 — 같은 디렉터리의 임시 파일에 cp → cmp -s 로 원본 대조 → mv. cp 만으로는 부분
+#   기록을 성공으로 칠 수 있다.
+_HANDOFF_TMP=""
+_promote_handoff_fail() {  # <원인>
+  if [[ -n "$_HANDOFF_TMP" ]]; then
+    rm -f "$_HANDOFF_TMP"
+    _HANDOFF_TMP=""
+  fi
+  echo "promote: 인계 파일을 기록하지 못했습니다 — ${1} (색인·기동은 건드리지 않았습니다)." >&2
+  echo "  작업 디렉터리: ${TARGET_DIR}" >&2
+  echo "  복구 방법 중 하나를 고르세요:" >&2
+  echo "    1) worktree 방식이면 같은 명령을 다시 실행합니다(살아 있는 worktree 에 인계만 다시 기록합니다)." >&2
+  echo "    2) 직접 복사한 뒤 아래 명령으로 세션을 엽니다:" >&2
+  echo "       cp $(printf '%q' "$HANDOFF_SRC") $(printf '%q' "$_handoff_dst")" >&2
+  echo "       $(session_launch_command "$TARGET_DIR" "$SLUG")" >&2
+  exit 1
+}
+_promote_write_handoff() {
+  _handoff_dst="$(session_handoff_file_path "$TARGET_DIR")"
+  if [[ -n "$_SKIP_LAUNCH_REASON" ]]; then
+    echo "promote: ${_SKIP_LAUNCH_REASON} — 인계 파일을 바꾸지 않습니다 (상태 변경 없음)." >&2
+    echo "  기존 기록: ${_handoff_dst}" >&2
+    echo "  확인: bash rd-workflow/scripts/rd task resolve-launch ${SLUG}" >&2
+    exit 1
+  fi
+  local dir
+  dir="$(dirname "$_handoff_dst")"
+  _HANDOFF_TMP="$(mktemp "${dir}/handoff.md.XXXXXX")" || {
+    _HANDOFF_TMP=""
+    _promote_handoff_fail "임시 파일을 만들 수 없습니다(mktemp rc≠0, 대상 ${dir})"
+  }
+  cp "$HANDOFF_SRC" "$_HANDOFF_TMP" || _promote_handoff_fail "원본을 임시 파일로 복사하지 못했습니다(${HANDOFF_SRC})"
+  cmp -s "$HANDOFF_SRC" "$_HANDOFF_TMP" || _promote_handoff_fail "복사본이 원본과 다릅니다(부분 기록)"
+  # 대상이 디렉터리(또는 디렉터리를 가리키는 링크)면 mv 가 임시 파일을 그 **안으로**
+  # 옮기고 성공한다. 그러면 고정 경로에는 인계 파일이 없는데 "ok" 를 내고 기동하고,
+  # 전달 단계가 경로 줄을 조용히 뺀다 — FR 본질 그대로다. 일반 파일이 아닌 대상은
+  # mv 전에 거부한다(`mv -T` 는 GNU 전용이라 쓰지 않는다).
+  if [[ -d "$_handoff_dst" ]] || { [[ -e "$_handoff_dst" || -L "$_handoff_dst" ]] && [[ ! -f "$_handoff_dst" ]]; }; then
+    _promote_handoff_fail "인계 파일 자리가 일반 파일이 아닙니다(디렉터리·깨진 링크 등: ${_handoff_dst}) — 그 항목을 치운 뒤 복구하십시오"
+  fi
+  mv "$_HANDOFF_TMP" "$_handoff_dst" || _promote_handoff_fail "임시 파일을 인계 파일 자리로 옮기지 못했습니다"
+  _HANDOFF_TMP=""
+  # 성공은 실제 자리에 원본과 같은 일반 파일이 놓인 뒤에만 낸다.
+  if [[ ! -f "$_handoff_dst" ]] || ! cmp -s "$HANDOFF_SRC" "$_handoff_dst"; then
+    _promote_handoff_fail "옮긴 뒤 인계 파일 자리의 내용이 원본과 다릅니다(${_handoff_dst})"
+  fi
+  echo "promote: 인계 기록 — ok (${_handoff_dst})"
+}
+if [[ -n "$HANDOFF_SRC" ]]; then
+  _promote_write_handoff
+fi
 
 LAUNCH_TOKEN=""
 if [[ -n "$_SKIP_LAUNCH_REASON" ]]; then
@@ -719,17 +1118,47 @@ fi
 if [[ -n "$LAUNCH_TOKEN" ]]; then
   REQUEST_HANDOFF_PATH="${TARGET_DIR}/REQUEST.md"
   LAUNCH_RESULT="$(session_launch "$TARGET_DIR" "$SLUG" "$REQUEST_HANDOFF_PATH" "$_SESSION_MODEL")"
-  if tasks_lock_acquire promote "$SLUG"; then
+  # 락은 유한 재시도한다 — rc=1(다른 명령이 잠깐 점유)만 0.25초 간격 최대 20회(약 5초).
+  # rc=2(점유자 불확실)는 기다려도 풀리지 않으므로 즉시 중단한다. 재시도 중 stderr 는
+  # 모아 두었다가 끝내 실패했을 때만 낸다(일시 경합 때 점유 안내가 20번 찍히지 않게).
+  _rec_ok=0
+  _lock_rc=1
+  _lock_err=""
+  for _try in $(seq 1 20); do
+    _lock_rc=0
+    _lock_err="$(tasks_lock_acquire promote "$SLUG" 2>&1 >/dev/null)" || _lock_rc=$?
+    [[ "$_lock_rc" -eq 1 ]] || break
+    sleep 0.25
+  done
+  if [[ "$_lock_rc" -eq 0 ]]; then
     _cur_token="$(tasks_index_get "$SLUG" launch-token 2>/dev/null)" || _cur_token=""
     if [[ "$_cur_token" == "$LAUNCH_TOKEN" ]]; then
       tasks_index_upsert "$SLUG" launch="$LAUNCH_RESULT"
     fi
     tasks_lock_release
+    _rec_ok=1
   else
+    [[ -n "$_lock_err" ]] && printf '%s\n' "$_lock_err" >&2
     echo "promote: 기동 결과를 기록할 락을 얻지 못했습니다 — launching 상태로 남습니다." >&2
     echo "  확인: bash rd-workflow/scripts/rd task resolve-launch ${SLUG}" >&2
   fi
-  echo "promote: 세션 기동 결과 — ${LAUNCH_RESULT} ($(session_launch_status_hint "$LAUNCH_RESULT" "$SLUG"))"
+  if [[ "$_rec_ok" -eq 1 ]]; then
+    echo "promote: 세션 기동 결과 — ${LAUNCH_RESULT} ($(session_launch_status_hint "$LAUNCH_RESULT" "$SLUG"))"
+  elif [[ "$LAUNCH_RESULT" == "ok" ]]; then
+    # 기록하지 못했으면 ok 를 단정하지 않는다 — 색인은 launching 이다.
+    echo "promote: 세션 기동 성공 / 상태 기록 미완료 — launch 는 launching 으로 남았습니다. 복구: bash rd-workflow/scripts/rd task resolve-launch ${SLUG}"
+  else
+    echo "promote: 세션 기동 결과 — ${LAUNCH_RESULT} ($(session_launch_status_hint "$LAUNCH_RESULT" "$SLUG")) / 상태 기록 미완료 — launch 는 launching 으로 남았습니다. 복구: bash rd-workflow/scripts/rd task resolve-launch ${SLUG}"
+  fi
+  # D8 — 자동 기동이 없었으면(--no-worktree·비-herdr·자식 세션) 사람이 세션을 손으로
+  # 연다. 그 세션에 붙여 넣을 인계 문구와 인계 파일 경로를 함께 보인다.
+  _handoff_dst="$(session_handoff_file_path "$TARGET_DIR")"
+  if [[ "$LAUNCH_RESULT" == "none" && -f "$_handoff_dst" ]]; then
+    echo "promote: 인계 파일 — ${_handoff_dst}"
+    echo "promote: 새 세션에 붙여 넣을 인계 문구:"
+    session_handoff_text "$SLUG" "$REQUEST_HANDOFF_PATH" "$TARGET_DIR" "$_handoff_dst"
+    echo
+  fi
 fi
 
 echo "promote: 완료 (${DECISION}). fr-branch=${TARGET_BRANCH}, worktree=${TARGET_DIR}"

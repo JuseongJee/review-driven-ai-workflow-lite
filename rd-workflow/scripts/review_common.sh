@@ -284,6 +284,17 @@ _rp_criteria_path() {
   esac
 }
 
+# 리뷰 응답 언어 — workflow.json 의 review_response_language (한 줄 문자열)
+# 파일·키 부재, 빈 값, 읽기 실패, 이스케이프(\)를 포함한 값은 지원하지 않는 입력으로 보고 한국어를 쓴다.
+get_review_response_language() {
+  local cfg="${PROJECT_ROOT:-.}/rd-workflow/config/workflow.json" v=""
+  if [[ -f "$cfg" ]]; then
+    v="$(sed -n 's/.*"review_response_language"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" 2>/dev/null | head -1 || true)"
+  fi
+  if [[ -z "$v" || "$v" == *\\* ]]; then v="한국어"; fi
+  printf '%s\n' "$v"
+}
+
 # 리뷰 프롬프트 생성
 build_review_prompt() {
   local output_file="$1"
@@ -428,6 +439,9 @@ ${_rp_fb_note}     Follow the review criteria referenced in \"Review goal\" abov
 "
 
   # 사용자 가시성: 인라인/fallback 현황 (부모 stderr)
+  local _rp_lang
+  _rp_lang="$(get_review_response_language)"
+
   local _rp_ok_n _rp_try_n _rp_fb_all
   _rp_ok_n="$(printf '%s' "$_rp_inline_ok" | grep -c . || true)"
   _rp_fb_all="${_rp_fb_read}${_rp_fb_note}"
@@ -483,6 +497,10 @@ ${_rp_ctx_block}   - Previous turn files are available at ${session_dir_rel}/tur
    - Do NOT read all previous turns by default.
    - If you need line numbers, read with \`nl -ba\` from the start. Do NOT read the same file twice with different commands.
 2. Create exactly one new turn file at EXPECTED_TURN_FILE.
+   - Write in this order: turn file, then CHECKPOINT_FILE, then SESSION_FILE. Do not start a step before the previous one is finished.
+   - Write each file with exactly one write operation. Never put two operations on the same file in one patch.
+   - Write CHECKPOINT_FILE once with its full final content. Do not edit it in several partial steps.
+   - If a write is rejected, do not touch the finished turn file. Retry the remaining files with one operation per file.
 3. Update CHECKPOINT_FILE.
 4. Update SESSION_FILE so that Current Owner is no longer Reviewer.
    - Modify ONLY the "Status" and "Current Owner" sections.
@@ -500,6 +518,13 @@ Constraints:
 - If this is turn ${turn_limit}, you must stop the loop by setting Status=awaiting-user.
 - Do not answer the human directly; the files are the source of truth.
 - Do not implement code changes or create commits.
+
+Response language: write EXPECTED_TURN_FILE, CHECKPOINT_FILE and your final summary in ${_rp_lang}. Keep code, file paths, commands, and the required section headings in their original form.
+
+Closing format for the "Open Issues" section of CHECKPOINT_FILE (a machine check reads it when the session is sealed):
+- (a) If every objection is resolved, write the first line of the section as exactly "- 없음". Do not add any text on that line.
+- (b) Put the closing explanation below it, after one blank line, as a separate paragraph. Text on the next line directly after "- 없음" is rejected.
+- (c) If any objection remains, do not write "- 없음". Keep each open objection as a list item.
 
 Required turn file sections:
 - Summary
@@ -721,4 +746,114 @@ record_self_review_block() {
 1. (1회 승인) \`RD_SELF_REVIEW_APPROVE=1 bash rd-workflow/scripts/run_review_turn.sh <session-path>\` 로 재실행
 2. (정책 변경) \`rd-workflow/config/review-tools.json\` 의 \`tools.claude.self_review_policy\` 를 \`warn\`(경고 후 통과) 또는 \`off\`(무음 통과) 로 바꾼 뒤 재실행
 EOF
+}
+
+# ---------------------------------------------------------------------------
+# 어댑터 실패 진단 (run_review_turn.sh 일반 실패 분기에서 호출). 두 함수 모두 항상 rc 0.
+# ---------------------------------------------------------------------------
+
+# 로그 끝 블록(codex) 또는 result 오류 줄(claude)에서 원인 키를 판정한다.
+# 사용: classify_adapter_failure_cause "<log_path>" "<tool>"
+# 출력: "<confirmed|candidates|unknown> <키,키…>"  키 ∈ effort|capacity|ratelimit|auth|model
+classify_adapter_failure_cause() {
+  local log_path="${1:-}" tool="${2:-}"
+  local tail_text="" target="" line k keys="" count=0
+  if [[ -z "$log_path" || ! -f "$log_path" || -L "$log_path" ]]; then
+    printf 'unknown \n'
+    return 0
+  fi
+  tail_text="$( { tail -n 40 "$log_path" 2>/dev/null || true; } )"
+  if [[ "$tool" == "claude" ]]; then
+    # stream-json: result + is_error 줄의 result 문자열만 진단 대상 (jq 부재·실패는 빈 결과 = 원인 불명)
+    target="$( { printf '%s\n' "$tail_text" | jq -Rr 'fromjson? | select(type=="object" and .type=="result" and .is_error==true) | (.result|tostring)' 2>/dev/null || true; } )"
+  else
+    # codex: 끝 빈 줄과 푸터(tokens used + 숫자 줄)를 걷어내고, 끝에서부터 연속된 줄머리 ERROR:/error: 줄만 취한다
+    target="$( { printf '%s\n' "$tail_text" | awk '
+      { l[NR] = $0 }
+      END {
+        n = NR
+        while (n > 0 && l[n] ~ /^[[:space:]]*$/) n--
+        if (n > 1 && l[n] ~ /^[[:space:]]*[0-9][0-9,.]*[[:space:]]*$/ && l[n-1] ~ /^[[:space:]]*tokens used[[:space:]]*$/) n -= 2
+        while (n > 0 && l[n] ~ /^[[:space:]]*$/) n--
+        while (n > 0 && l[n] ~ /^(ERROR|error):/) { out = l[n] "\n" out; n-- }
+        printf "%s", out
+      }' || true; } )"
+  fi
+  if [[ -z "$target" ]]; then
+    printf 'unknown \n'
+    return 0
+  fi
+  local f_effort=0 f_capacity=0 f_rate=0 f_auth=0 f_model=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if printf '%s\n' "$line" | grep -qiE 'reasoning_effort' \
+       && printf '%s\n' "$line" | grep -qiE 'unknown variant|invalid value|not supported'; then f_effort=1; fi
+    printf '%s\n' "$line" | grep -qiE 'at capacity' && f_capacity=1
+    printf '%s\n' "$line" | grep -qiE 'rate limit|rate_limit|too many requests|429' && f_rate=1
+    printf '%s\n' "$line" | grep -qiE 'unauthorized|authentication|not logged in|invalid api key|401' && f_auth=1
+    if printf '%s\n' "$line" | grep -qiE 'model not found|model_not_found' \
+       || { printf '%s\n' "$line" | grep -qi 'model' && printf '%s\n' "$line" | grep -qi 'does not exist'; }; then f_model=1; fi
+  done <<< "$target"
+  [[ $f_effort -eq 1 ]] && { keys="${keys:+$keys,}effort"; count=$((count+1)); }
+  [[ $f_capacity -eq 1 ]] && { keys="${keys:+$keys,}capacity"; count=$((count+1)); }
+  [[ $f_rate -eq 1 ]] && { keys="${keys:+$keys,}ratelimit"; count=$((count+1)); }
+  [[ $f_auth -eq 1 ]] && { keys="${keys:+$keys,}auth"; count=$((count+1)); }
+  [[ $f_model -eq 1 ]] && { keys="${keys:+$keys,}model"; count=$((count+1)); }
+  k=unknown
+  [[ $count -eq 1 ]] && k=confirmed
+  [[ $count -ge 2 ]] && k=candidates
+  printf '%s %s\n' "$k" "$keys"
+  return 0
+}
+
+# 중단된 턴의 보존 안내 (change spec codex-adapter-turn-loss-and-reap §2.3). stderr 출력, 반환 0.
+# turn 파일이 없으면 아무것도 출력하지 않는다. 자동 복구·승격은 하지 않고 관측만 알린다.
+# CHECKPOINT 판정은 mtime 이 아니라 어댑터 실행 직전 cksum(checkpoint_sum_before, 파일 없으면 빈 값)과 지금 cksum 의 비교다.
+# 사용: report_preserved_turn "<turn_file>" "<checkpoint_file>" "<checkpoint_sum_before>" "<session_file>" ["<표시용 turn 경로>"]
+report_preserved_turn() {
+  local turn_file="${1:-}" checkpoint_file="${2:-}" sum_before="${3:-}" session_file="${4:-}"
+  local shown="${5:-$1}" owner="" status="" sum_now="" cp_state
+  [[ -n "$turn_file" && -e "$turn_file" ]] || return 0
+  if [[ -n "$session_file" && -f "$session_file" ]]; then
+    status="$( { extract_section "$session_file" "Status" | trim_blank_lines || true; } 2>/dev/null )"
+    owner="$( { extract_section "$session_file" "Current Owner" | trim_blank_lines || true; } 2>/dev/null )"
+  fi
+  if [[ -n "$checkpoint_file" && -f "$checkpoint_file" ]]; then
+    sum_now="$(cksum < "$checkpoint_file" 2>/dev/null || true)"
+    if [[ -n "$sum_now" && "$sum_now" == "$sum_before" ]]; then cp_state="같음"; else cp_state="다름"; fi
+  else
+    cp_state="없음(파일 없음)"
+  fi
+  echo "보존된 턴 파일: ${shown} (하네스는 이 파일을 삭제·수정하지 않았습니다. 마지막 줄이 절단됐을 수 있습니다.)" >&2
+  echo "관측: CHECKPOINT.md 내용이 어댑터 실행 전과 ${cp_state} / SESSION Owner='${owner}' Status='${status}'" >&2
+  echo "      (CHECKPOINT 는 어댑터 실행 직전 cksum 과 비교한 관측이며, 내용이 완성됐는지는 판단하지 않습니다.)" >&2
+  echo "조치: 리뷰 도구 프로세스가 모두 종료된 것을 확인한 뒤 Author 가 위 turn 파일을 검토하고 CHECKPOINT.md·SESSION.md 를 직접 갱신하십시오. 이 세션에서 같은 명령을 재실행하면 다음 번호의 턴이 새로 만들어집니다." >&2
+  return 0
+}
+
+# 세션 안전성 판정. status_file 은 이번 실행의 .review_wait_status (writer 종료 확인 증거).
+# 사용: assess_session_safety "<session_file>" "<expected_turn_file>" "<status_file>"
+# 출력 1행: ok(가) | manual(나) | anomaly(다), 2행: 관측 사실
+assess_session_safety() {
+  local session_file="${1:-}" turn_file="${2:-}" status_file="${3:-}"
+  local turn_state="부재" owner="" status="" writer="미확인" verdict
+  if [[ -n "$turn_file" && -e "$turn_file" ]]; then turn_state="존재"; fi
+  if [[ -n "$session_file" && -f "$session_file" ]]; then
+    status="$( { extract_section "$session_file" "Status" | trim_blank_lines || true; } )"
+    owner="$( { extract_section "$session_file" "Current Owner" | trim_blank_lines || true; } )"
+  fi
+  # 종료 확인은 어댑터가 증명했다고 남긴 `writer_group: verified` 줄이 있을 때만 인정한다.
+  # 줄이 없는 옛 형식·`unverified`(pgid·ps 조회 실패)는 미확인이다.
+  if [[ -n "$status_file" && -f "$status_file" && ! -L "$status_file" ]] \
+     && grep -q '^writer_group: verified$' "$status_file" 2>/dev/null; then writer="확인"; fi
+  if [[ "$writer" != "확인" ]]; then
+    verdict=manual
+  elif [[ "$turn_state" == "존재" || "$owner" != "Reviewer" || "$status" != "awaiting-reviewer" ]]; then
+    verdict=anomaly
+  else
+    verdict=ok
+  fi
+  printf '%s\n' "$verdict"
+  printf "턴 파일: %s, Current Owner='%s', Status='%s', writer 종료: %s\n" "$turn_state" "$owner" "$status" "$writer"
+  return 0
 }

@@ -166,6 +166,25 @@ tasks_index_get() {
   return 1
 }
 
+# 색인의 모든 행(정리 대기 포함)의 slug. 표시·정리 판정용.
+tasks_index_all_slugs() {
+  local path
+  path="$(tasks_index_path)"
+  [[ -f "$path" ]] || return 0
+
+  local line rest
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      slug=*)
+        rest="${line#slug=}"
+        printf '%s\n' "${rest%%$'\t'*}"
+        ;;
+    esac
+  done <"$path"
+}
+
+# 진행 중인 작업의 slug. `state=cleanup-pending` 행(발행 끝, worktree 정리만 남음)은
+# 세지 않는다 — 세면 task_resolve_target 의 「여러 건」 판정이 오판한다.
 tasks_index_slugs() {
   local path
   path="$(tasks_index_path)"
@@ -175,6 +194,9 @@ tasks_index_slugs() {
   while IFS= read -r line || [[ -n "$line" ]]; do
     case "$line" in
       slug=*)
+        case "$line" in
+          *$'\t'state=cleanup-pending|*$'\t'state=cleanup-pending$'\t'*) continue ;;
+        esac
         rest="${line#slug=}"
         printf '%s\n' "${rest%%$'\t'*}"
         ;;
@@ -244,6 +266,85 @@ tasks_lock_acquire() {
   return 2
 }
 
+# tasks_lock_acquire_wait <cmd> <slug> <wait_for_cmd> [max_sec]
+#   점유자 cmd 가 wait_for_cmd 일 때만 1초 간격으로 한정 대기한다. tasks_lock_acquire 의
+#   의미는 바꾸지 않는다. rc 0 획득 / 1 점유·상한 초과·다른 점유자 / 2 불확실(종전과 같음).
+#   max_sec 생략 시 RD_ARCHIVE_LOCK_WAIT_MAX(기본 60, 0 이면 대기 안 함, 무효값은 경고 후 60).
+#   대기 중에는 $(tasks_shared_dir)/archive-waiting 에 자기 pid 를 두어 지연 정리가 양보하게 한다.
+tasks_lock_acquire_wait() {
+  local cmd="$1" slug="$2" wait_for="$3" max="${4:-}"
+  if [[ -z "$max" ]]; then
+    max="${RD_ARCHIVE_LOCK_WAIT_MAX:-60}"
+    case "$max" in
+      *[!0-9]*|[0-9][0-9][0-9][0-9][0-9][0-9][0-9]*)
+        printf '경고: RD_ARCHIVE_LOCK_WAIT_MAX 값이 올바르지 않아 60초를 씁니다 (받은 값: %s)\n' "$max" >&2
+        max=60
+        ;;
+    esac
+  fi
+  # 선행 0(`08`·`010`)을 bash 산술이 8진수로 읽지 않도록 십진수로 정규화한다.
+  case "$max" in
+    ''|*[!0-9]*) max=60 ;;
+    *) max=$((10#$max)) ;;
+  esac
+
+  local shared ownerfile marker err rc=0
+  shared="$(tasks_shared_dir)" || return 2
+  ownerfile="$shared/tasks.lock/owner"
+  marker="$shared/archive-waiting"
+
+  err="$(tasks_lock_acquire "$cmd" "$slug" 2>&1 >/dev/null)" || rc=$?
+  [[ "$rc" -eq 0 ]] && return 0
+  if [[ "$rc" -eq 2 ]]; then printf '%s\n' "$err" >&2; return 2; fi
+
+  local owner_cmd owner_pid
+  owner_cmd="$(_tasks_lock_owner_field "$ownerfile" cmd || true)"
+  if [[ "$owner_cmd" != "$wait_for" || "$max" -eq 0 ]]; then
+    printf '%s\n' "$err" >&2
+    return 1
+  fi
+
+  owner_pid="$(_tasks_lock_owner_field "$ownerfile" pid || true)"
+  printf '%s\n' "$$" >"$marker" 2>/dev/null || true
+  local note=""
+  [[ "$wait_for" == "tasks-list-prune" ]] && note=" (낡은 정리 대기 기록 정리 중)"
+  printf '%s: 락 대기 — 점유자 pid=%s cmd=%s%s, 상한 %s초\n' "$cmd" "$owner_pid" "$wait_for" "$note" "$max" >&2
+
+  local elapsed=0 mark_pid
+  while [[ "$elapsed" -lt "$max" ]]; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+    rc=0
+    err="$(tasks_lock_acquire "$cmd" "$slug" 2>&1 >/dev/null)" || rc=$?
+    if [[ "$rc" -ne 1 ]]; then
+      mark_pid="$(cat "$marker" 2>/dev/null || true)"
+      [[ "$mark_pid" == "$$" ]] && rm -f "$marker"
+      if [[ "$rc" -eq 0 ]]; then
+        printf '%s: 락을 얻어 이어갑니다 (대기 %s초)\n' "$cmd" "$elapsed" >&2
+        return 0
+      fi
+      printf '%s\n' "$err" >&2
+      return "$rc"
+    fi
+    owner_cmd="$(_tasks_lock_owner_field "$ownerfile" cmd || true)"
+    if [[ -n "$owner_cmd" && "$owner_cmd" != "$wait_for" ]]; then
+      mark_pid="$(cat "$marker" 2>/dev/null || true)"
+      [[ "$mark_pid" == "$$" ]] && rm -f "$marker"
+      printf '%s\n' "$err" >&2
+      return 1
+    fi
+    if [[ $((elapsed % 10)) -eq 0 && "$elapsed" -lt "$max" ]]; then
+      printf '%s: 락 대기 중 — %s초 경과 / 상한 %s초\n' "$cmd" "$elapsed" "$max" >&2
+    fi
+  done
+
+  mark_pid="$(cat "$marker" 2>/dev/null || true)"
+  [[ "$mark_pid" == "$$" ]] && rm -f "$marker"
+  printf '%s\n' "$err" >&2
+  printf '%s: 락 대기 %s초 후 중단 — 점유자가 끝난 뒤 같은 명령을 다시 실행하십시오 (상태 변경 없음).\n' "$cmd" "$max" >&2
+  return 1
+}
+
 # 자기 pid 가 소유자일 때만 지운다. 남의 락을 지우지 않는다.
 tasks_lock_release() {
   local shared lockdir ownerfile owner_pid
@@ -304,6 +405,74 @@ tasks_publish_evidence() {
   fi
 
   printf 'cleanup-pending\n'
+}
+
+# tasks_path_occupied <path>
+#   rc 0: 점유 — 내 계정 프로세스의 CWD 가 <path> 이거나 그 아래다.
+#   rc 1: 비점유 — 내 계정 프로세스 전부의 CWD 를 읽었고 <path> 안에 있는 것이 없다.
+#   rc 2: 판정불가 — lsof 없음 / 조회 실패 / 내 계정 프로세스의 CWD 를 읽지 못함.
+#         사유는 전역 TASKS_OCCUPIED_REASON 에 남긴다(서브셸로 부르면 잃는다).
+#
+# 범위는 **내 계정(id -u) 프로세스까지**다(사용자 결정 2026-10-29). 다른 계정(root 포함)의
+# 프로세스는 lsof 가 CWD 를 읽지 못하므로 범위 밖이다. 내 계정 프로세스인데 읽지 못한 것이
+# 있으면 점유 여부를 보증할 수 없으므로 rc 2 다. 예외는 comm 기본 이름이 `login` 인 것
+# 하나뿐이다(setuid 래퍼라 lsof 가 읽지 못하고 CWD 도 작업 디렉터리가 아니다 — 2026-10-29 실측).
+# ps 는 BSD·procps 모두 `-U <uid>` 가 실 uid 선택이다(macOS 의 `-u` 는 형식 옵션이다).
+tasks_path_occupied() {
+  TASKS_OCCUPIED_REASON=""
+  local target uid
+  target="$(cd "$1" 2>/dev/null && pwd -P)" || return 1   # 없는 경로는 누구의 CWD 도 아니다
+  command -v lsof >/dev/null 2>&1 || { TASKS_OCCUPIED_REASON="lsof 없음"; return 2; }
+  uid="$(id -u)"
+
+  # 점유가 확인되면(rc 0) 읽지 못한 프로세스가 있어도 점유다. 비점유(rc 1)는 읽지 못한 프로세스가
+  # 없을 때만 낸다. `top -l 2` 같은 수 초짜리 setuid 모니터가 잠깐 끼어 읽기 불가로 잡히므로(2026-10-29
+  # 실측), 읽기 불가가 남으면 TASKS_OCCUPIED_RETRY(기본 3)회까지 1초 간격으로 다시 읽는다.
+  local retry="${TASKS_OCCUPIED_RETRY:-3}" attempt=0 ps_out snap lsof_out lrc pid missed candidates line
+  while :; do
+    lsof_out=""; lrc=0
+    # ps 실패나 빈 스냅샷(숫자 pid 행이 하나도 없음 — 빈 출력 포함)은 대조 근거가 사라진다는 뜻이다 — 비점유로 흘리지 않고 판정불가로 낸다.
+    ps_out="$(ps -U "$uid" -o pid=,stat=,comm= 2>/dev/null)" || { TASKS_OCCUPIED_REASON="프로세스 목록 조회 실패"; return 2; }
+    snap="$(printf '%s\n' "$ps_out" | awk '
+      $1 !~ /^[0-9]+$/ {next}
+      $2 ~ /^Z/ {next}
+      {pid=$1; c=$0; sub(/^[ \t]*[0-9]+[ \t]+[^ \t]+[ \t]*/, "", c); sub(/.*\//, "", c); print pid "\t" c}')"
+    [[ -n "$snap" ]] || { TASKS_OCCUPIED_REASON="프로세스 목록이 비어 있음"; return 2; }
+    # -a 가 없으면 lsof 는 조건을 OR 로 묶어 내 계정의 모든 파일을 훑는다(실측 17초·5만 줄).
+    lsof_out="$(lsof -a -u "$uid" -d cwd -Fpn 2>/dev/null)" || lrc=$?
+    if [[ "$lrc" -ne 0 && -z "$lsof_out" ]]; then
+      TASKS_OCCUPIED_REASON="조회 실패"; return 2
+    fi
+
+    while IFS= read -r line; do
+      case "$line" in
+        n"$target"|n"$target"/*) return 0 ;;
+      esac
+    done <<<"$lsof_out"
+
+    # 권한 제한 대조 — 살아 있는 내 계정 pid 중 CWD 경로를 실제로 읽지 못한 것을 센다.
+    #   lsof 출력에 `p<pid>` 가 있어도 뒤따르는 `n` 줄이 절대경로가 아니면(예: `n/proc/<pid>/cwd (readlink:
+    #   Permission denied)` 같은 오류 설명) 읽은 것으로 치지 않는다 — 프로세스 식별과 경로 읽기는 별개다.
+    #   pid 마다 grep 을 띄우면 프로세스가 수백 개일 때 수십 초가 걸린다 — awk 한 번으로 거른다.
+    missed=0
+    candidates="$(printf '%s\n' "$snap" | LSOF_OUT="$lsof_out" awk -F'\t' '
+      BEGIN { n = split(ENVIRON["LSOF_OUT"], a, "\n"); cur = ""
+        for (i = 1; i <= n; i++) {
+          if (a[i] ~ /^p/) cur = substr(a[i], 2)
+          else if (a[i] ~ /^n\// && a[i] !~ /\(.*\)$/ && cur != "") seen[cur] = 1
+        } }
+      $1 != "" && $2 != "login" && !($1 in seen) { print $1 }')"
+    while IFS= read -r pid; do
+      [[ -z "$pid" ]] && continue
+      kill -0 "$pid" 2>/dev/null || continue
+      missed=$((missed + 1))
+    done <<<"$candidates"
+    [[ "$missed" -eq 0 ]] && return 1
+    if [[ "$attempt" -ge "$retry" ]]; then
+      TASKS_OCCUPIED_REASON="내 계정 프로세스 ${missed}건 CWD 읽기 불가"; return 2
+    fi
+    attempt=$((attempt + 1)); sleep 1
+  done
 }
 
 tasks_lock_owner_info() {

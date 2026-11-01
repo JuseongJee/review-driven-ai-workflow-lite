@@ -81,6 +81,20 @@ if ! source_fr_list="$(source_fr_resolve_list "$raw_source_fr_list" "$project_ro
 fi
 [[ -z "$source_fr_list" ]] && exit 0
 
+# --- 리뷰 종결 뒤 작업이 다시 열린 Status (구현 중·검증 중) ---
+# 정규 아카이브 기록 커밋은 seal 직후 `아카이브 보류` 에서만 일어난다 (WORKFLOW.md 「아카이브
+# 보류」 절의 순서). `구현 중`·`검증 중` 의 커밋은 아카이브 커밋이 아니므로 Source FR 미완료
+# 판정으로 막지 않는다 — 외부 검증 대기 중 작업물 보존과 리뷰 후 재작업을 위해서다.
+# 허용은 두 값의 **명시적 열거(정확 일치)** 다. 부정 비교를 쓰지 않으며, 그 밖의 값(빈 값·
+# 알 수 없는 값 포함)은 아무것도 하지 않고 아래 기존 판정으로 떨어진다 (fail-closed 유지).
+# 이 게이트는 마감 누락의 최종 보장이 아니다 (파일 머리 주석) — 그 성격은 바뀌지 않는다.
+case "$(state_read_field "status")" in
+  "구현 중"|"검증 중")
+    echo "[guard] Status '$(state_read_field "status")' — 리뷰 종결 뒤 작업이 다시 열린 상태라 이 커밋을 허용합니다. 보호 트리를 바꾸면 재리뷰·재seal 이 필요합니다." >&2
+    exit 0
+    ;;
+esac
+
 # --- 아카이브 보류 상태의 기록 커밋 예외 (spec §4.3) ---
 # task-state status 가 `아카이브 보류` 이면, 커밋에 들어갈 수 있는 변경이 전부 제외 경로(§2.1)
 # 안일 때만 통과시킵니다. 그래야 §4.2 정상 경로(seal → 상태 전이 → 기록 커밋)가 성립합니다.
@@ -118,6 +132,17 @@ if [[ "$(state_read_field "status")" == "아카이브 보류" ]]; then
   esac
 fi
 
+# `아카이브 보류` 에서 기록 경로 밖의 변경을 커밋하려 할 때의 안내. Source FR 이 전부 done 인
+# 경로와 미완료인 경로가 같은 안내를 내도록 한 곳에 둔다 — 외부 검증 대기 중에는 Source FR 이
+# 아직 미완료이므로 미완료 경로가 이 기능의 주된 시나리오다.
+pending_out_of_scope_guidance() {
+  echo "[guard] 아카이브 보류 상태에서는 기록 경로 밖의 변경을 커밋할 수 없습니다." >&2
+  echo "[guard] 코드 변경이 필요하면 상태를 '구현 중' 으로 되돌리고 리뷰를 다시 받으세요:" >&2
+  echo "[guard]   bash rd-workflow/scripts/rd task set-status \"구현 중\"" >&2
+  echo "[guard] 외부 검증 대기라 작업물만 보존하려면 'rd task set-status \"검증 중\"' 후 커밋하세요:" >&2
+  echo "[guard]   bash rd-workflow/scripts/rd task set-status \"검증 중\"" >&2
+}
+
 # --- Source FR 전부의 status 확인 (AC C-16) ---
 # 실존은 source_fr_resolve_list 가 이미 보장하므로 여기서 다시 확인하지 않는다.
 # done/dropped 가 아닌 FR 이 하나라도 있으면 첫 건에서 멈추지 않고 전부 모은다 —
@@ -140,9 +165,7 @@ if [[ -z "$incomplete" ]]; then
   if [[ "$pending_block" == "0" ]]; then
     exit 0
   fi
-  echo "[guard] 아카이브 보류 상태에서는 기록 경로 밖의 변경을 커밋할 수 없습니다." >&2
-  echo "[guard] 코드 변경이 필요하면 상태를 '구현 중' 으로 되돌리고 리뷰를 다시 받으세요:" >&2
-  echo "[guard]   bash rd-workflow/scripts/rd task set-status \"구현 중\"" >&2
+  pending_out_of_scope_guidance
   # reason: `아카이브 보류` 상태에서 기록 경로 밖의 변경을 커밋하려 한 분기.
   guard_deny "pre_commit_archive_gate.pending-out-of-scope"
 fi
@@ -152,6 +175,12 @@ while IFS=$'\t' read -r fr fr_status; do
   [[ -z "$fr" ]] && continue
   echo "[guard] Source FR '${fr}'의 status가 '${fr_status}'입니다 (done/dropped 필요)." >&2
 done <<< "$incomplete"
-echo "[guard] REQUEST 아카이브를 먼저 실행하세요." >&2
+if [[ "$pending_block" == "1" ]]; then
+  # 아카이브 보류 + 기록 경로 밖 변경: 지금 아카이브하라는 안내는 틀린 다음 행동이다 (외부 검증이
+  # 끝나기 전에 발행하게 된다). 보류 상태의 복구 경로를 안내한다.
+  pending_out_of_scope_guidance
+else
+  echo "[guard] REQUEST 아카이브를 먼저 실행하세요." >&2
+fi
 # reason: diff review는 통과했지만 Source FR 중 done/dropped가 아닌 항목이 남은 분기.
 guard_deny "pre_commit_archive_gate.incomplete-source-fr"

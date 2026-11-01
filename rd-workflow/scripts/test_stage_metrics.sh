@@ -119,7 +119,7 @@ else
   fi
 fi
 
-if out="$( cd "$REPO/.worktrees/rounda" && bash "$ARCHIVE_SH" --force-skip-review-check "테스트" 2>&1 )"; then
+if out="$( cd "$REPO/.worktrees/rounda" && bash "$ARCHIVE_SH" --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )"; then
   a2_main="$(git -C "$REPO" rev-parse main)"
   a2_line="$(git -C "$REPO" show "${a2_main}:rd-workflow-workspace/.lifecycle/stage_metrics.tsv" 2>/dev/null | grep -F "rounda" | tail -1 || true)"
   if [[ "$a2_line" == *"rounda"*"대기 중"* ]]; then
@@ -153,7 +153,7 @@ if bash "$PROMOTE_SH" --short-title roundf --size small --source-fr - >/tmp/rd_s
   ( cd "$REPO/.worktrees/roundf" \
       && git rm -q --cached --ignore-unmatch rd-workflow-workspace/.lifecycle/stage_metrics.tsv >/dev/null 2>&1 \
       && git commit -q -m "fixture: stage_metrics.tsv 제거(F1 재현)" --allow-empty >/dev/null 2>&1 )
-  if out="$( cd "$REPO/.worktrees/roundf" && bash "$ARCHIVE_SH" --force-skip-review-check "테스트" 2>&1 )"; then
+  if out="$( cd "$REPO/.worktrees/roundf" && bash "$ARCHIVE_SH" --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )"; then
     pass "A5: stage_metrics.tsv 부재 상태에서도 archive.sh 가 exit 0 으로 끝난다"
   else
     fail "A5: stage_metrics.tsv 부재 상태에서 archive.sh 가 실패함 — $out"

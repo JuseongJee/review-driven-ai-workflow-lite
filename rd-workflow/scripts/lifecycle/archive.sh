@@ -32,7 +32,7 @@ _archive_read_field_at() {
 # 이 배열을 그대로 전달한다.
 ORIG_ARGS=("$@")
 
-DRY_RUN=0; FORCE_DIRTY=0; NO_REMOTE=0; FR_BRANCH_OVERRIDE=""; FORCE_SKIP_REVIEW=0; SKIP_REASON=""; TASK_SLUG_ARG=""
+DRY_RUN=0; FORCE_DIRTY=0; NO_REMOTE=0; FR_BRANCH_OVERRIDE=""; FORCE_SKIP_REVIEW=0; SKIP_REASON=""; ALLOW_STATUS=0; STATUS_REASON=""; TASK_SLUG_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fr-branch) FR_BRANCH_OVERRIDE="$2"; shift 2 ;;
@@ -45,7 +45,12 @@ while [[ $# -gt 0 ]]; do
       # 다음 토큰이 없거나 -로 시작하면 사유 누락 → 빈 값 유지 (precheck에서 차단)
       if [[ $# -ge 2 && "$2" != -* ]]; then SKIP_REASON="$2"; shift 2; else shift 1; fi
       ;;
-    -h|--help) printf '%s\n' "usage: archive.sh [--fr-branch <ref>] [--task <slug>] [--no-remote] [--force-dirty] [--force-skip-review-check <사유>] [--dry-run]"; exit 0 ;;
+    --allow-status-mismatch)
+      ALLOW_STATUS=1
+      # --force-skip-review-check 와 같은 모양 — 사유 누락은 빈 값으로 두고 헬퍼가 차단한다.
+      if [[ $# -ge 2 && "$2" != -* ]]; then STATUS_REASON="$2"; shift 2; else shift 1; fi
+      ;;
+    -h|--help) printf '%s\n' "usage: archive.sh [--fr-branch <ref>] [--task <slug>] [--no-remote] [--force-dirty] [--force-skip-review-check <사유>] [--allow-status-mismatch <사유>] [--dry-run]"; exit 0 ;;
     *) printf 'archive: unknown arg: %s\n' "$1" >&2; exit 1 ;;
   esac
 done
@@ -312,7 +317,7 @@ _archive_on_exit() {
 trap '_archive_on_exit' EXIT
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
-  if tasks_lock_acquire archive "$SLUG"; then
+  if tasks_lock_acquire_wait archive "$SLUG" tasks-list-prune; then
     ARCHIVE_LOCK_HELD=1
   else
     _archive_lock_rc=$?
@@ -407,20 +412,43 @@ fi
 project_root="$CURRENT_WT"
 source "$SCRIPT_DIR/../hooks/_guard_common.sh"
 AUDIT_LOG="$CURRENT_WT/rd-workflow-workspace/.lifecycle/review-skip-audit.log"
+# Status 게이트는 seal 검사 **앞**에 둔다 — no-fr 의 cleanup 이후 재실행은 seal 포인터가
+# 지워져 seal 검사가 먼저 거부하므로, 뒤에 두면 Status 쪽 재실행 안내에 도달하지 못한다.
+# 두 게이트는 서로의 판정을 바꾸지 않는 독립 게이트다(각각 자기 우회 플래그만 받는다).
+archive_status_precheck "$ALLOW_STATUS" "$STATUS_REASON" "$SLUG" "$AUDIT_LOG" "$FR_BRANCH" || exit 1
 archive_review_precheck "$FORCE_SKIP_REVIEW" "$SKIP_REASON" "$SLUG" "$AUDIT_LOG" "$FR_BRANCH" || exit 1
 
 # Step 2 — archive content 휴리스틱 (warning만)
 # no-fr 모드에는 fr tip 이 없으므로 같은 휴리스틱을 현재 HEAD 의 마지막 커밋에 적용합니다.
 # 경고일 뿐이라 판정을 바꾸지 않지만, "아카이브 내용을 커밋하지 않았다" 는 흔한 실수는
 # 두 모드에서 똑같이 일어나므로 no-fr 이라고 알림을 없애지 않습니다.
+# fr 모드는 마지막 커밋이 아니라 기본 브랜치와의 공통 조상 이후 커밋 전체에서 아카이브 사본
+# (request-archive/*.md) **추가** 를 찾습니다. REQUEST.md·CURRENT_TASK.md 변경은 착수 커밋부터
+# 계속 있으므로 신호로 쓰지 않습니다.
 if [[ "$BRANCH_MODE" == "no-fr" ]]; then
   LAST_COMMIT_REF="HEAD"
+  LAST_COMMIT_FILES="$(git log -1 "$LAST_COMMIT_REF" --name-only --pretty=format: 2>/dev/null || true)"
+  if ! grep -qE '(^|/)(REQUEST\.md|CURRENT_TASK\.md|FUTURE_REQUESTS\.md|request-archive/.*\.md)' <<<"$LAST_COMMIT_FILES"; then
+    printf 'archive: WARNING — %s 마지막 commit 에 archive content 미감지\n' "$LAST_COMMIT_REF" >&2
+  fi
 else
-  LAST_COMMIT_REF="$FR_BRANCH"
-fi
-LAST_COMMIT_FILES="$(git log -1 "$LAST_COMMIT_REF" --name-only --pretty=format: 2>/dev/null || true)"
-if ! grep -qE '(^|/)(REQUEST\.md|CURRENT_TASK\.md|FUTURE_REQUESTS\.md|request-archive/.*\.md)' <<<"$LAST_COMMIT_FILES"; then
-  printf 'archive: WARNING — %s 마지막 commit 에 archive content 미감지\n' "$LAST_COMMIT_REF" >&2
+  _cd_default="$(get_default_branch 2>/dev/null)" || _cd_default=""
+  _cd_base=""
+  if [[ -n "$_cd_default" ]]; then
+    _cd_base="$(git merge-base "$_cd_default" "$FR_BRANCH" 2>/dev/null)" || _cd_base=""
+  fi
+  if [[ -z "$_cd_base" ]]; then
+    printf 'archive: WARNING — archive content 감지를 수행하지 못했습니다 (기준 이력 없음)\n' >&2
+  elif [[ "$_cd_base" == "$(git rev-parse "$FR_BRANCH" 2>/dev/null)" ]]; then
+    printf 'archive: archive content 감지를 건너뜁니다 (fr 브랜치가 이미 기본 브랜치에 병합됨)\n' >&2
+  else
+    # 출력을 변수에 모은 뒤 끝까지 소비하는 grep 으로 판정한다 — grep -q 로 일찍 끝내면
+    # SIGPIPE 가 pipefail 아래에서 양성 판정을 뒤집을 수 있다.
+    _cd_added="$(git log --diff-filter=A --name-only --pretty=format: "$_cd_base..$FR_BRANCH" 2>/dev/null || true)"
+    if ! grep -E 'rd-workflow-workspace/backlog/request-archive/[^/]+\.md$' <<<"$_cd_added" | grep -v '/README\.md$' >/dev/null; then
+      printf 'archive: WARNING — %s 의 기본 브랜치 이후 커밋 전체에 archive content(request-archive/*.md 추가) 미감지\n' "$FR_BRANCH" >&2
+    fi
+  fi
 fi
 
 # Step 3 — merge (idempotent)
@@ -430,39 +458,121 @@ if [[ "$BRANCH_MODE" == "no-fr" ]]; then
 elif git merge-base --is-ancestor "$FR_BRANCH" HEAD 2>/dev/null; then
   printf 'archive: %s 이미 merge 됨 — skip\n' "$FR_BRANCH"
 else
-  if ! git merge --no-ff "$FR_BRANCH" -m "merge: $SLUG (autopilot 완료)"; then
+  # git merge 출력은 변수에 잡아 둔다. 충돌이 자동 해소되면 git 의 「자동 병합이 실패했습니다」 가 거짓 실패로 읽히므로
+  # 성공·멈춤 경로에서만 낸다. 해소 성공 경로는 내지 않는다. 대입 단독 실행은 set -e 로 종료하므로 if 조건에 둔다.
+  _merge_out=""
+  _merge_dump() { [[ -z "${_merge_out:-}" ]] || printf '%s\n' "$_merge_out" >&2; }
+  if _merge_out="$(git merge --no-ff "$FR_BRANCH" -m "merge: $SLUG (autopilot 완료)" 2>&1)"; then
+    printf '%s\n' "$_merge_out"
+  else
     # FUTURE_REQUESTS.md 단독 충돌은 행 집합 3-way 병합으로 해결한다 (spec D7).
     #   등록 커밋이 기본 브랜치에 먼저 쌓이는 구조에서 fr 브랜치와 기본 브랜치가 표 끝에 서로 다른 행을
     #   append 하면 git 줄 병합은 반드시 충돌한다. 인덱스는 제목을 키로 하는 행 집합이므로 집합 병합이 맞다.
     #   다른 경로가 함께 충돌하거나 집합 병합도 실패하면 종전대로 사람이 해결한다 (충돌 상태 유지).
     _IDX="rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
+    _SM="rd-workflow-workspace/.lifecycle/stage_metrics.tsv"
+    _CT="CURRENT_TASK.md"
     _conf="$(git diff --name-only --diff-filter=U 2>/dev/null)"
     if [[ "$_conf" == "$_IDX" ]]; then
-      _mb="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-      [[ -n "$_mb" && -f "$_mb" ]] || { echo "archive: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-      _mo="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-      [[ -n "$_mo" && -f "$_mo" ]] || { echo "archive: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-      _mt="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-      [[ -n "$_mt" && -f "$_mt" ]] || { echo "archive: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-      _mr="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-      [[ -n "$_mr" && -f "$_mr" ]] || { echo "archive: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+      _mb="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; _merge_dump; exit 1; }
+      [[ -n "$_mb" && -f "$_mb" ]] || { echo "archive: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; _merge_dump; exit 1; }
+      _mo="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; _merge_dump; exit 1; }
+      [[ -n "$_mo" && -f "$_mo" ]] || { echo "archive: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; _merge_dump; exit 1; }
+      _mt="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; _merge_dump; exit 1; }
+      [[ -n "$_mt" && -f "$_mt" ]] || { echo "archive: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; _merge_dump; exit 1; }
+      _mr="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; _merge_dump; exit 1; }
+      [[ -n "$_mr" && -f "$_mr" ]] || { echo "archive: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; _merge_dump; exit 1; }
       # 정리 확인: 아래 `rm -f "$_mb" "$_mo" "$_mt" "$_mr"` 는 전부 위 네 가드를 통과한 뒤에만
       # 도달하는 분기(성공 경로 :206·:211, 실패 경로 :208·:213) 안에 있다. 가드가 막히면
       # exit 1 로 즉시 빠지므로 미생성 변수를 rm 하는 경로가 없다 — 조치 불필요.
       if git show ":1:$_IDX" > "$_mb" 2>/dev/null && git show ":2:$_IDX" > "$_mo" 2>/dev/null && git show ":3:$_IDX" > "$_mt" 2>/dev/null \
          && bash "$SCRIPT_DIR/merge_fr_index.sh" "$_mb" "$_mo" "$_mt" > "$_mr"; then
-        cp "$_mr" "$_IDX" && git add "$_IDX" || { rm -f "$_mb" "$_mo" "$_mt" "$_mr"; printf 'archive: 인덱스 병합 결과 반영 실패 — git status 로 확인 후 수동 resolve 하고 git commit --no-edit, 또는 git merge --abort\n' >&2; exit 1; }
+        cp "$_mr" "$_IDX" && git add "$_IDX" || { rm -f "$_mb" "$_mo" "$_mt" "$_mr"; printf 'archive: 인덱스 병합 결과 반영 실패 — git status 로 확인 후 수동 resolve 하고 git commit --no-edit, 또는 git merge --abort\n' >&2; _merge_dump; exit 1; }
         _nv=""; if lifecycle_needs_hook_bypass; then _nv="--no-verify"; fi
-        RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit ${_nv:+"$_nv"} --no-edit -m "merge: $SLUG (autopilot 완료)" >/dev/null || { rm -f "$_mb" "$_mo" "$_mt" "$_mr"; printf 'archive: 인덱스 충돌은 해결했으나 merge 커밋이 실패했습니다. git status 로 확인한 뒤 git commit --no-edit 으로 merge 를 마치고 archive.sh 를 재실행하거나, git merge --abort 로 되돌리십시오\n' >&2; exit 1; }
+        RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit ${_nv:+"$_nv"} --no-edit -m "merge: $SLUG (autopilot 완료)" >/dev/null || { rm -f "$_mb" "$_mo" "$_mt" "$_mr"; printf 'archive: 인덱스 충돌은 해결했으나 merge 커밋이 실패했습니다. git status 로 확인한 뒤 git commit --no-edit 으로 merge 를 마치고 archive.sh 를 재실행하거나, git merge --abort 로 되돌리십시오\n' >&2; _merge_dump; exit 1; }
         [[ -n "$_nv" ]] && lifecycle_notify_hook_bypass archive
         printf 'archive: FUTURE_REQUESTS.md 충돌을 행 집합 병합으로 해결했습니다 (merge_fr_index.sh)\n'
         rm -f "$_mb" "$_mo" "$_mt" "$_mr"
       else
         rm -f "$_mb" "$_mo" "$_mt" "$_mr"
-        printf 'archive: merge 실패 — FUTURE_REQUESTS.md 행 집합 병합도 실패했습니다. conflict resolve 후 재실행\n' >&2; exit 1
+        printf 'archive: merge 실패 — FUTURE_REQUESTS.md 행 집합 병합도 실패했습니다. conflict resolve 후 재실행\n' >&2; _merge_dump; exit 1
       fi
+    elif printf '%s\n' "$_conf" | grep -qxF -e "$_SM" -e "$_CT" \
+         && [[ -z "$(printf '%s\n' "$_conf" | grep -vxF -e "$_SM" -e "$_IDX" -e "$_CT")" ]]; then
+      # stage_metrics.tsv 충돌(단독, 또는 FUTURE_REQUESTS.md 와 함께)은 줄 합집합으로 해결한다 (change spec 2026-10-29-1800).
+      # CURRENT_TASK.md 충돌은 main 쪽 버전(stage 2)을 취한다 (change spec 2026-10-30-1245 D1) —
+      #   발행이 이 파일을 어차피 기준 상태로 되돌리므로 fr 쪽 내용은 버려도 잃는 것이 없다.
+      #   로그는 작업마다 파일 끝에 행을 덧붙이는 append-only 4열 형식이라 병렬 발행마다 반드시 충돌하고, 해소는
+      #   항상 「양쪽 줄 보존」 이다. 작업 트리·인덱스는 임시 파일에서 병합·검증을 모두 마친 뒤에만 바꾼다 —
+      #   하나라도 실패하면 충돌 상태를 그대로 두고 종전처럼 멈춘다. 그 밖의 파일이 섞인 충돌은 이 분기에 오지 않는다.
+      _sb=""; _so=""; _st=""; _sr=""; _ib=""; _io=""; _it=""; _ir=""; _ctm=""
+      _sm_stop() {  # _sm_stop [사유] — 임시 파일을 지우고 충돌 상태를 둔 채 중단한다
+        rm -f "$_sb" "$_so" "$_st" "$_sr" "$_ib" "$_io" "$_it" "$_ir" "$_ctm"
+        [[ -n "${1:-}" ]] && printf 'archive: %s\n' "$1" >&2
+        printf 'archive: merge 실패 — conflict resolve 후 재실행\n' >&2; _merge_dump; exit 1
+      }
+      _sm_tmp() {  # 가드된 임시 파일 경로를 stdout 으로 낸다
+        local _t
+        _t="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+        [[ -n "$_t" && -f "$_t" ]] || { echo "archive: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+        printf '%s' "$_t"
+      }
+      _hasidx=0; _hassm=0; _hasct=0
+      printf '%s\n' "$_conf" | grep -qxF -e "$_IDX" && _hasidx=1
+      printf '%s\n' "$_conf" | grep -qxF -e "$_SM" && _hassm=1
+      printf '%s\n' "$_conf" | grep -qxF -e "$_CT" && _hasct=1
+      if (( _hasct )); then
+        # main 쪽 버전(stage 2)이 있어야 하고 첫 줄이 `# Current Task` 여야 한다 (delete/modify 충돌은 stage 2 가 없다).
+        git ls-files -u -- "$_CT" | awk '{print $3}' | grep -qx 2 \
+          || _sm_stop "CURRENT_TASK.md main 쪽 버전이 없어 자동 해소하지 않습니다"
+        _ctm="$(_sm_tmp)" || _sm_stop
+        git show ":2:$_CT" > "$_ctm" 2>/dev/null || _sm_stop "stage 추출 실패: $_CT"
+        [[ "$(head -n 1 "$_ctm")" == "# Current Task" ]] || _sm_stop "CURRENT_TASK.md 형식 오류"
+      fi
+      if (( _hassm )); then
+        # stage 1(공통 조상)·2·3 이 모두 있어야 한다. add/add 는 merge-file --union 이 공통 헤더를 한 번만 남겨
+        # 형식 검증을 통과해 버리므로 자동 수용 근거가 없다 — 멈춘다.
+        _stg="$(git ls-files -u -- "$_SM" | awk '{print $3}' | sort -u | tr '\n' ' ')"
+        [[ "$_stg" == "1 2 3 " ]] || _sm_stop "stage_metrics.tsv 공통 조상 또는 한쪽 버전이 없어(stage: ${_stg:-없음}) 자동 해소하지 않습니다"
+        _sb="$(_sm_tmp)" || _sm_stop; _so="$(_sm_tmp)" || _sm_stop; _st="$(_sm_tmp)" || _sm_stop; _sr="$(_sm_tmp)" || _sm_stop
+        git show ":1:$_SM" > "$_sb" 2>/dev/null && git show ":2:$_SM" > "$_so" 2>/dev/null && git show ":3:$_SM" > "$_st" 2>/dev/null \
+          || _sm_stop "stage 추출 실패: $_SM"
+        git merge-file -p --union "$_so" "$_sb" "$_st" > "$_sr" || _sm_stop "stage_metrics.tsv 줄 합집합 병합 실패"
+        # 형식: 첫 줄 정확한 헤더 1개, 이후 `#` 줄 없음, 모든 행 탭 4필드(빈 줄은 0필드라 함께 거부).
+        _bad="$(awk -F'\t' 'NR==1 { if ($0 != "# short_title\tfrom_status\tto_status\tepoch") { print NR ": " substr($0, 1, 40); exit } next }
+          /^#/ || NF != 4 { print NR ": " substr($0, 1, 40); exit }
+          END { if (NR == 0) print "0: (빈 파일)" }' "$_sr")"
+        [[ -z "$_bad" ]] || _sm_stop "stage_metrics.tsv 형식 오류: $_bad"
+      fi
+      if (( _hasidx )); then
+        _ib="$(_sm_tmp)" || _sm_stop; _io="$(_sm_tmp)" || _sm_stop; _it="$(_sm_tmp)" || _sm_stop; _ir="$(_sm_tmp)" || _sm_stop
+        git show ":1:$_IDX" > "$_ib" 2>/dev/null && git show ":2:$_IDX" > "$_io" 2>/dev/null && git show ":3:$_IDX" > "$_it" 2>/dev/null \
+          || _sm_stop "stage 추출 실패: $_IDX"
+        bash "$SCRIPT_DIR/merge_fr_index.sh" "$_ib" "$_io" "$_it" > "$_ir" \
+          || _sm_stop "FUTURE_REQUESTS.md 행 집합 병합도 실패했습니다"
+      fi
+      if (( _hassm )); then
+        cp "$_sr" "$_SM" && git add "$_SM" \
+          || _sm_stop "stage_metrics.tsv 병합 결과 반영 실패 — git status 로 확인 후 수동 resolve 하고 git commit --no-edit, 또는 git merge --abort"
+      fi
+      if (( _hasct )); then
+        cp "$_ctm" "$_CT" && git add "$_CT" \
+          || _sm_stop "CURRENT_TASK.md 병합 결과 반영 실패 — git status 로 확인 후 수동 resolve 하고 git commit --no-edit, 또는 git merge --abort"
+      fi
+      if (( _hasidx )); then
+        cp "$_ir" "$_IDX" && git add "$_IDX" \
+          || _sm_stop "인덱스 병합 결과 반영 실패 — git status 로 확인 후 수동 resolve 하고 git commit --no-edit, 또는 git merge --abort"
+      fi
+      _nv=""; if lifecycle_needs_hook_bypass; then _nv="--no-verify"; fi
+      RD_LIFECYCLE_BYPASS_REASON=lifecycle git commit ${_nv:+"$_nv"} --no-edit -m "merge: $SLUG (autopilot 완료)" >/dev/null \
+        || _sm_stop "충돌은 해결했으나 merge 커밋이 실패했습니다. git status 로 확인한 뒤 git commit --no-edit 으로 merge 를 마치고 archive.sh 를 재실행하거나, git merge --abort 로 되돌리십시오"
+      [[ -n "$_nv" ]] && lifecycle_notify_hook_bypass archive
+      if (( _hassm )); then printf 'archive: stage_metrics.tsv 충돌을 줄 합집합으로 해결했습니다 (git merge-file --union)\n'; fi
+      if (( _hasct )); then printf 'archive: CURRENT_TASK.md 충돌을 main 쪽으로 해결했습니다 (발행이 이 파일을 기준 상태로 되돌립니다)\n'; fi
+      if (( _hasidx )); then printf 'archive: FUTURE_REQUESTS.md 충돌을 행 집합 병합으로 해결했습니다 (merge_fr_index.sh)\n'; fi
+      rm -f "$_sb" "$_so" "$_st" "$_sr" "$_ib" "$_io" "$_it" "$_ir" "$_ctm"
     else
-      printf 'archive: merge 실패 — conflict resolve 후 재실행\n' >&2; exit 1
+      printf 'archive: merge 실패 — conflict resolve 후 재실행\n' >&2; _merge_dump; exit 1
     fi
   fi
 fi
@@ -1029,9 +1139,9 @@ elif [[ "$WT_COUNT_BEFORE" -gt 0 ]]; then
       _archive_caller_norm="$(cd "$RD_ARCHIVE_CALLER_WT" 2>/dev/null && pwd -P)" || _archive_caller_norm="$RD_ARCHIVE_CALLER_WT"
       _archive_frwt_norm="$(cd "$fr_wt" 2>/dev/null && pwd -P)" || _archive_frwt_norm="$fr_wt"
       if [[ "$_archive_frwt_norm" == "$_archive_caller_norm" ]]; then
-        printf 'archive: %s 는 이 archive 를 호출한 worktree 라 제거하지 않습니다 — 기본 worktree 에서 정리하십시오\n' "$fr_wt" >&2
+        printf 'archive: %s 는 이 archive 를 호출한 worktree 라 제거하지 않습니다 — 기본 체크아웃에서 `rd task list` 를 실행하면 세션이 이 worktree 를 나온 뒤 자동으로 정리됩니다\n' "$fr_wt" >&2
         cleanup_add "worktree" "$fr_wt" \
-          "실행 중인 worktree(호출자)라 이 프로세스에서 제거하지 않았습니다. 기본 worktree 에서 정리하십시오" \
+          "실행 중인 worktree(호출자)라 이 프로세스에서 제거하지 않았습니다. 기본 체크아웃에서 rd task list 를 실행하면 세션이 이 worktree 를 나온 뒤 자동으로 정리됩니다" \
           "git -C $(printf '%q' "$PUBLISH_WT") worktree remove $(printf '%q' "$fr_wt")"
         continue
       fi

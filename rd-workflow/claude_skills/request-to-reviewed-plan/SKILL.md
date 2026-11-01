@@ -107,6 +107,25 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
    - 캡처 실패 시 경고만 (skill 진행 차단 안 함) — CLI 가 fail-open (exit 0) 으로 처리
 2. 명시적 원문 부재 시: 캡처 생략 + 경고 (Step 2와 동일 정책)
 
+## Status 전이
+
+이 skill 은 spec/plan review 종결까지의 Status 를 `bash rd-workflow/scripts/rd task set-status "<값>"` 으로 기록한다. 허용 전이는 `rd` CLI 가 판정하고(`_task_common.sh`), 이 절은 어느 시점에 어느 값으로 옮기는지를 정한다. 전이는 되돌릴 수 있는 로컬 작업이므로 묻지 않고 진행한다.
+
+| 시점 | 옮길 값 | 출발 Status |
+|---|---|---|
+| REQUEST review 세션을 만들기 직전 | `REQUEST review 대기` | `대기 중` |
+| REQUEST review 가 `이의 없음` 으로 종결되고 spec/plan 작성을 시작할 때 | `spec/plan 작성 중` | `REQUEST review 대기` |
+| spec/plan review 세션을 만들기 직전 | `spec/plan review 대기` | `spec/plan 작성 중` |
+| spec/plan review 가 `이의 없음` 으로 종결될 때 | `구현 대기` | `spec/plan review 대기` |
+| 종결 뒤 spec/plan 변경이 필요해질 때 | `spec/plan 작성 중` | `구현 대기` |
+
+- 각 행은 현재 Status 가 그 행의 출발 상태일 때만 실행한다. 이미 목표 값이면 건너뛴다. 그 밖의 값이면 전이하지 않고 아래 재진입 규칙으로 처리한다. 전이표 위반(exit 4)을 `--force` 로 우회하지 않는다.
+- `구현 대기` 전이 직후 종결 기록을 `CURRENT_TASK.md` 의 `## Notes` 에 한 줄 남긴다 (`implement-reviewed-plan` 이 이 기록과 현재 spec/plan 을 비교한다):
+  `spec/plan review 종결: <review 세션 경로> | spec=<git hash-object <spec 경로> 출력> | plan=<git hash-object <plan 경로> 출력>`
+  이전 종결 기록이 있으면 새 기록으로 바꾼다.
+- `구현 대기` 에서 이 skill 이 끝난다. `구현 중` 전이는 `/implement-reviewed-plan` 이 착수할 때 한다.
+- 재진입은 현재 Status 의 단계부터 재개한다: `REQUEST review 대기` → REQUEST review 계속 / `spec/plan 작성 중` → spec·plan 작성 계속 / `spec/plan review 대기` → spec/plan review 계속 / `구현 대기` → 사용자가 spec/plan 변경 또는 재리뷰를 요청했거나 `/implement-reviewed-plan` 이 증거 무효로 재리뷰를 안내해 온 경우에는 표의 마지막 행(`spec/plan 작성 중`)을 먼저 실행해 (내용 수정 없이도) 작성·재리뷰로 진행하고 재리뷰 수렴 뒤 새 종결 기록을 남긴다. 그런 요청이 없을 때만 `/implement-reviewed-plan` 을 안내 / `구현 중` 이후 → 이 skill 의 대상이 아니므로 중단한다. `대기 중` 에서 시작하면 첫 행부터 실행한다.
+
 ## Execution rules
 
 - Keep the original scope. Do not widen the request.
@@ -118,6 +137,7 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
 - Use `bash rd-workflow/scripts/prepare_review_pipeline.sh spec-plan` or the explicit spec / plan paths plus `bash rd-workflow/scripts/run_review_turn.sh ...` for spec / plan review.
 - **Superpowers가 사용 가능하면 반드시 `brainstorming`과 `writing-plans`를 사용한다.** 사용 불가능할 때만 같은 산출물을 직접 작성한다.
 - Update `CURRENT_TASK.md` at the major checkpoints.
+- Status 는 위 `## Status 전이` 절을 따라 기록한다.
 - Stop before implementation.
 - `/planning-design-intake`에서 REQUEST.md가 이미 생성된 경우, REQUEST.md를 읽고 REQUEST review부터 시작한다. REQUEST를 처음부터 새로 작성하지 않는다.
 - REQUEST.md에 `## Design Reference Memo`가 있으면, spec 작성 시 해당 내용을 spec의 `## Design Reference` 섹션으로 승격한다.

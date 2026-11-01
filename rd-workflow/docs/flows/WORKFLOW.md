@@ -67,7 +67,7 @@
 | 기존 FR | 있으면 같은 커밋에서 done (인덱스 삭제 + 상세 status) | archive content commit 에서 done | 현행 |
 | 사용자 가시 결과 | 종료 보고 블록 | 종료 보고 + archive 출력 | 현행 |
 
-**`archive.sh` 는 작업 worktree 안에서 호출해도 됩니다.** 발행 대상이 기본 브랜치 worktree(main worktree)가 아니면 그쪽으로 `cd` 해 자기 자신을 재실행하며, 원래 호출한 worktree 는 정리하지 않고 보존합니다. `--task <slug>` 를 명시하면 어느 위치에서 불러도 그 작업을 대상으로 삼습니다.
+**`archive.sh` 는 작업 worktree 안에서 호출해도 됩니다.** 발행 대상이 기본 브랜치 worktree(main worktree)가 아니면 그쪽으로 `cd` 해 자기 자신을 재실행하며, 원래 호출한 worktree 는 정리하지 않고 보존하며(skipped-self) 색인에 `state=cleanup-pending` 행을 남깁니다. 이 호출자 worktree·로컬 fr 브랜치·색인 행은 이후 기본 체크아웃에서 실행하는 `rd task list` 가 안전할 때 지연 정리합니다. 안전 조건은 그 worktree 안에 내 계정 프로세스의 CWD 가 없을 것(점유·조회 불가는 보류), locked·미커밋(untracked 포함) 변경이 없을 것, 현재 브랜치 tip 기준 발행 증거가 유지될 것입니다. 결과는 `정리됨` / `정리 보류`(사유·재시도 안내) / `정리 부분 실패`(사유·복구 명령)로 구분해 출력합니다. 다른 계정(root 포함) 프로세스의 CWD 는 조회 범위 밖입니다. `--task <slug>` 를 명시하면 어느 위치에서 불러도 그 작업을 대상으로 삼습니다.
 
 **merge 만으로는 발행 완료가 아닙니다.** `archive.sh` 는 merge 이후 tag·기본 브랜치 push·tag push 를 별도 단계로 수행하므로, merge 직후 중단되거나 push 가 실패해도 "merge 됐다"는 사실만으로는 발행이 끝난 게 아닙니다. `rd task list`(및 `--rebuild`)는 아래 세 상태로 구별해 보여줍니다.
 
@@ -75,7 +75,32 @@
 |---|---|---|---|
 | 진행 중 | fr ref 가 기본 브랜치에 merge 되지 않음 | 진행 중 | 하지 않음 |
 | **발행 확인 필요** | merge 됐지만 archive tag 가 없거나 원격 반영을 확인할 수 없음 | ⚠ 발행 확인 필요 | **하지 않음** — `archive.sh --task <slug>` 재실행으로 확인·재개를 안내 |
-| 정리 잔여 | merge + 이 작업의 발행 commit 을 가리키는 archive tag + (원격 모드면) 그 commit 이 원격 기본 브랜치에 포함됨이 확인됨 | 정리 대기 | 정리 명령 제시 |
+| 정리 잔여 | merge + 이 작업의 발행 commit 을 가리키는 archive tag + (원격 모드면) 그 commit 이 원격 기본 브랜치에 포함됨이 확인됨 | 정리 대기 | 정리 명령 제시. 호출자 worktree 는 기본 체크아웃의 `rd task list` 가 지연 정리 |
+
+### 문서 이관 (promote 단계)
+
+`promote.sh` 를 부른 체크아웃(P)에 커밋되지 않은 채 있던 이 작업의 문서는 fr 브랜치로 따라옵니다. 착수 커밋 직후, 세션 기동 전에 별도 커밋(`chore(lifecycle): <slug> 기획 문서 이관 — REQUEST·spec·plan`)으로 싣습니다. final diff review 가 REQUEST·spec·plan 을 볼 수 있게 하려는 단계이며, 사람이 사후에 수동 커밋하지 않아도 됩니다.
+
+**이관 대상은 파일 이름으로 귀속이 확정되는 것뿐입니다.** 날짜·시각 접두는 고정 폭 숫자이고, 부분 일치는 쓰지 않습니다(`foo` 의 문서와 `foo-bar` 의 문서는 서로 섞이지 않습니다).
+
+| 종류 | 위치와 이름 |
+|---|---|
+| REQUEST | `REQUEST.md` — `## Source FR` 집합이 이 작업의 source-fr 와 같을 때만 |
+| spec·change-spec | `rd-workflow-workspace/specs/{base,changes}/YYYY-MM-DD-HHMM-<slug>-{spec,change-spec}.md` |
+| plan | `rd-workflow-workspace/plans/YYYY-MM-DD-HHMM-<slug>-plan.md` |
+| raw-capture | `rd-workflow-workspace/raw-captures/YYYY-MM-DD-{request,spec,plan}-<slug>.md` |
+| spec/plan review 세션 | `rd-workflow-workspace/handoffs/review_pipeline/YYYYMMDD_HHMMSS_HHMM-<slug>-spec-plan-review/` |
+
+request-review 세션은 이름과 `SESSION.md` 에 slug 가 없어 귀속을 확정할 수 없으므로 이관하지 않습니다.
+
+**P 쪽에서 허용하는 Git 상태**는 untracked 파일과, `REQUEST.md` 한정으로 「working tree 만 수정, index 는 HEAD 와 같음」입니다. 이미 커밋된 파일은 후보가 아닙니다. tracked 수정 spec·plan, staged `REQUEST.md`, 다른 작업의 REQUEST 는 이관하지 않고 원본을 그대로 둔 채 경고합니다. 대상 worktree(T) 쪽에서도 쓸 경로의 index 가 HEAD 와 같을 때만 씁니다. T 에 사용자가 staged 한 내용이 있으면 건너뜁니다. T 의 해당 경로가 디렉터리나 링크처럼 일반 파일이 아니면 부재로 보지 않고 건너뜁니다(안의 사용자 파일을 커밋하지 않기 위함).
+
+- **worktree 모드**: 복사(같은 디렉터리 임시 파일 → 검증 → 이름 변경) → 경로를 한정한 커밋 → 정리 직전에 원본과 방금 만든 커밋의 내용을 바이트 비교 → 같을 때만 P 의 원본을 정리합니다. `REQUEST.md` 는 커밋된 템플릿으로 복원하고 나머지는 삭제합니다. 비교가 다르면 그 파일은 보존하고 경고합니다. 정리하지 않으면 이후 `archive.sh` merge 가 untracked 파일 충돌로 막힐 수 있어서 넣은 단계입니다.
+- **`--no-worktree`**: `git switch` 가 파일을 그대로 들고 가므로 복사·정리 없이 같은 후보를 커밋만 합니다. 이관이 실패해 체크아웃이 이 작업의 `fr/<slug>` 에 남아 있어도 같은 `--no-worktree` 명령 재실행을 허용합니다(다른 작업의 체크아웃에서는 기존대로 거부). 체크아웃이 이 작업의 `fr/<slug>` 가 아닌데 `--no-worktree` 로 부르면(다른 worktree 에 작업이 살아 있는 경우 등) 기본 브랜치에 커밋하지 않고, 후보마다 보류 사유와 복구 방법(그 worktree 안에서 옮기거나 `--no-worktree` 없이 재실행)을 출력합니다.
+- **후보가 없으면** 커밋하지 않고 `promote: 문서 이관 — 대상 없음` 한 줄만 냅니다.
+- **결과 요약**은 건수·대상 브랜치·커밋 해시와 파일별 `이관 완료`·`건너뜀(사유)`·`원본 정리` 결과를 출력합니다.
+
+**실패하면 `exit 4` 로 끝납니다.** 「착수 성공 · 문서 이관 실패」를 별도 문구로 알리고, 세션을 기동하지 않으며 원본을 지우지 않습니다. 복구는 **같은 명령을 다시 실행**하는 것입니다. 이관 단계는 판정과 무관하게 매번 후보를 다시 계산합니다. 복사만 끝난 상태는 재복사 없이 커밋하고, 커밋은 됐지만 원본이 남은 상태는 커밋 없이 정리만 이어받습니다. 살아 있는 작업(`duplicate`)이라도 이관할 후보가 있으면 이어받고, 건너뜀 후보만 있으면 사유를 출력한 뒤 기존처럼 "이미 진행 중" 으로 종료합니다(exit 1).
 
 ### 세션 기동
 
@@ -246,7 +271,9 @@ autopilot 에서는 이 분기가 모드 A(`full`)/모드 B(`standard`) 로 나�
 
 ### `아카이브 보류` — 리뷰 종결과 발행 사이
 
-`아카이브 보류` 는 canonical Status 10종 중 하나이며, 의미는 「**리뷰 종결·발행 대기**」로 **완료가 아닙니다.** 전이는 `diff review 대기 → 아카이브 보류 → 완료` 이고, 리뷰 후 변경이 필요해지면 `아카이브 보류 → 구현 중` 으로 되돌아갑니다(그러면 마커의 트리 해시가 어긋나 재리뷰·재seal 없이는 발행할 수 없습니다).
+`아카이브 보류` 는 canonical Status 10종 중 하나이며, 의미는 「**리뷰 종결·발행 대기**」로 **완료가 아닙니다.** 전이는 `diff review 대기 → 아카이브 보류 → 완료` 이고, 리뷰 후 변경이 필요해지면 `아카이브 보류 → 구현 중` 으로 되돌아갑니다(그러면 마커의 트리 해시가 어긋나 재리뷰·재seal 없이는 발행할 수 없습니다). 외부 검증을 기다리며 작업물을 커밋해야 할 때는 `아카이브 보류 → 검증 중` 으로 전이합니다.
+
+**외부 검증 대기 절차**: `아카이브 보류` → `검증 중` → 작업물 커밋 → 검증 후 `검증 중` → `diff review 대기` → (보호 트리가 바뀌었으면 재seal) → `아카이브 보류` → 발행. 이미 작성돼 워킹트리에 있던 파일을 그대로 커밋하면 seal 의 보호 트리 해시는 바뀌지 않고, 보호 트리 내용을 바꾸면 재seal 이 필요합니다. `archive.sh` 는 발행 대상 커밋(fr tip, no-fr 은 HEAD)의 task-state Status 가 `아카이브 보류` 가 아니면 merge·push 전에 거부하므로 `검증 중` 같은 대기 상태에서는 발행되지 않습니다. 사람이 이 검사만 건너뛰려면 `--allow-status-mismatch "<사유>"` 를 주며 사유는 `review-skip-audit.log` 에 기록됩니다. 이 플래그는 `--force-skip-review-check` 와 독립이라 서로를 우회하지 않습니다. no-fr 은 metadata cleanup 뒤 push 가 실패하면 HEAD 의 Status 가 `대기 중` 이 되어, 재실행에 두 플래그가 모두 필요합니다(거부 안내가 이 경우를 알려 줍니다). 발행 시 락을 `rd task list` 의 지연 정리가 잡고 있으면 `archive.sh` 는 상한(`RD_ARCHIVE_LOCK_WAIT_MAX`, 기본 60초) 안에서 기다리고, 정리는 발행 대기 표지를 보면 남은 행을 양보합니다. 리뷰 세션 종결 뒤 커밋 게이트는 Status `구현 중`·`검증 중` 의 커밋을 허용하고 그 밖의 Status 는 종전대로 막습니다.
 
 **정상 경로의 순서가 계약입니다 — 리뷰 종결 → seal → 상태 전이 → 기록 커밋 → 발행.**
 

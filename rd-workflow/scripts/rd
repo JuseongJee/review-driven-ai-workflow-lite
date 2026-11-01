@@ -105,6 +105,39 @@ _rd_seal_audit_has() {
   grep -q "legacy-unverified: .* | rd-workflow-workspace/handoffs/review_pipeline/${sid}\$" "$audit" 2>/dev/null
 }
 
+# _rd_seal_reason_hint <사유>: 거부 사유별 복구 안내를 stderr 에 덧붙입니다.
+# 판정은 하지 않습니다 — 판정은 `_guard_common.sh` 의 `is_review_session_resolved` 가 하고,
+# 여기서는 그 사유 문자열의 접두만 읽어 사람이 무엇을 고칠지 알려 줍니다. 형식 오류가 아닌
+# 거부(실제 미해결 이의·진행 중 상태·파일 부재)에 `- 없음` 교체를 권하면 실제 이의를 지우게
+# 되므로 사유 종류별로 나눕니다.
+_rd_seal_reason_hint() {
+  local reason="$1" value=""
+  case "$reason" in
+    open-issues-prose-before-marker:*|open-issues-marker-continued:*)
+      value="${reason#*:}"
+      echo "  읽힌 값: ${value}" >&2
+      echo "  기대 형식: CHECKPOINT.md 의 'Open Issues' 첫 줄이 정확히 '- 없음' 이고, 종결 경위는 그 아래 빈 줄 한 줄을 띄운 문단입니다." >&2
+      echo "  복구: 이의가 모두 해소된 경우에만 첫 줄을 '- 없음' 으로 고치고 설명은 빈 줄 아래 문단으로 옮긴 뒤 다시 실행하십시오. 이의가 남았다면 리뷰를 재개해 해소하십시오." >&2
+      ;;
+    open-issues-empty|open-issues-missing)
+      echo "  기대 형식: CHECKPOINT.md 의 'Open Issues' 첫 줄이 정확히 '- 없음' 이고, 종결 경위는 그 아래 빈 줄 한 줄을 띄운 문단입니다." >&2
+      echo "  복구: 이의가 모두 해소된 경우에만 'Open Issues' 절에 '- 없음' 을 쓰고 다시 실행하십시오. 이의가 남았다면 리뷰를 재개해 해소하십시오." >&2
+      ;;
+    open-issues-unresolved:*)
+      value="${reason#*:}"
+      echo "  읽힌 값: ${value}" >&2
+      echo "  이 항목은 종결 마커('- 없음')가 아닌 리스트 항목입니다. 실제 이의라면 지우지 말고 리뷰를 재개해 해소하십시오." >&2
+      echo "  마커 표기 오류(예: '- 없음。')라면 이의가 모두 해소된 경우에만 '- 없음' 으로 고친 뒤 다시 실행하십시오." >&2
+      ;;
+    status:*|session-missing)
+      echo "  세션이 아직 진행 중이거나 없습니다. 리뷰를 종결(최신 Reviewer 턴 '이의 없음', Status awaiting-user 또는 closed)한 뒤 다시 실행하십시오." >&2
+      ;;
+    checkpoint-missing|parser-missing:*)
+      echo "  파일 배치 문제입니다. CHECKPOINT.md 또는 hooks 스크립트(_open_issues.awk) 설치를 복구한 뒤 다시 실행하십시오." >&2
+      ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # producer — rd review seal (§3.2, §3.4)
 # ---------------------------------------------------------------------------
@@ -161,6 +194,7 @@ rd_review_seal() {
   # Status 인지 Open Issues 인지 알려면 판정 awk 를 직접 읽어야 했다.
   if ! is_review_session_resolved "$session_path"; then
     echo "review seal: 세션이 종결되지 않았습니다 (${RD_REVIEW_UNRESOLVED_REASON:-사유 불명})." >&2
+    _rd_seal_reason_hint "${RD_REVIEW_UNRESOLVED_REASON:-}"
     return 1
   fi
 
@@ -240,6 +274,15 @@ rd_review_seal() {
     }
     if [[ "$reviewed_hash" != "$cur_hash" ]]; then
       echo "review seal: 리뷰 종결 후 보호 경로가 변경되었습니다 — 재리뷰가 필요합니다." >&2
+      return 1
+    fi
+    # 검사 5 — 이 트리의 새 검증 증거 (verify_record.sh). legacy 세션은 승인 트리 자체가 없어 대상 아님.
+    if ! declare -f rd_seal_evidence_check >/dev/null 2>&1; then
+      echo "review seal: 검증 증거 함수(_guard_common.sh 의 rd_seal_evidence_check) 를 불러올 수 없습니다 — 판정 불가로 차단합니다." >&2
+      return 1
+    fi
+    if ! rd_seal_evidence_check "$cur_hash"; then
+      echo "${RD_EVIDENCE_FAIL_MSG}" >&2
       return 1
     fi
     verified="yes"
@@ -357,6 +400,7 @@ _rd_status_pending_guidance() {
   echo "아카이브 보류 — 리뷰는 끝났고 발행이 남았습니다." >&2
   echo "  ${advice}" >&2
   echo "  되돌리기: bash rd-workflow/scripts/rd task set-status \"구현 중\"" >&2
+  echo "  외부 검증 대기: bash rd-workflow/scripts/rd task set-status \"검증 중\"" >&2
   [[ "$legacy" == "1" ]] && _rd_seal_legacy_warning
   return 0
 }

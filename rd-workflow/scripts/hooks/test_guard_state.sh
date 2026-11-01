@@ -105,25 +105,6 @@ assert_eq() {
   fi
 }
 
-assert_fn_return() {
-  local label="$1" fn_name="$2" fixture="$3" expected_rc="$4"
-  local actual_rc=0
-  (
-    project_root="$fixture"
-    export project_root
-    export TASK_STATE_PATH="$fixture/rd-workflow-workspace/.lifecycle/task-state"
-    source "$fixture/rd-workflow/scripts/hooks/_guard_common.sh"
-    "$fn_name"
-  ) 2>/dev/null || actual_rc=$?
-  if [[ "$expected_rc" == "$actual_rc" ]]; then
-    echo "[PASS] $label (rc=$actual_rc)"
-    PASS=$((PASS + 1))
-  else
-    echo "[FAIL] $label — expected rc=$expected_rc actual rc=$actual_rc" >&2
-    FAIL=$((FAIL + 1))
-  fi
-}
-
 # ---------------------------------------------------------------------------
 # Fixture 1: task-state(status=구현 중) + CURRENT_TASK.md(Status=완료)
 #   get_task_status = "구현 중" — task-state 우선, 뷰 무시 증명
@@ -186,42 +167,6 @@ echo "--- fixture 4: legacy 체인 (CURRENT_TASK '-' → active-fr fallback) ---
 
   result="$(call_guard_fn "$f" "get_current_short_title")"
   assert_eq "fixture 4: task-state 없음 + 뷰 '-' + active-fr(baz) → 'baz'" "baz" "$result"
-  cleanup_fixture
-}
-
-# ---------------------------------------------------------------------------
-# Fixture 5: commit_has_archive_signal AS2 검증
-#   5a: task-state(status=대기 중, short-title=-) → return 0 (archive 신호)
-#   5b: task-state(status=구현 중) → return 1 (archive 신호 없음)
-# ---------------------------------------------------------------------------
-echo "--- fixture 5: commit_has_archive_signal AS2 ---"
-{
-  # 5a: 대기 중 + short-title=- → archive 신호 있음 (return 0)
-  f="$(make_base_fixture)" || { echo "test_guard_state.sh:200: make_base_fixture 실패 (rc=$?)" >&2; exit 1; }
-  _current_fixture="$f"
-  write_task_state "$f" "대기 중" "-"
-  write_current_task "$f" "대기 중" "-"
-  # git repo 초기화 (commit_has_archive_signal이 git diff --cached 호출)
-  git -C "$f" init -q 2>/dev/null
-  git -C "$f" config user.email "test@test.com" 2>/dev/null
-  git -C "$f" config user.name "Test" 2>/dev/null
-
-  assert_fn_return "fixture 5a: task-state(대기 중, -) → archive 신호(return 0)" \
-    "commit_has_archive_signal" "$f" "0"
-  cleanup_fixture
-}
-{
-  # 5b: 구현 중 → archive 신호 없음 (return 1)
-  f="$(make_base_fixture)" || { echo "test_guard_state.sh:215: make_base_fixture 실패 (rc=$?)" >&2; exit 1; }
-  _current_fixture="$f"
-  write_task_state "$f" "구현 중" "some-task"
-  write_current_task "$f" "구현 중" "some-task"
-  git -C "$f" init -q 2>/dev/null
-  git -C "$f" config user.email "test@test.com" 2>/dev/null
-  git -C "$f" config user.name "Test" 2>/dev/null
-
-  assert_fn_return "fixture 5b: task-state(구현 중) → archive 신호 없음(return 1)" \
-    "commit_has_archive_signal" "$f" "1"
   cleanup_fixture
 }
 
@@ -607,6 +552,69 @@ err_has() {
     "$(force_skip_rc "$f" "$f/skip-as-dir")"
   assert_eq "fixture 10c: 차단 사유 안내" "yes" \
     "$(err_has "audit log 기록에 실패했습니다" "$(force_skip_err "$f" "$f/skip-as-dir")")"
+  cleanup_fixture
+}
+
+# ---------------------------------------------------------------------------
+# Fixture 11: archive_status_precheck — 발행 대상 커밋의 Status 게이트 (D3, T7b·T7c)
+#   잡는 실수: 허용값 비교가 느슨함 / 판독 불가를 통과로 흘림 / 사유 없는 우회 /
+#   audit 기록이 실패했는데 발행이 계속됨. 판독은 워킹트리가 아니라 대상 커밋입니다.
+# ---------------------------------------------------------------------------
+echo "--- fixture 11: archive_status_precheck ---"
+write_status_state() {  # <fixture> <status|-(키 없음)> — task-state 를 쓰고 fr/x 를 HEAD 로 옮긴다
+  local f="$1" st="$2"
+  {
+    printf 'schema=1\nshort-title=t9task\n'
+    [[ "$st" == "-" ]] || printf 'status=%s\n' "$st"
+    printf 'fr-branch=fr/x\nworktree-path=null\nsource-fr=-\n'
+  } > "$f/rd-workflow-workspace/.lifecycle/task-state"
+  seal_commit "$f"
+  git -C "$f" branch -f fr/x HEAD >/dev/null 2>&1
+}
+status_rc() {  # <fixture> <allow> <reason> <audit> — rc 를 출력한다
+  local f="$1" rc=0
+  (
+    project_root="$f"; export project_root
+    export TASK_STATE_PATH="$f/rd-workflow-workspace/.lifecycle/task-state"
+    source "$f/rd-workflow/scripts/hooks/_guard_common.sh"
+    archive_status_precheck "$2" "$3" "t9task" "$4" "fr/x"
+  ) >/dev/null 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+{
+  f="$(make_seal_fixture)" || { echo "test_guard_state.sh: make_seal_fixture 실패 (rc=$?)" >&2; exit 1; }
+  _current_fixture="$f"
+  audit="$f/audit/status.log"
+
+  write_status_state "$f" "아카이브 보류"
+  assert_eq "fixture 11a: Status=아카이브 보류 → 통과" "0" "$(status_rc "$f" 0 "" "$audit")"
+  assert_eq "fixture 11a: 통과 시 audit 를 남기지 않음" "no" "$([[ -e "$audit" ]] && echo yes || echo no)"
+
+  write_status_state "$f" "검증 중"
+  assert_eq "fixture 11b: Status=검증 중 → 차단" "1" "$(status_rc "$f" 0 "" "$audit")"
+  write_status_state "$f" "아카이브 보류 "   # 꼬리 공백 — 정확 일치만 허용
+  assert_eq "fixture 11b: 허용값은 정확 일치만 (꼬리 공백 → 차단)" "1" "$(status_rc "$f" 0 "" "$audit")"
+
+  # T7b — 판독 불가는 차단 (fail-closed)
+  write_status_state "$f" "-"
+  assert_eq "fixture 11c(T7b): status 키 없음 → 차단" "1" "$(status_rc "$f" 0 "" "$audit")"
+  git -C "$f" rm -q --cached rd-workflow-workspace/.lifecycle/task-state && git -C "$f" commit -qm "no state" \
+    && git -C "$f" branch -f fr/x HEAD >/dev/null 2>&1
+  assert_eq "fixture 11c(T7b): task-state 파일 없음 → 차단" "1" "$(status_rc "$f" 0 "" "$audit")"
+
+  # 우회 — 사유 필수, audit 에 [status:<값>] 기록
+  write_status_state "$f" "검증 중"
+  assert_eq "fixture 11d: allow=1 + 사유 → 통과" "0" "$(status_rc "$f" 1 "외부 검증 대기" "$audit")"
+  assert_eq "fixture 11d: audit 줄에 [status:검증 중] 와 사유 기록" "yes" \
+    "$(grep -F '[status:검증 중] 외부 검증 대기' "$audit" >/dev/null 2>&1 && echo yes || echo no)"
+  assert_eq "fixture 11e: allow=1 + 사유 없음 → 차단" "1" "$(status_rc "$f" 1 "" "$f/audit/none.log")"
+
+  # T7c — audit 기록 실패는 차단 (부모 경로가 일반 파일이라 mkdir -p 가 실패)
+  printf 'x\n' > "$f/plainfile"
+  assert_eq "fixture 11f(T7c): audit 기록 불가 → 차단" "1" "$(status_rc "$f" 1 "외부 검증 대기" "$f/plainfile/sub/status.log")"
+  # append 실패(audit 파일 자리에 디렉터리)도 차단 — mkdir 은 성공하므로 위와 다른 분기
+  mkdir -p "$f/status-as-dir"
+  assert_eq "fixture 11g(T7c): audit append 불가 → 차단" "1" "$(status_rc "$f" 1 "외부 검증 대기" "$f/status-as-dir")"
   cleanup_fixture
 }
 

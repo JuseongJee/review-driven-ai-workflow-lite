@@ -50,10 +50,12 @@ session_herdr_available() {
 
 # 내부 헬퍼: 이 머신에 `timeout` 명령이 없으므로 백그라운드 + 폴링으로 유한 시간을
 # 강제한다. stdout 은 $2 파일에 남기고, 리턴 값은 명령의 종료 코드(타임아웃이면 124).
+#   stderr 는 기본으로 버린다. herdr 는 오류 JSON(`{"error":{"code":..}}`)을 **stderr** 로
+#   내므로(2026-10-29 실측), 코드가 필요한 호출부는 `RD_SL_ERRFILE=<파일>` 을 앞에 붙여 받는다.
 _session_launch_run_with_timeout() {  # <timeout-secs> <outfile> <cmd...>
   local timeout_secs="$1" outfile="$2"; shift 2
   : > "$outfile"
-  ( "$@" >"$outfile" 2>/dev/null ) &
+  ( "$@" >"$outfile" 2>"${RD_SL_ERRFILE:-/dev/null}" ) &
   local pid=$!
   local max_checks=$(( timeout_secs * 5 ))
   [[ "$max_checks" -lt 1 ]] && max_checks=1
@@ -83,6 +85,43 @@ _session_launch_parse_tab_id() {  # <json-file>
   grep -o '"tab_id":"[^"]*"' "$1" 2>/dev/null | head -1 | sed -E 's/.*"tab_id":"([^"]*)".*/\1/'
 }
 
+# 내부 헬퍼: herdr JSON 응답 파일을 **완전한 JSON 파싱**으로 분류한다 (stdout 한 줄).
+#   error<TAB><code>   최상위 `error` 객체의 비어 있지 않은 문자열 `code`
+#   agent<TAB><cwd>    `result.agent` 객체와 문자열 `cwd` (`cwd` 키가 없으면 cwd 는 빈 값)
+#   invalid            그 밖 전부 — 빈 파일·잘린 JSON·잘못된 위치/타입·error 와 result 동시 존재
+#                      그리고 python3 부재. 호출부는 invalid 를 **확정 근거로 쓰지 않는다**.
+#   문자열 패턴 검사는 잘린 JSON 이나 다른 위치의 키를 정상으로 읽는다(spec D2).
+_session_launch_json_classify() {  # <file>
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'invalid\n'; return 0
+  fi
+  python3 -I - "$1" <<'PYEOF'
+import json, sys
+def out(s):
+    print(s)
+    sys.exit(0)
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        d = json.load(f)
+except Exception:
+    out("invalid")
+if not isinstance(d, dict) or ("error" in d and "result" in d):
+    out("invalid")
+e = d.get("error")
+if isinstance(e, dict):
+    c = e.get("code")
+    out("error\t" + c if isinstance(c, str) and c else "invalid")
+r = d.get("result")
+if isinstance(r, dict) and isinstance(r.get("agent"), dict):
+    a = r["agent"]
+    if "cwd" not in a:
+        out("agent\t")
+    c = a["cwd"]
+    out("agent\t" + c if isinstance(c, str) and c else "invalid")
+out("invalid")
+PYEOF
+}
+
 # 내부 헬퍼: agent start 시도 전에 만들어진 tab 을 최선을 다해 정리한다(결과는 보지 않는다).
 #   agent 가 아직 붙지 않은 tab 이므로 남겨두면 빈 셸 tab 하나가 목록에 남는다.
 _session_launch_close_tab_best_effort() {  # <tab-id>
@@ -106,8 +145,19 @@ _session_launch_agent_name() {  # <slug>
 # 인계 문구 (F4) — 세션에 넘길 작업 지시입니다. **기동 시점과 승인 이후 재개 시점이
 # 같은 문구를 쓰도록** 별도 함수로 둡니다. 여기서만 문구를 만들고, 두 경로가 이 함수를
 # 부릅니다 (문구가 갈리면 "같은 작업을 이어받는다" 는 계약이 경로마다 달라집니다).
-session_handoff_text() {  # <slug> <req> <worktree-path>
-  printf '작업(FR): %s\nREQUEST: %s\nWorktree: %s\n이 작업을 이어서 진행해 주십시오.' "$1" "$2" "$3"
+#   4번째 인자(인계 파일 경로)가 있으면 끝 줄 앞에 확정 결정 줄을 더합니다. 없으면 현행 출력입니다.
+session_handoff_text() {  # <slug> <req> <worktree-path> [<handoff-file>]
+  local _decision=""
+  if [[ -n "${4:-}" ]]; then
+    printf -v _decision '확정 결정: %s — 먼저 읽고 시작하십시오. 그 파일의 %s 밖의 행동은 하지 않습니다.\n' "$4" "'해도 되는 행동'"
+  fi
+  printf '작업(FR): %s\nREQUEST: %s\nWorktree: %s\n%s이 작업을 이어서 진행해 주십시오.' "$1" "$2" "$3" "$_decision"
+}
+
+# 인계 파일(확정 결정 기록)의 경로 — 유도 로직은 여기 한 곳에만 둡니다.
+session_handoff_file_path() {  # <worktree-path>
+  [[ -n "${1:-}" ]] || return 1
+  printf '%s/rd-workflow-workspace/.lifecycle/handoff.md\n' "$1"
 }
 
 # 인계 전달 (F4) — `herdr agent prompt` 로 위 문구를 세션에 밀어 넣습니다.
@@ -122,7 +172,10 @@ session_handoff_deliver() {  # <slug> <worktree-path> <request-path>
   fi
   local agent_name handoff outfile rc
   agent_name="$(_session_launch_agent_name "$slug")"
-  handoff="$(session_handoff_text "$slug" "$req" "$wt")"
+  local hfile=""
+  hfile="$(session_handoff_file_path "$wt")" || hfile=""
+  [[ -n "$hfile" && -f "$hfile" ]] || hfile=""
+  handoff="$(session_handoff_text "$slug" "$req" "$wt" "$hfile")"
   outfile="$(mktemp)" || return 1
   _session_launch_run_with_timeout "$timeout" "$outfile" \
     herdr agent prompt "$agent_name" "$handoff"
@@ -245,25 +298,34 @@ session_launch() {  # <worktree-path> <slug> <request-path> [<model>] → stdout
     printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model")" >&2
     printf 'failed\n'; return 0
   }
+  local errfile=""
+  errfile="$(mktemp)" || errfile=""
   if [[ -n "$model" ]]; then
-    _session_launch_run_with_timeout "$timeout" "$outfile" \
+    RD_SL_ERRFILE="${errfile:-/dev/null}" _session_launch_run_with_timeout "$timeout" "$outfile" \
       herdr agent start "$agent_name" --kind claude --pane "$pane_id" -- --model "$model"
   else
-    _session_launch_run_with_timeout "$timeout" "$outfile" \
+    RD_SL_ERRFILE="${errfile:-/dev/null}" _session_launch_run_with_timeout "$timeout" "$outfile" \
       herdr agent start "$agent_name" --kind claude --pane "$pane_id"
   fi
   rc=$?
-  local start_body=""
-  start_body="$(cat "$outfile" 2>/dev/null)"
-  rm -f "$outfile"
+  # 오류 JSON 은 stderr 로 나온다(2026-10-29 실측) — stdout 파일만 읽으면 start_body 가 늘 비어
+  # `agent_not_ready` 분기가 타지 않는다. 판정은 두 파일을 각각 분류해 하고, start_body 는
+  # 진단 출력용으로 둘을 이어 붙인다.
+  local start_body="" _cls_out="" _cls_err=""
+  _cls_out="$(_session_launch_json_classify "$outfile")"
+  [[ -n "$errfile" ]] && _cls_err="$(_session_launch_json_classify "$errfile")"
+  start_body="$(cat "$outfile" ${errfile:+"$errfile"} 2>/dev/null)"
+  rm -f "$outfile" ${errfile:+"$errfile"}
   if [[ $rc -ne 0 ]]; then
+    # 원인 확인용 계측 — 연속 기동 때 관측된 rc=1 은 응답이 버려져 원인을 알 수 없었다.
+    printf 'agent start 응답(rc=%s): %s\n' "$rc" "$(printf '%s' "$start_body" | tr '\n' ' ' | cut -c1-500)" >&2
     # **`agent_not_ready` 는 실패가 아니다** (2026-09-16 실측). 새 worktree 는 늘 처음 여는
     # 경로라 claude 가 기동 직후 신뢰 확인 같은 다이얼로그를 띄우고 `blocked` 로 들어가는데,
     # 그때 `agent start` 가 이 코드로 rc≠0 을 낸다. **에이전트는 멀쩡히 떠 있다.** 이것을
     # failed 로 보고 tab 을 닫으면 사람이 승인하기도 전에 방금 뜬 세션을 죽인다 — 그리고
     # 이 다이얼로그는 예외가 아니라 정상 착수의 거의 매번이다. 승인은 사람이 하는 것이므로
     # 여기서는 손대지 않고 unknown 으로 넘겨 확인 방법만 알린다.
-    if printf '%s' "$start_body" | grep -q 'agent_not_ready'; then
+    if [[ "$_cls_out" == $'error\tagent_not_ready' || "$_cls_err" == $'error\tagent_not_ready' ]]; then
       printf '세션이 떴지만 시작 단계에서 확인을 기다리고 있습니다(blocked) — herdr 화면에서 승인해 주십시오.\n' >&2
       printf '승인 뒤 인계 전달: bash rd-workflow/scripts/rd task resolve-launch %s\n' "$slug" >&2
       printf 'unknown\n'; return 0
@@ -303,31 +365,36 @@ session_probe() {  # <slug> [worktree-path] → stdout: alive|dead|unknown
     printf 'unknown\n'; return 0
   fi
 
-  local outfile rc body
+  local outfile errfile rc cls cwd
   # 조회 자체를 시도하지 못했으므로 dead 가 아니라 unknown 이다 — dead 로 오판하면
   # 호출부(resolve-launch)가 살아 있는 세션을 failed 로 확정해 버린다.
   outfile="$(mktemp)" || { printf 'unknown\n'; return 0; }
-  _session_launch_run_with_timeout "$timeout" "$outfile" herdr agent get "$(_session_launch_agent_name "$slug")"
+  errfile="$(mktemp)" || { rm -f "$outfile"; printf 'unknown\n'; return 0; }
+  RD_SL_ERRFILE="$errfile" _session_launch_run_with_timeout "$timeout" "$outfile" \
+    herdr agent get "$(_session_launch_agent_name "$slug")"
   rc=$?
   if [[ $rc -ne 0 ]]; then
-    rm -f "$outfile"
-    printf 'unknown\n'; return 0
+    # dead 는 herdr 가 구조화된 `agent_not_found` 를 낸 경우뿐이다. 그 밖의 실패(다른 코드·
+    # 타임아웃·응답 이상)는 세션이 없다는 증거가 아니다.
+    cls="$(_session_launch_json_classify "$errfile")"
+    rm -f "$outfile" "$errfile"
+    [[ "$cls" == $'error\tagent_not_found' ]] && printf 'dead\n' || printf 'unknown\n'
+    return 0
   fi
-  body="$(cat "$outfile" 2>/dev/null)"
-  rm -f "$outfile"
+  cls="$(_session_launch_json_classify "$outfile")"
+  rm -f "$outfile" "$errfile"
 
-  # agents 배열이 비어 있으면 세션이 없다고 본다.
-  case "$body" in
-    *'"agents":['*'{'*) ;;
-    *) printf 'dead\n'; return 0 ;;
+  # 실제 응답은 단수 `result.agent` 객체다(배열 `agents` 는 `agent list` 의 스키마).
+  case "$cls" in
+    agent$'\t'*) cwd="${cls#agent$'\t'}" ;;
+    *) printf 'unknown\n'; return 0 ;;
   esac
 
   if [[ -n "$wt" ]]; then
+    [[ -n "$cwd" ]] || { printf 'unknown\n'; return 0; }
     # 다른 작업을 맡은(cwd 가 다른) 세션을 alive 로 보지 않는다.
-    case "$body" in
-      *"\"cwd\":\"$wt\""*) printf 'alive\n'; return 0 ;;
-      *) printf 'dead\n'; return 0 ;;
-    esac
+    [[ "$cwd" == "$wt" ]] && printf 'alive\n' || printf 'dead\n'
+    return 0
   fi
 
   printf 'alive\n'; return 0

@@ -4,7 +4,7 @@ Status·Short Title·Source FR 변경은 `rd task` CLI를 경유한다 (기계 �
 
 Status 허용값 (`rd task` CLI 전이표가 이 값으로 판정하며, hook이 강제하지 않으므로 사람과 AI가 지킨다): `대기 중` / `REQUEST review 대기` / `spec/plan 작성 중` / `spec/plan review 대기` / `구현 대기` / `구현 중` / `검증 중` / `diff review 대기` / `아카이브 보류` / `완료`.
 
-`아카이브 보류` 는 「리뷰 종결·발행 대기」이며 **`완료` 가 아니다.** final diff review 가 종결되고 종결 마커(`rd review seal`)를 만든 뒤 진입하며, 그 상태에서 기록 커밋을 하고 `archive.sh` 로 발행한다. 전이는 `diff review 대기` → `아카이브 보류` → `완료` 이고, 리뷰 후 변경이 필요해지면 `아카이브 보류` → `구현 중` 으로 되돌린다.
+`아카이브 보류` 는 「리뷰 종결·발행 대기」이며 **`완료` 가 아니다.** final diff review 가 종결되고 종결 마커(`rd review seal`)를 만든 뒤 진입하며, 그 상태에서 기록 커밋을 하고 `archive.sh` 로 발행한다. 전이는 `diff review 대기` → `아카이브 보류` → `완료` 이고, 리뷰 후 변경이 필요해지면 `아카이브 보류` → `구현 중` 으로 되돌린다. 외부 검증을 기다리며 작업물을 커밋해야 하면 `아카이브 보류` → `검증 중` 으로 되돌리고, 커밋한 뒤 검증이 끝나면 `검증 중` → `diff review 대기` → (보호 트리가 바뀌었으면 재seal) → `아카이브 보류` 로 돌아와 발행한다. `archive.sh` 는 발행 대상 커밋의 Status 가 `아카이브 보류` 가 아니면 거부한다(건너뛰려면 `--allow-status-mismatch <사유>`, audit 기록). 리뷰 세션 종결 뒤 커밋 게이트는 Status `구현 중`·`검증 중` 의 커밋을 허용하고 그 밖의 Status 는 종전대로 막는다.
 
 `구현 대기` 는 「spec/plan review 종결·구현 착수 대기」다. spec/plan review 세션의 최신 Reviewer 턴이 `이의 없음`을 명시해 종결되면 orchestrator 가 `구현 대기` 로 전이하고, 구현을 실제로 시작하면 `구현 중` 으로 전이한다. 리뷰 후 변경이 필요해지면 `구현 대기` → `spec/plan 작성 중` 으로 되돌린다.
 

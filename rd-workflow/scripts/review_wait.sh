@@ -17,7 +17,7 @@
 #   RW_OBSERVER_OK                                            — 부모, 임계값 해석 직후
 #   RW_TARGET_PGID RW_TARGET_PID                              — 부모, spawn 직후
 #   RW_LINE_FORMATTER                                         — 부모 (선택 — codex 는 설정하지 않음)
-#   RW_KILL_ESCALATE RW_KILL_GRACE                             — 부모 (선택 — codex 는 설정하지 않음)
+#   RW_KILL_ESCALATE RW_KILL_GRACE                             — 부모 (선택 — 엔진 기본은 꺼짐, 두 어댑터가 모두 설정)
 #   RW_OUTCOME                                                 — 부모 (선택). 설정하면 최종 상태 파일에
 #                                                                `outcome: <값>` 으로 남는다. codex 는 설정하지 않으므로 출력 불변.
 
@@ -223,6 +223,10 @@ rw_publish_final_status() {  # $1=yes|no $2=사유 토큰 $3=회수 가능한 �
     # 이 필드가 없으면 터미널 출력을 놓친 사용자는 디스크만으로 idle/cap/정상/중단을
     # 구별할 수 없다 — 진행 중 snapshot 은 어느 경로에서나 같은 모습이기 때문이다.
     [ -n "${RW_OUTCOME:-}" ] && printf 'outcome: %s\n' "$RW_OUTCOME"
+    # writer 종료 증거 — **`RW_GROUP_STATE` 가 설정된 경우에만** 렌더링한다(`RW_OUTCOME` 과 같은 방식).
+    # `verified` 만 「process group 종료를 증명했다」 는 뜻이다. 부모(assess_session_safety)는
+    # 이 줄이 `verified` 일 때만 writer 종료 확인으로 인정한다.
+    [ -n "${RW_GROUP_STATE:-}" ] && printf 'writer_group: %s\n' "$RW_GROUP_STATE"
     :
   } > "$tmp" 2>/dev/null || {
     rm -f "$tmp" 2>/dev/null || true
@@ -253,6 +257,21 @@ rw_group_alive() {  # $1=pgid → 0=생존 / 1=없음
   local n
   n="$( { ps -eo pid,pgid 2>/dev/null || true; } | awk -v g="$pgid" '$2==g' | wc -l | tr -d ' ' )"
   [ "$n" -gt 0 ]
+}
+
+# process group 종료 증거 판정. stdout 한 단어, 항상 rc 0.
+#   alive      — ps 가 성공했고 pgid 가 같은 구성원이 있다.
+#   verified   — pgid 가 있고 ps 가 성공(rc 0 + 비어 있지 않은 출력)했고 구성원이 없다.
+#   unverified — pgid 가 비었거나 ps 가 실패(rc≠0 또는 빈 출력)했다. 종료를 증명하지 못한다.
+# rw_group_alive 는 ps 실패를 「그룹 없음」 으로 돌려주므로 종료 증거로 쓸 수 없다.
+rw_group_state() {  # $1=pgid
+  local pgid="${1:-}" out rc=0 n
+  if [ -z "$pgid" ]; then printf 'unverified'; return 0; fi
+  out="$(ps -eo pid,pgid 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then printf 'unverified'; return 0; fi
+  n="$(printf '%s\n' "$out" | awk -v g="$pgid" '$2==g' | wc -l | tr -d ' ')"
+  if [ "$n" -gt 0 ]; then printf 'alive'; else printf 'verified'; fi
+  return 0
 }
 
 # pgid 를 spawn 직후에 확정한다. cleanup 은 리더 생존과 독립적으로 이 그룹을
@@ -359,8 +378,8 @@ rw_watchdog_loop() {
     # 리더가 TERM 을 무시하면 부모의 wait 가 복귀하지 않아 cleanup 의 KILL 단계에 영원히
     # 닿지 못한다. 그래서 **리더의 wait 복귀와 독립적으로** 여기서 escalate 한다.
     # SIGKILL 은 무시할 수 없으므로 부모의 wait 가 반드시 복귀한다.
-    # 이 동작은 RW_KILL_ESCALATE=1 일 때만 켜진다 — codex 는 설정하지 않으므로
-    # codex 의 관측 가능한 동작은 바뀌지 않는다.
+    # 이 동작은 RW_KILL_ESCALATE=1 일 때만 켜진다 — 엔진 기본값은 꺼짐이고 두 어댑터가
+    # 설정한다. 엔진을 직접 호출하는 경로의 동작은 바뀌지 않는다.
     if [ "${RW_KILL_ESCALATE:-0}" = 1 ]; then
       # grace 는 **`sleep` 자식을 두지 않는다.** watchdog 셸만 kill 되면 sleep 이 고아로
       # 남아 상속한 stderr fd 를 붙잡고, 그동안 호출자의 출력 수집이 끝나지 않는다 —

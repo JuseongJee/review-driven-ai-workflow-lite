@@ -4,5 +4,6 @@
   "fr_github": false,
   "default_execution_mode": "semi-auto",
   "defect_report_upstream": "",
-  "default_branch": ""
+  "default_branch": "",
+  "review_response_language": "한국어"
 }

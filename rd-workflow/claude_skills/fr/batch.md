@@ -89,10 +89,20 @@ stdout 첫 줄의 `state=` 로 분기합니다.
 - `complete` → 발행은 끝났고 outcome 기록만 실패한 경우입니다. 이어붙이기 없이 `verify-done` 재확인 후 `set-state <manifest> "$slug" completed completed -` 로 전이합니다. **마지막 `-` 는 `block_reason` 을 비우는 인자입니다** — 생략하면 옛 실패 사유가 완료 항목 요약에 그대로 남습니다.
 - `incomplete-archive` → **이어붙이기 1회**. 기본 브랜치 worktree 에서 아래를 실행합니다. **무인자 재호출은 금지입니다** — `archive.sh` 는 tag·push 이전에 metadata 를 baseline 으로 되돌리므로 무인자로는 원래 slug 를 복원하지 못하고, 다른 작업이 활성화된 뒤라면 **다른 FR 을 대상으로 실행**할 수 있습니다. `archive.sh` 는 `RD_FINISH_POLICY` 를 읽지 않으므로 정책도 인자로 전달해야 합니다.
 
+  fr 브랜치 이름은 FR slug 가 아니라 **작업 이름**(SHORT_TITLE)입니다. 둘은 다를 수 있으므로(FR 여러 건을 묶은 작업 포함) 먼저 헬퍼로 확정합니다.
+
+  ```bash
+  task=$(bash rd-workflow/scripts/batch/batch_manifest.sh resolve-task "$slug"); rc=$?
+  ```
+
+  - `rc=0` → `task` 를 씁니다.
+  - `rc=1` (archive 증거 없음) → `task="$slug"` 입니다. `archive-state` 의 폴백과 같습니다.
+  - `rc=4` (작업 이름 후보가 둘 이상) → 이어붙이기를 하지 않고 아래 `unknown` 과 같이 상태를 보존한 채 중단·보고합니다.
+
   | policy | 명령 |
   |---|---|
-  | `push` | `bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch "fr/$slug"` |
-  | `merge` | `bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch "fr/$slug" --no-remote` |
+  | `push` | `bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch "fr/$task"` |
+  | `merge` | `bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch "fr/$task" --no-remote` |
 
   재호출 뒤 **같은 `archive-state` 를 다시 실행합니다.** `archive.sh` 의 성공 exit 만으로는 발행 완료가 보증되지 않습니다 — "fr branch 부재 + 동일 slug tag 존재" 만으로도 success exit 하기 때문입니다. **재판정에도 최초 판정과 같은 원칙을 적용합니다.**
 
@@ -118,6 +128,9 @@ stdout 첫 줄의 `state=` 로 분기합니다.
   | `default-ref-missing` | 기본 브랜치 ref 를 로컬에 확보한 뒤 판정 재실행 |
   | `no-default-branch` | `rd-workflow/config/workflow.json` 의 `default_branch` 확인 |
   | `lifecycle-common-missing` | 설치 상태 확인 (`install-root`) |
+  | `task-ambiguous` | 같은 FR 을 `## Source FR` 로 가진 request-archive 가 서로 다른 작업 이름으로 둘 이상 있습니다. 후보 archive 를 확인하고 잘못 적힌 `## Source FR` 을 정정한 뒤 **판정만** 재실행 (`archive-state`). `archive.sh` 재실행은 불필요합니다 |
+
+호출자 worktree·로컬 브랜치 잔여는 기본 체크아웃의 `rd task list` 지연 정리가 처리하며 이 절의 재시도 대상이 아닙니다.
 
 판정 사유(`state`·`missing`), 이어붙이기 시작·결과, 실패 시 미충족 증거와 유효한 다음 행동을 진행 표시·로그와 국면 3 최종 요약에 노출합니다. 별도 UI 는 만들지 않습니다.
 
@@ -140,7 +153,10 @@ manifest status가 `running`인 동안 반복합니다:
    - 재확인 통과 → `set-state <manifest> "$slug" completed completed`.
    - exit 0이나 재확인 실패(outcome 오기록) → `set-state <manifest> "$slug" blocked "" "ground truth 불일치"` 후 4의 전파 적용.
 4. **실패 처리(exit 10/20/30/40 또는 재확인 실패)**:
+   - **먼저 판정**: outcome 파일(`rd-workflow-workspace/.batch-outcome-<slug>`) 첫 줄이 `blocked:time-cap-unreaped` 이면 skip 전파·다음 FR 진행 없이 exit 10 과 같은 방식으로 처리합니다. manifest `.status` 를 `paused`로 저장(tmp+mv 규율)하고 item 은 `running` 유지한 채 "이전 FR 의 잔여 프로세스(outcome 둘째 줄 이후에 pid·명령)를 정리한 뒤 재개하십시오" 를 안내하고 멈춥니다.
+   - **먼저 판정**: outcome 파일 첫 줄이 `blocked:resume-undetermined` 이면 skip 전파·다음 FR 진행 없이 exit 10 과 같은 방식으로 처리합니다. 이 FR 의 문제가 아니라 재개 후보를 판정하지 못한 전역 실패라서 FR 을 `blocked` 로 기록하지 않습니다. manifest `.status` 를 `paused` 로 저장(tmp+mv 규율)하고 item 은 `running` 유지한 채, outcome 둘째 줄 이후(제외·불확실 작업과 사유·다음 조치)를 보이고 "`rd task resolve-launch <slug>` 로 확정하거나 재개 대상을 정리한 뒤 재개하십시오" 를 안내하고 멈춥니다.
    - exit 20/30 또는 재확인 실패 → `set-state <manifest> "$slug" blocked ...`. 이어서 `skip=$(... skip-dependents <manifest> "$slug")`의 각 slug를 `set-state <manifest> <s> skipped "" "선행 $slug blocked"`로 기록합니다. 독립 FR은 계속합니다.
+     - 사유가 `time-cap` 이면 위 blocked 처리와 같습니다. outcome 둘째 줄 이후의 진단(경과·작업 상태·열린 리뷰 세션 경로)이 blocked 사유로 보존되고, 요약에 사유 `time-cap` 이 보입니다.
    - exit 10(resume) → item은 `running` 유지(set-state로 바꾸지 않음), manifest `.status`를 `paused`로 저장(tmp+mv 규율 — 호출 형식 참조)하고 재개 안내 후 멈춥니다. 다음 `/fr batch` 실행이 이 paused manifest를 감지해 재개를 확인하고, `.status`를 `running`으로 되돌린 뒤(호출 형식 참조) 국면 2를 재진입하면 `next`가 이 `running` item을 최우선 산출해 같은 FR을 이어갑니다. 잔여 규모 보고가 필요하면 `batch_manifest.sh summary` 의 `pending=`/`running=` 값을 사용합니다(임의 jq 집계 금지).
    - exit 40(harness-error) → **먼저 「archive 이어붙이기 계약」 절의 판정을 수행합니다.** `complete`·`incomplete-archive`·`unknown` 은 그 절의 처리를 따릅니다. `not-archived` 일 때만 아래 재시도 경로로 갑니다.
 
@@ -154,7 +170,15 @@ manifest status가 `running`인 동안 반복합니다:
      2. `CURRENT_TASK.md` Status 를 실제 진행 단계에 맞게 보정합니다.
      3. 정리 결과를 `CURRENT_TASK.md` Notes 에 기록합니다.
 
-     매 시도가 서로 다른 지점까지 진도를 냈다면 작업 결함이 아니라 세션 수명 문제입니다. `blocked` 로 버리기 전에 autopilot SKILL.md 「무인 진입」의 「결과 대기 규율」 위반 여부를 확인합니다.
+     매 시도가 서로 다른 지점까지 진도를 냈다면 작업 결함이 아니라 세션 수명 문제입니다. `blocked` 로 버리기 전에 autopilot SKILL.md 「무인 진입」의 「결과 대기 규율」 위반 여부를 확인합니다. 조치는 다음 순서입니다(위 재개 지점 정리 목록과 별개).
+
+     - **조치 가.** 해당 항목 출력의 `autopilot_headless: BASH_DEFAULT_TIMEOUT_MS=` 줄에서 유효 값을 확인합니다. 재개 회수 스윕처럼 그 줄이 없으면 현재 셸의 `BASH_DEFAULT_TIMEOUT_MS` 값을 확인합니다.
+     - **조치 나.** 값이 검증 소요에 못 미치는 호출자 설정(예: 셸에 남은 `120000`·`600000`)이면 해제하거나 올려 재시도합니다.
+     - **조치 다.** 유효 값이 기본값 이상이어도 timeout 을 배제하지 않습니다. 이 줄은 DEFAULT 설정값일 뿐 개별 명령의 timeout 인자나 다른 watchdog 의 증거가 아닙니다. 실행 로그와 `CURRENT_TASK.md` Notes 의 `waiting:` 줄에서 마지막 명령의 경과 시간·지정 timeout·"moved to the background" 유무를 확인하고 원인별로 조치합니다.
+        - 개별 Bash 호출에 짧은 `timeout` 인자가 남아 있었다: 인자를 생략하거나 예상 소요에 맞게 고칩니다. DEFAULT 를 올려도 그 명령에는 효과가 없습니다.
+        - 리뷰 어댑터 watchdog 에 걸렸다(어댑터 출력의 원인과 `wait config` 의 idle·cap): idle 또는 `WAIT_TIMEOUT` 을 점검합니다. 안쪽 상한을 올리면 바깥 Bash 대기(DEFAULT)가 그보다 크게 유지되도록 DEFAULT 도 함께 올립니다.
+        - 명령이 유효 DEFAULT 에 실제로 도달했다(경과 시간이 유효 값 이상, timeout 인자 없음): 호출 env 를 올려 재기동합니다.
+        - 원인이 불명확하다: DEFAULT 상향을 처방으로 제시하지 않고 종전대로 「결과 대기 규율」 위반 여부를 봅니다.
 
      **적용 범위**: 신규 exit 40 과 재개 회수 스윕이 같은 분기를 씁니다. 이미 `completed` 로 집계된 항목의 판정은 소급하지 않습니다.
    - 상태전이는 모두 `set-state`로 수행되어 매번 flush됩니다(재개 지점 최신화).

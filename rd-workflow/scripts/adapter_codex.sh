@@ -49,6 +49,8 @@ RW_IDLE="$IDLE_TIMEOUT"
 RW_FALLBACK_CAP="$OBSERVER_FALLBACK_CAP"
 RW_HEARTBEAT="$HEARTBEAT_INTERVAL"
 RW_TICK="$TICK"
+RW_KILL_ESCALATE=1        # TERM 을 무시하는 리더도 유한 시간에 회수한다 (엔진 기본값은 꺼짐)
+RW_KILL_GRACE="$KILL_GRACE"
 
 if [ "$IDLE_TIMEOUT" -gt 0 ] && [ "$IDLE_TIMEOUT" -gt "$ABS_CAP" ]; then
   echo "경고: 유휴 임계(${IDLE_TIMEOUT}초)가 절대 상한(${ABS_CAP}초)보다 큽니다 — 유휴 판별이 발동하지 않습니다." >&2
@@ -80,6 +82,8 @@ RW_STATUS_FD=8
 # 여기서는 아직 경로가 없으므로 빈 값으로 선언해 두고(cleanup 이 부분 초기화 상태에서도
 # 호출되므로 set -u 아래에서 반드시 정의되어 있어야 한다) 구버전이 남긴 잔여만 지운다.
 timeout_marker=""
+# 이번 실행의 시작 시각 기준 파일 (타임아웃 진단의 CHECKPOINT 갱신 관측용 — 아래에서 생성)
+write_ref=""
 
 # --- stale 산출물 정리 (재실행 방어) ---
 rm -f "$turn_ready_file"
@@ -253,6 +257,8 @@ watchdog_pid=""
 watchdog_dir=""
 watchdog_fd_open=0
 codex_pgid=""
+# cleanup 의 writer 종료 증거 조회(rw_group_state)가 spawn 전·pgid 확보 중에도 set -u 에서 죽지 않도록 미리 정의한다.
+RW_TARGET_PID=""
 cleanup_done=0
 
 # process group 판정(rw_group_alive)·pgid 획득(rw_acquire_pgid)은 review_wait.sh 로
@@ -317,7 +323,7 @@ cleanup() {
   # **발행 전에 codex process group 이 실제로 종료됐는지 확인한다.** 살아 있는 codex 는
   # 세션 디렉토리에 쓸 수 있으므로, 그 상태에서 안정 이름으로 옮기면 검사와 `mv` 사이에
   # 외부 디렉터리 symlink 를 다시 심는 반복 공략이 되살아난다. 확인한 뒤에만 1회 발행한다.
-  local group_dead=1 log_ok=no log_reason="" log_recovery=""
+  local group_dead=1 log_ok=no log_reason="" log_recovery="" rw_gs=""
   if [ -n "$codex_pgid" ] && rw_group_alive "$codex_pgid"; then
     group_dead=0
   fi
@@ -376,7 +382,12 @@ cleanup() {
   fi
 
   if [ "$group_dead" -eq 1 ]; then
-    if rw_publish_final_status "$log_ok" "$log_reason" "$log_recovery"; then
+    # 종료를 증명했는지만 상태 파일에 남긴다(발행 조건은 위 group_dead 게이트 그대로).
+    # pgid 확보에 실패했어도(리더가 즉시 종료) 리더 pid 가 곧 pgid(set -m)이므로 그 그룹의 구성원 유무를 ps 로 확인한다.
+    # verified 가 아니면(ps 실패·alive 경합) unverified 로 쓴다.
+    rw_gs="$(rw_group_state "${codex_pgid:-$RW_TARGET_PID}")"
+    [ "$rw_gs" = verified ] || rw_gs=unverified
+    if RW_GROUP_STATE="$rw_gs" rw_publish_final_status "$log_ok" "$log_reason" "$log_recovery"; then
       # 발행 성공 — 진행 중 스트림은 남기지 않는다 (안정 파일이 최종 권위).
       rm -f "$status_stream" 2>/dev/null || true
     else
@@ -416,6 +427,9 @@ cleanup() {
   # 타임아웃 마커 정리 (cleanup 시점 제거 — 안정 이름이 없으므로 이 경로 하나뿐이다)
   if [ -n "$timeout_marker" ]; then
     rm -f "$timeout_marker" 2>/dev/null || true
+  fi
+  if [ -n "$write_ref" ]; then
+    rm -f "$write_ref" 2>/dev/null || true
   fi
   rm -f "$last_message_file"
 }
@@ -474,6 +488,11 @@ if ! exec 6< "$timeout_marker"; then
 fi
 marker_read_fd_open=1
 
+# 타임아웃 진단용 시작 시각 기준 파일. codex spawn **전에** 만들어 mtime 이 이번 실행의 시작을 뜻한다.
+# 이름이 `.wait_timeout.` 로 시작하므로 stale 정리(rm)·`.gitignore` 패턴이 그대로 적용된다.
+# 만들지 못해도 실행은 계속한다 — 진단이 「판정 불가」 로 표시할 뿐이다.
+write_ref="$(mktemp "${session_dir}/.wait_timeout.ref.XXXXXX" 2>/dev/null)" || write_ref=""
+
 # reasoning effort 전달 — 빈 값이면 -c 를 붙이지 않는다 (전역 설정을 따름 = 도입 전 동작).
 # -c 값은 TOML 로 파싱되므로 문자열을 따옴표로 감싼다.
 # bash 3.2 + set -u 에서 빈 배열 전개가 죽으므로 "${arr[@]+"${arr[@]}"}" 관용구가 필수다.
@@ -500,6 +519,8 @@ set -m
   --output-last-message "$last_message_file" \
   - < "$PROMPT_FILE" > "$codex_log" 2>&1 3<&- 4<&- 5<&- 6<&- 7>&- 8>&- &
 codex_pid=$!
+# 리더 pid 를 spawn 직후 보존한다 — pgid 확보(rw_acquire_pgid) 도중 신호가 와도 cleanup 이 리더 그룹을 조회할 수 있다.
+RW_TARGET_PID="$codex_pid"
 set +m
 
 # pgid 를 spawn 직후에 확정해 보존한다. cleanup 은 리더 생존과 독립적으로 이 그룹을
@@ -532,8 +553,9 @@ RW_TARGET_PID="$codex_pid"
 # escalation)는 rw_watchdog_loop 로 review_wait.sh 에 옮겨졌다. 부모가 설정한 RW_*
 # 변수(RW_TARGET_PGID·RW_TARGET_PID·RW_ABS_CAP·RW_IDLE·RW_TICK·RW_HEARTBEAT·
 # RW_FALLBACK_CAP·RW_OBSERVER_OK·RW_LOG_FD·RW_MARKER_FD·RW_TIMER_FD·RW_STATUS_FD 등)을
-# 서브셸이 상속해 읽는다. codex 는 RW_LINE_FORMATTER·RW_KILL_ESCALATE 를 설정하지
-# 않으므로 표시 절단·kill escalation 은 켜지지 않는다(동작 불변).
+# 서브셸이 상속해 읽는다. codex 는 RW_LINE_FORMATTER 를 설정하지 않으므로 표시 절단은
+# 켜지지 않는다(동작 불변). RW_KILL_ESCALATE 는 켠다 — 리더가 TERM 을 무시하면 부모의
+# wait 가 복귀하지 못해 cleanup 의 KILL 에 닿지 못하기 때문이다.
 ( rw_watchdog_loop ) &
 watchdog_pid=$!
 
@@ -674,6 +696,22 @@ report_session_state() {
   fi
 }
 
+# 타임아웃 시점에 **관측한** 기록 진행을 보고한다. 원인·중단 위치는 단정하지 않는다.
+# 턴 파일은 시작 때 지우므로 존재하면 이번 실행의 기록이다. CHECKPOINT 는 시작 기준 파일보다
+# 엄격히 새로울 때만 「갱신 관측」 이며, 아니면 같은 시각 기록을 구별하지 못하므로 「미관측」 이다.
+# SESSION.md 는 이 보고가 보지 않는다(완료 판정은 report_session_state 가 따로 보고한다).
+report_write_progress() {
+  if [ -z "$write_ref" ] || [ ! -e "$write_ref" ]; then
+    echo "기록 진행: 판정 불가 (시작 시각 기준 파일이 없습니다)" >&2
+  elif [ ! -f "$EXPECTED_TURN_FILE" ]; then
+    echo "기록 진행: 이번 실행의 턴 파일이 없습니다. 입력 읽기·추론 중이었거나 기록 시도가 실패했을 수 있으며 둘을 구별하지 못합니다." >&2
+  elif [ "${session_dir}/CHECKPOINT.md" -nt "$write_ref" ]; then
+    echo "기록 진행: 턴 파일과 CHECKPOINT 의 갱신이 관측되었습니다. SESSION.md 는 이 표시가 확인하지 않으며, 기록이 모두 끝났어도 프로세스가 종료되지 않아 타임아웃일 수 있습니다." >&2
+  else
+    echo "기록 진행: 턴 파일이 기록되었고 CHECKPOINT 의 이번 실행 갱신은 관측되지 않았습니다(같은 시각 기록은 구별하지 못함). SESSION.md 는 이 표시가 확인하지 않습니다." >&2
+  fi
+}
+
 if [ "$timed_out" -eq 1 ] && ! check_turn_complete; then
   case "$timeout_reason" in
     idle)
@@ -711,6 +749,7 @@ if [ "$timed_out" -eq 1 ] && ! check_turn_complete; then
       echo "Codex 턴 대기 타임아웃 (사유 불명 — 마커 내용: '${timeout_marker_line}')" >&2
       ;;
   esac
+  report_write_progress
   report_session_state "$timeout_reason"
   # last message 도 **fd 3 에서 미리 읽어 둔 변수**에서 낸다 (경로 재해석 없음).
   if [ -n "$last_message" ]; then
@@ -742,7 +781,8 @@ fi
 # --- 성공: flush 대기 + .turn_ready 마커 생성 ---
 sleep "$SETTLE_DELAY"
 
-echo "$EXPECTED_TURN_FILE" > "$turn_ready_file"
+# 내용은 디버깅용 턴 파일 이름뿐이다. 소비자는 존재만 확인하며, 머신 종속 절대 경로를 담지 않는다.
+echo "$(basename "$EXPECTED_TURN_FILE")" > "$turn_ready_file"
 
 # 턴 파일 최종 확인
 if [ ! -f "$EXPECTED_TURN_FILE" ]; then

@@ -648,3 +648,24 @@ bash rd-workflow/scripts/claudemd_rules_migrate.sh classify <project CLAUDE.md> 
 5. 분류기를 다시 실행해 결과를 9단계 완료 보고에 넣습니다. 보고에는 걷어낸 절, 유지(override)한 절, 보류한 절, `ambiguous` 절, `abort` 사유, 분류기 오류, 다음 행동을 적습니다. 보류 절이 있으면 "이 절과 rules 판이 두 벌로 로드되는 상태" 임을 적습니다.
 
 **재실행 성질**: 걷어낸 절은 더 이상 분류되지 않습니다. override 절은 `keep` 입니다. 보류 절만 다시 `modified` 로 나옵니다. 모든 절을 정리한 프로젝트에서 다시 실행하면 `template`·`modified` 행이 0 이고 `CLAUDE.md` 는 바뀌지 않습니다.
+
+## M014: `.turn_ready` 마커 추적 방지 · 이미 추적된 마커 안내
+
+**조건**: 프로젝트에 추적 중인 `.turn_ready` 파일이 있을 때(`git ls-files | grep -c '\.turn_ready'` 가 0 보다 큼). 추적 중인 파일이 없으면 이 항목은 할 일이 없습니다.
+
+**동작 변화**
+
+1. 템플릿 `.gitignore` 에 `rd-workflow-workspace/handoffs/review_pipeline/*/.turn_ready` 가 추가되었습니다. **패턴 전파는 M003 3번의 「부재 라인만 추가」 절차가 처리합니다.** 이 항목이 따로 추가하지 않습니다. 그 결과 신규 마커와 아직 추적되지 않은 마커는 커밋에 들어가지 않습니다.
+2. 마커 내용이 절대 경로에서 턴 파일 이름으로 바뀌었습니다. 소비자는 존재 여부만 확인하므로 동작은 같습니다.
+
+**실행 절차**: 이 항목은 프로젝트 파일을 **자동으로 바꾸지 않습니다.** `.gitignore` 는 이미 추적 중인 파일에 적용되지 않으므로, 기존 마커는 사용자가 직접 추적에서 뺍니다. sync 보고에 아래 안내를 그대로 옮깁니다.
+
+```bash
+git ls-files 'rd-workflow-workspace/handoffs/review_pipeline/*/.turn_ready' | xargs git rm --cached
+git commit -m "chore: 추적 중인 .turn_ready 마커 추적 해제"
+```
+
+- `git rm --cached` 는 워킹트리 파일을 지우지 않습니다. 진행 중인 리뷰 세션이 영향을 받지 않습니다.
+- **완료 확인**: `git ls-files | grep -c '\.turn_ready'` 가 `0` 이면 끝입니다.
+- 과거 커밋에 남은 마커는 이력 문제라 이 안내의 범위 밖입니다.
+

@@ -484,6 +484,150 @@ resnapshot_review_head() {
   return 0
 }
 
+# --- 어댑터 신호 전달과 유한 정리 (change spec codex-adapter-turn-loss-and-reap §2.2) ---
+# 어댑터를 백그라운드로 띄우고 wait 한다. 포그라운드 자식이 실행 중이면 bash 는 신호 trap 을
+# 자식 종료까지 미루므로 포그라운드로는 신호를 가로챌 수 없다.
+# 수명: A(rr_init ~ spawn 직전) B(spawn ~ rr_pid 대입 전) C(rr_adopt 직후) D(wait 중) E(수거 후).
+# **trap '' (신호 잠금)은 어댑터 spawn 뒤 rr_begin_terminate 에서만 쓴다.** 무시(ignore) 상태는
+# 자식이 상속하고 자식이 그 신호의 trap 을 설치할 수 없게 만든다. spawn 전에는 기록 전용 trap 이다.
+# 대상은 이번 실행의 rr_pid 하나다 (pkill·이름 매칭·프로세스 그룹 전체 kill 을 쓰지 않는다).
+rr_sig=""
+rr_sig_rc=""
+rr_pid=""
+rr_spawned=""
+rr_grace_expired=0
+rr_terminating=0
+rr_int_checked=0
+
+# bash 는 비대화형 셸이 시작 때 무시(ignore)된 신호를 trap 으로 되돌릴 수 없다. 부모가 `cmd &` 로
+# 이 스크립트를 띄우면 SIGINT 가 무시된 채 시작되어 INT 로는 어댑터 정리가 일어나지 않는다
+# (HUP·TERM 은 영향 없음). trap 재설정이 불가능하므로 한계를 실행당 한 번 알린다.
+# 감지: 상속된 무시 상태는 `trap -p` 에 나타나지 않으므로, INT trap 을 건 직후에도 `trap -p INT`
+# 가 비어 있으면 trap 이 적용되지 않은 것(= 무시 상태로 시작)이다.
+rr_warn_int_ignored() {
+  [[ "$rr_int_checked" -eq 1 ]] && return 0
+  rr_int_checked=1
+  if [[ -z "$(trap -p INT)" ]]; then
+    echo "주의: 이 실행은 SIGINT 가 무시된 채 시작되었습니다(부모가 \`cmd &\` 로 띄웠을 수 있습니다). INT 로는 어댑터 정리가 되지 않습니다. 중단은 TERM 또는 HUP 을 쓰십시오." >&2
+  fi
+}
+
+rr_init() {
+  rr_sig=""
+  rr_sig_rc=""
+  rr_pid=""
+  rr_spawned=""
+  rr_grace_expired=0
+  rr_terminating=0
+  trap 'rr_on_signal HUP 129' HUP
+  trap 'rr_on_signal INT 130' INT
+  trap 'rr_on_signal TERM 143' TERM
+  rr_warn_int_ignored
+}
+
+# 구간 A·B(rr_pid 없음)는 최초 신호만 기록하고 돌아온다. 구간 D 는 정리 진입점으로 넘긴다.
+rr_on_signal() {
+  if [[ -z "$rr_sig" ]]; then
+    rr_sig="$1"
+    rr_sig_rc="$2"
+  fi
+  if [[ -z "$rr_pid" ]]; then
+    return 0
+  fi
+  rr_begin_terminate
+}
+
+# 유일한 정리 진입점 (일회성). 신호 경로(구간 D)와 보류 확인 경로(구간 C)가 겹쳐도 한 번만 실행한다.
+rr_begin_terminate() {
+  if [[ "$rr_terminating" -eq 1 ]]; then
+    return 0
+  fi
+  rr_terminating=1
+  trap '' HUP INT TERM
+  echo "중단 신호 ${rr_sig} 수신 — 어댑터 정리 중 (최대 $(rr_term_grace)초)" >&2
+  rr_terminate_adapter
+}
+
+# 대기 상한(초). 숫자가 아니면 기본값 15.
+rr_term_grace() {
+  local g="${RD_REVIEW_TERM_GRACE:-15}"
+  case "$g" in
+    ''|*[!0-9]*) g=15 ;;
+  esac
+  # 선행 0 은 bash 산술식에서 8진수로 해석된다(08 은 오류, 010 은 8초). 10진수로 고정한다.
+  printf '%s' "$((10#$g))"
+}
+
+# 어댑터에 항상 SIGTERM 을 보낸다 (백그라운드 자식은 SIGINT 무시 상태일 수 있어 INT·HUP 을 그대로 전달하지 않는다).
+# 종료되면 즉시 반환하고, 상한을 넘기면 KILL 한다.
+rr_terminate_adapter() {
+  local max_ticks i=0
+  max_ticks=$(( $(rr_term_grace) * 2 ))
+  kill -TERM "$rr_pid" 2>/dev/null || true
+  while kill -0 "$rr_pid" 2>/dev/null; do
+    if [[ "$i" -ge "$max_ticks" ]]; then
+      kill -KILL "$rr_pid" 2>/dev/null || true
+      rr_grace_expired=1
+      break
+    fi
+    sleep 0.5
+    i=$(( i + 1 ))
+  done
+  if [[ "$rr_grace_expired" -eq 1 ]]; then
+    echo "    어댑터 정리 결과: 대기 초과 후 강제 종료" >&2
+  else
+    echo "    어댑터 정리 결과: 정상 종료" >&2
+  fi
+}
+
+# 구간 E: PID 무효화와 기본 동작 복원. 모든 반환 경로가 거친다.
+rr_finish() {
+  rr_pid=""
+  trap - HUP INT TERM
+}
+
+rr_spawn() {
+  "$@" &
+  rr_spawned=$!
+}
+
+rr_set_pid() {
+  rr_pid="$rr_spawned"
+}
+
+rr_check_pending() {
+  if [[ -n "$rr_sig" ]]; then
+    rr_begin_terminate
+  fi
+}
+
+rr_adopt() {
+  rr_set_pid
+  rr_check_pending
+}
+
+# 초기화는 하지 않는다 (호출자가 rr_init 을 먼저 부른다). 신호가 있었으면 반환값을 128+n 으로 덮어쓴다.
+rr_spawn_and_wait() {
+  local rc=0 pid
+  if [[ -n "$rr_sig" ]]; then
+    rr_finish
+    return "$rr_sig_rc"
+  fi
+  rr_spawn "$@"
+  rr_adopt
+  pid="$rr_pid"
+  wait "$pid" || rc=$?
+  # 신호가 wait 을 끊었으면 정리(trap)가 끝난 뒤 실제 수거를 마친다.
+  while [[ -n "$rr_sig" ]] && kill -0 "$pid" 2>/dev/null; do
+    wait "$pid" || rc=$?
+  done
+  rr_finish
+  if [[ -n "$rr_sig" ]]; then
+    rc="$rr_sig_rc"
+  fi
+  return "$rc"
+}
+
 # --- 메인 ---
 # 테스트 seam: `source run_review_turn.sh` 로 호출되면 함수 정의만 로드하고 반환한다.
 # production 경로는 항상 `bash run_review_turn.sh <session>` 이므로 동작이 바뀌지 않는다.
@@ -660,8 +804,22 @@ for tool in $PRIORITY; do
   metric_target_bytes="$(compute_target_bytes)"
   # 시간 원천도 fail-open — date 실패가 어댑터 실행·턴 진행·종료 코드에 영향을 주지 않는다.
   metric_start="$(date +%s 2>/dev/null)" || metric_start=""
+  # 사전 정리(spec §2.1): 이전 턴의 상태 파일·안정 로그를 이번 실행의 것으로 읽지 않도록
+  # 어댑터 실행 직전에 부모가 지운다. 지운 뒤에도 경로가 남으면(디렉터리 형태·권한 문제)
+  # STALE_UNCLEARED=1 — 실패 진단이 세 파일을 모두 없는 것으로 취급한다. 어댑터는 그대로 실행한다.
+  rm -f "${session_dir}/.review_wait_status" "${session_dir}/.codex_output.log" "${session_dir}/.claude_output.log" 2>/dev/null || true
+  STALE_UNCLEARED=0
+  if [[ -e "${session_dir}/.review_wait_status" || -L "${session_dir}/.review_wait_status" \
+        || -e "${session_dir}/.codex_output.log" || -L "${session_dir}/.codex_output.log" \
+        || -e "${session_dir}/.claude_output.log" || -L "${session_dir}/.claude_output.log" ]]; then
+    STALE_UNCLEARED=1
+  fi
+  # HUP·INT·TERM 을 받으면 어댑터에 SIGTERM 을 전달하고 RD_REVIEW_TERM_GRACE 초(기본 15)까지 기다린다.
+  # 어댑터 실행 직전 CHECKPOINT.md 내용 지문 (파일 없으면 빈 값). 중단 시 보존 안내가 변경 여부를 관측하는 기준이다.
+  checkpoint_sum_before="$(cksum < "$CHECKPOINT_FILE" 2>/dev/null || true)"
+  rr_init
   adapter_rc=0
-  "${adapter_env[@]}" bash "$adapter" || adapter_rc=$?
+  rr_spawn_and_wait "${adapter_env[@]}" bash "$adapter" || adapter_rc=$?
   metric_end="$(date +%s 2>/dev/null)" || metric_end=""
 
   metric_status="ok"
@@ -697,6 +855,7 @@ for tool in $PRIORITY; do
         # 침묵했는데, 부모가 그 뒤에 "재실행하십시오" 를 붙이면 그 침묵이 무효화되어
         # 사용자가 확인 없이 재실행해 부분 산출물을 덮어쓸 위험이 생긴다.
         echo "리뷰 턴 대기가 종료되었습니다: ${tool}. 위의 세션 상태 안내를 확인하십시오." >&2
+        report_preserved_turn "$EXPECTED_TURN_FILE" "$CHECKPOINT_FILE" "$checkpoint_sum_before" "$SESSION_FILE" "$relative_expected_turn_file"
         exit 124
         ;;
       *)
@@ -733,13 +892,24 @@ for tool in $PRIORITY; do
             129|130|143) sig_cleanup_guaranteed=1 ;;
             *)           sig_cleanup_guaranteed=0 ;;
           esac
+          # 부모가 대기 상한 안에 어댑터를 정리하지 못해 KILL 했다면 어댑터 cleanup 보장이 깨졌다.
+          # 신호 번호가 보장 범위 안(143 등)이어도 이 사유는 따로 말한다 — 「이 신호는 보장하지
+          # 못한다」 는 문장은 신호 번호가 실제로 범위 밖일 때만 쓴다(143 에서 자기모순이 된다).
+          if [[ "$rr_grace_expired" -eq 1 ]]; then
+            sig_cleanup_guaranteed=0
+            echo "    (어댑터가 대기 상한 안에 종료하지 않아 부모가 어댑터만 강제 종료했습니다.)" >&2
+          fi
           if [[ "$sig_cleanup_guaranteed" -eq 1 && ! -f "$EXPECTED_TURN_FILE" \
                 && "$sig_owner" == "Reviewer" && "$sig_status" == "awaiting-reviewer" ]]; then
             echo "    세션 상태: 턴 파일이 생성되지 않았고 SESSION.md 의 Current Owner=Reviewer / Status=awaiting-reviewer 가" >&2
             echo "               보존되어 있습니다 → 같은 명령으로 재실행하면 그대로 이어집니다." >&2
           elif [[ "$sig_cleanup_guaranteed" -ne 1 ]]; then
-            echo "    잔존 프로세스 경고: 이 신호(exit ${adapter_rc})는 어댑터가 cleanup 을 보장하지 못하는 신호입니다" >&2
-            echo "               (보장 범위는 HUP=129 / INT=130 / TERM=143 뿐이며 SIGKILL 은 트랩할 수 없습니다)." >&2
+            if [[ "$rr_grace_expired" -eq 1 ]]; then
+              echo "    잔존 프로세스 경고: 어댑터의 정리가 대기 상한 안에 끝나지 않아 정리 완료를 확인하지 못했습니다(exit ${adapter_rc})." >&2
+            else
+              echo "    잔존 프로세스 경고: 이 신호(exit ${adapter_rc})는 어댑터가 cleanup 을 보장하지 못하는 신호입니다" >&2
+              echo "               (보장 범위는 HUP=129 / INT=130 / TERM=143 뿐이며 SIGKILL 은 트랩할 수 없습니다)." >&2
+            fi
             echo "               어댑터만 죽고 **별도 process group 의 리뷰 도구와 그 자손이 계속 실행·수정 중일 수 있습니다.**" >&2
             echo "               세션 상태(턴 파일: $( [[ -f "$EXPECTED_TURN_FILE" ]] && echo 존재 || echo 부재 ), Current Owner='${sig_owner}', Status='${sig_status}')만으로는" >&2
             echo "               재개 안전성을 말할 수 없습니다 — **프로세스가 모두 종료된 것을 확인하기 전에 재실행하지 마십시오.**" >&2
@@ -749,18 +919,66 @@ for tool in $PRIORITY; do
             echo "               세션을 직접 확인한 뒤 이어가십시오 — 확인 없이 재실행하면 거부되거나 부분 산출물을 덮어쓸 수 있습니다." >&2
           fi
           echo "    (부모가 확인한 것은 이 두 필드와 턴 파일뿐입니다. CHECKPOINT.md 등 다른 파일은 검사하지 않았습니다.)" >&2
+          report_preserved_turn "$EXPECTED_TURN_FILE" "$CHECKPOINT_FILE" "$checkpoint_sum_before" "$SESSION_FILE" "$relative_expected_turn_file"
           exit "$adapter_rc"
         fi
-        echo "어댑터 실행 실패: ${tool}. 세션이 오염되었을 수 있으므로 즉시 중단합니다." >&2
-        # effort 를 전달했다면 무효값 가능성을 알리고 복구 경로를 제시한다.
-        # 자동 재시도는 하지 않는다 — 어느 지점에서 실패했는지 증명할 수 없으면
-        # 두 번째 agent 가 부분 수정된 세션을 이어서 고칠 위험이 더 크다.
-        if [[ "$tool" == "codex" && -n "$EFFORT_VALUE" ]]; then
+        # 일반 실패 진단: 원인(로그)과 세션 안전성(상태 파일 + 세션 상태)을 독립 판정한다 (spec §2).
+        # 의존: writer 종료 확인은 어댑터가 .review_wait_status 에 남기는 `writer_group: verified` 줄에만 의존한다.
+        # 발행 자체는 종료 증명이 아니다(pgid·ps 조회 실패 시 `unverified` 로 발행) — 줄이 없거나 unverified 면 (나).
+        fail_log="${session_dir}/.${tool}_output.log"
+        fail_status="${session_dir}/.review_wait_status"
+        if [[ "$STALE_UNCLEARED" -eq 1 ]]; then
+          fail_log=""
+          fail_status=""
+        fi
+        cause_out="$(classify_adapter_failure_cause "$fail_log" "$tool")"
+        cause_kind="${cause_out%% *}"
+        cause_keys="${cause_out#* }"
+        safety_out="$(assess_session_safety "$SESSION_FILE" "$EXPECTED_TURN_FILE" "$fail_status")"
+        safety_verdict="$(printf '%s\n' "$safety_out" | sed -n '1p')"
+        safety_obs="$(printf '%s\n' "$safety_out" | sed -n '2p')"
+
+        echo "어댑터 실행 실패: ${tool}." >&2
+        cause_labels=""
+        cause_hints=()
+        cause_effort=0
+        IFS=',' read -r -a cause_arr <<< "$cause_keys"
+        for ck in "${cause_arr[@]+"${cause_arr[@]}"}"; do
+          case "$ck" in
+            effort)    cause_labels="${cause_labels:+$cause_labels, }effort 거부"; cause_effort=1 ;;
+            capacity)  cause_labels="${cause_labels:+$cause_labels, }모델 용량 부족"
+                       cause_hints+=("모델 용량 부족은 일시적입니다. 잠시 뒤 같은 명령을 재시도하십시오. 설정을 바꾸지 마십시오.") ;;
+            ratelimit) cause_labels="${cause_labels:+$cause_labels, }rate limit"
+                       cause_hints+=("rate limit 입니다. 잠시 뒤 재시도하십시오.") ;;
+            auth)      cause_labels="${cause_labels:+$cause_labels, }인증 실패"
+                       cause_hints+=("도구 로그인 상태와 API 키를 확인하십시오 (로그인 후 재실행).") ;;
+            model)     cause_labels="${cause_labels:+$cause_labels, }모델 없음"
+                       cause_hints+=("rd-workflow/config/review-tools.json 의 모델 지정을 확인하십시오.") ;;
+          esac
+        done
+        case "$cause_kind" in
+          confirmed)  echo "원인(로그 끝 오류 줄 기준): ${cause_labels}" >&2 ;;
+          candidates) echo "원인 후보: ${cause_labels}" >&2 ;;
+          *)          echo "원인 불명 (로그 끝 확인: $( [[ -n "$fail_log" && -f "$fail_log" ]] && printf '%s' "$fail_log" || printf '없음' ))" >&2 ;;
+        esac
+        for hint in "${cause_hints[@]+"${cause_hints[@]}"}"; do
+          echo "    처방: ${hint}" >&2
+        done
+        # effort 복구 안내: effort 거부가 원인(후보 포함)이거나, 원인 불명인 codex 에서 effort 를 전달했을 때만.
+        # 영구 변경(키 제거)은 안내하지 않는다 — 일회성 무력화와 값 확인뿐이다.
+        if [[ "$cause_effort" -eq 1 || ( "$cause_kind" == "unknown" && "$tool" == "codex" && -n "$EFFORT_VALUE" ) ]]; then
           echo "    reasoning effort '${EFFORT_VALUE}' (source: ${EFFORT_SOURCE}) 를 전달했습니다." >&2
           echo "    이 값이 현재 모델에서 지원되지 않으면 codex 가 설정을 거부합니다. 복구 방법:" >&2
-          echo "      - 즉시 무력화: RD_REVIEW_EFFORT_OVERRIDE=0 을 설정하고 다시 실행" >&2
-          echo "      - 영구 해제: rd-workflow/config/review-tools.json 에서 해당 effort 키 제거" >&2
+          echo "      - 일회성 무력화: RD_REVIEW_EFFORT_OVERRIDE=0 을 설정하고 다시 실행" >&2
+          echo "      - 값 확인: rd-workflow/config/review-tools.json 의 effort 값을 확인" >&2
         fi
+        case "$safety_verdict" in
+          ok)      echo "세션: (가) 재실행 가능 — 같은 명령으로 재실행하면 이어집니다." >&2 ;;
+          anomaly) echo "세션: (다) 세션 상태 이상 — 아래 관측 사실을 근거로 세션을 직접 확인하십시오." >&2 ;;
+          *)       echo "세션: (나) 수동 확인 필요 — 잔존 프로세스를 확인하기 전에 재실행하지 마십시오." >&2 ;;
+        esac
+        echo "    관측: ${safety_obs}" >&2
+        report_preserved_turn "$EXPECTED_TURN_FILE" "$CHECKPOINT_FILE" "$checkpoint_sum_before" "$SESSION_FILE" "$relative_expected_turn_file"
         exit 1
         ;;
     esac

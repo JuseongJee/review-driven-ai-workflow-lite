@@ -15,6 +15,8 @@
 #   - 대화형 autopilot(.autopilot_active)은 트리거에 넣지 않는다. 재진입 주체(사람)가
 #     있어 자멸하지 않으며, 묶으면 정당한 백그라운드 사용까지 막는다.
 # 판정 불가는 전부 통과(exit 0) — positive 감지 한정 fail-open.
+# 한계: PreToolUse 는 명령 실행 전에만 돌아 timeout 도달 뒤의 harness 자동 이관을 볼 수 없다.
+#   PostToolUse 로 이관 결과 문구를 볼 수 있는지는 미확인이라 코드를 바꾸지 않았고, 별도 FR 로 다룬다.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,11 +33,11 @@ cat >&2 <<'MSG'
         응답을 내는 순간 세션이 종료되어 결과를 수령할 주체가 사라집니다
         (outcome 이 빈 채 남아 wrapper 가 harness-error / exit 40 으로 매핑).
 
-        대안 1 — foreground 로 실행하고 timeout 을 최대치로 지정하십시오.
-                 timeout: 600000 (ms). 그보다 오래 걸리면 harness 의 자동
-                 백그라운드 이관에 맡깁니다. 스스로 백그라운드를 고르지 않습니다.
+        대안 1 — foreground 로 실행하십시오. timeout 인자는 생략합니다
+                 (wrapper 가 올린 기본값이 적용됩니다). 스스로 백그라운드를
+                 고르지 않습니다.
 
-        대안 2 — 리뷰 턴은 어댑터 watchdog 을 바깥보다 크게 겁니다.
+        대안 2 — 리뷰 턴은 안쪽 WAIT_TIMEOUT 을 바깥 Bash 대기(기본 7500초)보다 작게 둡니다.
                  WAIT_TIMEOUT=3600 bash rd-workflow/scripts/run_review_turn.sh <session-path>
 
         규약: autopilot SKILL.md 「무인 진입 § 결과 대기 규율」

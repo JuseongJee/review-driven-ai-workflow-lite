@@ -9,7 +9,7 @@
 #   RD_RALPH_NONPROGRESS_LIMIT 연속 non-terminal(완료/blocked 미도달) 한도 (기본 5)
 #   RD_RALPH_WRAPPER_CMD       wrapper 호출 명령 오버라이드 (테스트 훅; 기본 "bash rd-workflow/scripts/autopilot_headless.sh")
 #
-# exit code: 0 정상 종료(queue-empty·queue-blocked) / 1 중단(backstop·harness-error 재발·관계 판정 불가·미지 코드)
+# exit code: 0 정상 종료(queue-empty·queue-blocked) / 1 중단(backstop·harness-error 재발·관계/재개 판정 불가·미지 코드)
 set -uo pipefail
 
 FINISH_POLICY="${RD_FINISH_POLICY:-merge}"
@@ -89,10 +89,15 @@ while : ; do
       # set-aside 하고 다음 FR 로 넘어가는 계약이지만, 관계 판정 실패는 FR 을 고르기
       # **전의 전역 실패**라 다음 iteration 도 똑같이 실패한다. 카운터를 올리지 않고
       # 즉시 중단한다 (그러지 않으면 같은 실패를 상한까지 되풀이한다).
+      # resume-undetermined(재개 대상 판정 불가)도 전역 상태라 다음 iteration 이 같은 실패를 되풀이한다.
       # 이 경로에는 FR status 변경·CURRENT_TASK 초기화 같은 일반 blocked 절차도
       # 적용되지 않는다 — 대상 FR 이 없기 때문이다.
-      if [ "$reason" = "relations-unavailable" ]; then
-        stop_reason="관계 판정 불가 (relations-unavailable) — 전역 실패이므로 즉시 중단"
+      if [ "$reason" = "relations-unavailable" ] || [ "$reason" = "resume-undetermined" ]; then
+        if [ "$reason" = "resume-undetermined" ]; then
+          stop_reason="재개 판정 불가 (resume-undetermined) — 전역 실패이므로 즉시 중단"
+        else
+          stop_reason="관계 판정 불가 (relations-unavailable) — 전역 실패이므로 즉시 중단"
+        fi
         blocked_detail="$(awk 'NR>1' "$OUTCOME_FILE" 2>/dev/null)"
         summarize; exit 1
       fi
