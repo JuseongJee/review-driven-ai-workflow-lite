@@ -70,6 +70,15 @@ alive_sleeps() {
   if (( rc > 1 )); then echo ERR; else printf '%s' "$out" | grep -c . | tr -d ' ' || true; fi
 }
 
+# 생존 sleep 의 pid·ppid·stat·command. T1b 가 부하에서 드물게 FAIL 하는 원인을 다음 관측 때
+# 확정하려는 진단이다(FR autopilot-headless-timecap-orphan-reap-flake, 2026-11-01 부하 20회 재현 0건).
+alive_sleeps_detail() {
+  local p
+  for p in $(pgrep -f "^sleep (${STUB_SLEEP}|$((STUB_SLEEP + 1)))\$" 2>/dev/null); do
+    ps -o pid=,ppid=,stat=,command= -p "$p" 2>/dev/null
+  done
+}
+
 # run_wrapper <mode> <mark> <cwd> <env...> — outcome/stderr/stdout/elapsed 를 ${TMP}/run-* 에 남긴다.
 run_wrapper() {
   local mode="$1" mark="$2" cwd="$3"; shift 3
@@ -110,7 +119,9 @@ check "task-state 불변(해시·mtime)" "$([[ "$ts_before" == "$(sig "${REPO_RO
 run_wrapper t1b t1bm "$TMP" RD_FR_WALL_MINUTES=0.03
 echo "[T1b 재부모화 고아]"
 check "wrapper 가 멈추지 않고 반환" "$RUN_HUNG"
-check "고아 자식까지 회수 (생존 0)" "$([[ "$(alive_sleeps)" == 0 ]]; echo $?)"
+t1b_alive="$(alive_sleeps)"
+check "고아 자식까지 회수 (생존 0)" "$([[ "$t1b_alive" == 0 ]]; echo $?)"
+if [[ "$t1b_alive" != 0 ]]; then alive_sleeps_detail | sed 's/^/    생존: /' >&2; fi
 check "outcome 첫 줄 blocked:time-cap" "$([[ "$(outcome_first)" == "blocked:time-cap" ]]; echo $?)"
 
 # ── T2 completed 유지

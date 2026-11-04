@@ -13,8 +13,10 @@ trap 'rm -rf "$TMPROOT"' EXIT
 # 전제로 돌므로, 기동 경로는 환경에서 원천 차단한다(2026-09 사고: 테스트가 실제 pane 을 생성).
 #   - HERDR_ENV= : session_launch 의 herdr 환경 판정 자체를 끈다.
 #   - RD_CHILD_SESSION=1 : 이미 자식 세션이라는 깊이-1 제한 경로로 보내 기동을 거부한다.
+#   - HC_TERMINAL_ID= : herdr app(HC_TERMINAL_ID)도 같은 이유로 비운다.
 # 둘 다 두는 이유는 어느 한쪽 판정이 바뀌어도 차단이 남게 하기 위해서다.
 export HERDR_ENV=
+export HC_TERMINAL_ID=
 export RD_CHILD_SESSION=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -107,6 +109,7 @@ setup_repo() {
     cp -R "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/hooks/. rd-workflow/scripts/hooks/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_state_common.sh rd-workflow/scripts/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_task_common.sh rd-workflow/scripts/; \
+    cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_submodule_common.sh rd-workflow/scripts/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/rd rd-workflow/scripts/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_fr_register_common.sh rd-workflow/scripts/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/fr_backlog_scan.sh rd-workflow/scripts/; \
@@ -1409,7 +1412,8 @@ run_promote "$SZ1" --short-title szt --no-worktree --size large >/dev/null 2>&1
 assert_eq "$(sz_status "$SZ1")" "대기 중" "promote --size large → 대기 중"
 # rd 와 그 의존을 fixture 에 넣고 사본으로 전이를 시험한다
 cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/rd \
-   "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_task_common.sh "$SZ1/rd-workflow/scripts/"
+   "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_task_common.sh \
+   "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_submodule_common.sh "$SZ1/rd-workflow/scripts/"
 ( cd "$SZ1" && bash rd-workflow/scripts/rd task set-status "REQUEST review 대기" ) >/dev/null 2>&1 && rc=0 || rc=1
 assert_eq "$rc" "0" "promote --size large 후 첫 전이가 --force 없이 성공"
 

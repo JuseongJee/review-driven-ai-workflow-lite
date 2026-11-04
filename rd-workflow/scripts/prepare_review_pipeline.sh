@@ -7,6 +7,9 @@ cd "${project_root}"
 
 # 기본 브랜치 resolver (diff 기본 target 일반화)
 source "${script_dir}/lifecycle/_lifecycle_common.sh"
+# 리뷰 대상 문자열·완전성 검사(rd_review_diff_target·rd_review_input_check). _rd_is_repo_root 가 _state_common.sh 에 있어 먼저 부릅니다.
+source "${script_dir}/_state_common.sh"
+source "${script_dir}/_submodule_common.sh"
 
 turn_limit="${REVIEW_TURN_LIMIT:-20}"
 
@@ -19,7 +22,7 @@ review-kind:
   project-context
   request
   spec-plan [spec-path] [plan-path]
-  diff [--base <ref>] [diff-target]
+  diff [--base <ref>] [diff-target]   # diff-target: [git diff ]<a>...<b> | <a>..<b> | <ref>
 
 예:
   bash rd-workflow/scripts/prepare_review_pipeline.sh project-context
@@ -29,9 +32,13 @@ review-kind:
   bash rd-workflow/scripts/prepare_review_pipeline.sh diff
   bash rd-workflow/scripts/prepare_review_pipeline.sh diff --base main
   bash rd-workflow/scripts/prepare_review_pipeline.sh diff "git diff main...HEAD"
+  bash rd-workflow/scripts/prepare_review_pipeline.sh diff "main...fr/x"   # 접두 없는 a...b · a..b 도 받습니다
+  bash rd-workflow/scripts/prepare_review_pipeline.sh diff main            # ref 하나 = "main...HEAD"
   # diff 의 base 우선순위: --base <ref> → task-state fr-branch(merge-base 계산 입력) → task-state base-commit.
   # 셋 다 없으면 세션을 만들지 않고 실패합니다 (빈 diff 를 리뷰 대상으로 남기지 않기 위함입니다).
   # --base 와 diff-target 위치 인자는 동시에 지정할 수 없습니다.
+  # ref 하나(`diff main`)는 `main...HEAD` 와 같습니다 — 커밋된 HEAD 만 보며, 작업 트리를 비교하는
+  # `git diff main` 과 다릅니다. ref 를 커밋으로 해석하지 못하면 세션을 만들지 않고 실패합니다.
   # 위치 인자의 오른쪽이 `HEAD` 가 아니면(예: "git diff main..branch-B") 그 head 를 pinned 로
   # 고정합니다 — 리뷰 도중 재snapshot 하지 않으므로 iteration commit 은 반영되지 않습니다.
 EOF
@@ -141,6 +148,125 @@ diff_change_state() {
     1) return 0 ;;
     *) return 2 ;;
   esac
+}
+
+# review_input_warn_threshold — 규모 경고 기준(행)을 stdout 에 정수로 냅니다.
+# workflow.json 의 review_input_warn_lines: 키 부재·파일 부재는 기본값 8000 (조용히),
+# 0 이상의 정수가 아닌 값은 기본값 8000 + stderr 안내, 0 은 경고 끔.
+review_input_warn_threshold() {
+  local cfg="${project_root}/rd-workflow/config/workflow.json" v=""
+  if [[ -f "$cfg" ]] && grep -q '"review_input_warn_lines"[[:space:]]*:' "$cfg" 2>/dev/null; then
+    v="$(sed -n 's/.*"review_input_warn_lines"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p' "$cfg" 2>/dev/null | head -1 || true)"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    if [[ "$v" =~ ^[0-9]+$ ]]; then
+      printf '%s\n' "$((10#$v))"
+      return 0
+    fi
+    echo "review input: workflow.json 의 review_input_warn_lines 값('${v}')이 0 이상의 정수가 아니어서 기본값 8000 을 씁니다." >&2
+  fi
+  printf '8000\n'
+}
+
+# review_input_size_warning <base> <head> — 변경 행 수(추가+삭제)가 기준을 넘으면 stderr 로 경고합니다.
+# 경고만 하며 항상 0 을 반환합니다 (세션 생성은 이미 끝났고 막지 않습니다).
+review_input_size_warning() {
+  local base="$1" head="$2" threshold numstat total=0 a d p tab=$'\t'
+  [[ -n "$base" && -n "$head" ]] || return 0
+  threshold="$(review_input_warn_threshold)"
+  [[ "$threshold" -gt 0 ]] || return 0
+  numstat="$(git -c core.quotePath=false diff --numstat "${base}..${head}" 2>/dev/null)" || return 0
+  [[ -n "$numstat" ]] || return 0
+  local rows=""
+  while IFS="$tab" read -r a d p; do
+    [[ -n "$p" ]] || continue
+    [[ "$a" =~ ^[0-9]+$ ]] || a=0
+    [[ "$d" =~ ^[0-9]+$ ]] || d=0
+    total=$((total + a + d))
+    rows="${rows}$((a + d))${tab}${p}"$'\n'
+  done <<< "$numstat"
+  [[ "$total" -gt "$threshold" ]] || return 0
+
+  echo "review input: 변경 ${total}행이 경고 기준 ${threshold}행을 넘습니다 — 리뷰가 제한 시간 안에 끝나지 않을 수 있습니다." >&2
+  echo "  행 수가 큰 파일:" >&2
+  local n path any_split=0 mark
+  while IFS="$tab" read -r n path; do
+    [[ -n "$path" ]] || continue
+    mark=""
+    case "${path##*/}" in
+      *.lock|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|go.sum|*.min.js|*.min.css|*.map|*.snap)
+        mark="  [분리 후보]"; any_split=1 ;;
+    esac
+    echo "    ${n}  ${path}${mark}" >&2
+  done < <(printf '%s' "$rows" | sort -t"$tab" -k1,1nr -k2,2 | head -5)
+  if [[ "$any_split" -eq 1 ]]; then
+    echo "  분리 후보(락파일·축소본·소스맵·스냅샷)는 별도 커밋·별도 리뷰로 나누는 것을 검토하십시오." >&2
+  fi
+  echo "  경고 기준은 rd-workflow/config/workflow.json 의 review_input_warn_lines 로 바꿀 수 있습니다 (0 은 끔)." >&2
+  return 0
+}
+
+# shell_quote <문자열> — 안내 명령에 붙일 문자열을 셸에서 그대로 읽히게 인용합니다.
+# [A-Za-z0-9_./-] 만 있으면 그대로, 아니면 작은따옴표로 감쌉니다 (안의 ' 는 '\'' 로 바꿈).
+shell_quote() {
+  local q="$1" sq="'"
+  if [[ "$q" =~ ^[A-Za-z0-9_./-]+$ ]]; then
+    printf '%s' "$q"
+  else
+    # 변수로 치환해 bash 버전별 따옴표·백슬래시 해석 차이를 피합니다.
+    printf "'%s'" "${q//$sq/$sq\\$sq$sq}"
+  fi
+}
+
+# review_submodule_notice <base> <head> — outer diff 가 담지 못하는 서브모듈 내부 변경을 stderr 로 알립니다.
+# (가) 체크아웃 OID ≠ outer HEAD 의 gitlink OID (.gitmodules 가 있을 때만),
+# (나) reviewed 구간 안의 gitlink 변경 (.gitmodules 와 무관). 알림 전용이며 항상 0 을 반환합니다.
+review_submodule_notice() {
+  local base="$1" head="$2" lines="" p link co top real tab=$'\t' rec inner
+  if [[ -f .gitmodules ]]; then
+    # -z 출력은 레코드마다 "<key>\n<value>\0" 이라 공백이 있는 이름·경로도 값만 온전히 꺼냅니다.
+    while IFS= read -r -d '' rec; do
+      p="${rec#*$'\n'}"
+      [[ "$p" != "$rec" ]] || continue
+      [[ -n "$p" ]] || continue
+      link="$(git ls-tree HEAD -- "$p" 2>/dev/null | awk '$1 == "160000" { print $3; exit }')"
+      [[ -n "$link" ]] || continue
+      [[ -d "$p" ]] || continue
+      top="$(git -C "$p" rev-parse --show-toplevel 2>/dev/null)" || continue
+      top="$(cd "$top" 2>/dev/null && pwd -P)" || continue
+      real="$(cd "$p" 2>/dev/null && pwd -P)" || continue
+      [[ "$top" == "$real" ]] || continue
+      co="$(git -C "$p" rev-parse HEAD 2>/dev/null)" || continue
+      [[ -n "$co" && "$co" != "$link" ]] || continue
+      lines="${lines}  [체크아웃] ${p}: 체크아웃 ${co:0:12} ≠ outer HEAD 기록 ${link:0:12}"$'\n'
+      inner="git -C $(shell_quote "$p") diff ${link}..HEAD"
+      lines="${lines}    내부 변경을 리뷰하려면: prepare_review_pipeline.sh diff $(shell_quote "$inner")"$'\n'
+    done < <(git config -f .gitmodules -z --get-regexp '^submodule\..*\.path$' 2>/dev/null || true)
+  fi
+  if [[ -n "$base" && -n "$head" ]]; then
+    local meta path om nm oo no
+    # -z 출력은 "<meta>\0<path>\0" 이라 따옴표·역슬래시가 있는 경로도 C 식 인용 없이 그대로 옵니다.
+    while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+      [[ -n "$path" ]] || continue
+      # meta = ":<old mode> <new mode> <old oid> <new oid> <status>"
+      set -- $meta
+      om="${1#:}"; nm="$2"; oo="$3"; no="$4"
+      [[ "$om" == "160000" || "$nm" == "160000" ]] || continue
+      if [[ "$om" == "160000" && "$nm" == "160000" ]]; then
+        lines="${lines}  [커밋된 포인터] ${path}: ${oo:0:12}→${no:0:12} (리뷰 입력에 내부 코드를 펼쳤습니다)"$'\n'
+      elif [[ "$nm" == "000000" ]]; then
+        lines="${lines}  [커밋된 포인터] ${path}: 서브모듈 삭제 (${oo:0:12} → 없음, 이 리뷰에는 포인터 변경만 보입니다)"$'\n'
+      elif [[ "$om" != "000000" ]]; then
+        lines="${lines}  [커밋된 포인터] ${path}: 서브모듈↔일반 파일 종류 변경"$'\n'
+      else
+        lines="${lines}  [커밋된 포인터] ${path}: 서브모듈 추가 (없음 → ${no:0:12}, 리뷰 입력에 내부 코드를 펼쳤습니다)"$'\n'
+      fi
+    done < <(git diff --raw -z --no-abbrev --no-renames "${base}..${head}" 2>/dev/null || true)
+  fi
+  [[ -n "$lines" ]] || return 0
+  echo "review target: 서브모듈 변경이 있습니다 — outer diff 는 서브모듈 내부 변경을 담지 않습니다." >&2
+  printf '%s' "$lines" >&2
+  return 0
 }
 
 if [[ $# -lt 1 ]]; then
@@ -274,7 +400,20 @@ ${plan_path}"
       # merge-base 를 base 로 씁니다 — 그래야 기록한 두 점 diff 가 원래 표현과 같은
       # 변경 집합을 가리킵니다.
       _pos_head_oid=""
-      if [[ "$diff_positional" =~ ^[[:space:]]*git[[:space:]]+diff[[:space:]]+([^[:space:]]+)\.\.\.([^[:space:]]+)[[:space:]]*$ ]]; then
+      _pos_form=""
+      # 앞뒤 공백을 걷고 선택적 접두 `git diff ` 를 뗀 나머지가 body 입니다 (change-spec 2.2).
+      # body 가 공백을 포함하면 파싱 불가(legacy)입니다.
+      _pos_expr="$diff_positional"
+      _pos_expr="${_pos_expr#"${_pos_expr%%[![:space:]]*}"}"
+      _pos_expr="${_pos_expr%"${_pos_expr##*[![:space:]]}"}"
+      _pos_body="$_pos_expr"
+      if [[ "$_pos_expr" =~ ^git[[:space:]]+diff[[:space:]]+(.*)$ ]]; then
+        _pos_body="${BASH_REMATCH[1]}"
+      fi
+      if [[ -z "$_pos_body" || "$_pos_body" =~ [[:space:]] ]]; then
+        :
+      elif [[ "$_pos_body" =~ ^([^[:space:].][^[:space:]]*)\.\.\.([^[:space:]]+)$ ]]; then
+        _pos_form="range3"
         _pos_l="${BASH_REMATCH[1]}"
         _pos_r="${BASH_REMATCH[2]}"
         _pos_l_oid="$(rd_resolve_commit_oid "$_pos_l")" \
@@ -283,13 +422,25 @@ ${plan_path}"
           || diff_fail "diff-target 의 '${_pos_r}' 를 커밋으로 해석할 수 없습니다"
         _base_oid="$(diff_merge_base "$_pos_l_oid" "$_pos_head_oid")" \
           || diff_fail "merge-base 계산 실패 — '${_pos_l}' 와 '${_pos_r}' 의 공통 조상을 찾을 수 없습니다 (얕은 clone 일 수 있습니다)"
-      elif [[ "$diff_positional" =~ ^[[:space:]]*git[[:space:]]+diff[[:space:]]+([^[:space:]]+)\.\.([^[:space:]]+)[[:space:]]*$ ]]; then
+      elif [[ "$_pos_body" != *...* && "$_pos_body" =~ ^([^[:space:].][^[:space:]]*)\.\.([^[:space:]]+)$ ]]; then
+        _pos_form="range2"
         _pos_l="${BASH_REMATCH[1]}"
         _pos_r="${BASH_REMATCH[2]}"
         _base_oid="$(rd_resolve_commit_oid "$_pos_l")" \
           || diff_fail "diff-target 의 '${_pos_l}' 를 커밋으로 해석할 수 없습니다"
         _pos_head_oid="$(rd_resolve_commit_oid "$_pos_r")" \
           || diff_fail "diff-target 의 '${_pos_r}' 를 커밋으로 해석할 수 없습니다"
+      elif [[ "$_pos_body" != *..* && "$_pos_body" != -* ]]; then
+        # ref 하나: `<ref>...HEAD` 와 같습니다 (change-spec 2.2 순서 3, head 정책 auto).
+        _pos_form="single"
+        _pos_l="$_pos_body"
+        _pos_r="HEAD"
+        _pos_l_oid="$(rd_resolve_commit_oid "$_pos_l")" \
+          || diff_fail "diff-target 의 '${_pos_l}' 를 커밋으로 해석할 수 없습니다"
+        _pos_head_oid="$(rd_resolve_commit_oid "$_pos_r")" \
+          || diff_fail "diff-target 의 'HEAD' 를 커밋으로 해석할 수 없습니다"
+        _base_oid="$(diff_merge_base "$_pos_l_oid" "$_pos_head_oid")" \
+          || diff_fail "merge-base 계산 실패 — '${_pos_l}' 와 'HEAD' 의 공통 조상을 찾을 수 없습니다 (얕은 clone 일 수 있습니다)"
       fi
 
       if [[ -n "$_base_oid" ]]; then
@@ -353,6 +504,10 @@ ${plan_path}"
         diff_fail "base ${_base_oid} 가 현재 HEAD 의 조상이 아닙니다 — 입력이 서로 모순입니다"
       fi
       if [[ "$_base_oid" == "$_head_oid" ]]; then
+        if [[ "${_pos_form:-}" == "single" ]]; then
+          diff_fail "base 와 HEAD 가 같은 커밋입니다 (${_base_oid}) — 리뷰할 변경이 없습니다
+  비교 기준 브랜치를 주십시오 (예: diff main)."
+        fi
         diff_fail "base 와 HEAD 가 같은 커밋입니다 (${_base_oid}) — 리뷰할 변경이 없습니다"
       fi
       # 서로 다른 OID 라는 조건만으로는 부족합니다 — 변경 커밋과 완전 revert 커밋이 이어지면
@@ -367,7 +522,10 @@ ${plan_path}"
       esac
       REVIEW_BASE_OID="$_base_oid"
       REVIEW_HEAD_OID="$_head_oid"
-      diff_target="git diff ${REVIEW_BASE_OID}..${REVIEW_HEAD_OID}"
+      # submodule 포인터가 바뀐 구간은 안쪽 코드를 펼친 형식으로 대상을 만들고, 펼치지 못하면 세션 생성 전에 멈춥니다.
+      rd_review_input_check "$REVIEW_BASE_OID" "$REVIEW_HEAD_OID" \
+        || diff_fail "리뷰 입력에 submodule 코드를 펼칠 수 없습니다 — 위 안내를 따르십시오"
+      diff_target="$(rd_review_diff_target "$REVIEW_BASE_OID" "$REVIEW_HEAD_OID")"
     fi
     review_type="diff-review"
     session_slug="final-diff-review"
@@ -383,6 +541,17 @@ esac
 
 session_path="$("${script_dir}/init_review_pipeline.sh" "${session_slug}" "${review_type}" "${review_target}" "${review_goal}")"
 prompts_path="${session_path}/PROMPTS.md"
+
+# ref 하나 형태로 해석한 세션은 해석 결과를 알립니다 (change-spec 2.3). 거부하지 않고 알려서,
+# 기본 브랜치에서 리뷰할 브랜치를 기준으로 착각해 준 경우도 바로 알아차리게 합니다.
+if [[ "${_pos_form:-}" == "single" ]]; then
+  _single_head_name="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)" \
+    || _single_head_name="${REVIEW_HEAD_OID:0:12}"
+  {
+    echo "diff review: '${_pos_l}' 를 비교 기준으로 해석했습니다 — 리뷰 대상은 ${REVIEW_BASE_OID:0:12}..${_single_head_name} (${_pos_l}...HEAD 와 같습니다)."
+    echo "  다른 브랜치를 리뷰하려면 양끝을 주십시오. 예: prepare_review_pipeline.sh diff \"<기준>...<리뷰할 브랜치>\""
+  } >&2
+fi
 
 cat <<EOF > "${prompts_path}"
 # Review Pipeline Prompts
@@ -500,6 +669,12 @@ fi
 
 if [[ "$DIFF_TARGET_UNRESOLVED" -eq 1 ]]; then
   echo "diff-target 을 OID 로 해석할 수 없어 reviewed OID 를 기록하지 않았습니다 — 이 세션은 봉인 시 --legacy-unverified 가 필요합니다" >&2
+fi
+
+# 리뷰 입력 규모 경고 — reviewed OID 가 둘 다 있을 때만 잽니다 (경고 전용, 세션 생성은 막지 않음).
+review_input_size_warning "${REVIEW_BASE_OID:-}" "${REVIEW_HEAD_OID:-}" || true
+if [[ "$review_type" == "diff-review" ]]; then
+  review_submodule_notice "${REVIEW_BASE_OID:-}" "${REVIEW_HEAD_OID:-}" || true
 fi
 
 # Review Scope section (review-turn-latency-reduction — A / review-tiering-by-risk — D8)

@@ -31,3 +31,26 @@ When you answer, keep it short and use this format:
 - `Stop if: ...`
 
 If a critical fact is missing, ask one short question instead of guessing.
+
+## rd-workflow 버전 대조
+
+이 skill 은 아래 `RD_SKILL_BASE` 보다 나중에 배포된 rd-workflow 를 전제한다. 첫 작업 단계보다 먼저, 프로젝트 루트에서 아래 명령을 이 호출에서 한 번 실행한다.
+
+- 출력이 없으면 그대로 진행한다.
+- 출력이 있으면 출력 전문을 사용자에게 알리고, 템플릿을 sync 할지 그대로 계속할지 묻고 멈춘다. 사용자가 계속을 지시하면 진행한다.
+- autopilot·무인 실행처럼 물을 사람이 없으면 계속하지 않고 그 출력을 중단 사유로 보고한다.
+
+```bash
+bash -s <<'RD_SKILL_COMPAT'
+RD_SKILL_BASE=2026-11-01-202303 RD_SKILL_NAME=workflow-router
+vf="rd-workflow/VERSION"
+if [ ! -f "$vf" ] && [ -f "_ROOT_FILES/rd-workflow/VERSION" ]; then exit 0; fi
+v=""; [ -f "$vf" ] && v="$(cat "$vf")"; v="${v#lite-}"
+if [[ "$v" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$ ]] && [[ "$v" > "$RD_SKILL_BASE" ]]; then exit 0; fi
+echo "rd-workflow 버전 불일치 — skill '$RD_SKILL_NAME' 은 $RD_SKILL_BASE 보다 나중에 배포된 rd-workflow 가 필요합니다."
+echo "프로젝트: $PWD"
+echo "프로젝트 VERSION: ${v:-없음} (파일: $vf)"
+echo "이 상태로 진행하면 skill 이 가리키는 문서 절·스크립트·인자가 없어 중간에 실패할 수 있습니다."
+echo "해결: 템플릿을 sync 하십시오 (/tpl update 또는 rd-workflow/docs/guides/sync_template.md 절차)."
+RD_SKILL_COMPAT
+```

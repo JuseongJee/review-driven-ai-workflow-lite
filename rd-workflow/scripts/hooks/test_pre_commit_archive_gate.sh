@@ -29,7 +29,16 @@ export RD_GUARD_BLOCK_LOG
 _rd_gbl_cleanup() {
   [ "$RD_GUARD_BLOCK_LOG" = "/dev/null" ] || rm -f "$RD_GUARD_BLOCK_LOG"
 }
-trap 'cleanup_fixture; _rd_gbl_cleanup' EXIT INT TERM
+
+# 원본 불변 보장 (spec 4.1): FX_BASE·GIT_SEED 는 만든 직후 읽기 전용으로 두고 사본만 씁니다.
+fx_freeze() { chmod -R a-w "$1"; }
+fx_clone()  { cp -R "$1/." "$2" && chmod -R u+w "$2"; }   # 새 디렉터리에 내용 복사
+fx_thaw()   { [[ -n "${1:-}" && -d "$1" ]] && { chmod -R u+w "$1" 2>/dev/null; rm -rf "$1"; }; return 0; }
+fx_snap()   { find "$@" -print | LC_ALL=C sort; find "$@" -type f -exec cksum {} + | LC_ALL=C sort; }
+FX_BASE=""
+GIT_SEED=""
+_fx_cleanup_all() { fx_thaw "$FX_BASE"; fx_thaw "$GIT_SEED"; }
+trap 'cleanup_fixture; _fx_cleanup_all; _rd_gbl_cleanup' EXIT INT TERM
 
 # make_fixture <source-fr-값(__NONE__=섹션 없음)> <fr상세파일 상대경로(__NONE__=생성 안 함)> <fr-status> [세션모드]
 # hook 은 script_dir/../../.. 를 project_root 로 계산 → fixture/rd-workflow/scripts/hooks 에 배치.
@@ -41,40 +50,16 @@ make_fixture() {
   local fixture
   fixture="$(mktemp -d)" || { echo "test_pre_commit_archive_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$fixture" && -d "$fixture" ]] || { echo "test_pre_commit_archive_gate.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
-  mkdir -p "$fixture/rd-workflow/scripts/hooks"
-  cp "$HOOK_SOURCE" "$fixture/rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"
-  cp "$GUARD_COMMON" "$fixture/rd-workflow/scripts/hooks/_guard_common.sh"
-  cp "$STATE_COMMON" "$fixture/rd-workflow/scripts/_state_common.sh"
-  # 스캐너를 함께 복사한다. 누락하면 폴백 경로로 테스트되어 새 판정을 검사하지 못한다.
-  # **조건부(`[[ -f ]] &&`)로 두지 않는다.** 파일이 없어도 복사를 건너뛴 채 테스트가
-  # 통과해 버린다 — hook 이 `scan_command_commit` 에서 폴백 판정으로 흡수하기 때문이다.
-  # 이 스크립트에는 `set -e` 가 없으므로 실패도 명시적으로 중단시킨다.
-  cp "$HOOK_DIR/_commit_scan.awk" "$fixture/rd-workflow/scripts/hooks/" \
-    || { echo "test_pre_commit_archive_gate.sh: _commit_scan.awk 복사 실패 (HOOK_DIR='$HOOK_DIR')" >&2; return 1; }
-  # 판정 규칙이 담긴 awk 도 함께 복사한다. 누락하면 fixture 안의 판정이 항상 실패해
-  # 종결 세션을 전제로 한 케이스가 게이트에 도달하지 못한 채 통과한다.
-  cp "$HOOK_DIR/_open_issues.awk" "$fixture/rd-workflow/scripts/hooks/" \
-    || { echo "test_pre_commit_archive_gate.sh: _open_issues.awk 복사 실패 (HOOK_DIR='$HOOK_DIR')" >&2; return 1; }
-  mkdir -p "$fixture/rd-workflow-workspace/.lifecycle"
-  cat > "$fixture/rd-workflow-workspace/.lifecycle/task-state" <<'TSEOF'
-schema=1
-short-title=t1
-status=diff review 대기
-fr-branch=null
-worktree-path=null
-source-fr=-
-TSEOF
+  # 공통부(스크립트 사본 5개·task-state·resolved 세션)는 FX_BASE 를 복제한다. 스캐너·판정 awk
+  # 복사 누락은 폴백 판정으로 흡수되어 테스트가 헛통과하므로 FX_BASE 생성 시 명시적으로 중단시킨다.
+  fx_clone "$FX_BASE" "$fixture" || { echo "test_pre_commit_archive_gate.sh: FX_BASE 복제 실패" >&2; return 1; }
   local sess="$fixture/rd-workflow-workspace/handoffs/review_pipeline/20260101_000000_final-diff-review"
-  if [[ "$sess_mode" != "none" ]]; then
-    mkdir -p "$sess"
-    if [[ "$sess_mode" == "open" ]]; then
-      # 미종결 — Status 가 awaiting-user/closed 가 아니면 is_review_session_resolved 가 거부한다.
-      printf '%s\n' "# Review Session" "" "## Status" "awaiting-reviewer" "" "## Branch Context" "- short-title: t1" > "$sess/SESSION.md"
-      printf '%s\n' "# Review Checkpoint" "" "## Open Issues" "- 미해결 이슈가 있습니다" > "$sess/CHECKPOINT.md"
-    else
-      printf '%s\n' "# Review Session" "" "## Status" "awaiting-user" "" "## Branch Context" "- short-title: t1" > "$sess/SESSION.md"
-      printf '%s\n' "# Review Checkpoint" "" "## Open Issues" "- 없음" > "$sess/CHECKPOINT.md"
-    fi
+  if [[ "$sess_mode" == "none" ]]; then
+    rm -rf "$fixture/rd-workflow-workspace/handoffs"
+  elif [[ "$sess_mode" == "open" ]]; then
+    # 미종결 — Status 가 awaiting-user/closed 가 아니면 is_review_session_resolved 가 거부한다.
+    printf '%s\n' "# Review Session" "" "## Status" "awaiting-reviewer" "" "## Branch Context" "- short-title: t1" > "$sess/SESSION.md"
+    printf '%s\n' "# Review Checkpoint" "" "## Open Issues" "- 미해결 이슈가 있습니다" > "$sess/CHECKPOINT.md"
   fi
   if [[ "$src_val" == "__NONE__" ]]; then
     printf '%s\n' "# Change Request" "" "## Task Type" "change" > "$fixture/REQUEST.md"
@@ -125,6 +110,43 @@ run_scenario() {
 }
 
 ITEM="rd-workflow-workspace/backlog/items/2026-01-01-t1.md"
+
+# FX_BASE — 모든 fixture 의 공통부를 1회 만든다. hook 은 script_dir/../../.. 를 project_root 로
+# 계산하므로 rd-workflow/scripts/hooks 에 배치한다. 종결(resolved) 세션이 기본인 이유는 대부분의
+# 시나리오가 enforcement 경로 도달을 전제하기 때문이다.
+make_fx_base() {
+  local b
+  b="$(mktemp -d)" || { echo "test_pre_commit_archive_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$b" && -d "$b" ]] || return 1
+  FX_BASE="$b"
+  mkdir -p "$b/rd-workflow/scripts/hooks"
+  cp "$HOOK_SOURCE" "$b/rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"
+  cp "$GUARD_COMMON" "$b/rd-workflow/scripts/hooks/_guard_common.sh"
+  cp "$STATE_COMMON" "$b/rd-workflow/scripts/_state_common.sh"
+  # **조건부(`[[ -f ]] &&`)로 두지 않는다.** 이 스크립트에는 `set -e` 가 없으므로 실패도 명시적으로 중단시킨다.
+  cp "$HOOK_DIR/_commit_scan.awk" "$b/rd-workflow/scripts/hooks/" \
+    || { echo "test_pre_commit_archive_gate.sh: _commit_scan.awk 복사 실패 (HOOK_DIR='$HOOK_DIR')" >&2; return 1; }
+  cp "$HOOK_DIR/_open_issues.awk" "$b/rd-workflow/scripts/hooks/" \
+    || { echo "test_pre_commit_archive_gate.sh: _open_issues.awk 복사 실패 (HOOK_DIR='$HOOK_DIR')" >&2; return 1; }
+  mkdir -p "$b/rd-workflow-workspace/.lifecycle"
+  cat > "$b/rd-workflow-workspace/.lifecycle/task-state" <<'TSEOF'
+schema=1
+short-title=t1
+status=diff review 대기
+fr-branch=null
+worktree-path=null
+source-fr=-
+TSEOF
+  local sess="$b/rd-workflow-workspace/handoffs/review_pipeline/20260101_000000_final-diff-review"
+  mkdir -p "$sess"
+  printf '%s\n' "# Review Session" "" "## Status" "awaiting-user" "" "## Branch Context" "- short-title: t1" > "$sess/SESSION.md"
+  printf '%s\n' "# Review Checkpoint" "" "## Open Issues" "- 없음" > "$sess/CHECKPOINT.md"
+}
+make_fx_base || { echo "test_pre_commit_archive_gate.sh: FX_BASE 생성 실패" >&2; exit 1; }
+fx_freeze "$FX_BASE"
+FX_SNAP0="$(fx_snap "$FX_BASE")"
+[[ "$(id -u)" != "0" ]] || echo "test_pre_commit_archive_gate.sh: root 실행 — 읽기 전용이 무시되어 원본 불변 보장은 끝의 해시 비교만 남습니다" >&2
+
 
 run_scenario 1 "백틱 path + status idea → 차단" \
   '`'"$ITEM"'`' "$ITEM" "idea" 2 "done/dropped 필요"
@@ -217,29 +239,7 @@ make_multi_fixture() {
   local fixture
   fixture="$(mktemp -d)" || { echo "test_pre_commit_archive_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$fixture" && -d "$fixture" ]] || { echo "test_pre_commit_archive_gate.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
-  mkdir -p "$fixture/rd-workflow/scripts/hooks"
-  cp "$HOOK_SOURCE" "$fixture/rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"
-  cp "$GUARD_COMMON" "$fixture/rd-workflow/scripts/hooks/_guard_common.sh"
-  cp "$STATE_COMMON" "$fixture/rd-workflow/scripts/_state_common.sh"
-  cp "$HOOK_DIR/_commit_scan.awk" "$fixture/rd-workflow/scripts/hooks/" \
-    || { echo "test_pre_commit_archive_gate.sh: _commit_scan.awk 복사 실패 (HOOK_DIR='$HOOK_DIR')" >&2; return 1; }
-  # 판정 규칙이 담긴 awk 도 함께 복사한다. 누락하면 fixture 안의 판정이 항상 실패해
-  # 종결 세션을 전제로 한 케이스가 게이트에 도달하지 못한 채 통과한다.
-  cp "$HOOK_DIR/_open_issues.awk" "$fixture/rd-workflow/scripts/hooks/" \
-    || { echo "test_pre_commit_archive_gate.sh: _open_issues.awk 복사 실패 (HOOK_DIR='$HOOK_DIR')" >&2; return 1; }
-  mkdir -p "$fixture/rd-workflow-workspace/.lifecycle"
-  cat > "$fixture/rd-workflow-workspace/.lifecycle/task-state" <<'TSEOF'
-schema=1
-short-title=t1
-status=diff review 대기
-fr-branch=null
-worktree-path=null
-source-fr=-
-TSEOF
-  local sess="$fixture/rd-workflow-workspace/handoffs/review_pipeline/20260101_000000_final-diff-review"
-  mkdir -p "$sess"
-  printf '%s\n' "# Review Session" "" "## Status" "awaiting-user" "" "## Branch Context" "- short-title: t1" > "$sess/SESSION.md"
-  printf '%s\n' "# Review Checkpoint" "" "## Open Issues" "- 없음" > "$sess/CHECKPOINT.md"
+  fx_clone "$FX_BASE" "$fixture" || { echo "test_pre_commit_archive_gate.sh: FX_BASE 복제 실패" >&2; return 1; }
   printf '%s\n' "# Change Request" "" "## Source FR" \
     "- ${ITEM_A}" "- ${ITEM_B}" "- ${ITEM_C}" "- ${ITEM_D}" > "$fixture/REQUEST.md"
   mkdir -p "$fixture/$(dirname "$ITEM_A")"
@@ -301,7 +301,7 @@ eval "$3"
 RUNEOF
 
 cleanup_runner() { [[ -n "${_SC_RUNNER:-}" ]] && rm -f "$_SC_RUNNER"; }
-trap 'cleanup_fixture; cleanup_runner; _rd_gbl_cleanup' EXIT INT TERM
+trap 'cleanup_fixture; cleanup_runner; _fx_cleanup_all; _rd_gbl_cleanup' EXIT INT TERM
 
 # sc_run <fixture> <project_root> <cwd> <코드> — stdout 만 돌려줍니다.
 # project_root 를 fixture 와 따로 받는 것이 이식성 케이스(§6 의 2)의 핵심입니다 — 하위
@@ -344,10 +344,10 @@ set_state_status() {
 # make_git_fixture — 아카이브 보류 상태 + git 저장소인 fixture.
 # 기록 경로(reports/completions)·보호 경로(src, 제외 목록 밖의 `.lifecycle/` 파일)를 함께
 # 심어 경계 케이스가 같은 fixture 에서 재현되게 합니다.
-make_git_fixture() {
+make_git_seed() {
   local fixture
   fixture="$(make_fixture '`'"$ITEM"'`' "$ITEM" "idea" "resolved")" || {
-    echo "test_pre_commit_archive_gate.sh:248: make_fixture 실패 (rc=$?)" >&2
+    echo "test_pre_commit_archive_gate.sh: make_fixture 실패 (rc=$?)" >&2
     return 1
   }
   set_state_status "$fixture" "아카이브 보류"
@@ -374,6 +374,20 @@ CFGEOF
   git -C "$fixture" commit -qm base >/dev/null 2>&1
   printf '%s' "$fixture"
 }
+
+# make_git_fixture — GIT_SEED(1회 생성·읽기 전용)를 복제한 git 저장소 fixture.
+# git config 에 절대 경로가 없으므로 복제해도 유효합니다 (index stat 어긋남은 porcelain 이 흡수).
+make_git_fixture() {
+  local fixture
+  fixture="$(mktemp -d)" || { echo "test_pre_commit_archive_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  [[ -n "$fixture" && -d "$fixture" ]] || return 1
+  fx_clone "$GIT_SEED" "$fixture" || { echo "test_pre_commit_archive_gate.sh: GIT_SEED 복제 실패" >&2; return 1; }
+  printf '%s' "$fixture"
+}
+
+GIT_SEED="$(make_git_seed)" || { echo "test_pre_commit_archive_gate.sh: GIT_SEED 생성 실패" >&2; exit 1; }
+fx_freeze "$GIT_SEED"
+GIT_SEED_SNAP0="$(fx_snap "$GIT_SEED")"
 
 hash_of() { sc_run "$1" "$1" "$1" "rd_protected_tree_hash \"$2\""; }
 
@@ -661,6 +675,10 @@ case "$_hook_last_err" in
   *) assert_eq "parser-missing: 찾은 경로를 보여준다" "경로 있음" "경로 없음" ;;
 esac
 cleanup_fixture
+
+# 보조: 복제 원본이 바뀌지 않았는지 (PASS 줄은 내지 않고 FAIL 만 냅니다)
+[[ "$(fx_snap "$FX_BASE")" == "$FX_SNAP0" ]] || { echo "[FAIL] 복제 원본이 바뀜: FX_BASE" >&2; FAIL=$((FAIL + 1)); }
+[[ "$(fx_snap "$GIT_SEED")" == "$GIT_SEED_SNAP0" ]] || { echo "[FAIL] 복제 원본이 바뀜: GIT_SEED" >&2; FAIL=$((FAIL + 1)); }
 
 echo ""
 echo "pre_commit_archive_gate: PASS=$PASS FAIL=$FAIL"

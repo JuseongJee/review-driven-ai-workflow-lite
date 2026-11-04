@@ -188,8 +188,9 @@ rw_status_init_snapshot() {  # $1=스트림fd $2=cap $3=idle
 # 실행 중 심겨 남아 있는 symlink·디렉터리를 그대로 따라가면 산출물이 세션 밖으로 나간다.
 # 실패는 삼키지 않고 1 을 돌려 호출자가 사실대로 보고하게 한다.
 # **상태 파일만** 발행한다 — 그룹 확인·로그 이동은 호출자(cleanup)의 책임이다.
-rw_publish_final_status() {  # $1=yes|no $2=사유 토큰 $3=회수 가능한 임시 경로(선택)
-  local base="" tmp
+# 블록 렌더링은 rw_render_final_block 이 맡고, 발행하지 않을 때의 진단(rw_status_append_final)도 같은 블록을 쓴다.
+rw_render_final_block() {  # $1=yes|no $2=사유 토큰 $3=회수 가능한 임시 경로(선택) → stdout
+  local base=""
   # 스트림 경로가 실행 중 symlink 로 대체됐다면 그 내용은 도구가 고른 파일이므로 읽지 않는다.
   if [ -n "$RW_STATUS_STREAM_PATH" ] && [ -f "$RW_STATUS_STREAM_PATH" ] && [ ! -L "$RW_STATUS_STREAM_PATH" ]; then
     base="$( { rw_status_last_snapshot "$RW_STATUS_STREAM_PATH" \
@@ -205,9 +206,6 @@ rw_publish_final_status() {  # $1=yes|no $2=사유 토큰 $3=회수 가능한 �
         "effective_cap: ${RW_ABS_CAP}s")"
       ;;
   esac
-  tmp="$(mktemp "${RW_SESSION_DIR}/.review_wait_status.XXXXXX" 2>/dev/null || true)"
-  [ -n "$tmp" ] || return 1
-  chmod 600 "$tmp" 2>/dev/null || true
   {
     printf '%s\n' "$base"
     printf 'log_preserved: %s\n' "$1"
@@ -228,7 +226,25 @@ rw_publish_final_status() {  # $1=yes|no $2=사유 토큰 $3=회수 가능한 �
     # 이 줄이 `verified` 일 때만 writer 종료 확인으로 인정한다.
     [ -n "${RW_GROUP_STATE:-}" ] && printf 'writer_group: %s\n' "$RW_GROUP_STATE"
     :
-  } > "$tmp" 2>/dev/null || {
+  }
+}
+
+# 발행하지 않을 때의 진단 — 최종 블록을 안정 이름 대신 **열려 있는 상태 스트림 fd** 에
+# 마지막 snapshot 으로 덧붙인다. 렌더링은 rw_publish_final_status 와 같은 함수를 쓴다.
+# 렌더링을 **먼저 끝낸 뒤** 덧붙인다. 파이프로 바로 이으면 rw_status_append 가 구분선을 먼저
+# 쓰고, 렌더링이 그 빈 블록을 「마지막 snapshot」 으로 읽어 뼈대를 잃는다(실측).
+rw_status_append_final() {  # $1=yes|no $2=사유 토큰 $3=회수 경로(선택) → rc=rw_status_append 의 rc
+  local block
+  block="$(rw_render_final_block "$@")"
+  printf '%s\n' "$block" | rw_status_append "${RW_STATUS_FD:-8}"
+}
+
+rw_publish_final_status() {  # $1=yes|no $2=사유 토큰 $3=회수 가능한 임시 경로(선택)
+  local tmp
+  tmp="$(mktemp "${RW_SESSION_DIR}/.review_wait_status.XXXXXX" 2>/dev/null || true)"
+  [ -n "$tmp" ] || return 1
+  chmod 600 "$tmp" 2>/dev/null || true
+  rw_render_final_block "$@" > "$tmp" 2>/dev/null || {
     rm -f "$tmp" 2>/dev/null || true
     return 1
   }
@@ -245,25 +261,47 @@ rw_publish_final_status() {  # $1=yes|no $2=사유 토큰 $3=회수 가능한 �
   return 0
 }
 
-# --- process group 판정·획득 (구현 보존 — kill -0 로 바꾸지 않는다) ---
+# --- process group 판정·획득 (ps 판정 보존 — ps 가 성공하면 kill -0 로 바꾸지 않는다) ---
 
 # 확인된 process group 에 살아 있는 프로세스가 있는가.
 # pgid 조회·판정은 반드시 `ps -eo pid,pgid` + awk 로 한다. `ps -o ... -p <pid>` 는
 # busybox ps 가 -p 를 지원하지 않아 빈 값을 돌려주고, 그러면 그룹 종료 경로로 넘어가지
 # 못해 자식이 고아로 남아 호출자 파이프를 계속 붙잡는다(Alpine 실측).
-rw_group_alive() {  # $1=pgid → 0=생존 / 1=없음
-  local pgid="${1:-}"
-  [ -n "$pgid" ] || return 1
-  local n
-  n="$( { ps -eo pid,pgid 2>/dev/null || true; } | awk -v g="$pgid" '$2==g' | wc -l | tr -d ' ' )"
-  [ "$n" -gt 0 ]
+#
+# 반환값은 세 가지다 — 0=있음 / 1=없음 / 2=판정 불가. 호출자는 `if rw_group_alive` 로
+# 쓰지 않고 rc 를 받아 2 를 따로 다룬다.
+# ps 가 실패(rc≠0 또는 빈 출력)하면 rc≠0 만으로 「없음」 을 정하지 않고 kill -0 로
+# 재확인한다. 「No such process」(ESRCH) 만 없음이고, 그 밖의 오류(EPERM 등)는 판정 불가다.
+# kill 내장은 strerror 문구를 그대로 내고 glibc 는 LC_MESSAGES 로 번역하므로 이 한 명령에만
+# LC_ALL=C 를 준다. 판정 불가 때 오류 문구(한 줄)를 전역 RW_GROUP_PROBE_ERR 에 남긴다 —
+# 서브셸로 부르지 않으므로 호출자가 진단 문구로 쓸 수 있다.
+RW_GROUP_PROBE_ERR=""
+rw_group_alive() {  # $1=pgid → 0=있음 / 1=없음 / 2=판정 불가
+  local pgid="${1:-}" out rc=0 err
+  RW_GROUP_PROBE_ERR=""
+  [ -n "$pgid" ] || return 1          # 종전과 같음 — 호출부가 pgid 빈 값을 먼저 걸러 낸다
+  out="$(ps -eo pid,pgid 2>/dev/null)" || rc=$?
+  if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
+    printf '%s\n' "$out" | awk -v g="$pgid" '$2==g {f=1} END {exit !f}' && return 0
+    return 1
+  fi
+  # ps 실패 — kill -0 로 재확인. rc≠0 만으로 「없음」을 정하지 않는다.
+  err="$(LC_ALL=C kill -0 -- -"$pgid" 2>&1)" && return 0
+  case "$err" in
+    *'No such process'*) return 1 ;;
+    *)
+      RW_GROUP_PROBE_ERR="$(printf '%s' "$err" | tr '\n' ' ' | sed 's/ *$//')"
+      return 2
+      ;;
+  esac
 }
 
 # process group 종료 증거 판정. stdout 한 단어, 항상 rc 0.
 #   alive      — ps 가 성공했고 pgid 가 같은 구성원이 있다.
 #   verified   — pgid 가 있고 ps 가 성공(rc 0 + 비어 있지 않은 출력)했고 구성원이 없다.
 #   unverified — pgid 가 비었거나 ps 가 실패(rc≠0 또는 빈 출력)했다. 종료를 증명하지 못한다.
-# rw_group_alive 는 ps 실패를 「그룹 없음」 으로 돌려주므로 종료 증거로 쓸 수 없다.
+# rw_group_alive 는 ps 실패 때 kill -0 로 「있음/없음」 을 정하지만, 그 「없음」 은 ps 로 증명한
+# 종료가 아니다. 그래서 종료 증거(verified)는 이 함수만 판정한다.
 rw_group_state() {  # $1=pgid
   local pgid="${1:-}" out rc=0 n
   if [ -z "$pgid" ]; then printf 'unverified'; return 0; fi
@@ -391,10 +429,11 @@ rw_watchdog_loop() {
       # 종료 대상 선택은 **TERM 을 보낸 것과 같은 분기**를 쓴다. pgid 조회가 실패했는데
       # (rw_acquire_pgid 는 빈 값을 돌려줄 수 있다) 그룹 분기만 두면, 리더가 TERM 을
       # 무시했을 때 KILL 이 실행되지 않아 부모의 wait 가 그대로 막힌다.
+      # 그룹 판정이 「없음」(1)이 아니면 KILL 한다 — ps 가 실패해 판정 불가(2)여도 보낸다.
+      # 판정 불가를 없음으로 읽으면 TERM 을 무시하는 리더의 wait 가 풀리지 않는다.
       if [ -n "$RW_TARGET_PGID" ]; then
-        if rw_group_alive "$RW_TARGET_PGID"; then
-          kill -9 -- -"$RW_TARGET_PGID" 2>/dev/null || true
-        fi
+        _wd_gs=0; rw_group_alive "$RW_TARGET_PGID" || _wd_gs=$?
+        [ "$_wd_gs" -ne 1 ] && { kill -9 -- -"$RW_TARGET_PGID" 2>/dev/null || true; }
       elif [ -n "$RW_TARGET_PID" ] && kill -0 "$RW_TARGET_PID" 2>/dev/null; then
         # **PID fallback 은 자손 전체 회수를 보장하지 못한다** — 확인되지 않은 pgid 를
         # 추정해 그룹 신호를 보내지 않는다(남의 그룹을 죽일 수 있다). 리더만 회수해

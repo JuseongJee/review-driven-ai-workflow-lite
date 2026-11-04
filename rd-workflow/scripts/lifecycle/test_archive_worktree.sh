@@ -23,8 +23,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 것만으로 실제 herdr pane split/agent start 가 발생한다(2026-09-15 실측 사고).
 # 첫 테스트 케이스보다 앞에서 export 한다 — 서브셸은 export 된 값을 그대로 물려받으므로
 # 이 파일의 모든 케이스에 적용된다.
+# herdr app(HC_TERMINAL_ID)도 같은 이유로 비운다.
 export HERDR_ENV=
+export HC_TERMINAL_ID=
 export RD_CHILD_SESSION=1
+# 바깥 셸의 project_root·TASK_STATE_PATH 를 물려받지 않는다. promote.sh·_state_common.sh 는
+# 두 값이 있으면 그 값을 루트·상태 파일로 쓰므로, 상속되면 fixture 가 아니라 바깥 저장소를
+# 고친다(2026-10-29 실제 저장소에 fr/alpha·fr/beta·fr/delta 가 생긴 사고).
+unset project_root TASK_STATE_PATH
 
 PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -518,17 +524,24 @@ lock_tags_before="$(git -C "$REPO" tag --list | sort)"
 
 # 점유자를 **살아 있는 별도 프로세스**로 둔다 — owner pid 가 죽어 있으면 acquire 가
 # rc 2(불확실)로 갈라져 우리가 보려는 rc 1(정상 점유) 경로를 타지 않는다.
+# `exec` 로 owner pid($$)와 sleep pid 를 같게 해, 정리 kill 이 고아 sleep 을 남기지 않는다
+# (2026-11-01 관찰: 고아 sleep 60 이 stderr 를 쥐어 스텝 종료가 8초 늦음).
+LOCK_HOLDER_PIDFILE="$(mktemp)" || { echo "test_archive_worktree.sh: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$LOCK_HOLDER_PIDFILE" && -e "$LOCK_HOLDER_PIDFILE" ]] || { echo "test_archive_worktree.sh: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+_ast_cleanup+=("$LOCK_HOLDER_PIDFILE")
 ( cd "$REPO" && bash -c '
     source rd-workflow/scripts/lifecycle/_tasks_index.sh
     tasks_lock_acquire promote otherslug || exit 1
-    sleep 60
-  ' ) &
+    echo $$ > "$1"
+    exec sleep 60
+  ' _ "$LOCK_HOLDER_PIDFILE" ) &
 LOCK_HOLDER_PID=$!
 lock_wait=0
-while [[ ! -d "$LOCK_DIR" && "$lock_wait" -lt 50 ]]; do sleep 0.1; lock_wait=$((lock_wait+1)); done
+while [[ ( ! -d "$LOCK_DIR" || ! -s "$LOCK_HOLDER_PIDFILE" ) && "$lock_wait" -lt 50 ]]; do sleep 0.1; lock_wait=$((lock_wait+1)); done
 
 lock_rc=0
 lock_out="$( cd "$REPO/.worktrees/lockcase" && bash "$ARCHIVE_SH" --no-remote --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )" || lock_rc=$?
+kill "$(cat "$LOCK_HOLDER_PIDFILE" 2>/dev/null)" 2>/dev/null || true
 kill "$LOCK_HOLDER_PID" 2>/dev/null || true
 wait "$LOCK_HOLDER_PID" 2>/dev/null || true
 # 죽은 점유자의 락은 자동 회수되지 않는다(설계) — 테스트가 직접 치운다.
@@ -709,29 +722,52 @@ mo_archive mo3b
 git -C "$REPO" merge --abort >/dev/null 2>&1 || true
 
 # CURRENT_TASK.md 충돌 (FR publish-path-interruptions D1) — fr 는 `대기 중` 줄을 `아카이브 보류` 로, main 은 같은 줄을 `구현 중` 으로 바꾼다.
-# mo_ct_diverge <slug> [sm|x]  — 케이스 사이에 main 의 CURRENT_TASK.md 를 `대기 중` 기준으로 되돌려 둔 뒤 시작한다.
+# mo_ct_diverge <slug> [sm|x|ve|vedel|veonly]  — 케이스 사이에 main 의 CURRENT_TASK.md 를 `대기 중` 기준으로 되돌려 둔 뒤 시작한다.
+#   ve     : sm + FUTURE_REQUESTS.md + verify-evidence 를 양쪽에서 다르게 바꾼다 (2026-11-01 실사례 네 파일 조합).
+#   vedel  : fr 는 verify-evidence 를 지우고 main 은 바꾼다 (stage 3 없음).
+#   veonly : verify-evidence 만 양쪽에서 다르게 바꾼다 — CURRENT_TASK.md 는 건드리지 않는다 (단독 충돌).
+mo_ve="rd-workflow-workspace/.lifecycle/review-seals/verify-evidence"
+mo_idx="rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
+mo_ev() {  # mo_ev <command 값> <파일> — 6키 증거 파일을 쓴다
+  mkdir -p "$(dirname "$2")"
+  printf 'schema=1\ncommand=%s\nexit-code=0\ntree-hash=0\nhead=0\nrecorded-at=0\n' "$1" > "$2"
+}
 mo_ct_diverge() {
-  local slug="$1" extra="${2:-}"
+  local slug="$1" extra="${2:-}" ct=1
+  [[ "$extra" != veonly ]] || ct=0
   if ! grep -qx '대기 중' "$REPO/CURRENT_TASK.md"; then
     sed -i 's/^구현 중$/대기 중/' "$REPO/CURRENT_TASK.md"
     git -C "$REPO" add -A
     RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main: CURRENT_TASK 기준 복구 ($slug)"
   fi
-  if [[ "$extra" == sm ]]; then  # 앞 케이스(mo3b)가 main 에 남긴 형식 오류 행을 기준 상태로 되돌린다
+  if [[ "$extra" == sm || "$extra" == ve ]]; then  # 앞 케이스(mo3b)가 main 에 남긴 형식 오류 행을 기준 상태로 되돌린다
     printf '%s\nmo-base\t대기 중\t구현 중\t100\n' "$mo_hdr" > "$REPO/$mo_sm"
     git -C "$REPO" add -A
     RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main: stage_metrics 기준 복구 ($slug)" || true
   fi
+  case "$extra" in ve|vedel|veonly)  # 증거(·인덱스) 공통 조상
+    mo_ev base "$REPO/$mo_ve"
+    [[ "$extra" != ve ]] || printf '# FR\n\n## 인덱스\n\n| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |\n|---|---|---|---|---|---|---|\n' > "$REPO/$mo_idx"
+    git -C "$REPO" add -A
+    RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main: 증거 기준 ($slug)" || true ;;
+  esac
   bash "$PROMOTE_SH" --short-title "$slug" --size large --source-fr - >/dev/null 2>&1
-  sed -i 's/^대기 중$/아카이브 보류/' "$REPO/.worktrees/$slug/CURRENT_TASK.md"
+  (( ct )) && sed -i 's/^대기 중$/아카이브 보류/' "$REPO/.worktrees/$slug/CURRENT_TASK.md"
   printf 'work-%s\n' "$slug" > "$REPO/.worktrees/$slug/src-$slug.txt"
-  [[ "$extra" != sm ]] || printf '%s\t대기 중\t구현 중\t200\n' "$slug" >> "$REPO/.worktrees/$slug/$mo_sm"
+  [[ "$extra" != sm && "$extra" != ve ]] || printf '%s\t대기 중\t구현 중\t200\n' "$slug" >> "$REPO/.worktrees/$slug/$mo_sm"
   [[ "$extra" != x ]] || printf 'fr-side-%s\n' "$slug" > "$REPO/.worktrees/$slug/x.txt"
+  case "$extra" in
+    ve|veonly) mo_ev "fr-$slug" "$REPO/.worktrees/$slug/$mo_ve" ;;
+    vedel) git -C "$REPO/.worktrees/$slug" rm -q -- "$mo_ve" ;;
+  esac
+  [[ "$extra" != ve ]] || printf '| 2026-02-02 | fr-%s | s | tooling | idea | - | [상세](items/fr-%s.md) |\n' "$slug" "$slug" >> "$REPO/.worktrees/$slug/$mo_idx"
   git -C "$REPO/.worktrees/$slug" add -A
   git -C "$REPO/.worktrees/$slug" commit -q -m "구현: $slug"
-  sed -i 's/^대기 중$/구현 중/' "$REPO/CURRENT_TASK.md"
-  [[ "$extra" != sm ]] || printf '%s-main\t대기 중\t구현 중\t300\n' "$slug" >> "$REPO/$mo_sm"
+  (( ct )) && sed -i 's/^대기 중$/구현 중/' "$REPO/CURRENT_TASK.md"
+  [[ "$extra" != sm && "$extra" != ve ]] || printf '%s-main\t대기 중\t구현 중\t300\n' "$slug" >> "$REPO/$mo_sm"
   [[ "$extra" != x ]] || printf 'main-side-%s\n' "$slug" > "$REPO/x.txt"
+  case "$extra" in ve|vedel|veonly) mo_ev "main-$slug" "$REPO/$mo_ve" ;; esac
+  [[ "$extra" != ve ]] || printf '| 2026-02-03 | main-%s | s | tooling | idea | - | [상세](items/main-%s.md) |\n' "$slug" "$slug" >> "$REPO/$mo_idx"
   git -C "$REPO" add -A
   RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main: $slug"
 }
@@ -760,6 +796,45 @@ mo_archive ct3
   && pass "T3: git 충돌 출력(x.txt 줄)을 낸다" || fail "T3: git 충돌 출력 누락 — $mo_out"
 [[ "$mo_out" != *"충돌은 해결했으나"* && "$mo_out" != *"병합 결과 반영 실패"* && "$mo_out" != *"해결했습니다"* ]] \
   && pass "T3: 자동 해소 분기에 들어가지 않는다" || fail "T3: 허용 밖 파일이 섞였는데 자동 해소를 시도했다 — $mo_out"
+git -C "$REPO" merge --abort >/dev/null 2>&1 || true
+
+# T4 — CURRENT_TASK.md·stage_metrics.tsv·FUTURE_REQUESTS.md·verify-evidence 네 파일 동시 충돌(2026-11-01 실사례 조합)이 모두 해소된다.
+mo_ct_diverge ct4 ve
+# merge-tree 는 충돌이 있으면 exit 1 이다 — 충돌이 기대값이므로 그 exit 는 받아 둔다.
+mo_conf="$( { git -C "$REPO" merge-tree --write-tree --name-only main fr/ct4 || true; } | sed -n '2,/^$/p' | sed '/^$/d' | LC_ALL=C sort)"
+mo_conf_want="$(printf '%s\n' CURRENT_TASK.md "$mo_sm" "$mo_idx" "$mo_ve" | LC_ALL=C sort)"
+[[ "$mo_conf" == "$mo_conf_want" ]] \
+  && pass "T4: 충돌 집합이 실사례와 같은 네 파일이다" || fail "T4: 충돌 집합이 다르다 — $mo_conf"
+mo_ve_fr="$(git -C "$REPO" show fr/ct4:"$mo_ve")"
+mo_archive ct4
+[[ "$mo_rc" -eq 0 ]] && pass "T4: 네 파일 동시 충돌 발행이 rc=0 이다" || fail "T4: rc=$mo_rc — $mo_out"
+[[ "$mo_out" == *"verify-evidence 충돌을 발행 줄기 쪽으로 해결했습니다"* && "$mo_out" == *"CURRENT_TASK.md 충돌을 main 쪽"* \
+   && "$mo_out" == *"stage_metrics.tsv 충돌을 줄 합집합으로 해결했습니다"* && "$mo_out" == *"FUTURE_REQUESTS.md 충돌을 행 집합 병합으로 해결했습니다"* ]] \
+  && pass "T4: 네 해소 안내가 모두 있다" || fail "T4: 해소 안내 누락 — $mo_out"
+[[ "$(git -C "$REPO" show main:"$mo_ve")" == "$mo_ve_fr" ]] \
+  && pass "T4: main 의 verify-evidence 가 발행 줄기 쪽 내용이다" || fail "T4: verify-evidence 가 fr 쪽 내용이 아니다"
+git -C "$REPO" show main:"$mo_idx" | grep -q '| fr-ct4 |' && git -C "$REPO" show main:"$mo_idx" | grep -q '| main-ct4 |' \
+  && pass "T4: 인덱스에 양쪽 신규 행이 남는다" || fail "T4: 인덱스 행 누락"
+[[ "$mo_out" != *"Automatic merge failed"* && "$mo_out" != *"자동 병합이 실패했습니다"* && "$mo_out" != *"CONFLICT"* ]] \
+  && pass "T4: 해소 성공 출력에 git 실패 문구가 없다" || fail "T4: git 실패 문구가 새어 나왔다 — $mo_out"
+git -C "$REPO" merge --abort >/dev/null 2>&1 || true  # 실패했을 때 다음 케이스로 번지지 않게 한다
+
+# T5 — fr 쪽이 verify-evidence 를 지운 충돌(stage 3 없음)은 멈춘다.
+mo_ct_diverge ct5 vedel
+mo_archive ct5
+[[ "$mo_rc" -ne 0 ]] && pass "T5: 발행 줄기 쪽 증거가 없는 충돌은 rc≠0 이다" || fail "T5: rc=0 — $mo_out"
+[[ "$mo_out" == *"verify-evidence 발행 줄기 쪽 버전이 없어"* && "$mo_out" != *"해결했습니다"* ]] \
+  && pass "T5: 사유를 내고 자동 해소하지 않는다" || fail "T5: 자동 해소를 시도했거나 사유 누락 — $mo_out"
+git -C "$REPO" merge --abort >/dev/null 2>&1 || true
+
+# T6 — verify-evidence 단독 충돌도 자동 해소 분기에 들어간다 (change spec 2026-11-02-0740 D2 의 새 진입 항).
+mo_ct_diverge ct6 veonly
+mo_ve_fr="$(git -C "$REPO" show fr/ct6:"$mo_ve")"
+mo_archive ct6
+[[ "$mo_rc" -eq 0 && "$mo_out" == *"verify-evidence 충돌을 발행 줄기 쪽으로 해결했습니다"* ]] \
+  && pass "T6: verify-evidence 단독 충돌이 자동 해소된다" || fail "T6: rc=$mo_rc — $mo_out"
+[[ "$(git -C "$REPO" show main:"$mo_ve")" == "$mo_ve_fr" ]] \
+  && pass "T6: main 의 verify-evidence 가 발행 줄기 쪽 내용이다" || fail "T6: verify-evidence 가 fr 쪽 내용이 아니다"
 git -C "$REPO" merge --abort >/dev/null 2>&1 || true
 
 # T1b — main 이 CURRENT_TASK.md 를 삭제하고 fr 이 수정한 delete/modify 충돌은 stage 2 가 없어 멈춘다.

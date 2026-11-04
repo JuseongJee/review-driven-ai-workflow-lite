@@ -13,6 +13,29 @@ Typical user requests:
 - "standard 로 보고 바로 구현해줘"
 - "이거 작은 수정으로 처리해줘" (AI 가 신호표로 `standard` 판정 후 진입)
 
+## rd-workflow 버전 대조
+
+이 skill 은 아래 `RD_SKILL_BASE` 보다 나중에 배포된 rd-workflow 를 전제한다. 첫 작업 단계보다 먼저, 프로젝트 루트에서 아래 명령을 이 호출에서 한 번 실행한다.
+
+- 출력이 없으면 그대로 진행한다.
+- 출력이 있으면 출력 전문을 사용자에게 알리고, 템플릿을 sync 할지 그대로 계속할지 묻고 멈춘다. 사용자가 계속을 지시하면 진행한다.
+- autopilot·무인 실행처럼 물을 사람이 없으면 계속하지 않고 그 출력을 중단 사유로 보고한다.
+
+```bash
+bash -s <<'RD_SKILL_COMPAT'
+RD_SKILL_BASE=2026-11-01-202303 RD_SKILL_NAME=small-task-implement
+vf="rd-workflow/VERSION"
+if [ ! -f "$vf" ] && [ -f "_ROOT_FILES/rd-workflow/VERSION" ]; then exit 0; fi
+v=""; [ -f "$vf" ] && v="$(cat "$vf")"; v="${v#lite-}"
+if [[ "$v" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$ ]] && [[ "$v" > "$RD_SKILL_BASE" ]]; then exit 0; fi
+echo "rd-workflow 버전 불일치 — skill '$RD_SKILL_NAME' 은 $RD_SKILL_BASE 보다 나중에 배포된 rd-workflow 가 필요합니다."
+echo "프로젝트: $PWD"
+echo "프로젝트 VERSION: ${v:-없음} (파일: $vf)"
+echo "이 상태로 진행하면 skill 이 가리키는 문서 절·스크립트·인자가 없어 중간에 실패할 수 있습니다."
+echo "해결: 템플릿을 sync 하십시오 (/tpl update 또는 rd-workflow/docs/guides/sync_template.md 절차)."
+RD_SKILL_COMPAT
+```
+
 ## 절차
 
 1. **시작 계약 확인** (WORKFLOW.md 시작 계약 5항, 순서 그대로): `Status = 대기 중` → switch 전에 현재 브랜치·clean 선확인(dirty 면 상태 변경 없이 중단 — 이미 기본 브랜치이고 사용자가 전부 채택을 명시한 경우만 예외) → 필요 시 기본 브랜치 checkout 후 clean 재확인 → `bash rd-workflow/scripts/lifecycle/start_preflight.sh` 실행 — exit 0(synchronized·등록 커밋만 ahead 인 자동 채택·local-only)이면 진행, exit 10 은 인계(사용자가 ahead 커밋 발행을 명시 채택하면 진행하고 `## Risk Tier` 이력에 기록) → baseline HEAD 기록 → **시작 보고 블록 1회 출력** — 필드는 WORKFLOW.md 위험 등급 절의 정본 목록을 그대로 상속하고(`실행 모드: <모드> (출처: <출처>)` 포함), 여기서 값이 정해지는 것은 둘뿐입니다: `push 예정` = `archive.sh 경유`(채택한 ahead 커밋 수 병기), `미병합 브랜치 FR 후보` = preflight 출력 줄 그대로.

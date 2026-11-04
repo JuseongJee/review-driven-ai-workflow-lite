@@ -74,8 +74,6 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 - `CLAUDE.md` (프로젝트 소유 — `workflow.json` 과 같은 의미입니다. 경로가 없으면 배포본을 새로 두고, 있으면 5단계 복사가 손대지 않습니다. 기존 프로젝트의 내용 정리는 M013 이 따로 합니다)
 - `README.md` (프로젝트 고유 문서 — 배포 repo의 README는 GitHub 페이지 표시용이며 사용자 프로젝트에 적용 대상 아님)
 - `PROJECT_CONTEXT.md`
-- `REQUEST.md`, `CURRENT_TASK.md` (프로젝트 고유 내용이 있는 경우)
-- `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` (항목이 있는 경우)
 - `rd-workflow-workspace/backlog/request-archive/` 안의 아카이브 파일
 - `rd-workflow-workspace/specs/`, `rd-workflow-workspace/plans/` 안의 작업 산출물 (README 제외)
 - `rd-workflow/scripts/{build,test,lint,typecheck}.sh` (프로젝트별 명령이 들어 있음)
@@ -92,15 +90,73 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
   - 단, `.claude/rules/rd-workflow/` 는 템플릿 소유라 보존하지 않고 동기화 대상입니다. `.claude/rules/` 의 그 밖 파일은 프로젝트 소유이며 보존합니다
   - 단, `.claude/settings.json`의 hook 등록 목록과 `.gitignore`의 워크플로 관리 라인은 M003 마이그레이션이 **부재 항목만 추가**하고, 템플릿 유래 stale hook 등록(존재하지 않는 스크립트를 가리키는 항목)은 M005 마이그레이션이 제거합니다 (통째 동기화 아님 — 4단계 참조)
 
+**조건부 보존** — 아래 다섯 파일은 조건에 따라 보존하거나 템플릿 본으로 맞춥니다. 조건은 파일마다 하나이며, 처리 결과는 하나로 정해집니다.
+
+| 파일 | 보존 조건 | 조건을 충족하지 않으면 |
+| --- | --- | --- |
+| `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` | 표에 행이 있음 (A1) | 동기화 대상 |
+| `rd-workflow-workspace/backlog/FUTURE_REQUESTS_PARKED.md` | 표에 행이 있음 (A1) | 동기화 대상 |
+| `rd-workflow-workspace/reports/tier-log.md` | 표에 행이 있음 (A1) | 동기화 대상 |
+| `REQUEST.md`, `CURRENT_TASK.md` (두 파일을 한 묶음으로 판정) | 어느 한 파일이라도 「템플릿 본만 남음」이 아님 (A3) | 둘 다 동기화 대상 |
+
+경로가 없으면 다섯 파일 모두 「신규 추가」입니다.
+
+**A1. 「표에 행이 있음」의 정의.** 파일 안에서 구분선 줄(`|---` 또는 `| ---` 로 시작하는 줄) 아래에 `|` 로 시작하는 줄이 한 줄 이상 있으면 「행이 있음」입니다. 구분선 줄이 없는 파일(형식이 무너진 파일)은 「행이 있음」으로 봅니다. 판정할 수 없는 기록을 덮지 않는 쪽이 안전합니다.
+
+**A3. 「템플릿 본만 남음」의 판정 (REQUEST·CURRENT_TASK).** 판정 단위는 줄입니다. 프로젝트 파일에서 아래 세 종류를 뺀 뒤 남는 줄이 하나도 없으면 그 파일은 「템플릿 본만 남음」입니다. 한 줄이라도 남으면 「프로젝트 내용 있음 또는 판정 불가」이고 보존합니다.
+
+1. 빈 줄(공백만 있는 줄 포함)
+2. **줄 전체가 주석인 줄** — 한 줄 주석(`<!-- … -->` 만 있는 줄)과, 여러 줄 주석 블록(`<!--` 로 시작해 `-->` 로 끝나는 줄까지, 앞뒤에 본문 없음). 주석과 본문이 같은 줄에 섞인 줄, 닫는 줄 뒤에 본문이 있는 블록, 닫히지 않은 주석은 빼지 않고 남깁니다. 판정할 수 없으면 보존 쪽으로 기웁니다.
+3. 임시 clone 의 같은 이름 템플릿 파일(`<clone>/REQUEST.md`, `<clone>/CURRENT_TASK.md`)에 글자 그대로 있는 줄 — `-`, `## User Goal` 같은 제목, `- 최종 등급: -` 같은 고정 줄이 여기에 듭니다.
+
+두 파일이 모두 「템플릿 본만 남음」(또는 경로 없음)일 때만 둘 다 동기화합니다. 하나라도 보존이면 둘 다 보존합니다.
+
+에이전트는 아래 명령으로 남는 줄을 셉니다. `CURRENT_TASK.md` 는 파일 이름만 바꿔 같은 명령을 돌립니다. 출력이 비어 있어야 「템플릿 본만 남음」입니다.
+
+```bash
+awk '
+function closes_clean(s,  t) { t = s; return gsub(/-->/, "", t) == 1 && s ~ /-->[[:space:]]*$/ }
+c { buf = buf $0 "\n"
+    if ($0 ~ /-->/) { if (closes_clean($0) && $0 !~ /<!--/) buf = ""; printf "%s", buf; buf = ""; c = 0 }
+    next }
+/^[[:space:]]*<!--/ { t = $0; n = gsub(/<!--/, "", t)
+    if (n == 1 && closes_clean($0)) next
+    if (n == 1 && $0 !~ /-->/) { c = 1; buf = $0 "\n"; next } }
+{ print }
+END { if (c) printf "%s", buf }
+' REQUEST.md | grep -v '^[[:space:]]*$' | grep -vxF -f <clone>/REQUEST.md
+```
+
+이 규칙이 가르는 경우:
+
+| 프로젝트 상태 | 남는 줄 | 결과 |
+| --- | --- | --- |
+| 아카이브 직후 빈 템플릿 (REQUEST·CURRENT_TASK 모두) | 없음 | 둘 다 동기화 |
+| CURRENT_TASK 의 Short Title 에 값이 있음 (진행 중 작업) | Short Title 값 줄 | 둘 다 보존 |
+| REQUEST 만 작성됨 (`/planning-design-intake` 가 승격 전에 씀) | REQUEST 본문 줄 | 둘 다 보존 |
+| 제목 체계가 다른 수동·구형 REQUEST 에 요구사항이 있음 | 요구사항 줄 | 둘 다 보존 |
+| 내용은 없지만 새 템플릿에 없는 옛 고정 문구가 있음 | 옛 문구 줄 | 둘 다 보존 (판정 불가) |
+| 빈 템플릿 + `<!-- 참고 --> 요구사항` (주석 뒤 본문) | 그 줄 | 둘 다 보존 |
+| 빈 템플릿 + `요구사항 <!-- 참고 -->` (본문 뒤 주석) | 그 줄 | 둘 다 보존 |
+| 빈 템플릿 + `<!-- a --> 본문 <!-- b -->` | 그 줄 | 둘 다 보존 |
+| 빈 템플릿 + 여러 줄 주석(앞뒤 본문 없음) | 없음 | 둘 다 동기화 |
+| 빈 템플릿 + 여러 줄 주석의 닫는 줄 뒤에 본문 | 블록 전체 | 둘 다 보존 |
+| 빈 템플릿 + 닫히지 않은 주석과 그 뒤 줄 | 그 뒤 전체 | 둘 다 보존 |
+
+- 「판정 불가」의 비용: 내용 없는 옛 템플릿 일부는 새 템플릿으로 바뀌지 않습니다. 지울 수 없는 기록을 지우는 쪽보다 안전하므로 이 비용을 받습니다. 3단계 확인 화면에 「판정 불가로 보존 — 남은 줄 N개」와 위 명령이 낸 첫 줄을 보여 주어 사용자가 직접 바꿀 수 있게 합니다.
+- 두 파일을 묶어 판정하는 이유: 한쪽만 새 템플릿으로 바꾸면 REQUEST 와 CURRENT_TASK 의 섹션 체계가 갈라집니다.
+- 이 판정은 A1(표 파일)과 같은 방향입니다. 판정할 수 없으면 보존합니다.
+
 ### 2.1 파일군별 전파 정책 표
 
 이 표는 전체 sync 가 끝난 뒤의 결과를 파일군별로 보여 줍니다. 5단계 복사만이 아니라 마이그레이션이 바꾸는 내용도 `수정·삭제 가능성` 열에 적습니다.
 
-정책 값은 네 가지입니다.
+정책 값은 다섯 가지입니다.
 
 - `덮어쓰기` — 템플릿 내용으로 맞춥니다. 템플릿에 없는 파일은 삭제 후보입니다.
 - `부재 항목 머지` — 부재한 항목이나 라인만 추가합니다.
 - `부재 시 생성` — 경로가 없을 때만 배포본을 둡니다. 경로가 있으면 5단계 복사가 건드리지 않습니다.
+- `조건부 보존` — 2절의 조건을 충족하면 보존하고, 충족하지 않으면 템플릿 본으로 맞춥니다. 경로가 없으면 배포본을 둡니다.
 - `미전파` — 프로젝트 고유 파일, 휘발 상태, 작업 산출물입니다. sync 가 건드리지 않습니다.
 
 경로 패턴은 정확한 경로이거나 `/` 로 끝나는 디렉토리 prefix 입니다. 한 파일이 여러 행에 걸리면 더 긴 패턴이 이깁니다.
@@ -128,16 +184,16 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 | `rd-workflow/VERSION` | 덮어쓰기 | 6단계 복사 | 없음. |
 | `.claude/rules/rd-workflow/` | 덮어쓰기 | 2절 동기화 대상, 5단계 복사, M013 | 템플릿에 없는 파일은 삭제 후보입니다. 이 폴더 밖의 `.claude/rules/` 파일은 프로젝트 소유이며 보존합니다. |
 | `.claude/settings.json` | 부재 항목 머지 | M005, M008, M003 | 템플릿 유래인데 가리키는 스크립트가 없어진 hook 등록은 제거됩니다(M005). 옛 표기 command 는 새 표기로 바뀌고 같은 group 안의 중복 등록은 접힙니다(M008). permissions 와 프로젝트 고유 hook 은 보존됩니다. |
-| `.claudeignore` | 미전파 | 2절 보존 목록의 프로젝트 고유 설정 파일 | 없음. |
-| `.gitignore` | 부재 항목 머지 | M003 | 부재한 라인만 파일 끝에 추가합니다. 기존 라인은 바꾸지 않습니다. |
+| `.claudeignore` | 부재 시 생성 | 2절 신규 추가, 2절 보존 목록의 프로젝트 고유 설정 파일 | 경로가 있으면 건드리지 않습니다(보존 목록의 「… 등」에 속한다는 해석). |
+| `.gitignore` | 부재 항목 머지 | M003 | 부재한 라인만 파일 끝에 추가합니다. 기존 라인은 바꾸지 않습니다. 이미 추적 중인 파일은 건드리지 않습니다. 새 ignore 패턴에 걸리는 기존 추적 파일의 추적 해제는 해당 마이그레이션의 안내가 처리합니다(예: M014). |
 | `WORKING_WITH_AI.md` | 덮어쓰기 | 2절 동기화 대상, 5단계 복사 | 없음. |
 | `CLAUDE.md` | 부재 시 생성 | 2절 보존 목록, 5단계 복사 | 조건에 해당하는 기존 프로젝트는 M013 이 템플릿 규칙 절을 정리합니다. |
 | `README.md` | 미전파 | 2절 보존 목록 | 없음. |
-| `PROJECT_CONTEXT.md` | 미전파 | 2절 보존 목록 | 없음. |
-| `REQUEST.md` | 미전파 | 2절 보존 목록 | 없음. |
-| `CURRENT_TASK.md` | 미전파 | 2절 보존 목록 | 없음. |
-| `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` | 미전파 | 2절 보존 목록 | 없음. |
-| `rd-workflow-workspace/backlog/FUTURE_REQUESTS_PARKED.md` | 미전파 | 2절 보존 목록 | 없음. |
+| `PROJECT_CONTEXT.md` | 부재 시 생성 | 2절 신규 추가, 2절 보존 목록 | 경로가 있으면 건드리지 않습니다. |
+| `REQUEST.md` | 조건부 보존 | 2절 조건부 보존, 5단계 복사 | CURRENT_TASK.md 와 한 묶음으로 판정합니다. 두 파일 중 하나라도 템플릿 본 외의 줄이 남으면 둘 다 보존합니다(2절 A3). 조건 불충족이면 템플릿 본으로 바뀝니다. |
+| `CURRENT_TASK.md` | 조건부 보존 | 2절 조건부 보존, 5단계 복사 | REQUEST.md 와 한 묶음으로 판정합니다. 두 파일 중 하나라도 템플릿 본 외의 줄이 남으면 둘 다 보존합니다(2절 A3). 조건 불충족이면 템플릿 본으로 바뀝니다. |
+| `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` | 조건부 보존 | 2절 조건부 보존, 5단계 복사 | 표에 행이 있으면 보존합니다(2절 A1). 조건 불충족이면 템플릿 본으로 바뀝니다. |
+| `rd-workflow-workspace/backlog/FUTURE_REQUESTS_PARKED.md` | 조건부 보존 | 2절 조건부 보존, 5단계 복사 | 표에 행이 있으면 보존합니다(2절 A1). 조건 불충족이면 템플릿 본으로 바뀝니다. |
 | `rd-workflow-workspace/backlog/request-archive/` | 미전파 | 2절 보존 목록 | 아카이브 파일을 덮어쓰거나 지우지 않습니다. |
 | `rd-workflow-workspace/backlog/request-archive/README.md` | 덮어쓰기 | 5단계 복사 | 없음. |
 | `rd-workflow-workspace/backlog/items/README.md` | 덮어쓰기 | 5단계 복사 (lite 전용) | 없음. |
@@ -151,7 +207,7 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 | `rd-workflow-workspace/raw-captures/` | 미전파 | Raw Capture 마이그레이션 절 | capture 본문은 입력 원문이라 덮어쓰거나 지우지 않습니다. |
 | `rd-workflow-workspace/raw-captures/README.md` | 덮어쓰기 | 5단계 복사 | 없음. |
 | `rd-workflow-workspace/reports/` | 미전파 | 프로젝트의 보고서 산출물 | 보고서를 덮어쓰거나 지우지 않습니다. |
-| `rd-workflow-workspace/reports/tier-log.md` | 미전파 | 프로젝트 기록 | `light` 마감 때마다 행이 쌓이는 기록이라 덮어쓰지 않습니다. |
+| `rd-workflow-workspace/reports/tier-log.md` | 조건부 보존 | 2절 조건부 보존, 5단계 복사 | `light` 마감 기록이 쌓이는 파일입니다. 표에 행이 있으면 보존합니다(2절 A1). 조건 불충족이면 템플릿 본으로 바뀝니다. |
 | `rd-workflow-workspace/reports/autopilot/.gitkeep` | 덮어쓰기 | 5단계 복사 (full 전용) | 없음. |
 | `rd-workflow-workspace/reports/completions/.gitkeep` | 덮어쓰기 | 5단계 복사 (full 전용) | 없음. |
 | `rd-workflow-workspace/reports/reviews/.gitkeep` | 덮어쓰기 | 5단계 복사 (full 전용) | 없음. |
@@ -188,6 +244,7 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 - 새로 추가할 파일 목록
 - 삭제할 파일 목록 (있다면)
 - 보존할 파일 요약
+- 조건부 보존 파일 다섯 개의 판정 결과(보존 / 템플릿으로 동기화 / 신규 추가)와 그 근거(행 수, Status·Short Title 값)
 
 ### 4. 구조 마이그레이션 감지
 
@@ -538,7 +595,7 @@ bash rd-workflow/scripts/defect_reports.sh set-upstream "<배포 repo URL>"
 
 ### 6. 검증 및 버전 갱신
 
-동기화 후 임시 clone의 템플릿 파일과 프로젝트 파일이 일치하는지 확인합니다. (보존 대상 제외)
+동기화 후 임시 clone의 템플릿 파일과 프로젝트 파일이 일치하는지 확인합니다. 2절에서 보존으로 판정한 파일은 비교에서 뺍니다. 조건부 보존 파일은 2절 판정 결과가 보존일 때만 뺍니다.
 
 이어서 적용 시점이 "동기화 후"인 마이그레이션(M004, M013)을 실행합니다: `rd-workflow-workspace/.lifecycle/task-state`가 없으면 `bash rd-workflow/scripts/rd task status`를 1회 실행하고, 판정과 후속 조치는 clone된 `MIGRATIONS.md`의 M004 항목을 따릅니다. 그다음 M013 을 실행합니다: clone 에 `.claude/rules/rd-workflow/` 가 있으면 분류기(`classify`)를 돌려 조건(`template`·`modified` 행 유무)을 판정하고, 절차는 clone된 `MIGRATIONS.md`의 M013 항목을 따릅니다.
 

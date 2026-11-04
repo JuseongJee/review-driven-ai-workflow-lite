@@ -10,11 +10,16 @@ PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1" >&2; }
 IDX=rd-workflow-workspace/backlog/FUTURE_REQUESTS.md
+# 이 테스트가 읽는 제품 파일만 복사한다 (정적 source 추적 + 덫 사본으로 확정, spec 7.2).
+cp_scripts() { # cp_scripts <repo> — 필요한 제품 파일만 <repo>/rd-workflow/scripts 아래 같은 상대 경로로 복사 (cp 2회)
+  local d="$1/rd-workflow/scripts"
+  mkdir -p "$d/lifecycle" && cp "$SCRIPT_DIR/fr_backlog_scan.sh" "$SCRIPT_DIR/_state_common.sh" "$d/" && cp "$SCRIPT_DIR/lifecycle/_lifecycle_common.sh" "$d/lifecycle/"
+}
 mk_repo() { # mk_repo <dir> — 스크립트 사본 + 기본 backlog 를 가진 main 저장소
   mkdir -p "$1" && ( cd "$1" && git init -q && git checkout -q -b main 2>/dev/null \
     && git config user.email t@e.com && git config user.name t \
     && mkdir -p rd-workflow rd-workflow-workspace/backlog/items rd-workflow-workspace/.lifecycle \
-    && cp -R "$SCRIPT_DIR" rd-workflow/scripts \
+    && cp_scripts "$PWD" \
     && printf '# FR\n\n## 인덱스\n\n| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |\n|---|---|---|---|---|---|---|\n| 2026-01-01 | base-a | a | tooling | idea | - | [상세](items/2026-01-01-base-a.md) |\n' > "$IDX" \
     && printf '# base-a\n- status: idea\n' > rd-workflow-workspace/backlog/items/2026-01-01-base-a.md \
     && git add -A && git commit -q -m init )

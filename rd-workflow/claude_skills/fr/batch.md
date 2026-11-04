@@ -55,7 +55,7 @@
 ### 국면 1 — 대화형 준비 (사람 있음)
 
 0. **slug resolve**: 각 입력 slug를 `bash rd-workflow/scripts/batch/batch_manifest.sh resolve-slug <slug>`로 확인합니다. exit≠0(미존재 또는 복수 매칭)이면 그 slug를 보고하고 batch를 시작하지 않습니다(전체 중단). 사용자 입력 오타·미존재를 준비 착수 전에 차단합니다.
-1. **선별(feasibility)**: 각 slug에 대해 `bash rd-workflow/scripts/check_fr_related_files_existence.sh <해당 items 경로>`를 먼저 호출하고, 그 출력(비율 또는 `검사 대상 없음`)을 아래 적합성 판정과 선별 보고에 포함합니다. `exit 2`(스크립트 실행 오류)는 판정 불가로 보고하고 적합 판정의 근거로 쓰지 않습니다. 이 출력을 근거 중 하나로 삼아 각 slug에 autopilot 적합성 기준(autopilot SKILL.md 단일 출처 — `/fr inspect`가 인용하는 것과 동일)을 적용해 가능/조건부/불가 판정합니다.
+1. **선별(feasibility)**: 각 slug에 대해 `bash rd-workflow/scripts/check_fr_related_files_existence.sh <해당 items 경로>`를 먼저 호출하고, 그 출력(비율 또는 `검사 대상 없음`)을 아래 적합성 판정과 선별 보고에 포함합니다. `exit 2`(스크립트 실행 오류)는 판정 불가로 보고하고 적합 판정의 근거로 쓰지 않습니다. 이어서 `bash rd-workflow/scripts/fr_related_history.sh <해당 items 경로>`를 호출하고, 첫 줄(`변경 N건` / `검사 대상 없음` / `판정 불가(사유)`)을 선별 보고에 그대로 포함합니다. `변경 N건`(N>0)이면 나열된 커밋이 그 FR 의 문제를 이미 해결했을 수 있으므로 보고에서 사용자에게 확인을 요청합니다. `검사 대상 없음`·`판정 불가`·`exit 2` 는 해결 여부의 근거로 쓰지 않습니다. 이 신호만으로 FR 을 종결하거나 선별에서 제외하지 않습니다. 판정은 사람이 합니다. 이 출력을 근거 중 하나로 삼아 각 slug에 autopilot 적합성 기준(autopilot SKILL.md 단일 출처 — `/fr inspect`가 인용하는 것과 동일)을 적용해 가능/조건부/불가 판정합니다.
    - 불가: 묶음에서 제외, manifest item `feasibility=excluded` + `state=skipped` + `exclude_reason` 기록. (선별 제외 invariant — `validate`가 `excluded ⟹ state=skipped`를 강제하고, `summary`는 이를 `excluded`로만 집계하여 `skipped`(실행 중 선행 blocked로 건너뛴 eligible)와 구분합니다.)
    - 조건부: 다음 단계에서 결정을 닫으면 승격, 못 닫으면 excluded.
 2. **brainstorming 보강**: 처리 가능한 각 FR에 대해, headless mode A가 자율로 못 닫을 **사람 결정**(제품 방향·외부 의존 채택 등)만 사용자와 대화로 확정하고 FR 상세(request seed/범위/제약)에 명시적으로 기록합니다. full brainstorming skill을 FR마다 호출하는 것이 아니라 경량 "결정 닫기"입니다.
@@ -175,10 +175,10 @@ manifest status가 `running`인 동안 반복합니다:
      - **조치 가.** 해당 항목 출력의 `autopilot_headless: BASH_DEFAULT_TIMEOUT_MS=` 줄에서 유효 값을 확인합니다. 재개 회수 스윕처럼 그 줄이 없으면 현재 셸의 `BASH_DEFAULT_TIMEOUT_MS` 값을 확인합니다.
      - **조치 나.** 값이 검증 소요에 못 미치는 호출자 설정(예: 셸에 남은 `120000`·`600000`)이면 해제하거나 올려 재시도합니다.
      - **조치 다.** 유효 값이 기본값 이상이어도 timeout 을 배제하지 않습니다. 이 줄은 DEFAULT 설정값일 뿐 개별 명령의 timeout 인자나 다른 watchdog 의 증거가 아닙니다. 실행 로그와 `CURRENT_TASK.md` Notes 의 `waiting:` 줄에서 마지막 명령의 경과 시간·지정 timeout·"moved to the background" 유무를 확인하고 원인별로 조치합니다.
-        - 개별 Bash 호출에 짧은 `timeout` 인자가 남아 있었다: 인자를 생략하거나 예상 소요에 맞게 고칩니다. DEFAULT 를 올려도 그 명령에는 효과가 없습니다.
-        - 리뷰 어댑터 watchdog 에 걸렸다(어댑터 출력의 원인과 `wait config` 의 idle·cap): idle 또는 `WAIT_TIMEOUT` 을 점검합니다. 안쪽 상한을 올리면 바깥 Bash 대기(DEFAULT)가 그보다 크게 유지되도록 DEFAULT 도 함께 올립니다.
-        - 명령이 유효 DEFAULT 에 실제로 도달했다(경과 시간이 유효 값 이상, timeout 인자 없음): 호출 env 를 올려 재기동합니다.
-        - 원인이 불명확하다: DEFAULT 상향을 처방으로 제시하지 않고 종전대로 「결과 대기 규율」 위반 여부를 봅니다.
+        - 개별 Bash 호출에 짧은 `timeout` 인자가 남아 있었습니다: 인자를 생략하거나 예상 소요에 맞게 고칩니다. DEFAULT 를 올려도 그 명령에는 효과가 없습니다.
+        - 리뷰 어댑터 watchdog 에 걸렸습니다(어댑터 출력의 원인과 `wait config` 의 idle·cap): idle 또는 `WAIT_TIMEOUT` 을 점검합니다. 안쪽 상한을 올리면 바깥 Bash 대기(DEFAULT)가 그보다 크게 유지되도록 DEFAULT 도 함께 올립니다.
+        - 명령이 유효 DEFAULT 에 실제로 도달했습니다(경과 시간이 유효 값 이상, timeout 인자 없음): 호출 env 를 올려 재기동합니다.
+        - 원인이 불명확합니다: DEFAULT 상향을 처방으로 제시하지 않고 종전대로 「결과 대기 규율」 위반 여부를 봅니다.
 
      **적용 범위**: 신규 exit 40 과 재개 회수 스윕이 같은 분기를 씁니다. 이미 `completed` 로 집계된 항목의 판정은 소급하지 않습니다.
    - 상태전이는 모두 `set-state`로 수행되어 매번 flush됩니다(재개 지점 최신화).

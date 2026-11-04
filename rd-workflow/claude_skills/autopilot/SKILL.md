@@ -7,6 +7,29 @@ description: Use when wanting to pick a task from FUTURE_REQUESTS.md and run the
 
 FUTURE_REQUESTS에서 작업을 선택하고 파이프라인을 자율 실행한다. 실행 모드는 두 가지다 — 모드 A(`full` 등급: 모든 리뷰를 포함한 정식 절차 전부), 모드 B(`standard` 등급: final diff review 만). 모드는 `WORKFLOW.md` 위험 등급 절의 신호표로 판정한 등급이 정한다 ("실행 모드" 섹션).
 
+## rd-workflow 버전 대조
+
+이 skill 은 아래 `RD_SKILL_BASE` 보다 나중에 배포된 rd-workflow 를 전제한다. 첫 작업 단계보다 먼저, 프로젝트 루트에서 아래 명령을 이 호출에서 한 번 실행한다.
+
+- 출력이 없으면 그대로 진행한다.
+- 출력이 있으면 출력 전문을 사용자에게 알리고, 템플릿을 sync 할지 그대로 계속할지 묻고 멈춘다. 사용자가 계속을 지시하면 진행한다.
+- autopilot·무인 실행처럼 물을 사람이 없으면 계속하지 않고 그 출력을 중단 사유로 보고한다.
+
+```bash
+bash -s <<'RD_SKILL_COMPAT'
+RD_SKILL_BASE=2026-11-01-202303 RD_SKILL_NAME=autopilot
+vf="rd-workflow/VERSION"
+if [ ! -f "$vf" ] && [ -f "_ROOT_FILES/rd-workflow/VERSION" ]; then exit 0; fi
+v=""; [ -f "$vf" ] && v="$(cat "$vf")"; v="${v#lite-}"
+if [[ "$v" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$ ]] && [[ "$v" > "$RD_SKILL_BASE" ]]; then exit 0; fi
+echo "rd-workflow 버전 불일치 — skill '$RD_SKILL_NAME' 은 $RD_SKILL_BASE 보다 나중에 배포된 rd-workflow 가 필요합니다."
+echo "프로젝트: $PWD"
+echo "프로젝트 VERSION: ${v:-없음} (파일: $vf)"
+echo "이 상태로 진행하면 skill 이 가리키는 문서 절·스크립트·인자가 없어 중간에 실패할 수 있습니다."
+echo "해결: 템플릿을 sync 하십시오 (/tpl update 또는 rd-workflow/docs/guides/sync_template.md 절차)."
+RD_SKILL_COMPAT
+```
+
 ## Pipeline
 
 ```dot
@@ -174,8 +197,8 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 `
    - `select` 로 그 worktree 로 이동해 재개한 직후 `bash rd-workflow/scripts/autopilot_driver.sh begin` 을 실행한다.
    - 첫 줄이 `none`: 2·3항으로 내려간다.
    - 첫 줄이 `undetermined` (rc=3): `RD_AUTOPILOT_FR` 값과 무관하게(`auto` 든 명시 slug 든) 새 작업을 시작하지 않는다. outcome `blocked:resume-undetermined` 를 기록하고 스크립트 출력의 둘째 줄 이후를 outcome 둘째 줄부터 그대로 옮긴 뒤 종료한다. 생존·소유를 확인할 수 없는 작업을 가로채지 않으려는 것이다. 이 실패는 FR 을 고르기 전의 전역 실패이므로 `ralph_drain.sh` 가 즉시 중단하며, FR status 를 바꾸거나 `CURRENT_TASK` 를 초기화하지 않는다 — 대상 FR 이 없다.
-   - 어느 경우든 outcome 둘째 줄 이후에 `재개: <slug> <worktree> (<선택 이유>)` 줄과 스크립트의 `skip` 줄(제외 사유·다음 조치)을 적는다. 첫 줄은 토큰 전용이다.
-   - 후보가 여럿이면(`auto` 일 때) `RD_AUTOPILOT_FR` 과 같은 slug 를 먼저, 없으면 색인 순서 첫 후보를 스크립트가 고른다. `launch=ok`(대화형 세션을 기동한 적 있음) 작업은 후보가 아니다 — 사용자의 대화형 작업을 가로채지 않는다. 세션이 끝났다면 `rd task resolve-launch <slug> --assume-ended` 로 풀 수 있다.
+   - 어느 경우든 outcome 둘째 줄 이후에 `재개: <slug> <worktree> (<선택 이유>)` 줄과 스크립트의 `skip`·`info` 줄(제외 사유·다음 조치, 종료 확인 근거)을 적는다. 첫 줄은 토큰 전용이다.
+   - 후보가 여럿이면(`auto` 일 때) `RD_AUTOPILOT_FR` 과 같은 slug 를 먼저, 없으면 색인 순서 첫 후보를 스크립트가 고른다. `launch=ok`(대화형 세션을 기동한 적 있음) 작업은 세 갈래로 나뉜다. 세션 종료가 확인되면(herdr·프로세스 관측이 모두 완전하고 세션 없음) 후보가 되고, 색인의 launch 값은 바뀌지 않는다. herdr app 으로 기동한 작업(`launch-backend=hc`)은 이름 조회를 `hc get` 으로 한다. 세션이 살아 있으면 제외한다 — 사용자의 대화형 작업을 가로채지 않는다. 판정할 수 없으면(herdr 없음·조회 실패·시간 초과·불완전 관측) 제외하고 `rd task resolve-launch <slug> --assume-ended` 로 수동 확정하라고 안내한다.
 2. else `RD_AUTOPILOT_FR=<slug>` → 그 FR 을 선택한다.
 3. else `RD_AUTOPILOT_FR=auto` → `bash rd-workflow/scripts/fr_relations.sh auto-pick --root .` 를 실행하고 **첫 줄과 종료 코드**로 분기한다. 후보 집합 계산과 갈림 판정은 이 스크립트가 한다 — 여기서 다시 계산하지 않는다. `eligible` 은 **validated / ready-for-request 후보**(기존 화이트리스트 그대로, `blocked` 은 set-aside 라 제외)이고, `selectable` 은 그중 관계 판정이 `ready` 인 것이다.
    - 첫 줄이 `unavailable` (rc=2): outcome `blocked:relations-unavailable` 을 기록하고 종료한다. 스크립트 출력의 둘째 줄 이후를 outcome 둘째 줄부터 그대로 옮긴다. 이 실패는 FR 을 고르기 전의 전역 실패이므로 `ralph_drain.sh` 가 즉시 중단하며, 일반 blocked 처럼 FR status 를 바꾸거나 `CURRENT_TASK` 를 초기화하지 않는다 — 대상 FR 이 없다.
@@ -267,12 +290,14 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
   모드 A (큰 작업):
   ```bash
   bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug> --size large \
-    --source-fr rd-workflow-workspace/backlog/items/<선택한-항목>.md
+    --source-fr rd-workflow-workspace/backlog/items/<선택한-항목>.md \
+    --autopilot
   ```
   모드 B (작은 작업) — `--size` 만 다르다:
   ```bash
   bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug> --size small \
-    --source-fr rd-workflow-workspace/backlog/items/<선택한-항목>.md
+    --source-fr rd-workflow-workspace/backlog/items/<선택한-항목>.md \
+    --autopilot
   ```
   - **모드에 맞는 블록을 골라 쓴다.** 두 모드를 한 블록으로 두면 그대로 복사하는 실행자가 작은 작업도 `large` 로 시작해, 추가 전이·`--force` 우회 문제가 되살아난다. 이 계약은 `rd-workflow/scripts/check_autopilot_promote_contract.sh` 가 정적으로 점검한다 — 모드 라벨과 `--size` 값의 대응, 명령마다의 `--source-fr` canonical 경로까지 본다. 자연어 문장의 의미 반전은 점검 범위가 아니므로 사람 리뷰가 받는다.
   - **모드 B 는 promote 호출 전에 WORKFLOW.md 시작 계약 5항**(Status 대기 중 → 기본 브랜치 clean 선확인 → `start_preflight.sh` exit 10 이면 시작하지 않고 인계(등록 커밋만 ahead 면 자동 채택), 사용자 명시 채택 시 진행 → baseline HEAD) 을 확인하고 **그 직후 시작 보고 블록을 1회** 낸다. 모드 A 는 모드 결정 시점에 이미 냈으므로 여기서 다시 내지 않는다.
@@ -281,7 +306,7 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
   - `<slug>`는 `CURRENT_TASK.md ## Short Title` 값이다(생략 시 promote.sh가 자동 추출).
   - promote.sh가 `fr/<slug>` 브랜치 + task-state fr 필드 기록(commit) + CURRENT_TASK 갱신을 생성한다. 이는 §6 step 7 archive.sh가 요구하는 형식과 일치한다. **브랜치는 별도 worktree 에 부착되며, 호출 세션의 체크아웃은 기본 브랜치에 그대로 남는다** — `git switch` 는 `--no-worktree` 분기에만 있다(`promote.sh` 8단계). 이어서 아래 `launch` 처리를 반드시 수행한다.
 - **promote 직후 `launch` 결과 처리 (건너뛰지 않는다)**: promote 는 마지막에 `promote: 세션 기동 결과 — <값>` 을 출력한다. 그 값에 따라 갈린다.
-  - `ok` — 이 세션은 여기서 멈춘다. 이후 단계는 기동된 세션이 진행한다. **멈추기 전에** promote 출력의 `worktree <path>` 에 있는 스크립트로 이 세션이 표식을 대신 둔다: `bash <path>/rd-workflow/scripts/autopilot_driver.sh begin`. 인계 문구는 자식 세션에 이 skill 의 지시를 전달하지 않으므로 자식의 호출에 기대지 않는다(자식이 autopilot 절차를 따르지 않으면 `end` 가 실행되지 않아 표식이 남을 수 있고, 그 한계는 조건 문구 안내로 허용한다).
+  - `ok` — 이 세션은 여기서 멈춘다. 이후 단계는 기동된 세션이 진행한다. promote 가 `--autopilot` 으로 실행 주체 표식을 기동 전에 이미 두었고, 자식 세션은 인계 문구의 autopilot 줄로 이 skill 의 절차와 `end` 호출 지시를 받는다. 이 세션이 표식을 대신 두지 않는다. 자식이 그 지시를 따를지는 강제하지 못한다 — 따르지 않으면 `end` 가 실행되지 않아 표식이 남을 수 있고, 그 한계는 조건 문구 안내로 허용한다.
   - `none`·`failed` — 이 세션이 이어간다. **단 §4 로 넘어가기 전에 promote 출력의 `worktree <path>` 로 이동한다.** 이동하지 않으면 기본 브랜치 체크아웃에서 구현하게 되어, 작업이 fr 브랜치가 아닌 기본 브랜치에 쌓인다. `--no-worktree` 로 호출했을 때만 이동이 불필요하다(그 경우 promote 가 현재 체크아웃을 직접 전환한다). 이동한 직후(`unknown` 을 `failed` 로 확정해 이어가는 경우 포함) `bash rd-workflow/scripts/autopilot_driver.sh begin` 을 실행한다.
   - `unknown` — 이 세션도 아직 이어받지 않는다. `bash rd-workflow/scripts/rd task resolve-launch <slug>` 로 확정한 뒤에만 갈린다(살아 있으면 멈춤 / `failed` 로 확정되면 위 이동 후 진행).
   - 무인(headless) 실행은 `autopilot_headless.sh` 가 `RD_CHILD_SESSION=1` 을 export 하므로 항상 `none` 이다. 즉 **무인 경로의 기본값이 「이동해서 이어가기」**다.

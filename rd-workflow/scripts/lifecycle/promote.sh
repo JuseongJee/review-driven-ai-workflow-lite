@@ -27,7 +27,7 @@ source "$SCRIPT_DIR/../_task_common.sh"
 # 작업의 착수가 첫 번째의 기본 브랜치 커밋 때문에 막히지 않는다.
 # ===========================================================================
 
-DRY_RUN=0; SHORT_TITLE=""; WORKTREE_PATH=""; NO_WORKTREE=0; STATUS_VAL=""; SIZE_VAL=""; SOURCE_FR_ARGS=""; SOURCE_FR_ARG_FAIL=0; HANDOFF_SRC=""
+DRY_RUN=0; SHORT_TITLE=""; WORKTREE_PATH=""; NO_WORKTREE=0; STATUS_VAL=""; SIZE_VAL=""; SOURCE_FR_ARGS=""; SOURCE_FR_ARG_FAIL=0; HANDOFF_SRC=""; AUTOPILOT=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --short-title) SHORT_TITLE="$2"; shift 2 ;;
@@ -48,8 +48,9 @@ while [[ $# -gt 0 ]]; do
       # 조용히 사라지고, D9 가 기존 인계 파일까지 지운다.
       [[ $# -ge 2 && -n "$2" ]] || { echo "promote: --handoff 에 값이 없습니다 — 확정 결정을 적은 인계 파일 경로를 지정하세요." >&2; exit 1; }
       HANDOFF_SRC="$2"; shift 2 ;;
+    --autopilot) AUTOPILOT=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
-    -h|--help) echo "usage: promote.sh --short-title <slug> (--size large|small | --status <canonical>) [--worktree-path <path>] [--no-worktree] [--source-fr <path|-> (반복 지정 가능)] [--handoff <file>] [--dry-run]"; exit 0 ;;
+    -h|--help) echo "usage: promote.sh --short-title <slug> (--size large|small | --status <canonical>) [--worktree-path <path>] [--no-worktree] [--source-fr <path|-> (반복 지정 가능)] [--handoff <file>] [--autopilot] [--dry-run]"; exit 0 ;;
     *) echo "promote: unknown arg: $1" >&2; exit 1 ;;
   esac
 done
@@ -142,6 +143,13 @@ if [[ -z "$SHORT_TITLE" && -f "$project_root/CURRENT_TASK.md" ]]; then
 fi
 [[ -z "$SHORT_TITLE" || "$SHORT_TITLE" == "-" ]] && { echo "promote: --short-title 필수" >&2; exit 1; }
 SLUG="$(normalize_slug "$SHORT_TITLE")"
+# 잘린 이름 경고는 실제로 기동할 백엔드의 명령을 짚는다(spec C6-6). 자식 세션은 기동하지 않으므로 내지 않는다.
+if [[ "${#SLUG}" -gt 32 && -z "${RD_CHILD_SESSION:-}" ]]; then
+  case "$(session_launch_backend)" in
+    herdr) echo "promote: slug 가 32자를 넘어 herdr 에이전트 이름은 $(session_agent_name "$SLUG") 로 잘립니다 — herdr agent prompt·get 에는 이 이름을 씁니다." ;;
+    hc)    echo "promote: slug 가 32자를 넘어 hc 세션 이름은 $(session_agent_name "$SLUG") 로 잘립니다 — hc get·attach 에는 이 이름을 씁니다." ;;
+  esac
+fi
 TARGET_BRANCH="fr/$SLUG"
 
 # source-fr 값 결정: 인자 > REQUEST.md 해석 > '-'
@@ -771,6 +779,7 @@ fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "would ${DECISION}: fr-branch=${TARGET_BRANCH} worktree=${TARGET_DIR} (branch=${NEED_BRANCH} attach=${NEED_ATTACH} content=${NEED_CONTENT})"
+  [[ "$AUTOPILOT" -eq 1 ]] && echo "promote: (dry-run) autopilot 표식을 기동 전에 둘 예정입니다."
   exit 0
 fi
 
@@ -838,13 +847,13 @@ trap '_promote_on_exit' EXIT
 #      `.git/rd-workflow/tasks.local` 이 사라지면 뒤 절반도 참이 됩니다. 그 작업은
 #      `--no-worktree` 여도 `session_launch` 를 그대로 타므로(12 단계는 `NO_WORKTREE` 로
 #      갈라지지 않습니다) **살아 있는 세션을 가질 수 있습니다.**
-# 저장소 안에는 ①과 ②를 가를 증거가 없습니다(기동 사실은 herdr 쪽에만 있고, 그 유일한
-# 조회 수단인 `session_probe` 는 herdr 밖에서 unknown 만 냅니다). 그래서 `none` 으로
+# 저장소 안에는 ①과 ②를 가를 증거가 없습니다(기동 사실은 herdr·herdr app 쪽에만 있고, 그 유일한
+# 조회 수단인 `session_probe` 는 기동한 백엔드를 쓸 수 없는 셸에서 unknown 만 냅니다). 그래서 `none` 으로
 # 단언하면 ②에서 **살아 있는 세션 위에 두 번째 세션을 띄웁니다** — 재착수 3경로에서
 # `none` 은 「예약 후 기동 시도」이기 때문입니다(10 단계 ③).
 #
 # 틀렸을 때의 비용이 비대칭이므로 안전한 쪽으로 기웁니다: 확인 1회(`resolve-launch`,
-# herdr 밖이면 `--assume-ended`) vs 살아 있는 작업 위 중복 기동.
+# 세션을 조회할 수 없는 환경이면 `--assume-ended`) vs 살아 있는 작업 위 중복 기동.
 _promote_absorb_legacy() {
   metadata_exists || return 0
   local legacy_branch legacy_slug have legacy_wt
@@ -1016,7 +1025,7 @@ case "$_EXISTING_LAUNCH" in
     _SKIP_LAUNCH_REASON="이전 기동 결과가 아직 확인되지 않았습니다(launch=${_EXISTING_LAUNCH})"
     ;;
   ok)
-    _probe="$(session_probe "$SLUG" "$TARGET_DIR")"
+    _probe="$(session_probe "$SLUG" "$TARGET_DIR" "$(tasks_index_get "$SLUG" launch-backend 2>/dev/null || true)")"
     case "$_probe" in
       alive)   _SKIP_LAUNCH_REASON="이미 살아 있는 세션이 있습니다" ;;
       unknown) _SKIP_LAUNCH_REASON="세션 생존 여부를 확인할 수 없습니다(probe=unknown)" ;;
@@ -1101,8 +1110,11 @@ else
   esac
   echo "promote: 다음 기동에 사용할 모델 — ${_SESSION_MODEL:-미지정} (출처: ${_SESSION_MODEL_LABEL})"
   LAUNCH_TOKEN="$(date -u '+%Y-%m-%d-%H%M')-$$"
+  # 기동 대상 백엔드는 예약과 같은 upsert 에 남긴다(spec D2). 기동 도중 끝나거나 결과를 기록하지
+  # 못해도 resolve-launch 가 올바른 대상을 조회한다. `none` 도 써서 이전 기동의 값을 덮어쓴다.
+  if [[ -n "${RD_CHILD_SESSION:-}" ]]; then _LAUNCH_BACKEND="none"; else _LAUNCH_BACKEND="$(session_launch_backend)"; fi
   tasks_index_upsert "$SLUG" fr-branch="$TARGET_BRANCH" worktree-path="$TARGET_DIR" checkout=yes \
-    ${_NW_FLAG:+no-worktree="$_NW_FLAG"} launch=launching launch-token="$LAUNCH_TOKEN"
+    ${_NW_FLAG:+no-worktree="$_NW_FLAG"} launch=launching launch-token="$LAUNCH_TOKEN" launch-backend="$_LAUNCH_BACKEND"
 fi
 
 # 11. 락 해제 — 세션 기동보다 앞선다(예약은 이미 기록됐다). 기동은 락 밖에서 돈다 —
@@ -1110,14 +1122,24 @@ fi
 [[ "${LOCK_HELD:-0}" -eq 1 ]] && { tasks_lock_release; LOCK_HELD=0; }
 
 # 12. 세션 기동 (락 밖). **판정을 복제하지 않고 항상 session_launch 를 부른다** —
-#     herdr 가 없거나 이미 자식 세션이면 그 함수 자신이 그것을 판단해 수동 기동
-#     명령을 stderr 로 내고 none 을 반환한다. promote 가 그 판단을 앞에서 복제해
-#     조건이 거짓일 때 아예 부르지 않으면, 이 템플릿을 쓰는 대다수(비-herdr 환경)가
+#     자동 기동을 지원하지 않는 환경이거나 이미 자식 세션이면 그 함수 자신이 그것을 판단해
+#     수동 기동 명령을 stderr 로 내고 none 을 반환한다. promote 가 그 판단을 앞에서 복제해
+#     조건이 거짓일 때 아예 부르지 않으면, 이 템플릿을 쓰는 대다수(자동 기동을 지원하지 않는 환경)가
 #     수동 기동 명령을 못 본 채 worktree 만 남는다(2026-09 final diff review I5).
 #     결과 기록은 락을 다시 잡아 **token 이 같을 때만** 반영한다.
+# autopilot 표식 — 세션 기동 전에 둔다(인계 문구가 기동 시점에 표식을 본다). 실패해도 계속한다.
+if [[ "$AUTOPILOT" -eq 1 ]]; then
+  _ap_err=""
+  if _ap_err="$(bash "${TARGET_DIR}/rd-workflow/scripts/autopilot_driver.sh" begin 2>&1 >/dev/null)"; then
+    echo "promote: autopilot 표식 — ok"
+  else
+    echo "promote: autopilot 표식 — 실패(${_ap_err%%$'\n'*}) — 인계 문구에 autopilot 지시가 빠집니다"
+  fi
+fi
+
 if [[ -n "$LAUNCH_TOKEN" ]]; then
   REQUEST_HANDOFF_PATH="${TARGET_DIR}/REQUEST.md"
-  LAUNCH_RESULT="$(session_launch "$TARGET_DIR" "$SLUG" "$REQUEST_HANDOFF_PATH" "$_SESSION_MODEL")"
+  LAUNCH_RESULT="$(session_launch "$TARGET_DIR" "$SLUG" "$REQUEST_HANDOFF_PATH" "$_SESSION_MODEL" "$_LAUNCH_BACKEND")"
   # 락은 유한 재시도한다 — rc=1(다른 명령이 잠깐 점유)만 0.25초 간격 최대 20회(약 5초).
   # rc=2(점유자 불확실)는 기다려도 풀리지 않으므로 즉시 중단한다. 재시도 중 stderr 는
   # 모아 두었다가 끝내 실패했을 때만 낸다(일시 경합 때 점유 안내가 20번 찍히지 않게).
@@ -1150,13 +1172,23 @@ if [[ -n "$LAUNCH_TOKEN" ]]; then
   else
     echo "promote: 세션 기동 결과 — ${LAUNCH_RESULT} ($(session_launch_status_hint "$LAUNCH_RESULT" "$SLUG")) / 상태 기록 미완료 — launch 는 launching 으로 남았습니다. 복구: bash rd-workflow/scripts/rd task resolve-launch ${SLUG}"
   fi
-  # D8 — 자동 기동이 없었으면(--no-worktree·비-herdr·자식 세션) 사람이 세션을 손으로
+  if [[ "$LAUNCH_RESULT" == "ok" || "$LAUNCH_RESULT" == "unknown" ]]; then
+    _agent_name="$(session_agent_name "$SLUG")"
+    if [[ "$_agent_name" != "$SLUG" ]]; then
+      if [[ "${_LAUNCH_BACKEND:-}" == "hc" ]]; then
+        echo "promote: hc 세션 이름 — ${_agent_name}"
+      else
+        echo "promote: herdr 에이전트 이름 — ${_agent_name}"
+      fi
+    fi
+  fi
+  # D8 — 자동 기동이 없었으면(--no-worktree·자동 기동을 지원하지 않는 환경·자식 세션) 사람이 세션을 손으로
   # 연다. 그 세션에 붙여 넣을 인계 문구와 인계 파일 경로를 함께 보인다.
   _handoff_dst="$(session_handoff_file_path "$TARGET_DIR")"
   if [[ "$LAUNCH_RESULT" == "none" && -f "$_handoff_dst" ]]; then
     echo "promote: 인계 파일 — ${_handoff_dst}"
     echo "promote: 새 세션에 붙여 넣을 인계 문구:"
-    session_handoff_text "$SLUG" "$REQUEST_HANDOFF_PATH" "$TARGET_DIR" "$_handoff_dst"
+    session_handoff_text "$SLUG" "$REQUEST_HANDOFF_PATH" "$TARGET_DIR" "$_handoff_dst" "$(session_handoff_autopilot "$TARGET_DIR")"
     echo
   fi
 fi

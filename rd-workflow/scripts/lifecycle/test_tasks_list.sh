@@ -48,6 +48,7 @@ TMP="$(cd "$TMP" && pwd -P)"
   cp -R "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/hooks/. rd-workflow/scripts/hooks/ && \
   cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_state_common.sh rd-workflow/scripts/ && \
   cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_task_common.sh rd-workflow/scripts/ && \
+  cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_submodule_common.sh rd-workflow/scripts/ && \
   cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/rd rd-workflow/scripts/ && \
   git add -A && \
   git commit -q -m "init" )
@@ -355,14 +356,14 @@ git -C "$TMP" worktree add -q "$TMP/.worktrees/legacy" fr/legacy
 # 흡수가 남기는 행의 모양 — 기동 예약이 없었으므로 launch-token 이 없다.
 tasks_index_upsert legacy fr-branch=fr/legacy worktree-path="$TMP/.worktrees/legacy" checkout=yes launch=unknown
 
-if out="$( cd "$REPO" && env -u HERDR_ENV bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task legacy 2>&1 )"; then
+if out="$( cd "$REPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task legacy 2>&1 )"; then
   fail "F1 사전조건: unknown 인데 rollback 이 통과했다"
 else
   pass "F1 사전조건 — 기록된 unknown 은 rollback 을 막는다"
 fi
 
 # 기본 동작은 확정하지 않는다 — token 이 없어도 마찬가지다(유실과 구별할 수 없다).
-if out="$( cd "$REPO" && env -u HERDR_ENV bash rd-workflow/scripts/rd task resolve-launch legacy 2>&1 )"; then
+if out="$( cd "$REPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/rd task resolve-launch legacy 2>&1 )"; then
   fail "F1: herdr 없이 unknown 을 조용히 확정했다"
 else
   [[ "$(tasks_index_get legacy launch)" == "unknown" ]] \
@@ -373,14 +374,14 @@ else
     && pass "명시 확정 경로(--assume-ended)를 안내한다 (F1)" || fail "F1 안내 누락: $out"
 fi
 
-if out="$( cd "$REPO" && env -u HERDR_ENV bash rd-workflow/scripts/rd task resolve-launch legacy --assume-ended 2>&1 )"; then
+if out="$( cd "$REPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/rd task resolve-launch legacy --assume-ended 2>&1 )"; then
   [[ "$(tasks_index_get legacy launch)" == "failed" ]] \
     && pass "--assume-ended 는 사용자 확인으로 failed 확정한다 (F1)" || fail "F1 --assume-ended 확정 실패"
 else
   fail "F1: --assume-ended 가 실패했다 — $out"
 fi
 
-if ( cd "$REPO" && env -u HERDR_ENV bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task legacy >/dev/null 2>&1 ); then
+if ( cd "$REPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task legacy >/dev/null 2>&1 ); then
   pass "확정 뒤 herdr 없이도 마감(rollback)까지 도달한다 (F1, AC 8·AC 18)"
 else
   fail "F1: 확정했는데도 차단이 풀리지 않았다"
@@ -389,7 +390,7 @@ fi
 # 예약(launch-token)이 남아 있는 unknown 도 같은 규칙이다 — token 유무로 갈리지 않는다.
 git -C "$TMP" branch fr/pending main
 tasks_index_upsert pending fr-branch=fr/pending checkout=no launch=unknown launch-token="2026-09-16-1200-424242"
-if out="$( cd "$REPO" && env -u HERDR_ENV bash rd-workflow/scripts/rd task resolve-launch pending 2>&1 )"; then
+if out="$( cd "$REPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/rd task resolve-launch pending 2>&1 )"; then
   fail "F1: 예약이 있는 unknown 을 herdr 없이 조용히 확정했다"
 else
   [[ "$(tasks_index_get pending launch)" == "unknown" ]] \
@@ -412,7 +413,7 @@ else
   fail "F8: 세션 시작 요약에 pending 행이 없다 — $ss_out"
 fi
 
-if out="$( cd "$REPO" && env -u HERDR_ENV bash rd-workflow/scripts/rd task resolve-launch pending --assume-ended 2>&1 )"; then
+if out="$( cd "$REPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/rd task resolve-launch pending --assume-ended 2>&1 )"; then
   [[ "$(tasks_index_get pending launch)" == "failed" ]] \
     && pass "--assume-ended 는 사용자 확인으로 failed 확정한다 (F1)" || fail "F1 --assume-ended 확정 실패"
 else
@@ -433,7 +434,7 @@ tasks_index_upsert ended fr-branch=fr/ended worktree-path="$TMP/.worktrees/ended
 # 취소가 막히는 **그 화면**에 종료 확정 경로가 보여야 한다 (F9 잔여). 기능만 만들고
 # 막힌 자리에 적지 않으면 사용자에게는 없는 것과 같고, 눈에 보이는 유일한 출구가
 # 두 보호를 함께 해제하는 --force 가 된다.
-rb_out="$( cd "$REPO" && env -u HERDR_ENV bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task ended 2>&1 )" || true
+rb_out="$( cd "$REPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task ended 2>&1 )" || true
 [[ "$rb_out" == *"resolve-launch ended --assume-ended"* ]] \
   && pass "ok/unknown 취소 거부가 종료 확정 경로를 안내한다 (F9 잔여)" || fail "F9 잔여 안내 누락: $rb_out"
 [[ "$rb_out" == *"작업물 보호까지"* ]] \
@@ -442,7 +443,7 @@ rb_out="$( cd "$REPO" && env -u HERDR_ENV bash rd-workflow/scripts/lifecycle/pro
   && pass "판정 불가에서 되풀이되는 재시도를 권하지 않는다 (F9 잔여)" || fail "F9 잔여: 실패하는 재시도를 안내했다"
 
 # 플래그 없이는 여전히 거부한다 — 그때는 해소할 것이 없다.
-if out="$( cd "$REPO" && env -u HERDR_ENV bash rd-workflow/scripts/rd task resolve-launch ended 2>&1 )"; then
+if out="$( cd "$REPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/rd task resolve-launch ended 2>&1 )"; then
   fail "F9: ok 를 플래그 없이 해소했다"
 else
   [[ "$(tasks_index_get ended launch)" == "ok" ]] \
@@ -451,7 +452,7 @@ else
     && pass "ok 거부 메시지가 종료 확정 경로를 안내한다 (F9)" || fail "F9 ok 안내 누락: $out"
 fi
 
-if out="$( cd "$REPO" && env -u HERDR_ENV bash rd-workflow/scripts/rd task resolve-launch ended --assume-ended 2>&1 )"; then
+if out="$( cd "$REPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/rd task resolve-launch ended --assume-ended 2>&1 )"; then
   [[ "$(tasks_index_get ended launch)" == "failed" ]] \
     && pass "ok + --assume-ended 는 종료로 확정된다 (F9)" || fail "F9 ok 확정 실패: $(tasks_index_get ended launch)"
 else
@@ -463,7 +464,7 @@ fi
 # 사용자에게 보호와 손실 안내가 함께 사라지던 자리다.
 git -C "$TMP/.worktrees/ended" config status.showUntrackedFiles no
 printf 'work in progress\n' > "$TMP/.worktrees/ended/untracked-work.txt"
-if out="$( cd "$REPO" && env -u HERDR_ENV bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task ended 2>&1 )"; then
+if out="$( cd "$REPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task ended 2>&1 )"; then
   fail "F6 잔여: showUntrackedFiles=no 에서 미추적 작업물이 있는데 취소가 통과했다"
 else
   [[ -f "$TMP/.worktrees/ended/untracked-work.txt" ]] \
@@ -474,12 +475,12 @@ fi
 
 # dry-run 의 손실 목록도 같은 helper 를 쓴다 — 여기서 비어 보이면 사용자는 취소 전에
 # 위험을 볼 수 없다.
-dry_out="$( cd "$REPO" && env -u HERDR_ENV bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task ended --dry-run 2>&1 )" || true
+dry_out="$( cd "$REPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task ended --dry-run 2>&1 )" || true
 [[ "$dry_out" == *"untracked-work.txt"* ]] \
   && pass "--dry-run 손실 목록에도 미추적 파일이 나온다 (F6 잔여)" || fail "F6 잔여 dry-run 목록: $dry_out"
 
 # --force 로는 버릴 수 있다 — 취소 기능 자체는 살아 있다.
-if out="$( cd "$REPO" && env -u HERDR_ENV bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task ended --force 2>&1 )"; then
+if out="$( cd "$REPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task ended --force 2>&1 )"; then
   [[ ! -d "$TMP/.worktrees/ended" ]] \
     && pass "--force 는 미추적 작업물을 알고도 버리고 완주한다 (F6)" || fail "F6 --force 미완주"
 else
@@ -653,7 +654,7 @@ rc=0; ( PATH="$STUB_LSOF:$PATH"; tasks_path_occupied "$TMP" ) || rc=$?
 mkdir -p "$TMP/.s7b-empty"
 rc=0
 ( sleep 30 & _spid=$!
-  ps() { printf '%s S sleep\n%s S bash\n' "$_spid" "$$"; }
+  ps() { printf '%s %s S\n%s %s S\n' "$_spid" "$(id -u)" "$$" "$(id -u)"; }
   lsof() { printf 'p%s\nn/\n' "$$"; }
   TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
   kill "$_spid" 2>/dev/null; exit "$_r" ) || rc=$?
@@ -663,7 +664,7 @@ rc=0
 # 모든 pid 가 `p` 줄은 있으므로, rc 2 는 오직 경로 검증 때문에 나온다(ps·lsof 스텁 고정).
 rc=0
 ( sleep 30 & _spid=$!
-  ps() { printf '%s S sleep\n' "$_spid"; }
+  ps() { printf '%s %s S\n' "$_spid" "$(id -u)"; }
   lsof() { printf 'p%s\nn/proc/%s/cwd (readlink: Permission denied)\n' "$_spid" "$_spid"; }
   TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
   kill "$_spid" 2>/dev/null; exit "$_r" ) || rc=$?
@@ -682,6 +683,29 @@ rc=0
   lsof() { printf 'p%s\nn/\n' "$$"; }
   TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty" ) || rc=$?
 [[ "$rc" -eq 2 ]] && pass "S7f ps 출력이 비어 있으면 점유 판정은 rc 2" || fail "S7f rc=$rc (기대 2)"
+
+# S7g·S7h 유효 uid 가 다른(setuid) 프로세스 — ps 는 실 uid 로 고르므로 VPN helper·login 같은 setuid 프로세스가
+# 내 계정 행으로 들어온다. lsof 가 그 CWD 를 읽지 못해도 판정불가로 세지 않고(S7g), 읽힌 CWD 가 대상 안이면
+# 유효 uid 와 관계없이 점유다(S7h). 스텁의 유효 uid 0 이 내 계정과 같아지는 root 실행에서는 건너뛴다.
+if [[ "$(id -u)" -eq 0 ]]; then
+  echo "  SKIP: S7g·S7h root 로 실행 중이라 유효 uid 가 다른 프로세스를 스텁으로 만들 수 없음"
+else
+  rc=0
+  ( sleep 30 & _spid=$!
+    ps() { printf '%s 0 S\n%s %s S\n' "$_spid" "$$" "$(id -u)"; }
+    lsof() { printf 'p%s\nn/\n' "$$"; }
+    TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
+    kill "$_spid" 2>/dev/null; exit "$_r" ) || rc=$?
+  [[ "$rc" -eq 1 ]] && pass "S7g 유효 uid 가 다른(setuid) 프로세스의 CWD 를 못 읽어도 나머지가 대상 밖이면 rc 1" || fail "S7g rc=$rc (기대 1)"
+
+  rc=0
+  ( sleep 30 & _spid=$!
+    ps() { printf '%s 0 S\n%s %s S\n' "$_spid" "$$" "$(id -u)"; }
+    lsof() { printf 'p%s\nn/\np%s\nn%s\n' "$$" "$_spid" "$TMP/.s7b-empty"; }
+    TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
+    kill "$_spid" 2>/dev/null; exit "$_r" ) || rc=$?
+  [[ "$rc" -eq 0 ]] && pass "S7h 유효 uid 가 다른 프로세스라도 읽힌 CWD 가 대상 안이면 rc 0" || fail "S7h rc=$rc (기대 0)"
+fi
 
 # S7c 판정불가 보류 — lsof 가 실패하면 worktree 를 지우지 않고 다음 행동을 안내한다
 _sw_mk s7c
@@ -797,6 +821,97 @@ if grep -q '^calls=2$' "$T6DIR/events.log" && ! grep -q '양보함' "$T6DIR/swee
 else
   fail "T6b stale 표지를 무시하지 않음: $(tr '\n' ',' <"$T6DIR/events.log") $(cat "$T6DIR/sweep.err")"
 fi
+
+# N1 이름 줄 — herdr 에이전트 이름은 32자에서 잘린다. 잘린 slug(33자 이상)의 행에만
+#    실제 이름 줄을 보여 호출 세션이 그 이름으로 herdr 를 부르게 한다. 이름은 계산값이다(herdr 미호출).
+_N1_LONG="abcdefghij-abcdefghij-abcdefghij-xyz12345"
+_N1_SHORT="short-name"
+cd "$TMP"
+# 브랜치에 커밋이 있어야 발행 확인 행이 아니라 메인 표 행(in-progress)으로 분류된다.
+for _b in "$_N1_LONG" "$_N1_SHORT"; do
+  git branch "fr/$_b"
+  git checkout -q "fr/$_b"; git commit -q --allow-empty -m "$_b work"; git checkout -q main
+done
+tasks_index_upsert "$_N1_LONG" fr-branch="fr/$_N1_LONG" checkout=no launch=ok
+tasks_index_upsert "$_N1_SHORT" fr-branch="fr/$_N1_SHORT" checkout=no launch=ok
+n1_out="$(bash "$SCRIPT_DIR/tasks_list.sh")"
+n1_cnt="$(printf '%s\n' "$n1_out" | grep -c -F '→ herdr 이름: abcdefghij-abcdefghij-abcdefghij' || true)"
+[[ "$n1_cnt" == "1" ]] \
+  && pass "N1 33자 이상 slug 행에 herdr 이름 줄이 1회 나온다" || fail "N1 이름 줄 횟수=$n1_cnt"
+n1_cnt="$(printf '%s\n' "$n1_out" | grep -c -F 'herdr 이름' || true)"
+[[ "$n1_cnt" == "1" ]] \
+  && pass "N1 32자 이하 slug 행에는 herdr 이름 줄이 없다" || fail "N1 짧은 slug 에 이름 줄 있음 (전체 ${n1_cnt}줄)"
+# N2 hc 로 기동한 작업(launch-backend=hc)은 hc 명령을 짚는 이름 줄을 낸다 (resume-name spec C6-6)
+_N2_LONG="hclong-abcdefghij-abcdefghij-abcdefghij"
+git branch "fr/$_N2_LONG"; git checkout -q "fr/$_N2_LONG"; git commit -q --allow-empty -m "n2 work"; git checkout -q main
+tasks_index_upsert "$_N2_LONG" fr-branch="fr/$_N2_LONG" checkout=no launch=ok launch-backend=hc
+n2_out="$(bash "$SCRIPT_DIR/tasks_list.sh")"
+n2_line="$(printf '%s\n' "$n2_out" | grep -F "→ hc 세션 이름: $(bash -c 'source "$1/session_launch.sh"; session_agent_name "$2"' _ "$SCRIPT_DIR" "$_N2_LONG")" || true)"
+[[ -n "$n2_line" ]] && pass "N2 hc 작업 행에 hc 세션 이름 줄" || fail "N2 hc 이름 줄 없음: $n2_out"
+n1_cnt="$(printf '%s\n' "$n2_out" | grep -c -F 'herdr 이름' || true)"
+[[ "$n1_cnt" == "1" ]] && pass "N2 hc 작업 행에는 herdr 이름 줄이 없다(N1 행 1줄만)" || fail "N2 herdr 이름 줄 수=$n1_cnt"
+# ---------------------------------------------------------------------------
+# resolve-launch 의 hc(herdr app) 갈래 (change spec D6). 기록된 launch-backend 로만 조회·인계 확인을
+# 하고, 인계가 처리되기 전에는 launch 를 ok 로 바꾸지 않는다. hc 대역은 `hc get` 응답만 흉내낸다.
+# ---------------------------------------------------------------------------
+HCT="$TMP/.stub-hc"; mkdir -p "$HCT"
+make_hc_get_stub() {  # <scenario: live-same|live-turn0|finished>
+  local out
+  case "$1" in
+    live-same)  out='{"state":"live","cwd":"/tmp/wt","turn":1,"status":{"state":"done"}}' ;;
+    live-turn0) out='{"state":"live","cwd":"/tmp/wt","turn":0,"status":null}' ;;
+    finished)   out='{"state":"finished","cwd":"/tmp/wt","turn":1,"exit_code":0}' ;;
+  esac
+  : > "$HCT/hc.log"
+  printf '%s' "$out" > "$HCT/hc.out"
+  cat > "$HCT/hc" <<STUBEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$HCT/hc.log"
+cat "$HCT/hc.out"
+STUBEOF
+  chmod +x "$HCT/hc"
+}
+hc_resolve() {  # <slug> [env...] — hc 대역을 PATH 앞에 두고 resolve-launch 를 실행한다
+  local slug="$1"; shift
+  ( cd "$REPO" && env HERDR_ENV= "$@" PATH="$HCT:$PATH" bash rd-workflow/scripts/rd task resolve-launch "$slug" 2>&1 )
+}
+
+# 처리 전(turn=0)에는 ok 로 바꾸지 않는다
+tasks_index_upsert hc1 launch=unknown launch-backend=hc worktree-path=/tmp/wt checkout=yes
+make_hc_get_stub live-turn0
+rc=0; out="$(hc_resolve hc1 HC_TERMINAL_ID=t6)" || rc=$?
+[[ "$rc" -ne 0 && "$(tasks_index_get hc1 launch)" == "unknown" ]] \
+  && pass "hc 인계 미처리는 unknown 유지" || fail "처리 전 ok 확정: rc=$rc launch=$(tasks_index_get hc1 launch)"
+[[ "$out" == *"붙여 넣지 마십시오"* ]] \
+  && pass "hc 인계 미처리는 붙여 넣지 말라는 안내를 낸다" || fail "hc 미처리 안내 누락: $out"
+# 처리됨
+make_hc_get_stub live-same
+rc=0; out="$(hc_resolve hc1 HC_TERMINAL_ID=t6)" || rc=$?
+[[ "$rc" -eq 0 && "$(tasks_index_get hc1 launch)" == "ok" ]] \
+  && pass "hc 인계 처리 확인 뒤 launch=ok" || fail "hc 처리 확인 뒤 ok 아님: rc=$rc launch=$(tasks_index_get hc1 launch) out=$out"
+grep -q 'send' "$HCT/hc.log" && fail "hc send 호출됨" || pass "hc resolve 는 hc send 를 부르지 않는다"
+# 세션 종료
+tasks_index_upsert hc1 launch=unknown
+make_hc_get_stub finished
+rc=0; out="$(hc_resolve hc1 HC_TERMINAL_ID=t6)" || rc=$?
+[[ "$(tasks_index_get hc1 launch)" == "failed" ]] \
+  && pass "hc 세션 종료는 launch=failed" || fail "hc 종료 failed 아님: $(tasks_index_get hc1 launch)"
+# 기록된 hc 인데 이 셸에서 hc 를 쓸 수 없음
+tasks_index_upsert hc1 launch=unknown
+make_hc_get_stub live-same
+rc=0; out="$(hc_resolve hc1 HC_TERMINAL_ID=)" || rc=$?
+[[ "$rc" -ne 0 && "$(tasks_index_get hc1 launch)" == "unknown" ]] \
+  && pass "기록 hc + HC_TERMINAL_ID 없음 → unknown 유지" || fail "기록된 백엔드 무시: rc=$rc launch=$(tasks_index_get hc1 launch)"
+[[ "$out" == *"herdr app 에서 기동했습니다"* && "$out" == *"--assume-ended"* ]] \
+  && pass "hc 사용 불가 안내에 기동 환경과 --assume-ended 가 있다" || fail "기동 환경 안내 누락: $out"
+# Review Focus 5 — launch-backend 없는 행(레거시)은 herdr 로 본다. hc 환경이어도 hc 를 부르지 않는다
+tasks_index_upsert hc2 launch=unknown worktree-path=/tmp/wt checkout=yes
+make_hc_get_stub live-same
+rc=0; out="$(hc_resolve hc2 HC_TERMINAL_ID=t6)" || rc=$?
+[[ "$rc" -ne 0 && "$(tasks_index_get hc2 launch)" == "unknown" ]] \
+  && pass "레거시 행은 herdr 로 보고 unknown 유지" || fail "기록된 백엔드 무시: 레거시 행 rc=$rc launch=$(tasks_index_get hc2 launch)"
+[[ "$out" == *"터미널 herdr 에서 기동했습니다"* && ! -s "$HCT/hc.log" ]] \
+  && pass "레거시 행은 hc 를 부르지 않고 터미널 herdr 안내를 낸다" || fail "레거시 행 hc 조회: log=$(cat "$HCT/hc.log") out=$out"
 
 printf 'tasks_list: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

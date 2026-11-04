@@ -15,6 +15,7 @@ fi
 cd "$project_root"
 
 source "$SCRIPT_DIR/_lifecycle_common.sh"
+source "$SCRIPT_DIR/../_submodule_common.sh"
 
 REBUILD=0
 while [[ $# -gt 0 ]]; do
@@ -248,7 +249,12 @@ _tl_sweep_one() {  # <slug>
       _tl_hold "$slug" "점유 판정불가(${TASKS_OCCUPIED_REASON:-알 수 없음})" "lsof 를 확인한 뒤 rd task list 를 다시 실행"
       return 0
     fi
-    if ! err="$(git worktree remove "$rn" 2>&1)"; then
+    local _rrc=0 _hi; err="$(rd_worktree_remove_safe "$rn")" || _rrc=$?
+    if [[ "$_rrc" -eq 1 ]]; then
+      _hi="$(rd_worktree_hold_info "${err%%$'\t'*}" "${err#*$'\t'}" "$rn")"
+      _tl_hold "$slug" "${_hi%%$'\t'*}" "${_hi#*$'\t'} 로 확인한 뒤 rd task list 를 다시 실행"
+      return 0
+    elif [[ "$_rrc" -ne 0 ]]; then
       _tl_fail "$slug" "worktree 제거 실패 (${err//$'\n'/ })" "git worktree remove ${rp}"
       return 0
     fi
@@ -468,6 +474,22 @@ while IFS= read -r slug; do
   # 다루므로, 행동만 `none`(수동 기동 권유)으로 갈리면 같은 행이 서로 다른 말을 한다.
   action="$(_tl_launch_action "$slug" "$launch_raw" "$action_wt")"
 
+  # 세션 이름은 32자에서 잘린다. 잘린 slug 의 행에만 실제 이름을 보여 호출 세션이 그 이름으로
+  # 세션을 부르게 한다. 이름은 slug 에서 계산한 값이다(herdr·hc 를 호출하지 않는다). 문구는 색인에
+  # 기록된 기동 백엔드의 명령을 짚는다 — hc 는 `hc get·attach`, 그 밖(빈 값 포함)은 herdr.
+  name_action=""
+  agent_name="$(session_agent_name "$slug")"
+  if [[ "$agent_name" != "$slug" ]]; then
+    case "$launch_raw" in
+      ok|unknown|launching|"")
+        if [[ "$(tasks_index_get "$slug" launch-backend 2>/dev/null)" == "hc" ]]; then
+          name_action="→ hc 세션 이름: ${agent_name}"
+        else
+          name_action="→ herdr 이름: ${agent_name}"
+        fi ;;
+    esac
+  fi
+
   cleanup_action=""
   if [[ "$checked_out" != "yes" ]]; then
     cleanup_action="→ 정리: git worktree prune"
@@ -476,6 +498,9 @@ while IFS= read -r slug; do
   MAIN_ROWS="${MAIN_ROWS}${slug}	${stage}	${wt_col}	${launch_label}	${behind}\n"
   if [[ -n "$action" ]]; then
     MAIN_ROWS="${MAIN_ROWS}	 	 	${action}	\n"
+  fi
+  if [[ -n "$name_action" ]]; then
+    MAIN_ROWS="${MAIN_ROWS}	 	 	${name_action}	\n"
   fi
   if [[ -n "$cleanup_action" ]]; then
     MAIN_ROWS="${MAIN_ROWS}	 	 	${cleanup_action}	\n"

@@ -3,6 +3,10 @@
 # 회귀(B) + 전이 로깅 계약(C) + CLI 인자 계약(D) 스위트
 # (change-spec 2026-09-24-2310-stage-transition-timestamps, plan Task 4)
 set -u
+# 바깥 셸의 project_root·TASK_STATE_PATH 를 물려받지 않는다. promote.sh·_state_common.sh 는
+# 두 값이 있으면 그 값을 루트·상태 파일로 쓰므로, 상속되면 fixture 가 아니라 바깥 저장소를
+# 고친다(2026-10-29 실제 저장소에 fr/rounda·fr/roundf 가 생긴 사고).
+unset project_root TASK_STATE_PATH
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RD="${SCRIPT_DIR}/rd"
 LC="${SCRIPT_DIR}/lifecycle/_lifecycle_common.sh"
@@ -10,7 +14,9 @@ LC="${SCRIPT_DIR}/lifecycle/_lifecycle_common.sh"
 # **실제 herdr 호출 차단.** promote.sh 가 session_launch 를 호출하므로, HERDR_ENV 가
 # 하위 프로세스로 상속되면 fixture 실행만으로 실제 herdr pane 이 뜬다
 # (test_archive_worktree.sh 의 동일 방어를 그대로 따른다).
+# herdr app(HC_TERMINAL_ID)도 같은 이유로 비운다.
 export HERDR_ENV=
+export HC_TERMINAL_ID=
 export RD_CHILD_SESSION=1
 
 PASS=0; FAIL=0

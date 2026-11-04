@@ -56,7 +56,9 @@ source "$SCRIPT_DIR/slug.sh"
 # 파일 상단에서 한 번 export 해 이 파일의 모든 케이스(FIX1~FIX15, Task 4 worktree
 # 병렬 착수 블록 포함)에 적용되게 한다. 서브셸은 export 된 환경변수를 그대로 물려받으므로
 # 각 케이스에서 다시 설정할 필요가 없다.
+# herdr app(HC_TERMINAL_ID)도 같은 이유로 비운다.
 export HERDR_ENV=
+export HC_TERMINAL_ID=
 export RD_CHILD_SESSION=1
 
 PASS=0; FAIL=0
@@ -3032,11 +3034,28 @@ git -C "$RLREPO" add -A && git -C "$RLREPO" commit -q -m seed
 RL_STUB_OK="$RLREPO/stub-ok.sh"
 printf '#!/usr/bin/env bash\nprintf "ok\\n"\n' > "$RL_STUB_OK"
 chmod +x "$RL_STUB_OK"
-RD_LAUNCH_STUB="$RL_STUB_OK" bash "$RLREPO/rd-workflow/scripts/lifecycle/promote.sh" \
-  --short-title launchok --size large --source-fr -
+rl_ok_out="$(RD_LAUNCH_STUB="$RL_STUB_OK" bash "$RLREPO/rd-workflow/scripts/lifecycle/promote.sh" \
+  --short-title launchok --size large --source-fr - 2>&1)"
+printf '%s\n' "$rl_ok_out"
+[[ "$rl_ok_out" != *"herdr 에이전트 이름"* ]] \
+  && pass "32자 이하 slug 는 herdr 에이전트 이름 줄을 내지 않는다" || fail "짧은 slug 에 이름 줄 출력"
 rl_launch="$(cd "$RLREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get launchok launch')"
 [[ "$rl_launch" == "ok" ]] \
   && pass "기동 예약 → token 일치 시 결과를 기록한다(ok)" || fail "예약-확정 불일치: launch=$rl_launch"
+
+# 32자 초과 slug — 잘린 herdr 에이전트 이름을 경고·기동 결과 뒤에 낸다.
+# 가짜 herdr(rc 0)와 HERDR_ENV=1 로 session_backend_usable herdr 를 참으로 만든다(기동은 대역이 맡는다).
+RL_FAKE_BIN="$RLREPO/fakebin"
+mkdir -p "$RL_FAKE_BIN"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$RL_FAKE_BIN/herdr"
+chmod +x "$RL_FAKE_BIN/herdr"
+rl_long_out="$(PATH="$RL_FAKE_BIN:$PATH" HERDR_ENV=1 HC_TERMINAL_ID= RD_CHILD_SESSION= RD_LAUNCH_STUB="$RL_STUB_OK" bash "$RLREPO/rd-workflow/scripts/lifecycle/promote.sh" \
+  --short-title abcdefghij-abcdefghij-abcdefghij-abcdefg --size large --source-fr - 2>&1)"
+printf '%s\n' "$rl_long_out"
+[[ "$rl_long_out" == *"promote: slug 가 32자를 넘어 herdr 에이전트 이름은 abcdefghij-abcdefghij-abcdefghij 로 잘립니다"* ]] \
+  && pass "slug 33자 이상이면 잘림 경고를 낸다" || fail "잘림 경고 없음"
+[[ "$rl_long_out" == *"promote: herdr 에이전트 이름 — abcdefghij-abcdefghij-abcdefghij"* ]] \
+  && pass "기동 결과 뒤에 herdr 에이전트 이름 줄을 낸다" || fail "에이전트 이름 줄 없음"
 
 # 대역 2 — 기동 "도중"(대역이 실행되는 시점) 다른 프로세스가 이 slug 의
 # launch-token 을 경쟁적으로 덮어썼다고 흉내낸다. promote 가 자신이 예약한 token 과
@@ -3396,8 +3415,8 @@ else
     && pass "F9: 기동을 건너뛴 재착수는 모델을 적용된 것처럼 표시하지 않는다" \
     || fail "F9: 건너뛴 재착수인데 모델 표시가 뒤섞임 — $reout"
   # 그래도 herdr 없이 마감이 막히지는 않는다 — 명시 확정 경로가 열려 있다.
-  _ae_out="$( cd "$RBREPO" && env -u HERDR_ENV bash rd-workflow/scripts/rd task resolve-launch oldtask --assume-ended 2>&1 )" || _ae_out="RC!=0 $_ae_out"
-  _rb_out="$( cd "$RBREPO" && env -u HERDR_ENV bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task oldtask --force 2>&1 )" || _rb_out="RC!=0 $_rb_out"
+  _ae_out="$( cd "$RBREPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/rd task resolve-launch oldtask --assume-ended 2>&1 )" || _ae_out="RC!=0 $_ae_out"
+  _rb_out="$( cd "$RBREPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task oldtask --force 2>&1 )" || _rb_out="RC!=0 $_rb_out"
   if [[ "$_ae_out" != RC!=0* && "$_rb_out" != RC!=0* ]]; then
     pass "F1 근본: --assume-ended 로 herdr 없이 마감까지 도달한다 (AC 8·AC 18)"
   else
@@ -3442,7 +3461,7 @@ fi
 # ② 기동된 세션(launch=ok) — 생존 확인이 서지 않으면(여기서는 herdr 없는 환경) 보존한다.
 ( cd "$RBREPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title livewt --size large --source-fr - ) >/dev/null
 ( cd "$RBREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_upsert livewt launch=ok' )
-if out="$( cd "$RBREPO" && env -u HERDR_ENV bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task livewt 2>&1 )"; then
+if out="$( cd "$RBREPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task livewt 2>&1 )"; then
   fail "F6: launch=ok 인데 rollback 이 통과했다"
 else
   [[ -d "$RBREPO/.worktrees/livewt" ]] \
@@ -3452,7 +3471,7 @@ else
   [[ "$out" == *"세션"* && "$out" == *"--force"* ]] \
     && pass "F6: 세션을 끝내는 방법과 재시도·강제 경로를 함께 안내한다" || fail "F6 안내 누락: $out"
 fi
-if ( cd "$RBREPO" && env -u HERDR_ENV bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task livewt --force ) >/dev/null 2>&1; then
+if ( cd "$RBREPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task livewt --force ) >/dev/null 2>&1; then
   pass "F6: launch=ok 도 --force 로는 취소할 수 있다"
 else
   fail "F6: launch=ok 를 --force 로도 취소하지 못했다"

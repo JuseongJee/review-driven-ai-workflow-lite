@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # check_fr_related_files_existence.sh — 활성 FR 상세 파일의 `- related files:` 줄이
 # 가리키는 저장소 상대 경로가 빌드된 rd-workflow/ 트리에 실재하는지 확인한다.
-# 사용: bash check_fr_related_files_existence.sh <fr-item-file> [--root <repo-root>]
+# 사용: bash check_fr_related_files_existence.sh <fr-item-file>... [--root <repo-root>]
+#       파일을 여러 개 넘기면 파일별로 종전과 같은 출력을 내고, 한 파일이라도 실행 오류면
+#       나머지를 모두 처리한 뒤 exit 2 로 끝낸다(뒤 파일 성공이 앞 오류를 덮지 않는다).
 #
-# 경로 토큰 추출은 check_skill_reference_existence.sh 의 skref_match_path_token()·
-# skref_inline_segments() 를 source 해서 재사용한다 — 같은 파싱을 다시 구현하지
+# 경로 토큰 추출은 check_skill_reference_existence.sh 의 skref_match_path_token_r()·
+# skref_inline_segments_r() 를 source 해서 재사용한다 — 같은 파싱을 다시 구현하지
 # 않는다(spec D1). related files 한 줄에서 백틱 내부 문자열만 먼저 뽑아낸 뒤 단어
 # 판정을 해야 한다 — 그러지 않으면 실제 FR 형식(백틱으로 감싼 경로)이 전부 패턴
 # 불일치로 제외된다(spec/plan review Turn 002 F1, 실측 재현).
@@ -40,8 +42,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 이 조기 종료를 구조적으로 잡는다.
 _probe_out="$(bash -c '
   source "$1/check_skill_reference_existence.sh" || exit 2
-  declare -f skref_match_path_token >/dev/null 2>&1 || exit 2
-  declare -f skref_inline_segments >/dev/null 2>&1 || exit 2
+  declare -f skref_match_path_token_r >/dev/null 2>&1 || exit 2
+  declare -f skref_inline_segments_r >/dev/null 2>&1 || exit 2
   echo __SKREF_LOADED_OK__
 ' _ "$SCRIPT_DIR" 2>&1)"
 _probe_rc=$?
@@ -49,10 +51,9 @@ if [[ "$_probe_rc" -ne 0 || "$_probe_out" != *"__SKREF_LOADED_OK__"* ]]; then
   echo "check_fr_related_files_existence.sh: 공용 파서 로딩 실패: ${SCRIPT_DIR}/check_skill_reference_existence.sh" >&2
   exit 2
 fi
-# probe를 통과했으므로 같은 파일에 대한 이 source는 결정적으로 성공한다.
 source "${SCRIPT_DIR}/check_skill_reference_existence.sh"
 
-FR_FILE="${1:-}"
+FR_FILES=("${1:-}")
 [[ $# -gt 0 ]] && shift
 ROOT=""
 while [[ $# -gt 0 ]]; do
@@ -64,67 +65,62 @@ while [[ $# -gt 0 ]]; do
           exit 2 ;;
       esac
       ROOT="$2"; shift 2 ;;
-    *)
+    -?*)
       echo "check_fr_related_files_existence.sh: 알 수 없는 인자: $1" >&2
       exit 2 ;;
+    *) FR_FILES+=("$1"); shift ;;
   esac
 done
 [[ -n "$ROOT" ]] || ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-if [[ -z "$FR_FILE" || ! -f "$FR_FILE" ]]; then
-  echo "check_fr_related_files_existence.sh: 입력 FR 파일이 없습니다: '${FR_FILE}'" >&2
-  exit 2
-fi
-if [[ ! -r "$FR_FILE" ]]; then
-  echo "check_fr_related_files_existence.sh: 입력 FR 파일을 읽을 수 없습니다: '${FR_FILE}'" >&2
-  exit 2
-fi
-if [[ ! -d "${ROOT}/rd-workflow" ]]; then
-  echo "check_fr_related_files_existence.sh: 기준 루트에 rd-workflow/ 가 없습니다: '${ROOT}'" >&2
-  exit 2
-fi
-
-REL_LINE=""
-REL_LINENO=0
-_cur_lineno=0
-while IFS= read -r _line || [[ -n "$_line" ]]; do
-  _cur_lineno=$((_cur_lineno + 1))
-  if [[ "$_line" =~ ^-\ related\ files: ]]; then
-    REL_LINE="$_line"
-    REL_LINENO="$_cur_lineno"
-    break
+ROOT_CHECKED=0
+# _frrel_check_one <file> — 파일 하나를 검사한다. 0 정상, 2 그 파일의 실행 오류.
+# 기준 루트 오류는 파일과 무관하므로 그 자리에서 exit 2 한다(첫 읽을 수 있는 파일에서
+# 확인 — 단일 파일 호출의 오류 우선순위 「파일 부재 → 루트 부재」 를 그대로 둔다).
+_frrel_check_one() {
+  local FR_FILE="$1" line REL_LINE="" REL_LINENO=0 n=0 word TOTAL=0 WARN=0 tok
+  local TOKENS=()
+  if [[ -z "$FR_FILE" || ! -f "$FR_FILE" ]]; then
+    echo "check_fr_related_files_existence.sh: 입력 FR 파일이 없습니다: '${FR_FILE}'" >&2
+    return 2
   fi
-done < "$FR_FILE"
-
-if [[ -z "$REL_LINE" ]]; then
-  echo "${FR_FILE}: 검사 대상 없음 (related files 파싱 결과 0건)"
-  exit 0
-fi
-
-REST="${REL_LINE#*related files:}"
-SCAN="$(skref_inline_segments "$REST")"
-
-TOKENS=()
-if [[ -n "$SCAN" ]]; then
-  for word in $SCAN; do
-    tok="$(skref_match_path_token "$word")" && TOKENS+=("$tok")
+  if [[ ! -r "$FR_FILE" ]]; then
+    echo "check_fr_related_files_existence.sh: 입력 FR 파일을 읽을 수 없습니다: '${FR_FILE}'" >&2
+    return 2
+  fi
+  if [[ "$ROOT_CHECKED" -eq 0 ]]; then
+    if [[ ! -d "${ROOT}/rd-workflow" ]]; then
+      echo "check_fr_related_files_existence.sh: 기준 루트에 rd-workflow/ 가 없습니다: '${ROOT}'" >&2
+      exit 2
+    fi
+    ROOT_CHECKED=1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    if [[ "$line" =~ ^-\ related\ files: ]]; then REL_LINE="$line"; REL_LINENO="$n"; break; fi
+  done < "$FR_FILE"
+  if [[ -n "$REL_LINE" ]]; then
+    skref_inline_segments_r "${REL_LINE#*related files:}"
+    for word in $REPLY; do
+      skref_match_path_token_r "$word" && TOKENS+=("$REPLY")
+    done
+  fi
+  if [[ "${#TOKENS[@]}" -eq 0 ]]; then
+    echo "${FR_FILE}: 검사 대상 없음 (related files 파싱 결과 0건)"
+    return 0
+  fi
+  for tok in "${TOKENS[@]}"; do
+    TOTAL=$((TOTAL + 1))
+    if [[ ! -e "${ROOT}/${tok}" ]]; then
+      WARN=$((WARN + 1))
+      echo "${FR_FILE}:${REL_LINENO}: 참조 경로 없음 — ${tok}" >&2
+    fi
   done
-fi
+  echo "${FR_FILE}: 대상 ${TOTAL}개 중 ${WARN}개 부재"
+}
 
-if [[ "${#TOKENS[@]}" -eq 0 ]]; then
-  echo "${FR_FILE}: 검사 대상 없음 (related files 파싱 결과 0건)"
-  exit 0
-fi
-
-TOTAL=0
-WARN=0
-for tok in "${TOKENS[@]}"; do
-  TOTAL=$((TOTAL + 1))
-  if [[ ! -e "${ROOT}/${tok}" ]]; then
-    WARN=$((WARN + 1))
-    echo "${FR_FILE}:${REL_LINENO}: 참조 경로 없음 — ${tok}" >&2
-  fi
+rc=0
+for f in "${FR_FILES[@]}"; do
+  _frrel_check_one "$f" || rc=2
 done
-
-echo "${FR_FILE}: 대상 ${TOTAL}개 중 ${WARN}개 부재"
-exit 0
+exit "$rc"

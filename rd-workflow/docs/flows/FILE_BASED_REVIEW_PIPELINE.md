@@ -182,6 +182,11 @@ final-diff-review 진행 중 reviewer 가 코드 수정을 요청하면, author 
 | 포인터가 가리키는 `<session-id>.seal` 마커 | `git show <판정 대상>:rd-workflow-workspace/.lifecycle/review-seals/<session-id>.seal` |
 | 현재 보호 트리 해시 (마커의 `tree-hash` 와 비교) | `git ls-tree` 로 계산 (워크플로 기록 경로 제외) |
 
+보호 트리 해시는 submodule 을 두 가지 방식으로 다룹니다.
+
+- **gitlink 는 내용 ID 로 셉니다.** 해시는 gitlink 의 커밋 OID 가 아니라 그 커밋의 트리 내용으로 계산합니다. submodule 안에서 같은 내용을 다른 커밋으로 옮기면(머지 커밋 등) 해시가 변하지 않습니다. 내용이 바뀌면 해시가 바뀝니다. 그 체크아웃에 커밋 객체가 없으면 같은 저장소의 다른 worktree 가 가진 submodule 객체로 계산합니다. 어디에도 없을 때만 `commit:<OID>` 로 대신합니다.
+- **submodule 포인터가 바뀐 구간은 리뷰 대상 형식과 완전성을 검사합니다.** 리뷰 대상은 안쪽 변경까지 보이는 `git diff --submodule=diff` 형식으로 냅니다. `prepare_review_pipeline.sh`, `run_review_turn.sh`, `rd review seal` 은 리뷰 입력에 안쪽 파일의 머리줄이 모두 있는지 대조합니다. 하나라도 빠지거나 객체를 읽을 수 없으면 세션을 만들지 않고 seal 을 거부합니다.
+
 판정 대상 commit 은 모드에 따라 정해집니다.
 
 | 모드 | 판정 대상 commit | 근거 |

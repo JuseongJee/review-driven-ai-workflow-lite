@@ -6,7 +6,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 T="$(mktemp -d)" || { echo "test_fr_register.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$T" && -d "$T" ]] || { echo "test_fr_register.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-T="$(cd "$T" && pwd -P)"; trap 'rm -rf "$T"' EXIT
+T="$(cd "$T" && pwd -P)"; trap 'fx_thaw "$T"' EXIT
+# 원본 불변 보장(spec 4.1): 원본은 만든 직후 읽기 전용으로 두고, 사본은 복제 + 쓰기 허용. 헬퍼는 파일마다 인라인.
+fx_freeze() { chmod -R a-w "$1"; }
+fx_clone()  { cp -R "$1" "$2" && chmod -R u+w "$2"; }
+fx_thaw()   { chmod -R u+w "$1" 2>/dev/null; rm -rf "$1"; }
+fx_snap()   { find "$@" -print | LC_ALL=C sort; find "$@" -type f -exec cksum {} + | LC_ALL=C sort; }
 PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1" >&2; }
@@ -14,17 +19,25 @@ IDX=rd-workflow-workspace/backlog/FUTURE_REQUESTS.md
 ITEMS=rd-workflow-workspace/backlog/items
 CAPS=rd-workflow-workspace/raw-captures
 D=2026-02-02
-mk_repo() { # mk_repo <dir> — 스크립트 사본 + task-state + 기본 backlog 를 가진 main 저장소
+# 복제 원본에 넣는 제품 파일 (정적 source 추적 + 덫 사본으로 확정, spec 7.1). 목록 밖 파일은 이 테스트가 읽지 않는다.
+FX_FILES="rd _task_common.sh _state_common.sh _fr_register_common.sh hooks/_guard_common.sh lifecycle/slug.sh lifecycle/_tasks_index.sh lifecycle/session_launch.sh lifecycle/_lifecycle_common.sh"
+mk_tpl() { # mk_tpl <dir> — 스크립트 사본 + task-state + 기본 backlog 를 가진 main 저장소 원본 (1회)
   mkdir -p "$1" && ( cd "$1" && git init -q && git checkout -q -b main 2>/dev/null \
-    && git config user.email t@e.com && git config user.name t && git config core.hooksPath "$1/.git/hooks" \
-    && mkdir -p rd-workflow rd-workflow-workspace/.lifecycle "$ITEMS" "$CAPS" \
-    && cp -R "$SCRIPT_DIR" rd-workflow/scripts \
+    && git config user.email t@e.com && git config user.name t \
+    && mkdir -p rd-workflow-workspace/.lifecycle "$ITEMS" "$CAPS" \
+    && mkdir -p rd-workflow/scripts/hooks rd-workflow/scripts/lifecycle && ( cd "$SCRIPT_DIR" && for f in $FX_FILES; do cp "$f" "$1/rd-workflow/scripts/$f" || exit 1; done ) \
     && printf 'schema=1\nshort-title=-\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' > rd-workflow-workspace/.lifecycle/task-state \
     && printf '# Current Task\n\n## Task\n-\n\n## Short Title\n-\n\n## Status\n대기 중\n\n## Notes\n-\n' > CURRENT_TASK.md \
     && printf '# FR\n\n## 인덱스\n\n| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |\n|---|---|---|---|---|---|---|\n| 2026-01-01 | base-a | a | tooling | idea | - | [상세](items/2026-01-01-base-a.md) |\n' > "$IDX" \
     && printf '# base-a\n- status: idea\n' > "$ITEMS/2026-01-01-base-a.md" && : > "$CAPS/.gitkeep" \
     && git add -A && git commit -q -m init )
 }
+mk_repo() { # mk_repo <dir> — 원본 복제 + 사본마다 hooksPath 만 덧쓰기 (원본 config 에는 절대 경로를 넣지 않는다)
+  fx_clone "$TPL" "$1" && printf '[core]\n\thooksPath = %s/.git/hooks\n' "$1" >> "$1/.git/config"
+}
+TPL="$T/_tpl"; mk_tpl "$TPL" || { echo "test_fr_register.sh: 복제 원본 생성 실패" >&2; exit 1; }
+fx_freeze "$TPL"; SNAP0="$(fx_snap "$TPL")"
+[[ "$(id -u)" != 0 ]] || echo "  (안내: root 로 실행 중 — 읽기 전용 원본 보호가 동작하지 않고 끝의 해시 비교만 남습니다)" >&2
 row_of() { printf '| %s | %s | 요약 %s | tooling | idea | - | [상세](items/%s-%s.md) |\n' "$D" "$1" "$1" "$D" "$1"; }
 detail_of() { printf '# %s %s\n- status: idea\n' "$D" "$1"; }
 cap_of() { printf -- '---\nstage: fr\nshort-title: %s\n---\n\n## 원본 입력\nx\n' "$1"; }
@@ -374,5 +387,33 @@ add_fr "$R" n1
 out="$(reg "$R" n1)"; rc=$?
 [[ "$rc" == 3 && "$out" == *"reason=no-default-ref"* && -f "$R/$ITEMS/$D-n1.md" ]] && pass "ref 부재 → skipped, 등록 파일 유지" || fail "rc=$rc — $out"
 
+echo "== 인덱스 제목 칸 위치 (헤더 기반) =="
+# 확장 인덱스 등록: 맨 앞에 '순' 칸이 더 있는 8칸 인덱스. 새 행의 순 칸(제목 앞)·요약 칸(제목 뒤)에 이스케이프 파이프를 넣는다.
+R="$T/r-ext"; mk_repo "$R"
+( cd "$R" && printf '# FR\n\n## 인덱스\n\n| 순 | 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |\n|---|---|---|---|---|---|---|---|\n| 1 | 2026-01-01 | base-a | a | tooling | idea | - | [상세](items/2026-01-01-base-a.md) |\n' > "$IDX" && git add -A && git commit -q -m ext )
+in_fr "$R" fr/ext
+( cd "$R" && printf '| 1 \\| x | %s | ext1 | a \\| b | tooling | idea | - | [상세](items/%s-ext1.md) |\n' "$D" "$D" >> "$IDX" && detail_of ext1 > "$ITEMS/$D-ext1.md" )
+out="$(reg "$R" ext1)"; rc=$?
+[[ "$rc" == 0 && "$(line1 "$out")" == "result=committed branch=main commit="*" reason=-" ]] && pass "확장 인덱스 등록: committed (rc=0, reason=-)" || fail "확장 인덱스 등록 — rc=$rc $out"
+[[ "$(cd "$R" && source rd-workflow/scripts/lifecycle/_lifecycle_common.sh; registration_commit_shape main)" == "ext1" ]] && pass "확장 인덱스 등록: 형태 검증이 slug 를 냄" || fail "확장 인덱스 등록: 형태 검증 실패"
+# 제목 헤더 없음: 헤더의 `제목` 이 title → index-format, 재실행 불가 안내
+R="$T/r-nohdr"; mk_repo "$R"; in_fr "$R" fr/nh
+( cd "$R" && sed 's/| 제목 |/| title |/' "$IDX" > "$IDX.n" && mv "$IDX.n" "$IDX" ) ; add_fr "$R" nh1
+out="$(reg "$R" nh1)"; rc=$?
+[[ "$rc" == 3 && "$out" == *"reason=index-format"* && "$out" == *"재실행으로는 풀리지 않습니다"* ]] && pass "제목 헤더 없음: skipped index-format (재실행 불가 안내)" || fail "제목 헤더 없음 — rc=$rc $out"
+# 제목 칸이 아닌 칸에만 slug: 제목 칸은 other-title, 요약 칸이 slug 와 같다
+R="$T/r-colmm"; mk_repo "$R"; in_fr "$R" fr/cm
+( cd "$R" && printf '| %s | other-title | oth | tooling | idea | - | [상세](items/%s-oth.md) |\n' "$D" "$D" >> "$IDX" && detail_of oth > "$ITEMS/$D-oth.md" )
+out="$(reg "$R" oth)"; rc=$?
+[[ "$rc" == 3 && "$out" == *"reason=row-column-mismatch"* ]] && pass "제목 칸이 아닌 칸에만 slug: skipped row-column-mismatch" || fail "제목 칸이 아닌 칸에만 slug — rc=$rc $out"
+# 기본 브랜치 인덱스 없음(Review Focus 1): 261행 조회의 rc 4 를 index-format 으로 내면 안 되고 git-error 로 중단해야 한다
+R="$T/r-noidx"; mk_repo "$R"
+( cd "$R" && cp "$IDX" "$T/idx-keep" && git rm -q "$IDX" && git commit -q -m "인덱스 삭제" && git checkout -q -b fr/ni main && cp "$T/idx-keep" "$IDX" )
+add_fr "$R" ni1
+! ( cd "$R" && git cat-file -e "main:$IDX" 2>/dev/null ) && pass "사전조건: main 에 인덱스 없음" || fail "사전조건 — main 에 인덱스 있음"
+out="$(reg "$R" ni1)"; rc=$?
+[[ "$rc" == 3 && "$out" == *"reason=git-error"* && "$out" != *"index-format"* ]] && pass "기본 브랜치 인덱스 없음: skipped git-error (index-format 아님)" || fail "기본 브랜치 인덱스 없음 — rc=$rc $out"
+
+[[ "$(fx_snap "$TPL")" == "$SNAP0" ]] || fail "복제 원본이 시나리오 중 바뀜"
 echo "fr_register: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]

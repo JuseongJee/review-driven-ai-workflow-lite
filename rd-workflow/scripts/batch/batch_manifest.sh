@@ -13,6 +13,34 @@ BM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 cmd="${1:-}"; shift || true
 
+# --- 그래프 1회 적재: items 를 jq 1회로 읽어 병렬 인덱스 배열에 둔다(연관배열 미사용) ---
+# 필드 구분자는 \x1f(비공백 IFS) — 빈 필드가 앞으로 당겨지지 않는다. depends_on 은 공백 결합.
+_bm_load() {
+  local raw s st fe dp dx
+  BM_SLUG=(); BM_STATE=(); BM_FEAS=(); BM_DEPS=(); BM_DEPX=()
+  raw="$(jq -r '.items[] | [.slug, (.state // ""), (.feasibility // ""),
+      ((.depends_on // []) | join(" ")), ((.depends_on // []) | join("\u001e"))] | join("\u001f")' "$1")" || return 0
+  [ -n "$raw" ] || return 0
+  while IFS=$'\x1f' read -r s st fe dp dx; do
+    BM_SLUG+=("$s"); BM_STATE+=("$st"); BM_FEAS+=("$fe"); BM_DEPS+=("$dp"); BM_DEPX+=("$dx")
+  done <<<"$raw"
+}
+# n 에 직접 의존하는 항목 slug(items 순서, 줄바꿈 결합) → BM_OUT
+_bm_children() {
+  local i r=$'\x1e'; BM_OUT=""
+  for ((i = 0; i < ${#BM_SLUG[@]}; i++)); do
+    case "${r}${BM_DEPX[i]}${r}" in *"${r}${1}${r}"*) BM_OUT="${BM_OUT}${BM_SLUG[i]}"$'\n' ;; esac
+  done
+}
+# slug 의 첫 항목 인덱스 → BM_I (없으면 -1)
+_bm_idx() {
+  local i; BM_I=-1
+  for ((i = 0; i < ${#BM_SLUG[@]}; i++)); do
+    if [ "${BM_SLUG[i]}" = "$1" ]; then BM_I=$i; return 0; fi
+  done
+  return 1
+}
+
 # --- validate: 스키마 + finish_policy + dangling + 순환(문자열 Kahn) ---
 cmd_validate() {
   local mf="${1:-}"
@@ -64,14 +92,15 @@ cmd_validate() {
   [ -z "$bad_excl" ] || { echo "validate: eligible 이 excluded 에 의존 (dead-end): ${bad_excl}" >&2; return 1; }
   # 순환 탐지: 문자열 Kahn. done_set 에 depends_on 이 모두 있으면 옮깁니다. 한 라운드도 못 옮기면 사이클입니다.
   local all_slugs remaining done_set="" progress=1
-  all_slugs=$(jq -r '.items[].slug' "$mf")
+  _bm_load "$mf" || return 1
+  all_slugs="$(printf '%s\n' ${BM_SLUG[@]+"${BM_SLUG[@]}"})"
   remaining="$all_slugs"
   while [ "$progress" -eq 1 ]; do
     progress=0
     local nr="" s
     for s in $remaining; do
       local deps ok=1 d
-      deps=$(jq -r --arg s "$s" '.items[]|select(.slug==$s)|.depends_on[]?' "$mf")
+      deps=""; _bm_idx "$s" && deps="${BM_DEPS[BM_I]}"
       for d in $deps; do
         case " $done_set " in *" $d "*) ;; *) ok=0 ;; esac
       done
@@ -83,7 +112,7 @@ cmd_validate() {
     done
     remaining="$nr"
   done
-  if [ -n "$(echo "$remaining" | tr -d '[:space:]')" ]; then
+  if [ -n "${remaining//[[:space:]]/}" ]; then
     echo "validate: 순환 의존 감지 (해소 불가:${remaining})" >&2; return 1
   fi
   return 0
@@ -144,13 +173,17 @@ cmd_skip_dependents() {
   [ -n "$mf" ] && [ -f "$mf" ] || die2 "manifest 경로 오류: '${mf}'"
   jq -e . "$mf" >/dev/null 2>&1 || die2 "manifest JSON 파싱 실패: '${mf}'"
   [ -n "$root" ] || die2 "blocked-slug 인자가 필요합니다"
-  local pending_list; pending_list=" $(jq -r '.items[]|select(.state=="pending")|.slug' "$mf" | tr '\n' ' ') "
+  _bm_load "$mf" || return 1
+  local pending_list=" " i
+  for ((i = 0; i < ${#BM_SLUG[@]}; i++)); do
+    [ "${BM_STATE[i]}" = "pending" ] && pending_list="${pending_list}${BM_SLUG[i]} "
+  done
   local seen=" ${root} "
   local queue=("$root") n c children
   while [ ${#queue[@]} -gt 0 ]; do
     n="${queue[0]}"; queue=("${queue[@]:1}")
     # n 에 의존하는 자식(depends_on 에 n 포함)
-    children=$(jq -r --arg n "$n" '.items[] | select(.depends_on | index($n)) | .slug' "$mf")
+    _bm_children "$n"; children="$BM_OUT"
     for c in $children; do
       case "$seen" in
         *" ${c} "*) ;;
@@ -176,11 +209,12 @@ cmd_restore_dependents() {
   jq -e . "$mf" >/dev/null 2>&1 || die2 "manifest JSON 파싱 실패: '${mf}'"
   [ -n "$root" ] || die2 "회수된 slug 인자가 필요합니다"
 
+  _bm_load "$mf" || return 1
   # 1) root 의 후손(전이)을 모은다 — skip-dependents 와 같은 BFS.
   local seen=" ${root} " queue=("$root") n c children desc=" "
   while [ ${#queue[@]} -gt 0 ]; do
     n="${queue[0]}"; queue=("${queue[@]:1}")
-    children=$(jq -r --arg n "$n" '.items[] | select(.depends_on | index($n)) | .slug' "$mf")
+    _bm_children "$n"; children="$BM_OUT"
     for c in $children; do
       case "$seen" in *" ${c} "*) continue ;; esac
       seen="${seen}${c} "; queue+=("$c"); desc="${desc}${c} "
@@ -194,14 +228,14 @@ cmd_restore_dependents() {
     progressed=0
     for c in $desc; do
       case "$emitted" in *" ${c} "*) continue ;; esac
-      st=$(jq -r --arg s "$c" '(.items[]|select(.slug==$s)|.state) // ""' "$mf")
-      [ "$st" = "skipped" ] || continue
-      [ "$(jq -r --arg s "$c" '(.items[]|select(.slug==$s)|.feasibility) // ""' "$mf")" = "eligible" ] || continue
-      deps=$(jq -r --arg s "$c" '.items[]|select(.slug==$s)|.depends_on[]?' "$mf")
+      _bm_idx "$c" || continue
+      [ "${BM_STATE[BM_I]}" = "skipped" ] || continue
+      [ "${BM_FEAS[BM_I]}" = "eligible" ] || continue
+      deps="${BM_DEPS[BM_I]}"
       okdep=1
       for d in $deps; do
         case "$emitted" in *" ${d} "*) continue ;; esac
-        st=$(jq -r --arg s "$d" '(.items[]|select(.slug==$s)|.state) // "missing"' "$mf")
+        st="missing"; _bm_idx "$d" && st="${BM_STATE[BM_I]}"
         case "$st" in completed|pending) ;; *) okdep=0 ;; esac
       done
       if [ "$okdep" = "1" ]; then emitted="${emitted}${c} "; echo "$c"; progressed=1; fi

@@ -11,16 +11,18 @@ STATE_COMMON="$SCRIPTS_DIR/_state_common.sh"
 PASS=0
 FAIL=0
 
-_current_fixture=""
-cleanup_fixture() {
-  if [[ -n "$_current_fixture" && -d "$_current_fixture" ]]; then
-    rm -rf "$_current_fixture"
-    _current_fixture=""
-  fi
-}
+# fixture 는 조합 6종을 1회씩 만들어 모든 시나리오가 공유한다 (fixture_for). hook 은 읽기·판정만
+# 하므로 읽기 전용으로 얼려 두고(fx_freeze), 시나리오가 원본에 쓰면 OS 가 거부한다.
+FX_LIST=""
+FX_SNAP0=""
+fx_freeze() { chmod -R a-w "$1"; }
+fx_thaw()   { chmod -R u+w "$1" 2>/dev/null; rm -rf "$1"; }
+fx_snap()   { find "$@" -print | LC_ALL=C sort; find "$@" -type f -exec cksum {} + | LC_ALL=C sort; }
 NOJQ_DIR=""
 cleanup_all() {
-  cleanup_fixture
+  local d
+  for d in $FX_LIST; do fx_thaw "$d"; done
+  FX_LIST=""
   if [[ -n "$NOJQ_DIR" && -d "$NOJQ_DIR" ]]; then
     rm -rf "$NOJQ_DIR"
     NOJQ_DIR=""
@@ -80,6 +82,36 @@ make_fixture() {
       > "$fixture/rd-workflow-workspace/.lifecycle/task-state"
   fi
   printf '%s' "$fixture"
+}
+
+# 조합 6종 fixture (status|autopilot|with_state). 모르는 조합은 FAIL 이다.
+FX_V_NO=""; FX_I_NO=""; FX_I_YES=""; FX_I_STATE=""; FX_I_LINK=""; FX_I_HARD=""
+build_fixtures() {
+  FX_V_NO="$(make_fixture "검증 중" "no" "")" || return 1
+  FX_I_NO="$(make_fixture "구현 중" "no" "")" || return 1
+  FX_I_YES="$(make_fixture "구현 중" "yes" "")" || return 1
+  FX_I_STATE="$(make_fixture "구현 중" "no" "yes")" || return 1
+  FX_I_LINK="$(make_fixture "구현 중" "no" "link")" || return 1
+  FX_I_HARD="$(make_fixture "구현 중" "no" "hardlink")" || return 1
+  FX_LIST="$FX_V_NO $FX_I_NO $FX_I_YES $FX_I_STATE $FX_I_LINK $FX_I_HARD"
+  local d
+  for d in $FX_LIST; do fx_freeze "$d"; done
+  FX_SNAP0="$(fx_snap $FX_LIST)"
+  if [[ "$(id -u)" == "0" ]]; then
+    echo "주의: root 실행 — 읽기 전용 보호가 무효이고 끝의 해시 비교만 원본 불변을 확인합니다" >&2
+  fi
+}
+# fixture_for <status> <autopilot> <with_state> → 경로를 stdout 으로, 모르는 조합은 rc 1
+fixture_for() {
+  case "$1|$2|$3" in
+    "검증 중|no|")        printf '%s' "$FX_V_NO" ;;
+    "구현 중|no|")        printf '%s' "$FX_I_NO" ;;
+    "구현 중|yes|")       printf '%s' "$FX_I_YES" ;;
+    "구현 중|no|yes")     printf '%s' "$FX_I_STATE" ;;
+    "구현 중|no|link")    printf '%s' "$FX_I_LINK" ;;
+    "구현 중|no|hardlink") printf '%s' "$FX_I_HARD" ;;
+    *) return 1 ;;
+  esac
 }
 
 # run_with_timeout <상한초> <stdin 파일> <명령...>
@@ -193,8 +225,8 @@ run_hook() {
 run_scenario() {
   local num="$1" name="$2" status="$3" autopilot="$4" path_tmpl="$5" expected="$6" agent_id="${7:-}" with_state="${8:-}"
   local fixture
-  fixture="$(make_fixture "$status" "$autopilot" "$with_state")" || {
-    echo "[FAIL] scenario ${num}: ${name} — fixture 생성 실패 (make_fixture rc=$?)" >&2
+  fixture="$(fixture_for "$status" "$autopilot" "$with_state")" || {
+    echo "[FAIL] scenario ${num}: ${name} — 알 수 없는 fixture 조합 ($status|$autopilot|$with_state)" >&2
     FAIL=$((FAIL + 1))
     return 1
   }
@@ -202,7 +234,6 @@ run_scenario() {
     # make_fixture 가 만든 CURRENT_TASK.md 가 소문자 이름으로도 보이면 비구분 볼륨이다.
     if [[ -e "$fixture/current_task.md" ]]; then expected=2; else expected=0; fi
   fi
-  _current_fixture="$fixture"
   local fixture_base fixture_parent file_path
   fixture_base="$(basename "$fixture")"
   fixture_parent="$(dirname "$fixture")"
@@ -219,7 +250,6 @@ run_scenario() {
     echo "[FAIL] $label — expected exit=$expected actual=$_hook_last_exit (fixture: $fixture)" >&2
     FAIL=$((FAIL + 1))
   fi
-  cleanup_fixture
 }
 
 # ---------------------------------------------------------------------------
@@ -236,12 +266,11 @@ PERF_LIMIT_SEC=10
 run_perf_scenario() {
   local num="$1" name="$2"
   local fixture
-  fixture="$(make_fixture "구현 중" "no")" || {
-    echo "[FAIL] scenario ${num}: ${name} — fixture 생성 실패 (make_fixture rc=$?)" >&2
+  fixture="$(fixture_for "구현 중" "no" "")" || {
+    echo "[FAIL] scenario ${num}: ${name} — 알 수 없는 fixture 조합" >&2
     FAIL=$((FAIL + 1))
     return 1
   }
-  _current_fixture="$fixture"
   local t0=$SECONDS
   HOOK_TIMEOUT_SEC="$PERF_LIMIT_SEC" run_hook "$fixture" "$fixture/CURRENT_TASK.md" "__BIG__"
   local dt=$((SECONDS - t0))
@@ -253,7 +282,6 @@ run_perf_scenario() {
     echo "[FAIL] $label — exit=$_hook_last_exit (기대 0; 137=상한 초과로 강제 종료), 소요 ${dt}s (상한 ${PERF_LIMIT_SEC}s)" >&2
     FAIL=$((FAIL + 1))
   fi
-  cleanup_fixture
 }
 
 # ---------------------------------------------------------------------------
@@ -307,7 +335,7 @@ run_watchdog_scenario() {
   fi
   [[ -n "$child_pid" ]] && kill -9 "$child_pid" 2>/dev/null
   rm -rf "$dir"
-  local label="[${MODE:-jq}] scenario ${num}: ${name}"
+  local label="[모드 무관] scenario ${num}: ${name}"
   if [[ $rc_ok -eq 1 && $desc_ok -eq 1 ]]; then
     echo "[PASS] $label (rc=137, 자손 pid=${child_pid} 종료 확인)"
     PASS=$((PASS + 1))
@@ -430,8 +458,7 @@ run_scenario 41 "subagent + agent_type 빈 값 + agent_id 값 있음 → 차단 
   "구현 중" "no" "{F}/CURRENT_TASK.md" 2 "__MIXED__"
 # 42 는 성능 회귀와 오인 차단을 한 payload 로 건다 (run_perf_scenario 주석 참조).
 run_perf_scenario 42 "메인 세션 + 200KB content(내부에 판별 필드 문자열) → 통과 + 선형 시간"
-# 43 은 42 의 상한을 실효화하는 기구를 검증한다 (run_watchdog_scenario 주석 참조).
-run_watchdog_scenario 43 "watchdog 상한 초과 → 명령 치환 자손까지 회수"
+# 43(watchdog)은 jq 모드와 무관하므로 두 모드 뒤에 1회만 실행한다.
 }
 
 # --- jq 경로와 bash 폴백을 둘 다 결정적으로 실행한다 ---
@@ -461,6 +488,8 @@ else
   echo "jq: absent — 'jq' 모드도 bash 폴백을 실행한다 (개수는 동일)"
 fi
 
+build_fixtures || { echo "test_implementation_gate.sh: fixture 생성 실패" >&2; exit 1; }
+
 echo ""
 echo "=== 모드: no-jq (실패하는 jq shim 강제) ==="
 MODE="no-jq"
@@ -472,6 +501,15 @@ echo "=== 모드: jq (환경 PATH 그대로) ==="
 MODE="jq"
 PATH="$_orig_path"
 run_all_scenarios
+
+# 43 은 42 의 상한을 실효화하는 기구를 검증한다 (run_watchdog_scenario 주석 참조).
+run_watchdog_scenario 43 "watchdog 상한 초과 → 명령 치환 자손까지 회수"
+
+# 보조: 공유 fixture 가 시나리오에 오염되지 않았는지 끝에서 비교한다.
+if [[ "$(fx_snap $FX_LIST)" != "$FX_SNAP0" ]]; then
+  echo "[FAIL] 복제 원본이 바뀜 — 공유 fixture 가 시나리오 실행 중 변경되었습니다" >&2
+  FAIL=$((FAIL + 1))
+fi
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"

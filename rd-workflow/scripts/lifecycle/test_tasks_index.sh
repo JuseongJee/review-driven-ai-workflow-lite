@@ -113,6 +113,25 @@ git -C "$OTHER" init -q
   && pass "cwd 쪽 저장소에는 아무것도 만들지 않는다" || fail "남의 저장소에 .git/rd-workflow 를 만들었다"
 rm -rf "$OTHER"
 
+# 10b) 같은 프로세스에서 project_root 를 다른 저장소로 바꾸면 공유 위치 캐시가 따라 바뀐다 (P1)
+#      캐시가 이전 저장소를 가리키면 B 의 행이 A 색인에 쓰인다.
+SW_A="$(mktemp -d)" || { echo "test_tasks_index.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+SW_B="$(mktemp -d)" || { echo "test_tasks_index.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$SW_A" && -d "$SW_A" && -n "$SW_B" && -d "$SW_B" ]] || { echo "test_tasks_index.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+git -C "$SW_A" init -q; git -C "$SW_B" init -q
+(
+  project_root="$SW_A"; tasks_index_upsert sw-a k=a
+  project_root="$SW_B"; tasks_index_upsert sw-b k=b
+)
+if grep -q '^slug=sw-b' "$SW_B/.git/rd-workflow/tasks.local" 2>/dev/null \
+   && ! grep -q '^slug=sw-b' "$SW_A/.git/rd-workflow/tasks.local" 2>/dev/null \
+   && grep -q '^slug=sw-a' "$SW_A/.git/rd-workflow/tasks.local" 2>/dev/null; then
+  pass "같은 프로세스에서 project_root 를 바꾸면 새 저장소의 색인에 쓴다"
+else
+  fail "same_process_root_switch: 낡은 캐시로 다른 저장소 색인에 썼다"
+fi
+rm -rf "$SW_A" "$SW_B"
+
 # 11) 정리 대기 행은 진행 중 목록(tasks_index_slugs)에서 빠지고 전체 목록(tasks_index_all_slugs)에는 남는다
 tasks_index_upsert live-row fr-branch=fr/live-row launch=ok
 tasks_index_upsert pend-row fr-branch=fr/pend-row state=cleanup-pending published-at=2026-10-29-1000

@@ -43,6 +43,8 @@
 #   WAIT_TIMEOUT 값은 판정 로그를 구분하기 위한 표시이며 **안전 장치가 아니다.** 아래 salt 는
 #   bounded 계산이라 유일성을 보장하지 않지만(주석 참조), 값이 겹쳐도 무관한 프로세스를
 #   종료할 수 없다 — 종료 대상 식별에 값을 전혀 쓰지 않기 때문이다.
+#   테스트가 끊기면 trap 이 자손에 TERM → 상한 10초 대기 → 남은 것 KILL 순서로 회수한다.
+#   어댑터가 TERM 으로 자기 도구 그룹을 회수하게 하려는 순서다. SIGKILL 은 범위 밖이다.
 #
 # 사용법: bash test_watchdog_portability.sh [adapter_path]
 # Linux 검증 (repo 를 마운트해 실제 어댑터를 검사한다):
@@ -99,6 +101,86 @@ group_size() {  # $1: pgid → 살아 있는 구성원 수
 }
 
 SELF_PGID="$(own_pgid $$)"
+
+# 테스트 셸($$)이 띄운 프로세스를 회수한다 (spec §3.3).
+# (1) 자손 트리 스냅숏 — 어댑터를 먼저 죽이면 그 자식(도구의 별도 그룹)이 init 으로 넘어가 트리에서 빠진다.
+# (2) TERM — 어댑터가 자기 cleanup 으로, 기록해 둔 도구 그룹(리더가 먼저 끝나 트리에 없는 자손 포함)을 회수한다.
+# (3) 상한 10초 안에 사라지지 않은 스냅숏 대상만 KILL.
+# 세 함수 모두 항상 0 을 반환한다 — 대상이 이미 사라진 것은 정상 회수 결과이며, set -e 아래에서도 끝까지 돈다.
+REAP_TARGETS=""
+REAP_RAN=0          # 0=미실행 1=진행 중 2=완료 — 진행 중·완료 뒤 다시 부르면 아무것도 하지 않는다
+REAP_SIGNAL_RC=""   # 첫 신호의 종료 코드(129/130/143)
+_reap_send() {  # $1: 신호 이름 — REAP_TARGETS 의 각 대상에 보낸다
+  local kind id
+  while read -r kind id; do
+    [ -n "${id:-}" ] || continue
+    if [ "$kind" = G ]; then kill -"$1" -- -"$id" 2>/dev/null || true
+    else kill -"$1" "$id" 2>/dev/null || true; fi
+  done <<REAP_EOF
+$REAP_TARGETS
+REAP_EOF
+  return 0
+}
+_reap_alive() {  # 살아 있는 대상 수를 stdout 으로 낸다
+  local kind id n=0
+  while read -r kind id; do
+    [ -n "${id:-}" ] || continue
+    if [ "$kind" = G ]; then
+      if kill -0 -- -"$id" 2>/dev/null; then n=$((n + 1)); fi
+    else
+      if kill -0 "$id" 2>/dev/null; then n=$((n + 1)); fi
+    fi
+  done <<REAP_EOF
+$REAP_TARGETS
+REAP_EOF
+  echo "$n"
+  return 0
+}
+reap_descendants() {
+  [ "$REAP_RAN" -eq 0 ] || return 0
+  REAP_RAN=1
+  _reap_run
+  REAP_RAN=2
+  return 0
+}
+_reap_run() {
+  local snap i
+  snap="$( { ps -eo pid=,ppid=,pgid= 2>/dev/null || true; } )"
+  if [ -z "$snap" ]; then
+    echo "경고: 프로세스 조회 실패로 종료 회수를 하지 못했습니다 — 이 테스트가 띄운 프로세스가 남았을 수 있습니다" >&2
+    return 0
+  fi
+  REAP_TARGETS="$(printf '%s\n' "$snap" | awk -v root="$$" -v self="${SELF_PGID:-}" '
+    { grp[$1]=$3; kids[$2]=kids[$2] " " $1 }
+    END {
+      q=" " root
+      while (q != "") {
+        n=split(q, a, " "); q=""
+        for (i=1;i<=n;i++) { m=split(kids[a[i]], c, " "); for (j=1;j<=m;j++) if (!(c[j] in d)) { d[c[j]]=1; q=q " " c[j] } }
+      }
+      for (p in d) { print "P " p; if (grp[p]==p && p!=self) print "G " p }
+    }' || true)"
+  [ -n "$REAP_TARGETS" ] || return 0
+  _reap_send TERM
+  for i in $(seq 1 50); do
+    [ "$(_reap_alive)" -eq 0 ] && return 0
+    sleep 0.2 || true   # 그룹 신호로 sleep 이 먼저 끝나도 회수를 이어 간다
+  done
+  _reap_send KILL
+  return 0
+}
+# 회수 진행 중(최대 10초 대기)에 온 신호는 종료 코드만 기록하고 돌아온다. bash 는 trap 이 돌아오면
+# 중단된 명령 다음부터 이어 가므로 원래 회수가 KILL 까지 마친다. 종료 코드는 첫 신호의 값이다.
+reap_on_signal() {  # $1: 종료 코드
+  [ -n "$REAP_SIGNAL_RC" ] || REAP_SIGNAL_RC="$1"
+  [ "$REAP_RAN" -eq 1 ] && return 0
+  reap_descendants
+  exit "$REAP_SIGNAL_RC"
+}
+trap 'reap_descendants' EXIT
+trap 'reap_on_signal 129' HUP
+trap 'reap_on_signal 130' INT
+trap 'reap_on_signal 143' TERM
 
 # 지정 디렉터리 안의 watchdog 임시 디렉터리 개수 (절대 개수)
 leftover_in() {
@@ -168,6 +250,15 @@ finish_job() {  # $1: sandbox, $2: 판정 그룹 pgid, $3: job pid
     wait "$3" || true
   } 2>/dev/null
   return 0
+}
+
+# 자손 생성의 증거 — mock 은 자손을 띄운 직후 그 pid 를 기록한다.
+# 「관측 시점에 살아 있음」을 증거로 쓰지 않는다: 어댑터가 codex 종료 직후 그룹을 정리하면
+# 0.5초 간격 관측보다 정리가 먼저 끝나, 만든 자손을 「못 만들었다」로 오판한다.
+child_recorded() {  # $1: child.pid 경로
+  local cp
+  cp="$(cat "$1" 2>/dev/null || echo)"
+  case "$cp" in ''|*[!0-9]*) echo 0 ;; *) echo 1 ;; esac
 }
 
 child_alive() {  # $1: child.pid 경로
@@ -435,7 +526,7 @@ for kind in hang_with_child exit_with_child stubborn_child; do
   if [ ! -f "$sb/codex_ran" ]; then
     bad "${i}. ${label} — codex 미실행 (sentinel 없음)"
   else
-    pre="$(child_alive "$sb/child.pid")"
+    pre="$(child_recorded "$sb/child.pid")"
     w=0
     while [ "$w" -lt "$CAP" ] && [ ! -f "$sb/.piped_done" ]; do sleep 1; w=$((w + 1)); done
     closed="$([ -f "$sb/.piped_done" ] && echo 예 || echo 아니오)"

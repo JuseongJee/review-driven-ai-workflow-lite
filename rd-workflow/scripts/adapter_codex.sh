@@ -259,7 +259,11 @@ watchdog_fd_open=0
 codex_pgid=""
 # cleanup 의 writer 종료 증거 조회(rw_group_state)가 spawn 전·pgid 확보 중에도 set -u 에서 죽지 않도록 미리 정의한다.
 RW_TARGET_PID=""
-cleanup_done=0
+cleanup_state=0   # 0=미실행 1=진행 중 2=완료
+pending_signal_rc=""
+# 발행 게이트의 그룹 판정 — dead | alive | unknown. **스크립트 전역**이다: cleanup 이 local 없이
+# 쓰고, 성공 경로가 .turn_ready 생성 전에 읽는다(지역 변수였을 때는 성공 판정이 그룹 상태를 몰랐다).
+group_state=dead
 
 # process group 판정(rw_group_alive)·pgid 획득(rw_acquire_pgid)은 review_wait.sh 로
 # 옮겨졌다. 구현은 그대로이며 인자로 pgid 를 받는다(전역 codex_pgid 를 암묵적으로
@@ -268,8 +272,8 @@ cleanup_done=0
 # cleanup 은 멱등이어야 한다: 신호 핸들러와 EXIT trap 이 연달아 호출되고,
 # 부분 초기화 상태(fifo 준비 도중 실패)에서도 호출된다.
 cleanup() {
-  [ "$cleanup_done" -eq 1 ] && return 0
-  cleanup_done=1
+  [ "$cleanup_state" -ne 0 ] && return 0
+  cleanup_state=1
   # watchdog 종료 및 reap
   if [ -n "$watchdog_pid" ]; then
     kill "$watchdog_pid" 2>/dev/null || true
@@ -303,16 +307,21 @@ cleanup() {
   # 자손이 남아 있는데 리더만 죽었다면 리더 기준 판단은 KILL 을 건너뛴다.
   # 그룹에 살아 있는 프로세스가 있을 때만 종료 시퀀스를 수행한다. 무조건 grace 를 기다리면
   # 이미 모두 종료된 정상·비정상 경로에서 KILL_GRACE 만큼 불필요하게 지연된다.
-  if [ -n "$codex_pgid" ] && rw_group_alive "$codex_pgid"; then
-    kill -- -"$codex_pgid" 2>/dev/null || true
-    sleep "$KILL_GRACE"
-    if rw_group_alive "$codex_pgid"; then
-      kill -9 -- -"$codex_pgid" 2>/dev/null || true
+  # 판정이 「없음」(1)이 아니면 신호를 보낸다 — ps 가 실패해 판정 불가(2)여도 보낸다.
+  # 판정 불가의 대표 원인인 권한 거부는 kill 도 같은 EPERM 으로 실패하므로 남의 그룹에 닿지 않는다.
+  local gs=0
+  if [ -n "$codex_pgid" ]; then
+    gs=0; rw_group_alive "$codex_pgid" || gs=$?
+    if [ "$gs" -ne 1 ]; then
+      kill -- -"$codex_pgid" 2>/dev/null || true
+      sleep "$KILL_GRACE" || true  # 그룹 단위 신호로 sleep 이 먼저 끝나도 set -e 가 cleanup 을 끊지 않게 한다
+      gs=0; rw_group_alive "$codex_pgid" || gs=$?
+      [ "$gs" -ne 1 ] && { kill -9 -- -"$codex_pgid" 2>/dev/null || true; }
     fi
   elif [ -z "$codex_pgid" ] && [ -n "$codex_pid" ] && kill -0 "$codex_pid" 2>/dev/null; then
     # 그룹이 확인되지 않은 경우의 폴백 — 단일 프로세스만 종료한다
     kill "$codex_pid" 2>/dev/null || true
-    sleep "$KILL_GRACE"
+    sleep "$KILL_GRACE" || true
     kill -0 "$codex_pid" 2>/dev/null && kill -9 "$codex_pid" 2>/dev/null || true
   fi
   if [ -n "$codex_pid" ]; then
@@ -323,17 +332,29 @@ cleanup() {
   # **발행 전에 codex process group 이 실제로 종료됐는지 확인한다.** 살아 있는 codex 는
   # 세션 디렉토리에 쓸 수 있으므로, 그 상태에서 안정 이름으로 옮기면 검사와 `mv` 사이에
   # 외부 디렉터리 symlink 를 다시 심는 반복 공략이 되살아난다. 확인한 뒤에만 1회 발행한다.
-  local group_dead=1 log_ok=no log_reason="" log_recovery="" rw_gs=""
-  if [ -n "$codex_pgid" ] && rw_group_alive "$codex_pgid"; then
-    group_dead=0
+  # 종료를 확인(「없음」)했을 때만 dead 다. 판정 불가(2)는 unknown 이며 발행하지 않는다.
+  group_state=dead
+  local log_ok=no log_reason="" log_recovery="" rw_gs=""
+  if [ -n "$codex_pgid" ]; then
+    gs=0; rw_group_alive "$codex_pgid" || gs=$?
+    case "$gs" in
+      1) ;;
+      0) group_state=alive ;;
+      *) group_state=unknown ;;
+    esac
   fi
 
-  if [ "$group_dead" -ne 1 ]; then
+  if [ "$group_state" = alive ]; then
     # 아는 것만 말한다 — 정리되지 않은 그룹이 남아 있으면 발행하지 않고 그 사실을 알린다.
     echo "알림: codex process group(${codex_pgid})이 아직 살아 있어 산출물을 안정 경로로 발행하지 않았습니다." >&2
     echo "      codex 출력 로그(임시 경로): ${codex_log}" >&2
     echo "      대기 상태 스트림: ${status_stream}" >&2
     log_reason="codex-group-alive"
+  elif [ "$group_state" = unknown ]; then
+    echo "알림: codex process group(${codex_pgid})의 종료를 확인하지 못해(ps 실패, kill -0: ${RW_GROUP_PROBE_ERR}) 산출물을 안정 경로로 발행하지 않았습니다." >&2
+    echo "      codex 출력 로그(임시 경로): ${codex_log}" >&2
+    echo "      대기 상태 스트림: ${status_stream}" >&2
+    log_reason="codex-group-unknown"
   elif [ -n "${codex_log:-}" ]; then
     # codex 출력 로그는 **지우지 않고 안정된 이름으로 보존한다** — 사후 관찰이 목적이다.
     # (last_message_file 은 종전대로 삭제한다.)
@@ -381,8 +402,8 @@ cleanup() {
     fi
   fi
 
-  if [ "$group_dead" -eq 1 ]; then
-    # 종료를 증명했는지만 상태 파일에 남긴다(발행 조건은 위 group_dead 게이트 그대로).
+  if [ "$group_state" = dead ]; then
+    # 종료를 증명했는지만 상태 파일에 남긴다(발행 조건은 위 group_state 게이트 그대로).
     # pgid 확보에 실패했어도(리더가 즉시 종료) 리더 pid 가 곧 pgid(set -m)이므로 그 그룹의 구성원 유무를 ps 로 확인한다.
     # verified 가 아니면(ps 실패·alive 경합) unverified 로 쓴다.
     rw_gs="$(rw_group_state "${codex_pgid:-$RW_TARGET_PID}")"
@@ -394,6 +415,10 @@ cleanup() {
       echo "알림: 대기 상태를 안정 경로(${STATUS_FILE})로 발행하지 못했습니다." >&2
       echo "      진행 중 상태는 스트림에 남아 있습니다: ${status_stream}" >&2
     fi
+  else
+    # 발행하지 않았다 — 사유를 상태 스트림의 마지막 snapshot 으로 남긴다. 스트림 파일은 지우지 않는다.
+    rw_status_append_final no "$log_reason" "$codex_log" \
+      || echo "      대기 상태 스트림에 최종 사유를 덧붙이지 못했습니다: ${status_stream}" >&2
   fi
 
   # 읽기·쓰기 fd 전부 닫기 (fd 3·4·5·6·7·8 — 모두 codex spawn 전에 부모가 열었다).
@@ -428,20 +453,41 @@ cleanup() {
   if [ -n "$timeout_marker" ]; then
     rm -f "$timeout_marker" 2>/dev/null || true
   fi
+  rm -f "$last_message_file"
+  cleanup_state=2
+  # 진행 중에 받은 신호는 on_signal 이 기록만 했다. 시퀀스를 끝낸 지금 그 코드로 끝낸다.
+  [ -n "$pending_signal_rc" ] && exit "$pending_signal_rc"
+  return 0
+}
+# write_ref(시작 시각 기준 파일)는 cleanup 이 아니라 종료 시에만 지운다. cleanup 은 타임아웃
+# 분기 **앞에서** 명시 호출되는데, 타임아웃 보고(report_write_progress)가 그 뒤에 이 파일을 읽는다.
+exit_cleanup() {
+  cleanup
   if [ -n "$write_ref" ]; then
     rm -f "$write_ref" 2>/dev/null || true
   fi
-  rm -f "$last_message_file"
 }
-trap cleanup EXIT
+trap exit_cleanup EXIT
 # 신호는 명시적으로 처리한다. EXIT trap 만 두어도 cleanup 자체는 실행되지만,
 # job control 하에서 INT 의 종료 코드가 129 로 잘못 보고된다(명시적 trap 에서만 130).
 # 주의: 어댑터가 background job 으로 시작되면 SIGINT 은 셸 진입 시점에 무시로 설정되어
 # trap 자체가 무효다(POSIX). TERM·HUP 은 background job 에서도 정상 전달된다.
 # SIGKILL 은 트랩 불가이므로 보장 범위 밖이다.
-trap 'cleanup; exit 129' HUP
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
+# cleanup 진행 중(그룹 TERM 뒤 grace sleep 등)에 온 신호는 「종료 코드 기록 후 이어 가기」 다.
+# bash 는 전경 외부 명령(grace `sleep`) 종료까지 trap 을 미루고, trap 이 돌아오면 중단된
+# 명령 다음부터 이어 간다. 여기서 바로 exit 하면 KILL 단계와 산출물 발행이 빠진다.
+# 종료 코드는 첫 신호의 값이다 — cleanup 을 시작한 신호도 먼저 기록해야 grace 중 신호가 덮어쓰지 않는다.
+on_signal() {
+  if [ -z "$pending_signal_rc" ]; then pending_signal_rc="$1"; fi
+  if [ "$cleanup_state" -eq 1 ]; then
+    return 0
+  fi
+  cleanup
+  exit "$pending_signal_rc"
+}
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 # --- watchdog 타이머 준비 (codex spawn 보다 먼저) ---
 # 순서가 계약이다: 여기서 실패하면 codex 는 아직 시작되지 않았으므로
@@ -639,6 +685,12 @@ if [ -n "$timeout_marker_line" ]; then
   IFS=' ' read -r timeout_reason timeout_cap timeout_observer <<<"$timeout_marker_line" || true
 fi
 
+# --- cleanup 명시 호출 — 판정 전에 그룹을 정리하고 group_state 를 확정한다 ---
+# 로그 tail·last message·마커는 이미 변수로 읽었으므로 cleanup 이 fd 를 닫아도 진단 자료는 남는다.
+# **명령 치환·서브셸 안에서 부르지 않는다** — 그러면 cleanup_state·group_state 가 부모에 반영되지 않는다.
+# 이후 EXIT trap 의 cleanup 호출은 멱등 가드로 아무것도 하지 않는다.
+cleanup
+
 # 세션이 재개 가능한 상태인지 **판별한다** (추정하지 않는다).
 # 판별 범위는 기계 판정 권위인 SESSION.md 의 두 필드 + 턴 파일 부재뿐이며,
 # 그 범위를 메시지에 함께 밝힌다. CHECKPOINT.md 등은 어댑터의 완료 판정에
@@ -775,6 +827,18 @@ if ! check_turn_complete; then
     echo "최근 출력:" >&2
     printf '%s\n' "$log_tail" | sed 's/^/          /' >&2
   fi
+  exit 1
+fi
+
+# --- 성공: 그룹 종료를 확인했을 때만 완료 처리 ---
+# 그룹이 남았거나 종료를 확인하지 못했으면 아직 쓰는 writer 가 있을 수 있다. .turn_ready 를 만들지 않는다.
+if [ "$group_state" = alive ]; then
+  echo "codex process group(${codex_pgid})이 아직 살아 있어 턴을 완료 처리하지 않았습니다." >&2
+  echo "    codex 출력 로그(임시 경로): ${codex_log}" >&2
+  exit 1
+elif [ "$group_state" != dead ]; then
+  echo "codex process group(${codex_pgid})의 종료를 확인하지 못해 턴을 완료 처리하지 않았습니다." >&2
+  echo "    codex 출력 로그(임시 경로): ${codex_log}" >&2
   exit 1
 fi
 

@@ -104,7 +104,20 @@ request-review 세션은 이름과 `SESSION.md` 에 slug 가 없어 귀속을 �
 
 ### 세션 기동
 
-worktree 를 만든 뒤 `promote.sh` 는 **그 worktree 에서 작업할 에이전트 세션을 기동하려 시도**합니다. 여기서 보장하는 것은 두 가지뿐입니다 — worktree 가 준비되고, 그 안에서 세션을 여는 명령이 화면에 제시됩니다. **실제 자동 기동은 herdr 안에서 돌고 있을 때만** 일어나며(`HERDR_ENV=1`), 그 밖의 환경에서는 제시된 명령을 사람이 직접 실행합니다. 즉 herdr 는 선택적 의존이지 전제가 아닙니다.
+worktree 를 만든 뒤 `promote.sh` 는 **그 worktree 에서 작업할 에이전트 세션을 기동하려 시도**합니다. 여기서 보장하는 것은 두 가지뿐입니다 — worktree 가 준비되고, 그 안에서 세션을 여는 명령이 화면에 제시됩니다. **실제 자동 기동은 터미널 herdr(`HERDR_ENV=1`) 또는 herdr app(`HC_TERMINAL_ID`) 안에서 돌고 있을 때만** 일어나며, 그 밖의 환경에서는 제시된 명령을 사람이 직접 실행합니다. 즉 두 herdr 는 선택적 의존이지 전제가 아닙니다.
+
+**백엔드 판정과 기록.** promote 는 터미널 herdr → herdr app → 없음(`none`) 순서로 기동 백엔드를 고릅니다. 두 환경 변수가 함께 있으면 터미널 herdr 를 씁니다. 고른 값은 기동 예약 때 색인의 `launch-backend` 필드(`herdr`|`hc`|`none`)에 남습니다. 이후 생존 조회·인계 확인·`resolve-launch`·rollback 은 지금 셸의 환경이 아니라 이 기록값의 백엔드로 조회합니다. 값이 없는 옛 행은 `herdr` 로 봅니다.
+
+| 항목 | 터미널 herdr | herdr app |
+|---|---|---|
+| 기동 방식 | `herdr` 로 tab 을 만들고 그 안에서 에이전트를 시작 | `hc run --bg --outlive-parent` 로 세션을 띄우고 `herdr.space` 라벨로 현재 space 에 tab 생성 |
+| tab 이름 | 작업 slug | 번호로 생긴 tab 을 기동 직후 작업 slug 로 바꿈 |
+| 인계 전달 | 세션이 뜬 뒤 인계 문구를 입력으로 보냄 | 인계 문구를 기동 인자로 넘기고, 첫 턴이 시작됐는지로 처리를 확인 |
+| 생존 조회 | `herdr` 의 agent 상태 | `hc get` 의 상태(`finished` 면 종료) |
+| 세션 종료 시 tab | 남음(사람이 닫음) | 저절로 사라짐 |
+| 확인한 OS | macOS | macOS |
+
+herdr app 에서 띄운 작업 세션은 앱 왼쪽 Agents 패널에 부모 세션의 하위 항목으로 나타납니다. Claude Code 의 Agent 도구 subagent 는 같은 프로세스 안에서 돌므로 이 패널에 나타나지 않습니다. 진행 상황은 Claude Code 하단 표시줄에서 확인합니다.
 
 기동은 **현재 workspace 안에 tab 을 새로 만들어** 그 안에 세션을 띄웁니다(화면을 분할하지 않습니다). tab 의 이름은 작업 slug 이고, herdr 의 agents 패널은 행마다 그 tab 이름을 보여주므로 **동시에 여러 작업이 떠 있어도 목록에서 바로 구분됩니다.** 사용자의 focus 는 가져오지 않습니다.
 
@@ -119,7 +132,7 @@ worktree 를 만든 뒤 `promote.sh` 는 **그 worktree 에서 작업할 에이�
 
 | `launch` | 호출 세션의 거취 |
 |---|---|
-| `ok` | 이 세션은 여기서 멈춘다 — 이후 단계는 기동된 탭의 세션이 진행한다 |
+| `ok` | 이 세션은 여기서 멈춘다 — 이후 단계는 기동된 작업 세션이 진행한다 |
 | `unknown` | 호출 세션도 이어받지 않는다 — `resolve-launch` 로 확정한 뒤에만 갈린다(살아 있으면 멈춤 / `failed` 확정이면 이어서 진행) |
 | `failed`·`none` | 자식 세션이 없다 — 호출 세션이 이어서 진행하거나 안내된 명령으로 세션을 연다 |
 
@@ -139,16 +152,16 @@ worktree 를 만든 뒤 `promote.sh` 는 **그 worktree 에서 작업할 에이�
 |---|---|---|
 | `ok` | 세션이 붙었음이 확인됨 | 없음 |
 | `failed` | 기동을 시도했고 실패가 확정됨 | 제시된 수동 기동 명령 실행 |
-| `none` | 기동을 시도하지 않음(herdr 밖, 자식 세션 등) | 제시된 수동 기동 명령 실행 |
-| `unknown` | 시도했으나 성공·실패를 판정하지 못함(승인 대기·응답 지연·시간 초과 등) | `rd task resolve-launch <slug>` — 생존 확인 후 `ok`/`failed` 로 확정하고, 살아 있으면 인계까지 전달. herdr 로 조회할 수 없으면 아래 「herdr 밖에서 `unknown` 해소하기」 |
+| `none` | 기동을 시도하지 않음(자동 기동 미지원 환경, 자식 세션 등) | 제시된 수동 기동 명령 실행 |
+| `unknown` | 시도했으나 성공·실패를 판정하지 못함(승인 대기·응답 지연·시간 초과 등) | `rd task resolve-launch <slug>` — 생존 확인 후 `ok`/`failed` 로 확정하고, 살아 있으면 인계까지 전달. 기동한 백엔드로 조회할 수 없으면 아래 「기동한 백엔드로 조회할 수 없을 때」 |
 
 **`unknown` 은 `none` 이 아닙니다.** 세션이 실제로 떠 있는데도 없는 것으로 다루면 같은 worktree 에 두 번째 세션을 띄우게 되므로, 자동 재기동을 하지 않고 사람이 확인합니다.
 
 기동이 진행 중인 동안 색인의 `launch` 는 `launching` 으로 예약됩니다. 이 상태에서는 그 작업의 `rollback`·`archive` 가 거부됩니다(기동 중인 세션의 worktree 를 지우지 않기 위해서입니다). `unknown` 도 같은 이유로 거부되므로, **`launching` 과 `unknown` 은 모두 `bash rd-workflow/scripts/rd task resolve-launch <slug>` 로 해소합니다** — 세션이 살아 있으면 `ok`, 찾을 수 없으면 `failed` 로 확정하고, 판정이 서지 않으면 아무것도 바꾸지 않습니다. `launching` 은 예약을 만든 프로세스가 아직 살아 있으면 해소하지 않습니다(`unknown` 은 예약이 없을 수 있으므로 곧바로 생존 확인으로 갑니다).
 
-#### herdr 밖에서 `unknown` 해소하기
+#### 기동한 백엔드로 조회할 수 없을 때
 
-herdr 가 없는 셸(또는 herdr 미설치)에서는 생존 조회가 언제나 "판정 불가" 로 돌아옵니다. 그래도 작업을 끝낼 수 있도록 `resolve-launch` 는 두 갈래로 갈립니다.
+지금 셸에서 기동한 백엔드를 쓸 수 없으면(예: herdr app 에서 띄운 작업을 터미널 herdr 나 일반 셸에서 조회, herdr 미설치) 생존 조회가 언제나 "판정 불가" 로 돌아옵니다. `resolve-launch` 는 이때 그 작업을 어느 환경에서 기동했는지 함께 알려 줍니다. 그래도 작업을 끝낼 수 있도록 `resolve-launch` 는 두 갈래로 갈립니다.
 
 - **자동 기동을 시도한 기록이 없는 작업** — 기동 예약(`launch-token`)이 없는 행입니다. 구버전 작업을 색인으로 흡수할 때 `launch=unknown` 으로 적히는 경우가 여기 해당합니다. 띄운 세션이 애초에 없으므로 사람 확인 없이 `launch=none` 으로 확정하고, 그 자리에서 `rollback`·`archive` 차단이 풀립니다.
 - **기동을 시도했는데 결과를 모르는 작업** — 조용히 확정하지 않습니다. 살아 있는 세션을 없다고 적으면 같은 worktree 에 두 번째 세션을 띄우게 되기 때문입니다. 세션이 없거나 이미 끝났음을 **직접 확인한 뒤** `bash rd-workflow/scripts/rd task resolve-launch <slug> --assume-ended` 로 `failed` 확정합니다.
@@ -370,6 +383,7 @@ fr branch lifecycle 관련 스크립트 요약:
 - skill이 없거나 원하는 출력이 안 나오면 `rd-workflow/docs/prompts/`에서 맞는 프롬프트를 꺼냅니다
 - `full` 등급은 reviewed spec / plan 파일을 만든 뒤에만 구현합니다
 - 범위를 벗어난 아이디어는 `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md`에 적습니다
+- plan 은 실행 시간(self_test 그룹 소요 등)을 통과 판정 기준으로 쓰지 않고 기록만 합니다. 같은 트리·같은 조건에서도 회차 간 분산이 24~34% 라 구현 전후 1회씩 잰 값의 비교는 사실이 아니라 측정 순서를 반영합니다(2026-09-10 실측, `rd-workflow-workspace/reports/mktemp-guard-timing.md`). 가드·검사 추가의 오버헤드는 「단가 × 지점 수 × 실행 횟수」 산술 상한으로 논증합니다.
 
 ## 권장 skill 순서
 

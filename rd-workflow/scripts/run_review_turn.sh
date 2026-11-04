@@ -14,6 +14,10 @@ source "${script_dir}/review_common.sh"
 if [[ -f "${script_dir}/_state_common.sh" ]]; then
   source "${script_dir}/_state_common.sh"
 fi
+# 리뷰 대상 문자열·완전성 검사. 같은 이유로 조건부 로드이며, 함수가 없으면 호출 자리가 fail-closed 로 막습니다.
+if [[ -f "${script_dir}/_submodule_common.sh" ]]; then
+  source "${script_dir}/_submodule_common.sh"
+fi
 PROJECT_ROOT="$project_root"
 
 # turn_limit은 session 검증 후 SESSION.md에서 읽음 (source-of-truth).
@@ -321,7 +325,7 @@ turn_change_state() {
 # ("기록된 OID 와 reviewer 가 읽은 diff 가 다름") 가 그대로 생깁니다.
 resnapshot_review_head() {
   local session_dir="$1" session_file="$2" rtype="$3"
-  local base_oid old_head new_head policy tmp rc cs
+  local base_oid old_head new_head policy tmp rc cs render_target
 
   # diff-review 가 아니면 대상이 아닙니다 (author 턴은 호출부에서 이미 걸러집니다).
   [[ "$rtype" == "diff-review" ]] || return 0
@@ -429,7 +433,8 @@ resnapshot_review_head() {
   if [[ "$policy" == "pinned" ]]; then
     local cur_target want_target
     cur_target="$(extract_section "$session_file" "Review Target" | trim_blank_lines)"
-    want_target="git diff ${resolved_base}..${new_head}"
+    rd_review_input_check "$resolved_base" "$new_head" || return 1
+    want_target="$(rd_review_diff_target "$resolved_base" "$new_head")"
     if [[ "$cur_target" != "$want_target" ]]; then
       echo "review turn: SESSION 의 Review Target 이 기록된 OID 와 어긋납니다." >&2
       echo "  기록된 OID 기준: ${want_target}" >&2
@@ -446,12 +451,16 @@ resnapshot_review_head() {
     return 0
   fi
 
+  # 대상 문자열 계산과 완전성 검사는 임시 파일을 만들기 전에 합니다 — 차단돼도 SESSION 디렉터리에 찌꺼기가 남지 않습니다.
+  rd_review_input_check "$resolved_base" "$new_head" || return 1
+  render_target="$(rd_review_diff_target "$resolved_base" "$new_head")"
+
   # ② 같은 디렉터리 임시 파일에 SESSION 전체를 렌더링
   tmp="$(mktemp "${session_dir}/.SESSION.md.XXXXXX")" || {
     echo "review turn: 임시 파일 생성 실패 — SESSION 을 바꾸지 않고 중단합니다." >&2
     return 1
   }
-  awk -v newhead="$new_head" -v target="git diff ${resolved_base}..${new_head}" '
+  awk -v newhead="$new_head" -v target="$render_target" '
     {
       if (skip) {
         if ($0 ~ /^## /) { skip = 0; print "" } else { next }

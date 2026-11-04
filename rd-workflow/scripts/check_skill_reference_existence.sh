@@ -35,30 +35,19 @@ set -f
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# skref_match_path_token <word> — 단어 하나를 트리밍한 뒤 저장소 상대 경로 패턴과
-# 완전히 일치하면 트리밍된 토큰을 stdout에 echo하고 return 0, 아니면 아무 출력
-# 없이 return 1. 이 파일을 source하는 다른 스크립트가 재사용하는 공개 함수다 —
-# 같은 파싱을 다시 구현하지 않는다(spec D1).
-skref_match_path_token() {
-  local word="$1" trimmed
-  trimmed="${word%[.,;:)]}"
+# skref_match_path_token_r <word> — 일치하면 REPLY 에 트리밍된 토큰을 담고 return 0,
+# 아니면 REPLY="" 로 return 1. 결과를 stdout 이 아닌 REPLY 로 돌려줘 호출자가 명령
+# 치환(서브셸)을 띄우지 않게 한다.
+skref_match_path_token_r() {
+  local trimmed="${1%[.,;:)]}"
   trimmed="${trimmed#(}"
-  if [[ "$trimmed" =~ ^rd-workflow/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$ ]]; then
-    printf '%s\n' "$trimmed"
-    return 0
-  fi
-  return 1
+  REPLY=""
+  [[ "$trimmed" =~ ^rd-workflow/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$ ]] || return 1
+  REPLY="$trimmed"
 }
-
-# skref_inline_segments <line> — 그 줄 안의 백틱 쌍(여러 쌍 가능) 내부 문자열만
-# 공백으로 이어 붙여 stdout에 echo한다. 백틱 쌍이 없으면 빈 문자열. FR 상세 파일의
-# `- related files:` 한 줄처럼 fenced 코드블록이 없는 텍스트에서 인라인 코드만
-# 뽑아낼 때 재사용한다(spec D1 — check_fr_related_files_existence.sh가 source해서
-# 쓰는 두 번째 공개 함수. spec/plan review Turn 002 F1 — 이 경계 처리 없이 토큰
-# 판정만 하면 백틱이 붙은 채로 패턴 불일치가 나 정상 경로가 전부 제외된다).
-skref_inline_segments() {
-  local line="$1"
-  local rest="$line" seg out=""
+# skref_inline_segments_r <line> — 백틱 쌍 내부 문자열을 공백으로 이어 붙여 REPLY 에 담는다.
+skref_inline_segments_r() {
+  local rest="$1" seg out=""
   while [[ "$rest" == *'`'* ]]; do
     rest="${rest#*\`}"
     [[ "$rest" == *'`'* ]] || break
@@ -66,31 +55,31 @@ skref_inline_segments() {
     out="${out} ${seg}"
     rest="${rest#*\`}"
   done
-  printf '%s' "$out"
+  REPLY="$out"
 }
-
 # _skref_extract_paths <file> — 추출된 경로를 <line>\t<path> 형식으로 한 줄씩 stdout 에 낸다.
 # fenced 코드블록(```) 안은 줄 전체를, 그 밖은 인라인 코드(백틱 쌍, 한 줄에 여러 쌍
 # 가능) 내부만 스캔 대상으로 모은다. 그 문자열을 공백 기준 단어로 나눠 단어 전체
-# 판정을 한다(F1 — 부분 추출 금지).
+# 판정을 한다(F1 — 부분 추출 금지). 백틱 없는 줄 건너뛰기는 펜스 판정 뒤에 둔다
+# (펜스 안 줄은 백틱이 없어도 스캔 대상이다).
 _skref_extract_paths() {
-  local file="$1" in_fence=0 line lineno=0
+  local file="$1" in_fence=0 line lineno=0 scan word
   while IFS= read -r line || [[ -n "$line" ]]; do
     lineno=$((lineno + 1))
     if [[ "$line" =~ ^[[:space:]]*'```' ]]; then
       in_fence=$((1 - in_fence))
       continue
     fi
-    local scan=""
     if [[ "$in_fence" -eq 1 ]]; then
       scan="$line"
     else
-      scan="$(skref_inline_segments "$line")"
+      # 백틱 쌍이 없는 줄은 skref_inline_segments_r 가 빈 문자열을 내므로 건너뛴다.
+      [[ "$line" == *'`'*'`'* ]] || continue
+      skref_inline_segments_r "$line"; scan="$REPLY"
     fi
     [[ -n "$scan" ]] || continue
-    local word matched
     for word in $scan; do
-      matched="$(skref_match_path_token "$word")" && printf '%s\t%s\n' "$lineno" "$matched"
+      skref_match_path_token_r "$word" && printf '%s\t%s\n' "$lineno" "$REPLY"
     done
   done < "$file"
 }
@@ -156,7 +145,7 @@ _skref_main() {
 }
 
 # 직접 실행될 때만 main을 호출한다 — source될 때(check_fr_related_files_existence.sh
-# 가 skref_match_path_token()·skref_inline_segments()만 가져다 쓸 때)는 이 아래가
+# 가 skref_match_path_token_r()·skref_inline_segments_r()만 가져다 쓸 때)는 이 아래가
 # 실행되지 않는다(spec D1).
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   _skref_main "$@"

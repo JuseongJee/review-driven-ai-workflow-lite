@@ -14,6 +14,8 @@ fi
 # 루트 확정 실패(마커 부재)는 여기서 끝난다 — state_ensure 에 닿지 않으므로
 # 상태 파일이 만들어지지 않는다 (AC 17).
 source "${SCRIPT_DIR}/_task_common.sh" || exit 3
+# 일반 seal 의 리뷰 입력 완전성 검사(rd_review_input_check). _state_common.sh 는 위 _task_common.sh 가 불러옵니다.
+source "${SCRIPT_DIR}/_submodule_common.sh" || exit 3
 # 진입 시 task-state 보장 — 부재 시 마이그레이션 수행 (결정 4). 손상 legacy → exit 3.
 state_ensure || exit 3
 
@@ -177,8 +179,20 @@ rd_review_seal() {
   fi
   session_path="${session_path%/}"
   if [[ ! -d "$session_path" ]]; then
-    echo "review seal: 세션 경로가 없습니다: ${session_path}" >&2
-    return 1
+    local seal_std_rel="rd-workflow-workspace/handoffs/review_pipeline"
+    if [[ "$session_path" != */* && -d "${project_root}/${seal_std_rel}/${session_path}" ]]; then
+      echo "review seal: 세션 이름 '${session_path}' 을 ${seal_std_rel}/${session_path} 로 해석했습니다." >&2
+      session_path="${project_root}/${seal_std_rel}/${session_path}"
+    else
+      local seal_cur
+      seal_cur="$(state_read_field "review-session" 2>/dev/null)" || seal_cur=""
+      echo "review seal: 세션 경로가 없습니다: ${session_path}" >&2
+      echo "  기대 형식: ${seal_std_rel}/<세션> (저장소 루트 기준, 세션 이름만 주면 이 위치에서 찾습니다)" >&2
+      if [[ -n "$seal_cur" && "$seal_cur" != "null" ]]; then
+        echo "  현재 작업의 세션: ${seal_std_rel}/${seal_cur} (저장소 루트 기준)" >&2
+      fi
+      return 1
+    fi
   fi
 
   local session_id internal_id
@@ -276,6 +290,11 @@ rd_review_seal() {
       echo "review seal: 리뷰 종결 후 보호 경로가 변경되었습니다 — 재리뷰가 필요합니다." >&2
       return 1
     fi
+    # 검사 4b — 리뷰 입력이 submodule 안쪽 코드를 실제로 담았는가 (객체 삭제·ignore 설정으로 누락될 수 있음)
+    ( cd "$project_root" && rd_review_input_check "$raw_base" "$reviewed_oid" ) || {
+      echo "review seal: 리뷰 입력이 submodule 코드를 담지 못합니다 — 일반 seal 을 만들지 않습니다." >&2
+      return 1
+    }
     # 검사 5 — 이 트리의 새 검증 증거 (verify_record.sh). legacy 세션은 승인 트리 자체가 없어 대상 아님.
     if ! declare -f rd_seal_evidence_check >/dev/null 2>&1; then
       echo "review seal: 검증 증거 함수(_guard_common.sh 의 rd_seal_evidence_check) 를 불러올 수 없습니다 — 판정 불가로 차단합니다." >&2
@@ -421,7 +440,7 @@ usage() {
                                            (--rebuild: 색인을 worktree 목록에서 재구성)
   resolve-launch <slug> [--assume-ended]    기동 예약(launching)·미확정(unknown)을 사람이 확정/해소
                                            (진행 중이면 exit 1, 확정 시 launch=ok|failed|none)
-                                           --assume-ended: herdr 로 조회할 수 없을 때, 세션이
+                                           --assume-ended: 기동한 백엔드로 조회할 수 없을 때, 세션이
                                            없거나 끝났음을 직접 확인했다고 밝혀 failed 로 확정
   guard --candidate <slug> --mode <m> [--source-fr <path|-> ...]
                                            m: intake|promote|fr-add. decision=... 출력 (차단 exit 2)

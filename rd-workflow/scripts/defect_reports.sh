@@ -617,17 +617,14 @@ gh_run() {
   if [[ -z "$errfile" || ! -f "$errfile" ]]; then
     # 진단을 수집할 수 없습니다. 원문을 그대로 흘리면 마스킹을 우회해 credential 이
     # 새고 성공 경로까지 시끄러워지므로, 변경 전처럼 억제하고 그 사실만 알립니다.
-    if [[ "$host" == "github.com" ]]; then gh "$@" 2>/dev/null; else GH_HOST="$host" gh "$@" 2>/dev/null; fi
+    # github.com 도 명시한다 — 셸의 GH_HOST 가 호스트 없는 -R O/R 을 다른 호스트로 보낸다(gh help environment)
+    GH_HOST="$host" gh "$@" 2>/dev/null
     rc=$?
     (( rc != 0 )) && printf 'gh 오류: 호출 실패 (host=%s, 명령: gh %s) — 진단 원문을 수집하지 못했습니다 (임시 파일 생성 실패).\n' \
         "$host" "$(printf '%s' "$*" | sed "$_GH_MASK")" >&2
     return $rc
   fi
-  if [[ "$host" == "github.com" ]]; then
-    gh "$@" 2>"$errfile"
-  else
-    GH_HOST="$host" gh "$@" 2>"$errfile"
-  fi
+  GH_HOST="$host" gh "$@" 2>"$errfile"
   rc=$?
   (( rc != 0 )) && _gh_diagnose "$host" "$errfile" "$*" >&2
   rm -f "$errfile"

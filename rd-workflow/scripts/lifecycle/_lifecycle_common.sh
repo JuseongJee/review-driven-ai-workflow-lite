@@ -797,17 +797,28 @@ index_row_ncol() {
   awk '{ n = 1; L = length($0); for (i = 1; i <= L; i++) { c = substr($0, i, 1); if (c == "\\" && i < L) { i++; continue } if (c == "|") n++ } print n }'
 }
 
+# index_title_field <file|->: FUTURE_REQUESTS.md 표의 헤더에서 `제목` 칸의 필드 번호를 stdout 에 낸다.
+#   셀 하나가 정확히 `제목`(앞뒤 공백 제거) 인 첫 `|` 행이 헤더다. 셀 본문의 `\|` 는 \001 로 치환한 뒤
+#   `|` 로 나눈 필드 번호(맨 앞 `|` 앞의 빈 필드가 1번)이며, check_fr_index_detail_consistency.sh 와 같은 방식이다.
+#   그런 행이 없으면 출력 없이 rc 1. 정본 7칸 인덱스(| 날짜 | 제목 | …)에서는 항상 3 이다.
+index_title_field() {
+  awk 'BEGIN { r = 1 }
+    /^\|/ { l = $0; gsub(/\\\|/, "\001", l); n = split(l, a, "|")
+      for (i = 1; i <= n; i++) { c = a[i]; gsub(/^[ \t]+|[ \t]+$/, "", c); if (c == "제목") { print i; r = 0; exit } } }
+    END { exit r }' "$1"
+}
+
 # registration_commit_shape <commit>: FR 등록 커밋 형태 검증 (REQUEST CD (1)-9, 자동 채택 범위 A).
 #   형태 = 부모 정확히 1개 + 그 부모 대비 raw diff 가 {인덱스 M(100644), items/<date>-<slug>.md A(100644, 직접 자식),
 #   (선택) raw-captures/*-fr-<slug>[-N].md A(100644, 직접 자식)} 로만 구성 + slug 가 canonical kebab-case
-#   + 인덱스 diff 가 '+' 1줄·'-' 0줄이고 그 줄이 헤더와 같은 컬럼 수의 표 행이며 제목 컬럼 == slug, [상세] 링크 == 추가된 상세 파일명.
+#   + 인덱스 diff 가 '+' 1줄·'-' 0줄이고 그 줄이 헤더와 같은 컬럼 수의 표 행이며 제목 컬럼(헤더의 `제목` 칸 — index_title_field) == slug, [상세] 링크 == 추가된 상세 파일명.
 #   통과 시 slug 를 stdout 에 내고 rc 0. 그 외 rc 1 (출력 없음). 커밋 메시지·작성자는 보지 않는다.
 #   helper(rd task fr-register) 가 자기 커밋을 이 함수로 검증하고, 시작 계약이 ahead 커밋을 같은 함수로 분류한다.
 #   helper 가 만드는 것보다 넓은 커밋(중첩 경로·symlink·표 아닌 줄·링크 불일치)을 자동 채택하지 않도록 좁게 본다.
 registration_commit_shape() {
   local c="$1" idx="rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
   local items="rd-workflow-workspace/backlog/items" caps="rd-workflow-workspace/raw-captures"
-  local parents n raw meta path smode dmode ssha dsha status detail="" cap="" seen_idx=0 slug base line plus=0 minus=0 row="" title link ncol_h ncol_r
+  local parents n raw meta path smode dmode ssha dsha status detail="" cap="" seen_idx=0 slug base line plus=0 minus=0 row="" title tfield link ncol_h ncol_r
   parents="$(git rev-list --parents -n 1 "$c" 2>/dev/null)" || return 1
   n="$(printf '%s\n' "$parents" | wc -w | tr -d ' ')"
   [[ "$n" -eq 2 ]] || return 1
@@ -847,7 +858,9 @@ EOF
   ncol_h="$(git show "${c}:${idx}" 2>/dev/null | awk '/^\|/ { print; exit }' | index_row_ncol)"
   ncol_r="$(printf '%s\n' "$row" | index_row_ncol)"
   [[ -n "$ncol_h" && "$ncol_h" == "$ncol_r" ]] || return 1
-  title="$(printf '%s\n' "$row" | awk -F'|' '{ t = $3; gsub(/^[ \t]+|[ \t]+$/, "", t); print t }')"
+  tfield="$(git show "${c}:${idx}" 2>/dev/null | index_title_field -)" || return 1
+  [[ -n "$tfield" ]] || return 1
+  title="$(printf '%s\n' "$row" | awk -v f="$tfield" '{ l = $0; gsub(/\\\|/, "\001", l); split(l, a, "|"); t = a[f]; gsub(/^[ \t]+|[ \t]+$/, "", t); print t }')"
   [[ "$title" == "$slug" ]] || return 1
   link="$(printf '%s\n' "$row" | sed -n 's/.*\[상세\](items\/\([^)]*\.md\)).*/\1/p')"
   [[ "$link" == "$(basename "$detail")" ]] || return 1

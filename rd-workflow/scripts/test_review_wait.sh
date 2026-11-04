@@ -2,7 +2,7 @@
 # test_review_wait.sh — adapter_codex.sh 대기 계약·판정 단일화 테스트
 # 케이스:
 #   1. 정상 완료 (CHECKPOINT Suggested Next Owner = Reviewer여도 성공 — CHECKPOINT 비소비 증명)
-#   2. 비정상 종료 (mock exit 1, 즉시 실패)
+#   2. 비정상 종료 (mock exit 1, 대기 상한(120초)까지 기다리지 않고 15초 안에 실패)
 #   3. 타임아웃 (mock sleep 30, WAIT_TIMEOUT=3)
 #   4. 폴링 부재 grep (adapter_codex.sh + adapter_claude.sh)
 #   5. malformed owner 실패 (Bogus / 빈 값 / awaiting-reviewer Status)
@@ -13,7 +13,10 @@ set -euo pipefail
 
 PASS=0
 FAIL=0
+SKIP=0
 ERRORS=()
+# 실행할 케이스 이름 (비어 있으면 전부). 사용: test_review_wait.sh [케이스...]
+SELECTED=("$@")
 
 # 색상 출력 (터미널 비지원 시 무시)
 RED='\033[0;31m'
@@ -29,6 +32,11 @@ fail() {
   echo -e "${RED}FAIL${NC} $1"
   ERRORS+=("$1")
   FAIL=$((FAIL + 1))
+}
+
+skip() {
+  echo "SKIP $1"
+  SKIP=$((SKIP + 1))
 }
 
 # --- 경로 ---
@@ -108,6 +116,8 @@ ps_is_trustworthy() {
 # 대신 어댑터를 자체 process group 리더로 띄운다. process group 은 자손에게 상속되고
 # 부모가 죽어 고아가 되어도 바뀌지 않으므로, 그 pgid 의 구성원이라는 사실이 곧
 # "이 케이스가 만든 프로세스" 라는 증거다 (macOS 3.2 / Alpine 5.3 / Ubuntu 5.2 실측).
+#   테스트가 끊기면 trap 이 자손에 TERM → 상한 10초 대기 → 남은 것 KILL 순서로 회수한다.
+#   어댑터가 TERM 으로 자기 도구 그룹을 회수하게 하려는 순서다. SIGKILL 은 범위 밖이다.
 own_pgid() {  # $1: pid → pgid (관측 불가 시 빈 문자열)
   { ps -eo pid,pgid 2>/dev/null || true; } | awk -v p="$1" '$1==p {print $2; exit}'
 }
@@ -119,6 +129,86 @@ group_size() {  # $1: pgid → 살아 있는 구성원 수
 }
 
 SELF_PGID="$(own_pgid $$)"
+
+# 테스트 셸($$)이 띄운 프로세스를 회수한다 (spec §3.3).
+# (1) 자손 트리 스냅숏 — 어댑터를 먼저 죽이면 그 자식(도구의 별도 그룹)이 init 으로 넘어가 트리에서 빠진다.
+# (2) TERM — 어댑터가 자기 cleanup 으로, 기록해 둔 도구 그룹(리더가 먼저 끝나 트리에 없는 자손 포함)을 회수한다.
+# (3) 상한 10초 안에 사라지지 않은 스냅숏 대상만 KILL.
+# 세 함수 모두 항상 0 을 반환한다 — 대상이 이미 사라진 것은 정상 회수 결과이며, set -e 아래에서도 끝까지 돈다.
+REAP_TARGETS=""
+REAP_RAN=0          # 0=미실행 1=진행 중 2=완료 — 진행 중·완료 뒤 다시 부르면 아무것도 하지 않는다
+REAP_SIGNAL_RC=""   # 첫 신호의 종료 코드(129/130/143)
+_reap_send() {  # $1: 신호 이름 — REAP_TARGETS 의 각 대상에 보낸다
+  local kind id
+  while read -r kind id; do
+    [ -n "${id:-}" ] || continue
+    if [ "$kind" = G ]; then kill -"$1" -- -"$id" 2>/dev/null || true
+    else kill -"$1" "$id" 2>/dev/null || true; fi
+  done <<REAP_EOF
+$REAP_TARGETS
+REAP_EOF
+  return 0
+}
+_reap_alive() {  # 살아 있는 대상 수를 stdout 으로 낸다
+  local kind id n=0
+  while read -r kind id; do
+    [ -n "${id:-}" ] || continue
+    if [ "$kind" = G ]; then
+      if kill -0 -- -"$id" 2>/dev/null; then n=$((n + 1)); fi
+    else
+      if kill -0 "$id" 2>/dev/null; then n=$((n + 1)); fi
+    fi
+  done <<REAP_EOF
+$REAP_TARGETS
+REAP_EOF
+  echo "$n"
+  return 0
+}
+reap_descendants() {
+  [ "$REAP_RAN" -eq 0 ] || return 0
+  REAP_RAN=1
+  _reap_run
+  REAP_RAN=2
+  return 0
+}
+_reap_run() {
+  local snap i
+  snap="$( { ps -eo pid=,ppid=,pgid= 2>/dev/null || true; } )"
+  if [ -z "$snap" ]; then
+    echo "경고: 프로세스 조회 실패로 종료 회수를 하지 못했습니다 — 이 테스트가 띄운 프로세스가 남았을 수 있습니다" >&2
+    return 0
+  fi
+  REAP_TARGETS="$(printf '%s\n' "$snap" | awk -v root="$$" -v self="${SELF_PGID:-}" '
+    { grp[$1]=$3; kids[$2]=kids[$2] " " $1 }
+    END {
+      q=" " root
+      while (q != "") {
+        n=split(q, a, " "); q=""
+        for (i=1;i<=n;i++) { m=split(kids[a[i]], c, " "); for (j=1;j<=m;j++) if (!(c[j] in d)) { d[c[j]]=1; q=q " " c[j] } }
+      }
+      for (p in d) { print "P " p; if (grp[p]==p && p!=self) print "G " p }
+    }' || true)"
+  [ -n "$REAP_TARGETS" ] || return 0
+  _reap_send TERM
+  for i in $(seq 1 50); do
+    [ "$(_reap_alive)" -eq 0 ] && return 0
+    sleep 0.2 || true   # 그룹 신호로 sleep 이 먼저 끝나도 회수를 이어 간다
+  done
+  _reap_send KILL
+  return 0
+}
+# 회수 진행 중(최대 10초 대기)에 온 신호는 종료 코드만 기록하고 돌아온다. bash 는 trap 이 돌아오면
+# 중단된 명령 다음부터 이어 가므로 원래 회수가 KILL 까지 마친다. 종료 코드는 첫 신호의 값이다.
+reap_on_signal() {  # $1: 종료 코드
+  [ -n "$REAP_SIGNAL_RC" ] || REAP_SIGNAL_RC="$1"
+  [ "$REAP_RAN" -eq 1 ] && return 0
+  reap_descendants
+  exit "$REAP_SIGNAL_RC"
+}
+trap 'reap_descendants' EXIT
+trap 'reap_on_signal 129' HUP
+trap 'reap_on_signal 130' INT
+trap 'reap_on_signal 143' TERM
 JOB=""
 GROUP_PGID=""
 
@@ -144,6 +234,88 @@ reap_group() {  # $1: pgid — 소유권이 확인된 그룹만 종료 (자기 �
   [ "$(group_size "$g")" -gt 0 ] || return 0
   kill -9 -- -"$g" 2>/dev/null || true
   return 0
+}
+
+# ps shim 생성 헬퍼 — PATH 앞의 <dir> 에 둘 가짜 ps 를 만든다.
+# 사용: make_ps_shim <dir> fail|empty|after-marker <marker>
+#   fail         — 항상 exit 1
+#   empty        — 출력 없이 exit 0
+#   after-marker — <marker> 파일이 없으면 실제 ps 를 실행해 출력을 변수에 받고, 실제 ps 가 rc 0 이면
+#                  <dir>/ps-ok 에 한 줄을 덧붙인 뒤 그 출력과 rc 를 그대로 낸다(handshake 용).
+#                  <marker> 가 있으면 exit 1.
+# REAL_PS 는 shim 생성 시점에 `command -v ps` 로 고정해 shim 본문에 박아 넣는다(PATH 가 바뀐 뒤에도 실제 ps 를 부르기 위함).
+# FR cleanup-pending-hold-env-dependence 가 같은 형태를 재사용할 수 있다.
+make_ps_shim() {
+  local dir="$1" mode="$2" marker="${3:-}" REAL_PS
+  mkdir -p "$dir"
+  case "$mode" in
+    fail)  printf '#!/bin/sh\nexit 1\n' > "$dir/ps" ;;
+    empty) printf '#!/bin/sh\nexit 0\n' > "$dir/ps" ;;
+    after-marker)
+      REAL_PS="$(command -v ps || true)"
+      if [ -z "$REAL_PS" ]; then
+        echo "make_ps_shim: 실제 ps 를 찾지 못해 after-marker shim 을 만들 수 없음" >&2
+        return 1
+      fi
+      cat > "$dir/ps" <<SHIM_EOF
+#!/bin/sh
+if [ -e "$marker" ]; then exit 1; fi
+out=\$("$REAL_PS" "\$@")
+rc=\$?
+if [ "\$rc" -eq 0 ]; then echo ok >> "$dir/ps-ok"; fi
+printf '%s\n' "\$out"
+exit \$rc
+SHIM_EOF
+      ;;
+    *) echo "make_ps_shim: 알 수 없는 모드 '$mode'" >&2; return 1 ;;
+  esac
+  chmod +x "$dir/ps"
+}
+
+# mock 본문에 넣을 handshake 대기 셸 조각을 stdout 으로 낸다.
+# <dir>/ps-ok 가 비어 있지 않을 때까지 0.05초 간격으로 기다리고(상한 5초=100회),
+# 넘기면 <sandbox>/handshake-timeout 을 만든다.
+wait_ps_handshake() {  # $1=<dir>(shim 디렉터리) $2=<sandbox>
+  printf '%s\n' "i=0; while [ ! -s \"$1/ps-ok\" ] && [ \$i -lt 100 ]; do sleep 0.05; i=\$((i+1)); done; [ -s \"$1/ps-ok\" ] || : > \"$2/handshake-timeout\""
+}
+
+# <sandbox>/mock.pid 의 pid 가 자기 그룹 리더일 때만 그 그룹을 SIGKILL 한다. 실패는 무시한다.
+reap_mock_group() {  # $1=<sandbox>
+  local pid
+  pid="$(cat "$1/mock.pid" 2>/dev/null || true)"
+  [ -n "$pid" ] || return 0
+  if kill -0 -- -"$pid" 2>/dev/null; then
+    kill -9 -- -"$pid" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# 케이스 이름 목록: ps 가 없으면 판정할 수 없는 케이스 (케이스 전체 건너뜀)
+PS_REQUIRED=(14 36a 36b 39 47 48)
+PS_OK=1
+
+run() {  # $1=케이스 이름 — 선택·건너뜀 판정 뒤 run_case<이름> 호출
+  local n="$1" x found=0
+  if [ ${#SELECTED[@]} -ne 0 ]; then
+    for x in "${SELECTED[@]}"; do [ "$x" = "$n" ] && found=1; done
+    [ "$found" -eq 1 ] || return 0
+  fi
+  if [ "$PS_OK" -eq 0 ]; then
+    for x in "${PS_REQUIRED[@]}"; do
+      if [ "$x" = "$n" ]; then
+        skip "케이스 $n: ps 를 쓸 수 없어 판정할 수 없음"
+        return 0
+      fi
+    done
+  fi
+  "run_case$n"
+}
+
+section() {  # 선택이 없을 때만 절 머리말 출력
+  [ ${#SELECTED[@]} -eq 0 ] || return 0
+  echo ""
+  echo "=== $1 ==="
+  echo ""
 }
 
 # 케이스 전용 WAIT_TIMEOUT salt.
@@ -246,7 +418,7 @@ exit 0
 }
 
 # ===========================================================================
-# 케이스 2: 비정상 종료 — mock exit 1, 즉시(2초 내) exit 1
+# 케이스 2: 비정상 종료 — mock exit 1, 대기 상한(120초)까지 기다리지 않고 15초 안에 exit
 # ===========================================================================
 run_case2() {
   local sandbox
@@ -256,25 +428,45 @@ run_case2() {
   write_session "$sandbox" "Reviewer" "awaiting-reviewer"
   write_checkpoint "$sandbox" "Author"
 
-  # mock: 아무것도 쓰지 않고 즉시 exit 1
+  # mock: 자기 pid 를 남기고 아무것도 쓰지 않은 채 즉시 exit 1
   local mock_bin
-  mock_bin="$(setup_mock "$sandbox" "exit 1")"
+  mock_bin="$(setup_mock "$sandbox" "echo \$\$ > \"$sandbox/mock.pid\"; exit 1")"
 
-  local t0 t1 elapsed rc=0
-  t0=$(date +%s)
-  TOOL_BIN="$mock_bin/codex" \
-  SESSION_PATH="$sandbox" \
-  PROMPT_FILE="/dev/null" \
-  EXPECTED_TURN_FILE="$expected_turn" \
-  PROJECT_ROOT="$sandbox" \
-    bash "$ADAPTER" >/dev/null 2>&1 || rc=$?
-  t1=$(date +%s)
-  elapsed=$((t1 - t0))
+  # 어댑터를 백그라운드로 띄우고 rc 를 sentinel 파일에 쓴다. 0.1초 간격 폴링, 상한 15초.
+  # (kill -0 로 job 을 보면 좀비를 살아 있는 것으로 오판하므로 sentinel 을 쓴다.)
+  local job rc=0 ticks=0 cap_ticks=150
+  set -m
+  (
+    arc=0
+    TOOL_BIN="$mock_bin/codex" \
+    SESSION_PATH="$sandbox" \
+    PROMPT_FILE="/dev/null" \
+    EXPECTED_TURN_FILE="$expected_turn" \
+    PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=120 RD_REVIEW_IDLE_TIMEOUT=120 \
+      bash "$ADAPTER" >/dev/null 2>&1 || arc=$?
+    echo "$arc" > "$sandbox/rc"
+  ) &
+  job=$!
+  set +m
+  while [ ! -s "$sandbox/rc" ] && [ "$ticks" -lt "$cap_ticks" ]; do
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
 
-  if [ "$rc" -ne 0 ] && [ "$elapsed" -le 2 ]; then
-    pass "케이스 2: 비정상 종료 즉시 exit 1 (${elapsed}초)"
+  if [ ! -s "$sandbox/rc" ]; then
+    kill -9 -- -"$job" 2>/dev/null || true
+    reap_mock_group "$sandbox"
+    wait "$job" 2>/dev/null || true
+    fail "케이스 2: 15초 안에 끝나지 않음 — 대기 상한까지 기다리는 결함 의심"
   else
-    fail "케이스 2: 비정상 종료 기대 rc≠0·2초 내 — rc=$rc, elapsed=${elapsed}초"
+    rc="$(cat "$sandbox/rc")"
+    wait "$job" 2>/dev/null || true
+    if [ "$rc" -ne 0 ]; then
+      pass "케이스 2: 비정상 종료 즉시 exit (rc=$rc, 약 $((ticks / 10)).$((ticks % 10))초)"
+    else
+      fail "케이스 2: 기대 rc≠0 — rc=$rc"
+    fi
   fi
 
   rm -rf "$sandbox"
@@ -2883,7 +3075,7 @@ run_case39() {
   local sandbox expected_turn mock_bin rc=0 adapter_pid adapter_pgid survivors
   sandbox="$(make_sandbox)"
   expected_turn="$sandbox/turns/turn-001.md"
-  mock_bin="$(setup_mock_claude "$sandbox" "exec sleep 60")"
+  mock_bin="$(setup_mock_claude "$sandbox" "touch '$sandbox/mock_started'; exec sleep 60")"
 
   spawn_group "$sandbox/wrap.log" env \
     TOOL_BIN="$mock_bin/claude" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
@@ -2893,7 +3085,10 @@ run_case39() {
   adapter_pid="$JOB"
   adapter_pgid="$GROUP_PGID"
 
-  sleep 1
+  # 고정 1초가 아니라 mock 기동(= 어댑터가 상태 스냅샷을 시작한 뒤 spawn)을 확인하고 TERM 을 보낸다.
+  # 부하가 높으면 1초 안에 spawn 전 단계를 못 지나, 시작 실패 경로(상태 파일 미발행)를 타서 FAIL 했다.
+  local i
+  for i in $(seq 1 100); do [ -e "$sandbox/mock_started" ] && break; sleep 0.1; done
   kill -TERM "$adapter_pid" 2>/dev/null || true
   wait "$adapter_pid" 2>/dev/null || rc=$?
 
@@ -3034,9 +3229,8 @@ run_case42() {
   sandbox="$(make_sandbox)" || { fail "케이스 42: sandbox 생성 실패"; return; }
   shim_fail="$sandbox/shim_fail"; shim_empty="$sandbox/shim_empty"
   mkdir -p "$shim_fail" "$shim_empty"
-  printf '#!/bin/sh\nexit 1\n' > "$shim_fail/ps"
-  printf '#!/bin/sh\nexit 0\n' > "$shim_empty/ps"
-  chmod +x "$shim_fail/ps" "$shim_empty/ps"
+  make_ps_shim "$shim_fail" fail
+  make_ps_shim "$shim_empty" empty
   self_pg="$(own_pgid $$)"
 
   got="$(source "$SCRIPT_DIR/review_wait.sh"; rw_group_state "")"
@@ -3048,11 +3242,19 @@ run_case42() {
   got="$(PATH="$shim_empty:$PATH"; source "$SCRIPT_DIR/review_wait.sh"; rw_group_state "$self_pg")"
   [ "$got" = unverified ] && pass "케이스 42c: ps rc=0 + 빈 출력 → unverified" || fail "케이스 42c: 기대 unverified — 실제 '$got'"
 
-  got="$(source "$SCRIPT_DIR/review_wait.sh"; rw_group_state "$self_pg")"
-  [ "$got" = alive ] && pass "케이스 42d: 구성원 있음 → alive" || fail "케이스 42d: 기대 alive — 실제 '$got'"
+  if [ "$PS_OK" -eq 0 ]; then
+    skip "케이스 42d: ps 를 쓸 수 없어 판정할 수 없음"
+  else
+    got="$(source "$SCRIPT_DIR/review_wait.sh"; rw_group_state "$self_pg")"
+    [ "$got" = alive ] && pass "케이스 42d: 구성원 있음 → alive" || fail "케이스 42d: 기대 alive — 실제 '$got'"
+  fi
 
-  got="$(source "$SCRIPT_DIR/review_wait.sh"; rw_group_state 99999999)"
-  [ "$got" = verified ] && pass "케이스 42e: 구성원 없음 → verified" || fail "케이스 42e: 기대 verified — 실제 '$got'"
+  if [ "$PS_OK" -eq 0 ]; then
+    skip "케이스 42e: ps 를 쓸 수 없어 판정할 수 없음"
+  else
+    got="$(source "$SCRIPT_DIR/review_wait.sh"; rw_group_state 99999999)"
+    [ "$got" = verified ] && pass "케이스 42e: 구성원 없음 → verified" || fail "케이스 42e: 기대 verified — 실제 '$got'"
+  fi
 
   rm -rf "$sandbox"
 }
@@ -3077,8 +3279,13 @@ writer_group_harness() {  # $1=codex|claude $2=A1|A2 $3=기대 값
     mock_bin="$(setup_mock_claude "$sandbox" "$body")"; adapter="$ADAPTER_CLAUDE"
   fi
   shim="$sandbox/shim"; mkdir -p "$shim"
+  if [ "$mode" = A2 ] && [ "$PS_OK" -eq 0 ]; then
+    skip "케이스 43 A2(${tool}): ps 를 쓸 수 없어 판정할 수 없음"
+    rm -rf "$sandbox"
+    return 0
+  fi
   if [ "$mode" = A1 ]; then
-    printf '#!/bin/sh\nexit 1\n' > "$shim/ps"; chmod +x "$shim/ps"
+    make_ps_shim "$shim" fail
   elif [ "$mode" = A3 ]; then
     printf '#!/bin/sh\nprintf "  PID  PGID\\n    1     1\\n"\n' > "$shim/ps"; chmod +x "$shim/ps"
   fi
@@ -3124,10 +3331,11 @@ init_guard_harness() {  # $1=codex|claude $2=a|b|c
     mock_bin="$(setup_mock_claude "$sandbox" "sleep 20")"; adapter="$ADAPTER_CLAUDE"
   fi
   shim="$sandbox/shim"; mkdir -p "$shim"; err="$sandbox/adapter.err"; marker="$sandbox/ps-entered"
+  mkdir -p "$sandbox/tmp"  # 어댑터의 mktemp 가 여기에만 만들어, 종료 뒤 rd-watchdog.* 잔존을 센다
   if [ "$mode" = c ]; then
     local benv="$sandbox/debug_env.sh"
     printf '%s\n' "trap 'if [[ \"\$BASH_COMMAND\" == \"set -m\" ]]; then trap - DEBUG; kill -TERM \$\$; fi' DEBUG" > "$benv"
-    BASH_ENV="$benv" TOOL_BIN="$mock_bin/$tool" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    TMPDIR="$sandbox/tmp" BASH_ENV="$benv" TOOL_BIN="$mock_bin/$tool" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
       EXPECTED_TURN_FILE="$sandbox/turns/turn-001.md" PROJECT_ROOT="$sandbox" \
       WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=60 \
       bash "$adapter" >/dev/null 2>"$err" || rc=$?
@@ -3138,7 +3346,7 @@ init_guard_harness() {  # $1=codex|claude $2=a|b|c
     fi
   elif [ "$mode" = a ]; then
     printf '#!/bin/sh\nexit 1\n' > "$shim/mkfifo"; chmod +x "$shim/mkfifo"
-    PATH="$shim:$PATH" TOOL_BIN="$mock_bin/$tool" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    TMPDIR="$sandbox/tmp" PATH="$shim:$PATH" TOOL_BIN="$mock_bin/$tool" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
       EXPECTED_TURN_FILE="$sandbox/turns/turn-001.md" PROJECT_ROOT="$sandbox" \
       WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=60 \
       bash "$adapter" >/dev/null 2>"$err" || rc=$?
@@ -3148,8 +3356,8 @@ init_guard_harness() {  # $1=codex|claude $2=a|b|c
       fail "케이스 44a(${tool}): 기대 rc=1·unbound 없음 — rc=$rc, $(grep -m1 'unbound' "$err" || echo '(unbound 없음)')"
     fi
   else
-    printf '#!/bin/sh\n: > "%s"\nsleep 3\nexit 1\n' "$marker" > "$shim/ps"; chmod +x "$shim/ps"
-    PATH="$shim:$PATH" TOOL_BIN="$mock_bin/$tool" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    printf '#!/bin/sh\n: > "%s"\nsleep 3\nexit 1\n' "$marker" > "$shim/ps"; chmod +x "$shim/ps"  # 진입 표시 후 대기하는 별도 형태 — 헬퍼 모드 아님
+    TMPDIR="$sandbox/tmp" PATH="$shim:$PATH" TOOL_BIN="$mock_bin/$tool" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
       EXPECTED_TURN_FILE="$sandbox/turns/turn-001.md" PROJECT_ROOT="$sandbox" \
       WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=60 \
       bash "$adapter" >/dev/null 2>"$err" &
@@ -3163,13 +3371,19 @@ init_guard_harness() {  # $1=codex|claude $2=a|b|c
       fail "케이스 44b(${tool}): 기대 rc=143·unbound 없음 — rc=$rc, $(grep -m1 'unbound' "$err" || echo '(unbound 없음)')"
     fi
   fi
+  n="$( { find "$sandbox/tmp" -maxdepth 1 -name 'rd-watchdog.*' 2>/dev/null || true; } | wc -l | tr -d ' ' )"
+  if [ "$n" -eq 0 ]; then
+    pass "케이스 44${mode}(${tool}): 전용 TMPDIR 에 rd-watchdog 잔존 0"
+  else
+    fail "케이스 44${mode}(${tool}): 전용 TMPDIR 에 rd-watchdog ${n}개 잔존"
+  fi
   rm -rf "$sandbox"
 }
 
 # 케이스 45: 타임아웃 기록 진행 표시 — 관측한 파일 상태별로 서로 다른 문구, 원인·위치 단정 금지
 # 세 상태 모두 WAIT_TIMEOUT=2 로 타임아웃시킨다 (mock 은 sleep 30).
 # mock 본문 $2 를 실행한 뒤 sleep 한다. 출력을 전역 C45_OUT 에 담는다.
-run_case45_one() {
+case45_one() {
   local sandbox mock_bin expected_turn
   sandbox="$(make_sandbox)"
   expected_turn="$sandbox/turns/turn-001-reviewer.md"
@@ -3186,12 +3400,12 @@ run_case45_one() {
 
 run_case45() {
   local none turn_only both turn="\$EXPECTED_TURN_FILE" ck="\$SESSION_PATH/CHECKPOINT.md"
-  run_case45_one ':'
+  case45_one ':'
   none="$(echo "$C45_OUT" | grep '^기록 진행:' || true)"
-  run_case45_one "echo x > \"$turn\""
+  case45_one "echo x > \"$turn\""
   turn_only="$(echo "$C45_OUT" | grep '^기록 진행:' || true)"
   # 미래 시각으로 만들어 시작 기준 파일보다 확실히 새롭게 한다 (mtime 해상도 의존 제거)
-  run_case45_one "echo x > \"$turn\"; touch -t 203001010000 \"$ck\""
+  case45_one "echo x > \"$turn\"; touch -t 203001010000 \"$ck\""
   both="$(echo "$C45_OUT" | grep '^기록 진행:' || true)"
 
   if [ -n "$none" ] && [ -n "$turn_only" ] && [ -n "$both" ] \
@@ -3223,155 +3437,409 @@ run_case44() {
   done
 }
 
+# ===========================================================================
+# 케이스 46: rw_group_alive 세 값 판정 — ps 가 실패하면 kill -0 로 재확인한다
+#   (a) ps 실패 + 그룹 살아 있음 → 0 (종전에는 ps 실패를 「없음」 1 로 오판했다)
+#   (b) ps 실패 + 그룹 없음 → 1
+#   (c) ps 실패 + kill -0 가 「No such process」 가 아닌 오류 → 2, RW_GROUP_PROBE_ERR 에 그 문구
+# 프로브를 ko_KR 로캘로 돌려, kill -0 오류 문구가 번역되면 판정이 깨지는 회귀(LC_ALL=C 누락)를 잡는다.
+# 한계: 그 번역은 ko 메시지 카탈로그가 있는 glibc 에서만 일어난다. macOS 와 ko 로캘이 없는 Linux 에서는
+# 문구가 영어 그대로라 LC_ALL=C 를 빼도 이 케이스는 통과한다 — 그 환경에서는 이 회귀를 잡지 못한다.
+# ===========================================================================
+case46_probe() {  # $1=shim 디렉터리 $2=a|b|c → stdout "<rc>|<RW_GROUP_PROBE_ERR>"
+  (
+    export LANG=ko_KR.UTF-8 LC_ALL=
+    PATH="$1:$PATH"
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/review_wait.sh"
+    if [ "$2" = c ]; then
+      kill() {
+        if [ "$1" = -0 ] && [ "$2" = -- ]; then
+          echo "bash: kill: ($3) - Operation not permitted" >&2
+          return 1
+        fi
+        builtin kill "$@"
+      }
+    fi
+    set -m; sleep 30 >/dev/null 2>&1 & g=$!; set +m
+    if [ "$2" = b ]; then
+      kill -9 -- -"$g" 2>/dev/null || true
+      wait "$g" 2>/dev/null || true
+    fi
+    rc=0; RW_GROUP_PROBE_ERR=""
+    rw_group_alive "$g" || rc=$?
+    kill -9 -- -"$g" 2>/dev/null || true
+    wait "$g" 2>/dev/null || true
+    printf '%s|%s\n' "$rc" "$RW_GROUP_PROBE_ERR"
+  )
+}
+
+run_case46() {
+  local sandbox got
+  sandbox="$(make_sandbox)"
+  make_ps_shim "$sandbox/shim" fail
+
+  got="$(case46_probe "$sandbox/shim" a)"
+  [ "${got%%|*}" = 0 ] \
+    && pass "케이스 46a: ps 실패 + 살아 있는 그룹 → 0(있음)" \
+    || fail "케이스 46a: 기대 0 — 실제 ${got%%|*}"
+
+  got="$(case46_probe "$sandbox/shim" b)"
+  [ "${got%%|*}" = 1 ] \
+    && pass "케이스 46b: ps 실패 + 회수된 그룹 → 1(없음)" \
+    || fail "케이스 46b: 기대 1 — 실제 ${got%%|*}"
+
+  got="$(case46_probe "$sandbox/shim" c)"
+  [ "${got%%|*}" = 2 ] \
+    && pass "케이스 46c: ps 실패 + kill -0 의 그 밖의 오류 → 2(판정 불가)" \
+    || fail "케이스 46c: 기대 2 — 실제 ${got%%|*}"
+  case "${got#*|}" in
+    *'Operation not permitted'*) pass "케이스 46c(오류 문구): RW_GROUP_PROBE_ERR 에 kill -0 오류 문구 보존" ;;
+    *) fail "케이스 46c(오류 문구): 오류 문구 없음 — RW_GROUP_PROBE_ERR='${got#*|}'" ;;
+  esac
+
+  rm -rf "$sandbox"
+}
+
+# ===========================================================================
+# 케이스 47: 어댑터 cleanup — ps 가 cleanup 때만 실패해도 writer 그룹에 신호를 보내고,
+#   그룹 종료를 확인했을 때만 산출물을 안정 이름으로 발행한다 (codex·claude 각각)
+#   signal  — mock 이 TERM 을 따르는 자손을 남기고 exit 1. 그룹 소멸·발행·writer_group: unverified
+#   unknown — 마커 뒤 kill -0 그룹 probe 만 「Operation not permitted」 로 실패(BASH_ENV 함수).
+#             TERM·KILL 은 내장으로 나가므로 그룹은 사라져야 하고, 판정 불가라 발행하지 않는다.
+#   spawn 때 ps 성공은 handshake 로 보장한다(케이스 48 과 같음). 단언은 서로 독립으로 평가한다.
+#   판정(그룹이 사라졌는가)은 테스트 셸의 내장 kill 로 한다 — BASH_ENV 는 어댑터에만 준다.
+# ===========================================================================
+group_cleanup_harness() {  # $1=codex|claude $2=signal|unknown
+  local tool="$1" mode="$2" sandbox expected_turn mock_bin adapter_path tool_bin stable
+  local mode_body bash_env="" job rc="" ticks=0 cap_ticks=200 mpid gone=0 i stream last tag
+  tag="케이스 47-${mode}(${tool})"
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001.md"
+  make_ps_shim "$sandbox/shim" after-marker "$sandbox/ps-broken"
+
+  if [ "$mode" = signal ]; then
+    mode_body="touch \"$sandbox/ps-broken\"
+exit 1"
+  else
+    # 턴을 완성한다 — codex 는 케이스 1 처럼 턴 파일 + SESSION, claude 는 케이스 35 처럼 턴 파일.
+    if [ "$tool" = codex ]; then
+      mode_body="printf 'turn body\n' > \"$expected_turn\"
+printf '## Current Owner\nAuthor\n\n## Status\nawaiting-author\n\n## Turn Limit\n20\n' > \"$sandbox/SESSION.md\""
+    else
+      mode_body="printf 'turn body\n' > \"$expected_turn\""
+    fi
+    mode_body="$mode_body
+touch \"$sandbox/ps-broken\"
+exit 0"
+    bash_env="$sandbox/env.sh"
+    cat > "$bash_env" <<ENV_EOF
+kill() { if [ "\${1:-}" = -0 ] && [ "\${2:-}" = -- ] && [ -e "$sandbox/ps-broken" ]; then echo "kill: (\${3:-}) - Operation not permitted" >&2; return 1; fi; builtin kill "\$@"; }
+ENV_EOF
+  fi
+
+  local body="echo \$\$ > \"$sandbox/mock.pid\"
+( trap - TERM; exec sleep 30 ) &
+$(wait_ps_handshake "$sandbox/shim" "$sandbox")
+$mode_body"
+  if [ "$tool" = codex ]; then
+    write_session "$sandbox" "Reviewer" "awaiting-reviewer"
+    mock_bin="$(setup_mock "$sandbox" "$body")"
+    tool_bin="$mock_bin/codex"; adapter_path="$ADAPTER"; stable="$sandbox/.codex_output.log"
+  else
+    mock_bin="$(setup_mock_claude "$sandbox" "$body")"
+    tool_bin="$mock_bin/claude"; adapter_path="$ADAPTER_CLAUDE"; stable="$sandbox/.claude_output.log"
+  fi
+
+  # 케이스 48 과 같은 방식 — rc 를 sentinel 파일에 쓰고 0.1초 간격 폴링, 상한 20초.
+  set -m
+  (
+    arc=0
+    PATH="$sandbox/shim:$PATH" BASH_ENV="$bash_env" \
+    TOOL_BIN="$tool_bin" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" WAIT_TIMEOUT=60 \
+      bash "$adapter_path" > "$sandbox/out.log" 2>&1 || arc=$?
+    echo "$arc" > "$sandbox/rc"
+  ) &
+  job=$!
+  set +m
+  while [ ! -s "$sandbox/rc" ] && [ "$ticks" -lt "$cap_ticks" ]; do
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
+  [ -s "$sandbox/rc" ] && rc="$(cat "$sandbox/rc")"
+
+  [ ! -e "$sandbox/handshake-timeout" ] \
+    && pass "$tag 전제: spawn 때 ps 성공 handshake 성립" \
+    || fail "$tag 전제: 전제 불성립 — handshake 상한(5초) 초과"
+  [ -n "$rc" ] || fail "$tag: 어댑터가 20초 안에 끝나지 않음"
+
+  # 그룹 소멸 — 고아 자손의 회수를 짧게 기다린다(좀비 구성원은 kill -0 에 「있음」).
+  mpid="$(cat "$sandbox/mock.pid" 2>/dev/null || true)"
+  if [ -z "$mpid" ]; then
+    fail "$tag 그룹: mock pid 를 읽지 못함"
+  else
+    for i in $(seq 1 20); do
+      kill -0 -- -"$mpid" 2>/dev/null || { gone=1; break; }
+      sleep 0.1
+    done
+    [ "$gone" -eq 1 ] \
+      && pass "$tag 그룹: cleanup 이 writer 그룹을 정리함" \
+      || fail "$tag 그룹: 그룹이 살아 있음 (pgid $mpid)"
+  fi
+
+  if [ "$mode" = signal ]; then
+    [ -f "$stable" ] \
+      && pass "$tag 발행: 안정 로그 발행됨" \
+      || fail "$tag 발행: 안정 로그 없음 ($stable)"
+    grep -q '^writer_group: unverified$' "$sandbox/.review_wait_status" 2>/dev/null \
+      && pass "$tag 증거: .review_wait_status 에 writer_group: unverified" \
+      || fail "$tag 증거: writer_group: unverified 없음"
+  else
+    if [ -n "$rc" ] && [ "$rc" -ne 0 ]; then
+      pass "$tag rc: 어댑터 rc=$rc (0 아님)"
+    else
+      fail "$tag rc: 기대 rc≠0 — 실제 rc=${rc:-없음}"
+    fi
+    if [ ! -e "$stable" ] && [ ! -e "$sandbox/.review_wait_status" ]; then
+      pass "$tag 미발행: 안정 로그·상태 파일 모두 없음"
+    else
+      fail "$tag 미발행: 안정 로그가 발행됨 (log=$([ -e "$stable" ] && echo 있음 || echo 없음), status=$([ -e "$sandbox/.review_wait_status" ] && echo 있음 || echo 없음))"
+    fi
+    grep -q '발행하지 않았습니다' "$sandbox/out.log" 2>/dev/null \
+      && pass "$tag 안내: stderr 에 미발행 안내" \
+      || fail "$tag 안내: stderr 에 안내 없음"
+    stream="$( { ls "$sandbox"/.review_wait_status.* 2>/dev/null || true; } | head -n 1)"
+    last=""
+    [ -n "$stream" ] && last="$(awk '$0 == "=== rd-review-wait-snapshot ===" { buf = ""; next } { buf = buf $0 "\n" } END { printf "%s", buf }' "$stream" 2>/dev/null || true)"
+    case "$last" in
+      *"log_preserved_reason: ${tool}-group-unknown"*) pass "$tag 스트림: 마지막 snapshot 에 log_preserved_reason: ${tool}-group-unknown" ;;
+      *) fail "$tag 스트림: 스트림에 사유 없음 (stream='${stream}')" ;;
+    esac
+    if [ "$tool" = codex ]; then
+      [ ! -e "$sandbox/.turn_ready" ] \
+        && pass "$tag 마커: .turn_ready 없음" \
+        || fail "$tag 마커: .turn_ready 존재"
+    fi
+  fi
+
+  kill -9 -- -"$job" 2>/dev/null || true
+  reap_mock_group "$sandbox"
+  wait "$job" 2>/dev/null || true
+  rm -rf "$sandbox"
+}
+
+run_case47() {
+  group_cleanup_harness codex signal
+  group_cleanup_harness claude signal
+  group_cleanup_harness codex unknown
+  group_cleanup_harness claude unknown
+}
+
+# ===========================================================================
+# 케이스 48: watchdog KILL — ps 가 판정 중에 실패해도 TERM 무시 그룹을 KILL 한다
+#   mock(claude)은 TERM 을 무시하는 자손을 띄우고 자신도 TERM 을 무시한다. spawn 때 ps 는
+#   성공하고(handshake), 그 뒤로는 ps 가 실패한다. watchdog 이 ps 실패를 「그룹 없음」 으로
+#   읽으면 KILL 을 건너뛰어 부모의 wait 가 mock 의 sleep 60 까지 막힌다.
+#   단언 셋은 서로 독립으로 평가한다(앞 단언이 실패해도 뒤 단언을 평가한다).
+# ===========================================================================
+run_case48() {
+  local sandbox expected_turn mock_bin job rc="" ticks=0 cap_ticks=150 mpid gone=0 i
+  sandbox="$(make_sandbox)"
+  expected_turn="$sandbox/turns/turn-001.md"
+  make_ps_shim "$sandbox/shim" after-marker "$sandbox/ps-broken"
+  mock_bin="$(setup_mock_claude "$sandbox" "echo \$\$ > \"$sandbox/mock.pid\"
+( trap '' TERM; exec sleep 60 ) &
+trap '' TERM
+$(wait_ps_handshake "$sandbox/shim" "$sandbox")
+touch \"$sandbox/ps-broken\"
+sleep 60")"
+
+  # 케이스 2 와 같은 방식 — rc 를 sentinel 파일에 쓰고 0.1초 간격 폴링, 상한 15초.
+  set -m
+  (
+    arc=0
+    PATH="$sandbox/shim:$mock_bin:$PATH" \
+    TOOL_BIN="$mock_bin/claude" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=2 \
+      bash "$ADAPTER_CLAUDE" >/dev/null 2>&1 || arc=$?
+    echo "$arc" > "$sandbox/rc"
+  ) &
+  job=$!
+  set +m
+  while [ ! -s "$sandbox/rc" ] && [ "$ticks" -lt "$cap_ticks" ]; do
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
+  [ -s "$sandbox/rc" ] && rc="$(cat "$sandbox/rc")"
+
+  [ ! -e "$sandbox/handshake-timeout" ] \
+    && pass "케이스 48-전제: spawn 때 ps 성공 handshake 성립" \
+    || fail "케이스 48-전제: 전제 불성립 — handshake 상한(5초) 초과"
+
+  if [ -z "$rc" ]; then
+    fail "케이스 48-종료: 15초 안에 끝나지 않음 — watchdog 이 KILL 을 건너뛴 결함 의심"
+  elif [ "$rc" -eq 124 ]; then
+    pass "케이스 48-종료: 상한 안에 rc=124 (약 $((ticks / 10)).$((ticks % 10))초)"
+  else
+    fail "케이스 48-종료: 기대 rc=124 — 실제 rc=$rc"
+  fi
+
+  # 고아가 된 자손의 회수(init)를 짧게 기다린다 — 좀비 구성원은 kill -0 에 「있음」 으로 보인다.
+  mpid="$(cat "$sandbox/mock.pid" 2>/dev/null || true)"
+  if [ -z "$mpid" ]; then
+    fail "케이스 48-그룹: mock pid 를 읽지 못함"
+  else
+    for i in $(seq 1 20); do
+      kill -0 -- -"$mpid" 2>/dev/null || { gone=1; break; }
+      sleep 0.1
+    done
+    [ "$gone" -eq 1 ] \
+      && pass "케이스 48-그룹: TERM 무시 자손까지 그룹 소멸" \
+      || fail "케이스 48-그룹: 그룹이 살아 있음 (pgid $mpid)"
+  fi
+
+  kill -9 -- -"$job" 2>/dev/null || true
+  reap_mock_group "$sandbox"
+  wait "$job" 2>/dev/null || true
+  rm -rf "$sandbox"
+}
+
 
 # ===========================================================================
 # 실행
 # ===========================================================================
-echo "=== adapter_codex.sh 대기 계약·판정 단일화 테스트 ==="
-echo ""
+# 인자 검증: 모든 케이스 정의 뒤, 실행 전에 한다 (오타가 0건 통과로 끝나지 않게)
+# run_case<이름> 접두사는 아래 `run <이름>` 으로 실행하는 공개 케이스 전용이다. 도우미 함수에 쓰지 않는다
+# (쓰면 선택·안내 목록에 끼어 0건 실행이 exit 0 으로 끝난다).
+for a in "${SELECTED[@]+"${SELECTED[@]}"}"; do
+  if ! declare -F "run_case$a" >/dev/null; then
+    echo "알 수 없는 케이스: $a" >&2
+    echo "사용 가능: $(declare -F | sed -n 's/^declare -f run_case//p' | tr '\n' ' ')" >&2
+    exit 2
+  fi
+done
 
-run_case1
-run_case2
-run_case3
-run_case4
-run_case5
-run_case6
+PS_OK=1; ps_is_trustworthy || PS_OK=0
 
-echo ""
-echo "=== §2 결정 3 — run_review_turn.sh 설정 파싱 1회 통합 테스트 (Task 2) ==="
-echo ""
+section "adapter_codex.sh 대기 계약·판정 단일화 테스트"
 
-run_case7
-run_case8
-run_case9
-run_case10
-run_case11
+run 1
+run 2
+run 3
+run 4
+run 5
+run 6
 
-echo ""
-echo "=== 회귀 테스트 — .tools/.overrides 부재 방어 (fix: priority 폐기 회귀) ==="
-echo ""
+section "§2 결정 3 — run_review_turn.sh 설정 파싱 1회 통합 테스트 (Task 2)"
 
-run_case12
-run_case13
+run 7
+run 8
+run 9
+run 10
+run 11
 
-echo ""
-echo "=== 회귀 테스트 — watchdog 자손 lifecycle (fix: 고아 sleep 이 호출자 파이프 점유) ==="
-echo ""
+section "회귀 테스트 — .tools/.overrides 부재 방어 (fix: priority 폐기 회귀)"
 
-run_case14
-run_case15
+run 12
+run 13
 
-echo ""
-echo "=== 회귀 테스트 — writable surface 세션 하위 폐쇄 (codex-adapter-writable-root) ==="
-echo ""
+section "회귀 테스트 — watchdog 자손 lifecycle (fix: 고아 sleep 이 호출자 파이프 점유)"
 
-run_case16
+run 14
+run 15
 
-echo ""
-echo "=== 회귀 테스트 — 환경변수 해석 (review-turn-timeout-too-short Task 1) ==="
-echo ""
+section "회귀 테스트 — writable surface 세션 하위 폐쇄 (codex-adapter-writable-root)"
 
-run_case17
+run 16
 
-echo ""
-echo "=== 회귀 테스트 — codex 출력 관측 기반 유휴 판정 (review-turn-timeout-too-short Task 2) ==="
-echo ""
+section "회귀 테스트 — 환경변수 해석 (review-turn-timeout-too-short Task 1)"
 
-run_case18
-run_case19
-run_case20
+run 17
 
-echo ""
-echo "=== 회귀 테스트 — heartbeat·상태 파일 (review-turn-timeout-too-short Task 3) ==="
-echo ""
+section "회귀 테스트 — codex 출력 관측 기반 유휴 판정 (review-turn-timeout-too-short Task 2)"
 
-run_case21
+run 18
+run 19
+run 20
 
-echo ""
-echo "=== 회귀 테스트 — 활동 관측 fd 채널·유효 상한 (review-turn-timeout-too-short Task 4 / 턴 006 Critical 1) ==="
-echo ""
+section "회귀 테스트 — heartbeat·상태 파일 (review-turn-timeout-too-short Task 3)"
 
-run_case22
-run_case24
+run 21
 
-echo ""
-echo "=== 회귀 테스트 — 타임아웃 메시지 오염 단정 금지 (review-turn-timeout-too-short Task 5) ==="
-echo ""
+section "회귀 테스트 — 활동 관측 fd 채널·유효 상한 (review-turn-timeout-too-short Task 4 / 턴 006 Critical 1)"
 
-run_case23
+run 22
+run 24
 
-echo ""
-echo "=== 회귀 테스트 — 상태 snapshot 초기화·관리 키 단일 (final diff review Important 2) ==="
-echo ""
+section "회귀 테스트 — 타임아웃 메시지 오염 단정 금지 (review-turn-timeout-too-short Task 5)"
 
-run_case25
+run 23
 
-echo ""
-echo "=== 회귀 테스트 — 상태 파일 쓰기 symlink 비추종 (final diff review Critical 1) ==="
-echo ""
+section "회귀 테스트 — 상태 snapshot 초기화·관리 키 단일 (final diff review Important 2)"
 
-run_case26
+run 25
 
-echo ""
-echo "=== 회귀 테스트 — 로그 최종 이동 실패 정직 보고 (final diff review Important 3) ==="
-echo ""
+section "회귀 테스트 — 상태 파일 쓰기 symlink 비추종 (final diff review Critical 1)"
 
-run_case27
+run 26
 
-echo ""
-echo "=== 회귀 테스트 — 산출물 수명 재설계 (final diff review 턴 004 Important 3·4) ==="
-echo ""
+section "회귀 테스트 — 로그 최종 이동 실패 정직 보고 (final diff review Important 3)"
 
-run_case28
-run_case29
+run 27
 
-echo ""
-echo "=== 회귀 테스트 — 읽기 채널 fd 전용·안정 이름 수명 (final diff review 턴 006 Critical 1·Important 2) ==="
-echo ""
+section "회귀 테스트 — 산출물 수명 재설계 (final diff review 턴 004 Important 3·4)"
 
-run_case30
-run_case31
+run 28
+run 29
 
-echo ""
-echo "=== 회귀 테스트 — 진단 읽기 지연에 의한 뒤늦은 마커 오분류 방지 (final diff review 008턴 Important 1) ==="
-echo ""
+section "회귀 테스트 — 읽기 채널 fd 전용·안정 이름 수명 (final diff review 턴 006 Critical 1·Important 2)"
 
-run_case32
+run 30
+run 31
 
-echo ""
-echo "=== claude 대기 계약 행동 검증 (adapter-wait-contract Task 3) ==="
-echo ""
+section "회귀 테스트 — 진단 읽기 지연에 의한 뒤늦은 마커 오분류 방지 (final diff review 008턴 Important 1)"
 
-run_case33
-run_case34
-run_case35
-run_case36a
-run_case36b
-run_case36c
-run_case36d
-run_case37
-run_case38
-run_case39
-run_case40
+run 32
 
-run_case41
+section "claude 대기 계약 행동 검증 (adapter-wait-contract Task 3)"
+
+run 33
+run 34
+run 35
+run 36a
+run 36b
+run 36c
+run 36d
+run 37
+run 38
+run 39
+run 40
+
+run 41
+
+section "writer 종료 증거 계약 (spec §6 개정 1)"
+
+run 42
+run 43
+run 44
+
+section "타임아웃 기록 진행 표시"
+
+run 45
+
+section "ps 실패 시 그룹 생존 판정·watchdog KILL"
+
+run 46
+run 47
+run 48
 
 echo ""
-echo "=== writer 종료 증거 계약 (spec §6 개정 1) ==="
-echo ""
-
-run_case42
-run_case43
-run_case44
-
-echo ""
-echo "=== 타임아웃 기록 진행 표시 ==="
-echo ""
-
-run_case45
-
-echo ""
-echo "=== 결과: PASS=$PASS FAIL=$FAIL ==="
+echo "=== 결과: PASS=$PASS FAIL=$FAIL SKIP=$SKIP ==="
+if [ "$SKIP" -gt 0 ]; then
+  echo "ps 를 쓸 수 없는 환경이라 ${SKIP}개를 건너뛰었습니다 — 이 실행은 그 단언을 검증하지 않았습니다."
+fi
 
 if [ "${#ERRORS[@]}" -gt 0 ]; then
   echo "실패 케이스:"

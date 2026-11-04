@@ -310,6 +310,53 @@ STUBEOF
   rm -rf "$fx"
 }
 
+# 회귀 단언 — 다중 파일 호출에서 가운데 파일의 실행 오류가 뒤 파일 성공에 덮이지 않아야 한다.
+test_multi_file_middle_error() {
+  local fx out rc
+  fx="$(_mk_fixture_root)"
+  printf -- '- related files: `rd-workflow/scripts/missA.sh`\n' > "${fx}/a.md"
+  printf -- '- related files: `rd-workflow/scripts/missC.sh`\n' > "${fx}/c.md"
+  out="$(bash "$TARGET" "${fx}/a.md" "${fx}/absent.md" "${fx}/c.md" --root "$fx" 2>&1)"; rc=$?
+  if [[ "$rc" -eq 2 ]] \
+     && printf '%s' "$out" | grep -q "a.md:1: 참조 경로 없음 — rd-workflow/scripts/missA.sh" \
+     && printf '%s' "$out" | grep -q "입력 FR 파일이 없습니다" \
+     && printf '%s' "$out" | grep -q "c.md:1: 참조 경로 없음 — rd-workflow/scripts/missC.sh" \
+     && printf '%s' "$out" | grep -q "c.md: 대상 1개 중 1개 부재"; then
+    pass "multi_file_middle_error: 가운데 파일 부재 → rc 2, 앞뒤 파일 결과 모두 출력"
+  else
+    fail "multi_file_middle_error: rc=$rc out=$out"
+  fi
+  rm -rf "$fx"
+}
+
+# 회귀 단언 — self_test 래퍼가 done 항목은 검사하지 않고 status 줄 없는 항목은 검사한다.
+# 래퍼가 활성 항목만 걸러 검사기에 넘기도록 바뀌기 전에는 FAIL 한다(done 항목 경고도 나옴).
+test_wrapper_active_filter() {
+  local fx out
+  fx="$(mktemp -d)" || { fail "wrapper_active_filter fixture mktemp 실패"; return; }
+  mkdir -p "${fx}/rd-workflow/scripts" "${fx}/rd-workflow-workspace/backlog/items"
+  cp "${SCRIPT_DIR}/self_test.sh" "${fx}/rd-workflow/scripts/self_test.sh"
+  cp "$TARGET" "${fx}/rd-workflow/scripts/check_fr_related_files_existence.sh"
+  cp "$PARSER" "${fx}/rd-workflow/scripts/check_skill_reference_existence.sh"
+  printf -- '# done item\n- status: done\n- related files: `rd-workflow/scripts/gone_done.sh`\n' \
+    > "${fx}/rd-workflow-workspace/backlog/items/done-item.md"
+  printf -- '# no status item\n- related files: `rd-workflow/scripts/gone_nostatus.sh`\n' \
+    > "${fx}/rd-workflow-workspace/backlog/items/nostatus-item.md"
+  # status 가 개행 없는 마지막 줄인 done 항목도 비활성으로 판정해야 한다 (final diff review F2)
+  printf -- '# eof done item\n- related files: `rd-workflow/scripts/gone_eofdone.sh`\n- status: done' \
+    > "${fx}/rd-workflow-workspace/backlog/items/eofdone-item.md"
+  out="$(RD_SELFTEST_CHECKER_ONLY=fr_related_files_existence_check \
+    bash "${fx}/rd-workflow/scripts/self_test.sh" 2>&1)"
+  if printf '%s' "$out" | grep -q "gone_nostatus.sh" \
+     && ! printf '%s' "$out" | grep -q "gone_done.sh" \
+     && ! printf '%s' "$out" | grep -q "gone_eofdone.sh"; then
+    pass "wrapper_active_filter: status 없는 항목만 경고, done 항목(개행 없는 마지막 줄 포함)은 검사하지 않음"
+  else
+    fail "wrapper_active_filter: out=$out"
+  fi
+  rm -rf "$fx"
+}
+
 test_all_present
 test_partial_missing_channel_separated
 test_all_missing
@@ -324,4 +371,6 @@ test_exec_error_parser_missing_functions
 test_exec_error_parser_premature_exit0
 test_probe_handles_special_char_install_path
 test_selftest_empty_backlog_succeeds_and_propagates_error
+test_multi_file_middle_error
+test_wrapper_active_filter
 exit $FAIL

@@ -21,14 +21,18 @@ trap cleanup EXIT INT TERM
 ok()  { PASS=$((PASS+1)); }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $*" >&2; }
 
+# _kv <줄> <키> → REPLY: 줄의 마지막 `키=값` 의 값(공백 전까지). 키가 없으면 빈 값.
+# sed 's/.*키=\([^ ]*\).*/\1/p' 와 같은 결과를 서브셸 없이 낸다.
+_kv() { REPLY=""; case "$1" in *"$2="*) REPLY="${1##*"$2"=}"; REPLY="${REPLY%% *}" ;; esac; }
+
 # check <이름> <manifest> <기대 state> [기대 missing 토큰] [기대 reason]
 check() {
   local name="$1" mf="$2" want_state="$3" want_missing="${4:-}" want_reason="${5:-}"
   local line state missing reason
   line="$(bash "$BM" archive-state "$mf" "$SLUG" 2>/dev/null | head -n1)"
-  state="$(printf '%s' "$line"   | sed -n 's/.*state=\([^ ]*\).*/\1/p')"
-  missing="$(printf '%s' "$line" | sed -n 's/.*missing=\([^ ]*\).*/\1/p')"
-  reason="$(printf '%s' "$line"  | sed -n 's/.*reason=\([^ ]*\).*/\1/p')"
+  _kv "$line" state;   state="$REPLY"
+  _kv "$line" missing; missing="$REPLY"
+  _kv "$line" reason;  reason="$REPLY"
   if [[ "$state" != "$want_state" ]]; then
     bad "$name — 기대 state=$want_state, 실제 '$state' (줄: $line)"; return
   fi
@@ -228,6 +232,19 @@ case " $RESTORED " in *" cc "*) ok ;; *) bad "restore: 간접 의존 cc 미산�
 case " $RESTORED " in *" ff "*) bad "restore: blocked 선행(ee)이 남은 ff 를 산출했습니다 ('$RESTORED')" ;; *) ok ;; esac
 case " $RESTORED " in *" dd "*) bad "restore: excluded 항목 dd 를 산출했습니다 ('$RESTORED')" ;; *) ok ;; esac
 case " $RESTORED " in *" gg "*) bad "restore: root 와 무관한 가지 gg 를 산출했습니다 ('$RESTORED')" ;; *) ok ;; esac
+
+# --- P3 회귀: restore-dependents 의 후손 탐색은 의존 slug 를 원소 단위로 완전 일치시킨다 ---
+# a-b 는 a 와 무관한 a-x 에만 의존한다. 부분 문자열 일치면 a-b 가 a 의 후손으로 잡혀 산출된다.
+PO="$WORK/prefix-overlap-mf.json"
+cat > "$PO" <<'JSON'
+{"finish_policy":"push","status":"done","items":[
+  {"slug":"a","order":1,"depends_on":[],"state":"completed","feasibility":"eligible","block_reason":"","outcome":"completed"},
+  {"slug":"a-x","order":2,"depends_on":[],"state":"completed","feasibility":"eligible","block_reason":"","outcome":"completed"},
+  {"slug":"a-b","order":3,"depends_on":["a-x"],"state":"skipped","feasibility":"eligible","block_reason":"","outcome":""}
+]}
+JSON
+RESTORED3="$(bash "$BM" restore-dependents "$PO" a 2>/dev/null | tr '\n' ' ')"
+case " $RESTORED3 " in *" a-b "*) bad "restore_prefix_overlap: a 와 무관한 a-b 를 산출했습니다 ('$RESTORED3')" ;; *) ok ;; esac
 
 # --- F2 회귀: 완료 기록·후속 복원 사이에 중단돼도 재조정이 수렴한다 ---
 # 완료 전이와 각 후속 pending 전이는 별도 set-state 로 flush 되므로 그 사이 중단이

@@ -45,11 +45,24 @@ _frr_skip() { # <slug> <branch> <reason> <사유문> — exit 3 계약 (호출�
   return 3
 }
 
-# 인덱스 파일에서 제목 == slug 인 행만 출력 (파일 인자가 - 면 stdin)
-_frr_rows_for() { awk -F'|' -v s="$2" '/^\|/ { t = $3; gsub(/^[ \t]+|[ \t]+$/, "", t); if (t == s) print }' "$1"; }
+# 인덱스 파일에서 제목 칸 == slug 인 행만 출력 (파일 인자가 - 면 stdin). 제목 칸은 헤더의 `제목` 셀로 찾고(index_title_field), 헤더 뒤 행만 본다. 출력은 원래 행 그대로.
+#   rc 0 정상(0행 포함) / 4 `제목` 헤더 없음 / 5 출력 0행인데 다른 칸에 slug 와 같은 셀이 있음.
+_frr_rows_for() { # <file|-> <slug>
+  local data f
+  data="$(cat "$1")"
+  f="$(printf '%s\n' "$data" | index_title_field -)" || return 4
+  printf '%s\n' "$data" | awk -v s="$2" -v f="$f" '
+    /^\|/ { l = $0; gsub(/\\\|/, "\001", l); n = split(l, a, "|")
+      if (!seen) { c = a[f]; gsub(/^[ \t]+|[ \t]+$/, "", c); if (c == "제목") seen = 1; next }
+      t = a[f]; gsub(/^[ \t]+|[ \t]+$/, "", t)
+      if (t == s) { print; cnt++; next }
+      for (i = 1; i <= n; i++) if (i != f) { c = a[i]; gsub(/^[ \t]+|[ \t]+$/, "", c); if (c == s) other = 1 } }
+    END { exit (cnt == 0 && other) ? 5 : 0 }'
+}
 # base 인덱스(파일) 의 마지막 표 행 뒤에 행 1개 삽입 → stdout (출력은 줄 끝 개행으로 정규화된다)
 _frr_insert_row() { # <base-file> <row>
-  awk -v row="$2" '{ l[NR] = $0; if ($0 ~ /^\|/) last = NR } END { for (i = 1; i <= NR; i++) { print l[i]; if (i == last) print row } }' "$1"
+  # awk -v 는 값의 백슬래시 이스케이프(`\|` 등)를 해석해 지우므로 ENVIRON 으로 넘긴다 — 요약의 `\|` 가 합성 행에서 구분자로 바뀌는 것을 막는다.
+  FRR_ROW="$2" awk '{ l[NR] = $0; if ($0 ~ /^\|/) last = NR } END { for (i = 1; i <= NR; i++) { print l[i]; if (i == last) print ENVIRON["FRR_ROW"] } }' "$1"
 }
 
 # 무손실 교체 — 대상을 같은 디렉터리의 임시 이름으로 옮긴 뒤(원자적 rename) 새 내용을 hard link 로 놓고, 옮긴 원본이 기대한 옛 내용과 같을 때만 성공한다.
@@ -231,7 +244,9 @@ fr_register_run() { # <slug> → exit 0 (committed|already) / 3 (skipped)
   # 1) 입력 추출 — 현재 워킹트리
   [[ -L "$FR_IDX_PATH" ]] && { _frr_skip "$slug" "$default" path-symlink "인덱스 파일이 symlink 입니다: $FR_IDX_PATH"; _frr_restore_traps; return 3; }
   [[ -f "$FR_IDX_PATH" ]] || { _frr_skip "$slug" "$default" row-not-found "현재 워킹트리에 $FR_IDX_PATH 가 없습니다"; _frr_restore_traps; return 3; }
-  row="$(_frr_rows_for "$FR_IDX_PATH" "$slug")"
+  row="$(_frr_rows_for "$FR_IDX_PATH" "$slug")" && rc=0 || rc=$?
+  [[ "$rc" -ne 4 ]] || { _frr_skip "$slug" "$default" index-format "인덱스 표에서 '제목' 헤더 칸을 찾지 못했습니다 — 표 형식을 확인하십시오. 재실행으로는 풀리지 않습니다"; _frr_restore_traps; return 3; }
+  [[ "$rc" -ne 5 ]] || { _frr_skip "$slug" "$default" row-column-mismatch "'$slug' 가 제목 칸이 아닌 다른 칸에 있습니다 — 표의 칸 배치를 확인하십시오"; _frr_restore_traps; return 3; }
   n="$(printf '%s' "$row" | grep -c . || true)"
   [[ "$n" -ne 0 ]] || { _frr_skip "$slug" "$default" row-not-found "인덱스에 '$slug' 행이 없습니다"; _frr_restore_traps; return 3; }
   [[ "$n" -eq 1 ]] || { _frr_skip "$slug" "$default" row-ambiguous "인덱스에 '$slug' 행이 $n 개입니다"; _frr_restore_traps; return 3; }
@@ -258,7 +273,7 @@ fr_register_run() { # <slug> → exit 0 (committed|already) / 3 (skipped)
   done
 
   # 2) 중복·충돌 — 보존 대상 tuple(행 전문·상세 blob·선택 캡처) 전부가 같을 때만 already. 부분 일치는 명시 reason 으로 skipped.
-  base_row="$(git cat-file -p "${ref}:${FR_IDX_PATH}" 2>/dev/null | _frr_rows_for - "$slug")"
+  base_row="$(git cat-file -p "${ref}:${FR_IDX_PATH}" 2>/dev/null | _frr_rows_for - "$slug")" || true   # 기본 브랜치에 인덱스가 없으면 rc 4 — 여기서는 보지 않고 뒤의 cat-file 이 git-error 로 중단한다
   if [[ -n "$cap" ]] && git cat-file -e "${ref}:${cap}" 2>/dev/null; then
     if [[ "$(git rev-parse "${ref}:${cap}")" != "$(git hash-object "$cap")" ]]; then
       _frr_skip "$slug" "$default" capture-conflict "기본 브랜치에 같은 경로의 캡처가 다른 내용으로 있습니다: $cap"; _frr_restore_traps; return 3

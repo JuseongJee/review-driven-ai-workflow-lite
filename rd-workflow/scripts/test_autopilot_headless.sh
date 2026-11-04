@@ -85,7 +85,7 @@ STUB
 chmod +x "${TMP}/bin/claude"
 probe_of="${TMP}/probe"; seen_file="${TMP}/seen"; : > "$seen_file"
 env -u RD_CHILD_SESSION PATH="${TMP}/bin:$PATH" RD_PROBE_SEEN_FILE="$seen_file" \
-  RD_AUTOPILOT_FR=probe RD_AUTOPILOT_OUTCOME_FILE="$probe_of" \
+  RD_AUTOPILOT_FR=probe RD_FR_WALL_MINUTES=0 RD_AUTOPILOT_OUTCOME_FILE="$probe_of" \
   bash "$WRAPPER" >/dev/null 2>&1
 probe_seen="$(cat "$seen_file" 2>/dev/null)"
 if [[ "$probe_seen" == "1" ]]; then
@@ -110,10 +110,10 @@ assert_chdir_outcome() {  # $1=desc $2=RD_AUTOPILOT_OUTCOME_FILE 값(빈값이�
   ( cd "${TMP}/caller" || exit 40
     if [[ -n "$of" ]]; then
       env PATH="${TMP}/bin:$PATH" RD_PROBE_CHDIR="${TMP}/elsewhere" \
-        RD_AUTOPILOT_FR=probe RD_AUTOPILOT_OUTCOME_FILE="$of" bash "$WRAPPER" >/dev/null 2>&1
+        RD_AUTOPILOT_FR=probe RD_FR_WALL_MINUTES=0 RD_AUTOPILOT_OUTCOME_FILE="$of" bash "$WRAPPER" >/dev/null 2>&1
     else
       env PATH="${TMP}/bin:$PATH" RD_PROBE_CHDIR="${TMP}/elsewhere" \
-        RD_AUTOPILOT_FR=probe bash "$WRAPPER" >/dev/null 2>&1
+        RD_AUTOPILOT_FR=probe RD_FR_WALL_MINUTES=0 bash "$WRAPPER" >/dev/null 2>&1
     fi )
   local code=$?
   if [[ "$code" == 0 ]]; then
@@ -142,7 +142,7 @@ assert_timeout_env() {  # $1=desc $2=기대 seen $3=stderr 부분문자열 $4..=
   local seen_f="${TMP}/t-seen" err_f="${TMP}/t-err" of="${TMP}/t-outcome"
   : > "$seen_f"; : > "$err_f"
   env -u BASH_DEFAULT_TIMEOUT_MS -u BASH_MAX_TIMEOUT_MS PATH="${TMP}/tbin:$PATH" \
-    RD_PROBE_SEEN_FILE="$seen_f" RD_AUTOPILOT_FR=probe RD_AUTOPILOT_OUTCOME_FILE="$of" "$@" \
+    RD_PROBE_SEEN_FILE="$seen_f" RD_AUTOPILOT_FR=probe RD_FR_WALL_MINUTES=0 RD_AUTOPILOT_OUTCOME_FILE="$of" "$@" \
     bash "$WRAPPER" >/dev/null 2>"$err_f"
   local seen err; seen="$(cat "$seen_f")"; err="$(cat "$err_f")"
   if [[ "$seen" == "$want_seen" && "$err" == *"$want_err"* ]]; then

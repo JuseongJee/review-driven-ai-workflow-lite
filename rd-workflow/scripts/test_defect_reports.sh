@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -uo pipefail
+# 셸의 GH_HOST 와 무관하게 github.com 대상이 호스트를 명시하는지 검사한다.
+# 비우면 운영 결함을 가린다.
+export GH_HOST=decoy.invalid
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TARGET="$SCRIPT_DIR/defect_reports.sh"

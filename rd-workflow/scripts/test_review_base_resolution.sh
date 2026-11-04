@@ -83,6 +83,7 @@ mk_repo() {
      "${RD_SRC}/scripts/run_review_turn.sh" \
      "${RD_SRC}/scripts/review_common.sh" \
      "${RD_SRC}/scripts/_state_common.sh" \
+     "${RD_SRC}/scripts/_submodule_common.sh" \
      "${RD_SRC}/scripts/_task_common.sh" \
      "${RD_SRC}/scripts/rd" \
      "${RD_SRC}/scripts/verify_record.sh" \
@@ -461,6 +462,95 @@ prep "$RE" --base "$REBASE"; rc=$?
 eq "$rc" "1" "동일 tree: 세션 생성 차단 — exit 1"
 eq "$(session_count "$RE")" "0" "동일 tree: 세션 미생성"
 has "리뷰할 변경이 없습니다" "$(cat "${OUT}/prep.err")" "동일 tree: 사유 안내"
+
+echo "=== 10b. ref·접두 없는 위치 인자 (change-spec 2.2~2.4) ==="
+# fixture: main 에 base, fr/x 에 커밋 1개, 그 뒤 main 전진. 태그 v1.0 = 분기 지점.
+RR="$(mk_repo)" || { echo "  FAIL  10b: fixture 생성 실패"; exit 1; }
+RRFORK="$(git -C "$RR" rev-parse HEAD)"
+git -C "$RR" tag v1.0
+git -C "$RR" checkout -q -b fr/x
+commit_code "$RR" x1
+RRTIP="$(git -C "$RR" rev-parse HEAD)"
+git -C "$RR" checkout -q main
+commit_code "$RR" main-adv
+git -C "$RR" checkout -q fr/x
+
+prep "$RR" "main"; rc=$?
+eq "$rc" "0" "10b A1: ref 하나 — 성공"
+SRR="$(session_dir "$RR")"
+eq "$(bc_field "$SRR" review-base-oid)" "$RRFORK" "10b A1: base-oid = 분기 지점"
+eq "$(bc_field "$SRR" review-head-oid)" "$RRTIP" "10b A1: head-oid = 현재 HEAD"
+eq "$(bc_field "$SRR" review-head-policy)" "auto" "10b A1: policy auto"
+has "'main' 를 비교 기준으로 해석했습니다" "$(cat "${OUT}/prep.err")" "10b A2: 해석 안내 문구"
+has "${RRFORK:0:12}" "$(cat "${OUT}/prep.err")" "10b A2: 안내에 base 축약 OID"
+rm -rf "${RR}/${SESS_REL:?}"/*
+
+prep "$RR" "git diff main"; rc=$?
+eq "$rc" "0" "10b A3: 접두 있는 ref 하나 — 성공"
+SRR="$(session_dir "$RR")"
+eq "$(bc_field "$SRR" review-base-oid)" "$RRFORK" "10b A3: base-oid 동일"
+eq "$(bc_field "$SRR" review-head-oid)" "$RRTIP" "10b A3: head-oid 동일"
+eq "$(bc_field "$SRR" review-head-policy)" "auto" "10b A3: policy auto"
+rm -rf "${RR}/${SESS_REL:?}"/*
+
+prep "$RR" "main...fr/x"; rc=$?
+eq "$rc" "0" "10b A4: 접두 없는 세 점 — 성공"
+SRR="$(session_dir "$RR")"
+eq "$(bc_field "$SRR" review-base-oid)" "$RRFORK" "10b A4: base-oid = merge-base"
+eq "$(bc_field "$SRR" review-head-oid)" "$RRTIP" "10b A4: head-oid = fr/x tip"
+eq "$(bc_field "$SRR" review-head-policy)" "pinned" "10b A4: policy pinned"
+rm -rf "${RR}/${SESS_REL:?}"/*
+
+prep "$RR" "v1.0"; rc=$?
+eq "$rc" "0" "10b A6: 점이 든 태그 — 성공"
+SRR="$(session_dir "$RR")"
+eq "$(bc_field "$SRR" review-base-oid)" "$RRFORK" "10b A6: base-oid = 태그 지점"
+
+# A9: A1 과 같은 형태의 세션을 종결해 플래그 없이 seal
+close_session "$SRR"
+seal "$RR" "${SRR#${RR}/}"; rc=$?
+eq "$rc" "0" "10b A9: ref 하나 세션이 플래그 없이 seal 성공"
+SIDR="$(basename "$SRR")"
+eq "$(seal_field "$(marker_path "$RR" "$SIDR")" verified)" "yes" "10b A9: 마커 verified=yes"
+rm -rf "${RR}/${SESS_REL:?}"/*
+
+N0="$(session_count "$RR")"
+prep "$RR" "no-such-ref"; rc=$?
+eq "$rc" "1" "10b A7: 해석 불가 ref — exit 1"
+eq "$(session_count "$RR")" "$N0" "10b A7: 세션 미생성"
+has "커밋으로 해석할 수 없습니다" "$(cat "${OUT}/prep.err")" "10b A7: 사유 안내"
+
+prep "$RR" "fr/x"; rc=$?
+eq "$rc" "1" "10b A8: 현재 브랜치 이름 — exit 1"
+has "리뷰할 변경이 없습니다" "$(cat "${OUT}/prep.err")" "10b A8: 기존 사유"
+has "비교 기준 브랜치를 주십시오" "$(cat "${OUT}/prep.err")" "10b A8: 추가 안내"
+
+# A5: 접두 없는 두 점은 왼쪽(전진한 main tip)을 그대로 base 로 쓰므로 조상 검사에 걸립니다.
+R5="$(mk_repo)" || { echo "  FAIL  10b A5: fixture 생성 실패"; exit 1; }
+git -C "$R5" checkout -q -b fr/y
+commit_code "$R5" y1
+git -C "$R5" checkout -q main
+commit_code "$R5" main-adv5
+git -C "$R5" checkout -q fr/y
+prep "$R5" "main..fr/y"; rc=$?
+eq "$rc" "1" "10b A5: 접두 없는 두 점 — 조상 검사 실패"
+has "조상이 아닙니다" "$(cat "${OUT}/prep.err")" "10b A5: 사유 안내"
+
+# A10: `-` 로 시작하는 한 토큰(`git diff --cached` 등)은 ref 로 해석하지 않고 legacy 로 남습니다.
+R10="$(mk_repo)" || { echo "  FAIL  10b A10: fixture 생성 실패"; exit 1; }
+prep "$R10" "git diff --cached"; rc=$?
+eq "$rc" "0" "10b A10: 'git diff --cached' — legacy 세션 생성"
+eq "$(bc_field "$(session_dir "$R10")" review-base-oid)" "" "10b A10: legacy 라 base-oid 미기록"
+
+# A11: 오른쪽이 빈 세 점(`main...`)은 양끝 중 빈 쪽이 있어 파싱 불가 — 두 점으로 오해하지 않고 legacy 로 남습니다.
+R11="$(mk_repo)" || { echo "  FAIL  10b A11: fixture 생성 실패"; exit 1; }
+prep "$R11" "main..."; rc=$?
+eq "$rc" "0" "10b A11: 'main...' — legacy 세션 생성"
+eq "$(bc_field "$(session_dir "$R11")" review-base-oid)" "" "10b A11: 'main...' legacy 라 base-oid 미기록"
+R11B="$(mk_repo)" || { echo "  FAIL  10b A11: fixture 생성 실패"; exit 1; }
+prep "$R11B" "git diff main..."; rc=$?
+eq "$rc" "0" "10b A11: 'git diff main...' — legacy 세션 생성"
+eq "$(bc_field "$(session_dir "$R11B")" review-base-oid)" "" "10b A11: 'git diff main...' legacy 라 base-oid 미기록"
 
 echo "=== 11. seal 4검사 · iteration · reseal · 원자성 · legacy (§3.2 / §3.2.1 / §3.4) ==="
 
@@ -863,6 +953,52 @@ else
     "⑦ SHA-256: verified=yes"
 fi
 
+# --- 11b. seal 인자 해석 (change-spec 3) ---
+echo "=== 11b. seal 인자 해석 (change-spec 3) ==="
+RN="$(mk_repo)" || { echo "  FAIL  11b: fixture 생성 실패"; exit 1; }
+RNBASE="$(git -C "$RN" rev-parse HEAD)"
+commit_code "$RN" n1
+state_set "$RN" base-commit "$RNBASE"
+prep "$RN"; rc=$?
+eq "$rc" "0" "11b: 세션 생성"
+SN="$(session_dir "$RN")"
+SNID="$(basename "$SN")"
+close_session "$SN"
+
+seal "$RN" "$SNID"; rc=$?
+eq "$rc" "0" "11b B1: 세션 이름만 주면 seal 성공"
+has "세션 이름 '${SNID}' 을 ${SESS_REL}/${SNID} 로 해석했습니다" "$(cat "${OUT}/seal.err")" "11b B1: 해석 안내 문구"
+
+# B2: 저장소 루트에 같은 이름의 디렉터리가 있으면 기존 경로가 우선합니다.
+mkdir "${RN}/${SNID}"
+seal "$RN" "$SNID"; rc=$?
+ne "$rc" "0" "11b B2: 루트의 동명 디렉터리가 우선 — 세션이 아니므로 실패"
+case "$(cat "${OUT}/seal.err")" in
+  *해석했습니다*) fail "11b B2: 기존 경로 우선인데 해석 안내가 나옴" ;;
+  *) pass "11b B2: 해석 안내 없음" ;;
+esac
+rmdir "${RN}/${SNID}"
+
+seal "$RN" "no-such-session"; rc=$?
+eq "$rc" "1" "11b B3: 없는 이름 — exit 1"
+has "기대 형식: ${SESS_REL}/<세션>" "$(cat "${OUT}/seal.err")" "11b B3: 기대 형식 안내"
+has "현재 작업의 세션: ${SESS_REL}/$(awk -F= '$1=="review-session"{print $2}' "${RN}/rd-workflow-workspace/.lifecycle/task-state")" "$(cat "${OUT}/seal.err")" "11b B4: 현재 작업 세션 안내"
+
+seal "$RN" "./${SNID}"; rc=$?
+eq "$rc" "1" "11b B5: ./ 접두 이름은 해석하지 않음 — exit 1"
+has "기대 형식: ${SESS_REL}/<세션>" "$(cat "${OUT}/seal.err")" "11b B5: 기대 형식 안내"
+case "$(cat "${OUT}/seal.err")" in
+  *해석했습니다*) fail "11b B5: 해석 안내가 나오면 안 됨" ;;
+  *) pass "11b B5: 해석 안내 없음" ;;
+esac
+
+# B6: 하위 디렉터리에서도 세션 이름으로 seal 됩니다 (이름 해석 후 내부 경로는 절대 경로).
+rm -f "$(marker_path "$RN" "$SNID")"
+put_evidence "$RN"
+( cd "${RN}/rd-workflow" && bash scripts/rd review seal "$SNID" ) >"${OUT}/seal.out" 2>"${OUT}/seal.err"; rc=$?
+eq "$rc" "0" "11b B6: 하위 디렉터리 cwd 에서 세션 이름 seal 성공"
+eq "$([ -f "$(marker_path "$RN" "$SNID")" ] && echo yes || echo no)" "yes" "11b B6: 마커 생성"
+
 # --- seal evidence ---
 # seal 은 이 트리의 새 검증 증거(verify_record.sh)를 요구합니다. seal() 헬퍼의 자동 증거를 끄고
 # (SEAL_NO_EVIDENCE) 증거 파일을 직접 조작해 거부 경로를 봅니다.
@@ -927,6 +1063,152 @@ rm -f "${RL}/rd-workflow-workspace/.lifecycle/review-seals/verify-evidence"
 seal "$RL" --legacy-unverified "증거 면제 회귀" "${SL#${RL}/}"; rc=$?
 eq "$rc" "0" "(f) legacy 세션: 증거 없이 seal 성공"
 unset SEAL_NO_EVIDENCE
+
+# --- 12. 리뷰 입력 규모 경고 (change-spec 5) ---
+# 막는 실수: 거대한 diff 가 경고 없이 리뷰에 들어가 제한 시간 초과로 끝나는 것.
+# 설정 파일을 쓰면 보호 트리가 바뀌므로 seal 용 저장소와 분리한 별도 저장소를 씁니다.
+mk_size_repo() { # mk_size_repo — base 뒤 커밋 1개(yarn.lock 30 + a.txt 10 + b.txt 5 = 45행)
+  local r
+  r="$(mk_repo)" || return 1
+  seq 30 > "${r}/yarn.lock"; seq 10 > "${r}/a.txt"; seq 5 > "${r}/b.txt"
+  git -C "$r" add -A && git -C "$r" commit -q -m "size fixture" || return 1
+  printf '%s\n' "$r"
+}
+set_warn_cfg() { # set_warn_cfg <repo> <JSON 값 원문>
+  mkdir -p "${1}/rd-workflow/config"
+  printf '{\n  "review_input_warn_lines": %s\n}\n' "$2" > "${1}/rd-workflow/config/workflow.json"
+}
+WARN_ERR=""
+RS1="$(mk_size_repo)" || { echo "  FAIL  12: fixture 생성 실패"; exit 1; }
+set_warn_cfg "$RS1" 20
+prep "$RS1" --base main~1; rc=$?
+WARN_ERR="$(cat "${OUT}/prep.err")"
+eq "$rc" "0" "12 C1: 임계 초과여도 세션 생성(rc 0)"
+eq "$(session_count "$RS1")" "1" "12 C1: 세션 생성됨"
+has "변경 45행이 경고 기준 20행을 넘습니다" "$WARN_ERR" "12 C1: 규모 경고 문구"
+case "$WARN_ERR" in *"yarn.lock  [분리 후보]"*) pass "12 C2: yarn.lock 에 분리 후보 표시" ;; *) fail "12 C2: yarn.lock 에 분리 후보 표시 (문구 없음)" ;; esac
+has "분리 후보(락파일" "$WARN_ERR" "12 C2: 분리 후보 안내 줄"
+A_LINE="$(printf '%s\n' "$WARN_ERR" | grep 'a\.txt' || true)"
+has "a.txt" "$A_LINE" "12 C3: a.txt 줄 존재"
+case "$A_LINE" in *"[분리 후보]"*) fail "12 C3: a.txt 는 분리 후보가 아님 (표시됨)" ;; *) pass "12 C3: a.txt 는 분리 후보가 아님" ;; esac
+
+nowarn() { # nowarn <설명> — 직전 prep 의 stderr 에 규모 경고가 없음
+  case "$(cat "${OUT}/prep.err")" in *"행을 넘습니다"*) fail "$1 (문구 있음)" ;; *) pass "$1" ;; esac
+}
+RS4="$(mk_size_repo)" || exit 1; set_warn_cfg "$RS4" 45
+prep "$RS4" --base main~1; nowarn "12 C4: 합계 == 임계면 경고 없음(초과일 때만)"
+RS5="$(mk_size_repo)" || exit 1; set_warn_cfg "$RS5" 0
+prep "$RS5" --base main~1; nowarn "12 C5: 0 은 경고 끔"
+RS6="$(mk_size_repo)" || exit 1; set_warn_cfg "$RS6" '"abc"'
+prep "$RS6" --base main~1; rc=$?
+E6="$(cat "${OUT}/prep.err")"
+eq "$rc" "0" "12 C6: 무효 값이어도 세션 생성"
+has "값('\"abc\"')이 0 이상의 정수가 아니어서 기본값 8000 을 씁니다" "$E6" "12 C6: 무효 값 안내"
+nowarn "12 C6: 무효 값이면 기본값 8000 으로 비교(경고 없음)"
+RS7="$(mk_repo)" || exit 1
+seq 8001 > "${RS7}/big.txt"; git -C "$RS7" add -A && git -C "$RS7" commit -q -m big
+prep "$RS7" --base main~1
+has "경고 기준 8000행" "$(cat "${OUT}/prep.err")" "12 C7: workflow.json 없으면 기본값 8000"
+RS8="$(mk_size_repo)" || exit 1; set_warn_cfg "$RS8" 1
+prep "$RS8" "git -C sub diff x..y"; rc=$?
+eq "$rc" "0" "12 C8: 파싱 불가 표현 세션 생성"
+nowarn "12 C8: reviewed OID 가 없으면 규모 경고 없음"
+
+# --- 13. 서브모듈 알림 (change-spec 6) ---
+# 막는 실수: outer diff 가 서브모듈 내부 변경을 담지 않는데 리뷰어·사용자가 그걸 모른 채 리뷰가 끝나는 것.
+# fixture 는 seal 용 저장소와 분리합니다 (.gitmodules·gitlink 가 보호 트리를 바꾸므로).
+GITSM() { git -c protocol.file.allow=always "$@"; }
+SUBSRC="$(mktemp -d "${WORK}/subsrc.XXXXXX")" || exit 1
+git init -q -b main "$SUBSRC" && git -C "$SUBSRC" config user.email t@e.com && git -C "$SUBSRC" config user.name t
+echo 1 > "${SUBSRC}/f"; git -C "$SUBSRC" add -A; git -C "$SUBSRC" commit -q -m s1; S1="$(git -C "$SUBSRC" rev-parse HEAD)"
+echo 2 > "${SUBSRC}/f"; git -C "$SUBSRC" commit -q -am s2; S2="$(git -C "$SUBSRC" rev-parse HEAD)"
+SM_NOTICE="서브모듈 변경이 있습니다"
+
+# D1 (가) 체크아웃 불일치: sub 를 S2 로 옮겨 gitlink 만 stage(커밋 안 함)
+RD1="$(mk_repo)" || { echo "  FAIL  13: fixture 생성 실패"; exit 1; }
+GITSM -C "$RD1" submodule add -q "$SUBSRC" sub >/dev/null 2>&1
+git -C "${RD1}/sub" checkout -q "$S1"; git -C "$RD1" add -A
+git -C "$RD1" commit -q -m "add sub"; O1="$(git -C "$RD1" rev-parse HEAD)"
+echo d1 >> "${RD1}/code.txt"; git -C "$RD1" commit -q -am "code d1"
+# outer HEAD 의 gitlink 는 S1 로 두고, 체크아웃만 S2 로 옮긴 뒤 gitlink 를 stage 합니다 (커밋 안 함).
+git -C "${RD1}/sub" checkout -q "$S2"
+git -C "$RD1" add sub
+prep "$RD1" --base "$O1"; E="$(cat "${OUT}/prep.err")"
+has "[체크아웃] sub:" "$E" "13 D1: 체크아웃 불일치 알림 (stage 만 된 gitlink 도 감지)"
+has "git -C sub diff ${S1}..HEAD" "$E" "13 D1: 지정 예에 outer HEAD gitlink 전체 OID"
+
+# D2 (나) 커밋된 포인터 변경
+RD2="$(mk_repo)" || exit 1
+GITSM -C "$RD2" submodule add -q "$SUBSRC" sub >/dev/null 2>&1
+git -C "${RD2}/sub" checkout -q "$S1"; git -C "$RD2" add -A
+git -C "$RD2" commit -q -m "add sub at s1"; P1="$(git -C "$RD2" rev-parse HEAD)"
+git -C "${RD2}/sub" checkout -q "$S2"; git -C "$RD2" commit -q -am "bump sub"; P3="$(git -C "$RD2" rev-parse HEAD)"
+prep "$RD2" --base "$P1"; E="$(cat "${OUT}/prep.err")"
+has "[커밋된 포인터] sub: ${S1:0:12}→${S2:0:12} (리뷰 입력에 내부 코드를 펼쳤습니다)" "$E" "13 D2: 커밋된 포인터 변경 알림"
+case "$E" in *"내부 변경을 리뷰하려면"*) fail "13 D2: 펼친 구간에는 우회 안내 없음 (안내가 있음)" ;; *) pass "13 D2: 펼친 구간에는 우회 안내 없음" ;; esac
+
+# D3 (나) 삭제: 마지막 서브모듈과 .gitmodules 를 함께 지운 커밋
+git -C "$RD2" rm -q sub; git -C "$RD2" rm -qf .gitmodules
+git -C "$RD2" commit -q -m "drop sub"
+if [ ! -e "${RD2}/.gitmodules" ]; then
+  prep "$RD2" --base "$P3"; E="$(cat "${OUT}/prep.err")"
+  has "[커밋된 포인터] sub:" "$E" "13 D3: .gitmodules 없이도 삭제 알림"
+  case "$E" in *"git -C sub diff"*) fail "13 D3: 추가·삭제는 diff 예 없음 (예가 있음)" ;; *) pass "13 D3: 추가·삭제는 diff 예 없음" ;; esac
+else
+  fail "13 D3: fixture 전제 깨짐 (.gitmodules 가 남아 있음)"
+fi
+
+# D4 미초기화·구간 무변경: 서브모듈을 초기화하지 않은 clone
+RC4="${WORK}/clone4"; git clone -q "$RD1" "$RC4" 2>/dev/null
+git -C "$RC4" config user.email t@e.com; git -C "$RC4" config user.name t
+git -C "$RC4" checkout -q "$O1" 2>/dev/null
+echo d4 >> "${RC4}/code.txt"; git -C "$RC4" commit -q -m "code d4" code.txt
+prep "$RC4" --base HEAD~1; E="$(cat "${OUT}/prep.err")"
+case "$E" in *"$SM_NOTICE"*) fail "13 D4: 미초기화·구간 무변경이면 서브모듈 알림 없음 (알림 있음)" ;; *) pass "13 D4: 미초기화·구간 무변경이면 서브모듈 알림 없음" ;; esac
+
+# D5 미초기화·구간 변경: (나)는 나오고 (가)는 없음
+RC5="${WORK}/clone5"; git clone -q "$RD2" "$RC5" 2>/dev/null
+git -C "$RC5" config user.email t@e.com; git -C "$RC5" config user.name t
+git -C "$RC5" checkout -q "$P3" 2>/dev/null
+prep "$RC5" --base "$P1"; E="$(cat "${OUT}/prep.err")"
+# 미초기화 submodule 의 포인터가 바뀐 구간은 안쪽 코드를 펼칠 수 없으므로 세션 생성 전에 차단된다(spec D6).
+has "객체 부재" "$E" "13 D5: 미초기화 submodule 의 구간 포인터 변경은 객체 부재로 차단"
+case "$E" in *"[체크아웃]"*) fail "13 D5: 미초기화면 [체크아웃] 없음 (있음)" ;; *) pass "13 D5: 미초기화면 [체크아웃] 없음" ;; esac
+
+# D6 공백이 있는 서브모듈 이름·경로: (가) 알림이 사라지지 않고 안내 명령 경로가 인용됩니다.
+RD6="$(mk_repo)" || exit 1
+mkdir -p "${RD6}/libs"
+GITSM -C "$RD6" submodule add -q "$SUBSRC" "libs/my sub" >/dev/null 2>&1
+git -C "${RD6}/libs/my sub" checkout -q "$S1"; git -C "$RD6" add -A
+git -C "$RD6" commit -q -m "add spaced sub"; Q1="$(git -C "$RD6" rev-parse HEAD)"
+echo d6 >> "${RD6}/code.txt"; git -C "$RD6" commit -q -am "code d6"
+git -C "${RD6}/libs/my sub" checkout -q "$S2"
+prep "$RD6" --base "$Q1"; E="$(cat "${OUT}/prep.err")"
+has "[체크아웃] libs/my sub:" "$E" "13 D6a: 공백이 있는 서브모듈 경로도 체크아웃 불일치 알림"
+# 안내 줄을 복사해 실행한 것처럼 평가합니다. stub 만 정의한 서브셸에서, 임시 디렉터리를 cwd 로 하므로
+# 실제 git·prepare 스크립트는 돌지 않습니다. target = diff 대상 원문, cpath = 그 안 `git -C <경로>` 의 경로.
+run_notice_line() { # run_notice_line <stderr 텍스트> <작업 디렉터리>
+  local line cmdline
+  line="$(printf '%s\n' "$1" | grep -F '내부 변경을 리뷰하려면: ' | head -1)"
+  cmdline="${line#*내부 변경을 리뷰하려면: }"
+  rm -f "${2}/target" "${2}/cpath"
+  (
+    cd "$2" || exit 1
+    prepare_review_pipeline.sh() { printf '%s' "$2" > "${NOTICE_DIR}/target"; }
+    git() { printf '%s' "$2" > "${NOTICE_DIR}/cpath"; }
+    NOTICE_DIR="$2"
+    eval "$cmdline"
+    [ -f "${NOTICE_DIR}/target" ] && eval "$(cat "${NOTICE_DIR}/target")"
+  ) >/dev/null 2>&1
+}
+eq() { [ "$1" = "$2" ] && pass "$3" || fail "$3 (기대=[${2}] 실제=[${1}])"; }
+
+NT="$(mktemp -d "${WORK}/notice.XXXXXX")" || exit 1
+run_notice_line "$E" "$NT"
+eq "$(cat "${NT}/cpath" 2>/dev/null)" "libs/my sub" "13 D6b: 안내 줄을 실행하면 공백 경로가 한 단어로 전달됨"
+
+# D7(경로 특수 문자가 든 [커밋된 포인터] 안내 줄의 셸 인용)은 그 안내 줄이 사라져(spec D10) 대상이 없어 지웁니다.
+# [체크아웃] 안내 줄의 인용은 D6b 가 본다.
 
 if [ "$FAIL" = 0 ]; then
   echo "test_review_base_resolution: ALL PASS"

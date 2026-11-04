@@ -441,9 +441,13 @@ task_resolve_launch() {
     fi
   fi
 
-  local wt probe
+  # 조회 대상은 **기동 때 색인에 기록한 백엔드**다(spec D2). 지금 셸이 어디인지로 다시 정하지
+  # 않는다. 키가 없거나 빈 값이면 이 기록이 생기기 전의 작업이므로 herdr 다.
+  local wt probe backend
   wt="$(tasks_index_get "$slug" worktree-path 2>/dev/null)" || wt=""
-  probe="$(session_probe "$slug" "$wt")"
+  backend="$(tasks_index_get "$slug" launch-backend 2>/dev/null)" || backend=""
+  [[ -n "$backend" ]] || backend="herdr"
+  probe="$(session_probe "$slug" "$wt" "$backend")"
 
   # 사람이 확인했다고 밝힌 경우에만 dead 와 같은 처리로 보낸다 (F1).
   if [[ "$probe" == "unknown" && "$assume_ended" -eq 1 ]]; then
@@ -452,6 +456,29 @@ task_resolve_launch() {
 
   case "$probe" in
     alive)
+      local _req="" _drc=1
+      _req="$(session_handoff_request_path "$wt")" || _req=""
+      if [[ "$backend" == "hc" ]]; then
+        # hc 는 인계문을 기동 인자로 넣었으므로 보내지 않고 처리 여부만 확인한다(spec D5·D6).
+        # 처리가 확인되기 전에는 ok 로 확정하지 않는다 — 신뢰 확인 대기 중인 세션을 ok 로
+        # 두면 아무도 그 세션을 승인하러 가지 않는다. 안내는 deliver 가 stderr 로 낸다.
+        _drc=0
+        session_handoff_deliver "$slug" "$wt" "${_req:-}" hc || _drc=$?
+        if [[ "$_drc" -ne 0 ]]; then
+          echo "resolve-launch: '${slug}' 세션은 살아 있지만 인계가 처리됐는지 확인되지 않아 launch 를 바꾸지 않았습니다(launch=${launch} 유지)." >&2
+          return 1
+        fi
+        tasks_lock_acquire "resolve-launch" "$slug" || {
+          echo "resolve-launch: 락을 얻지 못했습니다 — 잠시 후 다시 시도하세요." >&2
+          return 1
+        }
+        tasks_index_upsert "$slug" launch=ok
+        tasks_lock_release
+        echo "resolve-launch: '${slug}' 세션이 살아 있고 인계가 처리돼 launch=ok 로 확정했습니다."
+        echo "resolve-launch: $(session_launch_status_hint ok "$slug")"
+        echo "resolve-launch: 인계가 처리됐습니다 (worktree=${wt})."
+        return 0
+      fi
       tasks_lock_acquire "resolve-launch" "$slug" || {
         echo "resolve-launch: 락을 얻지 못했습니다 — 잠시 후 다시 시도하세요." >&2
         return 1
@@ -463,18 +490,26 @@ task_resolve_launch() {
       # 인계 전달 (F4) — 락 **밖**에서 한다. 전달은 herdr 응답을 기다리는 일이라 락 안에
       # 두면 다른 작업의 착수·마감이 그 응답을 기다리게 된다. 실패해도 위 생존 확정은
       # 그대로 유효하므로 return 값을 바꾸지 않고 사실만 구분해 알린다.
-      local _req=""
-      _req="$(session_handoff_request_path "$wt")" || _req=""
-      if [[ -n "$_req" ]] && session_handoff_deliver "$slug" "$wt" "$_req"; then
+      # 전달 결과: 0 성공 / 1 보내지 않았음이 확실함 / 2 제출 여부를 모름(이미 입력됐을 수 있음).
+      if [[ -n "$_req" ]]; then
+        _drc=0
+        session_handoff_deliver "$slug" "$wt" "$_req" || _drc=$?
+      fi
+      if [[ "$_drc" -eq 0 ]]; then
         echo "resolve-launch: 인계를 전달했습니다 (worktree=${wt})."
       else
-        echo "resolve-launch: 인계는 전달하지 못했습니다 — 세션 화면에서 직접 지시해 주십시오 (생존 확정은 유효합니다)." >&2
+        if [[ "$_drc" -eq 2 ]]; then
+          # 제출 여부를 모를 때 무조건 직접 지시를 권하면 같은 작업 지시가 두 번 들어간다.
+          echo "resolve-launch: 인계 문구가 이미 입력됐을 수 있습니다 — 위 안내대로 세션 화면을 먼저 확인하고, 입력창이 비어 있고 작업도 없을 때만 아래 문구를 붙여 넣으십시오 (생존 확정은 유효합니다)." >&2
+        else
+          echo "resolve-launch: 인계는 전달하지 못했습니다 — 세션 화면에서 직접 지시해 주십시오 (생존 확정은 유효합니다)." >&2
+        fi
         if [[ -n "$wt" ]]; then
           echo "  인계 문구:" >&2
           local _hf=""
           _hf="$(session_handoff_file_path "$wt")" || _hf=""
           [[ -n "$_hf" && -f "$_hf" ]] || _hf=""
-          session_handoff_text "$slug" "${_req:-<worktree>/REQUEST.md}" "$wt" "$_hf" >&2
+          session_handoff_text "$slug" "${_req:-<worktree>/REQUEST.md}" "$wt" "$_hf" "$(session_handoff_autopilot "$wt")" >&2
           echo "" >&2
         fi
       fi
@@ -501,11 +536,19 @@ task_resolve_launch() {
     *)
       # 조회가 서지 않는다 — 조용히 확정하지 않는다(위 주석 참조).
       echo "resolve-launch: '${slug}' 세션 상태를 확인할 수 없습니다(unknown) — 확정하지 않고 유지합니다." >&2
-      if session_herdr_available; then
-        echo "  확인: herdr agent get $(_session_launch_agent_name "$slug")" >&2
+      # 안내는 기록된 백엔드에 맞춘다(spec D6). 이 셸에서 쓸 수 없는 백엔드의 명령은 권하지 않는다.
+      if session_backend_usable "$backend"; then
+        if [[ "$backend" == "hc" ]]; then
+          echo "  확인: hc get $(_session_launch_agent_name "$slug")" >&2
+        else
+          echo "  확인: herdr agent get $(_session_launch_agent_name "$slug")" >&2
+        fi
+      elif [[ "$backend" == "hc" ]]; then
+        echo "  이 작업은 herdr app 에서 기동했습니다. 앱의 터미널에서 다시 실행하거나, 세션이 끝났음을 확인했다면 --assume-ended 로 확정하십시오." >&2
+      elif [[ "$backend" == "none" ]]; then
+        echo "  이 작업은 자동 기동 없이 시작돼 조회할 세션이 없습니다." >&2
       else
-        # herdr 가 이 셸에 없다 — 실행할 수 없는 명령을 권하지 않는다.
-        echo "  이 셸에서는 herdr 로 조회할 수 없습니다(HERDR_ENV 미설정 또는 herdr 미설치)." >&2
+        echo "  이 작업은 터미널 herdr 에서 기동했습니다. 그 herdr 안의 셸에서 다시 실행하거나, 세션이 끝났음을 확인했다면 --assume-ended 로 확정하십시오." >&2
       fi
       echo "  세션이 없거나 이미 끝났음을 직접 확인했다면 다음으로 확정하십시오:" >&2
       echo "    bash rd-workflow/scripts/rd task resolve-launch ${slug} --assume-ended" >&2

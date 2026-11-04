@@ -1029,7 +1029,7 @@ rt_make_root() { # rt_make_root <dir>
            "$d/rd-workflow/scripts/hooks" "$d/rd-workflow/scripts/lifecycle" \
            "$d/sub/deeper"
   cp "$SCRIPT_DIR/rd" "$SCRIPT_DIR/_task_common.sh" "$SCRIPT_DIR/_state_common.sh" \
-     "$d/rd-workflow/scripts/"
+     "$SCRIPT_DIR/_submodule_common.sh" "$d/rd-workflow/scripts/"
   cp "$SCRIPT_DIR/hooks/_guard_common.sh" "$d/rd-workflow/scripts/hooks/"
   cp "$SCRIPT_DIR/lifecycle/slug.sh" "$d/rd-workflow/scripts/lifecycle/"
 }
@@ -1037,7 +1037,7 @@ rt_make_bare() { # rt_make_bare <dir> — 마커 없는 배치
   local d="$1"
   mkdir -p "$d/rd-workflow/scripts/hooks" "$d/rd-workflow/scripts/lifecycle"
   cp "$SCRIPT_DIR/rd" "$SCRIPT_DIR/_task_common.sh" "$SCRIPT_DIR/_state_common.sh" \
-     "$d/rd-workflow/scripts/"
+     "$SCRIPT_DIR/_submodule_common.sh" "$d/rd-workflow/scripts/"
   cp "$SCRIPT_DIR/hooks/_guard_common.sh" "$d/rd-workflow/scripts/hooks/"
   cp "$SCRIPT_DIR/lifecycle/slug.sh" "$d/rd-workflow/scripts/lifecycle/"
 }
@@ -1435,6 +1435,26 @@ printf 'bash rd-workflow/scripts/lifecycle/promote.sh --short-title y\n' \
 bash "$CK" "$CK_ROOT" >/dev/null 2>&1; ck_rc=$?
 [[ "$ck_rc" == "1" ]] && echo "ok: check: 제외 규칙이 안내 예시 판정을 무력화하지 않았다" \
   || { echo "FAIL: check: 제외 규칙이 안내 예시 위반을 놓쳤다 (exit $ck_rc)"; FAIL=1; }
+
+# (12a) 줄 이음은 파일 경계를 넘지 않는다 — 점검기가 모든 파일을 awk 1회로 읽으므로
+# 파일 끝의 `\` 이음이 다음 파일 첫 줄과 합쳐지면 위반이 가려진다(회귀).
+# 두 파일 모두 `--size` 줄로 시작하고 인자 없는 이음 호출로 끝난다. find 순서와 상관없이
+# 앞 파일의 호출이 뒤 파일 첫 줄과 합쳐지면 한쪽 위반이 사라지므로 두 파일명을 모두 단언한다.
+CK_EOF="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$CK_EOF" && -d "$CK_EOF" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+mkdir -p "$CK_EOF/rd-workflow/docs"
+for _n in eofa eofb; do
+  printf -- '--size small\nbash rd-workflow/scripts/lifecycle/promote.sh --short-title %s \\\n' "$_n" \
+    > "$CK_EOF/rd-workflow/docs/${_n}.md"
+done
+ck_out="$(bash "$CK" "$CK_EOF" 2>&1)"; ck_rc=$?
+if [[ "$ck_rc" == "1" ]] && printf '%s' "$ck_out" | grep -q "eofa.md" \
+   && printf '%s' "$ck_out" | grep -q "eofb.md"; then
+  echo "ok: check: 파일 끝 줄 이음이 다음 파일로 넘어가지 않는다"
+else
+  echo "FAIL: check: 파일 끝 줄 이음이 다음 파일과 합쳐졌다 (exit $ck_rc, '$ck_out')"; FAIL=1
+fi
+rm -rf "$CK_EOF"
 
 # (12b) 설명 문장 속 promote.sh 언급은 실행 예시가 아니다 — 오탐 회귀.
 # 앞의 resume_candidates.sh 실행과 뒤의 설명 문장 `promote.sh` 가 한 줄에 있어도 걸리면 안 된다.

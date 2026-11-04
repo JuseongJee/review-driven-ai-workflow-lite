@@ -233,7 +233,7 @@ case "$_launch" in
   launching|unknown)
     printf 'rollback: '"'"'%s'"'"' 의 기동 결과가 아직 확인되지 않았습니다(launch=%s) — rollback 을 진행하지 않습니다 (상태 변경 없음).\n' "$SLUG" "$_launch" >&2
     printf '  확인: bash rd-workflow/scripts/rd task resolve-launch %s\n' "$SLUG" >&2
-    printf '  herdr 로 조회할 수 없는 환경이면: bash rd-workflow/scripts/rd task resolve-launch %s --assume-ended\n' "$SLUG" >&2
+    printf '  세션을 조회할 수 없는 환경이면: bash rd-workflow/scripts/rd task resolve-launch %s --assume-ended\n' "$SLUG" >&2
     exit 1
     ;;
   ok)
@@ -241,7 +241,7 @@ case "$_launch" in
     # (launching·unknown) 막고 "살아 있음이 확인됐을 때"(ok) 통과시켰다 — 정상 기동된
     # 세션이 미커밋 코드를 쓰고 있는 동안 그 worktree 를 통째로 지우는 경로였다(AC 16).
     # 지금 생존을 다시 확인해, 살아 있거나 판정이 서지 않으면 보존한다.
-    _rb_probe="$(session_probe "$SLUG" "${TARGET_DIR:-}")"
+    _rb_probe="$(session_probe "$SLUG" "${TARGET_DIR:-}" "$(tasks_index_get "$SLUG" launch-backend 2>/dev/null || true)")"
     if [[ "$_rb_probe" == "dead" ]]; then
       printf 'rollback: '"'"'%s'"'"' 세션이 이미 종료된 것으로 확인됐습니다 — 취소를 계속합니다.\n' "$SLUG"
     elif [[ "$FORCE" -eq 1 ]]; then
@@ -255,7 +255,7 @@ case "$_launch" in
       # 가드와 **미커밋 작업물 보호를 함께** 해제한다 — 보호를 지키는 경로를 만들어 놓고
       # 막힌 화면에 적지 않으면 없는 것과 같다.
       if [[ "$_rb_probe" == "alive" ]]; then
-        printf '  먼저 그 세션을 끝내십시오 (herdr 화면에서 해당 tab/agent 종료).\n' >&2
+        printf '  먼저 그 세션을 끝내십시오 (herdr 또는 앱 화면에서 그 작업의 tab 을 종료).\n' >&2
         printf '  종료 뒤 재시도: bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task %s\n' "$SLUG" >&2
       else
         printf '  이 셸에서는 세션 생존을 확인할 수 없습니다 — 끝낸 뒤 그냥 재시도해도 같은 결과가 나옵니다.\n' >&2

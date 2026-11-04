@@ -108,87 +108,29 @@ if [ ! -d "$RW_STATUS_FILE" ] || [ -L "$RW_STATUS_FILE" ]; then
   rm -f "$RW_STATUS_FILE" 2>/dev/null || true
 fi
 
-# --- 쓰기 채널 확보 (claude spawn 전) — 실패는 시작 실패 ---
-RW_LOG_PATH="$(mktemp "${RW_SESSION_DIR}/.claude_output.XXXXXX")" || {
-  echo "claude 출력 로그를 만들 수 없습니다: ${RW_SESSION_DIR}" >&2; exit 1; }
-chmod 600 "$RW_LOG_PATH"
-echo "claude 출력 로그: ${RW_LOG_PATH}  (진행 중 확인: tail -f '${RW_LOG_PATH}')" >&2
-
-status_stream="$(mktemp "${RW_SESSION_DIR}/.review_wait_status.XXXXXX")" || {
-  echo "대기 상태 스트림 파일을 만들 수 없습니다: ${RW_SESSION_DIR}" >&2
-  exit 1
-}
-chmod 600 "$status_stream" 2>/dev/null || true
-RW_STATUS_STREAM_PATH="$status_stream"
+# --- cleanup·trap 은 첫 임시 자원을 만들기 전에 설치한다(adapter_codex.sh 와 같은 순서) ---
+# cleanup 이 참조하는 전역은 trap 설치 전에 모두 초기화한다 — 부분 초기화 상태에서 set -u 로
+# cleanup 이 죽지 않게 하고, 시작 실패(exit 1)에서도 이미 만든 임시 자원을 cleanup 이 지운다.
+RW_LOG_PATH=""
+status_stream=""
 status_stream_fd_open=0
-if ! exec 8>> "$status_stream"; then
-  echo "대기 상태 스트림 fd open 실패: ${status_stream}" >&2
-  exit 1
-fi
-status_stream_fd_open=1
-RW_STATUS_FD_OPEN="$status_stream_fd_open"
-RW_STATUS_FD=8
-echo "대기 상태 스트림: ${status_stream}  (안정 경로 ${RW_STATUS_FILE} 는 종료 후에 발행됩니다)" >&2
-
-# 타임아웃 마커 — **안정 이름을 쓰지 않는다.** claude spawn 전에 mktemp 로 배타 생성하고
-# 쓰기 fd 7·읽기 fd 6 을 그 자리에서 연다(codex 와 동일 계약 — adapter_codex.sh:451-475).
+status_ready=0
 timeout_marker=""
 marker_write_fd_open=0
 marker_read_fd_open=0
-timeout_marker="$(mktemp "${RW_SESSION_DIR}/.wait_timeout.XXXXXX")" || {
-  echo "타임아웃 마커를 만들 수 없습니다: ${RW_SESSION_DIR}" >&2
-  exit 1
-}
-chmod 600 "$timeout_marker" 2>/dev/null || true
-if ! exec 7>> "$timeout_marker"; then
-  echo "타임아웃 마커 쓰기 fd open 실패: $timeout_marker" >&2
-  exit 1
-fi
-marker_write_fd_open=1
-if ! exec 6< "$timeout_marker"; then
-  echo "타임아웃 마커 읽기 fd open 실패: $timeout_marker" >&2
-  exit 1
-fi
-marker_read_fd_open=1
-RW_MARKER_FD=7
-
-# 타이머 — watchdog 이 sleep 자식 없이 fd + read -t 로 tick 을 만든다.
 watchdog_dir=""
 watchdog_fd_open=0
-watchdog_dir="$(mktemp -d "${TMPDIR:-/tmp}/rd-watchdog.XXXXXX")" || { echo "adapter_claude: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-[[ -n "$watchdog_dir" && -d "$watchdog_dir" ]] || { echo "adapter_claude: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-watchdog_fifo="${watchdog_dir}/timer"
-if ! mkfifo "$watchdog_fifo" 2>/dev/null; then
-  echo "watchdog 타이머 fifo 생성 실패: $watchdog_fifo" >&2
-  exit 1
-fi
-if ! exec 9<> "$watchdog_fifo"; then
-  echo "watchdog 타이머 fifo open 실패: $watchdog_fifo" >&2
-  exit 1
-fi
-watchdog_fd_open=1
-RW_TIMER_FD=9
-
-rw_status_init_snapshot "$RW_STATUS_FD" "$RW_ABS_CAP" "$RW_IDLE"
-
-# --- 읽기 채널 확보 (기능 저하만, 시작 실패 아님) ---
 log_read_fd_open=0
-if exec 4< "$RW_LOG_PATH"; then log_read_fd_open=1
-else echo "경고: claude 로그 읽기 fd(부모)를 열 수 없습니다 — 종료 후 최근 출력을 보고하지 않습니다." >&2; fi
-
 log_watch_fd_open=0
-if exec 5< "$RW_LOG_PATH"; then log_watch_fd_open=1
-else echo "경고: claude 로그 관측 fd 를 열 수 없습니다 — 활동 관측기를 고장으로 간주합니다." >&2; fi
-RW_OBSERVER_OK="$log_watch_fd_open"
-RW_LOG_FD=5
-
 claude_pid=""
 claude_pgid=""
 # cleanup 의 writer 종료 증거 조회(rw_group_state)가 spawn 전에도 set -u 에서 죽지 않도록 미리 정의한다.
 RW_TARGET_PID=""
 watchdog_pid=""
-cleanup_done=0
-group_dead=1
+cleanup_state=0       # 0=미실행 1=진행 중 2=완료
+pending_signal_rc=""  # 첫 신호의 종료 코드(129/130/143)
+# 발행 게이트의 그룹 판정 — dead | alive | unknown. cleanup 이 local 없이 쓰고 ④ 가 읽는다.
+group_state=dead
 log_final=""
 
 # 신호 trap 은 EXIT 와 분리하고 종료 코드를 명시한다. `trap cleanup EXIT HUP INT TERM`
@@ -196,8 +138,8 @@ log_final=""
 # background job 에서는 SIGINT 가 무시 disposition 을 상속해 trap 이 무효다(POSIX).
 # TERM·HUP 은 background 에서도 정상 전달된다. SIGKILL 은 트랩 불가다.
 cleanup() {
-  [ "$cleanup_done" -eq 1 ] && return 0
-  cleanup_done=1
+  [ "$cleanup_state" -ne 0 ] && return 0
+  cleanup_state=1
 
   if [ -n "$watchdog_pid" ]; then
     kill "$watchdog_pid" 2>/dev/null || true
@@ -216,15 +158,20 @@ cleanup() {
   fi
 
   # process group 종료 — 리더 생존과 독립. TERM → KILL_GRACE → KILL.
-  if [ -n "$claude_pgid" ] && rw_group_alive "$claude_pgid"; then
-    kill -- -"$claude_pgid" 2>/dev/null || true
-    sleep "${RW_KILL_GRACE:-3}"
-    if rw_group_alive "$claude_pgid"; then
-      kill -9 -- -"$claude_pgid" 2>/dev/null || true
+  # 판정이 「없음」(1)이 아니면 신호를 보낸다 — ps 가 실패해 판정 불가(2)여도 보낸다.
+  # 판정 불가의 대표 원인인 권한 거부는 kill 도 같은 EPERM 으로 실패하므로 남의 그룹에 닿지 않는다.
+  local gs=0
+  if [ -n "$claude_pgid" ]; then
+    gs=0; rw_group_alive "$claude_pgid" || gs=$?
+    if [ "$gs" -ne 1 ]; then
+      kill -- -"$claude_pgid" 2>/dev/null || true
+      sleep "${RW_KILL_GRACE:-3}" || true  # 그룹 단위 신호로 sleep 이 먼저 끝나도 set -e 가 cleanup 을 끊지 않게 한다
+      gs=0; rw_group_alive "$claude_pgid" || gs=$?
+      [ "$gs" -ne 1 ] && { kill -9 -- -"$claude_pgid" 2>/dev/null || true; }
     fi
   elif [ -z "$claude_pgid" ] && [ -n "$claude_pid" ] && kill -0 "$claude_pid" 2>/dev/null; then
     kill "$claude_pid" 2>/dev/null || true
-    sleep "${RW_KILL_GRACE:-3}"
+    sleep "${RW_KILL_GRACE:-3}" || true
     kill -0 "$claude_pid" 2>/dev/null && kill -9 "$claude_pid" 2>/dev/null || true
   fi
   if [ -n "$claude_pid" ]; then
@@ -232,17 +179,32 @@ cleanup() {
   fi
 
   # --- 산출물 발행 (안정 이름) — process group 종료 확인 후 1회 ---
-  group_dead=1
+  # 종료를 확인(「없음」)했을 때만 dead 다. 판정 불가(2)는 unknown 이며 발행하지 않는다.
+  group_state=dead
   local log_ok=no log_reason="" log_recovery="" rw_gs=""
-  if [ -n "$claude_pgid" ] && rw_group_alive "$claude_pgid"; then
-    group_dead=0
+  if [ -n "$claude_pgid" ]; then
+    gs=0; rw_group_alive "$claude_pgid" || gs=$?
+    case "$gs" in
+      1) ;;
+      0) group_state=alive ;;
+      *) group_state=unknown ;;
+    esac
   fi
 
-  if [ "$group_dead" -ne 1 ]; then
+  if [ "$status_ready" -ne 1 ]; then
+    # spawn 전 시작 실패 — 발행할 실행 결과가 없다. 만든 임시 파일만 지운다(안정 경로로 발행하지 않는다).
+    rm -f "${RW_LOG_PATH:-}" "${status_stream:-}" 2>/dev/null || true
+  elif [ "$group_state" = alive ]; then
     echo "알림: claude process group(${claude_pgid})이 아직 살아 있어 산출물을 안정 경로로 발행하지 않았습니다." >&2
     echo "      claude 출력 로그(임시 경로): ${RW_LOG_PATH}" >&2
     echo "      대기 상태 스트림: ${status_stream}" >&2
     log_reason="claude-group-alive"
+    log_final="$RW_LOG_PATH"
+  elif [ "$group_state" = unknown ]; then
+    echo "알림: claude process group(${claude_pgid})의 종료를 확인하지 못해(ps 실패, kill -0: ${RW_GROUP_PROBE_ERR}) 산출물을 안정 경로로 발행하지 않았습니다." >&2
+    echo "      claude 출력 로그(임시 경로): ${RW_LOG_PATH}" >&2
+    echo "      대기 상태 스트림: ${status_stream}" >&2
+    log_reason="claude-group-unknown"
     log_final="$RW_LOG_PATH"
   elif [ -n "${RW_LOG_PATH:-}" ]; then
     if [ -L "$RW_LOG_PATH" ]; then
@@ -284,20 +246,26 @@ cleanup() {
   # 존재 여부가 이 시점에 확정된다. 존재 확인은 읽기일 뿐이라 「후처리는 writer 정리
   # 뒤에」 계약을 어기지 않는다(헤더 삽입 같은 쓰기는 그대로 cleanup 뒤에 남는다).
   if [ "$outcome_kind" = "ok-pending" ]; then
-    if [ "$group_dead" -eq 1 ] && [ -f "$EXPECTED_TURN_FILE" ]; then
+    if [ "$group_state" = dead ] && [ -f "$EXPECTED_TURN_FILE" ]; then
       outcome_kind=ok
       RW_OUTCOME="ok: claude exit 0, 턴 파일 확인됨"
-    elif [ "$group_dead" -ne 1 ]; then
+    elif [ "$group_state" = alive ]; then
       outcome_kind=group-alive
       RW_OUTCOME="group-alive: claude exit 0 이었으나 process group 이 남아 후처리를 하지 않음 (어댑터 exit 1)"
+    elif [ "$group_state" = unknown ]; then
+      outcome_kind=group-unknown
+      RW_OUTCOME="group-unknown: claude exit 0 이었으나 process group 의 종료를 확인하지 못해 후처리를 하지 않음 (어댑터 exit 1)"
     else
       outcome_kind=turn-missing
       RW_OUTCOME="turn-missing: claude 는 exit 0 이었으나 턴 파일을 만들지 않음 (어댑터 exit 1)"
     fi
   fi
 
-  if [ "$group_dead" -eq 1 ]; then
-    # 종료를 증명했는지만 상태 파일에 남긴다(발행 조건은 위 group_dead 게이트 그대로).
+  if [ "$status_ready" -ne 1 ]; then
+    # 상태 스냅샷을 시작하기 전(spawn 전 시작 실패)이라 발행할 상태가 없다 — 종전의 시작 실패와 같다.
+    :
+  elif [ "$group_state" = dead ]; then
+    # 종료를 증명했는지만 상태 파일에 남긴다(발행 조건은 위 group_state 게이트 그대로).
     # pgid 확보에 실패했어도(리더가 즉시 종료) 리더 pid 가 곧 pgid(set -m)이므로 그 그룹의 구성원 유무를 ps 로 확인한다.
     # verified 가 아니면(ps 실패·alive 경합) unverified 로 쓴다.
     rw_gs="$(rw_group_state "${claude_pgid:-$RW_TARGET_PID}")"
@@ -308,6 +276,11 @@ cleanup() {
       echo "알림: 대기 상태를 안정 경로(${RW_STATUS_FILE})로 발행하지 못했습니다." >&2
       echo "      진행 중 상태는 스트림에 남아 있습니다: ${status_stream}" >&2
     fi
+  else
+    # 발행하지 않았다 — 사유를 상태 스트림의 마지막 snapshot 으로 남긴다(outcome 확정 뒤라 사유도 실린다).
+    # 스트림 파일은 지우지 않는다. 화면을 놓친 사용자의 사후 단서다.
+    rw_status_append_final no "$log_reason" "$RW_LOG_PATH" \
+      || echo "      대기 상태 스트림에 최종 사유를 덧붙이지 못했습니다: ${status_stream}" >&2
   fi
 
   if [ "$log_read_fd_open" -eq 1 ]; then
@@ -333,12 +306,103 @@ cleanup() {
   if [ -n "$timeout_marker" ]; then
     rm -f "$timeout_marker" 2>/dev/null || true
   fi
+
+  cleanup_state=2
+  # 진행 중에 받은 신호는 on_signal 이 기록만 했다 — 정리를 모두 마친 뒤 그 종료 코드로 끝낸다.
+  if [ -n "$pending_signal_rc" ]; then exit "$pending_signal_rc"; fi
+}
+# 신호 trap 공통 함수. 사유(outcome)를 먼저 남긴다 — 진행 중 snapshot 이 최종 결과로 오인되지 않게 한다.
+# cleanup 진행 중(grace sleep 등)에 신호가 오면 종료 코드만 기록하고 돌아온다. bash 는 전경 외부
+# 명령(grace `sleep`) 종료까지 trap 을 미루고, trap 이 돌아오면 중단된 명령 다음부터 이어 가므로
+# 원래 cleanup 이 KILL 단계와 산출물 발행까지 마친다. 두 번째 신호는 아무것도 바꾸지 않는다.
+# 종료 코드와 사유는 첫 신호의 것이다 — cleanup 을 시작한 신호도 먼저 기록해 뒤 신호가 덮어쓰지 않게 한다.
+on_signal() {  # $1=종료 코드 $2=사유 문구
+  if [ -z "$pending_signal_rc" ]; then
+    pending_signal_rc="$1"
+    outcome_kind=signal
+    RW_OUTCOME="$2"
+  fi
+  if [ "$cleanup_state" -eq 1 ]; then
+    return 0
+  fi
+  cleanup
+  exit "$pending_signal_rc"
 }
 trap cleanup EXIT
-# 신호 경로도 사유를 남긴다 — 진행 중 snapshot 이 최종 결과로 오인되지 않게 한다.
-trap 'outcome_kind=signal; RW_OUTCOME="signal: SIGHUP (exit 129) — 외부 중단"; cleanup; exit 129' HUP
-trap 'outcome_kind=signal; RW_OUTCOME="signal: SIGINT (exit 130) — 외부 중단"; cleanup; exit 130' INT
-trap 'outcome_kind=signal; RW_OUTCOME="signal: SIGTERM (exit 143) — 외부 중단"; cleanup; exit 143' TERM
+trap 'on_signal 129 "signal: SIGHUP (exit 129) — 외부 중단"' HUP
+trap 'on_signal 130 "signal: SIGINT (exit 130) — 외부 중단"' INT
+trap 'on_signal 143 "signal: SIGTERM (exit 143) — 외부 중단"' TERM
+
+
+# --- 쓰기 채널 확보 (claude spawn 전) — 실패는 시작 실패 ---
+RW_LOG_PATH="$(mktemp "${RW_SESSION_DIR}/.claude_output.XXXXXX")" || {
+  echo "claude 출력 로그를 만들 수 없습니다: ${RW_SESSION_DIR}" >&2; exit 1; }
+chmod 600 "$RW_LOG_PATH"
+echo "claude 출력 로그: ${RW_LOG_PATH}  (진행 중 확인: tail -f '${RW_LOG_PATH}')" >&2
+
+status_stream="$(mktemp "${RW_SESSION_DIR}/.review_wait_status.XXXXXX")" || {
+  echo "대기 상태 스트림 파일을 만들 수 없습니다: ${RW_SESSION_DIR}" >&2
+  exit 1
+}
+chmod 600 "$status_stream" 2>/dev/null || true
+RW_STATUS_STREAM_PATH="$status_stream"
+if ! exec 8>> "$status_stream"; then
+  echo "대기 상태 스트림 fd open 실패: ${status_stream}" >&2
+  exit 1
+fi
+status_stream_fd_open=1
+RW_STATUS_FD_OPEN="$status_stream_fd_open"
+RW_STATUS_FD=8
+echo "대기 상태 스트림: ${status_stream}  (안정 경로 ${RW_STATUS_FILE} 는 종료 후에 발행됩니다)" >&2
+
+# 타임아웃 마커 — **안정 이름을 쓰지 않는다.** claude spawn 전에 mktemp 로 배타 생성하고
+# 쓰기 fd 7·읽기 fd 6 을 그 자리에서 연다(codex 와 동일 계약 — adapter_codex.sh:451-475).
+timeout_marker="$(mktemp "${RW_SESSION_DIR}/.wait_timeout.XXXXXX")" || {
+  echo "타임아웃 마커를 만들 수 없습니다: ${RW_SESSION_DIR}" >&2
+  exit 1
+}
+chmod 600 "$timeout_marker" 2>/dev/null || true
+if ! exec 7>> "$timeout_marker"; then
+  echo "타임아웃 마커 쓰기 fd open 실패: $timeout_marker" >&2
+  exit 1
+fi
+marker_write_fd_open=1
+if ! exec 6< "$timeout_marker"; then
+  echo "타임아웃 마커 읽기 fd open 실패: $timeout_marker" >&2
+  exit 1
+fi
+marker_read_fd_open=1
+RW_MARKER_FD=7
+
+# 타이머 — watchdog 이 sleep 자식 없이 fd + read -t 로 tick 을 만든다.
+watchdog_dir="$(mktemp -d "${TMPDIR:-/tmp}/rd-watchdog.XXXXXX")" || { echo "adapter_claude: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$watchdog_dir" && -d "$watchdog_dir" ]] || { echo "adapter_claude: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+watchdog_fifo="${watchdog_dir}/timer"
+if ! mkfifo "$watchdog_fifo" 2>/dev/null; then
+  echo "watchdog 타이머 fifo 생성 실패: $watchdog_fifo" >&2
+  exit 1
+fi
+if ! exec 9<> "$watchdog_fifo"; then
+  echo "watchdog 타이머 fifo open 실패: $watchdog_fifo" >&2
+  exit 1
+fi
+watchdog_fd_open=1
+RW_TIMER_FD=9
+
+rw_status_init_snapshot "$RW_STATUS_FD" "$RW_ABS_CAP" "$RW_IDLE"
+status_ready=1
+
+# --- 읽기 채널 확보 (기능 저하만, 시작 실패 아님) ---
+log_read_fd_open=0
+if exec 4< "$RW_LOG_PATH"; then log_read_fd_open=1
+else echo "경고: claude 로그 읽기 fd(부모)를 열 수 없습니다 — 종료 후 최근 출력을 보고하지 않습니다." >&2; fi
+
+log_watch_fd_open=0
+if exec 5< "$RW_LOG_PATH"; then log_watch_fd_open=1
+else echo "경고: claude 로그 관측 fd 를 열 수 없습니다 — 활동 관측기를 고장으로 간주합니다." >&2; fi
+RW_OBSERVER_OK="$log_watch_fd_open"
+RW_LOG_FD=5
+
 
 # --- spawn — background + 독립 pgid + 내부 fd 닫아 전달 ---
 model_args=()
@@ -409,8 +473,8 @@ else
 fi
 
 # --- ② cleanup 명시 호출 — 최종화는 이 한 자리가 소유 ---
-# **명령 치환 안에서 부르지 않는다** — 서브셸에서 실행되면 부모의 cleanup_done 플래그와
-# 결과 변수(log_final·group_dead)가 갱신되지 않아 멱등성이 깨져 중복 발행이 난다.
+# **명령 치환 안에서 부르지 않는다** — 서브셸에서 실행되면 부모의 cleanup_state 와
+# 결과 변수(log_final·group_state)가 갱신되지 않아 멱등성이 깨져 중복 발행이 난다.
 cleanup
 
 # --- ③ 판정 — 마커 우선, 그 다음 rc ---
@@ -440,8 +504,12 @@ if [ "$claude_rc" -ne 0 ]; then
 fi
 
 # --- ④ 성공 후처리 — 그룹이 정리됐을 때만 ---
-if [ "$group_dead" -ne 1 ]; then
+if [ "$group_state" = alive ]; then
   echo "claude process group(${claude_pgid})이 아직 살아 있어 턴 후처리를 하지 않았습니다." >&2
+  echo "    claude 출력 로그: ${log_final}" >&2
+  exit 1
+elif [ "$group_state" != dead ]; then
+  echo "claude process group(${claude_pgid})의 종료를 확인하지 못해 턴 후처리를 하지 않았습니다." >&2
   echo "    claude 출력 로그: ${log_final}" >&2
   exit 1
 fi

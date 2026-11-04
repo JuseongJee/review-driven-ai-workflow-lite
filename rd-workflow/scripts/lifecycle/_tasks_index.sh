@@ -21,14 +21,34 @@
 #
 # `project_root` 가 없을 때의 동작은 예전과 같다(`$PWD`) — 이 파일을 단독으로 source 해
 # 쓰는 호출부(테스트·일회성 조회)가 그대로 동작한다.
-tasks_shared_dir() {
+_TASKS_SD_KEY="${_TASKS_SD_KEY:-}"; _TASKS_SD_COMMON="${_TASKS_SD_COMMON:-}"; _TASKS_SD_VAL="${_TASKS_SD_VAL:-}"
+_tasks_sd_key() {
+  local r="${project_root:-$PWD}"
+  case "$r" in /*) ;; *) r="$PWD/$r" ;; esac
+  _TASKS_SD_K="$r|${GIT_DIR:-}|${GIT_COMMON_DIR:-}"
+}
+# 현재 셸에 공유 위치를 채운다(서브셸 없이). 실패하면 _TASKS_SD_VAL 을 비우고 rc 1.
+_tasks_shared_dir_fill() {
+  _tasks_sd_key
+  if [[ -n "$_TASKS_SD_COMMON" && "$_TASKS_SD_K" == "$_TASKS_SD_KEY" && -d "$_TASKS_SD_COMMON" ]]; then
+    [[ -d "$_TASKS_SD_COMMON/rd-workflow" ]] || mkdir -p "$_TASKS_SD_COMMON/rd-workflow" || { _TASKS_SD_VAL=""; return 1; }
+    _TASKS_SD_VAL="$_TASKS_SD_COMMON/rd-workflow"; return 0
+  fi
+  _TASKS_SD_KEY=""; _TASKS_SD_COMMON=""; _TASKS_SD_VAL=""
   local cd_
   cd_="$(git -C "${project_root:-$PWD}" rev-parse --path-format=absolute --git-common-dir)" || return 1
-  mkdir -p "$cd_/rd-workflow" || return 1
-  printf '%s/rd-workflow\n' "$cd_"
+  _TASKS_SD_KEY="$_TASKS_SD_K"; _TASKS_SD_COMMON="$cd_"
+  [[ -d "$cd_/rd-workflow" ]] || mkdir -p "$cd_/rd-workflow" || return 1
+  _TASKS_SD_VAL="$cd_/rd-workflow"
 }
-
-tasks_index_path() { printf '%s/tasks.local\n' "$(tasks_shared_dir)"; }
+tasks_shared_dir() { _tasks_shared_dir_fill || return 1; printf '%s\n' "$_TASKS_SD_VAL"; }
+tasks_index_path() { _tasks_shared_dir_fill || :; printf '%s/tasks.local\n' "$_TASKS_SD_VAL"; }
+# source 시점 선계산 — 조용히, mkdir 없이 common dir 만 채운다.
+if [[ -z "$_TASKS_SD_COMMON" ]]; then
+  _tasks_sd_key
+  _TASKS_SD_COMMON="$(git -C "${project_root:-$PWD}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+    && _TASKS_SD_KEY="$_TASKS_SD_K" || { _TASKS_SD_COMMON=""; _TASKS_SD_KEY=""; }
+fi
 
 # 색인 파일이 없으면 schema=1 한 줄로 새로 만들고 경로를 돌려준다.
 _tasks_index_ensure() {
@@ -71,7 +91,7 @@ tasks_index_upsert() {
   done
 
   local path tmp
-  path="$(_tasks_index_ensure)" || return 1
+  _tasks_shared_dir_fill || :; path="$_TASKS_SD_VAL/tasks.local"; [[ -f "$path" ]] || printf 'schema=1\n' > "$path" || return 1
   tmp="$(mktemp "${path}.XXXXXX")" || return 1
 
   local found=0 line
@@ -125,7 +145,7 @@ tasks_index_remove() {
   [[ -n "${slug:-}" ]] || return 1
 
   local path
-  path="$(_tasks_index_ensure)" || return 1
+  _tasks_shared_dir_fill || :; path="$_TASKS_SD_VAL/tasks.local"; [[ -f "$path" ]] || printf 'schema=1\n' > "$path" || return 1
 
   local tmp line
   tmp="$(mktemp "${path}.XXXXXX")" || return 1
@@ -141,7 +161,7 @@ tasks_index_remove() {
 tasks_index_get() {
   local slug="$1" key="$2"
   local path
-  path="$(tasks_index_path)"
+  _tasks_shared_dir_fill || :; path="$_TASKS_SD_VAL/tasks.local"
   [[ -f "$path" ]] || { printf ''; return 1; }
 
   local line
@@ -169,7 +189,7 @@ tasks_index_get() {
 # 색인의 모든 행(정리 대기 포함)의 slug. 표시·정리 판정용.
 tasks_index_all_slugs() {
   local path
-  path="$(tasks_index_path)"
+  _tasks_shared_dir_fill || :; path="$_TASKS_SD_VAL/tasks.local"
   [[ -f "$path" ]] || return 0
 
   local line rest
@@ -187,7 +207,7 @@ tasks_index_all_slugs() {
 # 세지 않는다 — 세면 task_resolve_target 의 「여러 건」 판정이 오판한다.
 tasks_index_slugs() {
   local path
-  path="$(tasks_index_path)"
+  _tasks_shared_dir_fill || :; path="$_TASKS_SD_VAL/tasks.local"
   [[ -f "$path" ]] || return 0
 
   local line rest
@@ -226,7 +246,7 @@ _tasks_lock_owner_field() {
 tasks_lock_acquire() {
   local cmd="$1" slug="$2"
   local shared lockdir ownerfile
-  shared="$(tasks_shared_dir)" || return 2
+  _tasks_shared_dir_fill || return 2; shared="$_TASKS_SD_VAL"
   lockdir="$shared/tasks.lock"
   ownerfile="$lockdir/owner"
 
@@ -289,7 +309,7 @@ tasks_lock_acquire_wait() {
   esac
 
   local shared ownerfile marker err rc=0
-  shared="$(tasks_shared_dir)" || return 2
+  _tasks_shared_dir_fill || return 2; shared="$_TASKS_SD_VAL"
   ownerfile="$shared/tasks.lock/owner"
   marker="$shared/archive-waiting"
 
@@ -348,7 +368,7 @@ tasks_lock_acquire_wait() {
 # 자기 pid 가 소유자일 때만 지운다. 남의 락을 지우지 않는다.
 tasks_lock_release() {
   local shared lockdir ownerfile owner_pid
-  shared="$(tasks_shared_dir)" || return 1
+  _tasks_shared_dir_fill || return 1; shared="$_TASKS_SD_VAL"
   lockdir="$shared/tasks.lock"
   ownerfile="$lockdir/owner"
 
@@ -415,9 +435,14 @@ tasks_publish_evidence() {
 #
 # 범위는 **내 계정(id -u) 프로세스까지**다(사용자 결정 2026-10-29). 다른 계정(root 포함)의
 # 프로세스는 lsof 가 CWD 를 읽지 못하므로 범위 밖이다. 내 계정 프로세스인데 읽지 못한 것이
-# 있으면 점유 여부를 보증할 수 없으므로 rc 2 다. 예외는 comm 기본 이름이 `login` 인 것
-# 하나뿐이다(setuid 래퍼라 lsof 가 읽지 못하고 CWD 도 작업 디렉터리가 아니다 — 2026-10-29 실측).
-# ps 는 BSD·procps 모두 `-U <uid>` 가 실 uid 선택이다(macOS 의 `-u` 는 형식 옵션이다).
+# 있으면 점유 여부를 보증할 수 없으므로 rc 2 다.
+# 「읽지 못함」 대조는 실 uid 와 유효 uid 가 모두 내 계정인 프로세스만 센다(사용자 결정 2026-11-02).
+# setuid 프로세스는 실 uid 가 나여도 유효 uid 가 다른 계정이라 lsof 가 CWD 를 읽지 못한다 — 실측
+# 사례는 `login`, F5 VPN helper `svpn`(오래 살아 모든 정리를 막았다), `top`, `ps` 다(2026-11-02).
+# 읽힌 CWD 가 대상 안이면 유효 uid 와 관계없이 점유다(아래 첫 대조가 거름보다 앞선다).
+# 오판 범위: worktree 안에 CWD 를 둔 setuid 프로세스는 판정불가를 만들지 않으므로, 그 프로그램을
+# 띄운 셸이 끝났거나 `cd` 로 대상 밖에 나갔으면 점유를 잡지 못한다.
+# ps 는 BSD·procps 모두 `-U <uid>` 가 실 uid 선택이고 `-o uid` 가 유효 uid 다(macOS 의 `-u` 는 형식 옵션이다).
 tasks_path_occupied() {
   TASKS_OCCUPIED_REASON=""
   local target uid
@@ -426,17 +451,20 @@ tasks_path_occupied() {
   uid="$(id -u)"
 
   # 점유가 확인되면(rc 0) 읽지 못한 프로세스가 있어도 점유다. 비점유(rc 1)는 읽지 못한 프로세스가
-  # 없을 때만 낸다. `top -l 2` 같은 수 초짜리 setuid 모니터가 잠깐 끼어 읽기 불가로 잡히므로(2026-10-29
-  # 실측), 읽기 불가가 남으면 TASKS_OCCUPIED_RETRY(기본 3)회까지 1초 간격으로 다시 읽는다.
+  # 없을 때만 낸다. 재시도를 들인 사례인 `top -l 2`(2026-10-29 실측)는 setuid 라 이제 유효 uid 거름으로
+  # 빠지지만, 그 밖의 일시적 읽기 불가에 대비해 읽기 불가가 남으면 TASKS_OCCUPIED_RETRY(기본 3)회까지
+  # 1초 간격으로 다시 읽는다.
   local retry="${TASKS_OCCUPIED_RETRY:-3}" attempt=0 ps_out snap lsof_out lrc pid missed candidates line
   while :; do
     lsof_out=""; lrc=0
     # ps 실패나 빈 스냅샷(숫자 pid 행이 하나도 없음 — 빈 출력 포함)은 대조 근거가 사라진다는 뜻이다 — 비점유로 흘리지 않고 판정불가로 낸다.
-    ps_out="$(ps -U "$uid" -o pid=,stat=,comm= 2>/dev/null)" || { TASKS_OCCUPIED_REASON="프로세스 목록 조회 실패"; return 2; }
-    snap="$(printf '%s\n' "$ps_out" | awk '
+    ps_out="$(ps -U "$uid" -o pid=,uid=,stat= 2>/dev/null)" || { TASKS_OCCUPIED_REASON="프로세스 목록 조회 실패"; return 2; }
+    # 유효 uid 가 숫자가 아니면 거르지 않는다 — 대조에 남겨 읽지 못하면 판정불가가 되게 한다(fail-closed).
+    snap="$(printf '%s\n' "$ps_out" | awk -v me="$uid" '
       $1 !~ /^[0-9]+$/ {next}
-      $2 ~ /^Z/ {next}
-      {pid=$1; c=$0; sub(/^[ \t]*[0-9]+[ \t]+[^ \t]+[ \t]*/, "", c); sub(/.*\//, "", c); print pid "\t" c}')"
+      $3 ~ /^Z/ {next}
+      $2 ~ /^[0-9]+$/ && $2 != me {next}
+      {print $1}')"
     [[ -n "$snap" ]] || { TASKS_OCCUPIED_REASON="프로세스 목록이 비어 있음"; return 2; }
     # -a 가 없으면 lsof 는 조건을 OR 로 묶어 내 계정의 모든 파일을 훑는다(실측 17초·5만 줄).
     lsof_out="$(lsof -a -u "$uid" -d cwd -Fpn 2>/dev/null)" || lrc=$?
@@ -455,13 +483,13 @@ tasks_path_occupied() {
     #   Permission denied)` 같은 오류 설명) 읽은 것으로 치지 않는다 — 프로세스 식별과 경로 읽기는 별개다.
     #   pid 마다 grep 을 띄우면 프로세스가 수백 개일 때 수십 초가 걸린다 — awk 한 번으로 거른다.
     missed=0
-    candidates="$(printf '%s\n' "$snap" | LSOF_OUT="$lsof_out" awk -F'\t' '
+    candidates="$(printf '%s\n' "$snap" | LSOF_OUT="$lsof_out" awk '
       BEGIN { n = split(ENVIRON["LSOF_OUT"], a, "\n"); cur = ""
         for (i = 1; i <= n; i++) {
           if (a[i] ~ /^p/) cur = substr(a[i], 2)
           else if (a[i] ~ /^n\// && a[i] !~ /\(.*\)$/ && cur != "") seen[cur] = 1
         } }
-      $1 != "" && $2 != "login" && !($1 in seen) { print $1 }')"
+      $1 != "" && !($1 in seen) { print $1 }')"
     while IFS= read -r pid; do
       [[ -z "$pid" ]] && continue
       kill -0 "$pid" 2>/dev/null || continue
@@ -477,7 +505,7 @@ tasks_path_occupied() {
 
 tasks_lock_owner_info() {
   local shared lockdir ownerfile
-  shared="$(tasks_shared_dir)" || return 1
+  _tasks_shared_dir_fill || return 1; shared="$_TASKS_SD_VAL"
   lockdir="$shared/tasks.lock"
   ownerfile="$lockdir/owner"
   [[ -f "$ownerfile" ]] || return 1

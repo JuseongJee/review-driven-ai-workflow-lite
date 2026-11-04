@@ -181,18 +181,69 @@ _read_field() {
   fi
 }
 
+# items 필드 판독을 awk 1회로 한다. 파일마다 한 레코드(status 판독코드·값·kind 판독코드·값)를
+# 입력 순서대로 낸다. 판독코드는 _read_field 와 같다(0 매치·1 없음·2 읽기 실패).
+# getline < 파일 을 쓰는 이유: 빈 파일도 레코드를 내야 하고(FNR==1 이 오지 않음),
+# 읽기 실패가 awk 전체를 멈추지 않고 그 파일의 판독코드 2 로 남아야 한다.
+_ITEM_FILES=()
 if [[ -n "$_find_out" ]]; then
-  while IFS= read -r f; do
-    [[ -z "$f" ]] && continue
-    base="${f##*/}"
+  while IFS= read -r f; do [[ -n "$f" ]] && _ITEM_FILES+=("$f"); done <<< "$_find_out"
+fi
+# 정규 파일이 아니거나 읽을 수 없는 항목은 awk 에 넘기지 않는다 — 디렉터리는 awk 를
+# 치명 오류로 멈춘다. 이 항목은 아래 루프에서 판독코드 2 로 처리한다.
+# 판정은 _RD 에 한 번만 적고 아래 루프가 그대로 쓴다(두 곳에서 따로 판정하면 레코드가 어긋난다).
+_AWK_FILES=()
+_RD=()
+for f in "${_ITEM_FILES[@]+"${_ITEM_FILES[@]}"}"; do
+  if [[ -f "$f" && -r "$f" ]]; then
+    _RD+=(1); _AWK_FILES+=("$f")
+  else
+    _RD+=(0)
+  fi
+done
+_fields_out=""
+if [[ "${#_AWK_FILES[@]}" -gt 0 ]]; then
+  _fields_out="$(awk '
+    function tv(s) { sub(/^[^:]*:/, "", s); sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    BEGIN {
+      for (i = 1; i < ARGC; i++) {
+        f = ARGV[i]; src = 1; krc = 1; sv = ""; kv = ""
+        while ((r = (getline line < f)) > 0) {
+          if (src == 1 && index(line, "- status:") == 1) { src = 0; sv = tv(line) }
+          if (krc == 1 && index(line, "- kind:") == 1)   { krc = 0; kv = tv(line) }
+          if (src == 0 && krc == 0) break
+        }
+        if (r < 0) { src = 2; krc = 2; sv = ""; kv = "" }
+        close(f)
+        printf "%d\034%s\034%d\034%s\n", src, sv, krc, kv
+      }
+      printf "#N\034%d\n", ARGC - 1
+      exit 0
+    }' "${_AWK_FILES[@]}" 2>/dev/null)"
+  _fields_rc=$?
+  # 레코드 수 검증: awk 가 끝에 `#N\034<처리한 파일 수>` 한 줄을 붙인다. 이 줄이 없거나 수가 다르면
+  # 판독이 중간에 멈춘 것이다. (bash 3.2 의 `${var//[!x]/}` 로 개행을 세면 15초가 걸려 쓰지 않는다.)
+  _fields_tail="${_fields_out##*$'\n'}"
+  if [[ "$_fields_rc" -ne 0 || "$_fields_tail" != "#N"$'\034'"${#_AWK_FILES[@]}" ]]; then
+    echo "check_fr_index_detail_consistency.sh: items 필드 판독 실행 오류 (awk rc=${_fields_rc})" >&2
+    EXEC_ERROR=1
+    _ITEM_FILES=()
+  fi
+fi
 
-    status_val="$(_read_field "$f" '^- status:')"; status_rc=$?
+_i=0
+while [[ "$_i" -lt "${#_ITEM_FILES[@]}" ]]; do
+    f="${_ITEM_FILES[$_i]}"; _i=$((_i + 1))
+    base="${f##*/}"
+    if [[ "${_RD[$((_i - 1))]}" -eq 1 ]]; then
+      IFS=$'\034' read -r status_rc status_val kind_rc kind_val
+    else
+      status_rc=2; status_val=""; kind_rc=2; kind_val=""
+    fi
     if [[ "$status_rc" -eq 2 ]]; then
       echo "items/${base}: 필드 읽기 실패 (status, grep rc=2)" >&2
       EXEC_ERROR=1
     fi
-
-    kind_val="$(_read_field "$f" '^- kind:')"; kind_rc=$?
     if [[ "$kind_rc" -eq 2 ]]; then
       echo "items/${base}: 필드 읽기 실패 (kind, grep rc=2)" >&2
       EXEC_ERROR=1
@@ -238,8 +289,7 @@ if [[ -n "$_find_out" ]]; then
         K=$((K + 1))
       fi
     fi
-  done <<< "$_find_out"
-fi
+done <<< "$_fields_out"
 
 # 인덱스 행 → 상세 파일 존재/활성 여부 역방향 확인
 idx=0

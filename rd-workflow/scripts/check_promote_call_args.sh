@@ -51,57 +51,29 @@ rc=0
 #   ③ `promote.sh "$@"` 형태 — 인자를 그대로 넘기는 래퍼는 시작 상태를 호칭할 수 없다.
 # ①②는 파일 단위, ③은 줄 단위 제외다.
 SELF_BASE="$(basename "${BASH_SOURCE[0]}")"
+# 논리 줄 이어붙이기 + 후보 추림을 awk 1회로 한다. getline 대신 보류 버퍼를 쓴다 —
+# 여러 파일을 한 awk 가 읽으면 getline 이 다음 파일 첫 줄을 끌어온다.
+JOIN_AWK='
+function emit(fn, s) { if (index(s, "promote.sh")) printf "%s\034%s\n", fn, s }
+FNR == 1 && have { emit(pfile, pend); have = 0 }
+{
+  line = have ? pend " " $0 : $0; have = 0
+  if (line ~ /\\[ \t]*$/) { sub(/\\[ \t]*$/, "", line); pend = line; pfile = FILENAME; have = 1; next }
+  emit(FILENAME, line)
+}
+END { if (have) emit(pfile, pend) }'
 for tgt in $TARGETS; do
   [[ -e "$ROOT/$tgt" ]] || continue
-  # 파일별로: 백슬래시 개행을 이어붙여 논리 줄을 만든 뒤 promote.sh 실행 형태를 찾는다.
-  # 이어붙이기가 없으면 README 의 멀티라인 용법 블록을 위반으로 오탐한다.
-  while IFS= read -r f; do
-    # find 실패 마커는 파일이 아니므로 awk 로 넘기면 그대로 사라진다 — 그러면 아래
-    # 마커 검사가 영원히 통과해 점검 실패가 "위반 0건" 으로 보인다. 여기서 TMP 로
-    # 흘려보내 exit 2 판정에 도달하게 한다.
-    if [[ "$f" == "$FIND_MARKER" ]]; then
-      printf '%s\n' "$FIND_MARKER"
-      continue
-    fi
-    base="$(basename "$f")"
-    [[ "$base" == "$SELF_BASE" ]] && continue
-    case "$base" in
-      test_*.sh) continue ;;
-    esac
-    # awk 의 종료 상태를 검사한다. `set -e` 가 없고 아래 pipeline 이 0 으로 끝나므로,
-    # 검사하지 않으면 권한·I/O 오류로 읽지 못한 파일이 "위반 0건" 으로 소실된다 —
-    # "점검 자체 실패는 exit 2" 계약과 어긋난다 (final diff review Finding 5).
-    if ! joined="$(awk '{
-      line = $0
-      while (line ~ /\\[ \t]*$/) {
-        sub(/\\[ \t]*$/, "", line)
-        if ((getline nxt) <= 0) break
-        line = line " " nxt
-      }
-      print line
-    }' "$f")"; then
-      printf '%s\n' "$FIND_MARKER"
-      continue
-    fi
-    printf '%s\n' "$joined" | while IFS= read -r logical; do
-      # 실행 형태만 본다 — `bash <경로>promote.sh` 형태 (PROMOTE_CALL_RE)
-      [[ "$logical" =~ $PROMOTE_CALL_RE ]] || continue
-      # usage 문자열은 대상이 아니다
-      case "$logical" in
-        *usage:*) continue ;;
-      esac
-      # 인자를 그대로 넘기는 래퍼는 시작 상태를 호칭할 수 없다 — 호출자가 준다
-      case "$logical" in
-        *promote.sh\ \"\$@\"*) continue ;;
-      esac
-      # 시작 상태 인자가 있으면 통과
-      case "$logical" in
-        *--size*|*--status*) continue ;;
-      esac
-      printf '%s: %s\n' "${f#$ROOT/}" "$logical"
-    done
-    # find 실패는 조용히 넘기지 않는다 — 권한 문제나 경로 오류가 위반 0건으로 보인다
-  done < <(find "$ROOT/$tgt" -type f \( -name '*.md' -o -name '*.sh' \) || echo "$FIND_MARKER")
+  find "$ROOT/$tgt" -type f \( -name '*.md' -o -name '*.sh' \) \
+       ! -name "$SELF_BASE" ! -name 'test_*.sh' -exec awk "$JOIN_AWK" {} + \
+    || printf '%s\n' "$FIND_MARKER"
+done | while IFS=$'\034' read -r f logical; do
+  if [[ "$f" == "$FIND_MARKER" ]]; then printf '%s\n' "$FIND_MARKER"; continue; fi
+  [[ "$logical" =~ $PROMOTE_CALL_RE ]] || continue
+  case "$logical" in *usage:*) continue ;; esac
+  case "$logical" in *promote.sh\ \"\$@\"*) continue ;; esac
+  case "$logical" in *--size*|*--status*) continue ;; esac
+  printf '%s: %s\n' "${f#$ROOT/}" "$logical"
 done >> "$TMP" || { echo "check_promote_call_args: 점검 실행이 실패했습니다." >&2; exit 2; }
 
 if grep -q "$FIND_MARKER" "$TMP" 2>/dev/null; then

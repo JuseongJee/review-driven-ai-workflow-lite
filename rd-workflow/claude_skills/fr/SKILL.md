@@ -27,11 +27,11 @@ Typical user requests:
 - "done 항목 정리해줘" → `/fr archive`로 라우팅
 - "이거 parked로 옮겨줘" → `/fr park`로 라우팅
 
-사용자가 `/fr <subcommand> [args]` 형식으로 호출하거나, 위의 자연어 요청으로 호출한다.
+사용자가 `/fr <subcommand> [args]` 형식으로 호출하거나, 위의 자연어 요청으로 호출합니다.
 
 ## 서브커맨드 라우팅
 
-첫 번째 인자를 파싱한다:
+첫 번째 인자를 파싱합니다:
 
 - `add` → Read `rd-workflow/claude_skills/fr/add.md` and follow it.
 - `list` → Read `rd-workflow/claude_skills/fr/list.md` and follow it.
@@ -46,7 +46,7 @@ Typical user requests:
 - `batch` → Read `rd-workflow/claude_skills/fr/batch.md` and follow it.
 - 그 외 / 인자 없음 → 아래 사용법 출력 후 종료 (파일 수정 없음 보장)
 
-**Legacy call 처리**: 첫 번째 단어가 `add`, `list`, `pri`, `inspect`, `archive`, `park`, `status`, `pull`, `push`, `sync`, `batch` 중 어느 것도 아니면 사용법 help를 출력한다. 파일을 절대 수정하지 않는다.
+**Legacy call 처리**: 첫 번째 단어가 `add`, `list`, `pri`, `inspect`, `archive`, `park`, `status`, `pull`, `push`, `sync`, `batch` 중 어느 것도 아니면 사용법 help를 출력합니다. 파일을 절대 수정하지 않습니다.
 
 ### 사용법 출력
 
@@ -71,22 +71,22 @@ Typical user requests:
 
 ## 백엔드 결정
 
-서브커맨드 실행 전에 GitHub 연동 여부를 결정한다.
+서브커맨드 실행 전에 GitHub 연동 여부를 결정합니다.
 
-1. 인자에서 `--github` 또는 `--local` 플래그를 탐색한다. 발견하면 인자에서 제거한다.
+1. 인자에서 `--github` 또는 `--local` 플래그를 탐색합니다. 발견하면 인자에서 제거합니다.
    - `--github`: GitHub 연동 강제 활성화
    - `--local`: GitHub 연동 강제 비활성화
-2. 플래그가 없으면 `rd-workflow/config/workflow.json`의 `fr_github` 값을 읽는다.
+2. 플래그가 없으면 `rd-workflow/config/workflow.json`의 `fr_github` 값을 읽습니다.
 3. 파일이 없거나 `fr_github` 키가 없으면 기본값 `false` (연동 비활성).
-4. GitHub 연동 활성화 시 전제조건을 검증한다:
+4. GitHub 연동 활성화 시 전제조건을 검증합니다:
    - `gh` CLI 설치 여부 — 미설치: "gh CLI가 설치되어 있지 않습니다" 출력 후 종료
    - `gh auth status` 통과 여부 — 미인증: "gh auth login으로 인증이 필요합니다" 출력 후 종료
    - `gh repo view` 성공 여부 — 실패: "git remote가 설정되지 않았거나 Issues가 비활성화되어 있습니다" 출력 후 종료
-5. 검증 실패 시 로컬 fallback 없이 종료한다.
+5. 검증 실패 시 로컬 fallback 없이 종료합니다.
 6. **예외 — 결함 보고 전달 경로**: `workflow-defect-reporting.md` 규약에 따른 결함 보고 발행은 전제조건 실패 시 **종료하지 않습니다.** 보고 파일을 그대로 두고 미전달로 표시한 뒤, 사유·미전달 목록·재시도 명령을 안내합니다. 여기서 종료하면 보고서가 다시 조용히 쌓여 규약이 해결하려는 문제로 되돌아갑니다. 이 예외는 결함 보고 경로에만 적용되며 `add`/`push`/`pull`/`sync` 의 FR 경로는 위 5번 그대로입니다.
-7. `pull`, `push`, `sync` 서브커맨드는 `fr_github` 설정과 무관하게 항상 전제조건 검증을 실행한다.
+7. `pull`, `push`, `sync` 서브커맨드는 `fr_github` 설정과 무관하게 항상 전제조건 검증을 실행합니다.
 
-이후 각 서브커맨드는 결정된 연동 여부에 따라 동작한다.
+이후 각 서브커맨드는 결정된 연동 여부에 따라 동작합니다.
 
 ---
 
@@ -99,7 +99,7 @@ Typical user requests:
 - **kind**: `fr:feature`, `fr:bug`, `fr:refactor`, `fr:tech-debt`, `fr:tooling`, `fr:research`, `fr:test`
 - **priority**: 사용하지 않음 (pri는 로컬 전용)
 
-`fr:` namespace를 FR 전용으로 사용한다. 기존 repo에 `fr:*` label이 있으면 충돌 가능 — pull은 status label 필수 조건으로 완화된다.
+`fr:` namespace를 FR 전용으로 사용합니다. 기존 repo에 `fr:*` label이 있으면 충돌 가능 — pull은 status label 필수 조건으로 완화됩니다.
 
 ### 에러 처리
 
@@ -115,19 +115,19 @@ Typical user requests:
 
 ### 데이터 분리
 
-- 로컬과 GitHub는 독립 저장소이다. 연결은 인덱스의 GitHub 컬럼과 상세 파일의 `github-issue` 필드 양쪽에서 추적한다.
-- 연동을 비활성화해도 기존 `github-issue` 필드는 유지한다 (삭제 안 함).
+- 로컬과 GitHub는 독립 저장소입니다. 연결은 인덱스의 GitHub 컬럼과 상세 파일의 `github-issue` 필드 양쪽에서 추적합니다.
+- 연동을 비활성화해도 기존 `github-issue` 필드는 유지합니다 (삭제 안 함).
 - 사용자 안내: "GitHub 연동을 비활성화하면 로컬 데이터만 표시됩니다. GitHub Issues는 별도로 관리해야 합니다."
 
 ---
 
 ## 전역 규칙
 
-- `priority` 허용 값: `P1`, `P2`, `P3`, `-` 만 허용. 인덱스에서만 관리하고 상세 파일에는 넣지 않는다.
-- `/fr add`는 FR 등록만 한다. REQUEST.md 작성, 구현 착수 금지.
-- 서브커맨드가 없거나 알 수 없으면 사용법만 출력하고 종료한다. 파일 수정 없음.
-- `github-issue`는 인덱스(GitHub 컬럼)와 상세 파일 양쪽에서 관리한다. 연결/해제 시 양쪽 모두 갱신한다.
-- pull/push/sync는 `fr_github` 설정과 무관하게 `--github` 플래그 없이도 실행 가능하다 (항상 전제조건 검증 실행).
+- `priority` 허용 값: `P1`, `P2`, `P3`, `-` 만 허용. 인덱스에서만 관리하고 상세 파일에는 넣지 않습니다.
+- `/fr add`는 FR 등록만 합니다. REQUEST.md 작성, 구현 착수 금지.
+- 서브커맨드가 없거나 알 수 없으면 사용법만 출력하고 종료합니다. 파일 수정 없음.
+- `github-issue`는 인덱스(GitHub 컬럼)와 상세 파일 양쪽에서 관리합니다. 연결/해제 시 양쪽 모두 갱신합니다.
+- pull/push/sync는 `fr_github` 설정과 무관하게 `--github` 플래그 없이도 실행 가능합니다 (항상 전제조건 검증 실행).
 - 결함 보고 전달은 FR 경로와 분리됩니다 — 라벨은 `defect-report`, 도구는 `defect_reports.sh`, 실패는 종료가 아니라 미전달 표시입니다.
 - **모델 자기호출 경계**: 모델이 사용자의 명시 요청 없이 이 skill 을 스스로 호출한 경우 `list`·`pri`·`inspect`·`pull` 과 **로컬 전용 `add`** 만 수행합니다.
   - `add` 는 자기호출일 때 **유효 backend 와 무관하게 로컬로만 등록**합니다. GitHub 연동이 활성이어도 `gh issue create` 로 넘어가지 않고, 로컬 등록을 마친 뒤 "GitHub Issue 발행은 사용자 요청이 필요합니다 — 발행하려면 `/fr push <제목>` 를 요청해 주십시오" 를 알립니다. `add` 의 `GitHub 연동` 절차는 사용자가 직접 호출한 경우에만 실행합니다.

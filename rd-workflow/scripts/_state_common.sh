@@ -737,6 +737,110 @@ rd_resolve_commit_oid() {
   printf '%s\n' "$oid"
 }
 
+# --- submodule 내용 ID (spec 2.1 D2~D4) — rd_protected_tree_hash 가 씁니다. 이 파일은 자족이어야 해서 여기 둡니다. ---
+# _rd_is_repo_root <dir> — dir 이 독립 저장소의 최상위인가 (0: 맞음)
+# 초기화되지 않은 submodule 디렉터리는 상위 저장소로 올라가 판정되므로, 정규화한 toplevel 이
+# dir 자신과 같을 때만 저장소로 봅니다.
+_rd_is_repo_root() {
+  local dir="$1" top real
+  [[ -d "$dir" ]] || return 1
+  top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [[ -n "$top" ]] || return 1
+  top="$(cd "$top" 2>/dev/null && pwd -P)" || return 1
+  real="$(cd "$dir" 2>/dev/null && pwd -P)" || return 1
+  [[ "$top" == "$real" ]]
+}
+
+# rd_gitlink_content_id <repo_dir> <commit_oid> [<common_dir>] — stdout 한 줄: tree:<oid> | nested:<hash> | commit:<oid>
+# 항상 return 0. 읽을 수 없으면 `commit:<oid>` 로 내려갑니다(같은 커밋은 같은 내용).
+#
+# 같은 superproject 의 어느 worktree 에서 계산해도 값이 같아야 합니다. linked worktree 의 submodule 저장소는
+# `<common>/worktrees/<이름>/modules/<경로>`, 기본 worktree 의 것은 `<common>/modules/<경로>` 에 따로 있어서,
+# 작업 worktree 에서 만든 submodule 커밋을 기본 worktree 의 저장소는 모릅니다. 기본 worktree 에서 submodule 을
+# 초기화하지 않았거나 바깥 단계만 초기화한 경우에는 저장소 자체가 없습니다.
+# 그래서 세 번째 인자 <common_dir>(superproject 의 git common dir, rd_protected_tree_hash 가 구해 재귀로 넘김)가 있으면,
+# repo_dir 에서 커밋을 읽지 못할 때 `git --git-dir=<common_dir>` 에 common dir 아래 모든 submodule 객체 디렉터리를
+# GIT_ALTERNATE_OBJECT_DIRECTORIES 로 이 호출에만 붙여 읽습니다. 객체는 내용 주소라 다른 모듈의 디렉터리가 섞여도
+# 값이 달라지지 않습니다. 인자가 없으면 대체 조회를 하지 않고, 그래도 없으면 `commit:` 폴백(fail-closed)입니다.
+# repo_dir 에서 읽을 수 있으면 동작·출력은 종전과 바이트 그대로입니다.
+
+# _rd_git_common_dir <root> — root 저장소의 절대 git common dir 를 출력한다.
+# `--path-format=absolute` 를 모르는 git 은 상대 경로를 root 기준으로 절대화합니다.
+_rd_git_common_dir() {
+  local c
+  if c="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" && [[ -n "$c" ]]; then
+    printf '%s\n' "$c"; return 0
+  fi
+  c="$(git -C "$1" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  [[ -n "$c" ]] || return 1
+  case "$c" in /*) ;; *) c="$1/$c" ;; esac
+  printf '%s\n' "$c"
+}
+
+# _rd_submodule_object_pool <common_dir> — common dir 아래 모든 submodule 객체 디렉터리를 `:` 로 이어 출력(없으면 return 1).
+_rd_submodule_object_pool() {
+  local o out=""
+  while IFS= read -r o; do
+    [[ -n "$o" && -f "${o%/objects}/HEAD" && "$o" != *:* ]] && out="${out:+$out:}$o"
+  done <<EOF2
+$(find "$1/modules" "$1/worktrees" -type d -name objects -prune -print 2>/dev/null)
+EOF2
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out"
+}
+
+rd_gitlink_content_id() {
+  local repo_dir="${1-}" oid="${2-}" cdir="${3-}" raw flt tree rec meta path gl_oid hash rc nested bad=0 pool
+  local g=()
+  if [[ -z "$repo_dir" || -z "$oid" ]]; then
+    printf 'commit:%s\n' "$oid"; return 0
+  fi
+  if _rd_is_repo_root "$repo_dir" && git -C "$repo_dir" cat-file -e "${oid}^{commit}" 2>/dev/null; then
+    g=(git -C "$repo_dir")
+  elif [[ -n "$cdir" ]] && pool="$(_rd_submodule_object_pool "$cdir")" \
+       && GIT_ALTERNATE_OBJECT_DIRECTORIES="${GIT_ALTERNATE_OBJECT_DIRECTORIES:+$GIT_ALTERNATE_OBJECT_DIRECTORIES:}$pool" \
+          git --git-dir="$cdir" cat-file -e "${oid}^{commit}" 2>/dev/null; then
+    g=(env "GIT_ALTERNATE_OBJECT_DIRECTORIES=${GIT_ALTERNATE_OBJECT_DIRECTORIES:+$GIT_ALTERNATE_OBJECT_DIRECTORIES:}$pool" git --git-dir="$cdir")
+  else
+    printf 'commit:%s\n' "$oid"; return 0
+  fi
+  raw="$(mktemp "${TMPDIR:-/tmp}/rd-gl-raw.XXXXXX")" || { printf 'commit:%s\n' "$oid"; return 0; }
+  "${g[@]}" ls-tree -r -z --full-tree "$oid" > "$raw" 2>/dev/null
+  rc=$?
+  if [[ "$rc" != "0" ]]; then
+    rm -f "$raw"; printf 'commit:%s\n' "$oid"; return 0
+  fi
+  if ! grep -qz '^160000 ' "$raw"; then
+    rm -f "$raw"
+    tree="$("${g[@]}" rev-parse "${oid}^{tree}" 2>/dev/null)" || tree=""
+    if [[ -n "$tree" ]]; then printf 'tree:%s\n' "$tree"; else printf 'commit:%s\n' "$oid"; fi
+    return 0
+  fi
+  flt="$(mktemp "${TMPDIR:-/tmp}/rd-gl-flt.XXXXXX")" || { rm -f "$raw"; printf 'commit:%s\n' "$oid"; return 0; }
+  while IFS= read -r -d '' rec; do
+    if [[ "$rec" != *$'\t'* ]]; then bad=1; break; fi
+    if [[ "$rec" == "160000 "* ]]; then
+      meta="${rec%%$'\t'*}"; path="${rec#*$'\t'}"
+      gl_oid="${meta##* }"
+      nested="$(rd_gitlink_content_id "$repo_dir/$path" "$gl_oid" "$cdir")"
+      printf '160000 content %s\t%s\0' "$nested" "$path"
+    else
+      printf '%s\0' "$rec"
+    fi
+  done < "$raw" > "$flt"
+  rm -f "$raw"
+  if [[ "$bad" != "0" ]]; then
+    rm -f "$flt"; printf 'commit:%s\n' "$oid"; return 0
+  fi
+  hash="$("${g[@]}" hash-object --stdin < "$flt" 2>/dev/null)"
+  rc=$?
+  rm -f "$flt"
+  if [[ "$rc" != "0" || -z "$hash" ]]; then
+    printf 'commit:%s\n' "$oid"; return 0
+  fi
+  printf 'nested:%s\n' "$hash"
+}
+
 # rd_protected_tree_hash <commit-ish> — 기록 경로를 제외한 트리의 canonical 해시 (§2.2)
 #
 # **fail-closed 가 이 함수의 계약입니다.** repo root 탐색 / OID 확인 / `ls-tree` / 필터 /
@@ -758,7 +862,7 @@ rd_resolve_commit_oid() {
 # (`core.quotePath` 등 출력 설정에 무관), `-C <repo root>` 와 `--full-tree` 로 호출 위치가
 # 결과에 영향을 주지 않습니다.
 rd_protected_tree_hash() {
-  local ref="${1-}" root oid raw filtered hash rc rec path bad=0
+  local ref="${1-}" root oid raw filtered hash rc rec path meta bad=0 cdir=""
   if [[ -z "$ref" ]]; then
     echo "rd_protected_tree_hash: 대상 commit 이 지정되지 않았습니다 — 판정 불가." >&2
     return 1
@@ -767,6 +871,8 @@ rd_protected_tree_hash() {
     echo "rd_protected_tree_hash: repo root 를 찾을 수 없습니다 — 판정 불가." >&2
     return 1
   }
+  # submodule 내용 ID 의 대체 객체 조회가 쓰는 common dir. 구하지 못하면 대체 조회 없이 commit: 폴백으로 갑니다.
+  cdir="$(_rd_git_common_dir "$root" 2>/dev/null)" || cdir=""
   oid="$(rd_resolve_commit_oid "$ref" "$root")" || {
     echo "rd_protected_tree_hash: '${ref}' 를 commit 으로 해석할 수 없습니다 — 판정 불가." >&2
     return 1
@@ -793,6 +899,12 @@ rd_protected_tree_hash() {
     if [[ "$rec" != *$'\t'* ]]; then bad=1; break; fi
     path="${rec#*$'\t'}"
     rd_path_is_record "$path" && continue
+    if [[ "$rec" == "160000 "* ]]; then
+      # gitlink 는 커밋 OID 가 아니라 내용 ID 로 셉니다 (spec 2.1 D1).
+      meta="${rec%%$'\t'*}"
+      printf '160000 content %s\t%s\0' "$(rd_gitlink_content_id "${root}/${path}" "${meta##* }" "$cdir")" "$path"
+      continue
+    fi
     printf '%s\0' "$rec"
   done < "$raw" > "$filtered"
   rm -f "$raw"

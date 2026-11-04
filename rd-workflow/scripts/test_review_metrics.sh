@@ -312,6 +312,8 @@ grep -q '재시도' "$TMP/last_err.txt"; chk $? "T1: 재시도 처방"
 ! grep -q '오염되었을 수 있으므로' "$TMP/last_err.txt"; chk $? "T1: 오염 문구 부재"
 ! grep -q '제거' "$TMP/last_err.txt"; chk $? "T1: 영구 변경(제거) 지시 부재"
 grep -q '^세션: (가)' "$TMP/last_err.txt"; chk $? "T1: 세션 (가)"
+# T4a·T10(capacity) 는 T1 과 같은 mock 입력이라 같은 stderr 를 쓴다 — 같은 실행을 되풀이하지 않는다.
+cp "$TMP/last_err.txt" "$TMP/cap_err.txt"
 
 # T3: effort 전달 + effort 키 없는 unknown variant
 sess="$TMP/t3"; mk_full_session "$sess"
@@ -323,11 +325,9 @@ grep -q 'RD_REVIEW_EFFORT_OVERRIDE=0' "$TMP/last_err.txt" && grep -q 'review-too
 ! grep -q '제거' "$TMP/last_err.txt"; chk $? "T3: 영구 변경(제거) 지시 부재"
 
 # T4: 끝 블록 안의 구분 불가 인용 두 변형
-sess="$TMP/t4a"; mk_full_session "$sess"
-rc="$(run_with_mock_adapter "$sess" "$(mk_log_body "$CAP_LINE" 1)")"
-grep -q '원인(로그 끝 오류 줄 기준)' "$TMP/last_err.txt"; chk $? "T4(capacity 인용): 출처 표시 라벨"
-! grep -q 'RD_REVIEW_EFFORT_OVERRIDE' "$TMP/last_err.txt"; chk $? "T4(capacity 인용): 설정 변경 처방 부재"
-! grep -q '제거' "$TMP/last_err.txt"; chk $? "T4(capacity 인용): 영구 변경(제거) 지시 부재"
+grep -q '원인(로그 끝 오류 줄 기준)' "$TMP/cap_err.txt"; chk $? "T4(capacity 인용): 출처 표시 라벨"
+! grep -q 'RD_REVIEW_EFFORT_OVERRIDE' "$TMP/cap_err.txt"; chk $? "T4(capacity 인용): 설정 변경 처방 부재"
+! grep -q '제거' "$TMP/cap_err.txt"; chk $? "T4(capacity 인용): 영구 변경(제거) 지시 부재"
 sess="$TMP/t4b"; mk_full_session "$sess"
 rc="$(run_with_mock_adapter "$sess" "$(mk_log_body "error: invalid value for '-c model_reasoning_effort': unknown variant 'x'" 1)")"
 grep -q '원인(로그 끝 오류 줄 기준)' "$TMP/last_err.txt"; chk $? "T4(effort 인용): 출처 표시 라벨"
@@ -390,14 +390,19 @@ grep -q '^세션: (나)' "$TMP/last_err.txt"; chk $? "T11: unverified 발행은 
 grep -q 'writer 종료: 미확인' "$TMP/last_err.txt"; chk $? "T11: 관측 줄에 writer 종료 미확인"
 
 # T10: 4원인 처방 연결
-t10_check() { # $1=이름 $2=오류 줄 $3=처방 문구
-  sess="$TMP/t10_$1"; mk_full_session "$sess"
-  run_with_mock_adapter "$sess" "$(mk_log_body "$2" 1)" >/dev/null
-  grep -q "$3" "$TMP/last_err.txt"; chk $? "T10($1): 처방 '$3'"
-  ! grep -q 'RD_REVIEW_EFFORT_OVERRIDE' "$TMP/last_err.txt"; chk $? "T10($1): effort 안내 부재"
-  ! grep -q '제거' "$TMP/last_err.txt"; chk $? "T10($1): 영구 변경(제거) 지시 부재"
+t10_check() { # $1=이름 $2=오류 줄 $3=처방 문구 $4=(선택) 이미 얻은 stderr 파일 — 있으면 실행을 건너뜀
+  local err="$TMP/last_err.txt"
+  if [[ -n "${4:-}" ]]; then
+    err="$4"
+  else
+    sess="$TMP/t10_$1"; mk_full_session "$sess"
+    run_with_mock_adapter "$sess" "$(mk_log_body "$2" 1)" >/dev/null
+  fi
+  grep -q "$3" "$err"; chk $? "T10($1): 처방 '$3'"
+  ! grep -q 'RD_REVIEW_EFFORT_OVERRIDE' "$err"; chk $? "T10($1): effort 안내 부재"
+  ! grep -q '제거' "$err"; chk $? "T10($1): 영구 변경(제거) 지시 부재"
 }
-t10_check capacity "$CAP_LINE" '재시도'
+t10_check capacity "$CAP_LINE" '재시도' "$TMP/cap_err.txt"
 t10_check rate 'ERROR: rate limit exceeded, too many requests' '재시도'
 t10_check auth 'ERROR: unauthorized: not logged in' '로그인'
 t10_check model 'ERROR: model not found: gpt-x' '모델 지정'

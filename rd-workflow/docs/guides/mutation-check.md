@@ -105,6 +105,8 @@ plan 시점에는 대상 코드가 없으므로 실행 대신 명세를 적습�
 
 - final diff review 세션의 Author 첫 턴 (리뷰 중 갱신은 그 뒤 Author 턴).
 - 완료 보고 — completion report 의 검증 절, 또는 종료 보고 블록의 `검증 결과` 필드. 사용자는 이 결과표로 무엇이 검증됐고 무엇이 미검증인지 봅니다.
+- 결과표나 변이 실행 출력을 파일로 따로 남기면 `rd-workflow-workspace/reports/reviews/` 에 둡니다. 이 경로는 기록 경로라서 seal 뒤에 파일을 만들거나 고쳐도 보호 트리 해시가 바뀌지 않습니다.
+- `rd-workflow-workspace/reports/verifications/` 를 포함한 그 밖의 경로에는 두지 않습니다. 그 경로들은 보호 트리에 들어갑니다. seal 뒤에 그곳에 쓰면 `rd task status` 가 「종결 후 코드 변경」 을 내고 발행이 막힙니다. 그때는 리뷰를 다시 열어 재seal 해야 합니다.
 
 ## 리뷰어 행동
 
