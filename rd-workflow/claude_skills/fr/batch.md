@@ -195,4 +195,3 @@ manifest status가 `running`인 동안 반복합니다:
 - mode A 고정. mode B FR은 batch 대상이 아닙니다(개별 처리).
 - `none` 종료 정책은 지원하지 않습니다(비범위).
 - 실제 headless 완주·순차 merge 충돌은 자동 검증 불가한 잔여 위험입니다(spec §7). 구현/운영 검수 시 소규모 수동 smoke로 확인합니다.
-- 모든 출력은 존댓말입니다.

@@ -1,6 +1,6 @@
 ## 문서 작성 스타일
 
-적용 대상은 워크플로 산출물 문서다 — REQUEST·spec·plan·review turn·completion report·FR 본문. 대화 응답에는 강제하지 않는다. 어조(존댓말·평어체)는 이 절이 정하지 않고 `CLAUDE.md` 의 `## 언어` 프로젝트 컨벤션을 따른다.
+적용 대상은 워크플로 산출물 문서다 — REQUEST·spec·plan·review turn·completion report·FR 본문. 대화 응답에는 강제하지 않는다.
 
 - 한 문장에 한 가지만 담는다. 길어지면 나눈다.
 - 능동태를 쓴다. 수동태는 행위자가 무의미할 때만 쓴다.
