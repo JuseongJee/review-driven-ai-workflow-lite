@@ -242,8 +242,24 @@ _tl_sweep_one() {  # <slug>
       return 0
     fi
     orc=0; tasks_path_occupied "$rn" || orc=$?
+    tab_why=""
     if [[ "$orc" -eq 0 ]]; then
-      _tl_hold "$slug" "점유 — 세션이 ${rp} 안에 있음" "그 세션을 닫거나 worktree 를 나온 뒤 rd task list 를 다시 실행"
+      # 점유 중이면 끝난 작업 탭인지 보고 닫는다 (change spec D14). 닫았으면 탭 셸이 끝나길 기다려 다시 본다.
+      trc=0; tab_why="$(session_tab_close_if_ended "$slug")" || trc=$?
+      if [[ "$trc" -eq 0 ]]; then
+        _tl_note "탭 닫음: ${slug}"
+        tab_why=""
+        for _i in 1 2 3 4; do
+          sleep 0.5
+          orc=0; tasks_path_occupied "$rn" || orc=$?
+          [[ "$orc" -eq 0 ]] || break
+        done
+      elif [[ "$trc" -eq 2 ]]; then
+        tab_why=""
+      fi
+    fi
+    if [[ "$orc" -eq 0 ]]; then
+      _tl_hold "$slug" "점유 — 세션이 ${rp} 안에 있음${tab_why:+ (탭: ${tab_why%% — *})}" "그 세션을 닫거나 worktree 를 나온 뒤 rd task list 를 다시 실행"
       return 0
     elif [[ "$orc" -ne 1 ]]; then
       _tl_hold "$slug" "점유 판정불가(${TASKS_OCCUPIED_REASON:-알 수 없음})" "lsof 를 확인한 뒤 rd task list 를 다시 실행"
@@ -402,6 +418,27 @@ _tl_launch_action() {  # <slug> <launch-raw> <wt>
   esac
 }
 
+# 발행 큐 요약 (change spec D9) — 큐 디렉터리가 없거나 대기 요청이 없으면 줄을 내지 않는다.
+# publish_queue.sh 는 하위 셸에서만 source 한다 (이 스크립트의 셸 옵션·함수를 건드리지 않기 위함).
+_tl_queue_summary() {
+  local shared
+  shared="$(git -C "$project_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  [[ -d "${shared}/rd-workflow/publish-queue" ]] || return 0
+  (
+    set +e +u
+    source "$SCRIPT_DIR/publish_queue.sh" >/dev/null 2>&1 || exit 0
+    n=0
+    for f in "$(pq_dir)"/*.req; do
+      [[ -f "$f" ]] || continue
+      st="$(_pq_state_of "$(basename "$f" .req)" 2>/dev/null)" || continue
+      case "$st" in requested|user-approval) n=$((n+1)) ;; esac
+    done
+    (( n > 0 )) || exit 0
+    active="$(pq_slot_get)"
+    printf '\n발행 큐: 요청 %d · 허가 %s\n' "$n" "${active:-없음}"
+  ) || true
+}
+
 # ---------------------------------------------------------------------------
 # 본문 출력
 # ---------------------------------------------------------------------------
@@ -511,6 +548,7 @@ if [[ "$ANY" -eq 0 ]]; then
   printf '진행 중인 작업이 없습니다.\n'
   [[ -n "$PRUNED_NOTE" ]] && printf '%s\n' "$PRUNED_NOTE"
   [[ -n "$SWEEP_NOTES" ]] && printf '%s' "$SWEEP_NOTES"
+  _tl_queue_summary
   exit 0
 fi
 
@@ -532,3 +570,5 @@ fi
 if [[ -n "$SWEEP_NOTES" ]]; then
   printf '\n%s' "$SWEEP_NOTES"
 fi
+
+_tl_queue_summary

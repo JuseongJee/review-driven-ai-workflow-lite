@@ -1113,8 +1113,20 @@ else
   # 기동 대상 백엔드는 예약과 같은 upsert 에 남긴다(spec D2). 기동 도중 끝나거나 결과를 기록하지
   # 못해도 resolve-launch 가 올바른 대상을 조회한다. `none` 도 써서 이전 기동의 값을 덮어쓴다.
   if [[ -n "${RD_CHILD_SESSION:-}" ]]; then _LAUNCH_BACKEND="none"; else _LAUNCH_BACKEND="$(session_launch_backend)"; fi
+  # 호출 세션 식별(D2) — 백엔드가 herdr·hc 일 때만 남긴다. 값이 비면 쓰지 않는다.
+  #   자식 세션은 위에서 백엔드가 `none` 이 되므로 여기서 따로 거르지 않는다.
+  _CALLER_KV=()
+  _caller_id=""
+  case "$_LAUNCH_BACKEND" in
+    herdr) _caller_id="${HERDR_PANE_ID:-}" ;;
+    hc)    _caller_id="${HC_TERMINAL_ID:-}" ;;
+  esac
+  if [[ -n "$_caller_id" ]]; then
+    _CALLER_KV=(caller-backend="$_LAUNCH_BACKEND" caller-id="$_caller_id")
+  fi
   tasks_index_upsert "$SLUG" fr-branch="$TARGET_BRANCH" worktree-path="$TARGET_DIR" checkout=yes \
-    ${_NW_FLAG:+no-worktree="$_NW_FLAG"} launch=launching launch-token="$LAUNCH_TOKEN" launch-backend="$_LAUNCH_BACKEND"
+    ${_NW_FLAG:+no-worktree="$_NW_FLAG"} launch=launching launch-token="$LAUNCH_TOKEN" launch-backend="$_LAUNCH_BACKEND" \
+    ${_CALLER_KV[@]+"${_CALLER_KV[@]}"}
 fi
 
 # 11. 락 해제 — 세션 기동보다 앞선다(예약은 이미 기록됐다). 기동은 락 밖에서 돈다 —
@@ -1139,7 +1151,14 @@ fi
 
 if [[ -n "$LAUNCH_TOKEN" ]]; then
   REQUEST_HANDOFF_PATH="${TARGET_DIR}/REQUEST.md"
-  LAUNCH_RESULT="$(session_launch "$TARGET_DIR" "$SLUG" "$REQUEST_HANDOFF_PATH" "$_SESSION_MODEL" "$_LAUNCH_BACKEND")"
+  # session_launch 가 만든 탭 식별자를 임시 파일로 받는다(stdout 은 결과 한 줄 계약이라 쓰지 않는다).
+  _LAUNCH_META="$(mktemp "${TMPDIR:-/tmp}/rd-launch-meta.XXXXXX" 2>/dev/null)" || _LAUNCH_META=""
+  LAUNCH_RESULT="$(RD_LAUNCH_META_FILE="$_LAUNCH_META" session_launch "$TARGET_DIR" "$SLUG" "$REQUEST_HANDOFF_PATH" "$_SESSION_MODEL" "$_LAUNCH_BACKEND")"
+  _LAUNCH_TAB=""
+  if [[ -n "$_LAUNCH_META" && -f "$_LAUNCH_META" ]]; then
+    _LAUNCH_TAB="$(sed -n 's/^launch-tab=//p' "$_LAUNCH_META" | head -n 1)"
+    rm -f "$_LAUNCH_META"
+  fi
   # 락은 유한 재시도한다 — rc=1(다른 명령이 잠깐 점유)만 0.25초 간격 최대 20회(약 5초).
   # rc=2(점유자 불확실)는 기다려도 풀리지 않으므로 즉시 중단한다. 재시도 중 stderr 는
   # 모아 두었다가 끝내 실패했을 때만 낸다(일시 경합 때 점유 안내가 20번 찍히지 않게).
@@ -1155,7 +1174,8 @@ if [[ -n "$LAUNCH_TOKEN" ]]; then
   if [[ "$_lock_rc" -eq 0 ]]; then
     _cur_token="$(tasks_index_get "$SLUG" launch-token 2>/dev/null)" || _cur_token=""
     if [[ "$_cur_token" == "$LAUNCH_TOKEN" ]]; then
-      tasks_index_upsert "$SLUG" launch="$LAUNCH_RESULT"
+      # 새 기동이므로 launch-tab 은 항상 덮어쓴다 — 값이 없으면 빈 값으로 옛 탭을 가리키지 않게 한다.
+      tasks_index_upsert "$SLUG" launch="$LAUNCH_RESULT" launch-tab="$_LAUNCH_TAB"
     fi
     tasks_lock_release
     _rec_ok=1
@@ -1180,6 +1200,14 @@ if [[ -n "$LAUNCH_TOKEN" ]]; then
       else
         echo "promote: herdr 에이전트 이름 — ${_agent_name}"
       fi
+    fi
+  fi
+  # D9 — caller 승인 모드에서 호출 세션 식별을 기록했으면 watch 안내를 낸다.
+  #      판독은 하위 셸에서 source 해 promote 의 환경에 함수·변수가 새지 않게 한다.
+  if [[ "$_rec_ok" -eq 1 && "$LAUNCH_RESULT" == "ok" && ${#_CALLER_KV[@]} -gt 0 ]]; then
+    _pa_mode="$( (source "${SCRIPT_DIR}/publish_queue.sh" >/dev/null 2>&1; pq_approval_mode 2>/dev/null) )" || _pa_mode=""
+    if [[ "$_pa_mode" == "caller" ]]; then
+      echo "promote: 호출 세션은 발행 요청을 받으려면 bash rd-workflow/scripts/rd publish watch 를 백그라운드로 실행해 두십시오"
     fi
   fi
   # D8 — 자동 기동이 없었으면(--no-worktree·자동 기동을 지원하지 않는 환경·자식 세션) 사람이 세션을 손으로

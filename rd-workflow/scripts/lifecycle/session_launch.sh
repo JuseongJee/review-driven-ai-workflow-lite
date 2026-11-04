@@ -476,6 +476,10 @@ session_launch() {  # <worktree-path> <slug> <request-path> [<model>] [<backend>
   pane_id="$(_session_launch_parse_pane_id "$outfile")"
   tab_id="$(_session_launch_parse_tab_id "$outfile")"
   rm -f "$outfile"
+  # 호출부(promote)가 탭 id 를 색인에 남기도록 메타 파일에 쓴다. stdout 계약은 그대로다.
+  if [[ -n "${RD_LAUNCH_META_FILE:-}" && -n "$tab_id" ]]; then
+    printf 'launch-tab=%s\n' "$tab_id" > "$RD_LAUNCH_META_FILE" 2>/dev/null || true
+  fi
   if [[ -z "$pane_id" ]]; then
     # tab create 는 성공(rc=0)했지만 pane_id 를 응답에서 찾지 못한 경우다. agent 를 붙일
     # 대상을 알 수 없다. tab_id 를 건졌으면 그 tab 은 닫아 빈 tab 을 남기지 않는다.
@@ -1176,4 +1180,149 @@ session_launch_model() {
     printf 'inherit\t%s\n' "$inherited"; return 0
   fi
   printf 'default\t\n'; return 0
+}
+
+# ---- 탭 닫기 판정·호출 세션 생존 (읽기 + 조건부 tab close) -----------------------
+
+# 내부 헬퍼: `herdr agent list` 응답에서 각 에이전트의 <field> 값을 읽는다 (stdout).
+#   첫 줄은 `ok` 또는 `bad`. `ok` 다음 줄부터 값이 한 줄씩 나온다.
+#   result.agents 가 배열이 아니거나, 항목 하나라도 객체가 아니거나 <field> 가 빈 값·문자열이 아니면
+#   `bad` 다 — 판정할 수 없는 항목을 빼고 「없음」 으로 읽으면 살아 있는 세션을 끝난 것으로 오판한다.
+_session_launch_agents_values() {  # <json-file> <field>
+  command -v python3 >/dev/null 2>&1 || { printf 'bad\n'; return 0; }
+  python3 -I - "$1" "$2" <<'PYEOF4'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        d = json.load(f)
+    a = d["result"]["agents"]
+    if not isinstance(a, list):
+        raise ValueError
+    vals = []
+    for x in a:
+        v = x.get(sys.argv[2]) if isinstance(x, dict) else None
+        if not isinstance(v, str) or not v or "\n" in v:
+            raise ValueError
+        vals.append(v)
+except Exception:
+    print("bad")
+    sys.exit(0)
+print("ok")
+for v in vals:
+    print(v)
+PYEOF4
+}
+
+# 내부 헬퍼: `herdr agent list` 를 불러 필드 값을 outvar 파일에 둔다.
+#   return 0 정상(첫 줄 ok) / 1 조회 실패·응답 형식 이상(판정 불가)
+_session_launch_agents_query() {  # <field> <outfile>
+  local field="$1" out="$2" raw rc head
+  raw="$(mktemp)" || return 1
+  _session_launch_run_with_timeout "${RD_LAUNCH_TIMEOUT:-5}" "$raw" herdr agent list
+  rc=$?
+  if [[ $rc -ne 0 ]]; then rm -f "$raw"; return 1; fi
+  _session_launch_agents_values "$raw" "$field" > "$out"
+  rm -f "$raw"
+  head="$(head -1 "$out")"
+  [[ "$head" == ok ]]
+}
+
+# 작업 탭을 닫아도 되는지 판정하고, 되면 닫는다 (change spec D7).
+#   return 0 닫음 / 1 닫지 않음(사유 stdout 한 줄) / 2 이미 없음
+#   색인의 `launch-backend`·`launch-tab` 을 읽는다. 호출부는 `tasks_index_get` 을 source 해 둔다.
+session_tab_close_if_ended() {  # <slug>
+  local slug="$1" backend tab tg errf rc cls label vals
+  if ! declare -F tasks_index_get >/dev/null 2>&1; then
+    printf '색인 함수(tasks_index_get)를 불러오지 않음 — 탭을 닫지 않음\n'; return 1
+  fi
+  backend="$(tasks_index_get "$slug" launch-backend 2>/dev/null || true)"
+  tab="$(tasks_index_get "$slug" launch-tab 2>/dev/null || true)"
+  if [[ "$backend" != herdr ]]; then
+    printf '백엔드가 herdr 가 아님 — 탭을 닫지 않음\n'; return 1
+  fi
+  if [[ -z "$tab" ]]; then
+    printf '탭 식별자 없음 — 직접 닫으십시오\n'; return 1
+  fi
+  command -v herdr >/dev/null 2>&1 || { printf 'herdr 명령 없음 — 탭을 닫지 않음\n'; return 1; }
+
+  tg="$(mktemp)" || { printf '임시 파일 생성 실패 — 탭을 닫지 않음\n'; return 1; }
+  errf="$(mktemp)" || { rm -f "$tg"; printf '임시 파일 생성 실패 — 탭을 닫지 않음\n'; return 1; }
+  RD_SL_ERRFILE="$errf" _session_launch_run_with_timeout "${RD_LAUNCH_TIMEOUT:-5}" "$tg" herdr tab get "$tab"
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    cls="$(_session_launch_json_classify "$errf")"
+    rm -f "$tg" "$errf"
+    [[ "$cls" == $'error\ttab_not_found' ]] && return 2
+    printf '탭 조회 실패 — 탭을 닫지 않음\n'; return 1
+  fi
+  label="$(python3 -I - "$tg" <<'PYEOF5'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        l = json.load(f)["result"]["tab"]["label"]
+    if isinstance(l, str):
+        print(l)
+except Exception:
+    pass
+PYEOF5
+)"
+  rm -f "$tg" "$errf"
+  # 번호 접두(`[12] `)는 herdr 가 붙인다. 떼고 slug 와 정확히 같아야 한다 (접두 일치 금지).
+  if [[ "$label" =~ ^\[[0-9]+\]\  ]]; then label="${label#*\] }"; fi
+  if [[ "$label" != "$slug" ]]; then
+    printf '탭 이름이 작업과 다름 — 탭을 닫지 않음\n'; return 1
+  fi
+
+  vals="$(mktemp)" || { printf '임시 파일 생성 실패 — 탭을 닫지 않음\n'; return 1; }
+  if ! _session_launch_agents_query tab_id "$vals"; then
+    rm -f "$vals"; printf '에이전트 목록을 확인하지 못함 — 탭을 닫지 않음\n'; return 1
+  fi
+  if grep -qxF -- "$tab" "$vals"; then
+    rm -f "$vals"; printf '세션이 살아 있음 — 탭을 닫지 않음\n'; return 1
+  fi
+  # 닫기 직전 재조회: 그 사이 에이전트가 생겼을 수 있다.
+  if ! _session_launch_agents_query tab_id "$vals"; then
+    rm -f "$vals"; printf '에이전트 목록을 확인하지 못함 — 탭을 닫지 않음\n'; return 1
+  fi
+  if grep -qxF -- "$tab" "$vals"; then
+    rm -f "$vals"; printf '세션이 살아 있음 — 탭을 닫지 않음\n'; return 1
+  fi
+  rm -f "$vals"
+
+  tg="$(mktemp)" || { printf '임시 파일 생성 실패 — 탭을 닫지 않음\n'; return 1; }
+  _session_launch_run_with_timeout "${RD_LAUNCH_TIMEOUT:-5}" "$tg" herdr tab close "$tab"
+  rc=$?
+  rm -f "$tg"
+  if [[ $rc -ne 0 ]]; then printf '탭 닫기 실패\n'; return 1; fi
+  return 0
+}
+
+# 호출 세션이 살아 있는지 판정한다 (change spec D13).
+#   return 0 생존 / 1 소실 / 2 판정 불가 (판정 불가는 소실로 보지 않는다)
+session_caller_alive() {  # <backend> <id>
+  local backend="$1" id="$2" out rc state kind
+  [[ -n "$id" ]] || return 2
+  out="$(mktemp)" || return 2
+  case "$backend" in
+    herdr)
+      command -v herdr >/dev/null 2>&1 || { rm -f "$out"; return 2; }
+      if ! _session_launch_agents_query pane_id "$out"; then rm -f "$out"; return 2; fi
+      if grep -qxF -- "$id" "$out"; then rm -f "$out"; return 0; fi
+      rm -f "$out"; return 1 ;;
+    hc)
+      command -v hc >/dev/null 2>&1 || { rm -f "$out"; return 2; }
+      _session_launch_hc_get "$id" "$out"
+      rc=$?
+      state="$(_session_launch_hc_field "$out" state)"
+      kind="$(_session_launch_hc_field "$out" error.kind)"
+      rm -f "$out"
+      [[ "$kind" == not_found ]] && return 1
+      if [[ "$rc" -ne 0 || -z "$state" ]]; then return 2; fi
+      case "$state" in
+        live)     return 0 ;;
+        finished) return 1 ;;
+        *)        return 2 ;;
+      esac ;;
+    *) rm -f "$out"; return 2 ;;
+  esac
 }

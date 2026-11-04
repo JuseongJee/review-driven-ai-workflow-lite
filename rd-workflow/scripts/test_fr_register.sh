@@ -20,7 +20,7 @@ ITEMS=rd-workflow-workspace/backlog/items
 CAPS=rd-workflow-workspace/raw-captures
 D=2026-02-02
 # 복제 원본에 넣는 제품 파일 (정적 source 추적 + 덫 사본으로 확정, spec 7.1). 목록 밖 파일은 이 테스트가 읽지 않는다.
-FX_FILES="rd _task_common.sh _state_common.sh _fr_register_common.sh hooks/_guard_common.sh lifecycle/slug.sh lifecycle/_tasks_index.sh lifecycle/session_launch.sh lifecycle/_lifecycle_common.sh"
+FX_FILES="rd _task_common.sh _submodule_common.sh _state_common.sh _fr_register_common.sh hooks/_guard_common.sh lifecycle/slug.sh lifecycle/_tasks_index.sh lifecycle/session_launch.sh lifecycle/_lifecycle_common.sh"
 mk_tpl() { # mk_tpl <dir> — 스크립트 사본 + task-state + 기본 backlog 를 가진 main 저장소 원본 (1회)
   mkdir -p "$1" && ( cd "$1" && git init -q && git checkout -q -b main 2>/dev/null \
     && git config user.email t@e.com && git config user.name t \

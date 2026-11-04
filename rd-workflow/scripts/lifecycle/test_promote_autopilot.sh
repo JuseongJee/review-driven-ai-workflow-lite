@@ -117,5 +117,32 @@ out="$( cd "$RLREPO" && env HERDR_ENV= HC_TERMINAL_ID=t6 HC_STUB_CWD="$RLREPO/.w
 t10_promote hcb3 RD_CHILD_SESSION=1
 [[ "$(idx_get hcb3 launch-backend)" == "none" ]] && pass "T10-d: 자식 세션은 launch-backend=none" || fail "자식 세션 기록: [$(idx_get hcb3 launch-backend)]"
 
+# T6) 호출 세션 식별·탭 기록·watch 안내 (change spec D2·D9) — 색인은 위 임시 저장소($RLREPO)의 것만 쓴다.
+#     herdr 대역은 PATH 에 두기만 한다(백엔드 판정용). 실제 기동은 RD_LAUNCH_STUB 이 대신한다.
+HDIR="$RLREPO/herdrstub"; mkdir -p "$HDIR"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$HDIR/herdr"; chmod +x "$HDIR/herdr"
+STUB_TAB="$RLREPO/stub-launch-tab.sh"
+cat > "$STUB_TAB" <<'STUBEOF'
+#!/usr/bin/env bash
+[[ -n "${RD_LAUNCH_META_FILE:-}" ]] && printf 'launch-tab=wS:t1\n' > "$RD_LAUNCH_META_FILE"
+printf 'ok\n'
+STUBEOF
+chmod +x "$STUB_TAB"
+t6_promote() {  # <slug> [env...]
+  local slug="$1"; shift
+  ( cd "$RLREPO" && env HERDR_ENV=1 HERDR_PANE_ID=wS:p1 HC_TERMINAL_ID= RD_CHILD_SESSION= "$@" PATH="$HDIR:$PATH" RD_LAUNCH_STUB="$STUB_TAB" \
+      bash "$PROMOTE" --short-title "$slug" --size large --source-fr - 2>&1 ) || true
+}
+# test_promote_records_caller_and_tab
+out="$(t6_promote ct1)"
+[[ "$(idx_get ct1 caller-backend)" == "herdr" && "$(idx_get ct1 caller-id)" == "wS:p1" && "$(idx_get ct1 launch-tab)" == "wS:t1" ]] \
+  && pass "T6: 색인에 caller-backend·caller-id·launch-tab 기록" \
+  || fail "T6 기록: backend=[$(idx_get ct1 caller-backend)] id=[$(idx_get ct1 caller-id)] tab=[$(idx_get ct1 launch-tab)]"
+[[ "$out" == *"rd publish watch"* ]] && pass "T6: caller 모드 watch 안내 출력" || fail "T6 watch 안내 없음: $out"
+# test_promote_child_no_caller
+out="$(t6_promote ct2 RD_CHILD_SESSION=1)"
+[[ -z "$(idx_get ct2 caller-id)" && "$out" != *"rd publish watch"* ]] \
+  && pass "T6: 자식 세션은 caller-id 를 기록하지 않고 안내도 없다" || fail "T6 자식 세션: id=[$(idx_get ct2 caller-id)] out=$out"
+
 printf 'promote_autopilot: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

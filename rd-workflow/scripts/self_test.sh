@@ -1569,6 +1569,7 @@ run_step lifecycle consumer "작업 색인 단위 테스트 (test_tasks_index.sh
 run_step lifecycle consumer "세션 기동 단위 테스트 (test_session_launch.sh)" bash "${SCRIPT_DIR}/lifecycle/test_session_launch.sh"
 run_step lifecycle consumer "promote autopilot 표식 테스트 (test_promote_autopilot.sh)" bash "${SCRIPT_DIR}/lifecycle/test_promote_autopilot.sh"
 run_step lifecycle consumer "작업 목록 단위 테스트 (test_tasks_list.sh)" bash "${SCRIPT_DIR}/lifecycle/test_tasks_list.sh"
+run_step lifecycle consumer "발행 큐 단위 테스트 (test_publish_queue.sh)" bash "${SCRIPT_DIR}/lifecycle/test_publish_queue.sh"
 run_step lifecycle consumer "worktree archive 테스트 (test_archive_worktree.sh)" bash "${SCRIPT_DIR}/lifecycle/test_archive_worktree.sh"
 run_step lifecycle consumer "submodule 발행·정리 (test_archive_submodule.sh)" bash "${SCRIPT_DIR}/lifecycle/test_archive_submodule.sh"
 run_step lifecycle consumer "FR 등록 helper 격리 테스트 (test_fr_register.sh)" bash "${SCRIPT_DIR}/test_fr_register.sh"

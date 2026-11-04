@@ -913,5 +913,98 @@ rc=0; out="$(hc_resolve hc2 HC_TERMINAL_ID=t6)" || rc=$?
 [[ "$out" == *"터미널 herdr 에서 기동했습니다"* && ! -s "$HCT/hc.log" ]] \
   && pass "레거시 행은 hc 를 부르지 않고 터미널 herdr 안내를 낸다" || fail "레거시 행 hc 조회: log=$(cat "$HCT/hc.log") out=$out"
 
+# ---------------------------------------------------------------------------
+# publish-queue-tab-close Task 8 — 지연 정리의 탭 닫기, 큐 요약 줄, rd publish 디스패치
+#   가짜 herdr 는 TB 의 파일로 응답을 정하고 호출을 남긴다. 점유 대역 프로세스는 사례 끝에 반드시 정리한다.
+# ---------------------------------------------------------------------------
+TB="$TMP/tb"; mkdir -p "$TB/bin"
+tb_stub() {  # <agents-json-array 내용>
+  : > "$TB/calls.log"; rm -f "$TB/holder.pid"
+  printf '{"id":"cli:tab:get","result":{"tab":{"label":"%s","tab_id":"wX:t9"},"type":"tab_info"}}' "$2" > "$TB/tabget.out"
+  printf '{"id":"cli:agent:list","result":{"agents":[%s]}}' "$1" > "$TB/list.out"
+  cat > "$TB/bin/herdr" <<TBEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TB/calls.log"
+case "\$1 \$2" in
+  "tab get") cat "$TB/tabget.out" ;;
+  "agent list") cat "$TB/list.out" ;;
+  "tab close") [[ -f "$TB/holder.pid" ]] && kill "\$(cat "$TB/holder.pid")" 2>/dev/null; exit 0 ;;
+esac
+TBEOF
+  chmod +x "$TB/bin/herdr"
+}
+tb_holder() {  # <slug> — worktree 를 cwd 로 잡는 대역 프로세스(탭 셸 흉내)
+  ( cd "$TMP/.worktrees/$1" && exec sleep 30 ) & TB_PID=$!; disown "$TB_PID" 2>/dev/null || true
+  echo "$TB_PID" > "$TB/holder.pid"
+  sleep 0.5
+}
+tb_holder_stop() { kill "${TB_PID:-0}" 2>/dev/null || true; wait "${TB_PID:-0}" 2>/dev/null || true; TB_PID=""; }
+tb_run() { PATH="$TB/bin:$PATH" bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true; }
+
+# test_sweep_closes_ended_tab: 에이전트가 없고 탭 셸이 worktree 를 점유 → 탭을 닫고 정리한다
+_sw_mk tb1
+tasks_index_upsert tb1 launch-backend=herdr launch-tab=wX:t9
+tb_stub "" tb1; tb_holder tb1
+out="$(tb_run)"
+tb_holder_stop
+if _sw_all_gone tb1 && grep -qxF '탭 닫음: tb1' <<<"$out" && grep -q '^tab close' "$TB/calls.log"; then
+  pass "끝난 세션의 탭을 닫고 점유가 풀리면 정리한다"
+else
+  fail "탭 닫기 후 정리 실패: $out"
+fi
+_sw_cleanup tb1
+
+# test_sweep_keeps_live_tab: 에이전트가 살아 있으면 닫지 않고 보류, 사유에 탭 사정이 붙는다
+_sw_mk tb2
+tasks_index_upsert tb2 launch-backend=herdr launch-tab=wX:t9
+tb_stub '{"pane_id":"p1","tab_id":"wX:t9","name":"n","agent_status":"working"}' tb2; tb_holder tb2
+out="$(tb_run)"
+tb_holder_stop
+if _sw_all_kept tb2 && grep -E '^정리 보류: tb2 — ' <<<"$out" | grep -q '점유 — 세션이 .* 안에 있음 (탭: 세션이 살아 있음)' \
+   && ! grep -q '^tab close' "$TB/calls.log"; then
+  pass "살아 있는 세션의 탭은 닫지 않고 보류 사유에 탭 사정을 덧붙인다"
+else
+  fail "살아 있는 탭 보류 실패 (tab close 호출 $(grep -c '^tab close' "$TB/calls.log")회): $out"
+fi
+_sw_cleanup tb2
+
+# 비점유 worktree 에서는 탭 닫기를 부르지 않는다(herdr 조회 자체가 없다)
+_sw_mk tb3
+tasks_index_upsert tb3 launch-backend=herdr launch-tab=wX:t9
+tb_stub "" tb3
+out="$(tb_run)"
+if _sw_all_gone tb3 && [[ ! -s "$TB/calls.log" ]]; then
+  pass "비점유 worktree 는 herdr 를 호출하지 않고 정리한다"
+else
+  fail "비점유인데 herdr 호출: $(cat "$TB/calls.log") / $out"
+fi
+_sw_cleanup tb3
+
+# test_list_shows_queue_summary: 요청 1 + done 1 + 슬롯 없음 → 「요청 1 · 허가 없음」, 요청이 없으면 줄이 없다
+out="$(bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+[[ "$out" != *"발행 큐:"* ]] && pass "큐 디렉터리가 없으면 요약 줄을 내지 않는다" || fail "큐 없는데 요약 줄: $out"
+_qd="$(git -C "$TMP" rev-parse --path-format=absolute --git-common-dir)/rd-workflow/publish-queue"
+mkdir -p "$_qd"
+printf 'state=done\n' > "$_qd/q-done.req"
+out="$(bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+[[ "$out" != *"발행 큐:"* ]] && pass "done 만 있으면 요약 줄을 내지 않는다" || fail "done 만인데 요약 줄: $out"
+printf 'state=requested\n' > "$_qd/q-req.req"
+out="$(bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+grep -qxF '발행 큐: 요청 1 · 허가 없음' <<<"$out" && pass "요청 1·done 1·슬롯 없음 → 요청 1 · 허가 없음" || fail "큐 요약: $out"
+printf 'state=user-approval\n' > "$_qd/q-ua.req"; printf 'q-ua\n' > "$_qd/ACTIVE"
+out="$(bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+grep -qxF '발행 큐: 요청 2 · 허가 q-ua' <<<"$out" && pass "user-approval 도 세고 허가 슬롯 slug 를 보인다" || fail "큐 요약 2: $out"
+rm -rf "$_qd"
+
+# test_rd_publish_dispatch: rd publish <하위 명령> 이 publish_queue.sh 와 같은 결과·종료 코드를 낸다
+_d_rc=0; _d_rd="$(cd "$TMP" && bash rd-workflow/scripts/rd publish status 2>&1)" || _d_rc=$?
+_d_pqrc=0; _d_pq="$(cd "$TMP" && bash rd-workflow/scripts/lifecycle/publish_queue.sh status 2>&1)" || _d_pqrc=$?
+[[ "$_d_rd" == "$_d_pq" && "$_d_rc" == "$_d_pqrc" && "$_d_rd" != *"알 수 없는 명령"* && "$_d_rd" != *"사용법: bash rd-workflow/scripts/rd task"* ]] \
+  && pass "rd publish status 가 publish_queue.sh status 와 같다" || fail "rd publish 디스패치: rd=[$_d_rd]/$_d_rc pq=[$_d_pq]/$_d_pqrc"
+_d_rc=0; ( cd "$TMP" && bash rd-workflow/scripts/rd publish no-such-sub >/dev/null 2>&1 ) || _d_rc=$?
+_d_pqrc=0; ( cd "$TMP" && bash rd-workflow/scripts/lifecycle/publish_queue.sh no-such-sub >/dev/null 2>&1 ) || _d_pqrc=$?
+[[ "$_d_rc" == "$_d_pqrc" ]] && pass "rd publish 는 하위 명령의 종료 코드를 그대로 돌려준다" || fail "종료 코드 불일치: rd=$_d_rc pq=$_d_pqrc"
+rm -rf "$(git -C "$TMP" rev-parse --path-format=absolute --git-common-dir)/rd-workflow/publish-queue"
+
 printf 'tasks_list: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

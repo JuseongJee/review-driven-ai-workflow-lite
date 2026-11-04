@@ -20,6 +20,7 @@ Read these first:
 Execution rules:
 - 이 skill 은 `CURRENT_TASK.md` 의 `## Short Title` 을 read-only 로 사용한다 (변경 / 삭제 금지). short-title 은 작업 시작 시점 (`/fr add`, `planning-design-intake`, 또는 `promote.sh` 승격) 에 1회 부여되고 archive 까지 immutable 이다.
 - 검증은 `bash rd-workflow/scripts/verify_record.sh -- <검증 명령>` 으로 돌려 증거를 남긴다 (프로젝트의 검증 명령 — 예: `test.sh`·`lint.sh`·`typecheck.sh`·`build.sh`, 이 저장소는 `self_test.sh <그룹>`). 증거가 없거나 리뷰 중 코드를 고쳐 트리가 바뀌었으면 다시 돌린다. `rd review seal` 은 통과 증거의 트리가 리뷰 승인 트리와 같을 때만 종결 마커를 만든다.
+- seal 뒤 발행(`archive.sh`)의 승인 주체와 순서는 `rd-workflow/docs/flows/AUTONOMY.md` 「종결 마커(seal)와 발행 승인」 절을 따른다(`publish_approval` — 호출 세션 허가 또는 사용자 승인).
 - Draft the PR description with `rd-workflow/docs/PR_TEMPLATE.md`.
 - 세션 생성 전에 커밋 전 재분류(WORKFLOW.md 위험 등급 절) 를 끝내고 `REQUEST.md ## Risk Tier` 의 `- 최종 등급:` 이 확정되어 있어야 한다 — `prepare_review_pipeline.sh` 가 이 줄로 리뷰 effort 를 정한다.
 - **변이 결과표**: 세션 생성 전에 `rd-workflow/docs/guides/mutation-check.md` 「절차」로 이 변경의 필수 대상 단언 결과표를 만들고 Author 첫 턴에 싣는다. `full` 은 task 완료 보고의 행을 모으고, `standard` 는 diff 에서 필수 대상을 직접 식별한다(plan 은 쓰지 않는다). 필수 대상이 없으면 `필수 대상 없음 — 사유` 한 줄을 싣는다. `생존`·원복 `미확인` 행이 남은 채로 세션을 열지 않는다. 리뷰 중 고친 코드가 행의 대상·동작·실행 조건을 바꾸면 가이드 「갱신 규칙」대로 다음 Author 턴에 갱신 행을 싣는다.

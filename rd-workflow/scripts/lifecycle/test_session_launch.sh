@@ -878,5 +878,140 @@ got="$(HERDR_ENV= HC_TERMINAL_ID=t6 RD_CHILD_SESSION=1 PATH="$STUB:$PATH" sessio
 got="$(HERDR_ENV= HC_TERMINAL_ID=t6 RD_CHILD_SESSION= PATH="$STUB:$PATH" session_launch /tmp/wt alpha /tmp/wt/REQUEST.md "" none 2>/dev/null)"
 [[ "$got" == none && ! -s "$STUB/hc.log" ]] && pass "5번째 인자가 판정을 대신한다" || fail "넘긴 백엔드 무시: $got"
 
+# ---- 탭 id 메타 출력·탭 닫기 판정·호출 세션 생존 (publish-queue-tab-close Task 2) ----
+#   임시 저장소의 색인만 쓴다(project_root 로 고정). 가짜 herdr 는 $TQ 의 파일로 응답을 정하고 호출을 남긴다.
+source "$SCRIPT_DIR/_tasks_index.sh"
+QREPO="$TMP/qrepo"; mkdir -p "$QREPO"; git -C "$QREPO" init -q; QREPO="$(cd "$QREPO" && pwd -P)"
+project_root="$QREPO"
+[[ "$(tasks_index_path)" == "$QREPO"/.git/rd-workflow/tasks.local ]] || { fail "색인이 임시 저장소를 가리키지 않음: $(tasks_index_path)"; exit 1; }
+TQ="$TMP/tq"; mkdir -p "$TQ/bin"
+make_tq_stub() {  # 응답 파일을 비우고 가짜 herdr 를 만든다
+  rm -f "${TQ:?}"/*.out "${TQ:?}"/*.err "${TQ:?}"/*.rc "$TQ"/*.cnt "$TQ"/calls.log; : > "$TQ/calls.log"
+  cat > "$TQ/bin/herdr" <<TQEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TQ/calls.log"
+case "\$1 \$2" in
+  "tab get")
+    if [[ -f "$TQ/tabget.err" ]]; then cat "$TQ/tabget.err" >&2; exit 1; fi
+    cat "$TQ/tabget.out" ;;
+  "agent list")
+    n=\$(( \$(cat "$TQ/list.cnt" 2>/dev/null || echo 0) + 1 )); echo \$n > "$TQ/list.cnt"
+    f="$TQ/list.\$n.out"; [[ -f "\$f" ]] || f="$TQ/list.out"
+    cat "\$f"; exit \$(cat "$TQ/list.rc" 2>/dev/null || echo 0) ;;
+  "tab close") exit \$(cat "$TQ/close.rc" 2>/dev/null || echo 0) ;;
+esac
+TQEOF
+  chmod +x "$TQ/bin/herdr"
+}
+tq_label() { printf '{"id":"cli:tab:get","result":{"tab":{"label":"%s","tab_id":"wX:t9"},"type":"tab_info"}}' "$1" > "$TQ/tabget.out"; }
+tq_agents() { printf '{"id":"cli:agent:list","result":{"agents":[%s]}}' "$1" > "${2:-$TQ/list.out}"; }
+tq_agent() { printf '{"pane_id":"%s","tab_id":"%s","name":"n","agent_status":"working"}' "$1" "$2"; }
+tq_index() { tasks_index_upsert publish-x launch-backend="${1:-herdr}" launch-tab="${2-wX:t9}"; }
+tq_close() {  # → TQ_RC, TQ_OUT, 호출 기록은 calls.log
+  TQ_RC=0; TQ_OUT="$(PATH="$TQ/bin:$PATH" session_tab_close_if_ended "${1:-publish-x}")" || TQ_RC=$?
+}
+tq_closed() { grep -q '^tab close' "$TQ/calls.log"; }
+
+# test_meta_file_written: tab create 의 tab_id 가 메타 파일에 한 줄로 남고 stdout 계약은 그대로다
+make_stub 0 0 0
+MF="$TMP/meta"; rm -f "$MF"
+out="$(PATH="$STUB:$PATH" HERDR_ENV=1 RD_CHILD_SESSION= RD_LAUNCH_META_FILE="$MF" session_launch /tmp/wt alpha REQUEST.md 2>/dev/null)"
+[[ "$out" == ok && "$(cat "$MF" 2>/dev/null)" == "launch-tab=wX:t9" ]] \
+  && pass "메타 파일에 launch-tab 한 줄을 쓴다(stdout 은 ok)" || fail "메타 파일: out=$out meta=$(cat "$MF" 2>/dev/null)"
+rm -f "$MF"
+
+# test_tab_close_agent_alive: 그 탭에 에이전트가 있으면 닫지 않는다
+make_tq_stub; tq_index; tq_label publish-x; tq_agents "$(tq_agent wX:p1 wX:t9)"
+tq_close
+[[ "$TQ_RC" == 1 && "$TQ_OUT" == *"살아 있음"* ]] && ! tq_closed \
+  && pass "에이전트가 있으면 rc 1, tab close 미호출" || fail "agent_alive: rc=$TQ_RC out=$TQ_OUT"
+# 다른 탭의 에이전트는 영향이 없다
+tq_agents "$(tq_agent wX:p2 wX:t7)"; rm -f "$TQ/list.cnt"; : > "$TQ/calls.log"
+tq_close
+[[ "$TQ_RC" == 0 ]] && tq_closed && pass "다른 탭의 에이전트만 있으면 닫는다" || fail "other_tab: rc=$TQ_RC out=$TQ_OUT"
+
+# test_tab_close_label_variants: 번호 접두는 있어도 없어도 일치, 다른 slug 의 접두 일치는 불일치
+for lb in "publish-x" "[12] publish-x"; do
+  make_tq_stub; tq_index; tq_label "$lb"; tq_agents ""
+  tq_close
+  [[ "$TQ_RC" == 0 ]] && tq_closed && pass "라벨 '$lb' 는 일치로 보고 닫는다" || fail "label '$lb': rc=$TQ_RC out=$TQ_OUT"
+done
+make_tq_stub; tq_index; tq_label "[1] publish-x-2"; tq_agents ""
+tq_close
+[[ "$TQ_RC" == 1 ]] && ! tq_closed && pass "라벨 '[1] publish-x-2' 는 불일치(rc 1)" || fail "label mismatch: rc=$TQ_RC out=$TQ_OUT"
+
+# test_tab_close_list_fail: agent list 가 rc 1 이면(정상 형식 빈 목록이어도) 닫지 않는다
+make_tq_stub; tq_index; tq_label publish-x; tq_agents ""; echo 1 > "$TQ/list.rc"
+tq_close
+[[ "$TQ_RC" == 1 ]] && ! tq_closed && pass "agent list 실패는 rc 1, 닫지 않음" || fail "list_fail: rc=$TQ_RC out=$TQ_OUT"
+
+# test_tab_close_bad_shape: result.agents 배열이 없으면 닫지 않는다
+make_tq_stub; tq_index; tq_label publish-x; echo '{"result":{}}' > "$TQ/list.out"
+tq_close
+[[ "$TQ_RC" == 1 ]] && ! tq_closed && pass "agents 배열이 없으면 rc 1, 닫지 않음" || fail "bad_shape: rc=$TQ_RC out=$TQ_OUT"
+# test_tab_close_bad_item: 항목 하나라도 판정할 수 없으면(tab_id 누락·빈 값·객체 아님) 닫지 않는다
+for item in '{"pane_id":"wX:p1","agent_status":"working"}' '{"pane_id":"wX:p1","tab_id":""}' '{"pane_id":"wX:p1","tab_id":7}' '"wX:t9"'; do
+  make_tq_stub; tq_index; tq_label publish-x; tq_agents "$item"
+  tq_close
+  [[ "$TQ_RC" == 1 ]] && ! tq_closed && pass "판정할 수 없는 항목($item)이면 rc 1, 닫지 않음" || fail "bad_item $item: rc=$TQ_RC out=$TQ_OUT"
+done
+
+# test_tab_close_recheck_new_agent: 첫 조회는 빈 목록, 닫기 직전 재조회에서 에이전트가 보이면 닫지 않는다
+make_tq_stub; tq_index; tq_label publish-x; tq_agents "" "$TQ/list.1.out"; tq_agents "$(tq_agent wX:p1 wX:t9)" "$TQ/list.2.out"
+tq_close
+[[ "$TQ_RC" == 1 ]] && ! tq_closed && pass "재조회에서 에이전트가 생기면 rc 1" || fail "recheck: rc=$TQ_RC out=$TQ_OUT"
+
+# test_tab_close_not_found: tab get 이 tab_not_found 면 2, 그 밖의 오류는 1
+make_tq_stub; tq_index; echo '{"error":{"code":"tab_not_found","message":"x"},"id":"cli:tab:get"}' > "$TQ/tabget.err"
+tq_close
+[[ "$TQ_RC" == 2 ]] && ! tq_closed && pass "tab_not_found 는 rc 2" || fail "not_found: rc=$TQ_RC out=$TQ_OUT"
+echo '{"error":{"code":"internal","message":"x"}}' > "$TQ/tabget.err"
+tq_close
+[[ "$TQ_RC" == 1 ]] && pass "그 밖의 tab get 실패는 rc 1" || fail "tab get 기타 실패: rc=$TQ_RC"
+
+# test_tab_close_no_id: launch-tab 이 비면 1 과 안내
+make_tq_stub; tq_index herdr ""
+tq_close
+[[ "$TQ_RC" == 1 && "$TQ_OUT" == *"탭 식별자 없음"* ]] && ! grep -q . "$TQ/calls.log" \
+  && pass "launch-tab 이 비면 rc 1, herdr 를 부르지 않음" || fail "no_id: rc=$TQ_RC out=$TQ_OUT"
+
+# 백엔드가 herdr 가 아니면 1, tab close 실패면 1
+make_tq_stub; tq_index hc wX:t9; tq_label publish-x; tq_agents ""
+tq_close
+[[ "$TQ_RC" == 1 ]] && ! grep -q . "$TQ/calls.log" && pass "백엔드가 hc 면 rc 1" || fail "backend hc: rc=$TQ_RC"
+make_tq_stub; tq_index; tq_label publish-x; tq_agents ""; echo 1 > "$TQ/close.rc"
+tq_close
+[[ "$TQ_RC" == 1 && "$TQ_OUT" == *"탭 닫기 실패"* ]] && pass "tab close 실패는 rc 1" || fail "close fail: rc=$TQ_RC out=$TQ_OUT"
+
+# test_caller_alive_herdr: pane 있음 0 / 없음 1 / list 실패 2
+make_tq_stub; tq_agents "$(tq_agent wX:p1 wX:t1),$(tq_agent wX:p2 wX:t2)"
+rc=0; PATH="$TQ/bin:$PATH" session_caller_alive herdr wX:p2 || rc=$?
+[[ "$rc" == 0 ]] && pass "caller_alive: pane 이 있으면 0" || fail "caller_alive 있음: $rc"
+rc=0; PATH="$TQ/bin:$PATH" session_caller_alive herdr wX:p9 || rc=$?
+[[ "$rc" == 1 ]] && pass "caller_alive: pane 이 없으면 1" || fail "caller_alive 없음: $rc"
+echo 1 > "$TQ/list.rc"
+rc=0; PATH="$TQ/bin:$PATH" session_caller_alive herdr wX:p2 || rc=$?
+[[ "$rc" == 2 ]] && pass "caller_alive: list 실패는 2(소실로 보지 않음)" || fail "caller_alive 실패: $rc"
+make_tq_stub; tq_agents "$(tq_agent wX:p1 wX:t1),{\"tab_id\":\"wX:t2\"}"
+rc=0; PATH="$TQ/bin:$PATH" session_caller_alive herdr wX:p2 || rc=$?
+[[ "$rc" == 2 ]] && pass "caller_alive: pane_id 없는 항목이 있으면 2(소실로 보지 않음)" || fail "caller_alive 불완전 항목: $rc"
+
+# hc: live 0 / finished 1 / not_found 1 / 그 밖 2
+cat > "$TQ/bin/hc" <<'HCEOF'
+#!/usr/bin/env bash
+case "$(cat "$(dirname "$0")/../hc.mode")" in
+  live) echo '{"state":"live"}' ;;
+  finished) echo '{"state":"finished"}' ;;
+  notfound) echo '{"error":{"kind":"not_found"}}' >&2; exit 3 ;;
+  *) exit 1 ;;
+esac
+HCEOF
+chmod +x "$TQ/bin/hc"
+for pair in live:0 finished:1 notfound:1 broken:2; do
+  echo "${pair%%:*}" > "$TQ/hc.mode"
+  rc=0; PATH="$TQ/bin:$PATH" session_caller_alive hc t6 || rc=$?
+  [[ "$rc" == "${pair##*:}" ]] && pass "caller_alive hc ${pair%%:*} → ${pair##*:}" || fail "caller_alive hc ${pair%%:*}: $rc"
+done
+
 printf 'session_launch: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

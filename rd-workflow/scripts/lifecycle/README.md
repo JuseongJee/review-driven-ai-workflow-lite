@@ -221,6 +221,10 @@ lifecycle 스크립트 전체에 명문화된 git 최소 버전 정책은 없다
 
 원격 브랜치 삭제 경로는 추가로 `--force-with-lease`(1.8.5 도입)를 요구한다. **이 1.8.5 는 해당 경로의 기능 하한일 뿐 프로젝트 전체 하한이 아니다.** 실행 전에 `git --version` 을 파싱해 하한 미만이거나 버전 판정이 불가능하면 원격 삭제를 **시도하지 않고** 안전 불변식 위반으로 처리한다. 어느 경우에도 무보호 삭제로 fallback 하지 않는다.
 
+### `publish_queue.sh`
+
+발행 요청 큐 (`rd publish <하위 명령>`). 저장소는 `<git-common-dir>/rd-workflow/publish-queue/` 이고 추적하지 않는다. 작업 세션은 `request`·`wait`·`run`, 호출 세션은 `watch`·`next`, 누구나 `status`·`cancel`·`recover` 를 쓴다. 허가 슬롯(`ACTIVE`)은 하나뿐이라 동시에 한 작업만 발행한다. 결과는 `tasks_publish_evidence` 로 판정한다(성공·부분 완료·실패). 설계: `rd-workflow-workspace/specs/changes/2026-11-04-0917-publish-queue-tab-close-change-spec.md`.
+
 ### `merge_fr_index.sh`
 
 `FUTURE_REQUESTS.md` 행 집합 3-way 병합. `archive.sh` Step 3 merge 가 인덱스 단독 충돌로 실패했을 때 호출한다.

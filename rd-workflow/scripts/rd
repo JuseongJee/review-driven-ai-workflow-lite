@@ -473,10 +473,18 @@ usage() {
 사용법: bash rd-workflow/scripts/rd review <subcommand>
   seal [--legacy-unverified <사유>] <session-path>
                                            final diff review 종결 마커 생성 (4검사 통과 시 verified=yes)
+
+사용법: bash rd-workflow/scripts/rd publish <subcommand> [args...]
+  발행 큐 명령. lifecycle/publish_queue.sh 로 그대로 넘기며 종료 코드도 그대로입니다
 EOF
 }
 
 ns="${1:-}"; [[ $# -gt 0 ]] && shift
+# publish 네임스페이스 — 발행 큐 (publish_queue.sh 로 위임, 종료 코드 그대로)
+if [[ "$ns" == "publish" ]]; then
+  bash "${SCRIPT_DIR}/lifecycle/publish_queue.sh" ${1+"$@"}
+  exit $?
+fi
 case "$ns" in task|review) ;; *) usage; exit 1 ;; esac
 cmd="${1:-}"; [[ $# -gt 0 ]] && shift
 
