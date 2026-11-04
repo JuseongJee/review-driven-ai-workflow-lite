@@ -451,56 +451,50 @@ tasks_path_occupied() {
   uid="$(id -u)"
 
   # 점유가 확인되면(rc 0) 읽지 못한 프로세스가 있어도 점유다. 비점유(rc 1)는 읽지 못한 프로세스가
-  # 없을 때만 낸다. 재시도를 들인 사례인 `top -l 2`(2026-10-29 실측)는 setuid 라 이제 유효 uid 거름으로
-  # 빠지지만, 그 밖의 일시적 읽기 불가에 대비해 읽기 불가가 남으면 TASKS_OCCUPIED_RETRY(기본 3)회까지
-  # 1초 간격으로 다시 읽는다.
-  local retry="${TASKS_OCCUPIED_RETRY:-3}" attempt=0 ps_out snap lsof_out lrc pid missed candidates line
-  while :; do
-    lsof_out=""; lrc=0
-    # ps 실패나 빈 스냅샷(숫자 pid 행이 하나도 없음 — 빈 출력 포함)은 대조 근거가 사라진다는 뜻이다 — 비점유로 흘리지 않고 판정불가로 낸다.
-    ps_out="$(ps -U "$uid" -o pid=,uid=,stat= 2>/dev/null)" || { TASKS_OCCUPIED_REASON="프로세스 목록 조회 실패"; return 2; }
-    # 유효 uid 가 숫자가 아니면 거르지 않는다 — 대조에 남겨 읽지 못하면 판정불가가 되게 한다(fail-closed).
-    snap="$(printf '%s\n' "$ps_out" | awk -v me="$uid" '
-      $1 !~ /^[0-9]+$/ {next}
-      $3 ~ /^Z/ {next}
-      $2 ~ /^[0-9]+$/ && $2 != me {next}
-      {print $1}')"
-    [[ -n "$snap" ]] || { TASKS_OCCUPIED_REASON="프로세스 목록이 비어 있음"; return 2; }
-    # -a 가 없으면 lsof 는 조건을 OR 로 묶어 내 계정의 모든 파일을 훑는다(실측 17초·5만 줄).
-    lsof_out="$(lsof -a -u "$uid" -d cwd -Fpn 2>/dev/null)" || lrc=$?
-    if [[ "$lrc" -ne 0 && -z "$lsof_out" ]]; then
-      TASKS_OCCUPIED_REASON="조회 실패"; return 2
-    fi
+  # 없을 때만 낸다. 읽기 불가가 남으면 다시 읽지 않고 바로 판정불가(rc 2)다. 1초 간격 재시도는
+  # 2026-11-04 에 지웠다 — 그때까지 관측된 읽기 불가 사례(좀비, `top`·`svpn`·`login` 같은 setuid 프로세스)가
+  # 모두 거름(stat Z, 유효 uid)으로 빠졌다. 새 사례가 생기면 보류(fail-closed)되고 rd task list 재실행으로 풀린다.
+  local ps_out snap lsof_out lrc=0 pid missed candidates line
+  # ps 실패나 빈 스냅샷(숫자 pid 행이 하나도 없음 — 빈 출력 포함)은 대조 근거가 사라진다는 뜻이다 — 비점유로 흘리지 않고 판정불가로 낸다.
+  ps_out="$(ps -U "$uid" -o pid=,uid=,stat= 2>/dev/null)" || { TASKS_OCCUPIED_REASON="프로세스 목록 조회 실패"; return 2; }
+  # 유효 uid 가 숫자가 아니면 거르지 않는다 — 대조에 남겨 읽지 못하면 판정불가가 되게 한다(fail-closed).
+  snap="$(printf '%s\n' "$ps_out" | awk -v me="$uid" '
+    $1 !~ /^[0-9]+$/ {next}
+    $3 ~ /^Z/ {next}
+    $2 ~ /^[0-9]+$/ && $2 != me {next}
+    {print $1}')"
+  [[ -n "$snap" ]] || { TASKS_OCCUPIED_REASON="프로세스 목록이 비어 있음"; return 2; }
+  # -a 가 없으면 lsof 는 조건을 OR 로 묶어 내 계정의 모든 파일을 훑는다(실측 17초·5만 줄).
+  lsof_out="$(lsof -a -u "$uid" -d cwd -Fpn 2>/dev/null)" || lrc=$?
+  if [[ "$lrc" -ne 0 && -z "$lsof_out" ]]; then
+    TASKS_OCCUPIED_REASON="조회 실패"; return 2
+  fi
 
-    while IFS= read -r line; do
-      case "$line" in
-        n"$target"|n"$target"/*) return 0 ;;
-      esac
-    done <<<"$lsof_out"
+  while IFS= read -r line; do
+    case "$line" in
+      n"$target"|n"$target"/*) return 0 ;;
+    esac
+  done <<<"$lsof_out"
 
-    # 권한 제한 대조 — 살아 있는 내 계정 pid 중 CWD 경로를 실제로 읽지 못한 것을 센다.
-    #   lsof 출력에 `p<pid>` 가 있어도 뒤따르는 `n` 줄이 절대경로가 아니면(예: `n/proc/<pid>/cwd (readlink:
-    #   Permission denied)` 같은 오류 설명) 읽은 것으로 치지 않는다 — 프로세스 식별과 경로 읽기는 별개다.
-    #   pid 마다 grep 을 띄우면 프로세스가 수백 개일 때 수십 초가 걸린다 — awk 한 번으로 거른다.
-    missed=0
-    candidates="$(printf '%s\n' "$snap" | LSOF_OUT="$lsof_out" awk '
-      BEGIN { n = split(ENVIRON["LSOF_OUT"], a, "\n"); cur = ""
-        for (i = 1; i <= n; i++) {
-          if (a[i] ~ /^p/) cur = substr(a[i], 2)
-          else if (a[i] ~ /^n\// && a[i] !~ /\(.*\)$/ && cur != "") seen[cur] = 1
-        } }
-      $1 != "" && !($1 in seen) { print $1 }')"
-    while IFS= read -r pid; do
-      [[ -z "$pid" ]] && continue
-      kill -0 "$pid" 2>/dev/null || continue
-      missed=$((missed + 1))
-    done <<<"$candidates"
-    [[ "$missed" -eq 0 ]] && return 1
-    if [[ "$attempt" -ge "$retry" ]]; then
-      TASKS_OCCUPIED_REASON="내 계정 프로세스 ${missed}건 CWD 읽기 불가"; return 2
-    fi
-    attempt=$((attempt + 1)); sleep 1
-  done
+  # 권한 제한 대조 — 살아 있는 내 계정 pid 중 CWD 경로를 실제로 읽지 못한 것을 센다.
+  #   lsof 출력에 `p<pid>` 가 있어도 뒤따르는 `n` 줄이 절대경로가 아니면(예: `n/proc/<pid>/cwd (readlink:
+  #   Permission denied)` 같은 오류 설명) 읽은 것으로 치지 않는다 — 프로세스 식별과 경로 읽기는 별개다.
+  #   pid 마다 grep 을 띄우면 프로세스가 수백 개일 때 수십 초가 걸린다 — awk 한 번으로 거른다.
+  missed=0
+  candidates="$(printf '%s\n' "$snap" | LSOF_OUT="$lsof_out" awk '
+    BEGIN { n = split(ENVIRON["LSOF_OUT"], a, "\n"); cur = ""
+      for (i = 1; i <= n; i++) {
+        if (a[i] ~ /^p/) cur = substr(a[i], 2)
+        else if (a[i] ~ /^n\// && a[i] !~ /\(.*\)$/ && cur != "") seen[cur] = 1
+      } }
+    $1 != "" && !($1 in seen) { print $1 }')"
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    kill -0 "$pid" 2>/dev/null || continue
+    missed=$((missed + 1))
+  done <<<"$candidates"
+  [[ "$missed" -eq 0 ]] && return 1
+  TASKS_OCCUPIED_REASON="내 계정 프로세스 ${missed}건 CWD 읽기 불가"; return 2
 }
 
 tasks_lock_owner_info() {

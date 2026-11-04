@@ -50,6 +50,8 @@
    - `write`: `message` 를 사용자에게 알리고 진행 (task-state `short-title` 이 sentinel `-` 인 경우 — LC-18 write 진입점)
    - `proceed-readonly`: 변경 없이 진행 (진행 중 작업이 있어 Short Title 을 건드리지 않고 FR 등록만 계속)
 
+   이 명령은 판정만 하지 않습니다 — `write` 이면 부른 순간 Short Title 을 기록합니다. 그래서 중복 확인 등 앞 단계를 마친 뒤 이 5단계에서 한 번만 부릅니다. 상태만 미리 보려면 `--dry-run` 을 붙입니다(같은 `decision` 을 내고 아무것도 쓰지 않습니다). 예외: task-state 가 아직 없는 저장소에서는 판정 없이 exit 3 으로 멈추므로 `rd task status` 를 먼저 한 번 실행합니다.
+
    fr-add 모드는 차단이 없습니다 (`block-*` decision 발생 안 함). task-state의 `short-title` 키가 부재이거나 값이 비어있으면 CLI 가 `proceed-readonly` 를 반환하고, FR 등록 절차(인덱스 + items/ + FR 캡처)는 정상 계속합니다.
 
 6. `FUTURE_REQUESTS.md`의 `## 인덱스` 테이블 끝에 행 추가:

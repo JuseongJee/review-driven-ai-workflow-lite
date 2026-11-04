@@ -155,7 +155,7 @@ final-diff-review 진행 중 reviewer 가 코드 수정을 요청하면, author 
 - **base 와 새 head 사이에 실제 변경이 없으면 갱신하지 않고 실패합니다.** 조상 관계와 OID 상이만으로는 부족합니다 — iteration 중 변경이 완전히 revert 되면 OID 는 달라도 트리가 같아 diff 가 비어 있습니다. 판정은 `git diff --quiet <base>..<head>` 의 **세 값**(0=차이 없음 → 차단, 1=차이 있음 → 진행, 그 밖=git 오류 → 판정 불가로 차단)으로 합니다.
 - **원자성**: `review-head-oid` 와 `Review Target` 은 한 번에 교체됩니다. ① OID resolve·계보 검증을 먼저 전부 끝내고 ② SESSION 전체를 같은 디렉터리의 임시 파일에 렌더링한 뒤 ③ `mv` 로 교체하고 그 종료 상태를 확인하며 ④ 교체가 성공한 뒤에야 어댑터 호출·턴 파일 생성으로 넘어갑니다. 1~3 중 어디서 실패해도 기존 SESSION 을 그대로 두고 턴을 시작하지 않습니다. 한쪽만 바뀐 SESSION 으로 reviewer 가 dispatch 되면 "기록된 OID 와 reviewer 가 읽은 diff 가 다름" 이라는, 이 계약이 막으려는 상태가 그대로 생깁니다.
 - 기계 판독 권위는 `SESSION.md` 의 `## Branch Context` 에 있는 `- review-base-oid:` / `- review-head-oid:` 두 줄입니다. **`Review Target` 문자열을 파싱하지 않습니다** — 파싱 계약을 두면 표현이 바뀔 때마다 깨집니다.
-- **종결 마커(`rd review seal`) 의 권위는 마지막 reviewer 턴의 snapshot 입니다.** 「이의 없음」을 낸 그 턴이 실제로 본 head 가 `review-head-oid` 이므로, 그 뒤에 보호 경로를 고치면 seal 이 거부합니다 — 재리뷰 없이 봉인할 방법이 없습니다.
+- **종결 마커(`rd review seal`) 의 권위는 마지막 reviewer 턴의 snapshot 입니다.** 「이의 없음」을 낸 그 턴이 실제로 본 head 가 `review-head-oid` 이므로, 그 뒤에 보호 경로를 고치면 seal 이 거부합니다 — 재리뷰 없이 봉인할 방법이 없습니다. fr 모드에서 이 대조의 비교 단위는 전체 트리가 아니라 fr 변경 경로의 한정 해시(`fr-changes-hash`)입니다.
 
 ### head 갱신 정책 (`review-head-policy`)
 
@@ -200,6 +200,40 @@ final-diff-review 진행 중 reviewer 가 코드 수정을 요청하면, author 
 - 마커 검증은 strict 입니다 — 파일 존재 / `schema` 지원 / 필수 필드 / 파일명과 내부 `session-id` 일치 / 포인터와 일치 / `review-type=diff-review` / `branch-mode`·`fr-branch` 일치 / `verified` 값 / `tree-hash` 일치 / 해시 계산 성공. 부재·문법 오류·의미 불일치·해시 불일치가 각각 다른 메시지로 나옵니다.
 - `verified=legacy-unverified` 마커로 통과할 때는 `archive.sh` 와 `rd task status` **양쪽**이 매번 경고를 냅니다 (리뷰 당시 트리를 증명하지 않는 마커이므로).
 - 발행 순서는 `WORKFLOW.md` 의 "아카이브 보류" 절에 있습니다: **리뷰 종결 → seal → 상태 전이 → 기록 커밋 → 발행.**
+
+### seal 뒤 기본 브랜치 병합
+
+fr 모드 seal 은 전체 보호 트리가 아니라 **fr 브랜치가 바꾼 경로**를 보호합니다. 마커의 선택 필드 `fr-changes-hash` 가 그 범위를 담고, `tree-hash` 는 지금처럼 전체 보호 트리 해시로 남습니다 (마커 schema 는 `1` 그대로입니다).
+
+- **보호 범위**: `fr-changes-hash` 는 기본 쪽 commit 과 대상 commit 의 merge-base 이후 대상 commit 이 바꾼 경로와 그 결과 내용을 해시합니다. 워크플로 기록 경로와, 내용이 같은 커밋으로 옮긴 gitlink 는 뺍니다.
+- **판정**: 마커가 `branch-mode=fr` 이고 `fr-changes-hash` 가 있으면 검증은 이 값만 비교하고 `tree-hash` 는 보지 않습니다. 필드가 없는 마커(옛 마커, 전체 기준 봉인)는 종전대로 `tree-hash` 를 전체 보호 트리 해시와 비교합니다.
+- **결과**: main 이 fr 이 바꾸지 않은 경로만 바꾼 병합은 seal 을 유지합니다. fr 이 바꾼 경로의 내용이 달라지면 병합 방식과 상관없이 불일치로 막습니다.
+- **계산 불가**: 한정 해시를 계산할 수 없으면 `hash-error` 로 차단하고 전체 해시로 내려가지 않습니다. seal 은 예외로, 기본 브랜치를 정할 수 없으면 `fr-changes-hash` 없이 전체 트리 기준으로 봉인하고 stderr 에 알립니다. 이 seal 은 main 병합 뒤 무효가 됩니다.
+
+#### 병합 위치
+
+- **충돌이 없으면** fr 브랜치에 main 을 병합하지 않습니다. `archive.sh` 가 기본 브랜치 쪽에서 `--no-ff` 로 병합하고, 그 병합은 위 한정 해시로 통과합니다.
+- **fast-forward 병합은 발행하지 않습니다.** 한정 해시 마커는 기본 쪽 기준점이 있어야 리뷰 범위를 정합니다. 사람이 main 을 fr tip 으로 fast-forward 하면 기준점이 fr tip 자신이라 범위를 정할 수 없고, `archive.sh` 는 `hash-error` 로 막습니다. main 의 병합을 되돌리고 `archive.sh` 가 병합하게 합니다. 필드 없는 마커는 이 제한을 받지 않습니다.
+- **재실행의 기준점**: 앞선 실행이 병합한 뒤 push 에서 멈췄다면 fr tip 은 이미 HEAD 의 조상입니다. 이때 `archive_review_precheck` 는 `archive_baseline_commit` 으로 병합 커밋 M 을 찾아 **M^1**(병합 직전의 기본 쪽)을 기준점으로 씁니다. 기준선이 fr tip 자신(fast-forward)이거나 찾지 못하면 기준점이 없습니다.
+
+#### 코드 충돌
+
+충돌을 풀기 위한 fr 브랜치의 main 병합은 허용됩니다. 그 병합은 리뷰하지 않은 코드를 만들므로 **재검증, 새 final diff review, 재seal** 이 따릅니다. 충돌은 두 경로로 드러납니다.
+
+| 경로 | 시점 | `archive.sh` 동작 |
+|---|---|---|
+| 사전 감지 | 병합 전. fr 이 아직 HEAD 에 합쳐지지 않았음 | `git merge-tree --write-tree` 로 충돌을 미리 확인합니다. 자동 해소 대상 네 파일(`CURRENT_TASK.md`, `stage_metrics.tsv`, `FUTURE_REQUESTS.md`, `review-seals/verify-evidence`) 밖에 충돌이 있으면 main 을 바꾸지 않고 exit 1 로 멈춥니다. |
+| 손 병합 거부 | 병합 후. 이미 「이미 merge 됨」 경로이고 사람이 기본 체크아웃에서 병합 커밋을 만들었음 | 기준선 병합 커밋 M 을 `M^1`·`M^2` 의 자동 병합 결과와 비교합니다. 기록 경로 밖에서 충돌이 있었거나 결과 트리가 다르면 발행하지 않습니다. 이번 실행이 직접 만든 병합은 검사하지 않습니다. |
+
+- **사전 감지 후 순서**: 출력 안내를 작업 worktree 에서 따릅니다.
+  1. `rd task set-status "구현 중"`
+  2. `git merge <기본 브랜치>` 로 충돌을 풀고 커밋합니다.
+  3. `rd task set-status "검증 중"` 후 검증하고 `verify_record.sh -- <검증 명령>` 을 다시 돌립니다.
+  4. `rd task set-status "diff review 대기"` 후 새 final diff review 세션을 종결합니다.
+  5. `rd review seal <새 세션>` → `set-status "아카이브 보류"` → 기록 커밋 → 다시 발행합니다.
+- **손 병합이 이미 커밋된 뒤의 순서**: 먼저 기본 체크아웃에서 `git reset --keep <M^1 OID>` 로 손 병합을 되돌립니다. 되돌리기 전에 `git log --oneline <M^1 OID>..HEAD` 로 되돌릴 커밋이 이 병합과 archive 정리 커밋뿐인지 확인합니다. 이 검사는 Step 6 push 보다 앞서므로 손 병합 커밋은 아직 원격에 없고, 되돌려도 원격에 영향이 없습니다. 이후는 사전 감지 때의 1~5단계와 같습니다. `archive.sh` 는 이 명령을 실행하지 않고 안내만 합니다.
+- 두 안내가 막는 이유: 충돌을 사람이 푼 결과는 seal 이 보호하는 경로의 내용을 바꿀 수 있고, 한정 해시는 그 변경을 리뷰하지 않은 채 통과시키지 않습니다.
+- git 2.38 미만처럼 `merge-tree --write-tree` 를 쓸 수 없으면 사전 감지는 경고만 내고 병합으로 넘어갑니다. 손 병합 거부는 판정 불가로 보고 발행하지 않습니다.
 
 ## 종료 규칙
 

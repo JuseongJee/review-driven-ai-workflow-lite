@@ -147,27 +147,60 @@ _session_launch_hc_get() {  # <name> <outfile>
   _session_launch_hc_call "${RD_LAUNCH_TIMEOUT:-5}" "$2" get "$1" --json
 }
 
-# 내부 헬퍼: `hc get` JSON 에서 점 경로 값을 읽습니다 (stdout). 예: `state`, `status.state`, `turn`, `error.kind`.
+# 내부 헬퍼: hc 응답 JSON 에서 점 경로 값 여러 개를 python3 한 번으로 읽습니다 (stdout, 경로마다 한 줄).
+#   예: `state`, `status.state`, `turn`, `error.kind`. python3 기동이 부하 시 1회 0.7초라 응답 하나에 한 번만 띄웁니다.
 #   `labels.<키>` 는 키에 점이 있으므로(`herdr.space`) `labels` 아래 나머지 전체를 한 키로 읽습니다.
-#   null·객체·읽기 실패(빈 출력·깨진 JSON·python3 부재)는 모두 빈 값입니다.
-_session_launch_hc_field() {  # <json-file> <path>
+#   null·객체·읽기 실패(빈 출력·깨진 JSON)·줄바꿈이 든 값은 빈 줄입니다. 줄 위치는 경로 순서 그대로입니다.
+#   python3 가 없으면 아무것도 내지 않습니다. 호출부는 `_session_launch_hc_read` 로 받아 모든 변수를 빈 값으로 둡니다.
+_session_launch_hc_fields() {  # <json-file> <path>...
   command -v python3 >/dev/null 2>&1 || return 0
-  python3 -I - "$1" "$2" <<'PYEOF3'
+  python3 -I - "$@" <<'PYEOF3'
 import json, sys
+paths = sys.argv[2:]
 try:
     with open(sys.argv[1], encoding="utf-8") as f:
-        d = json.load(f)
-    p = sys.argv[2]
-    keys = ["labels", p[len("labels."):]] if p.startswith("labels.") else p.split(".")
-    for k in keys:
-        d = d[k]
-    if isinstance(d, bool):
-        print("true" if d else "false")
-    elif isinstance(d, (str, int)):
-        print(d)
+        root = json.load(f)
 except Exception:
-    pass
+    root = None
+for p in paths:
+    v = ""
+    try:
+        d = root
+        keys = ["labels", p[len("labels."):]] if p.startswith("labels.") else p.split(".")
+        for k in keys:
+            d = d[k]
+        if isinstance(d, bool):
+            v = "true" if d else "false"
+        elif isinstance(d, (str, int)):
+            v = str(d)
+    except Exception:
+        pass
+    if "\n" in v or "\r" in v:
+        v = ""
+    print(v)
 PYEOF3
+}
+
+# 내부 헬퍼: 경로 하나만 읽습니다 (stdout). 이 파일의 호출부는 쓰지 않습니다 — 동시에 진행하는 다른 작업이
+#   옛 이름으로 부르는 코드를 병합해도 깨지지 않게 남깁니다. 값을 둘 이상 읽으면 `_session_launch_hc_read` 를 씁니다.
+_session_launch_hc_field() {  # <json-file> <path>
+  _session_launch_hc_fields "$1" "$2"
+}
+
+# 내부 헬퍼: `_session_launch_hc_fields` 결과를 변수들에 차례로 담습니다. 못 읽은 변수는 빈 값입니다.
+#   사용: `_session_launch_hc_read <json-file> state turn status.state -- st tu ss`
+_session_launch_hc_read() {  # <json-file> <path>... -- <var>...
+  local _f="$1"; shift
+  local -a _paths=() _vals=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do _paths+=("$1"); shift; done
+  shift || true
+  local _line
+  while IFS= read -r _line; do _vals+=("$_line"); done < <(_session_launch_hc_fields "$_f" "${_paths[@]}")
+  local _i=0 _v
+  for _v in "$@"; do
+    printf -v "$_v" '%s' "${_vals[$_i]-}"
+    _i=$((_i + 1))
+  done
 }
 
 # 내부 헬퍼: herdr JSON 응답에서 pane id 를 파싱한다(추측하지 않는다).
@@ -350,9 +383,7 @@ _session_handoff_deliver_hc() {  # <slug>
   outfile="$(mktemp)" || return 2
   _session_launch_hc_get "$name" "$outfile"
   rc=$?
-  state="$(_session_launch_hc_field "$outfile" state)"
-  turn="$(_session_launch_hc_field "$outfile" turn)"
-  status="$(_session_launch_hc_field "$outfile" status.state)"
+  _session_launch_hc_read "$outfile" state turn status.state -- state turn status
   rm -f "$outfile"
   if [[ "$rc" -ne 0 || -z "$state" ]]; then
     printf '처리 여부를 확인하지 못했습니다 — 확인: hc get %s / 화면: hc attach %s\n' "$name" "$name" >&2
@@ -615,7 +646,7 @@ _session_launch_hc() {  # <worktree-path> <slug> <request-path> <model>
   }
   # 1) tab 을 만들 space — 현재 세션의 라벨(M11). 못 읽으면 라벨 없이 기동합니다.
   _session_launch_hc_get "$HC_TERMINAL_ID" "$outfile"
-  space="$(_session_launch_hc_field "$outfile" labels.herdr.space)"
+  _session_launch_hc_read "$outfile" labels.herdr.space -- space
   # 2) 기동 — 인계문은 claude 의 첫 인자로 넣습니다(M2). env 접두로 깊이 제한 변수를 넘깁니다(M10).
   hfile="$(session_handoff_file_path "$wt")" || hfile=""
   [[ -n "$hfile" && -f "$hfile" ]] || hfile=""
@@ -627,8 +658,7 @@ _session_launch_hc() {  # <worktree-path> <slug> <request-path> <model>
   run_args+=("$handoff")
   _session_launch_hc_call "${RD_LAUNCH_TIMEOUT:-5}" "$outfile" "${run_args[@]}"
   rc=$?
-  address="$(_session_launch_hc_field "$outfile" address)"
-  kind="$(_session_launch_hc_field "$outfile" error.kind)"
+  _session_launch_hc_read "$outfile" address error.kind -- address kind
   rm -f "$outfile"
   if [[ -z "$kind" && ( "$rc" -ne 0 || -z "$address" ) ]]; then
     # 터미널이 만들어졌을 수 있습니다(시간 초과·rc≠0 인데 address 가 있음·해석 불가) — 실패로 단정하지 않습니다.
@@ -669,9 +699,7 @@ _session_launch_hc() {  # <worktree-path> <slug> <request-path> <model>
     outfile="$(mktemp)" || break
     _session_launch_hc_call "$per" "$outfile" get "$agent_name" --json
     rc=$?
-    state="$(_session_launch_hc_field "$outfile" state)"
-    turn="$(_session_launch_hc_field "$outfile" turn)"
-    status="$(_session_launch_hc_field "$outfile" status.state)"
+    _session_launch_hc_read "$outfile" state turn status.state -- state turn status
     rm -f "$outfile"
     if [[ "$rc" -eq 0 && "$state" == finished ]]; then
       printf '세션이 바로 종료됐습니다 — 마지막 출력: hc read %s. 아래 명령으로 시작하십시오.\n' "$agent_name" >&2
@@ -701,9 +729,7 @@ _session_probe_hc() {  # <slug> <worktree-path>
   outfile="$(mktemp)" || { printf 'unknown\n'; return 0; }
   _session_launch_hc_get "$(_session_launch_agent_name "$slug")" "$outfile"
   rc=$?
-  state="$(_session_launch_hc_field "$outfile" state)"
-  kind="$(_session_launch_hc_field "$outfile" error.kind)"
-  cwd="$(_session_launch_hc_field "$outfile" cwd)"
+  _session_launch_hc_read "$outfile" state error.kind cwd -- state kind cwd
   rm -f "$outfile"
   # dead 는 구조화된 not_found 이거나 끝난·다른 작업의 터미널일 때뿐입니다. 시간 초과·해석 실패는 unknown 입니다.
   if [[ "$kind" == not_found ]]; then printf 'dead\n'; return 0; fi
@@ -962,9 +988,7 @@ session_observe_name_hc() {  # <slug> <wt> <wt-physical>
   name="$(session_agent_name "$slug")"
   tmp="$(mktemp)" || { printf 'unknown\thc get 실패\n'; return 0; }
   _session_launch_hc_get "$name" "$tmp" || rc=$?
-  kind="$(_session_launch_hc_field "$tmp" error.kind)"
-  state="$(_session_launch_hc_field "$tmp" state)"
-  cwd="$(_session_launch_hc_field "$tmp" cwd)"
+  _session_launch_hc_read "$tmp" error.kind state cwd -- kind state cwd
   rm -f "$tmp"
   if [[ $rc -eq 124 ]]; then printf 'unknown\thc get 시간 초과\n'; return 0; fi
   if [[ $rc -ne 0 ]]; then
@@ -1313,8 +1337,7 @@ session_caller_alive() {  # <backend> <id>
       command -v hc >/dev/null 2>&1 || { rm -f "$out"; return 2; }
       _session_launch_hc_get "$id" "$out"
       rc=$?
-      state="$(_session_launch_hc_field "$out" state)"
-      kind="$(_session_launch_hc_field "$out" error.kind)"
+      _session_launch_hc_read "$out" state error.kind -- state kind
       rm -f "$out"
       [[ "$kind" == not_found ]] && return 1
       if [[ "$rc" -ne 0 || -z "$state" ]]; then return 2; fi

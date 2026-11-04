@@ -2220,12 +2220,15 @@ for sm_v in row3 hdrdup nohdr; do
   rm -rf "$REPO"
 done
 
-echo "== scenario sm25: stage_metrics.tsv + 다른 파일 동시 충돌 → 자동 해소 없이 중단 =="
+echo "== scenario sm25: stage_metrics.tsv + 다른 파일 동시 충돌 → 병합 전에 중단 (change spec 2026-11-04-1327 D4) =="
 REPO="$(sm_fixture test-smother other)"
+sm_head="$(git -C "$REPO" rev-parse HEAD)"
 sm_out="$(cd "$REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task test-smother --no-remote --force-skip-review-check "통합 테스트 fixture" --allow-status-mismatch "테스트" 2>&1)" && sm_rc=0 || sm_rc=$?
 [[ "$sm_rc" -ne 0 ]] && pass "sm25: exit≠0" || fail "sm25: exit 0"
-( cd "$REPO" && grep -q '^<<<<<<<' "$SM_REL" && [[ "$(git log -1 --format=%P | wc -w | tr -d ' ')" == 1 ]] ) \
-  && pass "sm25: stage_metrics.tsv 무반영·병합 커밋 없음" || fail "sm25: 일부 반영됨 — $(cd "$REPO" && git status --short)"
+[[ "$sm_out" == *"코드 충돌이 있습니다"* ]] && pass "sm25: 병합 전 충돌 안내" || fail "sm25: 충돌 안내 없음 — $sm_out"
+( cd "$REPO" && [[ "$(git rev-parse HEAD)" == "$sm_head" ]] && [[ ! -e "$(git rev-parse --git-path MERGE_HEAD)" ]] \
+    && ! grep -q '^<<<<<<<' "$SM_REL" ) \
+  && pass "sm25: main HEAD 불변·MERGE_HEAD 없음·stage_metrics.tsv 충돌 표식 없음" || fail "sm25: 일부 반영됨 — $(cd "$REPO" && git status --short)"
 ( cd "$REPO" && git merge --abort ) >/dev/null 2>&1 || true
 rm -rf "$REPO"
 

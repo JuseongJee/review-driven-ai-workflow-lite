@@ -67,7 +67,7 @@
 | 기존 FR | 있으면 같은 커밋에서 done (인덱스 삭제 + 상세 status) | archive content commit 에서 done | 현행 |
 | 사용자 가시 결과 | 종료 보고 블록 | 종료 보고 + archive 출력 | 현행 |
 
-**`archive.sh` 는 작업 worktree 안에서 호출해도 됩니다.** 발행 대상이 기본 브랜치 worktree(main worktree)가 아니면 그쪽으로 `cd` 해 자기 자신을 재실행하며, 원래 호출한 worktree 는 정리하지 않고 보존하며(skipped-self) 색인에 `state=cleanup-pending` 행을 남깁니다. 이 호출자 worktree·로컬 fr 브랜치·색인 행은 이후 기본 체크아웃에서 실행하는 `rd task list` 가 안전할 때 지연 정리합니다. 안전 조건은 그 worktree 안에 내 계정 프로세스의 CWD 가 없을 것(점유·조회 불가는 보류), locked·미커밋(untracked 포함) 변경이 없을 것, 현재 브랜치 tip 기준 발행 증거가 유지될 것입니다. 결과는 `정리됨` / `정리 보류`(사유·재시도 안내) / `정리 부분 실패`(사유·복구 명령)로 구분해 출력합니다. 다른 계정(root 포함) 프로세스의 CWD 는 조회 범위 밖입니다. `--task <slug>` 를 명시하면 어느 위치에서 불러도 그 작업을 대상으로 삼습니다.
+**`archive.sh` 는 작업 worktree 안에서 호출해도 됩니다.** 발행 대상이 기본 브랜치 worktree(main worktree)가 아니면 그쪽으로 `cd` 해 자기 자신을 재실행하며, 원래 호출한 worktree 는 정리하지 않고 보존하며(skipped-self) 색인에 `state=cleanup-pending` 행을 남깁니다. 이 호출자 worktree·로컬 fr 브랜치·색인 행은 이후 기본 체크아웃에서 실행하는 `rd task list` 가 안전할 때 지연 정리합니다. 안전 조건은 그 worktree 안에 내 계정 프로세스의 CWD 가 없을 것(점유·조회 불가는 보류), locked·미커밋(untracked 포함) 변경이 없을 것, 현재 브랜치 tip 기준 발행 증거가 유지될 것입니다. 결과는 `정리됨` / `정리 보류`(사유·재시도 안내) / `정리 부분 실패`(사유·복구 명령)로 구분해 출력합니다. 다른 계정(root 포함) 프로세스의 CWD 는 조회 범위 밖입니다. 유효 uid 가 내 계정이 아닌 setuid 프로세스(예: VPN helper, `login`)도 CWD 를 읽지 못해도 조회 불가로 세지 않습니다. 읽힌 CWD 가 그 worktree 안이면 유효 uid 와 관계없이 점유입니다. `--task <slug>` 를 명시하면 어느 위치에서 불러도 그 작업을 대상으로 삼습니다.
 
 **merge 만으로는 발행 완료가 아닙니다.** `archive.sh` 는 merge 이후 tag·기본 브랜치 push·tag push 를 별도 단계로 수행하므로, merge 직후 중단되거나 push 가 실패해도 "merge 됐다"는 사실만으로는 발행이 끝난 게 아닙니다. `rd task list`(및 `--rebuild`)는 아래 세 상태로 구별해 보여줍니다.
 

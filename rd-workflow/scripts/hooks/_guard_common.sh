@@ -182,10 +182,120 @@ _rd_seal_pointer_check() {
   return 0
 }
 
-# rd_seal_verify <worktree|commit> [판정 대상 commit] [fr-branch 값]
+# rd_fr_changes_hash <commit> [<기본 쪽 commit>] — fr 이 바꾼 경로와 그 결과 내용의 한정 해시 (spec D2)
+#
+# 기본 쪽 commit 과 대상 commit 의 merge-base 를 기준으로 `diff-tree` 가 낸 변경 목록만 해시합니다.
+# 기본 쪽을 생략하면 `refs/heads/<기본 브랜치>` 입니다(원격 추적 ref 불사용).
+# **fail-closed**: 기본 브랜치 결정·merge-base(정확히 1개)·diff-tree·임시 파일·hash-object 중 하나라도
+# 실패하면 nonzero 입니다. 빈 목록(바꾼 경로 없음)은 실패가 아니며 머리만 해시합니다.
+rd_fr_changes_hash() {
+  local ref="${1-}" base_in="${2-}" root cdir oid base_oid bname mbs mb_n mb
+  local raw out meta path hash rc bad=0 om nm oo no st
+  if [[ -z "$ref" ]]; then
+    echo "rd_fr_changes_hash: 대상 commit 이 지정되지 않았습니다 — 판정 불가." >&2
+    return 1
+  fi
+  root="$(rd_repo_root)" || { echo "rd_fr_changes_hash: repo root 를 찾을 수 없습니다 — 판정 불가." >&2; return 1; }
+  cdir="$(_rd_git_common_dir "$root" 2>/dev/null)" || cdir=""
+  oid="$(rd_resolve_commit_oid "$ref" "$root")" \
+    || { echo "rd_fr_changes_hash: '${ref}' 를 commit 으로 해석할 수 없습니다 — 판정 불가." >&2; return 1; }
+  if [[ -n "$base_in" ]]; then
+    base_oid="$(rd_resolve_commit_oid "$base_in" "$root")" \
+      || { echo "rd_fr_changes_hash: 기본 쪽 '${base_in}' 를 commit 으로 해석할 수 없습니다 — 판정 불가." >&2; return 1; }
+  else
+    # get_default_branch 는 현재 셸의 전역을 덮지 않도록 서브셸에서 구합니다.
+    if declare -f get_default_branch >/dev/null 2>&1; then
+      bname="$(cd "$root" && get_default_branch 2>/dev/null)" || bname=""
+    else
+      bname="$( source "${RD_GUARD_DIR}/../lifecycle/_lifecycle_common.sh" 2>/dev/null \
+                && cd "$root" && get_default_branch 2>/dev/null )" || bname=""
+    fi
+    if [[ -z "$bname" ]]; then
+      echo "rd_fr_changes_hash: 기본 브랜치를 결정할 수 없습니다 — 판정 불가." >&2
+      return 1
+    fi
+    base_oid="$(rd_resolve_commit_oid "refs/heads/${bname}" "$root")" \
+      || { echo "rd_fr_changes_hash: 기본 브랜치 'refs/heads/${bname}' 를 commit 으로 해석할 수 없습니다 — 판정 불가." >&2; return 1; }
+  fi
+  mbs="$(git -C "$root" merge-base --all "$base_oid" "$oid" 2>/dev/null)" \
+    || { echo "rd_fr_changes_hash: merge-base 를 구할 수 없습니다 — 판정 불가." >&2; return 1; }
+  mb_n=0; mb=""
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    mb_n=$((mb_n+1)); mb="$path"
+  done <<EOT
+$mbs
+EOT
+  if [[ "$mb_n" != "1" ]]; then
+    echo "rd_fr_changes_hash: merge-base 가 ${mb_n}개입니다 (정확히 1개여야 합니다) — 판정 불가." >&2
+    return 1
+  fi
+  raw="$(mktemp "${TMPDIR:-/tmp}/rd-frc-raw.XXXXXX")" \
+    || { echo "rd_fr_changes_hash: mktemp 실패 — 판정 불가." >&2; return 1; }
+  out="$(mktemp "${TMPDIR:-/tmp}/rd-frc-out.XXXXXX")" \
+    || { rm -f "$raw"; echo "rd_fr_changes_hash: mktemp 실패 — 판정 불가." >&2; return 1; }
+  # --ignore-submodules=none: `.gitmodules`·config 의 submodule.<이름>.ignore=all 이 gitlink 변경을
+  # 목록에서 빼지 못하게 합니다 (_submodule_common.sh 와 같은 이유).
+  git -C "$root" diff-tree -r -z --no-renames --ignore-submodules=none "$mb" "$oid" > "$raw" 2>/dev/null
+  rc=$?
+  if [[ "$rc" != "0" ]]; then
+    rm -f "$raw" "$out"
+    echo "rd_fr_changes_hash: git diff-tree 실패 (exit ${rc}) — 판정 불가로 차단합니다." >&2
+    return 1
+  fi
+  (
+    printf 'rd-fr-changes 1\0'
+    # 레코드: ":<구모드> <신모드> <구객체> <신객체> <상태>" NUL "<경로>" NUL
+    while IFS= read -r -d '' meta; do
+      if ! IFS= read -r -d '' path || [[ "$meta" != :* ]]; then bad=1; break; fi
+      rd_path_is_record "$path" && continue
+      set -- ${meta#:}
+      om="$1"; nm="$2"; oo="$3"; no="$4"; st="${5-}"
+      if [[ -z "$st" ]]; then bad=1; break; fi
+      if [[ "$om" == "160000" && "$nm" == "160000" ]]; then
+        local ida idb
+        ida="$(rd_gitlink_content_id "${root}/${path}" "$oo" "$cdir")" || { bad=1; break; }
+        idb="$(rd_gitlink_content_id "${root}/${path}" "$no" "$cdir")" || { bad=1; break; }
+        [[ "$ida" == "$idb" ]] && continue
+      fi
+      if [[ "$nm" == "000000" ]]; then
+        printf '000000 deleted\t%s\0' "$path"
+      elif [[ "$nm" == "160000" ]]; then
+        local idn
+        idn="$(rd_gitlink_content_id "${root}/${path}" "$no" "$cdir")" || { bad=1; break; }
+        printf '160000 content %s\t%s\0' "$idn" "$path"
+      else
+        printf '%s %s\t%s\0' "$nm" "$no" "$path"
+      fi
+    done < "$raw"
+    [[ "$bad" == "0" ]] || exit 9
+  ) > "$out"
+  rc=$?
+  rm -f "$raw"
+  if [[ "$rc" != "0" ]]; then
+    rm -f "$out"
+    echo "rd_fr_changes_hash: diff-tree 출력 처리 실패 — 판정 불가로 차단합니다." >&2
+    return 1
+  fi
+  hash="$(git -C "$root" hash-object --stdin < "$out" 2>/dev/null)"
+  rc=$?
+  rm -f "$out"
+  if [[ "$rc" != "0" || -z "$hash" ]]; then
+    echo "rd_fr_changes_hash: git hash-object 실패 — 판정 불가로 차단합니다." >&2
+    return 1
+  fi
+  printf '%s\n' "$hash"
+}
+
+# rd_seal_verify <worktree|commit> [판정 대상 commit] [fr-branch 값] [기본 쪽 commit|none]
+#
+#   네 번째 인자는 한정 해시(`fr-changes-hash`) 검증에만 씁니다. `none` 은 「기준 없음」 입니다.
+#   필드 없는 마커는 네 번째 인자를 보지 않고 전체 보호 트리 해시로 검증합니다.
 #
 #   return 0 — 유효. `RD_SEAL_VERIFIED` 에 verified 값(yes|legacy-unverified) 을,
-#              `RD_SEAL_TREE_HASH` 에 검증이 통과한 보호 트리 해시를 담습니다.
+#              `RD_SEAL_TREE_HASH` 에 마커의 tree-hash 값을 담습니다. 필드 없는 마커는 이 값을
+#              검증했지만, 한정 해시 마커는 tree-hash 를 검증하지 않습니다 — 이 값은 no-fr
+#              재결속만 씁니다(한정 해시 마커는 no-fr 일 수 없음).
 #   return 1 — 무효. `RD_SEAL_FAIL_KIND`·`RD_SEAL_FAIL_MSG` 를 채웁니다.
 #
 # **source 인자 분리가 계약입니다 (§4.4).** 게이트(`archive_review_precheck`)는 언제나
@@ -196,7 +306,7 @@ _rd_seal_pointer_check() {
 # fr-branch 값은 **판정 입력이 아니라 판정 대상을 찾는 값**이므로(§3.3.1 의 유일한 예외)
 # 호출자가 넘깁니다. 생략하면 워킹트리 task-state 에서 읽습니다.
 rd_seal_verify() {
-  local src="${1-}" target="${2-}" fr_in="${3-}"
+  local src="${1-}" target="${2-}" fr_in="${3-}" base_in="${4-}"
   RD_SEAL_FAIL_KIND=""; RD_SEAL_FAIL_MSG=""; RD_SEAL_VERIFIED=""; RD_SEAL_SESSION_ID=""
   RD_SEAL_TREE_HASH=""
   local root sid tmp rc content_ok=0
@@ -240,7 +350,7 @@ rd_seal_verify() {
   fi
 
   # --- 3) schema / 필수 필드 / session-id / review-type / branch / verified ---
-  local schema missing="" f v m_sid m_type m_mode m_fr m_hash m_verified m_version
+  local schema missing="" f v m_sid m_type m_mode m_fr m_hash m_verified m_version m_frc
   schema="$(_rd_kv_get "$tmp" "schema")"
   if [[ "$schema" != "$RD_SEAL_SCHEMA" ]]; then
     rm -f "$tmp"
@@ -261,6 +371,11 @@ rd_seal_verify() {
   m_hash="$(_rd_kv_get "$tmp" "tree-hash")"
   m_verified="$(_rd_kv_get "$tmp" "verified")"
   m_version="$(_rd_kv_get "$tmp" "rd-version")"
+  m_frc="$(_rd_kv_get "$tmp" "fr-changes-hash")"
+  # 값이 빈 `fr-changes-hash=` 줄은 「필드 없음」 과 구별해 형식 오류로 봅니다 — 빈 값을 옛 마커로
+  # 읽으면 전체 해시 검증으로 조용히 넘어갑니다.
+  local m_frc_line=0
+  grep -q '^fr-changes-hash=' "$tmp" 2>/dev/null && m_frc_line=1
   rm -f "$tmp"
 
   # 파일명(<session-id>.seal) 과 내부 session-id 일치 — 복사·개명 탐지.
@@ -292,15 +407,42 @@ rd_seal_verify() {
     yes|legacy-unverified) ;;
     *) { _rd_seal_fail "malformed" "마커 verified 값이 올바르지 않습니다: ${m_verified}"; return 1; } ;;
   esac
+  # fr-changes-hash 는 선택 필드입니다 (spec D1). 있으면 소문자 16진 40자 또는 64자여야 하고,
+  # no-fr 마커에는 있을 수 없습니다.
+  if [[ -n "$m_frc" || "$m_frc_line" == "1" ]]; then
+    if [[ "$cur_mode" == "no-fr" ]]; then
+      { _rd_seal_fail "malformed" "no-fr 마커에 fr-changes-hash 가 있습니다"; return 1; }
+    fi
+    case "$m_frc" in
+      ''|*[!0-9a-f]*) { _rd_seal_fail "malformed" "마커 fr-changes-hash 형식 오류: ${m_frc}"; return 1; } ;;
+    esac
+    if [[ ${#m_frc} -ne 40 && ${#m_frc} -ne 64 ]]; then
+      { _rd_seal_fail "malformed" "마커 fr-changes-hash 형식 오류: ${m_frc}"; return 1; }
+    fi
+  fi
 
   # --- 4) 보호 트리 해시 일치 (§2.2 fail-closed — 계산 실패는 통과가 아닙니다) ---
   local cur_hash ref
   if [[ "$src" == "commit" ]]; then ref="$target"; else ref="HEAD"; fi
-  cur_hash="$(rd_protected_tree_hash "$ref" 2>/dev/null)" \
-    || { _rd_seal_fail "hash-error" "보호 트리 해시를 계산할 수 없습니다 — 판정 불가로 차단합니다"; return 1; }
-  if [[ "$m_hash" != "$cur_hash" ]]; then
-    { _rd_seal_fail "hash-mismatch" \
-      "리뷰 대상 불일치 — 종결 후 코드가 변경되었습니다. 재리뷰 후 seal 을 다시 실행하세요"; return 1; }
+  if [[ -n "$m_frc" ]]; then
+    # 한정 해시 마커 — 전체 해시(tree-hash)는 비교하지 않습니다 (spec D1).
+    if [[ "$base_in" == "none" ]]; then
+      { _rd_seal_fail "hash-error" \
+        "fast-forward 로 합쳐진 병합에서는 리뷰 범위를 정할 수 없습니다 — main 의 병합을 되돌리고 archive.sh 가 병합하게 하십시오"; return 1; }
+    fi
+    cur_hash="$(rd_fr_changes_hash "$ref" ${base_in:+"$base_in"} 2>/dev/null)" \
+      || { _rd_seal_fail "hash-error" "fr 변경 해시를 계산할 수 없습니다 — 판정 불가로 차단합니다"; return 1; }
+    if [[ "$m_frc" != "$cur_hash" ]]; then
+      { _rd_seal_fail "hash-mismatch" \
+        "리뷰 대상 불일치 — 종결 후 코드가 변경되었습니다. 재리뷰 후 seal 을 다시 실행하세요"; return 1; }
+    fi
+  else
+    cur_hash="$(rd_protected_tree_hash "$ref" 2>/dev/null)" \
+      || { _rd_seal_fail "hash-error" "보호 트리 해시를 계산할 수 없습니다 — 판정 불가로 차단합니다"; return 1; }
+    if [[ "$m_hash" != "$cur_hash" ]]; then
+      { _rd_seal_fail "hash-mismatch" \
+        "리뷰 대상 불일치 — 종결 후 코드가 변경되었습니다. 재리뷰 후 seal 을 다시 실행하세요"; return 1; }
+    fi
   fi
 
   # rd-version 불일치는 경고만 합니다 (§8) — 버전이 오른 것 자체는 정상이며, 차단하면
@@ -309,8 +451,9 @@ rd_seal_verify() {
     echo "경고: 마커의 rd-version(${m_version}) 이 현재 VERSION($(_rd_version)) 과 다릅니다." >&2
   fi
   RD_SEAL_VERIFIED="$m_verified"
-  # 통과한 해시를 남깁니다 — 이 시점에 `m_hash` 와 `cur_hash` 는 같습니다. 발행 직전
-  # 재결속은 "마커가 승인한 트리" 를 기준으로 해야 하므로 마커 값을 그대로 씁니다.
+  # 마커의 tree-hash 를 남깁니다. 필드 없는 마커는 이 시점에 `m_hash` 와 `cur_hash` 가 같습니다.
+  # 한정 해시 마커는 tree-hash 를 검증하지 않았으므로 이 값을 판정에 쓰지 않습니다 — 소비자는
+  # no-fr 재결속뿐이고, 한정 해시 마커는 no-fr 일 수 없습니다.
   RD_SEAL_TREE_HASH="$m_hash"
   return 0
 }
@@ -424,7 +567,24 @@ archive_review_precheck() {
   fi
 
   if [[ -z "$fail_msg" ]]; then
-    if rd_seal_verify "commit" "$target" "$fr_ref"; then
+    # 한정 해시 검증의 기본 쪽 기준점 (spec D2 1번) — fr 이 이미 HEAD 에 병합된 재실행 경로만 해당합니다.
+    # 필드 없는 마커는 이 값을 보지 않으므로 여기서 기준선 실패로 막지 않습니다.
+    local -a verify_extra=()
+    if [[ "$mode" == "fr" ]] && git merge-base --is-ancestor "$target" HEAD 2>/dev/null; then
+      local bl_oid="" head_oid="" bl_p1="" bl_p2="" bl_p3=""
+      verify_extra=("none")
+      if declare -f archive_baseline_commit >/dev/null 2>&1; then
+        head_oid="$(git rev-parse HEAD 2>/dev/null)" || head_oid=""
+        if [[ -n "$head_oid" ]] && bl_oid="$(archive_baseline_commit "$project_root" "$fr_ref" "$head_oid" 2>/dev/null)" \
+           && [[ -n "$bl_oid" && "$bl_oid" != "$target" ]]; then
+          read -r bl_p1 bl_p2 bl_p3 < <(git rev-list --parents -n 1 "$bl_oid" 2>/dev/null | cut -d' ' -f2-4) || true
+          if [[ -n "$bl_p1" && "$bl_p2" == "$target" && -z "$bl_p3" ]]; then
+            verify_extra=("$bl_p1")
+          fi
+        fi
+      fi
+    fi
+    if rd_seal_verify "commit" "$target" "$fr_ref" ${verify_extra[@]+"${verify_extra[@]}"}; then
       ok=0
     else
       fail_msg="$RD_SEAL_FAIL_MSG"

@@ -257,6 +257,26 @@ if [[ "$NO_WORKTREE" -eq 1 ]]; then
   done < <(tasks_index_slugs 2>/dev/null || true)
 fi
 
+# 세션 이름은 slug 앞 32자에서 잘린다(session_agent_name). 색인의 다른 작업과 세션 이름이 같으면
+# 기동·생존 조회·인계가 그 작업의 세션을 가리키므로 착수를 거부한다. 새 slug 가 짧아도 검사한다 —
+# 먼저 착수한 긴 slug 의 잘린 이름과 같을 수 있다. 정리 대기 행도 센다(발행 뒤에도 그 세션이 살아
+# 있을 수 있다). 이름 규칙은 바꾸지 않는다(기존 세션 이름이 그대로 맞도록).
+# 락 밖에서 한 번(빠른 안내), 락 안에서 색인을 쓰기 전에 다시 한 번 부른다(동시 착수).
+_promote_name_collision_check() {
+  local self other
+  self="$(session_agent_name "$SLUG")"
+  while IFS= read -r other; do
+    [[ -z "$other" || "$other" == "$SLUG" ]] && continue
+    if [[ "$(session_agent_name "$other")" == "$self" ]]; then
+      echo "promote: '${SLUG}' 의 세션 이름(${self})이 진행 중인 작업 '${other}' 와 같습니다 — 세션 이름은 slug 앞 32자에서 잘립니다 (상태 변경 없음)." >&2
+      echo "  앞 32자가 다른 --short-title 로 다시 실행하십시오." >&2
+      return 1
+    fi
+  done < <(tasks_index_all_slugs 2>/dev/null || true)
+  return 0
+}
+_promote_name_collision_check || exit 1
+
 # ---------------------------------------------------------------------------
 # 문서 이관 (change spec D1~D12) — 호출 체크아웃(P)에 미커밋으로 있는 이 작업의
 # REQUEST·spec·plan·raw-capture·spec/plan review 세션을 fr worktree(T)에 커밋한다.
@@ -875,6 +895,13 @@ _promote_absorb_legacy() {
   fi
 }
 _promote_absorb_legacy
+
+# 이름 충돌 재검사 — 락 밖 검사 뒤 이 락을 얻기 전에 다른 promote 가 같은 이름의 작업을 등록했을 수 있다.
+# 아직 branch·worktree 를 만들지 않았으므로 트랩의 「착수 중 실패」 안내를 내지 않게 표시한다.
+if ! _promote_name_collision_check; then
+  _STEP789_DONE=1
+  exit 1
+fi
 
 # 5. base-commit — 기본 브랜치 tip OID (branch 생성 시에만 실제로 쓰이지만, resolve 는
 #    항상 해 둔다 — 새 브랜치의 시작점 판단에 쓰인다).

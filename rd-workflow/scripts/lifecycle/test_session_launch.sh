@@ -1013,5 +1013,69 @@ for pair in live:0 finished:1 notfound:1 broken:2; do
   [[ "$rc" == "${pair##*:}" ]] && pass "caller_alive hc ${pair%%:*} → ${pair##*:}" || fail "caller_alive hc ${pair%%:*}: $rc"
 done
 
+# F1) hc 응답 다중 필드 읽기 — 앞 경로가 null·없음·줄바꿈 값이어도 뒤 경로의 값이 제자리에 온다.
+#     줄이 당겨지면 state 자리에 turn 이 들어가 생존·처리 판정이 틀어진다.
+printf '%s' '{"state":"live","status":{"state":null},"turn":3,"labels":{"herdr.space":"s1"},"cwd":"a\nb","address":"x"}' > "$TMP/f1.json"
+f1_a=; f1_b=; f1_c=; f1_d=; f1_e=; f1_f=; f1_g=
+_session_launch_hc_read "$TMP/f1.json" state status.state nope turn labels.herdr.space cwd address \
+  -- f1_a f1_b f1_c f1_d f1_e f1_f f1_g
+[[ "$f1_a|$f1_b|$f1_c|$f1_d|$f1_e|$f1_f|$f1_g" == "live|||3|s1||x" ]] \
+  && pass "hc 다중 필드: 빈 값 자리를 지키고 뒤 값을 제자리에 담는다" || fail "hc 다중 필드: [$f1_a|$f1_b|$f1_c|$f1_d|$f1_e|$f1_f|$f1_g]"
+printf 'not json' > "$TMP/f1b.json"
+f1_out="$(_session_launch_hc_fields "$TMP/f1b.json" state turn; printf 'end')"
+[[ "$f1_out" == $'\n\nend' ]] && pass "hc 다중 필드: 깨진 JSON 도 경로마다 빈 줄을 낸다" || fail "hc 다중 필드 깨진 JSON: [$f1_out]"
+# 대기 루프는 같은 변수를 바퀴마다 다시 읽는다. 읽지 못한 바퀴에 앞 바퀴 값이 남으면 처리 완료로 오판한다.
+(
+  command() { if [[ "${1-}" == "-v" && "${2-}" == "python3" ]]; then return 1; fi; builtin command "$@"; }
+  f1_a=old; f1_b=old
+  _session_launch_hc_read "$TMP/f1.json" state turn -- f1_a f1_b
+  [[ -z "$f1_a$f1_b" ]] || { echo "[$f1_a|$f1_b]" >&2; exit 1; }
+) && pass "hc 다중 필드: 읽지 못하면 앞 값을 지우고 빈 값으로 둔다" || fail "hc 다중 필드: 읽지 못한 변수에 앞 값이 남는다"
+
+# F2) promote — 앞 32자가 같은 다른 작업이 색인에 있으면 착수 전에 거부한다(세션 이름 충돌).
+#     같은 slug 재실행은 거부하지 않는다. promote 를 세 번 띄우므로 약 3~5초가 걸린다 — 거부가 브랜치·색인을
+#     만들기 전인지는 실제 promote 로만 확인할 수 있다.
+F2="$(mktemp -d)" || { echo "test_session_launch.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$F2" && -d "$F2" ]] || { echo "test_session_launch.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+F2="$(cd -P "$F2" && pwd -P)"
+mkdir -p "$F2/rd-workflow"
+cp -R "$SCRIPT_DIR/.." "$F2/rd-workflow/scripts"
+git -C "$F2" init -q -b main
+git -C "$F2" config user.email t@t && git -C "$F2" config user.name t
+mkdir -p "$F2/rd-workflow-workspace/.lifecycle" "$F2/rd-workflow-workspace/backlog/items"
+printf '.worktrees/\n' > "$F2/.gitignore"
+( source "$SCRIPT_DIR/_lifecycle_common.sh" && emit_current_task_baseline ) > "$F2/CURRENT_TASK.md"
+printf 'schema=1\nshort-title=-\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\nbase-commit=null\nreview-session=null\n' \
+  > "$F2/rd-workflow-workspace/.lifecycle/task-state"
+printf '# Change Request\n\n## Source FR\n-\n' > "$F2/REQUEST.md"
+git -C "$F2" add -A && git -C "$F2" commit -q -m seed
+F2_A="abcdefghij-abcdefghij-abcdefghij-first"
+F2_B="abcdefghij-abcdefghij-abcdefghij-second"
+f2_promote() { ( cd "$F2" && env HERDR_ENV= HC_TERMINAL_ID= RD_CHILD_SESSION=1 \
+  bash "$F2/rd-workflow/scripts/lifecycle/promote.sh" --short-title "$1" --size large --source-fr - 2>&1 ); }
+f2_rc=0; f2_out="$(f2_promote "$F2_A")" || f2_rc=$?
+[[ "$f2_rc" -eq 0 ]] || fail "F2 준비: 첫 promote 실패(rc=$f2_rc): $f2_out"
+f2_out="$(f2_promote "$F2_A")" || true
+[[ "$f2_out" != *"세션 이름("* ]] && pass "F2 같은 slug 재실행은 이름 충돌로 거부하지 않는다" || fail "F2 같은 slug 재실행이 거부됨: $f2_out"
+f2_rc=0; f2_out="$(f2_promote "$F2_B")" || f2_rc=$?
+f2_idx="$(cd "$F2" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_all_slugs')"
+if [[ "$f2_rc" -ne 0 && "$f2_out" == *"진행 중인 작업 '$F2_A'"* ]] \
+   && ! git -C "$F2" rev-parse --verify --quiet "refs/heads/fr/$F2_B" >/dev/null \
+   && [[ "$f2_idx" != *"$F2_B"* ]]; then
+  pass "F2 앞 32자가 같은 다른 작업이 있으면 브랜치·색인 행 없이 거부한다"
+else
+  fail "F2 이름 충돌 거부: rc=$f2_rc idx=[$f2_idx] out=$f2_out"
+fi
+# 짧은 slug 를 나중에 착수해도 먼저 착수한 긴 slug 의 잘린 이름과 같으면 거부한다.
+F2_C="abcdefghij-abcdefghij-abcdefghij"
+f2_rc=0; f2_out="$(f2_promote "$F2_C")" || f2_rc=$?
+if [[ "$f2_rc" -ne 0 && "$f2_out" == *"진행 중인 작업 '$F2_A'"* ]] \
+   && ! git -C "$F2" rev-parse --verify --quiet "refs/heads/fr/$F2_C" >/dev/null; then
+  pass "F2 32자 이하 slug 도 먼저 착수한 긴 slug 와 이름이 같으면 거부한다"
+else
+  fail "F2 짧은 slug 이름 충돌 거부: rc=$f2_rc out=$f2_out"
+fi
+rm -rf "$F2"
+
 printf 'session_launch: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

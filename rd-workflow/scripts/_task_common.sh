@@ -616,8 +616,13 @@ _fr_branch_active() {
 # GRD-01/02 + SEC-13: Short Title 3-way + Status guard 통합 판정 (기존 4개 산문 변형 대체)
 # stdout: decision=... / message=...  return: 0 진행, 2 차단
 # v2 2b: Short Title 읽기는 get_current_short_title(task-state 우선), 쓰기는 task-state + 뷰 미러
+# 4번째 인자 dry=1 (`rd task guard --dry-run`) 이면 판정·출력만 하고 task-state·CURRENT_TASK.md
+# 를 쓰지 않는다 (FR task-guard-name-hides-write). decision 값은 쓰기 경로와 같고, message 가
+# 기록하지 않았음을 밝힌다(`dry-run=yes` 줄은 rd 의 guard 분기가 decision 종류와 무관하게 낸다). 이름이 "guard" 라 상태를 보려고 부르기
+# 쉬운데 write·rebind 는 부른 순간 기록되기 때문이다. rd 진입부의 state_ensure(task-state
+# 부재 시 1회 마이그레이션)는 모든 하위 명령 공통이라 이 범위 밖이다.
 task_guard_decide() {
-  local cand="$1" mode="$2" src="${3:-}" cur status file="${project_root}/CURRENT_TASK.md"
+  local cand="$1" mode="$2" src="${3:-}" dry="${4:-0}" cur status file="${project_root}/CURRENT_TASK.md"
   # promote 모드 write/rebind 시 기록할 source-fr — 인자 없으면 '-' 리셋 (stale 차단).
   # REQUEST.md 추론을 여기 두지 않는 이유: guard 시점의 REQUEST.md 는 새 작업용으로
   # 작성 전(빈 템플릿 또는 이전 작업 잔재)이라 추론값이 '-' 또는 오염값이다.
@@ -635,7 +640,7 @@ task_guard_decide() {
         echo "message=CURRENT_TASK.md에 ## Short Title 섹션이 없습니다. 갱신 없이 진행합니다."
         return 0
       fi
-      printf '## Short Title\n-\n\n' >> "$file"   # intake/promote: 부재 = write 대상 (`standard` 등급 현행 의미)
+      [[ "$dry" == "1" ]] || printf '## Short Title\n-\n\n' >> "$file"   # intake/promote: 부재 = write 대상 (`standard` 등급 현행 의미)
     fi
     cur="$(_extract_task_section "Short Title")"
   fi
@@ -653,6 +658,11 @@ task_guard_decide() {
     if [[ "$mode" == "fr-add" ]] && state_file_exists && [[ -z "$cur" ]]; then
       echo "decision=proceed-readonly"
       echo "message=task-state의 short-title이 비어있습니다(손상 가능). 갱신 없이 진행합니다."
+      return 0
+    fi
+    if [[ "$dry" == "1" ]]; then
+      echo "decision=write"
+      echo "message=Short Title을 ${cand} 로 기록할 상황입니다 — --dry-run 이라 기록하지 않았습니다."
       return 0
     fi
     # Short Title 쓰기: task-state + 뷰 미러 (결정 3 LC-18)
@@ -738,6 +748,11 @@ task_guard_decide() {
   }
   [[ "$status" == "실행 중" ]] && status="구현 중"
   if [[ "$status" == "대기 중" ]]; then
+    if [[ "$dry" == "1" ]]; then
+      echo "decision=rebind"
+      echo "message=이전 Short Title (${cur}) 이 Status = 대기 중 인 stale 값이라 ${cand} 로 교체할 상황입니다 — --dry-run 이라 기록하지 않았습니다."
+      return 0
+    fi
     # Short Title 쓰기: task-state + 뷰 미러 (결정 3 LC-18)
     if state_file_exists; then
       if [[ "$mode" == "promote" ]]; then

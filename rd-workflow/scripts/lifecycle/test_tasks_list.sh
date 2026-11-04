@@ -21,7 +21,8 @@ fi
 
 TMP="$(mktemp -d)" || { echo "test_tasks_list.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$TMP" && -d "$TMP" ]] || { echo "test_tasks_list.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-trap 'rm -rf "$TMP"' EXIT
+PS_STUB_DIR=""
+trap 'rm -rf "$TMP" ${PS_STUB_DIR:+"$PS_STUB_DIR"}' EXIT
 # macOS: /var → /private/var 심링크. git worktree 경로 표현을 일치시키기 위해 정규화한다.
 TMP="$(cd "$TMP" && pwd -P)"
 
@@ -55,6 +56,25 @@ TMP="$(cd "$TMP" && pwd -P)"
 
 cd "$TMP"
 source "$SCRIPT_DIR/_tasks_index.sh"
+
+# 실제 ps 를 쓸 수 없는 환경(Codex 샌드박스는 /bin/ps 실행과 프로세스 목록 조회를 막는다)에서는
+# 점유 판정이 늘 판정불가로 보류돼 정상 정리 흐름을 검증할 수 없다. 그때만 lsof 가 본 pid 를 내는
+# 대역 ps 를 PATH 앞에 둔다. 대역 디렉터리는 fixture 저장소 밖에 둔다(기본 체크아웃 미커밋 판정에 섞이지 않게).
+if ! ps -U "$(id -u)" -o pid=,uid=,stat= >/dev/null 2>&1; then
+  PS_STUB_DIR="$(mktemp -d)" || { echo "test_tasks_list.sh: 대역 ps 디렉터리 생성 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+  cat > "$PS_STUB_DIR/ps" <<'PS_STUB_EOF'
+#!/usr/bin/env bash
+# 대역 ps — tasks_path_occupied 의 `ps -U <uid> -o pid=,uid=,stat=` 호출에만 답한다.
+# 그 밖의 형식은 샌드박스의 실제 ps 처럼 실패한다(publish_queue.sh·session_launch.sh 의 다른 ps 호출).
+if [[ "$#" -ne 4 || "$1" != "-U" || "$3" != "-o" || "$4" != "pid=,uid=,stat=" ]]; then
+  echo "ps(대역): 지원하지 않는 형식: $*" >&2; exit 1
+fi
+lsof -a -u "$2" -d cwd -Fp 2>/dev/null | sed -n 's/^p//p' | awk -v u="$2" '{ print $1, u, "S" }'
+PS_STUB_EOF
+  chmod +x "$PS_STUB_DIR/ps"
+  export PATH="$PS_STUB_DIR:$PATH"
+  echo "  NOTE: 실제 ps 를 쓸 수 없는 환경 — lsof 기반 대역 ps 로 정상 정리 흐름을 검증합니다(읽지 못한 프로세스 대조는 S7 스텁 단언이 검증)"
+fi
 
 # 1) 진행 중 작업이 없으면 그 사실을 알린다 (아직 fr 작업이 없다)
 out="$(bash "$SCRIPT_DIR/tasks_list.sh" 2>&1)"
@@ -656,7 +676,7 @@ rc=0
 ( sleep 30 & _spid=$!
   ps() { printf '%s %s S\n%s %s S\n' "$_spid" "$(id -u)" "$$" "$(id -u)"; }
   lsof() { printf 'p%s\nn/\n' "$$"; }
-  TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
+  tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
   kill "$_spid" 2>/dev/null; exit "$_r" ) || rc=$?
 [[ "$rc" -eq 2 ]] && pass "S7b 살아 있는 내 계정 pid 의 CWD 를 못 읽었으면 rc 2" || fail "S7b rc=$rc (기대 2)"
 
@@ -666,7 +686,7 @@ rc=0
 ( sleep 30 & _spid=$!
   ps() { printf '%s %s S\n' "$_spid" "$(id -u)"; }
   lsof() { printf 'p%s\nn/proc/%s/cwd (readlink: Permission denied)\n' "$_spid" "$_spid"; }
-  TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
+  tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
   kill "$_spid" 2>/dev/null; exit "$_r" ) || rc=$?
 [[ "$rc" -eq 2 ]] && pass "S7d pid 는 있으나 CWD 경로를 못 읽었으면 rc 2" || fail "S7d rc=$rc (기대 2)"
 
@@ -674,14 +694,14 @@ rc=0
 rc=0
 ( ps() { return 1; }
   lsof() { printf 'p%s\nn/\n' "$$"; }
-  TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty" ) || rc=$?
+  tasks_path_occupied "$TMP/.s7b-empty" ) || rc=$?
 [[ "$rc" -eq 2 ]] && pass "S7e ps 조회가 실패하면 점유 판정은 rc 2" || fail "S7e rc=$rc (기대 2)"
 
 # S7f ps 는 성공했지만 출력이 비어 있음 — 유효한 pid 행이 없으면 대조 근거가 없으므로 rc 2
 rc=0
 ( ps() { return 0; }
   lsof() { printf 'p%s\nn/\n' "$$"; }
-  TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty" ) || rc=$?
+  tasks_path_occupied "$TMP/.s7b-empty" ) || rc=$?
 [[ "$rc" -eq 2 ]] && pass "S7f ps 출력이 비어 있으면 점유 판정은 rc 2" || fail "S7f rc=$rc (기대 2)"
 
 # S7g·S7h 유효 uid 가 다른(setuid) 프로세스 — ps 는 실 uid 로 고르므로 VPN helper·login 같은 setuid 프로세스가
@@ -694,7 +714,7 @@ else
   ( sleep 30 & _spid=$!
     ps() { printf '%s 0 S\n%s %s S\n' "$_spid" "$$" "$(id -u)"; }
     lsof() { printf 'p%s\nn/\n' "$$"; }
-    TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
+    tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
     kill "$_spid" 2>/dev/null; exit "$_r" ) || rc=$?
   [[ "$rc" -eq 1 ]] && pass "S7g 유효 uid 가 다른(setuid) 프로세스의 CWD 를 못 읽어도 나머지가 대상 밖이면 rc 1" || fail "S7g rc=$rc (기대 1)"
 
@@ -702,7 +722,7 @@ else
   ( sleep 30 & _spid=$!
     ps() { printf '%s 0 S\n%s %s S\n' "$_spid" "$$" "$(id -u)"; }
     lsof() { printf 'p%s\nn/\np%s\nn%s\n' "$$" "$_spid" "$TMP/.s7b-empty"; }
-    TASKS_OCCUPIED_RETRY=0 tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
+    tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
     kill "$_spid" 2>/dev/null; exit "$_r" ) || rc=$?
   [[ "$rc" -eq 0 ]] && pass "S7h 유효 uid 가 다른 프로세스라도 읽힌 CWD 가 대상 안이면 rc 0" || fail "S7h rc=$rc (기대 0)"
 fi

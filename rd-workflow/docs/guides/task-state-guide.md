@@ -151,7 +151,7 @@ created-at=2026-07-05-1030
 
 ### guard 판정 (`task_guard_decide`, 7순위)
 
-`rd task guard --candidate <slug> --mode <intake|promote|fr-add> [--source-fr <path> ...]` 의 판정 순서다. `planning-design-intake`·`request-to-reviewed-plan` 은 이 함수 하나를 mode 만 다르게 호출하므로(`rd-workflow/docs/flows/WORKFLOW.md` 「Short Title 계약」 참조), 판정표는 **이 절 하나만 정본으로 둔다.**
+`rd task guard --candidate <slug> --mode <intake|promote|fr-add> [--source-fr <path> ...] [--dry-run]` 의 판정 순서다. `--dry-run` 은 같은 decision 을 내고 「상태 변경」 칸을 적용하지 않는다(`dry-run=yes` 출력). task-state 가 없는 저장소에서는 판정 없이 exit 3 으로 멈추고 `rd task status` 를 먼저 실행하라고 안내한다. `planning-design-intake`·`request-to-reviewed-plan` 은 이 함수 하나를 mode 만 다르게 호출하므로(`rd-workflow/docs/flows/WORKFLOW.md` 「Short Title 계약」 참조), 판정표는 **이 절 하나만 정본으로 둔다.**
 
 | 순위 | 조건 | decision | 상태 변경 |
 |---|---|---|---|

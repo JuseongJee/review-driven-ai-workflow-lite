@@ -1,6 +1,6 @@
 ## Task Tracking
 
-Status·Short Title·Source FR 변경은 `rd task` CLI를 경유한다 (기계 판정 권위: `rd-workflow-workspace/.lifecycle/task-state` — `CURRENT_TASK.md`의 해당 필드는 표시용 미러). 미러는 표시용이면서 **권위 손실 시의 대조 출처**이므로, 세 필드를 손으로 한쪽만 고치지 않는다 — promote 는 `source-fr` 가 양쪽에서 다르면 어느 쪽이 최신인지 판정하지 않고 중단한다.
+Status·Short Title·Source FR 변경은 `rd task` CLI를 경유한다 (기계 판정 권위: `rd-workflow-workspace/.lifecycle/task-state` — `CURRENT_TASK.md`의 해당 필드는 표시용 미러). 미러는 표시용이면서 **권위 손실 시의 대조 출처**이므로, 세 필드를 손으로 한쪽만 고치지 않는다 — promote 는 `source-fr` 가 양쪽에서 다르면 어느 쪽이 최신인지 판정하지 않고 중단한다. 커밋할 때도 미러만 넣지 않는다 — `rd task set-status` 가 끝에 알리는 「커밋할 파일」 을 함께 커밋한다.
 
 Status 허용값 (`rd task` CLI 전이표가 이 값으로 판정하며, hook이 강제하지 않으므로 사람과 AI가 지킨다): `대기 중` / `REQUEST review 대기` / `spec/plan 작성 중` / `spec/plan review 대기` / `구현 대기` / `구현 중` / `검증 중` / `diff review 대기` / `아카이브 보류` / `완료`.
 

@@ -440,7 +440,7 @@ cmd_archive_state() {
   # 작업에 archive.sh 를 호출하고, 전제조건 거부 → 재판정도 미완 → blocked 로 떨어져
   # 정상적으로 이어갈 작업이 사용자 개입을 요구하는 실패로 바뀐다.
   # 커버리지 손실은 없다 — merge 를 만드는 주체는 archive.sh 뿐이고, 그것은 항상
-  # `git merge --no-ff -m "merge: <slug> (autopilot 완료)"` 로 병합하므로 위 grep 이
+  # `git merge --no-ff -m "merge: <slug> (archive)"` 로 병합하므로 위 grep 이
   # 실제 merge 를 모두 잡는다 (인덱스 충돌 해결 경로의 재커밋도 같은 메시지다).
   if [ -z "$merge_oid" ]; then
     local anytag

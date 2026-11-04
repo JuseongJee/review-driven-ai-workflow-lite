@@ -153,17 +153,18 @@ rd_review_input_check() {
             pos = i + j - 1; A[substr(line, 1, pos - 1)] = 1; B[substr(line, pos + 3)] = 1; i = pos + 1
           }
         }
-        /^Submodule / && /\(submodule deleted\)$/ { dels[nd++] = $0 }
+        /^Submodule / && /\(submodule deleted\)$/ {
+          dp = substr($0, 11)
+          sub(/ [0-9a-f]+\.\.\.[0-9a-f]+ \(submodule deleted\)$/, "", dp)
+          dcnt[dp]++
+        }
         END {
           for (k = 1; k <= n; k++) {
             p = path[k]
             if (kind[k] == "P") { if (!(p in A) && !(p in B)) print p }
-            else {
-              f = 0
-              for (d = 0; d < nd; d++) if (index(dels[d], "Submodule " p " ") == 1) { f = 1; break }
-              if (!f) print p " (submodule deleted 머리줄)"
-            }
+            else ecnt[p]++
           }
+          for (p in ecnt) if (ecnt[p] > dcnt[p]) print p " (submodule deleted 머리줄)"
         }' "$exp" "$out" > "$missing.raw"; then
         printf 'C\t(출력 대조 awk 실패)\n' >> "$bad"
       elif ! sort -u "$missing.raw" > "$missing"; then
@@ -274,17 +275,19 @@ rd_worktree_remove_safe() {
 # rd_worktree_hold_info <원인> <submodule 경로> <worktree 경로> — spec D17 표의 사유와 복구 명령을 `사유<TAB>명령` 한 줄로 낸다.
 # 원인은 rd_submodule_tree_clean 이 낸 값(changes · unrecorded-commit · unpushed)입니다. 명령은 쉘 인용을 거칩니다.
 rd_worktree_hold_info() {
-  local cause="$1" sub="$2" wt="$3"
+  local cause="$1" sub="$2" wt="$3" lbl
+  # 사유 문구에 넣는 경로의 TAB·개행은 사유<TAB>명령 형식을 깨므로 공백으로 바꿉니다. 명령 쪽 %q 는 원래 경로를 씁니다.
+  lbl="${sub//[$'\t\n']/ }"
   case "$cause" in
     unrecorded-commit)
-      printf 'submodule %s 에 gitlink 로 올리지 않은 커밋이 체크아웃되어 있어 지우지 않았습니다\tgit -C %q log --oneline -1\n' "$sub" "$wt/$sub" ;;
+      printf 'submodule %s 에 gitlink 로 올리지 않은 커밋이 체크아웃되어 있어 지우지 않았습니다\tgit -C %q log --oneline -1\n' "$lbl" "$wt/$sub" ;;
     unpushed)
-      printf 'submodule %s 에 원격에 없는 커밋이 있어 지우지 않았습니다. 지우면 그 커밋을 잃습니다. 원격에 이미 있다면 git -C %q fetch 뒤 다시 실행하십시오\tgit -C %q log --oneline --all --not --remotes\n' "$sub" "$wt/$sub" "$wt/$sub" ;;
+      printf 'submodule %s 에 원격에 없는 커밋이 있어 지우지 않았습니다. 지우면 그 커밋을 잃습니다. 원격에 이미 있다면 git -C %q fetch 뒤 다시 실행하십시오\tgit -C %q log --oneline --all --not --remotes\n' "$lbl" "$wt/$sub" "$wt/$sub" ;;
     *)
       if [[ "$sub" != "." ]]; then
-        printf 'worktree 또는 그 submodule 에 미커밋 변경이 있어 지우지 않았습니다 (submodule 경로: %s)\tgit -C %q status --short\n' "$sub" "$wt/$sub"
+        printf 'worktree 또는 그 submodule 에 미커밋 변경이 있어 지우지 않았습니다 (submodule 경로: %s)\tgit -C %q status --short\n' "$lbl" "$wt/$sub"
       else
-        printf 'worktree 또는 그 submodule 에 미커밋 변경이 있어 지우지 않았습니다 (submodule 경로: %s)\tgit -C %q status --short\n' "$sub" "$wt"
+        printf 'worktree 또는 그 submodule 에 미커밋 변경이 있어 지우지 않았습니다 (submodule 경로: %s)\tgit -C %q status --short\n' "$lbl" "$wt"
       fi ;;
   esac
 }
@@ -342,15 +345,15 @@ EOF2
           if [[ -z "$ent" ]]; then disp="$path"; else disp="$path/$ent"; fi
           repo="$wt/$disp"
           if _rd_repo_has_changes "$repo"; then blocked="changes"; break; fi
-          rc=0; first="$(git -C "$repo" for-each-ref --contains HEAD 2>/dev/null)" || rc=$?
+          rc=0; first="$(git -C "$repo" for-each-ref --contains HEAD 2> "$subs.ferr")" || rc=$?
           if [[ "$rc" != 0 ]]; then
             # 판정에는 stdout 만 쓰고, stderr 는 실패 사유 문구에만 씁니다.
-            blocked="failed"; upd="$(git -C "$repo" for-each-ref --contains HEAD 2>&1 >/dev/null || true)"; upd="${upd%%$'\n'*}"; break
+            blocked="failed"; upd="$(head -1 "$subs.ferr" 2>/dev/null || true)"; [[ -n "$upd" ]] || upd="rc=$rc"; break
           fi
           if [[ -z "$first" ]]; then blocked="unreachable"; break; fi
         done < <(printf '\0'; cat "$subs")
       fi
-      [[ -z "$subs" ]] || rm -f "$subs" "$subs.err"
+      [[ -z "$subs" ]] || rm -f "$subs" "$subs.err" "$subs.ferr"
       subs=""
     fi
     case "$blocked" in

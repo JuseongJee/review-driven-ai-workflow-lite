@@ -128,6 +128,8 @@ sx_chk() {  # <라벨> — 기본 worktree 의 현재 초기화 상태에서 같
 sx_chk "재귀 초기화"
 G -C "$X/top" submodule deinit -q -f libs/prod; sx_chk "미초기화"
 G -C "$X/top" submodule update -q --init libs/prod; sx_chk "바깥만 초기화"
+# 기본 worktree 에 .git/modules 가 아예 없어도(클론 직후 상태) 해시가 같다
+G -C "$X/top" submodule deinit -q -f libs/prod; rm -rf "$X/top/.git/modules"; sx_chk "modules 부재"
 
 # ===========================================================================
 # 리뷰 입력 (spec 2.2 D5~D8) — S3 단위, S4 호출 지점
@@ -342,6 +344,31 @@ git -C "$N3/my mid" rm -q inner && git -C "$N3/my mid" commit -q -m del-inner
 git -C "$N3" add -f "my mid" && git -C "$N3" commit -q -m t-del-inner; B="$(head_of "$N3")"
 chk "$N3" "$A" "$B"; o="$(tgt_out "$N3" "$A" "$B")"
 [[ "$CK_RC" == 0 ]] && has "Submodule inner " "$o" && pass "S3h" || fail "S3h rc=$CK_RC err=$CK_ERR out=$(printf '%s' "$o" | grep -a '^Submodule' | head -3)"
+
+# s3h_dup <라벨> <A 쪽 inner 이름> — submodule A·B 가 각각 중첩 submodule 을 품고, A 쪽은 git rm, B 쪽은 gitlink 만 index 에서 제거(.gitmodules ignore=all 잔존)해
+# B 의 삭제 머리줄이 출력에서 숨겨진 구간을 만든다. 숨겨진 한 건이 같은 이름·접두 이름 삭제 줄에 가려지면 안 된다.
+s3h_dup() {
+  local lbl="$1" an="$2" d="$TMP/s3hd-$1" top
+  mkdir -p "$d"
+  mkdir "$d/i1" "$d/i2" "$d/a" "$d/b" "$d/top"
+  ( cd "$d/i1" && git init -q -b main && echo 1 > 1.txt && git add -A && git commit -q -m i1 )
+  ( cd "$d/i2" && git init -q -b main && echo 2 > 2.txt && git add -A && git commit -q -m i2 )
+  ( cd "$d/a" && git init -q -b main && echo a > a.txt && git add -A && git commit -q -m a && G submodule add -q "$d/i1" "$an" && git commit -q -m a-in )
+  ( cd "$d/b" && git init -q -b main && echo b > b.txt && git add -A && git commit -q -m b && G submodule add -q "$d/i2" inner && git commit -q -m b-in )
+  ( cd "$d/top" && git init -q -b main && echo t > t.txt && git add -A && git commit -q -m t \
+    && G submodule add -q "$d/a" A && G submodule add -q "$d/b" B && G submodule update -q --init --recursive && git commit -q -m top )
+  top="$d/top"; A="$(head_of "$top")"
+  git -C "$top/A" rm -q "$an" && git -C "$top/A" commit -q -m del
+  git -C "$top/B" config -f .gitmodules submodule.inner.ignore all
+  git -C "$top/B" update-index --force-remove inner && git -C "$top/B" add .gitmodules && git -C "$top/B" commit -q -m del-hidden
+  git -C "$top" add A B && git -C "$top" commit -q -m t-del; B="$(head_of "$top")"
+  chk "$top" "$A" "$B"
+  [[ "$CK_RC" == 1 ]] && has "inner (submodule deleted 머리줄)" "$CK_ERR" && pass "$lbl" || fail "$lbl rc=$CK_RC err=$CK_ERR"
+}
+echo "[S3h-dup] 같은 이름의 삭제가 둘이고 한쪽 머리줄이 숨겨지면 누락으로 차단한다"
+s3h_dup "S3h-dup" inner
+echo "[S3h-prefix] 한쪽 삭제 경로가 다른 쪽 경로의 접두(inner x)여도 같다"
+s3h_dup "S3h-prefix" "inner x"
 
 echo "[S3i] 판정 불가(diff-tree 실패)는 명령 실패로 차단하고 대상 문자열은 submodule 형식이다"
 N3="$(nested_copy "$TMP/s3i")"

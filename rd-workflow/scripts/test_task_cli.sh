@@ -251,6 +251,53 @@ rm -f "$TMP/rd-workflow-workspace/.lifecycle/task-state"
 printf '# Current Task\n\n## Status\n구현 중\n' > "$TMP/CURRENT_TASK.md"
 g "fr-add 섹션 부재(마이그레이션 후 sentinel): write" 0 "write" bash "$RD" task guard --candidate x --mode fr-add
 
+# --- guard --dry-run (FR task-guard-name-hides-write) — 같은 decision, 쓰기 없음 ---
+# write·rebind 는 기존 호출이 부른 순간 기록하는 경로다. --dry-run 이 그 경로에서
+# 파일을 건드리면 "상태만 보려던" 호출이 다시 Short Title 을 바꾼다.
+ts_file="$TMP/rd-workflow-workspace/.lifecycle/task-state"
+for _dr in "write|대기 중|-|dry-new|fr-add" "rebind|대기 중|stale-dry|fresh-dry|intake" \
+           "proceed-readonly|구현 중|busy-dry|other-dry|fr-add"; do
+  IFS='|' read -r _want _st _title _cand _mode <<< "$_dr"
+  mk_task_file "$TMP" "$_st" "$_title"
+  _ts_before="$(cat "$ts_file")"; _ct_before="$(cat "$TMP/CURRENT_TASK.md")"
+  _out="$(bash "$RD" task guard --candidate "$_cand" --mode "$_mode" --dry-run 2>/dev/null)"; _rc=$?
+  _d="$(printf '%s\n' "$_out" | awk -F= '$1=="decision"{print $2}')"
+  [[ "$_rc" == "0" && "$_d" == "$_want" && "$_out" == *"dry-run=yes"* ]] \
+    && echo "ok: guard --dry-run ${_want}: 같은 decision + dry-run=yes" \
+    || { echo "FAIL: guard --dry-run ${_want}: rc=$_rc out='$_out'"; FAIL=1; }
+  [[ "$(cat "$ts_file")" == "$_ts_before" && "$(cat "$TMP/CURRENT_TASK.md")" == "$_ct_before" ]] \
+    && echo "ok: guard --dry-run ${_want}: task-state·미러 byte 불변" \
+    || { echo "FAIL: guard --dry-run ${_want}: 파일을 썼다"; FAIL=1; }
+done
+
+# --- set-status 커밋할 파일 안내 (FR set-status-task-state-commit-guidance-missing) ---
+# 미러만 커밋해 권위(task-state)와 갈라진 사고의 재발 방지 — 바뀐 파일을 정확히 알린다.
+mk_task_file "$TMP" "구현 중" "cf-task"
+rm -f "$TMP/rd-workflow-workspace/.lifecycle/stage_metrics.tsv"
+cf_out="$(bash "$RD" task set-status "검증 중" 2>/dev/null)"
+[[ "$cf_out" == "커밋할 파일: CURRENT_TASK.md, rd-workflow-workspace/.lifecycle/task-state, rd-workflow-workspace/.lifecycle/stage_metrics.tsv" ]] \
+  && echo "ok: set-status 전이 — 바뀐 세 파일을 알린다" \
+  || { echo "FAIL: set-status 전이 안내 '$cf_out'"; FAIL=1; }
+cf_out="$(bash "$RD" task set-status "검증 중" 2>/dev/null)"
+[[ "$cf_out" == "커밋할 파일: 없음 (내용 변경 없음)" ]] \
+  && echo "ok: set-status 같은 값 — 바뀐 파일 없음을 알린다" \
+  || { echo "FAIL: set-status 같은 값 안내 '$cf_out'"; FAIL=1; }
+
+# --- task-state 부재(마이그레이션 전) 경계 — final diff review F1·F2 ---
+# 진입부 state_ensure 가 하위 명령보다 먼저 task-state 를 만든다. dry-run 은 그 전에 멈춰야
+# 하고(F1), set-status 는 그 생성도 커밋할 파일로 알려야 한다(F2).
+mk_task_file "$TMP" "대기 중" "-"
+rm -f "$ts_file"
+_ct_before="$(cat "$TMP/CURRENT_TASK.md")"
+bash "$RD" task guard --candidate mig-dry --mode intake --dry-run >/dev/null 2>&1; _rc=$?
+[[ "$_rc" == "3" && ! -e "$ts_file" && "$(cat "$TMP/CURRENT_TASK.md")" == "$_ct_before" ]] \
+  && echo "ok: guard --dry-run 마이그레이션 전 — exit 3, task-state 미생성, 미러 불변" \
+  || { echo "FAIL: guard --dry-run 마이그레이션 전 rc=$_rc task-state=$([[ -e "$ts_file" ]] && echo 생성됨 || echo 없음)"; FAIL=1; }
+cf_out="$(bash "$RD" task set-status "대기 중" 2>/dev/null)"
+[[ "$cf_out" == "커밋할 파일: rd-workflow-workspace/.lifecycle/task-state" ]] \
+  && echo "ok: set-status 마이그레이션 동반 — 생성된 task-state 를 알린다" \
+  || { echo "FAIL: set-status 마이그레이션 동반 안내 '$cf_out'"; FAIL=1; }
+
 # --- guard 순위 4 (신설, change spec §2.1·§2.2) — 통합 slug 재진입 ---
 # cand 가 현재 task-state 의 source-fr 집합 구성원과 slug 기준으로 일치하면 mode 무관
 # proceed-readonly. fr-branch 는 null(비활성)이어도 순위 4 가 순위 5 보다 먼저 판정된다.

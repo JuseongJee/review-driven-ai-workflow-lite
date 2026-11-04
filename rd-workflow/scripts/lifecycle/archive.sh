@@ -452,6 +452,91 @@ else
   fi
 fi
 
+# 병합 단계의 자동 해소 대상 네 파일 (줄바꿈 구분). Step 3 의 자동 해소 분기와 충돌 사전 감지(D4)가 같은 값을 쓴다.
+#   publish_queue.sh 의 PQ_AUTO_RESOLVE_PATHS 는 다른 줄기 소유라 이 값과 따로 둔다.
+ARCHIVE_AUTO_RESOLVE_PATHS="CURRENT_TASK.md
+rd-workflow-workspace/.lifecycle/stage_metrics.tsv
+rd-workflow-workspace/backlog/FUTURE_REQUESTS.md
+rd-workflow-workspace/.lifecycle/review-seals/verify-evidence"
+# Step 3 이 이번 실행에서 직접 병합했으면 1 (D5 는 그때 검사하지 않는다: archive.sh 가 만든 병합은 자동 병합과 네 파일 해소뿐이다).
+ARCHIVE_MERGED_THIS_RUN=0
+
+# archive_conflict_precheck <default_branch> <fr_branch> <worktree> — 병합 전 코드 충돌 사전 감지 (change spec D4)
+#   rc 0 진행 / 1 충돌(안내 출력 후, HEAD·인덱스·워킹트리를 바꾸지 않음) / 3 판정 불가(경고 출력 후 진행)
+#   merge-tree 출력: 첫 항목은 트리 OID 라 건너뛰고 나머지가 충돌 경로다. -z 로 받아 경로 인용(core.quotePath)을 피한다 —
+#   인용된 한글 기록 경로가 자동 해소 대상과 어긋나 거짓 거부가 나지 않게 한다. 줄바꿈을 품은 경로는 조각이 대상과
+#   맞지 않아 충돌로 잡혀 멈추는 쪽으로 기운다.
+archive_conflict_precheck() {
+  local def="$1" fr="$2" wt="$3" out rc=0 p a auto keep=""
+  out="$(git merge-tree --write-tree --name-only --no-messages -z HEAD "$fr" 2>/dev/null | tr '\0' '\n'; exit "${PIPESTATUS[0]}")" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) ;;
+    *)
+      printf 'archive: WARNING — 충돌 사전 확인을 할 수 없습니다(git 2.38 이상 필요) — 병합을 진행합니다\n' >&2
+      return 3 ;;
+  esac
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    auto=0
+    while IFS= read -r a; do [[ "$p" == "$a" ]] && auto=1; done <<EOF2
+$ARCHIVE_AUTO_RESOLVE_PATHS
+EOF2
+    [[ "$auto" -eq 1 ]] || keep="${keep}${p}"$'\n'
+  done < <(printf '%s\n' "$out" | sed 1d | sort -u)
+  [[ -n "$keep" ]] || return 0
+  # 작업 worktree 경로: fr 브랜치가 체크아웃된 worktree. 못 찾으면 호출자 worktree, 그것도 없으면 자리표시.
+  local fr_wt
+  fr_wt="$(git worktree list --porcelain 2>/dev/null | awk -v b="refs/heads/$fr" '
+    /^worktree /{p=$0; sub(/^worktree /,"",p); next}
+    $0 == "branch " b {print p; exit}')" || fr_wt=""
+  [[ -n "$fr_wt" ]] || fr_wt="${wt:-<작업 worktree>}"
+  printf 'archive: main 과 %s 사이에 코드 충돌이 있습니다 — main 을 바꾸지 않고 멈춥니다.\n' "$fr" >&2
+  printf 'archive:   충돌 경로:\n' >&2
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && printf 'archive:     - %s\n' "$p" >&2
+  done <<EOF2
+$keep
+EOF2
+  printf 'archive:   리뷰한 코드와 main 의 변경을 합친 결과는 리뷰를 거쳐야 발행할 수 있습니다. 작업 worktree(%s)에서:\n' "$fr_wt" >&2
+  printf 'archive:     1. bash rd-workflow/scripts/rd task set-status "구현 중"\n' >&2
+  printf 'archive:     2. git merge %s   — 충돌을 풀고 커밋합니다\n' "${def:-<기본 브랜치>}" >&2
+  printf 'archive:     3. bash rd-workflow/scripts/rd task set-status "검증 중" 후 검증, bash rd-workflow/scripts/verify_record.sh -- <검증 명령>\n' >&2
+  printf 'archive:     4. bash rd-workflow/scripts/rd task set-status "diff review 대기" 후 새 final diff review 세션을 종결합니다\n' >&2
+  printf 'archive:     5. bash rd-workflow/scripts/rd review seal <새 세션> → set-status "아카이브 보류" → 기록 커밋 → 다시 발행\n' >&2
+  return 1
+}
+
+# archive_merge_commit_check <M> — 기본 브랜치의 병합 커밋 M 이 자동 병합 결과와 같은가 (change spec D5)
+#   rc 0 같음 / 1 다름(차이 경로를 stdout 한 줄씩) / 2 판정 불가
+#   기록 경로는 차이로 세지 않는다: seal 보호 대상이 아니고, 자동 해소 결과가 merge-tree 결과와 다르기 때문이다.
+archive_merge_commit_check() {
+  local m="$1" out rc=0 t p diff_out bad=""
+  out="$(git merge-tree --write-tree --name-only --no-messages -z "${m}^1" "${m}^2" 2>/dev/null | tr '\0' '\n'; exit "${PIPESTATUS[0]}")" || rc=$?
+  case "$rc" in 0|1) ;; *) return 2 ;; esac
+  t="$(printf '%s\n' "$out" | sed -n 1p)"
+  [[ -n "$t" ]] || return 2
+  if [[ "$rc" -eq 1 ]]; then
+    while IFS= read -r p; do
+      [[ -n "$p" ]] || continue
+      rd_path_is_record "$p" || bad="${bad}${p}"$'\n'
+    done < <(printf '%s\n' "$out" | sed 1d | sort -u)
+    if [[ -n "$bad" ]]; then printf '%s' "$bad"; return 1; fi
+  fi
+  # NUL 구분 출력은 tr 로 줄바꿈으로 바꿔 받는다(pipefail 이 git 실패를 전달한다). 줄바꿈을 품은 경로는 조각이 기록 경로가
+  # 아니므로 차이로 잡혀 거부 쪽으로 기운다. --ignore-submodules=none: submodule.<이름>.ignore=all 이 손 병합에 섞은
+  # gitlink 변경을 목록에서 빼지 못하게 한다(한정 해시와 같은 이유).
+  diff_out="$(git diff-tree -r -z --no-renames --ignore-submodules=none --name-only "$t" "${m}^{tree}" 2>/dev/null | tr '\0' '\n')" || return 2
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    rd_path_is_record "$p" || bad="${bad}${p}"$'\n'
+  done <<EOF2
+$diff_out
+EOF2
+  if [[ -n "$bad" ]]; then printf '%s' "$bad"; return 1; fi
+  return 0
+}
+
 # Step 3 — merge (idempotent)
 # no-fr 모드는 합칠 브랜치가 없습니다 — 작업 커밋이 이미 기본 브랜치 위에 있습니다 (§5.1).
 if [[ "$BRANCH_MODE" == "no-fr" ]]; then
@@ -459,6 +544,11 @@ if [[ "$BRANCH_MODE" == "no-fr" ]]; then
 elif git merge-base --is-ancestor "$FR_BRANCH" HEAD 2>/dev/null; then
   printf 'archive: %s 이미 merge 됨 — skip\n' "$FR_BRANCH"
 else
+  # 병합 전 코드 충돌 사전 감지 (change spec D4) — 충돌이면 main 을 건드리기 전에 멈춘다.
+  _pc_def="$(get_default_branch 2>/dev/null)" || _pc_def=""
+  _pc_rc=0
+  archive_conflict_precheck "$_pc_def" "$FR_BRANCH" "$CURRENT_WT" || _pc_rc=$?
+  [[ "$_pc_rc" -ne 1 ]] || exit 1
   # git merge 출력은 변수에 잡아 둔다. 충돌이 자동 해소되면 git 의 「자동 병합이 실패했습니다」 가 거짓 실패로 읽히므로
   # 성공·멈춤 경로에서만 낸다. 해소 성공 경로는 내지 않는다. 대입 단독 실행은 set -e 로 종료하므로 if 조건에 둔다.
   _merge_out=""
@@ -470,12 +560,13 @@ else
     #   등록 커밋이 기본 브랜치에 먼저 쌓이는 구조에서 fr 브랜치와 기본 브랜치가 표 끝에 서로 다른 행을
     #   append 하면 git 줄 병합은 반드시 충돌한다. 인덱스는 제목을 키로 하는 행 집합이므로 집합 병합이 맞다.
     #   다른 경로가 함께 충돌하거나 집합 병합도 실패하면 종전대로 사람이 해결한다 (충돌 상태 유지).
-    _IDX="rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
-    _SM="rd-workflow-workspace/.lifecycle/stage_metrics.tsv"
-    _CT="CURRENT_TASK.md"
+    # 네 파일 경로는 ARCHIVE_AUTO_RESOLVE_PATHS(위)와 같은 값이다 — 목록이 갈라지지 않게 거기서 꺼낸다.
+    _CT="$(printf '%s\n' "$ARCHIVE_AUTO_RESOLVE_PATHS" | sed -n 1p)"
+    _SM="$(printf '%s\n' "$ARCHIVE_AUTO_RESOLVE_PATHS" | sed -n 2p)"
+    _IDX="$(printf '%s\n' "$ARCHIVE_AUTO_RESOLVE_PATHS" | sed -n 3p)"
     # verify-evidence 는 모든 작업이 같은 경로에 쓰는 검증 증거다. seal 시점(rd_seal_evidence_check)에만 읽히고
     #   병합 뒤에는 아무도 읽지 않으므로, 발행 줄기가 seal 에 쓴 증거(stage 3)를 남긴다 (change spec 2026-11-02-0740 D1).
-    _VE="rd-workflow-workspace/.lifecycle/review-seals/verify-evidence"
+    _VE="$(printf '%s\n' "$ARCHIVE_AUTO_RESOLVE_PATHS" | sed -n 4p)"
     _conf="$(git diff --name-only --diff-filter=U 2>/dev/null)"
     if [[ "$_conf" == "$_IDX" ]]; then
       _mb="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; _merge_dump; exit 1; }
@@ -499,7 +590,7 @@ else
         rm -f "$_mb" "$_mo" "$_mt" "$_mr"
       else
         rm -f "$_mb" "$_mo" "$_mt" "$_mr"
-        printf 'archive: merge 실패 — FUTURE_REQUESTS.md 행 집합 병합도 실패했습니다. conflict resolve 후 재실행\n' >&2; _merge_dump; exit 1
+        printf 'archive: merge 실패 — FUTURE_REQUESTS.md 행 집합 병합도 실패했습니다. conflict resolve 후 재실행\n' >&2; printf 'archive:   main 에서 직접 풀지 말고 git merge --abort 후 작업 worktree 에서 처리하십시오\n' >&2; _merge_dump; exit 1
       fi
     elif printf '%s\n' "$_conf" | grep -qxF -e "$_SM" -e "$_CT" -e "$_VE" \
          && [[ -z "$(printf '%s\n' "$_conf" | grep -vxF -e "$_SM" -e "$_IDX" -e "$_CT" -e "$_VE")" ]]; then
@@ -513,7 +604,7 @@ else
       _sm_stop() {  # _sm_stop [사유] — 임시 파일을 지우고 충돌 상태를 둔 채 중단한다
         rm -f "$_sb" "$_so" "$_st" "$_sr" "$_ib" "$_io" "$_it" "$_ir" "$_ctm" "$_vet"
         [[ -n "${1:-}" ]] && printf 'archive: %s\n' "$1" >&2
-        printf 'archive: merge 실패 — conflict resolve 후 재실행\n' >&2; _merge_dump; exit 1
+        printf 'archive: merge 실패 — conflict resolve 후 재실행\n' >&2; printf 'archive:   main 에서 직접 풀지 말고 git merge --abort 후 작업 worktree 에서 main 을 병합해 처리하십시오(리뷰한 코드와 다른 결과는 다시 리뷰해야 발행할 수 있습니다)\n' >&2; _merge_dump; exit 1
       }
       _sm_tmp() {  # 가드된 임시 파일 경로를 stdout 으로 낸다
         local _t
@@ -590,9 +681,11 @@ else
       if (( _hasve )); then printf 'archive: verify-evidence 충돌을 발행 줄기 쪽으로 해결했습니다 (seal 에 쓴 증거를 남깁니다)\n'; fi
       rm -f "$_sb" "$_so" "$_st" "$_sr" "$_ib" "$_io" "$_it" "$_ir" "$_ctm" "$_vet"
     else
-      printf 'archive: merge 실패 — conflict resolve 후 재실행\n' >&2; _merge_dump; exit 1
+      printf 'archive: merge 실패 — conflict resolve 후 재실행\n' >&2; printf 'archive:   main 에서 직접 풀지 말고 git merge --abort 후 작업 worktree 에서 main 을 병합해 처리하십시오(리뷰한 코드와 다른 결과는 다시 리뷰해야 발행할 수 있습니다)\n' >&2; _merge_dump; exit 1
     fi
   fi
+  # 여기까지 왔으면 이번 실행이 병합했다(자동 병합 성공 또는 자동 해소 성공 — 실패 분기는 모두 exit 1).
+  ARCHIVE_MERGED_THIS_RUN=1
 fi
 
 # 순서 불변식: 판정 base 는 반드시 merge 완료 "이후" 에 캡처한다.
@@ -648,6 +741,39 @@ if [[ "$_ec_rc" -eq 2 ]]; then
 elif [[ "$_ec_rc" -ne 0 ]]; then
   archive_block_notice "$FR_BRANCH" "$CURRENT_WT"
   exit 1
+fi
+
+# Step 3.6b — 손으로 푼 병합 커밋 거부 (change spec D5)
+# 이번 실행이 직접 병합했으면 검사하지 않는다. 이미 병합돼 있던 경우(재실행)에 한해, 기준선이 fast-forward 가 아닌 병합 커밋 M 이면
+# M 이 자동 병합 결과(M^1 + M^2)와 같은지 본다. fast-forward 기준선(= fr tip)이면 병합 커밋이 없어 대상이 아니다.
+if [[ "$BRANCH_MODE" == "fr" && "$ARCHIVE_MERGED_THIS_RUN" -eq 0 && -n "$BASELINE_OID" \
+      && "$BASELINE_OID" != "$(git rev-parse "$FR_BRANCH" 2>/dev/null)" ]]; then
+  _mc_rc=0
+  _mc_paths="$(archive_merge_commit_check "$BASELINE_OID")" || _mc_rc=$?
+  if [[ "$_mc_rc" -eq 1 ]]; then
+    _mc_short="$(git rev-parse --short "$BASELINE_OID" 2>/dev/null)" || _mc_short="$BASELINE_OID"
+    _mc_p1="$(git rev-parse "${BASELINE_OID}^1" 2>/dev/null)" || _mc_p1="<M^1 OID>"
+    printf 'archive: main 의 병합 커밋 %s 에 리뷰하지 않은 변경이 있습니다 — 발행하지 않습니다.\n' "$_mc_short" >&2
+    printf 'archive:   자동 병합 결과와 다른 경로:\n' >&2
+    while IFS= read -r _mc_p; do
+      [[ -n "$_mc_p" ]] && printf 'archive:     - %s\n' "$_mc_p" >&2
+    done <<EOF
+$_mc_paths
+EOF
+    printf 'archive:   이 병합은 archive.sh 가 아니라 손으로 만든 것으로 보입니다. 리뷰한 코드만 발행하려면:\n' >&2
+    printf 'archive:     1. 기본 체크아웃에서 손 병합을 되돌립니다: git reset --keep %s\n' "$_mc_p1" >&2
+    printf 'archive:        (먼저 git log --oneline %s..HEAD 로 되돌릴 커밋이 이 병합과 archive 정리 커밋뿐인지 확인하십시오)\n' "$_mc_p1" >&2
+    printf 'archive:     2. 이후는 충돌 감지 때와 같습니다 — 작업 worktree 에서 main 병합·해결 → 검증 → 새 final diff review → seal → 다시 발행\n' >&2
+    exit 1
+  elif [[ "$_mc_rc" -ne 0 ]]; then
+    printf 'archive: main 의 병합 커밋 %s 가 자동 병합 결과와 같은지 확인할 수 없습니다(git 2.38 이상이 필요하거나 저장소 상태를 읽을 수 없음) — 발행하지 않습니다.\n' "$(git rev-parse --short "$BASELINE_OID" 2>/dev/null || printf '%s' "$BASELINE_OID")" >&2
+    _mc_p1="$(git rev-parse "${BASELINE_OID}^1" 2>/dev/null)" || _mc_p1="<M^1 OID>"
+    printf 'archive:   git --version 이 2.38 이상인지 확인하십시오. 이 병합을 손으로 만들었다면 리뷰한 코드만 발행하려면:\n' >&2
+    printf 'archive:     1. 기본 체크아웃에서 손 병합을 되돌립니다: git reset --keep %s\n' "$_mc_p1" >&2
+    printf 'archive:        (먼저 git log --oneline %s..HEAD 로 되돌릴 커밋이 이 병합과 archive 정리 커밋뿐인지 확인하십시오)\n' "$_mc_p1" >&2
+    printf 'archive:     2. 이후는 충돌 감지 때와 같습니다 — 작업 worktree 에서 main 병합·해결 → 검증 → 새 final diff review → seal → 다시 발행\n' >&2
+    exit 1
+  fi
 fi
 
 # Step 3.5 (제거, 2026-09-03) — 이 자리에서 self_test consumer 전수를 강제하고 증명을 대조하던

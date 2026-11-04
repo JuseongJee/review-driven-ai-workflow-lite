@@ -11,7 +11,7 @@ plan이 phase를 표현하면 autopilot/subagent-driven 실행이 phase 내 task
 ### mechanical 판정 — 3조건 전부 충족 시에만
 
 - 변경 파일 2개 이하
-- brief(task 본문)에 전체 코드가 verbatim으로 포함됨 (전사 수준)
+- brief(task 본문)가 구현자에게 결정을 남기지 않음 — 넣을 문구·값·시그니처와 확인할 단언이 plan 에 정확히 있다. 시그니처와 테스트만으로 본문이 정해지지 않는 task 는 해당하지 않는다
 - 신규 로직 분기 없음
 
 하나라도 불충족이면 `needs-review`.

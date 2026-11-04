@@ -17,6 +17,13 @@ source "${SCRIPT_DIR}/_task_common.sh" || exit 3
 # 일반 seal 의 리뷰 입력 완전성 검사(rd_review_input_check). _state_common.sh 는 위 _task_common.sh 가 불러옵니다.
 source "${SCRIPT_DIR}/_submodule_common.sh" || exit 3
 # 진입 시 task-state 보장 — 부재 시 마이그레이션 수행 (결정 4). 손상 legacy → exit 3.
+# 마이그레이션 여부를 하위 명령이 알 수 있게 기록한다(set-status 의 커밋할 파일 안내).
+RD_STATE_MIGRATED=0; state_file_exists || RD_STATE_MIGRATED=1
+# guard --dry-run 은 쓰지 않기로 약속했으므로 마이그레이션 전이면 판정하지 않고 멈춘다.
+if [[ "$RD_STATE_MIGRATED" == "1" && "${1:-}" == "task" && "${2:-}" == "guard" && " $* " == *" --dry-run "* ]]; then
+  echo "guard --dry-run: task-state 가 아직 없어 마이그레이션이 필요합니다 — 판정 전용 경로는 파일을 쓰지 않으므로 멈춥니다. 'bash rd-workflow/scripts/rd task status' 로 마이그레이션한 뒤 다시 부르세요." >&2
+  exit 3
+fi
 state_ensure || exit 3
 
 # ---------------------------------------------------------------------------
@@ -278,17 +285,42 @@ rd_review_seal() {
     return 1
   }
 
+  # branch-mode 표기는 §3.2.2 헬퍼 한 곳에서만 판정합니다.
+  local fr_val mode fr_field
+  fr_val="$(state_read_field "fr-branch")"
+  mode="$(rd_branch_mode "$fr_val")" || return 1
+  if [[ "$mode" == "no-fr" ]]; then fr_field="null"; else fr_field="$fr_val"; fi
+
+  # fr 모드는 리뷰 대조 단위가 한정 해시(fr 이 바꾼 경로)입니다 (spec D3). 계산할 수 없으면
+  # 전체 트리 기준으로 봉인하고 fr-changes-hash 를 쓰지 않습니다.
+  local fr_cur="" fr_rev=""
+  if [[ "$mode" == "fr" && "$legacy" != "1" ]]; then
+    if fr_cur="$(rd_fr_changes_hash "HEAD" 2>/dev/null)" && fr_rev="$(rd_fr_changes_hash "$reviewed_oid" 2>/dev/null)"; then
+      :
+    else
+      fr_cur=""; fr_rev=""
+      echo "review seal: 기본 브랜치 기준을 정할 수 없어 전체 트리 기준으로 봉인합니다 — 이 seal 은 main 병합 뒤 무효가 됩니다." >&2
+    fi
+  fi
+
   # 검사 4 — reviewed head 의 해시 == 현재 해시 (이 설계의 실질, §3.2)
   local verified="legacy-unverified"
   if [[ "$legacy" != "1" ]]; then
-    local reviewed_hash
-    reviewed_hash="$(rd_protected_tree_hash "$reviewed_oid")" || {
-      echo "review seal: reviewed head 의 보호 트리 해시를 계산할 수 없습니다 — 판정 불가로 차단합니다." >&2
-      return 1
-    }
-    if [[ "$reviewed_hash" != "$cur_hash" ]]; then
-      echo "review seal: 리뷰 종결 후 보호 경로가 변경되었습니다 — 재리뷰가 필요합니다." >&2
-      return 1
+    if [[ -n "$fr_cur" ]]; then
+      if [[ "$fr_rev" != "$fr_cur" ]]; then
+        echo "review seal: 리뷰 종결 후 보호 경로가 변경되었습니다 — 재리뷰가 필요합니다." >&2
+        return 1
+      fi
+    else
+      local reviewed_hash
+      reviewed_hash="$(rd_protected_tree_hash "$reviewed_oid")" || {
+        echo "review seal: reviewed head 의 보호 트리 해시를 계산할 수 없습니다 — 판정 불가로 차단합니다." >&2
+        return 1
+      }
+      if [[ "$reviewed_hash" != "$cur_hash" ]]; then
+        echo "review seal: 리뷰 종결 후 보호 경로가 변경되었습니다 — 재리뷰가 필요합니다." >&2
+        return 1
+      fi
     fi
     # 검사 4b — 리뷰 입력이 submodule 안쪽 코드를 실제로 담았는가 (객체 삭제·ignore 설정으로 누락될 수 있음)
     ( cd "$project_root" && rd_review_input_check "$raw_base" "$reviewed_oid" ) || {
@@ -307,12 +339,6 @@ rd_review_seal() {
     verified="yes"
   fi
 
-  # branch-mode 표기는 §3.2.2 헬퍼 한 곳에서만 판정합니다.
-  local fr_val mode fr_field
-  fr_val="$(state_read_field "fr-branch")"
-  mode="$(rd_branch_mode "$fr_val")" || return 1
-  if [[ "$mode" == "no-fr" ]]; then fr_field="null"; else fr_field="$fr_val"; fi
-
   local dir marker tmp
   dir="$(_rd_seal_dir)"
   mkdir -p "$dir" || { echo "review seal: 마커 디렉터리를 만들 수 없습니다: ${dir}" >&2; return 1; }
@@ -323,7 +349,8 @@ schema=${RD_SEAL_SCHEMA}
 session-id=${session_id}
 review-type=diff-review
 tree-hash=${cur_hash}
-head=${head_now}
+${fr_cur:+fr-changes-hash=${fr_cur}
+}head=${head_now}
 branch-mode=${mode}
 fr-branch=${fr_field}
 rd-version=$(_rd_version)
@@ -433,6 +460,8 @@ usage() {
                                            실행 모드(manual/semi-auto) 조회가 아닙니다
                                            — rd-workflow/docs/flows/AUTONOMY.md 참조
   set-status <값> [--force] [--task <slug>]  전이표 검증 후 Status 갱신 (위반 exit 4)
+                                           성공하면 '커밋할 파일: ...' 한 줄 출력 —
+                                           실제로 바뀐 파일만(미러·task-state·stage_metrics)
                                            --task: 대상 작업 명시(worktree 여러 건일 때).
                                            생략 시 현재 worktree 의 작업, 그마저 없고
                                            작업이 여러 건이면 목록 안내 후 exit 1
@@ -442,8 +471,11 @@ usage() {
                                            (진행 중이면 exit 1, 확정 시 launch=ok|failed|none)
                                            --assume-ended: 기동한 백엔드로 조회할 수 없을 때, 세션이
                                            없거나 끝났음을 직접 확인했다고 밝혀 failed 로 확정
-  guard --candidate <slug> --mode <m> [--source-fr <path|-> ...]
+  guard --candidate <slug> --mode <m> [--source-fr <path|-> ...] [--dry-run]
                                            m: intake|promote|fr-add. decision=... 출력 (차단 exit 2)
+                                           decision=write·rebind 이면 Short Title 을 **기록한다**.
+                                           --dry-run: 판정만 하고 아무것도 쓰지 않음(dry-run=yes 출력)
+                                           task-state 가 없으면 판정 없이 exit 3 — 'rd task status' 를 먼저 실행
                                            --source-fr 는 promote 전용, 반복 지정으로 복수 허용
                                            (생략 시 '-' 리셋. '-' 는 단독일 때만 허용)
   source-fr                                task-state source-fr 출력 (줄 단위 목록, 부재 시 '-')
@@ -536,8 +568,41 @@ case "$cmd" in
     ss_orig_root="$project_root"; ss_orig_tsp="$TASK_STATE_PATH"
     project_root="$ss_target"
     TASK_STATE_PATH="${ss_target}/rd-workflow-workspace/.lifecycle/task-state"
+    # 커밋할 파일 안내 (FR set-status-task-state-commit-guidance-missing) — set-status 는
+    # 미러만이 아니라 권위(task-state)와 전이 로그도 바꾼다. 미러만 커밋하면 HEAD 의
+    # 권위와 미러가 갈라지므로, 실행 전후 내용을 비교해 실제로 바뀐 파일만 알린다.
+    # 상태 변경 함수(task_set_status)는 그대로 두고, 사람·AI 가 부르는 이 CLI 분기에서만
+    # 안내한다(안내는 stdout 한 줄, 실패 시에는 내지 않는다).
+    ss_files=("CURRENT_TASK.md"
+              "rd-workflow-workspace/.lifecycle/task-state"
+              "rd-workflow-workspace/.lifecycle/stage_metrics.tsv")
+    ss_before=()
+    for _f in "${ss_files[@]}"; do
+      if [[ -f "${ss_target}/${_f}" ]]; then ss_before+=("$(cksum < "${ss_target}/${_f}")"); else ss_before+=("absent"); fi
+    done
     task_set_status "$to" "$force"; ss_rc=$?
     project_root="$ss_orig_root"; TASK_STATE_PATH="$ss_orig_tsp"
+    if [[ "$ss_rc" -eq 0 ]]; then
+      ss_changed=""
+      # 진입부 마이그레이션(state_ensure)은 비교 시작 전에 task-state 를 만든다 — 그 생성도
+      # 이번 호출의 변경이므로 안내에 넣는다. 마이그레이션은 현재 worktree 에서만 일어나므로
+      # 대상이 현재 worktree 일 때만 해당한다.
+      if [[ "$RD_STATE_MIGRATED" == "1" && "$(cd "$ss_target" 2>/dev/null && pwd -P)" == "$(cd "$ss_orig_root" 2>/dev/null && pwd -P)" ]]; then
+        ss_before[1]="migrated"
+      fi
+      for _i in "${!ss_files[@]}"; do
+        if [[ -f "${ss_target}/${ss_files[$_i]}" ]]; then _after="$(cksum < "${ss_target}/${ss_files[$_i]}")"; else _after="absent"; fi
+        [[ "$_after" != "${ss_before[$_i]}" ]] && ss_changed="${ss_changed:+${ss_changed}, }${ss_files[$_i]}"
+      done
+      ss_where=""
+      [[ "$(cd "$ss_target" 2>/dev/null && pwd -P)" != "$(cd "$ss_orig_root" 2>/dev/null && pwd -P)" ]] \
+        && ss_where=" (작업 트리: ${ss_target})"
+      if [[ -n "$ss_changed" ]]; then
+        printf '커밋할 파일%s: %s\n' "$ss_where" "$ss_changed"
+      else
+        printf '커밋할 파일%s: 없음 (내용 변경 없음)\n' "$ss_where"
+      fi
+    fi
     exit "$ss_rc"
     ;;
   source-fr)
@@ -618,9 +683,10 @@ case "$cmd" in
     task_set_title "$val" "$force"
     ;;
   guard)
-    cand="" gmode="" gsrc="" gsrc_count=0 gsrc_list="" gsrc_fail=0
+    cand="" gmode="" gsrc="" gsrc_count=0 gsrc_list="" gsrc_fail=0 gdry=0
     while [[ $# -gt 0 ]]; do
       case "$1" in
+        --dry-run) gdry=1; shift ;;
         --candidate) cand="${2:-}"; shift 2 ;;
         --mode) gmode="${2:-}"; shift 2 ;;
         --source-fr)
@@ -666,7 +732,9 @@ case "$cmd" in
         gsrc="$(source_fr_join "$gseen")" || exit 1
       fi
     fi
-    task_guard_decide "$cand" "$gmode" "$gsrc"
+    # dry-run 표시는 decision 종류와 무관하게 한 번만 낸다 (write·rebind·proceed-readonly·block-*)
+    [[ "$gdry" == "1" ]] && echo "dry-run=yes"
+    task_guard_decide "$cand" "$gmode" "$gsrc" "$gdry"
     ;;
   capture)
     stage="" title="" src="routed"
