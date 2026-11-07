@@ -8,11 +8,17 @@
 - 템플릿 관련 파일(`rd-workflow/`, `CLAUDE.md`, `.claude/`)을 팀 repo에 커밋하고 싶지 않다
 - 여러 컴퓨터에서 워크플로 산출물(handoffs, workspace 등)에 접근하고 싶다
 
+이 가이드는 팀 저장소를 overlay 아래에 **새로 clone** 합니다. 기존 클론(예: `~/work/myproject`)은 옮기지 않고 그대로 남으므로 두 벌이 됩니다.
+기존 클론을 그대로 overlay 아래로 옮겨 쓰려면(브랜치·stash·미커밋 작업 유지) [이관 가이드의 「rd-workflow 가 없는 기존 클론」 절](team-overlay-migration.md#plain-clone)을 따릅니다.
+rd-workflow 가 이미 팀 저장소에 커밋돼 있거나 옛 심링크 방식으로 설치돼 있으면 [이관 가이드](team-overlay-migration.md)를 따릅니다.
+
+**실행 위치**: 설치가 끝나면 overlay 루트(`~/work/rd-myproject`)에서 새 AI 세션을 띄웁니다. 기존 클론에서 띄운 세션에는 overlay 의 `CLAUDE.md`·`.claude/` 가 로드되지 않습니다.
+
 <a id="structure"></a>
 ## 구조 — 무엇이 어디에 놓이는가
 
 ```
-~/ai-overlays/myproject/          ← overlay repo (내 private repo)
+~/work/rd-myproject/              ← overlay repo (내 private repo)
 ├── .claude/                      ← Claude Code 설정 (hook 포함)
 ├── .claudeignore
 ├── .gitignore
@@ -24,32 +30,32 @@
 ├── WORKING_WITH_AI.md
 ├── rd-workflow/                  ← 워크플로 템플릿
 ├── rd-workflow-workspace/        ← 작업 산출물 (spec·plan·review·backlog)
-└── <소스디렉토리>/                ← 팀 저장소 (git submodule)
+└── myproject/                    ← 팀 저장소 (git submodule)
     └── ... 팀 코드 ...
 ```
 
 | 무엇 | 저장소 | 커밋이 가는 곳 |
 |---|---|---|
-| `<소스디렉토리>/` 안의 코드 | 팀 저장소 | **팀원 전원에게 전파** |
+| `myproject/` 안의 코드 | 팀 저장소 | **팀원 전원에게 전파** |
 | 그 밖 overlay 루트의 모든 것 | 내 private overlay repo | 나만 |
-| `<소스디렉토리>` 리비전 포인터 (gitlink) | overlay repo | 나만 |
+| `myproject` 리비전 포인터 (gitlink) | overlay repo | 나만 |
 
-팀 repo 워킹트리에는 아무것도 두지 않는다. symlink도, 개인 설정 파일도 없다. 그래서 팀 저장소에서 `git reset --hard`나 `git clean -fd`를 실행해도 overlay 설정이 함께 날아가지 않고, 머신을 옮길 때 팀 repo 쪽에 다시 무언가를 심을 필요도 없다. 개인 설정은 overlay repo 하나에만 존재하며, 팀 저장소는 `<소스디렉토리>` 안에 submodule로 편입되어 있을 뿐 그 자체로는 아무것도 모른다.
+팀 repo 워킹트리에는 아무것도 두지 않는다. symlink도, 개인 설정 파일도 없다. 그래서 팀 저장소에서 `git reset --hard`나 `git clean -fd`를 실행해도 overlay 설정이 함께 날아가지 않고, 머신을 옮길 때 팀 repo 쪽에 다시 무언가를 심을 필요도 없다. 개인 설정은 overlay repo 하나에만 존재하며, 팀 저장소는 `myproject` 안에 submodule로 편입되어 있을 뿐 그 자체로는 아무것도 모른다.
 
 ## 사전 준비
 
 - GitHub (또는 다른 Git 호스팅)에 private repo를 하나 만든다
-  - 예: `me/myproject-ai-overlay`
+  - 예: `me/rd-myproject`
 - 개인 overlay 디렉토리 경로를 정한다
-  - 예: `~/ai-overlays/myproject/`
+  - 예: `~/work/rd-myproject/`
 
 ## 설치 절차
 
 ### 1. overlay repo 생성
 
 ```bash
-mkdir -p ~/ai-overlays/myproject
-cd ~/ai-overlays/myproject
+mkdir -p ~/work/rd-myproject
+cd ~/work/rd-myproject
 git init -b main
 # git 2.28 미만이면: git init && git branch -M main
 ```
@@ -76,8 +82,8 @@ rm -rf "$TMPL"
 ### 3. 소스 저장소를 submodule 로 추가
 
 ```bash
-# <소스디렉토리> 는 보통 소스 repo 이름을 그대로 쓴다
-git submodule add git@github.com:team/project.git <소스디렉토리>
+# 팀 저장소 이름(myproject)을 그대로 폴더 이름으로 쓴다. overlay 는 rd-myproject, 그 아래 myproject
+git submodule add git@github.com:team/myproject.git myproject
 ```
 
 ### 4. .gitignore 에 overlay 고유 항목 추가
@@ -87,8 +93,8 @@ git submodule add git@github.com:team/project.git <소스디렉토리>
 cat >> .gitignore <<'EOF'
 
 # ── overlay 고유 ──
-# 코드 본체(<소스디렉토리>)는 git submodule 이므로 이 파일이 다루지 않는다.
-# submodule 내부 무시 규칙은 <소스디렉토리>/.gitignore 가 관리한다.
+# 코드 본체(myproject)는 git submodule 이므로 이 파일이 다루지 않는다.
+# submodule 내부 무시 규칙은 myproject/.gitignore 가 관리한다.
 EOF
 ```
 
@@ -97,7 +103,7 @@ EOF
 ```bash
 git add -A
 git commit -m "init: AI workflow overlay"
-git remote add origin git@github.com:me/myproject-ai-overlay.git
+git remote add origin git@github.com:me/rd-myproject.git
 git push -u origin main
 ```
 
@@ -112,7 +118,7 @@ ls .claude/settings.json .claude/rules/rd-workflow WORKING_WITH_AI.md .gitignore
 
 # submodule 이 등록되고 소스가 체크아웃되었는가
 git submodule status
-ls <소스디렉토리>
+ls myproject
 
 # 런타임 로그가 추적 대상으로 잡히지 않는가 (배포 .gitignore 가 적용되는지)
 git status --short
@@ -140,24 +146,24 @@ lite 배포본의 `setup_with_claude.md` 에는 「full 배포본만」 표시�
 <a id="project-context"></a>
 ## PROJECT_CONTEXT 규약 추가
 
-`<소스디렉토리>`를 자기 값으로 바꿔 아래 블록을 `PROJECT_CONTEXT.md`에 붙여 넣는다.
+`myproject`를 팀 저장소 이름으로 바꿔 아래 블록을 `PROJECT_CONTEXT.md`에 붙여 넣는다.
 
 ```markdown
 ## Code Root
 
-코드 본체는 이 저장소가 아니라 `<소스디렉토리>/` submodule 안에 있습니다.
+코드 본체는 이 저장소가 아니라 `myproject/` submodule 안에 있습니다.
 
 - **문서·spec·plan·review 의 코드 경로는 overlay 루트 기준**으로 씁니다 —
-  `<소스디렉토리>/src/...`. 접두어를 빠뜨리면 실재하지 않는 경로가 됩니다.
-- **패키지 매니저·빌드·테스트 명령은 `<소스디렉토리>/` 안에서 실행**합니다.
+  `myproject/src/...`. 접두어를 빠뜨리면 실재하지 않는 경로가 됩니다.
+- **패키지 매니저·빌드·테스트 명령은 `myproject/` 안에서 실행**합니다.
 
 ## 팀 공유 영역
 
-`<소스디렉토리>/` 는 팀 저장소입니다. **여기 커밋하는 것은 전부 팀원에게 전파됩니다.**
+`myproject/` 는 팀 저장소입니다. **여기 커밋하는 것은 전부 팀원에게 전파됩니다.**
 
 - 이 안의 `.gitignore` 는 팀 전체에 영향을 주므로 개인 사정으로 고치지 않습니다.
   개인 파일을 감춰야 하면 소스 저장소의 로컬 exclude 를 씁니다:
-  `cd <소스디렉토리> && "$EDITOR" "$(git rev-parse --git-path info/exclude)"`
+  `cd myproject && "$EDITOR" "$(git rev-parse --git-path info/exclude)"`
 - AI 워크플로 산출물은 overlay 루트에만 둡니다.
 ```
 
@@ -166,8 +172,8 @@ lite 배포본의 `setup_with_claude.md` 에는 「full 배포본만」 표시�
 ## 다른 컴퓨터에서 설정
 
 ```bash
-git clone --recurse-submodules git@github.com:me/myproject-ai-overlay.git ~/ai-overlays/myproject
-cd ~/ai-overlays/myproject
+git clone --recurse-submodules git@github.com:me/rd-myproject.git ~/work/rd-myproject
+cd ~/work/rd-myproject
 
 # --recurse-submodules 를 빠뜨렸다면
 git submodule update --init
@@ -189,7 +195,7 @@ clone 직후 소스는 detached HEAD 상태다. 브랜치를 붙이는 방법은
 
 ### 2. gitlink 변경
 
-소스에서 커밋하거나 브랜치를 바꾸면 overlay의 `git status`에 `modified: <소스디렉토리> (new commits)` 한 줄이 잡힌다. 파일 내용이 아니라 **기록된 리비전 포인터**의 변경이다. 세 가지 중 하나를 선택한다 — 기록한다(overlay에서 커밋) / 되돌린다(`git submodule update`) / 무시한다(overlay 커밋에 포함하지 않는다).
+소스에서 커밋하거나 브랜치를 바꾸면 overlay의 `git status`에 `modified: myproject (new commits)` 한 줄이 잡힌다. 파일 내용이 아니라 **기록된 리비전 포인터**의 변경이다. 세 가지 중 하나를 선택한다 — 기록한다(overlay에서 커밋) / 되돌린다(`git submodule update`) / 무시한다(overlay 커밋에 포함하지 않는다).
 
 ### 3. `submodule.recurse` 켜고 끔
 
@@ -211,14 +217,14 @@ git checkout --no-recurse-submodules <브랜치>
 
 ### 4. 소스에 미커밋 작업이 있을 때
 
-recurse가 꺼져 있으면 overlay 브랜치 전환은 소스를 건드리지 않는다. 켜져 있거나 `git submodule update`를 실행하면 체크아웃이 시도되고, 충돌하면 git이 거부한다. **update 전에 소스에서 커밋하거나 stash**하고, 실패했으면 `git -C <소스디렉토리> status`로 상태를 확인한다.
+recurse가 꺼져 있으면 overlay 브랜치 전환은 소스를 건드리지 않는다. 켜져 있거나 `git submodule update`를 실행하면 체크아웃이 시도되고, 충돌하면 git이 거부한다. **update 전에 소스에서 커밋하거나 stash**하고, 실패했으면 `git -C myproject status`로 상태를 확인한다.
 
 ### 5. 재귀 clone·update 뒤 detached HEAD 와 작업 브랜치 선택
 
 `git clone --recurse-submodules`나 `git submodule update` 직후 소스는 **detached HEAD**다. 그대로 커밋하면 브랜치에 붙지 않아 잃기 쉽다.
 
 ```bash
-cd <소스디렉토리>
+cd myproject
 git status                    # HEAD detached at <해시>
 LC_ALL=C git remote show origin | sed -n 's/.*HEAD branch: *//p'   # 참고용 — 팀 저장소 기본 브랜치
 git switch <브랜치>            # 자신이 작업할 브랜치로 (기본 브랜치가 아니어도 무방하다)

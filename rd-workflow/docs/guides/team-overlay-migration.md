@@ -8,6 +8,7 @@ git submodule 기반 overlay 구조로 이관하는 절차.
 - 팀 프로젝트에 이미 `rd-workflow/`, `CLAUDE.md` 등이 커밋되어 있다
 - 또는 구 버전 가이드로 symlink overlay(`ai` 심링크, 로컬 exclude 설정, `skip-worktree`)를 이미 설치했다
 - 이 상태를 [신규 설치 가이드의 구조](team-overlay-fresh-install.md#structure)와 같은 submodule 구조로 옮기고 싶다
+- 또는 rd-workflow 가 없는 기존 팀 저장소 클론을, 새로 clone 하지 않고 그대로 overlay 아래로 옮겨 쓰고 싶다 (브랜치·stash·미커밋 작업을 유지하려는 경우) → 아래 [rd-workflow 가 없는 기존 클론](#plain-clone) 절
 
 새 프로젝트에 처음부터 overlay를 설치하는 경우는 이 가이드가 아니라 [신규 설치 가이드](team-overlay-fresh-install.md)를 씁니다.
 
@@ -16,6 +17,39 @@ git submodule 기반 overlay 구조로 이관하는 절차.
 이관이 끝나면 [신규 설치 가이드의 구조](team-overlay-fresh-install.md#structure)와
 같은 형태가 됩니다. 먼저 그 절을 읽어 최종 형태를 확인하십시오.
 
+예: 지금 쓰던 클론이 `~/work/myproject` 이면, 이관 뒤에는 `~/work/rd-myproject/` 가 overlay 루트가 되고
+기존 클론은 `~/work/rd-myproject/myproject/` 로 옮겨져 submodule 로 등록됩니다. 다시 clone 하지 않습니다.
+
+## 실행 위치
+
+5단계가 기존 클론 폴더 자체를 옮깁니다. 그래서 **기존 클론(`~/work/myproject`) 안에서 띄운 AI 세션이나 셸에서
+진행하지 않습니다.** 그 세션의 작업 폴더가 사라집니다.
+
+- 상위 폴더(예: `~/work`)에서 띄운 세션이나 셸에서 진행합니다.
+- 끝나면 overlay 루트(`~/work/rd-myproject`)에서 새 세션을 띄웁니다. 그래야 overlay 의 `CLAUDE.md`·`.claude/` 가 로드됩니다.
+
+<a id="plain-clone"></a>
+
+## rd-workflow 가 없는 기존 클론
+
+팀 저장소에 rd-workflow 를 설치한 적이 없으면 정리할 개인 내용이 없습니다. 1~4단계와 6단계를 건너뛰고 다음 순서로 진행합니다.
+
+1. **0단계 A (저장소 사전 검사)** 를 그대로 실행합니다.
+2. rd-workflow 흔적이 없는지 확인합니다. 하나라도 있으면 이 절이 아니라 0단계부터 전체 절차를 따릅니다.
+
+   ```bash
+   cd "$SRC"
+   for p in rd-workflow rd-workflow-workspace ai; do
+     [ ! -e "$p" ] && [ ! -L "$p" ] || { echo "중단: $p 가 있습니다 — 전체 절차(0단계 A-2 부터)를 따르십시오"; exit 1; }
+   done
+   echo "rd-workflow 흔적 없음"
+   ```
+
+   팀이 커밋한 `CLAUDE.md`·`.claude/` 는 팀 파일이므로 그대로 둡니다. submodule 안에 남고, overlay 루트에는 배포본의 것이 따로 들어갑니다.
+3. **5단계 (편입)** 를 그대로 실행합니다. 기존 클론이 `$DEST` 로 옮겨지고 submodule 로 등록됩니다.
+4. [신규 설치 가이드](team-overlay-fresh-install.md)의 **2단계(배포본 배치)·4단계(.gitignore)·5단계(첫 커밋과 push)** 를 overlay 루트에서 실행합니다. 정리할 개인 내용이 없으므로 배포본을 통째로 복사해도 됩니다.
+5. 아래 [검증 체크리스트](#검증-체크리스트) 중 submodule 항목(`git submodule status`, `branch`·`stash list`·`status` 가 이관 전과 같음)을 확인합니다.
+
 ## 0단계: 분류와 사전 검사 [읽기 전용 — 미지원 판정과 목록 확정]
 
 **이 단계는 아무것도 바꾸지 않습니다. 지원하지 않는 형태인지도 여기서 판정합니다.**
@@ -23,9 +57,9 @@ git submodule 기반 overlay 구조로 이관하는 절차.
 ### A. 저장소 사전 검사
 
 ```bash
-SRC=/path/to/team-project
-OVERLAY=~/ai-overlays/myproject
-DEST="$OVERLAY/<소스디렉토리>"
+SRC=~/work/myproject          # 지금 쓰던 팀 저장소 체크아웃
+OVERLAY=~/work/rd-myproject
+DEST="$OVERLAY/myproject"
 
 cd "$SRC"
 [ "$(git rev-parse --show-toplevel)" = "$(pwd -P)" ] || { echo "중단: 저장소 루트에서 실행하십시오"; exit 1; }
@@ -533,7 +567,7 @@ git stash list
 mv "$SRC" "$DEST"
 cd "$OVERLAY"
 git init -b main        # 구 overlay 를 재사용하면 생략
-git submodule add git@github.com:team/project.git <소스디렉토리>
+git submodule add git@github.com:team/myproject.git myproject
 ```
 
 | 미지원 형태 | 이유 | 대안 |
@@ -737,16 +771,16 @@ fi
 
 ## 검증 체크리스트
 
-- [ ] `ls -la <소스디렉토리>` → overlay 심링크가 없다 (`ai` 포함)
+- [ ] `ls -la myproject` → overlay 심링크가 없다 (`ai` 포함)
 - [ ] 0단계 B 의 `SKIP_FILES` 목록에 있던 파일의 bit 가 해제되어 있다
 - [ ] 그 목록에 없던 `skip-worktree`·sparse checkout 설정은 그대로 있다
-- [ ] `( cd <소스디렉토리> && cat "$(git rev-parse --git-path info/exclude)" )` → overlay 항목이 없고 내가 넣었던 다른 항목은 남아 있다
-- [ ] `( cd <소스디렉토리> && HOOKS=$(git rev-parse --git-path hooks); grep -c overlay-branch-sync "$HOOKS"/post-checkout "$HOOKS"/post-merge )` → 0 (또는 파일 부재)
+- [ ] `( cd myproject && cat "$(git rev-parse --git-path info/exclude)" )` → overlay 항목이 없고 내가 넣었던 다른 항목은 남아 있다
+- [ ] `( cd myproject && HOOKS=$(git rev-parse --git-path hooks); grep -c overlay-branch-sync "$HOOKS"/post-checkout "$HOOKS"/post-merge )` → 0 (또는 파일 부재)
 - [ ] 같은 hook 파일의 다른 도구(husky 등) 내용이 보존되어 있고 **실제로 동작한다**
-- [ ] A-정리한 경로가 팀 repo 의 **HEAD 에서도** 사라졌다 (`git -C <소스디렉토리> ls-tree -r --name-only HEAD -- <경로>` 가 **성공하고 출력이 비어 있다**. `cat-file -e` 는 부재도 조회 오류도 exit 128 이라 쓰지 않는다 — 4-1 의 각주 참조)
-- [ ] `git submodule status` → `<소스디렉토리>` 가 리비전과 함께 표시된다
-- [ ] `git -C <소스디렉토리> branch` / `stash list` → 이관 전 목록과 같다
-- [ ] `git -C <소스디렉토리> status --porcelain` / `--ignored --porcelain` → 이관 전 목록과 같다
+- [ ] A-정리한 경로가 팀 repo 의 **HEAD 에서도** 사라졌다 (`git -C myproject ls-tree -r --name-only HEAD -- <경로>` 가 **성공하고 출력이 비어 있다**. `cat-file -e` 는 부재도 조회 오류도 exit 128 이라 쓰지 않는다 — 4-1 의 각주 참조)
+- [ ] `git submodule status` → `myproject` 가 리비전과 함께 표시된다
+- [ ] `git -C myproject branch` / `stash list` → 이관 전 목록과 같다
+- [ ] `git -C myproject status --porcelain` / `--ignored --porcelain` → 이관 전 목록과 같다
 - [ ] overlay 의 개인 문서(`PROJECT_CONTEXT.md`·`CLAUDE.md`·`rd-workflow-workspace/`) **내용**이 이관 전과 같다
 - [ ] overlay 에 심링크가 하나도 복사되지 않았다 (`find . -maxdepth 2 -type l`)
 - [ ] `.claude/settings.json`·`.claude/rules/rd-workflow/`·`WORKING_WITH_AI.md` 가 있다

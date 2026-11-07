@@ -10,6 +10,10 @@ REQUEST → 리뷰 → spec/plan → 실행 → 검증 → 최종 리뷰까지, 
 
 최근 세 발행에서 달라진 것입니다. 내 프로젝트의 `rd-workflow/VERSION` 보다 뒤의 절이 `/tpl update` 로 받을 변화입니다. 전체 이력은 [`rd-workflow/CHANGELOG.md`](rd-workflow/CHANGELOG.md) 에 있습니다.
 
+### 2026-11-07-210251
+
+- **팀 overlay 가이드**: rd-workflow 가 없는 기존 팀 저장소 클론을 새로 clone 하지 않고 overlay 아래로 옮겨 submodule 로 등록하는 짧은 경로를 이관 가이드에 더했습니다(브랜치·stash·미커밋 작업 유지). 예시 이름을 overlay `rd-myproject` 아래 submodule `myproject` 로 맞추고, 기존 클론 안의 세션에서 진행하지 말고 끝나면 overlay 루트에서 새 세션을 띄우라는 실행 위치 안내를 넣었습니다.
+
 ### 2026-11-07-201215
 
 - 이 변경 이력(`rd-workflow/CHANGELOG.md`)을 새로 두었습니다. 배포 README 첫 화면에 최근 세 발행의 변화가 나옵니다.
@@ -59,22 +63,6 @@ REQUEST → 리뷰 → spec/plan → 실행 → 검증 → 최종 리뷰까지, 
 - **병렬 발행 충돌**: `archive.sh` 가 `verify-evidence` 충돌을 자동으로 풉니다.
 - **세션 기동 대기**: promote 가 기동이 느린 세션에도 시작 프롬프트를 전달합니다(`RD_LAUNCH_START_TIMEOUT` 기본 60초). autopilot 이 승격한 자식 세션에 autopilot 지시를 넘깁니다.
 - **FR 인덱스 칸**: 맨 앞에 칸을 더한 FR 인덱스에서도 `/fr add` 등록 커밋이 성공합니다.
-
-### 2026-11-01-202303
-
-2026-10-27-004054 이후의 변화입니다.
-
-- **`promote.sh --handoff <file>`**: 호출 세션이 확정한 결정을 기동 전에 worktree 의 `handoff.md` 로 넘깁니다.
-- **미커밋 문서 이관**: promote 가 호출한 체크아웃에 남은 이 작업의 REQUEST·spec·plan·리뷰 세션을 fr 브랜치로 옮깁니다.
-- **지연 정리**: 작업 worktree 안에서 `archive.sh` 를 불러도 됩니다. 남은 worktree·브랜치는 기본 체크아웃의 `rd task list` 가 안전할 때 지웁니다.
-- **seal 의 검증 증거**: `rd review seal` 이 `verify_record.sh` 로 남긴 새 검증 증거를 요구합니다.
-- **리뷰 응답 언어**: `workflow.json` 의 `review_response_language` 로 리뷰 턴 언어를 정합니다(기본 한국어). seal 거부 때 사유별 복구 안내가 나옵니다.
-- **리뷰 어댑터 실패 진단**: 원인(로그 끝 오류 줄)과 세션 안전성을 따로 보입니다. 설정을 영구히 바꾸라고 안내하지 않습니다.
-- **리뷰 턴 중단**: `run_review_turn.sh` 가 신호를 받으면 어댑터를 정리하고 128+n 으로 끝납니다. codex 가 TERM 을 무시해도 리뷰 턴이 멈추지 않습니다.
-- **Status 전이**: 리뷰 종결 뒤에도 Status `구현 중`·`검증 중` 이면 커밋을 허용합니다. `아카이브 보류 → 검증 중` 전이가 생겼습니다. spec/plan 구간에 `구현 대기` 단계가 보입니다.
-- **archive 자동 해소**: 병합 충돌이 `stage_metrics.tsv`·`FUTURE_REQUESTS.md`·`CURRENT_TASK.md` 안에만 있으면 자동으로 풉니다.
-- **무인 실행 시간 상한**(full): `autopilot_headless.sh` 1회 호출에 기본 240분 상한이 있습니다(`RD_FR_WALL_MINUTES`). 무인 재개가 진행 중인 fr worktree 를 찾습니다.
-- **압축 뒤 autopilot**: 컨텍스트 압축 뒤 SessionStart 훅이 autopilot 규칙을 다시 읽으라고 안내합니다.
 
 ## 전제 조건
 
