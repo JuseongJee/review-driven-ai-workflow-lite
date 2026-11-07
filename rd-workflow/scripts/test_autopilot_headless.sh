@@ -73,7 +73,7 @@ if [[ $? == 40 ]]; then echo "  PASS: 부재 outcome → 40"; else echo "  FAIL:
 
 # 무인 경로의 세션 기동 억제 — wrapper 가 RD_CHILD_SESSION 을 자식에게 넘기는지 본다.
 # 이것이 없으면 HERDR_ENV=1 환경에서 promote.sh 가 FR 마다 herdr 탭을 띄워 무인 완주가
-# 깨진다(2026-09-24 /fr batch 회귀). 변수가 비어 있는 상태로 wrapper 를 부른 뒤,
+# 깨진다(2026-09-24 옛 /fr batch 회귀). 변수가 비어 있는 상태로 wrapper 를 부른 뒤,
 # wrapper 가 만든 환경에서 값이 보이는지 확인한다.
 # 자식 프로세스가 실제로 값을 받는지 재야 하므로, claude 를 대역으로 세워 그 안에서
 # 본 값을 파일에 적게 한다. NO_INVOKE 경로는 claude 를 부르지 않아 이 기전을 못 본다.

@@ -777,7 +777,7 @@ autopilot_skill_lifecycle_check() {
 
 # 무인 진입 계약 정합: SKILL.md 무인 섹션 마커 + wrapper 존재.
 autopilot_headless_entry_check() {
-  # 배포 사본은 필수, _ROOT_FILES 정본은 설치본에 없는 것이 정상이라 선택이다 (batch 루프도 동일).
+  # 배포 사본은 필수, _ROOT_FILES 정본은 설치본에 없는 것이 정상이라 선택이다.
   local rc=0 skill skill_root="${SCRIPT_DIR}/../claude_skills/autopilot/SKILL.md"
   [[ -f "$skill_root" ]] || { echo "  $skill_root: 필수 파일 부재" >&2; rc=1; }
   for skill in \
@@ -801,18 +801,6 @@ autopilot_headless_entry_check() {
     # 테스트로는 잡히지 않아 앵커로 고정한다.
     grep -q '세션 기동 결과' "$skill"              || { echo "  $skill: promote 직후 launch 결과 처리 절 미존재" >&2; rc=1; }
     grep -q 'resolve-launch' "$skill"              || { echo "  $skill: launch unknown 확정(resolve-launch) 지시 미존재" >&2; rc=1; }
-  done
-  # batch 국면 2 의 exit 40 복구 경로 — 진행 상태·사용자 안내 보존의 핵심이라 앵커로 고정한다.
-  # 배포 사본은 필수, _ROOT_FILES 정본은 설치본에 없는 것이 정상이라 선택이다.
-  # 둘 다 선택으로 두면 배포 사본이 통째로 사라져도 0건 검사로 통과한다.
-  local batch batch_root="${SCRIPT_DIR}/../claude_skills/fr/batch.md"
-  [[ -f "$batch_root" ]] || { echo "  $batch_root: 필수 파일 부재" >&2; rc=1; }
-  for batch in \
-    "$batch_root" \
-    "${SCRIPT_DIR}/../../_ROOT_FILES/rd-workflow/claude_skills/fr/batch.md"; do
-    [[ -f "$batch" ]] || continue
-    grep -q '재개 지점을 정리' "$batch" || { echo "  $batch: exit 40 재개 지점 정리 절차 미존재" >&2; rc=1; }
-    grep -q 'USER_ACTION' "$batch"      || { echo "  $batch: 사용자 인계(USER_ACTION) 갱신 지시 미존재" >&2; rc=1; }
   done
   local wrapper="${SCRIPT_DIR}/autopilot_headless.sh"
   [[ -f "$wrapper" ]] || { echo "  autopilot_headless.sh 부재" >&2; rc=1; }
@@ -1673,13 +1661,14 @@ run_step lifecycle consumer "FR 등록 helper 격리 테스트 (test_fr_register
 run_step lifecycle consumer "미병합 브랜치 backlog 대조 (test_fr_backlog_scan.sh)" bash "${SCRIPT_DIR}/test_fr_backlog_scan.sh"
 run_step lifecycle consumer "인덱스 행 집합 병합 (test_merge_fr_index.sh)" bash "${SCRIPT_DIR}/lifecycle/test_merge_fr_index.sh"
 run_step lifecycle consumer "시작 계약 preflight (test_start_preflight.sh)" bash "${SCRIPT_DIR}/lifecycle/test_start_preflight.sh"
-run_step lifecycle consumer "archive 발행 상태 판정 (test_archive_state.sh)" bash "${SCRIPT_DIR}/batch/test_archive_state.sh"
+run_step lifecycle consumer "후속 FR 등록 확인 (test_followup_check.sh)" bash "${SCRIPT_DIR}/lifecycle/test_followup_check.sh"
 run_step lifecycle consumer "lifecycle 통합 테스트 (test_integration.sh)" bash "${SCRIPT_DIR}/lifecycle/test_integration.sh"
 run_step review consumer "review 대기 계약 테스트 (test_review_wait.sh)" bash "${SCRIPT_DIR}/test_review_wait.sh"
 run_step review consumer "watchdog 계약·이식성 probe (test_watchdog_portability.sh)" bash "${SCRIPT_DIR}/test_watchdog_portability.sh"
 run_step skills consumer "ralph_drain supervisor 테스트 (test_ralph_drain.sh)" bash "${SCRIPT_DIR}/test_ralph_drain.sh"
-run_step skills consumer "batch_manifest 헬퍼 테스트 (batch/test_batch_manifest.sh)" bash "${SCRIPT_DIR}/batch/test_batch_manifest.sh"
-run_step skills consumer "무인 실행 결과 해석 헬퍼 테스트 (batch/test_headless_result.sh)" bash "${SCRIPT_DIR}/batch/test_headless_result.sh"
+run_step skills consumer "/fr do 줄기 고르기 테스트 (fr_do/test_pick.sh)" bash "${SCRIPT_DIR}/fr_do/test_pick.sh"
+run_step skills consumer "/fr do 지휘 스크립트 테스트 (fr_do/test_stream_ops.sh)" bash "${SCRIPT_DIR}/fr_do/test_stream_ops.sh"
+run_step skills consumer "/fr batch 별칭 이관 안내 테스트 (fr_do/test_batch_legacy.sh)" bash "${SCRIPT_DIR}/fr_do/test_batch_legacy.sh"
 run_step skills consumer "blocked status 어휘 일관성 (test_fr_blocked_status.sh)" bash "${SCRIPT_DIR}/test_fr_blocked_status.sh"
 run_step skills consumer "autopilot blocked 계약 회귀 (test_autopilot_blocked_contract.sh)" bash "${SCRIPT_DIR}/test_autopilot_blocked_contract.sh"
 run_step skills consumer "sync_template 타입 가드 테스트 (test_sync_template.sh)" bash "${SCRIPT_DIR}/test_sync_template.sh"
@@ -1721,7 +1710,7 @@ run_step skills dev-only "무인 진입 계약 정합 (autopilot_headless_entry_
 run_step skills consumer "skill 호출 권한 판정표 (설치본)" skill_invocation_authority_check
 run_step skills dev-only "skill 호출 권한 판정표 (정본)" skill_invocation_canon_check
 run_step skills consumer "무인 wrapper 매핑 테스트 (test_autopilot_headless.sh)" bash "${SCRIPT_DIR}/test_autopilot_headless.sh"
-run_step skills consumer "재개 후보 helper 테스트 (test_resume_candidates.sh)" bash "${SCRIPT_DIR}/batch/test_resume_candidates.sh"
+run_step skills consumer "재개 후보 helper 테스트 (test_resume_candidates.sh)" bash "${SCRIPT_DIR}/test_resume_candidates.sh"
 run_step skills consumer "무인 wrapper 경과 시간 상한 테스트 (test_autopilot_headless_timecap.sh)" bash "${SCRIPT_DIR}/test_autopilot_headless_timecap.sh"
 # dev-only 인 이유: 점검 대상에 `scripts/` 가 있고 배포본에는 그 디렉터리가 없다.
 # 루트는 `_hook_repo_root` 로 구한다 — `SELFTEST_ROOT` 는 정본 레이아웃에서

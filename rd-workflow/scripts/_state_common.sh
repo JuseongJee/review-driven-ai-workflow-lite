@@ -1158,7 +1158,7 @@ state_stage_metrics_report() {
     printf '기록 없음 — %s\n' "$f"
     return 0
   fi
-  awk -F'\t' -v target="$target" -v now="$now" '
+  LC_ALL=C awk -F'\t' -v target="$target" -v now="$now" '
     /^#/ { next }
     # epoch 컬럼이 잘린 행(NF==3)을 통째로
     # 버리면 그 행이 나타내는 종료/전이 자체가 없었던 것처럼 처리돼, 이미 종료된

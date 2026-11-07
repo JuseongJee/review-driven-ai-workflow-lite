@@ -232,6 +232,26 @@ else
 $b7_out"
 fi
 
+# macOS awk 는 en_US.UTF-8 에서 한글끼리 == 를 strcoll 로 비교한다 — 마지막 상태 `검증 중` 을 `대기 중` 으로 보아
+# 열린 회차를 「종료됨」으로 닫고 `검증 중` 줄을 지운다. 상태 이름 비교가 로캘과 무관해야 한다.
+if LC_ALL=en_US.UTF-8 awk 'BEGIN{exit !("상세"=="제목")}' 2>/dev/null; then
+  BEN="$TMPROOT/ben.tsv"
+  cat > "$BEN" <<'EOF'
+# short_title	from_status	to_status	epoch
+smoke	대기 중	구현 중	1000
+smoke	구현 중	검증 중	1600
+EOF
+  ben_out="$(LC_ALL=en_US.UTF-8 state_stage_metrics_report "smoke" "$BEN" 2000)"
+  if [[ "$ben_out" == "회차: smoke (진행 중)"* && "$ben_out" == *$'\n  구현 중: 1회, 총 10분'* && "$ben_out" == *$'\n  검증 중: 1회, 진행 중 6분(잠정)'* ]]; then
+    pass "en_US.UTF-8 에서 서로 다른 상태를 다른 줄로 집계"
+  else
+    fail "en_US.UTF-8 에서 서로 다른 상태를 다른 줄로 집계 — 출력:
+$ben_out"
+  fi
+else
+  echo "skip: en_US.UTF-8 에서 한글 collation 결함이 재현되지 않음"
+fi
+
 B8="$TMPROOT/b8.tsv"
 cat > "$B8" <<'EOF'
 # short_title	from_status	to_status	epoch

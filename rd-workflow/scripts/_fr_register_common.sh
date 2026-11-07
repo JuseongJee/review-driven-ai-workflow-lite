@@ -51,7 +51,7 @@ _frr_rows_for() { # <file|-> <slug>
   local data f
   data="$(cat "$1")"
   f="$(printf '%s\n' "$data" | index_title_field -)" || return 4
-  printf '%s\n' "$data" | awk -v s="$2" -v f="$f" '
+  printf '%s\n' "$data" | LC_ALL=C awk -v s="$2" -v f="$f" '
     /^\|/ { l = $0; gsub(/\\\|/, "\001", l); n = split(l, a, "|")
       if (!seen) { c = a[f]; gsub(/^[ \t]+|[ \t]+$/, "", c); if (c == "제목") seen = 1; next }
       t = a[f]; gsub(/^[ \t]+|[ \t]+$/, "", t)

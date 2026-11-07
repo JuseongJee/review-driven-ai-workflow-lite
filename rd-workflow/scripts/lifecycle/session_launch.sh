@@ -18,7 +18,7 @@ session_launch_command() {  # <worktree-path> <slug> [<model>]
 session_launch_status_hint() {  # <launch> [<slug>]
   case "$1" in
     ok)      printf '이 세션은 여기서 멈춥니다 — 이후 단계는 기동된 작업 세션(%s)이 진행합니다.\n' "${2:-<slug>}" ;;
-    failed)  printf '자식 세션이 없습니다 — 이 세션이 이어서 진행하거나 위 명령으로 세션을 여십시오.\n' ;;
+    failed)  printf '자식 세션이 없습니다 — 이 세션이 이어서 진행하거나 위 명령으로 세션을 여십시오. 손으로 띄웠다면 띄운 뒤 bash rd-workflow/scripts/rd task resolve-launch %s 로 기록하십시오.\n' "${2:-<slug>}" ;;
     unknown) printf '호출 세션도 이어받지 않습니다 — 확인: bash rd-workflow/scripts/rd task resolve-launch %s\n' "${2:-<slug>}" ;;
     *)       printf '자식 세션이 없습니다 — 이 세션이 이어서 진행하거나 위 명령으로 세션을 여십시오.\n' ;;
   esac

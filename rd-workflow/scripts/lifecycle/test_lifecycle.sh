@@ -2784,7 +2784,7 @@ bash "$REPO/rd-workflow/scripts/lifecycle/promote.sh" --short-title beta --size 
 # 물리 디렉터리를 통째로 지우므로(자기 시나리오상 의도된 것), 그 뒤에는 이 경로에
 # 더 이상 쓸 수 없다 — 커밋해 두면 물리 디렉터리가 사라져도 fr/beta ref 의 이력에는
 # 남는다(뒤에서 git show 로 읽는다).
-sed -i 's/^status=.*/status=검증 중/' "$REPO/.worktrees/beta/rd-workflow-workspace/.lifecycle/task-state"
+sed -i.bak 's/^status=.*/status=검증 중/' "$REPO/.worktrees/beta/rd-workflow-workspace/.lifecycle/task-state" && rm -f "$REPO/.worktrees/beta/rd-workflow-workspace/.lifecycle/task-state.bak"
 printf 'review-session=zzz\n' >> "$REPO/.worktrees/beta/rd-workflow-workspace/.lifecycle/task-state"
 git -C "$REPO/.worktrees/beta" add rd-workflow-workspace/.lifecycle/task-state
 git -C "$REPO/.worktrees/beta" commit -q -m "progress: 검증 중"
@@ -2916,7 +2916,7 @@ fi
 #  기본 브랜치 자체의 task-state 를 구형 값으로 오염시켜 커밋한다(이 재설계에서
 #  promote 는 절대 이렇게 하지 않는다 — 이 테스트 전용 재현이다). 그 뒤 만드는
 #  fr/gamma 는 고유 커밋이 없으므로 그 오염값을 그대로 물려받는다.)
-sed -i 's/^short-title=.*/short-title=alpha/' "$REPO/rd-workflow-workspace/.lifecycle/task-state"
+sed -i.bak 's/^short-title=.*/short-title=alpha/' "$REPO/rd-workflow-workspace/.lifecycle/task-state" && rm -f "$REPO/rd-workflow-workspace/.lifecycle/task-state.bak"
 git -C "$REPO" add rd-workflow-workspace/.lifecycle/task-state
 git -C "$REPO" commit -q -m "구형 잔여 재현 (테스트 전용)"
 git -C "$REPO" branch fr/gamma main
@@ -3362,7 +3362,7 @@ fi
 # **기동하지 않는 것**까지 확인한다 — 값만 보면 회귀가 되살아나도 알 수 없다.
 git -C "$RBREPO" branch fr/oldtask main
 # 구형/유실 배치 재현 — 기본 worktree 의 task-state 가 활성 fr 을 가리킨다.
-sed -i 's|^fr-branch=.*|fr-branch=fr/oldtask|' "$RBREPO/rd-workflow-workspace/.lifecycle/task-state"
+sed -i.bak 's|^fr-branch=.*|fr-branch=fr/oldtask|' "$RBREPO/rd-workflow-workspace/.lifecycle/task-state" && rm -f "$RBREPO/rd-workflow-workspace/.lifecycle/task-state.bak"
 old_idx="$( cd "$RBREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get oldtask launch' 2>/dev/null || true )"
 if [[ -n "$old_idx" ]]; then
   fail "F1 근본 사전조건 실패 — oldtask 색인 행이 이미 있다: $old_idx"
@@ -3393,7 +3393,7 @@ else
     || fail "resolve-launch dead 출력에 거취 문구 없음: $_ae_out"
 fi
 # 기본 worktree 의 task-state 를 baseline 으로 되돌린다(이후 케이스 오염 방지).
-sed -i 's|^fr-branch=.*|fr-branch=null|' "$RBREPO/rd-workflow-workspace/.lifecycle/task-state"
+sed -i.bak 's|^fr-branch=.*|fr-branch=null|' "$RBREPO/rd-workflow-workspace/.lifecycle/task-state" && rm -f "$RBREPO/rd-workflow-workspace/.lifecycle/task-state.bak"
 
 # --- F6: rollback 이 살아 있는 세션과 미커밋 작업물을 보존한다 ---
 # 예전에는 보호가 거꾸로였다 — 생존이 **불확실할 때**(launching·unknown) 막고 생존이
@@ -3441,6 +3441,82 @@ if ( cd "$RBREPO" && env -u HERDR_ENV -u HC_TERMINAL_ID bash rd-workflow/scripts
   pass "F6: launch=ok 도 --force 로는 취소할 수 있다"
 else
   fail "F6: launch=ok 를 --force 로도 취소하지 못했다"
+fi
+
+# --- rollback 의 생존 보호 — failed 작업과 failed→ok 로 확정한 손 기동 세션 ---
+# 기동이 실패한 뒤 손으로 띄운 세션은 herdr 이름이 slug 가 아니라 이름 판정이 찾지 못한다.
+# cwd 관측으로 그 세션을 잡는다. 관측 경계(herdr·ps·lsof)는 PATH 앞 stub 으로 고정해
+# 이 맥의 실제 herdr·claude 프로세스를 보지 않는다. 「없음」 도 빈 ps stub 으로 고정한다.
+RBL_DIR="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패 (rollback 생존 보호)" >&2; exit 1; }
+[[ -n "$RBL_DIR" && -d "$RBL_DIR" ]] || { echo "test_lifecycle.sh: 임시 디렉터리 경로 검증 실패 (rollback 생존 보호)" >&2; exit 1; }
+_ast_cleanup+=("$RBL_DIR")
+RBL_P="$RBL_DIR/procs-bin"; RBL_H="$RBL_DIR/herdr-bin"; mkdir -p "$RBL_P" "$RBL_H"
+printf '#!/usr/bin/env bash\ncat "%s/ps.data"\n' "$RBL_P" > "$RBL_P/ps"
+printf '#!/usr/bin/env bash\ncat "%s/lsof.data"\n' "$RBL_P" > "$RBL_P/lsof"
+cat > "$RBL_H/herdr" <<STUBEOF
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "agent get") echo '{"error":{"code":"agent_not_found","message":"x"}}' >&2; exit 1 ;;
+  "agent list") echo '{"result":{"agents":[]}}' ;;
+  *) exit 1 ;;
+esac
+STUBEOF
+chmod +x "$RBL_P/ps" "$RBL_P/lsof" "$RBL_H/herdr"
+# rbl_procs <ps 출력> <lsof 출력> — claude 프로세스 관측 결과를 고정한다
+rbl_procs() { printf '%s' "$1" > "$RBL_P/ps.data"; printf '%s' "$2" > "$RBL_P/lsof.data"; }
+# rbl_mk <slug> — 작업을 만들고 기동 실패(launch=failed, backend=herdr)로 기록한다. stdout: worktree 경로
+rbl_mk() {
+  ( cd "$RBREPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title "$1" --size large --source-fr - ) >/dev/null 2>&1
+  ( cd "$RBREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_upsert "$1" launch=failed launch-backend=herdr; tasks_index_get "$1" worktree-path' _ "$1" )
+}
+rbl_kept() {  # <slug> <worktree> — worktree·브랜치가 모두 남았으면 0
+  [[ -d "$2" && -n "$(git -C "$RBREPO" rev-parse --verify --quiet "refs/heads/fr/$1")" ]]
+}
+rbl_gone() {  # <slug> <worktree> — worktree·브랜치가 모두 지워졌으면 0
+  [[ ! -d "$2" ]] && ! git -C "$RBREPO" rev-parse --verify --quiet "refs/heads/fr/$1" >/dev/null
+}
+
+# ① failed + 손 기동 세션 생존(herdr 밖 셸, claude 프로세스 cwd 일치) → 무변경 거부, --force 면 완주
+rbl_wt="$(rbl_mk rbflive)"
+rbl_procs $'4242 claude\n' "p4242"$'\n'"n$rbl_wt"$'\n'
+rbl_rc=0
+rbl_out="$( cd "$RBREPO" && env -u HERDR_ENV -u HC_TERMINAL_ID PATH="$RBL_P:$PATH" bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task rbflive 2>&1 )" || rbl_rc=$?
+[[ "$rbl_rc" -eq 1 && "$rbl_out" == *"--force"* ]] && rbl_kept rbflive "$rbl_wt" \
+  && pass "rollback failed: 살아 있으면 거부" \
+  || fail "rollback failed: 살아 있으면 거부 — rc=$rbl_rc wt=$([[ -d "$rbl_wt" ]] && echo 있음 || echo 없음): $rbl_out"
+rbl_rc=0
+rbl_out="$( cd "$RBREPO" && env -u HERDR_ENV -u HC_TERMINAL_ID PATH="$RBL_P:$PATH" bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task rbflive --force 2>&1 )" || rbl_rc=$?
+[[ "$rbl_rc" -eq 0 ]] && rbl_gone rbflive "$rbl_wt" \
+  && pass "rollback failed: 살아 있어도 --force 면 완주" \
+  || fail "rollback failed: 살아 있어도 --force 면 완주 — rc=$rbl_rc wt=$([[ -d "$rbl_wt" ]] && echo 있음 || echo 없음): $rbl_out"
+
+# ② failed + 관측된 세션 없음(herdr 없음, claude 프로세스 없음) → 지금처럼 완주
+rbl_wt="$(rbl_mk rbfnone)"
+rbl_procs '' ''
+rbl_rc=0
+rbl_out="$( cd "$RBREPO" && env -u HERDR_ENV -u HC_TERMINAL_ID PATH="$RBL_P:$PATH" bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task rbfnone 2>&1 )" || rbl_rc=$?
+[[ "$rbl_rc" -eq 0 ]] && rbl_gone rbfnone "$rbl_wt" \
+  && pass "rollback failed: 관측된 세션이 없으면 완주" \
+  || fail "rollback failed: 관측된 세션이 없으면 완주 — rc=$rbl_rc: $rbl_out"
+
+# ③ failed → resolve-launch 로 ok 확정 → rollback. 손 기동 세션은 이름 판정이 늘 dead 이므로
+#   ok 갈래도 cwd 판정을 해야 지우지 않는다. 두 명령 모두 같은 환경을 쓴다.
+rbl_wt="$(rbl_mk rbfchain)"
+rbl_procs $'4242 claude\n' "p4242"$'\n'"n$rbl_wt"$'\n'
+rbl_env=(env -u HC_TERMINAL_ID HERDR_ENV=1 PATH="$RBL_H:$RBL_P:$PATH")
+rbl_probe="$( cd "$RBREPO" && "${rbl_env[@]}" bash -c 'source rd-workflow/scripts/_task_common.sh >/dev/null 2>&1 || exit 9; session_probe rbfchain "$1" herdr' _ "$rbl_wt" 2>&1 )" || rbl_probe="rc!=0 $rbl_probe"
+rbl_rc=0
+rbl_rl="$( cd "$RBREPO" && "${rbl_env[@]}" bash rd-workflow/scripts/rd task resolve-launch rbfchain 2>&1 )" || rbl_rc=$?
+rbl_launch="$( cd "$RBREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get rbfchain launch' 2>/dev/null || true )"
+if [[ "$rbl_probe" != "dead" || "$rbl_rc" -ne 0 || "$rbl_launch" != "ok" ]]; then
+  fail "failed→resolve-launch ok→rollback: 손 기동 세션 보호 — 전제 불성립: probe=[$rbl_probe] resolve rc=$rbl_rc launch=$rbl_launch: $rbl_rl"
+else
+  rbl_rc=0
+  rbl_out="$( cd "$RBREPO" && "${rbl_env[@]}" bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task rbfchain 2>&1 )" || rbl_rc=$?
+  [[ "$rbl_rc" -eq 1 && "$rbl_out" == *"종료 뒤 재시도"* && "$rbl_out" == *"probe=alive — "* \
+     && "$rbl_out" != *"이 셸에서는 세션 생존을 확인할 수 없습니다"* ]] && rbl_kept rbfchain "$rbl_wt" \
+    && pass "failed→resolve-launch ok→rollback: 손 기동 세션 보호" \
+    || fail "failed→resolve-launch ok→rollback: 손 기동 세션 보호 — rc=$rbl_rc wt=$([[ -d "$rbl_wt" ]] && echo 있음 || echo 없음): $rbl_out"
 fi
 
 echo "== promote.sh 문서 이관 =="

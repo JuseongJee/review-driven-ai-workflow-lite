@@ -541,6 +541,8 @@ Required turn file sections:
 - Proposed Decision
 - Next Owner
 
+Optional section "## Reproduction": put the commands you ran and their output here, after Findings. Do not put them inside Findings; the script reads every list item in Findings as a finding.
+
 Findings format (a script checks it after your turn; violations are shown to the Author):
 - Start each finding with a head line "- F<number> [confidence <1-10>/10] <one-line title>". Continue numbering from the highest number in CHECKPOINT_FILE; reuse the same number when you revisit an issue.
 - Give every main finding at least one line "  - 근거: \`path:line\` — \`verbatim text\`". The path is relative to the project root. Copy the text exactly from within 3 lines of that line.
@@ -566,9 +568,9 @@ EOF
   } > "$output_file"
 }
 
-# 근거 경로를 프로젝트 안 일반 파일의 절대 경로로 푼다. 실패하면 1 을 반환한다.
-_rf_resolve_cite_path() {
-  local p="$1" root rootp full dirp
+# 근거 경로를 프로젝트 루트 기준 상대 경로로 정규화한다. 실패하면 1 을 반환한다.
+_rf_normalize_cite_path() {
+  local p="$1" root rootp
   root="${PROJECT_ROOT:-.}"
   rootp="$(cd "$root" 2>/dev/null && pwd -P)" || return 1
   while [[ "$p" == ./* ]]; do p="${p#./}"; done
@@ -584,6 +586,15 @@ _rf_resolve_cite_path() {
   [[ -n "$p" ]] || return 1
   # 앞의 ./ 만 정규화로 허용하고, 남은 .. · . · 빈 구성 요소는 정본 경로가 아니라 거부한다.
   case "/${p}/" in */../*|*/./*|*//*) return 1 ;; esac
+  printf '%s\n' "$p"
+}
+
+# 근거 경로를 프로젝트 안 일반 파일의 절대 경로로 푼다. 실패하면 1 을 반환한다.
+_rf_resolve_cite_path() {
+  local p root rootp full dirp
+  root="${PROJECT_ROOT:-.}"
+  rootp="$(cd "$root" 2>/dev/null && pwd -P)" || return 1
+  p="$(_rf_normalize_cite_path "$1")" || return 1
   full="${root}/${p}"
   [[ -f "$full" && ! -L "$full" ]] || return 1
   dirp="$(cd "$(dirname "$full")" 2>/dev/null && pwd -P)" || return 1
@@ -625,7 +636,21 @@ _rf_parse_findings() {
           q = substr(r, e + 2)
           sub(/^[ \t]*—[ \t]*/, "", q)
           q = trim(q)
-          if (length(q) >= 2 && substr(q, 1, 1) == "`" && substr(q, length(q), 1) == "`") q = substr(q, 2, length(q) - 2)
+          # 여는 백틱 열 길이 n 을 센다. 끝도 백틱이면 양끝에서 n 개씩 벗긴다(`` x `` 감싸기 포함).
+          # 끝이 백틱이 아니면 같은 길이의 닫는 백틱 열까지만 원문으로 보고 뒤의 설명은 버린다.
+          n = 0
+          while (substr(q, n + 1, 1) == "`") n++
+          if (n > 0 && length(q) > 2 * n && substr(q, length(q), 1) == "`") {
+            q = substr(q, n + 1, length(q) - 2 * n)
+          } else if (n > 0) {
+            body = substr(q, n + 1); tick = substr(q, 1, n); cut = 0; off = 0
+            while ((k = index(substr(body, off + 1), tick)) > 0) {
+              p = off + k
+              if (substr(body, p + n, 1) != "`" && (p == 1 || substr(body, p - 1, 1) != "`")) { cut = p; break }
+              off = p
+            }
+            if (cut > 0) q = substr(body, 1, cut - 1)
+          }
           q = trim(q)
         }
       }
@@ -639,6 +664,19 @@ _rf_check_impl() {
   local kind a b c
   local cur_id="" cur_sec="" cur_conf="-" cur_ncites=0
   local findings=0 main=0 appendix=0 cite_ok=0 violations=0 confs=""
+  local head_oid=""
+  # 리뷰 대상 커밋. Branch Context 에 full OID 가 있고 저장소에서 commit 으로 풀릴 때만 쓴다.
+  if [[ -f "${session_dir}/SESSION.md" ]]; then
+    head_oid="$(awk '
+      $0 == "## Branch Context" { f = 1; next }
+      f && /^## / { exit }
+      f && index($0, "- review-head-oid:") == 1 { sub(/^[^:]*:[ \t]*/, ""); sub(/[ \t]+$/, ""); print; exit }
+    ' "${session_dir}/SESSION.md")"
+    if ! [[ "$head_oid" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] \
+      || ! git -C "${PROJECT_ROOT:-.}" cat-file -e "${head_oid}^{commit}" 2>/dev/null; then
+      head_oid=""
+    fi
+  fi
 
   _rf_warn() { # _rf_warn <id> <code> <detail>
     violations=$((violations + 1))
@@ -696,19 +734,38 @@ _rf_check_impl() {
           _rf_warn "$cur_id" "cite-path" "근거 경로:줄 형식을 읽지 못했거나 줄 번호가 1 이상 정수가 아닙니다 (${ref})"
           continue
         fi
-        if ! full="$(_rf_resolve_cite_path "$cpath")"; then
+        # 대조 출처: 리뷰 대상 커밋(review-head-oid)의 파일과 작업 트리. 어느 한쪽 앞뒤 3줄에 원문이 있으면 통과한다.
+        # 리뷰어는 그 커밋을 읽고, 작업 트리는 검사 시점에 이미 달라졌을 수 있다. oid 가 없는 legacy 세션은 작업 트리만 읽는다.
+        local rel srcs=() src txt alt matched=0 inrange=0
+        full="$(_rf_resolve_cite_path "$cpath")" || full=""
+        if [[ -n "$head_oid" ]] && rel="$(_rf_normalize_cite_path "$cpath")" \
+          && [[ "$(git -C "${PROJECT_ROOT:-.}" cat-file -t "${head_oid}:${rel}" 2>/dev/null)" == blob ]] \
+          && txt="$(git -C "${PROJECT_ROOT:-.}" cat-file blob "${head_oid}:${rel}" 2>/dev/null && printf x)"; then
+          srcs+=("${txt%x}")
+        fi
+        # 명령 치환은 끝 개행을 모두 지운다. 끝 빈 줄도 줄 수에 들도록 표지 x 를 붙였다 뗀다.
+        if [[ -n "$full" ]] && txt="$(cat "$full" && printf x)"; then srcs+=("${txt%x}"); fi
+        if [[ "${#srcs[@]}" -eq 0 ]]; then
           _rf_warn "$cur_id" "cite-path" "근거 경로가 프로젝트 안 일반 파일이 아닙니다 (${ref})"
           continue
         fi
-        total="$(awk 'END{print NR}' "$full")"
-        if [[ "$cline" -gt "$total" ]]; then
-          _rf_warn "$cur_id" "cite-path" "줄 번호가 파일 줄 수 ${total} 를 넘습니다 (${ref})"
-          continue
-        fi
+        alt="$quote"
+        # 마크다운 안에서 원문 백틱을 \` 로 이스케이프한 인용도 원문으로 되돌려 대조한다.
+        [[ "$quote" != *'\`'* ]] || alt="${quote//\\\`/\`}"
         s=$((cline - 3)); [[ "$s" -ge 1 ]] || s=1
-        win="$(sed -n "${s},$((cline + 3))p" "$full")"
-        # 파이프 대신 문자열 포함 비교를 쓴다 — grep -q 가 먼저 끝나면 긴 줄을 쓰던 printf 가 SIGPIPE 로 죽어 pipefail 아래 거짓이 된다.
-        if [[ -n "$quote" && "$win" == *"$quote"* ]]; then
+        for src in "${srcs[@]}"; do
+          total="$(printf '%s' "$src" | awk 'END{print NR}')"
+          [[ "$cline" -le "$total" ]] || continue
+          inrange=1
+          win="$(printf '%s' "$src" | awk -v s="$s" -v e="$((cline + 3))" 'NR >= s && NR <= e')"
+          # 파이프 대신 문자열 포함 비교를 쓴다 — grep -q 가 먼저 끝나면 긴 줄을 쓰던 printf 가 SIGPIPE 로 죽어 pipefail 아래 거짓이 된다.
+          if [[ -n "$quote" ]] && [[ "$win" == *"$quote"* || "$win" == *"$alt"* ]]; then
+            matched=1; break
+          fi
+        done
+        if [[ "$inrange" -eq 0 ]]; then
+          _rf_warn "$cur_id" "cite-path" "줄 번호가 파일 줄 수 ${total} 를 넘습니다 (${ref})"
+        elif [[ "$matched" -eq 1 ]]; then
           cite_ok=$((cite_ok + 1))
         else
           _rf_warn "$cur_id" "cite-mismatch" "인용 원문이 $(basename "$cpath"):${cline} 앞뒤 3줄에 없습니다"

@@ -200,6 +200,69 @@ rd_review_input_check() {
 # worktree 정리 (spec 2.4 D15~D16) — submodule 을 품은 worktree 는 `git worktree remove` 가 거부한다.
 # ---------------------------------------------------------------------------
 
+# _rd_run_limited <초> <stderr 파일> <명령…> — 명령의 stdout 을 내고 종료 코드를 돌려줍니다.
+# <초> 안에 끝나지 않으면 TERM 을 보내고, 2초 유예 뒤에도 살아 있으면 KILL 합니다. 이때 124 를 돌려줍니다.
+# TERM 을 무시하는 실행(호출 셸의 `trap '' TERM` 상속)에서도 유한 시간에 돌아오게 하기 위해서입니다.
+# macOS 기본 환경에 timeout 명령이 없어 bash 로 감시합니다. 명령의 stdout 은 임시 파일로 받습니다 — 멈춘 명령의
+# 자식이 살아남아도 호출부 명령 치환의 파이프를 붙잡지 않게 합니다. 감시 프로세스의 출력도 /dev/null 입니다.
+_rd_run_limited() {
+  local lim="$1" errf="$2" pid wd rc=0 flag outf
+  shift 2
+  flag="$(mktemp "${TMPDIR:-/tmp}/rd-lim.XXXXXX")" || return 1
+  outf="$(mktemp "${TMPDIR:-/tmp}/rd-lim-out.XXXXXX")" || { rm -f "$flag"; return 1; }
+  "$@" >"$outf" 2>"$errf" &
+  pid=$!
+  ( sleep "$lim"
+    if kill -0 "$pid" 2>/dev/null; then
+      echo 1 > "$flag"; kill -TERM "$pid" 2>/dev/null
+      sleep 2
+      kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    fi ) >/dev/null 2>&1 &
+  wd=$!
+  wait "$pid" || rc=$?
+  kill "$wd" 2>/dev/null || true
+  [[ -s "$flag" ]] && rc=124
+  [[ "$rc" == 124 ]] || cat "$outf"
+  rm -f "$flag" "$outf"
+  return "$rc"
+}
+
+# _rd_unpushed_commits <repo> [표시 경로] — 원격 브랜치에도 원격 tag 에도 없는 커밋을 stdout 으로. 명령 실패는 return 1.
+# 원격 tracking ref 만 보면 원격에 push 한 tag 로만 닿는 커밋을 미push 로 셉니다. 그래서 후보가 있을 때만
+# 원격마다 `ls-remote --tags` 를 묻고, 로컬에 있는 tag 객체를 제외 기준에 더해 다시 셉니다.
+# ls-remote 가 실패한 원격(네트워크·인증)은 제외 기준에 넣지 않습니다 — 미push 로 남기는 안전한 쪽입니다.
+# 조회 시작과 실패 원인은 stderr 로 알립니다(stdout 은 판정 결과 전용). 전송 설정(core.sshCommand·GIT_SSH 등)은
+# 사용자 것을 그대로 쓰고, https 자격 증명 프롬프트만 끕니다.
+# 조회마다 대기 상한(RD_LSREMOTE_TIMEOUT 초, 기본 20)을 둡니다. 이 함수는 `rd task list` 의 공유 락 안에서도
+# 불리므로, 응답하지 않는 원격이 목록과 다른 작업의 promote·archive 를 붙잡지 않게 합니다. 초과는 조회 실패와 같습니다.
+_rd_unpushed_commits() {
+  local repo="$1" disp="${2:-$1}" out remote refs oid name err rc lim="${RD_LSREMOTE_TIMEOUT:-20}"
+  local -a excl=()
+  out="$(git -C "$repo" rev-list --all --not --remotes 2>/dev/null)" || return 1
+  [[ -n "$out" ]] || return 0
+  err="$(mktemp "${TMPDIR:-/tmp}/rd-lsr-err.XXXXXX")" || err=/dev/null
+  while IFS= read -r remote; do
+    [[ -n "$remote" ]] || continue
+    echo "submodule ${disp}: 원격 브랜치에 없는 커밋이 있어 원격 ${remote} 의 tag 를 조회합니다 (git ls-remote --tags, 최대 ${lim}초)" >&2
+    rc=0; refs="$(_rd_run_limited "$lim" "$err" env GIT_TERMINAL_PROMPT=0 git -C "$repo" ls-remote --tags "$remote")" || rc=$?
+    if [[ "$rc" != 0 ]]; then
+      if [[ "$rc" == 124 ]]; then
+        echo "submodule ${disp}: 원격 ${remote} tag 조회가 ${lim}초 안에 끝나지 않아 멈췄습니다 — 이 원격의 tag 는 push 근거로 쓰지 않습니다" >&2
+      else
+        echo "submodule ${disp}: 원격 ${remote} tag 조회 실패 — 이 원격의 tag 는 push 근거로 쓰지 않습니다 ($(head -1 "$err" 2>/dev/null))" >&2
+      fi
+      continue
+    fi
+    while IFS=$'\t' read -r oid name; do
+      [[ -n "$oid" ]] || continue
+      git -C "$repo" cat-file -e "${oid}^{commit}" 2>/dev/null && excl+=("$oid")
+    done <<<"$refs"
+  done < <(git -C "$repo" remote 2>/dev/null)
+  [[ "$err" == /dev/null ]] || rm -f "$err"
+  [[ "${#excl[@]}" -gt 0 ]] || { printf '%s\n' "$out"; return 0; }
+  git -C "$repo" rev-list --all --not --remotes "${excl[@]}" 2>/dev/null
+}
+
 # rd_submodule_tree_clean <path> [--require-pushed] — 최상위와 초기화된 모든 깊이의 submodule 을 검사한다.
 # 0: clean / 1: dirty — stdout 한 줄 `<원인>\t<경로>`, 원인 ∈ changes · unrecorded-commit · unpushed.
 # 판정 불가(명령 실패)도 1 이며 `changes` 로 보고한다.
@@ -231,7 +294,7 @@ rd_submodule_tree_clean() {
       rm -f "$list"; printf 'unrecorded-commit\t%s\n' "$disp"; return 1
     fi
     if [[ "$req" == "--require-pushed" ]]; then
-      if ! st="$(git -C "$repo" rev-list --all --not --remotes 2>/dev/null)"; then
+      if ! st="$(_rd_unpushed_commits "$repo" "$disp")"; then
         rm -f "$list"; printf 'changes\t%s\n' "$disp"; return 1
       fi
       if [[ -n "$st" ]]; then

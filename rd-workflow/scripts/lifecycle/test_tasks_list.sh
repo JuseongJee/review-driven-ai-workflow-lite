@@ -556,7 +556,31 @@ else
   [[ "$out" == *"진행 중인 작업이 없습니다"* ]] \
     && [[ "$after_baseline" == "$before_baseline" ]] \
     && pass "색인 0건 + 기본 브랜치는 baseline 을 대상 삼지 않는다 (AC 4)" || fail "AC4 baseline 보호"
+  # 거부 안내 — 원인(색인 경로·현재 브랜치)·새 작업 명령·빈 색인의 rm 안내
+  _ac4_idx="$(tasks_index_path)"
+  [[ "$out" == *"$_ac4_idx"* && "$out" == *"(main)"* && "$out" == *"promote.sh"* \
+     && "$out" == *"rm '$_ac4_idx'"* && "$out" != *"rd task list"* ]] \
+    && pass "no-fr 거부 안내: 빈 색인이면 색인 경로·원인·promote·rm 안내" || fail "no-fr 거부 안내(빈 색인): $out"
 fi
+# 정리 대기 행 1건 — rm 대신 rd task list 정리를 안내한다
+tasks_index_upsert ac4-pending state=cleanup-pending
+if out="$( cd "$REPO" && bash rd-workflow/scripts/rd task set-status "구현 중" 2>&1 )"; then
+  fail "정리 대기 행만 있는 기본 브랜치에서 전이가 성공했다"
+else
+  [[ "$out" == *"진행 중인 작업이 없습니다"* && "$out" == *"정리 대기 작업 1건"* \
+     && "$out" == *"rd task list"* && "$out" != *"rm '"* ]] \
+    && pass "no-fr 거부 안내: 정리 대기 행이 있으면 rd task list 안내(rm 안내 없음)" || fail "no-fr 거부 안내(정리 대기): $out"
+fi
+tasks_index_remove ac4-pending
+# detached HEAD — 브랜치 자리가 비지 않고 detached 로 나온다
+git -C "$REPO" update-ref --no-deref HEAD "$(git -C "$REPO" rev-parse HEAD)"
+if out="$( cd "$REPO" && bash rd-workflow/scripts/rd task set-status "구현 중" 2>&1 )"; then
+  fail "detached HEAD 에서 전이가 성공했다"
+else
+  [[ "$out" == *"진행 중인 작업이 없습니다"* && "$out" == *"(detached)"* ]] \
+    && pass "no-fr 거부 안내: detached HEAD 는 브랜치 자리에 detached" || fail "no-fr 거부 안내(detached): $out"
+fi
+git -C "$REPO" symbolic-ref HEAD refs/heads/main
 
 # ---------------------------------------------------------------------------
 # 정리 대기 행 지연 정리 (S1~S9) — 발행 증거가 있고 worktree 가 깨끗·비점유·미잠금일 때만

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # ralph_drain.sh — 무인 큐 드레인 supervisor (front-end A / Ralph loop).
+# `/fr do --headless` 의 엔진이기도 하다 (RD_RALPH_SLUGS 로 지정한 FR 목록만 처리).
 # autopilot_headless.sh 를 RD_AUTOPILOT_FR=auto 로 반복 호출해 준비된 큐(validated/ready-for-request)를
 # 사람 개입 없이 자율 소진한다. 오케스트레이션 지능은 넣지 않는다 — exit code 만 보고 계속/중단한다.
 #
@@ -8,6 +9,10 @@
 #   RD_RALPH_MAX_ITER          절대 iteration 상한 (기본 50)
 #   RD_RALPH_NONPROGRESS_LIMIT 연속 non-terminal(완료/blocked 미도달) 한도 (기본 5)
 #   RD_AUTOPILOT_COST_FILE    비용 기록 파일 경로 (선택). 있으면 모든 wrapper 호출에 넘기고 드레인 시작 이후 덧붙은 줄만 합산한다(비우지 않음). 없으면 임시 파일을 만든다
+#   RD_RALPH_SLUGS            공백 구분 short-title 목록. 설정하면 매 반복 fr_relations.sh auto-pick --slugs 로 그 안에서만 골라
+#                             RD_AUTOPILOT_FR=<slug> 로 호출한다(소진 시 exit 0). 미설정이면 종전 auto. 설정됐지만 공백뿐이면 exit 1
+#                             wrapper 가 완료(0)·blocked(20)로 끝낸 slug 는 이번 실행의 다음 반복 --slugs 에서 뺀다
+#   RD_RALPH_RELATIONS_CMD    관계 판정 명령 오버라이드 (테스트 훅, 단어 분리되는 문자열; 기본은 <스크립트 디렉터리>/fr_relations.sh 를 공백 안전하게 호출)
 #   RD_RALPH_WRAPPER_CMD      wrapper 호출 명령 오버라이드 (테스트 훅; 기본 "bash rd-workflow/scripts/autopilot_headless.sh")
 #
 # exit code: 0 정상 종료(queue-empty·queue-blocked) / 1 중단(backstop·harness-error 재발·관계/재개 판정 불가·미지 코드)
@@ -27,6 +32,26 @@ case "$NONPROGRESS_LIMIT" in *[!0-9]*|'') _die "RD_RALPH_NONPROGRESS_LIMIT 는 �
 [ "$NONPROGRESS_LIMIT" -ge 1 ] || _die "RD_RALPH_NONPROGRESS_LIMIT 는 1 이상이어야 합니다: '${NONPROGRESS_LIMIT}'"
 case "$FINISH_POLICY" in push|merge|none) ;; *) _die "RD_FINISH_POLICY 는 push|merge|none 중 하나여야 합니다: '${FINISH_POLICY}'" ;; esac
 
+# slug 모드 — 설정 여부는 ${VAR+x} 로 가른다. 빈 목록이 auto 로 떨어져 선별에서 뺀 FR 을 실행하지 않게 한다.
+SLUG_MODE=0
+if [ "${RD_RALPH_SLUGS+x}" = "x" ]; then
+  SLUG_MODE=1
+  case "${RD_RALPH_SLUGS//[[:space:]]/}" in
+    '') _die "RD_RALPH_SLUGS 가 비어 있습니다 — 실행할 FR 이 없습니다" ;;
+  esac
+fi
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 관계 판정 호출. 기본 경로는 따옴표로 감싸 프로젝트 경로의 공백에 안전하다. 테스트 훅은 종전처럼 문자열 명령이다.
+relations() {
+  if [ -n "${RD_RALPH_RELATIONS_CMD:-}" ]; then
+    $RD_RALPH_RELATIONS_CMD "$@"
+  else
+    bash "$SELF_DIR/fr_relations.sh" "$@"
+  fi
+}
+FR_ARG=auto
+slug_done=" "   # 이번 실행에서 완료·blocked 로 끝난 slug (다음 반복 --slugs 에서 뺀다)
+
 iter=0
 nonprogress=0
 completed=0
@@ -35,7 +60,7 @@ blocked_reasons=""
 blocked_detail=""
 stop_reason=""
 drain_start="$(date +%s)"
-cp_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lifecycle/cleanup_pending.sh"
+cp_helper="$SELF_DIR/lifecycle/cleanup_pending.sh"
 record_failed=""
 calls=0
 
@@ -66,7 +91,7 @@ fi
 invoke_once() {
   calls=$((calls + 1))
   RD_AUTOPILOT_COST_FILE="$([ -z "$cost_err" ] && printf '%s' "$cost_file")" \
-  RD_AUTOPILOT_FR=auto \
+  RD_AUTOPILOT_FR="$FR_ARG" \
   RD_AUTOPILOT_MODE=A \
   RD_FINISH_POLICY="$FINISH_POLICY" \
   RD_AUTOPILOT_OUTCOME_FILE="$OUTCOME_FILE" \
@@ -160,12 +185,48 @@ while : ; do
     exit 1
   fi
 
+  if [ "$SLUG_MODE" -eq 1 ]; then
+    slugs_left=""
+    for s_ in $RD_RALPH_SLUGS; do
+      case "$slug_done" in *" $s_ "*) ;; *) slugs_left="${slugs_left:+$slugs_left }$s_" ;; esac
+    done
+    if [ -z "$slugs_left" ]; then
+      stop_reason="queue-empty (지정 목록 소진)"; summarize; exit 0
+    fi
+    pick_err="$(mktemp 2>/dev/null)" || pick_err=""
+    pick_out="$(relations auto-pick --root . --slugs "$slugs_left" 2>"${pick_err:-/dev/null}")"; pick_rc=$?
+    pick_head="$(printf '%s\n' "$pick_out" | head -n1)"
+    pick_detail="$(printf '%s\n' "$pick_out" | awk 'NR>1')"
+    pick_errline=""
+    if [ -n "$pick_err" ]; then
+      pick_errline="$(awk 'NF{l=$0} END{print l}' "$pick_err" 2>/dev/null)"; rm -f "$pick_err"
+    fi
+    if [ "$pick_rc" -ne 0 ] || [ "$pick_head" = "unavailable" ]; then
+      stop_reason="관계 판정 불가 (relations-unavailable) — 전역 실패이므로 즉시 중단"
+      [ -n "$pick_errline" ] && stop_reason="${stop_reason} (rc ${pick_rc}, stderr: ${pick_errline})"
+      blocked_detail="$pick_detail"; summarize; exit 1
+    fi
+    case "$pick_head" in
+      select"$(printf '\t')"*)
+        stem="${pick_head#select$(printf '\t')}"; FR_ARG="${stem:11}"
+        [ -n "$FR_ARG" ] || { stop_reason="auto-pick 결과 해석 불가: '${pick_head}' — 중단"; summarize; exit 1; } ;;
+      queue-empty)
+        stop_reason="queue-empty (지정 목록 소진)"; summarize; exit 0 ;;
+      queue-blocked)
+        stop_reason="queue-blocked (의존 대기 — 지정 목록에 착수 가능 FR 없음)"
+        blocked_detail="$pick_detail"; summarize; exit 0 ;;
+      *)
+        stop_reason="auto-pick 결과 해석 불가: '${pick_head}' — 중단"; summarize; exit 1 ;;
+    esac
+  fi
+
   invoke_with_retry
   code=$?
 
   case "$code" in
     0)
       completed=$((completed + 1)); nonprogress=0
+      [ "$SLUG_MODE" -eq 1 ] && slug_done="$slug_done$FR_ARG "
       rf="$(awk 'NR>1 && /^cleanup-record-failed /' "$OUTCOME_FILE" 2>/dev/null)"
       [ -z "$rf" ] || record_failed="${record_failed:+${record_failed}
 }${rf}"
@@ -205,6 +266,7 @@ while : ; do
           summarize; exit 1 ;;
       esac
       blocked=$((blocked + 1)); nonprogress=0
+      [ "$SLUG_MODE" -eq 1 ] && slug_done="$slug_done$FR_ARG "
       blocked_reasons="${blocked_reasons}
   - ${reason}"
       echo "ralph_drain: iter ${iter} → blocked: ${reason} (누적 ${blocked})" ;;

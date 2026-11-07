@@ -66,7 +66,7 @@ fi
 # parse_sections <file> <prefix> : `##` 절로 나눠 목록(stdout)과 정규화 본문 파일($WORK/<prefix>N)을 만듭니다.
 #   목록 줄: id<TAB>heading<TAB>start<TAB>end<TAB>marker(1|0)
 parse_sections() {
-  MARKER="$OVERRIDE_MARKER" awk -v dir="$WORK" -v pfx="$2" '
+  LC_ALL=C MARKER="$OVERRIDE_MARKER" awk -v dir="$WORK" -v pfx="$2" '
     function flush(endline,   s, e, i, f) {
       if (!active) return
       s = 1; while (s <= nb && buf[s] == "") s++
@@ -101,7 +101,7 @@ parse_sections() {
 }
 
 # ids_for <list> <heading> : 그 제목의 절 id 들
-ids_for() { H="$2" awk -F'\t' '$2 == ENVIRON["H"] { print $1 }' "$1"; }
+ids_for() { LC_ALL=C H="$2" awk -F'\t' '$2 == ENVIRON["H"] { print $1 }' "$1"; }
 
 : > "$WORK/proj.list"
 : > "$WORK/cur.list"
@@ -120,7 +120,7 @@ for rf in "$RULES_DIR"/*.md; do
   parse_sections "$rf" "r${ri}_" > "$WORK/r${ri}.list" || die "rules 파일 파싱 실패: $rf"
   cat "$WORK/r${ri}.list" >> "$WORK/base.list"
   bn="$(basename "$rf")"
-  awk -F'\t' -v bn="$bn" '{ print $2 "\t" bn }' "$WORK/r${ri}.list" >> "$WORK/rules.map"
+  LC_ALL=C awk -F'\t' -v bn="$bn" '{ print $2 "\t" bn }' "$WORK/r${ri}.list" >> "$WORK/rules.map"
 done
 [[ "$ri" -gt 0 ]] || die "clone 의 .claude/rules/rd-workflow/ 에 *.md 가 없습니다: $RULES_DIR"
 
@@ -155,7 +155,7 @@ while IFS=$'\t' read -r id heading start end mk; do
   cur_ids="$(ids_for "$WORK/cur.list" "$heading")"
   base_ids="$(ids_for "$WORK/base.list" "$heading")"
   if [[ "$heading" != "(서두)" || -n "$base_ids" ]]; then
-    dest="$(H="$heading" awk -F'\t' '$1 == ENVIRON["H"] { print $2; exit }' "$WORK/rules.map")"
+    dest="$(LC_ALL=C H="$heading" awk -F'\t' '$1 == ENVIRON["H"] { print $2; exit }' "$WORK/rules.map")"
     [[ -n "$dest" ]] || dest="-"
   fi
 
@@ -172,7 +172,7 @@ while IFS=$'\t' read -r id heading start end mk; do
   fi
 
   if [[ -z "$class" ]]; then
-    n="$(H="$heading" awk -F'\t' '$2 == ENVIRON["H"] { n++ } END { print n + 0 }' "$WORK/proj.list")"
+    n="$(LC_ALL=C H="$heading" awk -F'\t' '$2 == ENVIRON["H"] { n++ } END { print n + 0 }' "$WORK/proj.list")"
     if [[ "$n" -ge 2 ]]; then
       class=ambiguous
     else

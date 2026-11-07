@@ -10,6 +10,19 @@
 
 <!-- 관리 규칙(템플릿 개발 저장소): 발행 전에 마지막 VERSION 이후 완료 보고의 「사용자에게 달라진 것」 절에서 골라 `## 다음 발행` 절에 적습니다. 발행 스크립트가 이 제목을 새 VERSION 으로 바꿉니다. -->
 
+## 2026-11-08-065139
+
+- **`/fr do` 추가**: 여러 FR 을 한 번에 처리하는 진입점입니다. `/fr do [<slug들>]` 는 대화형으로 FR 마다 줄기(세션)를 띄워 동시에 진행하고, `/fr do --headless [--finish push|merge|none] [<slug들>]` 는 무인으로 순서대로 완주합니다. 대화형의 동시 줄기 수 상한은 `workflow.json` 의 새 키 `fr_do_max_streams`(기본 `4`)로 정합니다.
+- **`/fr batch` 별칭화**: `/fr batch` 는 `/fr do --headless` 로 바뀌었습니다. 이번 발행까지 별칭으로 동작하고 다음 발행에서 없어집니다.
+- **batch manifest 폐지**: `rd-workflow-workspace/.batch-manifest.json` 과 `scripts/batch/` 의 `batch_manifest.sh`·`headless_result.sh` 를 없앴습니다. `fr_relations.sh batch-draft` 도 없앴습니다. 처리 대상은 slug 목록으로 지정합니다.
+- **`resume_candidates.sh` 경로 이동**: `scripts/batch/resume_candidates.sh` 가 `scripts/resume_candidates.sh` 로 옮겨졌습니다.
+- **후속 FR 확인**: REQUEST `## Constraints` 에 범위 밖 후속을 `- 후속 FR: <slug> — <설명>` 으로 적으면, `archive.sh` 가 등록되지 않은 slug 를 `archive: 후속 FR 확인` 경고로 알립니다. Source FR 과 서로 언급하는 dropped FR 이 있으면 `archive: 흡수 확인` 을 냅니다. 발행은 막지 않습니다. final diff review 의 최종 출력에도 같은 확인이 들어갑니다.
+- **submodule 저장소의 promote·정리**: `.gitmodules` 가 있으면 promote 가 새 worktree 의 submodule 을 중첩까지 초기화합니다. 실패해도 착수는 끝나고 복구 명령을 안내합니다. 원격 tag 로 닿는 submodule 커밋은 worktree 정리에서 더 이상 「원격에 없는 커밋」 으로 보류되지 않습니다.
+- **로캘과 무관한 FR 인덱스 처리**: 한글 collation 이 없는 로캘(`en_US.UTF-8` 등)에서도 `rd task fr-done`·`/fr add` 가 인덱스 칸을 바르게 찾습니다.
+- **작업 색인이 막을 때 안내**: 작업 색인이 있는 저장소의 기본 브랜치에서 `rd task` 쓰기가 거부되면, 색인 경로·원인·복구 방법을 함께 보입니다.
+- **손으로 띄운 세션 기록**: 자동 기동이 실패한(`launch=failed`) 작업도 `rd task resolve-launch <slug>` 로 손 기동 세션을 확정할 수 있습니다. 자동 기동 실패 안내가 이 방법을 알립니다. 확인 중 색인이 바뀌었거나 저장이 실패하면 확정했다고 보고하지 않고 다시 실행할 명령을 안내합니다. 세션이 살아 있으면 `promote_rollback.sh` 가 worktree 를 지우지 않습니다(`--force` 는 경고 후 계속).
+- **리뷰 인용 경고 정확도**: 리뷰어 턴 뒤의 `cite-mismatch` 경고가 맞는 인용에는 나오지 않습니다. 리뷰어는 재현 명령과 출력을 `## Reproduction` 절에 적습니다.
+
 ## 2026-11-07-210251
 
 - **팀 overlay 가이드**: rd-workflow 가 없는 기존 팀 저장소 클론을 새로 clone 하지 않고 overlay 아래로 옮겨 submodule 로 등록하는 짧은 경로를 이관 가이드에 더했습니다(브랜치·stash·미커밋 작업 유지). 예시 이름을 overlay `rd-myproject` 아래 submodule `myproject` 로 맞추고, 기존 클론 안의 세션에서 진행하지 말고 끝나면 overlay 루트에서 새 세션을 띄우라는 실행 위치 안내를 넣었습니다.

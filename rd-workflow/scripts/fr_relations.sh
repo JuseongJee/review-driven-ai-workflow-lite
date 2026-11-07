@@ -3,13 +3,14 @@
 #
 # items/ 상세 파일의 `- depends-on:` · `- series:` · `- relates:` 필드를 읽어 FR 별로
 # "착수 가능 / 대기 / 확인 필요 / 오류" 를 판정한다. 판정 로직은 이 스크립트에만 둔다.
-# skill 산문(`/fr list`·autopilot·`/fr batch`)은 이 스크립트를 호출해 출력을 표시만 한다.
+# skill 산문(`/fr list`·autopilot·`/fr do`)은 이 스크립트를 호출해 출력을 표시만 한다.
 #
 # 서브커맨드:
 #   readiness   --root <ROOT>                     활성 FR 1건당 `<stem><TAB><판정>`
 #   validate    --root <ROOT>                     위반 1건당 `<종류><TAB><stem><TAB><설명>`
-#   batch-draft --root <ROOT> --slugs "<s> <s>"   `<short-title><TAB><분류><TAB><값>`
-#   auto-pick   --root <ROOT>                     첫 줄 select/queue-empty/queue-blocked/unavailable
+#   candidates  --root <ROOT> [--slugs "<s> <s>"] 활성 FR 1건당 `<stem><TAB><status><TAB><priority><TAB><판정>`
+#                                                 (--slugs 면 지정한 비활성 FR 도 판정 `-` 로 냄)
+#   auto-pick   --root <ROOT> [--slugs "<s> <s>"] 첫 줄 select/queue-empty/queue-blocked/unavailable
 #
 # 판정 값: ready / waiting:<stem>,<stem> / check:<stem>,<stem> / error:<사유>
 #          우선순위는 error > waiting > check > ready 이고 하나만 낸다.
@@ -18,8 +19,8 @@
 # 종료 코드:
 #   readiness    0 정상 / 2 실행 불가
 #   validate     0 위반 없음(priority-drift 만 있으면 0) / 1 위반 / 2 실행 불가
-#   batch-draft  0 정상 / 1 관계 오류 있음 / 2 실행 불가(slug 미해결 포함)
-#   auto-pick    0 정상 / 2 unavailable
+#   candidates   0 정상 / 2 실행 불가(--slugs 미해결 포함)
+#   auto-pick    0 정상 / 2 unavailable(--slugs 미해결 포함)
 #
 # 데이터 원천의 권위:
 #   - 관계 필드·status 의 권위는 items/ 상세 파일이다.
@@ -52,7 +53,7 @@
 # bash 3.2 호환: 연관배열(declare -A)을 쓰지 않는다. 조회는 stem 을 변수명으로 바꾼
 # 동적 변수(`mput`/`mget`)로 한다 — items 325개에서 문자열 누적 + `${acc#*key=}` 추출은
 # 실측 68초였다 (bash 의 `#` 접두 제거가 문자열 길이에 제곱으로 든다). 순환 탐지는
-# `batch/batch_manifest.sh` 의 문자열 Kahn 을 옮긴 것이다.
+# 옛 batch_manifest.sh 에서 옮긴 문자열 Kahn 이다.
 #
 # 동적 변수는 `eval` 을 쓰므로 키가 곧 코드다. 두 층으로 막는다.
 #   ① 정책 층 — 외부에서 들어오는 stem(파일명·depends-on·relates 토큰·인덱스 제목·slug)이
@@ -135,7 +136,7 @@ mget() { # mget <맵이름> <키> — 결과는 MV. 없으면 "-"
 }
 
 # valid_stem <문자열> — FR stem 형식 `YYYY-MM-DD-<slug>` 인지 본다.
-# slug charset 은 `[a-z0-9-]+` 이며 batch_manifest.sh 의 resolve-slug 규칙과 같다.
+# slug charset 은 `[a-z0-9-]+` 이다.
 valid_stem() {
   case "$1" in
     [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*) ;;
@@ -359,7 +360,7 @@ build_prereqs() {
 
 # ---------------------------------------------------------------- ④ 순환 탐지
 
-# 문자열 Kahn (batch_manifest.sh 이식). 한 라운드도 못 옮기면 잔여가 남는다.
+# 문자열 Kahn (옛 batch_manifest.sh 에서 옮김). 한 라운드도 못 옮기면 잔여가 남는다.
 # 잔여를 그대로 순환으로 보지 않는다 — 잔여 안에서 자기 자신으로 돌아오는 경로가 있는
 # 노드만 cycle 이고, 나머지 잔여는 선행이 착수 불가일 뿐이라 waiting 이다.
 detect_cycles() {
@@ -728,80 +729,80 @@ cmd_validate() {
   return 0
 }
 
-# ---------------------------------------------------------------- batch-draft
+# ---------------------------------------------------------------- --slugs 해석
 
-cmd_batch_draft() {
-  local buf="" rc=0 slug stem matches cnt s
-  local resolved=""
-  if [ -z "$SLUGS" ]; then
-    echo "fr_relations.sh: batch-draft 에 --slugs 가 필요합니다." >&2
-    return 2
-  fi
-  compute_relations || { echo "fr_relations.sh: ${ERR_REASON}" >&2; return 2; }
-
-  # slug → stem 해결. `resolve-slug` 와 같은 규칙이다 — 정확히 1건일 때만 진행한다.
+# resolve_slugs — SLUGS(short-title 목록)를 stem 으로 풀어 SLUG_STEMS 에 넣는다.
+# 활성이 아닌(done·dropped·parked) FR 은 미해결이 아니다 — auto-pick 결과에서는 빠지고,
+# candidates 는 판정 `-` 로 낸다. 무인 엔진이 반복 중 완료된 FR 을 목록에 그대로 넘긴다. items/ 에 그 short-title 의
+# 상세 파일이 아예 없을 때만 실패(rc 2)한다.
+# 같은 short-title 이 여러 날짜에 있으면 하나만 고른다 — 인덱스에 행이 있는 stem 중 가장 늦은 날짜,
+# 행이 있는 stem 이 없으면 가장 늦은 날짜. 그래서 호출 전에 read_index 로 IHAS 를 채워야 한다.
+SLUG_STEMS=""
+SLUG_ERR=""
+resolve_slugs() {
+  local slug s found pick_idx pick_any
+  SLUG_STEMS=""
   for slug in $SLUGS; do
     case "$slug" in
       ""|*[!a-z0-9-]*)
-        echo "fr_relations.sh: slug 형식 오류 — '${slug}' (허용: [a-z0-9-])" >&2
-        return 2 ;;
+        SLUG_ERR="slug 형식 오류 — '${slug}' (허용: [a-z0-9-])"
+        return 1 ;;
     esac
-    matches=""; cnt=0
+    found=0; pick_idx=""; pick_any=""
     for s in $ALL_STEMS; do
       case "$s" in
-        ????-??-??-"$slug") matches="$matches $s"; cnt=$((cnt + 1)) ;;
+        ????-??-??-"$slug") ;;
+        *) continue ;;
       esac
+      found=1
+      [ -z "$pick_any" ] || [ "$s" \> "$pick_any" ] && pick_any="$s"
+      mget IHAS "$s"
+      if [ "$MV" = 1 ] && { [ -z "$pick_idx" ] || [ "$s" \> "$pick_idx" ]; }; then pick_idx="$s"; fi
     done
-    if [ "$cnt" -ne 1 ]; then
-      echo "fr_relations.sh: slug 해결 실패 — '${slug}' 매칭 ${cnt}건 (정확히 1건이어야 합니다)" >&2
-      return 2
+    if [ "$found" -eq 0 ]; then
+      SLUG_ERR="--slugs 에 없는 FR: ${slug}"
+      return 1
     fi
-    stem="${matches# }"
-    resolved="$resolved $stem"
-    mput SLUG "$slug" "$stem"
+    # 비활성(done 등)도 넣습니다. auto-pick 은 ACTIVE_STEMS 만 순회해 빼고, candidates 는 판정 `-` 로 냅니다.
+    SLUG_STEMS="$SLUG_STEMS ${pick_idx:-$pick_any}"
   done
+  return 0
+}
 
-  local v one dep_list ext_ok ext_unmet st
-  for slug in $SLUGS; do
-    mget SLUG "$slug"; stem="$MV"
-    # 비활성(done·dropped·parked) FR 은 batch 대상이 아니다. status 로 직접 본다 —
-    # VERDICT 는 전체 items 에 대해 만들어지므로 부재로 비활성을 가려낼 수 없다.
+# ---------------------------------------------------------------- candidates
+
+# --slugs 가 없으면 활성 FR 만 냅니다. --slugs 가 있으면 이름으로 지정해 해석한 FR 을 모두 냅니다.
+# 비활성(done·dropped·parked)은 판정 칸을 `-` 로 냅니다. 소비자(pick.py)가 상태로 제외 사유를 보입니다.
+cmd_candidates() {
+  local stem st v pri rank rows="" line pool seen=" "
+  compute_relations || { echo "fr_relations.sh: ${ERR_REASON}" >&2; return 2; }
+  pool="$ACTIVE_STEMS"
+  read_index || { echo "fr_relations.sh: ${ERR_REASON}" >&2; return 2; }
+  if [ -n "$SLUGS" ]; then
+    resolve_slugs || { echo "fr_relations.sh: ${SLUG_ERR}" >&2; return 2; }
+    pool="$SLUG_STEMS"
+  fi
+  for stem in $pool; do
+    case "$seen" in *" $stem "*) continue ;; esac
+    seen="$seen$stem "
     mget ST "$stem"; st="$MV"
-    case "$st" in
-      done|dropped|parked)
-        buf="${buf}${slug}	error	비활성 FR (status=${st})
-"
-        rc=1
-        continue ;;
+    case " $ACTIVE_STEMS " in
+      *" $stem "*) mget VERDICT "$stem"; v="$MV" ;;
+      *) v="-" ;;
     esac
-    mget VERDICT "$stem"; v="$MV"
-    case "$v" in
-      error:*)
-        buf="${buf}${slug}	error	${v#error:}
-"
-        rc=1
-        continue ;;
+    mget IPRI "$stem"; pri="$MV"
+    case "$pri" in
+      P1) rank=1 ;; P2) rank=2 ;; P3) rank=3 ;; *) rank=4 ;;
     esac
-    dep_list=""; ext_ok=""; ext_unmet=""
-    mget PREREQ "$stem"; split_csv "$MV"
-    for one in $SPLIT_OUT; do
-      case " $resolved " in
-        *" $one "*) dep_list="${dep_list:+$dep_list }${one:11}"; continue ;;
-      esac
-      mget ST "$one"; st="$MV"
-      if [ "$st" = "done" ]; then ext_ok="${ext_ok:+$ext_ok }$one"
-      else ext_unmet="${ext_unmet:+$ext_unmet }$one"; fi
-    done
-    [ -n "$dep_list" ] && buf="${buf}${slug}	depends_on	${dep_list}
-"
-    [ -n "$ext_ok" ] && buf="${buf}${slug}	external-satisfied	${ext_ok}
-"
-    [ -n "$ext_unmet" ] && buf="${buf}${slug}	external-unmet	${ext_unmet}
+    rows="${rows}${rank}	${stem:0:10}	${stem}	${st}	${pri}	${v}
 "
   done
-
-  printf '%s' "$buf"
-  return "$rc"
+  # 정렬: priority 순위 → 등록일 → stem. 앞 3칸이 정렬 키이고 출력에서 뗀다.
+  printf '%s' "$rows" | LC_ALL=C sort -t "$(printf '\t')" -k1,1n -k2,2 -k3,3 \
+    | while IFS=$'\t' read -r _ _ stem st pri v; do
+        printf '%s\t%s\t%s\t%s\n' "$stem" "$st" "$pri" "$v"
+      done
+  return 0
 }
 
 # ---------------------------------------------------------------- auto-pick
@@ -845,7 +846,21 @@ cmd_auto_pick() {
   local stem st v eligible="" selectable=""
   # ① 상세 파싱 → ② 판정 계산
   compute_relations || { emit_unavailable; return 2; }
+  # ③ 인덱스 읽기 (priority 정렬과 --slugs 의 날짜 고르기용)
+  read_index || { emit_unavailable; return 2; }
+  if [ -n "$SLUGS" ]; then
+    resolve_slugs || {
+      ERR_REASON="$SLUG_ERR"
+      ERR_ACTION="--slugs 값을 확인하십시오"
+      emit_unavailable
+      echo "fr_relations.sh: ${SLUG_ERR}" >&2
+      return 2
+    }
+  fi
   for stem in $ACTIVE_STEMS; do
+    if [ -n "$SLUGS" ]; then
+      case " $SLUG_STEMS " in *" $stem "*) ;; *) continue ;; esac
+    fi
     mget ST "$stem"; st="$MV"
     case "$st" in
       validated|ready-for-request) ;;
@@ -855,9 +870,6 @@ cmd_auto_pick() {
     mget VERDICT "$stem"; v="$MV"
     [ "$v" = "ready" ] && selectable="$selectable $stem"
   done
-
-  # ③ 인덱스 읽기 (priority 정렬용). 여기서 실패해도 위 판정은 이미 만들어져 있다.
-  read_index || { emit_unavailable; return 2; }
 
   # ④ 선택
   local buf=""
@@ -898,10 +910,10 @@ cmd_auto_pick() {
 case "$CMD" in
   readiness)   cmd_readiness ;;
   validate)    cmd_validate ;;
-  batch-draft) cmd_batch_draft ;;
+  candidates)  cmd_candidates ;;
   auto-pick)   cmd_auto_pick ;;
   ""|-h|--help|help)
-    echo "usage: fr_relations.sh {readiness|validate|batch-draft|auto-pick} [--root <ROOT>] [--slugs \"<s> <s>\"]" >&2
+    echo "usage: fr_relations.sh {readiness|validate|candidates|auto-pick} [--root <ROOT>] [--slugs \"<s> <s>\"]" >&2
     exit 2 ;;
   *)
     echo "fr_relations.sh: 알 수 없는 서브커맨드: ${CMD}" >&2

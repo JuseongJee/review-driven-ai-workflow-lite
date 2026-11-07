@@ -78,7 +78,7 @@
    [ "$rc" -eq 0 ] && LOCK="$INDEX.lock"
    [ "$rc" -eq 0 ] && { OUT="$(mktemp "$INDEX.XXXXXX")" || { echo "인덱스 이관 실패: 임시 파일을 만들지 못했습니다. 다음 조치: 인덱스 폴더의 쓰기 권한을 확인한 뒤 다시 실행하십시오. 아무것도 쓰지 않았습니다." >&2; rc=1; }; }
    if [ "$rc" -eq 0 ]; then
-   awk '
+   LC_ALL=C awk '
    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
    function ins(line, val,   head, tail) {
      if (match(line, RX) == 0) return line

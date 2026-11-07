@@ -1109,6 +1109,36 @@ grep -q '요약 a\\|b' "$FD_ROOT/rd-workflow-workspace/backlog/FUTURE_REQUESTS.m
 echo "$fd_out" | grep -q "행 부재" && echo "ok: fr-done 행 부재 보고" \
   || { echo "FAIL: 행 부재 보고 없음"; FAIL=1; }
 
+# fr-done 인덱스 머리행 해석 — 로캘 고정(en_US.UTF-8 한글 collation)과 해석 실패의 실패 보고
+# fdl_mk <root> <머리행> <slug> — items 파일 하나와 그 slug 행 하나를 가진 인덱스를 만든다.
+fdl_mk() {
+  mkdir -p "$1/rd-workflow-workspace/backlog/items"
+  printf '%s\n' "# fr item" "- status: idea" > "$1/rd-workflow-workspace/backlog/items/2026-06-01-$3.md"
+  printf '%s\n' "# FUTURE_REQUESTS" "" "## 인덱스" "" "$2" \
+    "|------|------|------|------|------|----------|------|" \
+    "| 2026-06-01 | $3 | 요약 | feature | idea | - | [상세](items/2026-06-01-$3.md) |" \
+    > "$1/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
+}
+if LC_ALL=en_US.UTF-8 awk 'BEGIN{exit !("상세"=="제목")}' 2>/dev/null; then
+  FDL="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패" >&2; exit 1; }
+  fdl_mk "$FDL" "| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |" enus
+  fdl_out="$(env LC_ALL=en_US.UTF-8 project_root="$FDL" bash "$RD" task fr-done \
+    rd-workflow-workspace/backlog/items/2026-06-01-enus.md 2>&1)"; fdl_rc=$?
+  fdl_row="$(grep '| enus |' "$FDL/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md")"
+  [[ "$fdl_rc" == "0" && "$fdl_out" == *"인덱스: done"* && "$fdl_row" == *"| feature | done | - |"* ]] \
+    && echo "ok: fr-done: en_US.UTF-8 에서 상태 칸을 done 으로" \
+    || { echo "FAIL: fr-done: en_US.UTF-8 에서 상태 칸을 done 으로 (rc=$fdl_rc row='$fdl_row' out='$fdl_out')"; FAIL=1; }
+else
+  echo "skip: en_US.UTF-8 에서 한글 collation 결함이 재현되지 않음"
+fi
+FDH="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패" >&2; exit 1; }
+fdl_mk "$FDH" "| 날짜 | 이름 | 요약 | 종류 | 상태 | 우선순위 | 상세 |" hdrfail
+fdh_out="$(env project_root="$FDH" bash "$RD" task fr-done \
+  rd-workflow-workspace/backlog/items/2026-06-01-hdrfail.md 2>&1)"; fdh_rc=$?
+[[ "$fdh_rc" == "1" && "$fdh_out" == *"머리행 해석 실패"* && "$fdh_out" == *"실패 1"* ]] \
+  && echo "ok: fr-done: slug 셀이 있는데 제목 칸을 못 찾으면 실패" \
+  || { echo "FAIL: fr-done: slug 셀이 있는데 제목 칸을 못 찾으면 실패 (rc=$fdh_rc out='$fdh_out')"; FAIL=1; }
+
 # fr-done <path>... 인자 지정 — task-state 없이도 동작 (발행 후 재시도 경로, §2.5.4)
 FD_ROOT2="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$FD_ROOT2" && -d "$FD_ROOT2" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
@@ -1577,7 +1607,7 @@ rm -rf "$CK_EOF"
 CK_PROSE="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$CK_PROSE" && -d "$CK_PROSE" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 mkdir -p "$CK_PROSE/rd-workflow/docs"
-printf '%s\n' '1. `bash rd-workflow/scripts/batch/resume_candidates.sh` 를 실행한다. `promote.sh` 는 작업 상태를 쓴다' \
+printf '%s\n' '1. `bash rd-workflow/scripts/resume_candidates.sh` 를 실행한다. `promote.sh` 는 작업 상태를 쓴다' \
   > "$CK_PROSE/rd-workflow/docs/prose.md"
 bash "$CK" "$CK_PROSE" >/dev/null 2>&1 && echo "ok: check: 설명 문장 속 promote.sh 언급을 오탐하지 않는다" \
   || { echo "FAIL: check: 설명 문장 속 promote.sh 언급을 위반으로 오탐했다"; FAIL=1; }

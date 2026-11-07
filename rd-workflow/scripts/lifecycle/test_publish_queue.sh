@@ -837,7 +837,7 @@ test_real_archive_partial_recovery() {
   bash "$REPO/rd-workflow/scripts/lifecycle/promote.sh" --short-title "$slug" --size large --source-fr - >/dev/null 2>&1 || { fail "통합: promote 실패"; return; }
   WT="$REPO/.worktrees/$slug"
   printf 'work\n' >"$WT/src-alpha.txt"; git -C "$WT" add -A; git -C "$WT" commit -q -m impl
-  sed -i 's/^status=.*/status=아카이브 보류/' "$WT/rd-workflow-workspace/.lifecycle/task-state"
+  sed -i.bak 's/^status=.*/status=아카이브 보류/' "$WT/rd-workflow-workspace/.lifecycle/task-state" && rm -f "$WT/rd-workflow-workspace/.lifecycle/task-state.bak"
   git -C "$WT" add -A; git -C "$WT" commit -q -m status
   printf '#!/usr/bin/env bash\nexec bash rd-workflow/scripts/lifecycle/archive.sh --force-skip-review-check 테스트 --allow-status-mismatch 테스트\n' >"$TMP/int-wrap.sh"
   chmod +x "$TMP/int-wrap.sh"

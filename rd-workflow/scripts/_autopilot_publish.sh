@@ -123,7 +123,7 @@ run_publish_cmd() {
     PUB_SIGNAME="$PUB_SIG"
   fi
   if (( PUB_UNREAPED )); then
-    PUB_RC=124   # 기다리지 않는다 — 유한 시간에 반환해야 batch 가 paused 로 멈춘다
+    PUB_RC=124   # 기다리지 않는다 — 유한 시간에 반환해야 호출자(`ralph_drain.sh`)가 멈춘다
   else
     wait "$pg" 2>/dev/null; PUB_RC=$?
   fi

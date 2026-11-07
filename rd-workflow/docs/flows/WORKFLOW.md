@@ -45,7 +45,7 @@
 | completion report | 생략 | 생략 | `auto_completion_report` 설정 |
 | 감사 기록 | `reports/tier-log.md` 한 줄 | REQUEST `## Risk Tier` | REQUEST `## Risk Tier` |
 
-`standard` 의 **축약 REQUEST** 는 `Task Type`·`Execution Path`·`User Goal`·`Change Description`·`Acceptance Criteria`·`Risk Tier`·`Source FR` 만 채우고 나머지는 `-` 로 둡니다. `promote.sh --size` 는 `standard = small`, `full = large` 입니다. autopilot 의 모드 A = `full`, 모드 B = `standard` 이고 `light` FR 은 autopilot 에서 `standard` 로 실행합니다.
+`standard` 의 **축약 REQUEST** 는 `Task Type`·`Execution Path`·`User Goal`·`Change Description`·`Acceptance Criteria`·`Risk Tier`·`Source FR` 만 채우고 나머지는 `-` 로 둡니다. 범위 밖 후속을 FR 로 넘겼으면 `## Constraints` 에 `- 후속 FR: <slug>` 줄을 남깁니다(아카이브 때 등록 여부를 대조합니다). `promote.sh --size` 는 `standard = small`, `full = large` 입니다. autopilot 의 모드 A = `full`, 모드 B = `standard` 이고 `light` FR 은 autopilot 에서 `standard` 로 실행합니다.
 
 ### 시작 계약 (`light`·`standard` 공통)
 
@@ -135,7 +135,8 @@ herdr app 에서 띄운 작업 세션은 앱 왼쪽 Agents 패널에 부모 세�
 |---|---|
 | `ok` | 이 세션은 여기서 멈춘다 — 이후 단계는 기동된 작업 세션이 진행한다 |
 | `unknown` | 호출 세션도 이어받지 않는다 — `resolve-launch` 로 확정한 뒤에만 갈린다(살아 있으면 멈춤 / `failed` 확정이면 이어서 진행) |
-| `failed`·`none` | 자식 세션이 없다 — 호출 세션이 이어서 진행하거나 안내된 명령으로 세션을 연다 |
+| `failed` | 자식 세션이 없다 — 호출 세션이 이어서 진행하거나 안내된 명령으로 세션을 연다. 손으로 띄웠다면 띄운 뒤 `rd task resolve-launch <slug>` 로 기록한다 |
+| `none` | 자식 세션이 없다 — 호출 세션이 이어서 진행하거나 안내된 명령으로 세션을 연다 |
 
 **이어서 진행할 때는 대상 worktree 로 먼저 이동합니다.** `promote.sh` 는 `--no-worktree`
 를 쓰지 않는 한 별도 worktree 를 만들 뿐 호출 세션의 작업 디렉터리를 바꾸지 않습니다 —
@@ -398,6 +399,7 @@ fr branch lifecycle 관련 스크립트 요약:
 
 ### 관련 `workflow.json` 설정 키
 
+- `fr_do_max_streams`(기본 `4`) — `/fr do` 대화형의 동시 줄기 수 상한. `scripts/fr_do/pick.py` 가 읽고, 없거나 1 미만·정수가 아니면 `4` 를 씁니다.
 - `stale_behind_threshold`(기본 `20`) — `rd task list` 가 작업을 "묵은 작업"(`⚠ N커밋 뒤처짐`)으로 표시하는 기준. 판정은 기본 브랜치 대비 그 fr 브랜치가 뒤처진 커밋 수(`git rev-list --count <fr-branch>..<default-branch>`)입니다. `tasks_list.sh` 가 이 키를 읽고, 없거나 파싱할 수 없으면 `20` 을 씁니다.
 - `worktree_root`(기본값 `.worktrees`) — `promote.sh` 가 worktree 를 만드는 기본 위치. 상대 경로는 main worktree 기준이고(`<main worktree>/<worktree_root>/<slug>`), 절대 경로와 `~/...` 도 씁니다. 부모 디렉터리가 없으면 만듭니다(새로 만들 때 안내 한 줄). `--worktree-path` 로 넘긴 명시 경로가 이 키보다 우선하며, 그 경우는 부모가 이미 있어야 합니다. 저장소 밖으로 옮기면 `.gitignore` 의 `.worktrees/` 항목이 더는 의미가 없으므로, 새 위치가 저장소 안이면 그 경로를 직접 무시 목록에 넣어야 합니다.
 

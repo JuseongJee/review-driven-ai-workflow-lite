@@ -38,6 +38,7 @@ Final output:
 - PR 본문 위치 (`## PR 본문` 절을 담은 가장 최근 Author 턴 경로)
 - final diff review session path
 - 정리 후보 (Reviewer 턴의 `정리 후보:` 줄과 Author 가 본 범위 밖 정리거리, 없으면 `없음`) — 완료 보고 `## 정리 후보` 로 옮긴다
+- 후속 FR 확인 — 기록 커밋 전에 `bash rd-workflow/scripts/lifecycle/followup_check.sh REQUEST.md HEAD <기본 브랜치>` 를 실행해 출력을 싣는다(출력이 없으면 `없음`). REQUEST 에서 범위 밖으로 뺀 후속은 `- 후속 FR: <slug>` 줄로 적혀 있어야 한다. 미등록 slug 와 흡수 확인 후보(Source FR 과 서로 언급하는 dropped FR)는 완료 보고 `## 정리 후보` 로 옮기고, 흡수 후보마다 이번 작업이 그 범위를 처리했는지 또는 어느 후속 FR 로 넘겼는지 적는다
 - merge readiness or the exact user decision still needed
 
 ## rd-workflow 버전 대조
@@ -50,7 +51,7 @@ Final output:
 
 ```bash
 bash -s <<'RD_SKILL_COMPAT'
-RD_SKILL_BASE=2026-11-04-203832 RD_SKILL_NAME=final-diff-review
+RD_SKILL_BASE=2026-11-07-210251 RD_SKILL_NAME=final-diff-review
 vf="rd-workflow/VERSION"
 if [ ! -f "$vf" ] && [ -f "_ROOT_FILES/rd-workflow/VERSION" ]; then exit 0; fi
 v=""; [ -f "$vf" ] && v="$(cat "$vf")"; v="${v#lite-}"

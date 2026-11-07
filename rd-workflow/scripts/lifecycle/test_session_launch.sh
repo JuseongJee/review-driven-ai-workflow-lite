@@ -38,10 +38,10 @@ _ht="$(session_handoff_text a /r /w /w/h.md)"
   && pass "unknown — 이어받지 않는다는 문구 + resolve-launch 명령" || fail "unknown 문구: $(session_launch_status_hint unknown alpha)"
 [[ "$(session_launch_status_hint unknown alpha)" != *"이어서 진행"* ]] \
   && pass "unknown 문구에는 '이어서 진행' 이 없다(failed/none 과 구분)" || fail "unknown 이 failed/none 문구와 섞였다"
-[[ "$(session_launch_status_hint failed)" == *"이어서 진행"* ]] \
-  && pass "failed — 이어서 진행한다는 문구" || fail "failed 문구: $(session_launch_status_hint failed)"
-[[ "$(session_launch_status_hint none)" == *"이어서 진행"* ]] \
-  && pass "none — 이어서 진행한다는 문구" || fail "none 문구: $(session_launch_status_hint none)"
+[[ "$(session_launch_status_hint failed tab7)" == *"이어서 진행"* && "$(session_launch_status_hint failed tab7)" == *"resolve-launch tab7"* ]] \
+  && pass "failed — 이어서 진행한다는 문구 + 손으로 띄운 경우의 resolve-launch 명령" || fail "failed 문구: $(session_launch_status_hint failed tab7)"
+[[ "$(session_launch_status_hint none)" == *"이어서 진행"* && "$(session_launch_status_hint none)" != *"resolve-launch"* ]] \
+  && pass "none — 이어서 진행한다는 문구, resolve-launch 없음" || fail "none 문구: $(session_launch_status_hint none)"
 
 # 5) CLI 대역(stub)으로 상태 분기를 검사한다 — PATH 앞에 가짜 herdr 를 둔다.
 #    실제 herdr 화면 동작은 수동 확인이지만, 상태 분기까지 수동에 맡기지 않는다.
@@ -428,6 +428,65 @@ rl_out="$(cd "$TMP_RL" && PATH="$STUB:$PATH" HERDR_ENV=1 project_root="$TMP_RL" 
 [[ "$rl_out" != *"autopilot: 이 작업은"* ]] \
   && pass "resolve-launch 수동 문구에 autopilot 줄 없음(표식 check 1)" || fail "13-3 check 1 인데 autopilot 줄: $rl_out"
 rm -rf "$TMP_RL" "$TMP_RL2"
+
+# 13-4) resolve-launch 의 failed 갈래 — 손으로 띄운 세션(이름이 slug 가 아님)을 cwd 관측으로 확정한다.
+#   관측 경계(herdr·ps·lsof)를 stub 으로 고정해 이 맥의 실제 herdr·claude 프로세스를 보지 않는다.
+RF="$TMP/rf-repo"; mkdir -p "$RF"; RF="$(cd -P "$RF" && pwd -P)"
+git -C "$RF" init -q
+mkdir -p "$RF/rd-workflow-workspace/.lifecycle"
+RF_BIN="$TMP/rf-bin"; mkdir -p "$RF_BIN"
+cat > "$RF_BIN/herdr" <<STUBEOF
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "agent get") echo '{"error":{"code":"agent_not_found","message":"x"}}' >&2; exit 1 ;;
+  "agent list") cat "$RF_BIN/list.data" ;;
+  "agent prompt") printf '%s\n' "\$*" >> "$RF_BIN/prompt.log"; exit 0 ;;
+esac
+STUBEOF
+printf '#!/usr/bin/env bash\ncat "%s/ps.data"\n' "$RF_BIN" > "$RF_BIN/ps"
+printf '#!/usr/bin/env bash\ncat "%s/lsof.data"\n' "$RF_BIN" > "$RF_BIN/lsof"
+chmod +x "$RF_BIN/herdr" "$RF_BIN/ps" "$RF_BIN/lsof"
+# rf_case <agent-list-json> <ps 출력> <lsof 출력> — 관측 데이터와 색인(launch=failed)을 초기화한다
+rf_case() {
+  printf '%s\n' "$1" > "$RF_BIN/list.data"
+  printf '%s' "$2" > "$RF_BIN/ps.data"
+  printf '%s' "$3" > "$RF_BIN/lsof.data"
+  : > "$RF_BIN/prompt.log"
+  (cd "$RF" && project_root="$RF" bash -c 'source "'"$SCRIPT_DIR"'/../_task_common.sh" && tasks_index_upsert rf-x launch=failed launch-backend=herdr worktree-path="'"$RF"'"') \
+    || fail "13-4 fixture 준비 실패"
+}
+# rf_run <env 인자...> -- <resolve-launch 추가 인자...> — 출력 끝 두 줄은 rc=<n> 과 색인 launch 값
+rf_run() {
+  local envs=() args=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do envs+=("$1"); shift; done
+  [[ $# -gt 0 ]] && shift
+  args=("$@")
+  (cd "$RF" && env ${envs[@]+"${envs[@]}"} PATH="$RF_BIN:$PATH" project_root="$RF" bash -c '
+    source "'"$SCRIPT_DIR"'/../_task_common.sh" || exit 9
+    task_resolve_launch rf-x "$@"; echo "rc=$?"
+    tasks_index_get rf-x launch
+  ' _ ${args[@]+"${args[@]}"} 2>&1) || true
+}
+rf_case '{"result":{"agents":[{"cwd":"'"$RF"'"}]}}' '' ''
+rf_out="$(rf_run -u HC_TERMINAL_ID HERDR_ENV=1 --)"
+[[ "$rf_out" == *$'\nrc=0\nok' && "$rf_out" == *"launch=ok 로 확정"* && ! -s "$RF_BIN/prompt.log" ]] \
+  && pass "resolve-launch failed: herdr 에이전트 cwd 로 살아 있으면 ok" \
+  || fail "resolve-launch failed: herdr 에이전트 cwd 로 살아 있으면 ok: $rf_out / prompt=$(cat "$RF_BIN/prompt.log")"
+rf_case '{"result":{"agents":[]}}' $'4242 claude\n' "p4242"$'\n'"n$RF"$'\n'
+rf_out="$(rf_run -u HERDR_ENV -u HC_TERMINAL_ID --)"
+[[ "$rf_out" == *$'\nrc=0\nok' && "$rf_out" == *"claude 프로세스 cwd 일치"* ]] \
+  && pass "resolve-launch failed: herdr 밖에서 claude 프로세스 cwd 로 살아 있으면 ok" \
+  || fail "resolve-launch failed: herdr 밖에서 claude 프로세스 cwd 로 살아 있으면 ok: $rf_out"
+rf_case '{"result":{"agents":[]}}' '' ''
+rf_out="$(rf_run -u HC_TERMINAL_ID HERDR_ENV=1 --)"
+[[ "$rf_out" == *$'\nrc=1\nfailed' && "$rf_out" == *"failed 를 유지"* && "$rf_out" == *"수동 기동: cd "* ]] \
+  && pass "resolve-launch failed: 확인 못하면 failed 유지" \
+  || fail "resolve-launch failed: 확인 못하면 failed 유지: $rf_out"
+rf_case '{"result":{"agents":[{"cwd":"'"$RF"'"}]}}' '' ''
+rf_out="$(rf_run -u HC_TERMINAL_ID HERDR_ENV=1 -- --assume-ended)"
+[[ "$rf_out" == *$'\nrc=1\nfailed' && "$rf_out" == *"이미 기동 실패(failed)"* ]] \
+  && pass "resolve-launch failed --assume-ended 거부" \
+  || fail "resolve-launch failed --assume-ended 거부: $rf_out"
 
 # 14) session_launch_model_valid — 별칭·구체 id 는 허용, 형식 밖 값은 anchored 검증으로 거부한다
 session_launch_model_valid opus && pass "별칭 opus 허용" || fail "별칭 opus 거부됨"

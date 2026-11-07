@@ -16,9 +16,9 @@ TAB=$'\t'
 RC_DIR="${BASH_SOURCE[0]%/*}"; [ "$RC_DIR" != "${BASH_SOURCE[0]}" ] || RC_DIR="."   # 프로세스 생성 없이 디렉터리 계산
 rc_judge_ok=1
 # shellcheck disable=SC1091
-. "$RC_DIR/../lifecycle/session_launch.sh" 2>/dev/null || rc_judge_ok=0
+. "$RC_DIR/lifecycle/session_launch.sh" 2>/dev/null || rc_judge_ok=0
 frs_ok=1
-frs_file="$RC_DIR/../_fr_status.sh"
+frs_file="$RC_DIR/_fr_status.sh"
 if [ -r "$frs_file" ]; then . "$frs_file" 2>/dev/null; fi
 [ -n "${FR_STATUS_AWK:-}" ] || frs_ok=0
 ACTIVE_STATUS="대기 중|REQUEST review 대기|spec/plan 작성 중|spec/plan review 대기|구현 대기|구현 중|검증 중|diff review 대기|아카이브 보류"

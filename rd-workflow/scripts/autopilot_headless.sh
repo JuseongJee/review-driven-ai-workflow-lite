@@ -35,9 +35,9 @@ set -uo pipefail
 # 이 wrapper 는 정의상 무인 진입점이다 — 사람이 보는 화면이 없다. 그러므로 이 아래에서
 # 도는 모든 것은 자식 세션이며, 또 다른 대화형 세션을 기동해서는 안 된다.
 # `session_launch` 는 이 변수가 있으면 기동을 건너뛰고 none 을 반환한다.
-# export 자리가 여기인 이유: 호출자(batch 국면 2 등)마다 변수를 기억하게 두면 한 곳만
+# export 자리가 여기인 이유: 호출자(`/fr do --headless`·`ralph_drain.sh` 등)마다 변수를 기억하게 두면 한 곳만
 # 빠져도 같은 결함이 재발한다. 무인이라는 사실을 아는 것은 이 스크립트 자신이다.
-# (2026-09-24 /fr batch 회귀 — promote 가 FR 마다 herdr 탭을 띄워 batch 가 exit 10 으로 멈췄다)
+# (2026-09-24 옛 /fr batch 회귀 — promote 가 FR 마다 herdr 탭을 띄워 호출자가 exit 10 으로 멈췄다)
 export RD_CHILD_SESSION=1
 
 # 자식 세션의 Bash 기본 timeout(ms). 무인 세션이 self_test(그룹 1~3분, 전수 약 12분) 같은
@@ -455,7 +455,7 @@ if [[ "${RD_AUTOPILOT_HEADLESS_NO_INVOKE:-0}" != "1" ]]; then
   fi
   # claude 종료 코드는 exit code 로 쓰지 않는다 — outcome 토큰이 의미를 정한다. 다만 값은 보존해
   # stderr 에 적고, outcome 미기록(exit 40) 요약 줄의 원인 진단에 쓴다.
-  # 상한이 발동했는데 CHILD 가 KILL 뒤에도 살아 있으면(미회수) 기다리지 않는다 — 유한 시간에 반환해야 batch 가 paused 로 멈춘다.
+  # 상한이 발동했는데 CHILD 가 KILL 뒤에도 살아 있으면(미회수) 기다리지 않는다 — 유한 시간에 반환해야 호출자(`ralph_drain.sh`)가 멈춘다.
   if (( TIMECAP_FIRED )) && kill -0 "$CHILD" 2>/dev/null; then
     echo "autopilot_headless: 경고 — claude(pid ${CHILD}) 가 회수 뒤에도 살아 있어 종료를 기다리지 않습니다" >&2
   else

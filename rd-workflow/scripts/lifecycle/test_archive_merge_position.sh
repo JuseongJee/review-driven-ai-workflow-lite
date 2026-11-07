@@ -81,6 +81,9 @@ mk_case() {
   [[ -d "$W" ]] || { fail "$name: promote 가 worktree 를 만들지 못했습니다"; return 1; }
   printf 'line1\nline2-FR\nline3\n' > "$W/shared.txt"
   printf 'fr-only\n' > "$W/fr.txt"
+  # 앞선 아카이브 사본(후속 없음)이 브랜치에 있어도 archive.sh 는 이번 마감의 사본을 읽어야 한다(T2 가 본다).
+  mkdir -p "$W/rd-workflow-workspace/backlog/request-archive"
+  printf '# Change Request\n\n## Source FR\n-\n' > "$W/rd-workflow-workspace/backlog/request-archive/2026-11-01-0000-older.md"
   [[ -z "$fr_extra" ]] || "$fr_extra"
   git -C "$W" add -A && git -C "$W" commit -q -m "구현"
   ( cd "$W" && bash rd-workflow/scripts/prepare_review_pipeline.sh diff ) >/dev/null 2>&1 || true
@@ -96,6 +99,8 @@ mk_case() {
   done
   mkdir -p "$W/rd-workflow-workspace/backlog/request-archive"
   cp "$W/REQUEST.md" "$W/rd-workflow-workspace/backlog/request-archive/2026-11-04-0000-t.md"
+  # 아카이브 사본의 「후속 FR:」 를 archive.sh 가 읽는지 T2 가 본다(미등록 slug → 경고, 발행은 계속).
+  printf '\n## Constraints\n- 후속 FR: mp-unregistered-followup\n' >> "$W/rd-workflow-workspace/backlog/request-archive/2026-11-04-0000-t.md"
   git -C "$W" add -A && git -C "$W" commit -q -m "docs: REQUEST 아카이브 + seal"
   SEAL_FILE="$(ls "$W"/rd-workflow-workspace/.lifecycle/review-seals/*.seal | head -1)"
 }
@@ -126,6 +131,7 @@ mk_case t2 && {
   ( cd "$W" && git merge --no-edit main ) >/dev/null 2>&1
   archive_main
   [[ "$ARC" -eq 0 ]]; mark $? "T2: archive rc=0" "rc=${ARC}: ${AOUT}"
+  rc=0; has "$AOUT" "archive:   - mp-unregistered-followup (미등록)" || rc=1; mark $rc "T2: 아카이브 사본의 미등록 후속 FR 을 경고하고 발행은 계속함" "${AOUT}"
   [[ "$(git -C "$B" show main:shared.txt)" == $'line1\nline2-FR\nline3' ]]; mark $? "T2: 원격 main 의 shared.txt 가 fr 내용"
 }
 

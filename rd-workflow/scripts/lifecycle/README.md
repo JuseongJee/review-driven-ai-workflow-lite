@@ -160,6 +160,8 @@ tag, push. tag 이름은 fr 모드와 같은 `fr/<YYYY-MM-DD-HHMM>/<slug>` 형�
 `bash rd-workflow/scripts/rd task set-title <제목>` 을 실행해야 한다. push 는 `REMOTE_MODE` 계약 그대로여서
 `local-only`·`--no-remote` 면 tag 가 로컬에만 남는다.
 
+**worktree 작업 색인이 있으면 기본 브랜치에서 no-fr 작업을 시작할 수 없습니다.** 작업 색인(`<git common dir>/rd-workflow/tasks.local`)이 있고 진행 중 행이 0건이면, `rd task set-status` 같은 작업 대상 명령은 fr 브랜치가 아닌 체크아웃을 작업 대상으로 고르지 않고 `진행 중인 작업이 없습니다.` 로 거부합니다. 모든 작업을 발행한 뒤 기본 브랜치에서 실수로 부른 명령이 기준(baseline) task-state·`CURRENT_TASK.md` 를 작업처럼 고치지 않게 하기 위해서입니다. 거부 메시지는 색인 경로·원인·새 작업 시작 명령(`promote.sh --short-title <slug> --size small|large --source-fr <FR 경로|->`)을 함께 보여 줍니다. 기본 브랜치에서 직접 작업하려면 색인 상태에 따라 복구합니다. 색인에 행이 하나도 없으면 색인 파일을 지웁니다(`rm '<색인 경로>'`, 다음 promote 가 새로 만듭니다). 정리 대기 행이 있으면 먼저 `bash rd-workflow/scripts/rd task list` 로 정리한 뒤 다시 실행합니다.
+
 #### 종료 코드 계약
 
 | 종료 코드 | 의미 |
@@ -217,7 +219,7 @@ worktree **제거 실패**나 **등록 잔존**(locked·prune 만료 등)은 이
 
 #### 정리 잔여 기록
 
-`archive.sh` 는 종료 직전 정리 잔여를 파일로도 남긴다. stdout 블록은 그 실행에서만 보이므로, 무인 소비처(autopilot 보고서·`ralph_drain.sh` 요약·`/fr batch` 최종 요약)가 읽을 수 있게 하기 위해서다. 읽고 쓰는 명령은 `cleanup_pending.sh` 가 맡는다.
+`archive.sh` 는 종료 직전 정리 잔여를 파일로도 남긴다. stdout 블록은 그 실행에서만 보이므로, 무인 소비처(autopilot 보고서·`ralph_drain.sh` 요약·`/fr do --headless` 최종 요약)가 읽을 수 있게 하기 위해서다. 읽고 쓰는 명령은 `cleanup_pending.sh` 가 맡는다.
 
 - **위치**: `<git-common-dir>/rd-workflow/archive-cleanup-pending/<slug>`. git 추적 밖이므로 `.gitignore` 도 마이그레이션도 필요 없고, worktree 가 지워져도 남는다.
 - **항목 단위**: 파일은 잔여 항목 줄만 담는다. 한 줄이 위 요약 블록의 내부 레코드 하나(4필드, TAB 구분, identifier 는 `%q` 인코딩 그대로)이고, 잔여 항목 1건이 1줄이다.
@@ -308,6 +310,13 @@ bash rd-workflow/scripts/lifecycle/promote_rollback.sh \
 ```
 
 **호출 위치:** 기본 브랜치 worktree only.
+
+**기동 실패 뒤 손으로 띄운 세션의 보호.** 자동 기동이 실패하면(`launch=failed`) 안내가 수동 기동 명령 `cd <worktree> && claude` 를 줍니다. 이 명령으로 띄운 세션은 herdr 이름이 slug 가 아니므로 이름 판정(`session_probe`)이 찾지 못합니다. 그래서 두 명령은 cwd 판정(cwd 가 그 worktree 안인 herdr 에이전트 또는 `claude` 프로세스)을 함께 씁니다. herdr 밖 셸에서도 `claude` 프로세스 관측(`ps`·`lsof`)으로 동작합니다.
+- `bash rd-workflow/scripts/rd task resolve-launch <slug>` 는 `launch=failed` 를 받습니다. 이름 판정이 `alive` 이거나 cwd 판정이 살아 있음을 확인하면 `launch=ok` 로 확정합니다. 확인하지 못하면 색인을 바꾸지 않고 rc 1 로 끝내며, 수동 기동 명령과 「띄운 뒤 같은 명령으로 확정」 안내를 보여 줍니다. `failed` 에 `--assume-ended` 를 주면 거부합니다.
+- resolve-launch 는 어느 갈래든 관측 뒤 락 아래에서 색인이 관측 전과 같은지 확인하고, 바뀌었거나 저장에 실패하면 색인을 그대로 두고 rc 1 로 끝냅니다.
+- rollback 은 `launch=failed` 에서 이름 판정 `alive` 또는 cwd 판정으로 살아 있음을 확인하면 worktree·브랜치를 지우지 않고 rc 1 로 거부합니다. 확인하지 못하면 지금처럼 취소를 끝까지 진행합니다.
+- rollback 은 `launch=ok` 에서 이름 판정이 `dead` 여도 cwd 판정을 한 번 더 합니다. 살아 있으면 `(launch=ok, probe=alive — <근거>)` 로 거부하고 「세션을 끝낸 뒤 재시도」 를 안내합니다. `failed` 를 `ok` 로 확정한 손 기동 세션이 여기서 보호됩니다.
+- 두 갈래 모두 `--force` 를 주면 WARNING 을 낸 뒤 계속합니다. `--force` 는 미커밋 작업물 보호도 함께 해제합니다. cwd 판정은 같은 worktree 에서 도는 다른 `claude` 프로세스도 살아 있음으로 봅니다 — 이 오인은 「지우지 않음」 쪽으로만 기웁니다.
 
 ---
 

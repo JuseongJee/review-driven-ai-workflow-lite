@@ -28,6 +28,7 @@ Thumbs.db
 .superpowers/
 # batch/autopilot 런타임 상태 (휘발성 — 커밋 불필요)
 rd-workflow-workspace/.batch-manifest.json
+rd-workflow-workspace/.lifecycle/fr-do/
 rd-workflow-workspace/.batch-outcome-*
 rd-workflow-workspace/.autopilot-outcome
 # 리뷰 세션 런타임 산출물 (어댑터 대기 상태·codex 출력 로그·타임아웃 마커).

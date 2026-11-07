@@ -869,3 +869,25 @@ PY
 **실행 절차**: 별도 스니펫이 없습니다. M005 가 옛 감시 항목 문자열을 지우고, M003 이 새 가드 등록과 새 감시 항목을 더합니다. 순서는 M005 → M008 → M003 입니다.
 
 **사용자가 할 일**: 세션 안에서 worktree 를 지우려다 막히면 세션을 끝낸 뒤 기본 체크아웃에서 `cd <기본 체크아웃> && bash rd-workflow/scripts/rd task list` 를 실행합니다.
+
+## M017: `/fr batch` 별칭화 · batch manifest 폐지 · `scripts/batch/` 제거
+
+**조건**: 이 버전 이후로 동기화하는 모든 프로젝트.
+
+**동작 변화**:
+- `/fr do` 가 새 진입점입니다. `/fr batch` 는 이번 발행까지 별칭으로 `/fr do --headless` 와 같이 동작하고, 시작할 때 별칭 안내와 남은 manifest 안내를 출력합니다. 다음 발행에서 별칭이 없어집니다.
+- batch manifest(`rd-workflow-workspace/.batch-manifest.json`)를 더는 쓰지 않습니다. `scripts/batch/` 의 `batch_manifest.sh`·`headless_result.sh`·`README.md` 와 그 테스트가 지워집니다.
+- `scripts/batch/resume_candidates.sh` 는 `scripts/resume_candidates.sh` 로 옮겨졌습니다.
+- `fr_relations.sh batch-draft` 서브커맨드가 없어졌습니다.
+- `workflow.json` 에 선택 키 `fr_do_max_streams`(기본 `4`)가 생겼습니다. 키가 없어도 `4` 로 동작합니다.
+
+**실행 절차**: 필수 스니펫은 없습니다. `.gitignore` 에 아래 줄을 더합니다. 기존 `.batch-manifest.json`·`.batch-outcome-*`·`.batch-logs/` 줄은 남은 파일이 미추적으로 잡히지 않도록 그대로 둡니다.
+
+```
+rd-workflow-workspace/.lifecycle/fr-do/
+```
+
+**사용자가 할 일**:
+- 진행 중이던 batch manifest 가 있으면 파일을 지우지 않고 남은 항목(`state` 가 `completed` 가 아니고 `feasibility` 가 `excluded` 가 아닌 항목)을 `/fr do <slug들>` 로 이어 처리합니다. `/fr batch` 별칭을 실행하면 남은 slug 를 안내합니다. 확인이 끝나면 manifest 파일을 직접 지웁니다.
+- `scripts/batch/resume_candidates.sh` 를 직접 부르던 스크립트는 `scripts/resume_candidates.sh` 로 바꿉니다.
+- `batch_manifest.sh`·`headless_result.sh` 를 직접 부르던 스크립트는 대체 경로가 없습니다. 무인 완주는 `/fr do --headless`(엔진 `ralph_drain.sh` 에 `RD_RALPH_SLUGS` 로 slug 목록 전달)로 바꿉니다.

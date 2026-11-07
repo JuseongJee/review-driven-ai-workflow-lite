@@ -862,7 +862,7 @@ elif [[ ! "$p" =~ $re ]]; then
 elif [[ "$c" =~ $re && ! "$c" > "$p" ]]; then
   echo "템플릿 변경 이력: 받은 VERSION($cur)이 이전 VERSION($prev)보다 뒤가 아니어서 새 변화가 없습니다."
 else
-  awk -v prev="$p" -v lite="${prev%%-*}" -v cap=40 -v path="$f" '
+  LC_ALL=C awk -v prev="$p" -v lite="${prev%%-*}" -v cap=40 -v path="$f" '
     BEGIN { d = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]" }
     /^## / {
       h = substr($0, 4); cur = 0; inold = (h == "그 이전")
@@ -1009,13 +1009,12 @@ capture 본문은 입력 원문이라 token / API key / password 가 포함될 �
 
 3. **legacy capture frontmatter 변환** (구 형식 `fr-title` frontmatter 의 capture 가 있는 프로젝트):
 
-   **Step 3-a: `fr-title` → `short-title` 자동 변환** (macOS BSD sed 기준):
+   **Step 3-a: `fr-title` → `short-title` 자동 변환** (BSD·GNU sed 공용):
    ```bash
-   # macOS BSD sed: sed -i ''
-   # GNU sed (Linux): sed -i (빈 인수 없이)
+   # sed -i.bak 은 BSD·GNU 둘 다에서 동작합니다. 만든 .bak 은 바로 지웁니다.
    find rd-workflow-workspace/raw-captures -maxdepth 1 -type f -name "*.md" 2>/dev/null \
      | while IFS= read -r f; do
-         sed -i '' 's/^fr-title:/short-title:/' "$f"
+         sed -i.bak 's/^fr-title:/short-title:/' "$f" && rm -f "$f.bak"
        done
    ```
 
@@ -1024,18 +1023,18 @@ capture 본문은 입력 원문이라 token / API key / password 가 포함될 �
    legacy capture 가 모두 FR 등록 시점 생성분이면 (구 형식은 fr stage capture 만 생성) 아래 명령으로 `stage: fr` 일괄 삽입 가능. 여러 stage 가 혼재하거나 출처가 불분명하면 수동 편집 필수.
 
    ```bash
-   # stage 필드가 없는 파일에 short-title 라인 직후 stage: fr 삽입 (macOS BSD sed 기준)
+   # stage 필드가 없는 파일에 short-title 라인 직후 stage: fr 삽입 (BSD·GNU sed 공용)
    find rd-workflow-workspace/raw-captures -maxdepth 1 -type f -name "*.md" 2>/dev/null \
      | while IFS= read -r f; do
          if ! awk '/^---$/{c++; if(c==2)exit} c==1 && /^stage:/{found=1} END{exit !found}' "$f"; then
-           sed -i '' '/^short-title:/a\
+           sed -i.bak '/^short-title:/a\
    stage: fr
-   ' "$f"
+   ' "$f" && rm -f "$f.bak"
          fi
        done
    ```
 
-   주의: `sed -i '' '/^---$/a\...'` 는 파일 안의 모든 `---` 라인 다음에 삽입될 수 있으므로 결과를 반드시 검토할 것. frontmatter 외부에 `---` 가 있으면 수동 편집 권장.
+   주의: `sed -i.bak '/^---$/a\...'` 는 파일 안의 모든 `---` 라인 다음에 삽입될 수 있으므로 결과를 반드시 검토할 것. frontmatter 외부에 `---` 가 있으면 수동 편집 권장.
 
    본 변환은 신 형식만 인식하는 runtime 코드와 호환을 맞춘다. runtime 호환 코드는 추가하지 않으므로 변환 누락 시 신 코드가 구 캡처를 인식 못 한다.
 

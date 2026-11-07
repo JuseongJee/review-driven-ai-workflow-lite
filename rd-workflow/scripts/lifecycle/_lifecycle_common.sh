@@ -802,7 +802,7 @@ index_row_ncol() {
 #   `|` 로 나눈 필드 번호(맨 앞 `|` 앞의 빈 필드가 1번)이며, check_fr_index_detail_consistency.sh 와 같은 방식이다.
 #   그런 행이 없으면 출력 없이 rc 1. 정본 7칸 인덱스(| 날짜 | 제목 | …)에서는 항상 3 이다.
 index_title_field() {
-  awk 'BEGIN { r = 1 }
+  LC_ALL=C awk 'BEGIN { r = 1 }
     /^\|/ { l = $0; gsub(/\\\|/, "\001", l); n = split(l, a, "|")
       for (i = 1; i <= n; i++) { c = a[i]; gsub(/^[ \t]+|[ \t]+$/, "", c); if (c == "제목") { print i; r = 0; exit } } }
     END { exit r }' "$1"

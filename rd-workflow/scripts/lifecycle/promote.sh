@@ -945,6 +945,20 @@ if [[ "$NEED_ATTACH" -eq 1 ]]; then
   else
     git worktree add "$TARGET_DIR" "$TARGET_BRANCH"
     echo "promote: worktree $TARGET_DIR 생성 ($TARGET_BRANCH)"
+    # 새 worktree 의 submodule 은 비어 있으므로 초기화한다. 실패해도 착수는 계속한다 —
+    # submodule 없이 작업하는 사용자도 있고, 원격 접근 실패가 작업 착수를 막을 이유는 아니다.
+    if [[ -f "${TARGET_DIR}/.gitmodules" ]]; then
+      echo "promote: submodule 을 초기화합니다 (git submodule update --init --recursive) — 원격에서 받으므로 시간이 걸릴 수 있습니다" >&2
+      if _sub_out="$(git -C "$TARGET_DIR" submodule update --init --recursive 2>&1)"; then
+        echo "promote: submodule 초기화 완료"
+      else
+        {
+          echo "promote: submodule 초기화 실패 — 착수는 계속합니다. submodule 디렉터리가 비어 있을 수 있습니다."
+          printf '%s\n' "$_sub_out" | tail -3 | sed 's/^/  /'
+          echo "  복구: git -C $(printf '%q' "$TARGET_DIR") submodule update --init --recursive"
+        } >&2
+      fi
+    fi
   fi
 fi
 

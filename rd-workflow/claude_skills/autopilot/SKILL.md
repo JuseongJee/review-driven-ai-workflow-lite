@@ -17,7 +17,7 @@ FUTURE_REQUESTS에서 작업을 선택하고 파이프라인을 자율 실행한
 
 ```bash
 bash -s <<'RD_SKILL_COMPAT'
-RD_SKILL_BASE=2026-11-04-203832 RD_SKILL_NAME=autopilot
+RD_SKILL_BASE=2026-11-07-210251 RD_SKILL_NAME=autopilot
 vf="rd-workflow/VERSION"
 if [ ! -f "$vf" ] && [ -f "_ROOT_FILES/rd-workflow/VERSION" ]; then exit 0; fi
 v=""; [ -f "$vf" ] && v="$(cat "$vf")"; v="${v#lite-}"
@@ -133,7 +133,7 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 `
 
 ## 무인 진입 (headless / unattended)
 
-`claude -p` 헤드리스에서 사람 개입 없이 autopilot 을 완주시키는 비대화형 진입 경로다. 두 front-end(ralph 무인 큐 드레인 · batch 큐레이션 묶음)가 공통으로 이 경로를 통해 진입하며, 얇은 wrapper `rd-workflow/scripts/autopilot_headless.sh` 가 진입점이다. front-end A(ralph 무인 큐 드레인)의 진입점은 supervisor 스크립트 `rd-workflow/scripts/ralph_drain.sh` 다 — wrapper 를 `RD_AUTOPILOT_FR=auto` 로 반복 호출해 준비된 큐를 소진하고, exit code(0/10/20/30/40)만 보고 계속/중단하며 blocked FR 은 위 status=blocked 처리로 자동 제외된다. 오케스트레이션 지능은 넣지 않는다.
+`claude -p` 헤드리스에서 사람 개입 없이 autopilot 을 완주시키는 비대화형 진입 경로다. 두 front-end(`/fr do --headless` 와 `ralph_drain.sh` 직접 실행)가 공통으로 이 경로를 통해 진입하며, 얇은 wrapper `rd-workflow/scripts/autopilot_headless.sh` 가 진입점이다. front-end A(ralph 무인 큐 드레인)의 진입점은 supervisor 스크립트 `rd-workflow/scripts/ralph_drain.sh` 다 — wrapper 를 `RD_AUTOPILOT_FR=auto` 로 반복 호출해 준비된 큐를 소진하고, exit code(0/10/20/30/40)만 보고 계속/중단하며 blocked FR 은 위 status=blocked 처리로 자동 제외된다. 오케스트레이션 지능은 넣지 않는다.
 
 ### 활성화 신호
 
@@ -208,13 +208,13 @@ autopilot_headless: 실행 비용 $0.4213 (정가 환산) · 토큰 입력 1,204
 | `RD_AUTOPILOT_MODE` | `A` \| `B` | 미지정이면 등급 판정이 모드를 정한다. 지정하면 사용자 override 로 취급한다(`B` 는 하향 — 되돌리기 어려운 효과가 있는 FR 에는 적용되지 않고 A 로 진행 + 보고) |
 | `RD_FINISH_POLICY` | `push` \| `merge` \| `none` | 미지정 시 `push`. `push`=정규 archive.sh 전체, `merge`=로컬 merge+tag(push 생략), `none`=fr branch 커밋만. wrapper 가 해석해 `archive.sh` 인자로 옮긴다(`merge`=`--no-remote`). 무인 front-end 를 띄울 때 고른 이 값이 발행 승인이며, 무인 경로는 발행 요청 큐(`rd publish request`)를 쓰지 않는다 |
 | `RD_AUTOPILOT_OUTCOME_FILE` | 경로 | outcome 기록 대상. wrapper 가 설정해 주입 (기본 `rd-workflow-workspace/.autopilot-outcome`) |
-| `RD_AUTOPILOT_COST_FILE` | 경로 | 비어 있지 않으면 wrapper 가 실행마다 `cost<TAB>ok<TAB><USD>` 또는 `cost<TAB>unknown<TAB><사유>` 줄을 덧붙인다(덮어쓰지 않음). worktree 밖 경로나 gitignore 된 경로만 쓴다 — 미추적 파일은 다음 발행의 clean 검사를 막는다. batch 류 호출자 권장: `$(git rev-parse --path-format=absolute --git-common-dir)/rd-workflow/batch-cost/<slug>.tsv` |
+| `RD_AUTOPILOT_COST_FILE` | 경로 | 비어 있지 않으면 wrapper 가 실행마다 `cost<TAB>ok<TAB><USD>` 또는 `cost<TAB>unknown<TAB><사유>` 줄을 덧붙인다(덮어쓰지 않음). worktree 밖 경로나 gitignore 된 경로만 쓴다 — 미추적 파일은 다음 발행의 clean 검사를 막는다. 호출자 권장: `$(git rev-parse --path-format=absolute --git-common-dir)/rd-workflow/autopilot-cost/<slug>.tsv` |
 | `RD_PUBLISH_WALL_MINUTES` | 분(소수 허용) | 발행 단계(`archive.sh`)의 경과 시간 상한. 미지정 시 `loop-guard.json` 의 `publish_wall_minutes` 키, 그것도 없으면 기본 30분 순으로 정한다. `0`=상한 없음. 초과하면 TERM → 유예 → KILL 이고 유예는 `RD_FR_WALL_GRACE_SECONDS` 를 공유한다 |
 
 ### 무인 분기 작업 선택 (§1 게이트 대체)
 
-1. **resume 우선**: `bash rd-workflow/scripts/batch/resume_candidates.sh` 를 실행하고 **첫 줄과 종료 코드**로 분기한다. 후보 계산은 이 스크립트가 한다 — 여기서 다시 계산하지 않는다. 출처는 메인 `CURRENT_TASK.md` 가 아니라 tasks 색인과 각 worktree 의 `task-state` 다(`promote.sh` 는 작업 상태를 fr worktree 에 쓰고 메인 파일은 baseline 으로 둔다). 읽기 전용이다.
-   - 첫 줄이 `select<TAB><slug><TAB><worktree>`: 그 worktree 로 이동해 그 FR 을 재개한다 (§5 재사용). `RD_AUTOPILOT_FR=auto`(또는 미지정)이면 스크립트가 고른 후보가 대상이고, `RD_AUTOPILOT_FR=<slug>` 이면 스크립트가 그 slug 만 `select` 한다 — batch 는 요청한 FR 의 결과를 그 FR 에 적용하므로 다른 작업을 재개하면 요청 FR 이 실행되지 않은 채 blocked 로 오판되기 때문이다. 명시 slug 가 후보가 아니면 스크립트가 `none` 을 내고 다른 후보는 `skip` 줄(`명시 FR <slug> 지정 중`)로만 보고한다.
+1. **resume 우선**: `bash rd-workflow/scripts/resume_candidates.sh` 를 실행하고 **첫 줄과 종료 코드**로 분기한다. 후보 계산은 이 스크립트가 한다 — 여기서 다시 계산하지 않는다. 출처는 메인 `CURRENT_TASK.md` 가 아니라 tasks 색인과 각 worktree 의 `task-state` 다(`promote.sh` 는 작업 상태를 fr worktree 에 쓰고 메인 파일은 baseline 으로 둔다). 읽기 전용이다.
+   - 첫 줄이 `select<TAB><slug><TAB><worktree>`: 그 worktree 로 이동해 그 FR 을 재개한다 (§5 재사용). `RD_AUTOPILOT_FR=auto`(또는 미지정)이면 스크립트가 고른 후보가 대상이고, `RD_AUTOPILOT_FR=<slug>` 이면 스크립트가 그 slug 만 `select` 한다 — slug 를 지정한 호출자는 요청 FR 의 결과를 그 FR 에 적용하므로 다른 작업을 재개하면 요청 FR 이 실행되지 않은 채 blocked 로 오판되기 때문이다. 명시 slug 가 후보가 아니면 스크립트가 `none` 을 내고 다른 후보는 `skip` 줄(`명시 FR <slug> 지정 중`)로만 보고한다.
    - `select` 로 그 worktree 로 이동해 재개한 직후 `bash rd-workflow/scripts/autopilot_driver.sh begin` 을 실행한다.
    - 첫 줄이 `none`: 2·3항으로 내려간다.
    - 첫 줄이 `undetermined` (rc=3): `RD_AUTOPILOT_FR` 값과 무관하게(`auto` 든 명시 slug 든) 새 작업을 시작하지 않는다. outcome `blocked:resume-undetermined` 를 기록하고 스크립트 출력의 둘째 줄 이후를 outcome 둘째 줄부터 그대로 옮긴 뒤 종료한다. 생존·소유를 확인할 수 없는 작업을 가로채지 않으려는 것이다. 이 실패는 FR 을 고르기 전의 전역 실패이므로 `ralph_drain.sh` 가 즉시 중단하며, FR status 를 바꾸거나 `CURRENT_TASK` 를 초기화하지 않는다 — 대상 FR 이 없다.

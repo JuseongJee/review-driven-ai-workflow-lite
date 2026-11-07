@@ -63,7 +63,7 @@ run_case() {
   # 주의: BSD/macOS env 는 옵션을 환경 대입보다 **앞**에 두어야 한다 (test_review_wait.sh probe() 와 동일).
   #       -u 를 "$@" 앞에 두므로, 호출부가 이 변수를 의도적으로 넘기면 그 대입이 이긴다.
   out=$(env -u RD_AUTOPILOT_FR -u RD_AUTOPILOT_MODE -u RD_FINISH_POLICY \
-        -u RD_RALPH_MAX_ITER -u RD_RALPH_NONPROGRESS_LIMIT -u RD_AUTOPILOT_COST_FILE "$@" \
+        -u RD_RALPH_MAX_ITER -u RD_RALPH_NONPROGRESS_LIMIT -u RD_AUTOPILOT_COST_FILE -u RD_RALPH_SLUGS -u RD_RALPH_RELATIONS_CMD "$@" \
         RD_STUB_CODES="$codes" RD_STUB_COUNTER="$counter" \
         RD_AUTOPILOT_OUTCOME_FILE="$outcome" \
         RD_RALPH_WRAPPER_CMD="bash $STUB" \
@@ -281,6 +281,82 @@ assert_not_contains '$0'
 run_case "비용 합계: 드레인 도중 기록 파일이 사라짐" 0 "0 30" RD_STUB_COSTS="ok:0.5 gone"
 assert_contains '집계 불가 — 비용 기록 파일을 읽을 수 없음'
 assert_not_contains '$0'
+
+# --- RD_RALPH_SLUGS: 지정 목록 모드 (/fr do --headless 엔진) ---
+# 관계 판정 stub — 호출마다 $RD_REL_DIR/<n>.out 을 내고 <n>.rc 가 있으면 그 코드로 끝낸다.
+REL_STUB="${TMP}/rel_stub.sh"
+cat > "$REL_STUB" <<'RELEOF'
+#!/usr/bin/env bash
+n=$(( $(cat "$RD_REL_DIR/n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$RD_REL_DIR/n"
+echo "$*" >> "$RD_REL_DIR/args"
+cat "$RD_REL_DIR/$n.out" 2>/dev/null || printf 'queue-empty\n'
+exit "$(cat "$RD_REL_DIR/$n.rc" 2>/dev/null || echo 0)"
+RELEOF
+slug_case() {
+  # $1 이름 $2 기대 exit $3 wrapper codes, 나머지 env. 호출 전 REL_DIR 에 <n>.out 을 채운다.
+  local name="$1" expect="$2" codes="$3"; shift 3
+  run_case "$name" "$expect" "$codes" RD_RALPH_RELATIONS_CMD="bash $REL_STUB" RD_REL_DIR="$REL_DIR" "$@"
+}
+new_rel_dir() { REL_DIR="${TMP}/rel.$1"; mkdir -p "$REL_DIR"; }
+
+new_rel_dir 1; printf 'select\t2026-01-01-b\n' > "$REL_DIR/1.out"; printf 'queue-empty\n' > "$REL_DIR/2.out"
+SENV="${TMP}/slugenv1"; : > "$SENV"
+slug_case "slugs_pick_passes_slug" 0 "0" RD_RALPH_SLUGS="b c" RD_FINISH_POLICY=push RD_STUB_ENVLOG="$SENV"
+assert_contains "queue-empty (지정 목록 소진)"
+if [ "$(head -n1 "$SENV")" = "FR=b MODE=A FINISH=push" ]; then echo "  ok [slugs] 첫 호출 FR=b MODE=A FINISH=push"; else echo "  FAIL [slugs] envlog: $(cat "$SENV")"; fail=1; fi
+if grep -q -- '--slugs b c' "$REL_DIR/args"; then echo "  ok [slugs] --slugs 전달"; else echo "  FAIL [slugs] args: $(cat "$REL_DIR/args")"; fail=1; fi
+
+new_rel_dir 2; printf 'queue-blocked\nb\t대기\t선행 FR 완료 후\n' > "$REL_DIR/1.out"
+slug_case "slugs_queue_blocked" 0 "0" RD_RALPH_SLUGS="b"
+assert_contains "queue-blocked"
+assert_detail_in_summary "b	대기	선행 FR 완료 후"
+
+new_rel_dir 3; printf 'unavailable\n-\t인덱스 없음\t확인\n' > "$REL_DIR/1.out"; echo 2 > "$REL_DIR/1.rc"
+slug_case "slugs_unavailable" 1 "0" RD_RALPH_SLUGS="b"
+assert_contains "관계 판정 불가"
+
+# 완료(0)한 slug 는 다음 반복의 --slugs 에서 빠진다. stub 이 매번 같은 FR 을 골라도 wrapper 는 1회다.
+new_rel_dir 4; for k in 1 2 3; do printf 'select\t2026-01-01-b\n' > "$REL_DIR/$k.out"; done
+slug_case "slugs_done_not_reselected" 0 "0 0 0" RD_RALPH_SLUGS="b"
+assert_invocations 1
+assert_contains "queue-empty (지정 목록 소진)"
+# blocked(20) 로 끝난 slug 도 빠지고, 남은 slug 만 다음 --slugs 로 넘긴다.
+new_rel_dir 5; printf 'select\t2026-01-01-b\n' > "$REL_DIR/1.out"; printf 'queue-empty\n' > "$REL_DIR/2.out"
+slug_case "slugs_blocked_excluded" 0 "20" RD_RALPH_SLUGS="b c"
+if [ "$(sed -n 2p "$REL_DIR/args")" = "auto-pick --root . --slugs c" ]; then echo "  ok [slugs] blocked slug 제외 후 --slugs c"; else echo "  FAIL [slugs] args: $(cat "$REL_DIR/args")"; fail=1; fi
+
+# 관계 판정 실패 요약에 stderr 마지막 줄을 붙인다.
+new_rel_dir 6; printf 'unavailable\n' > "$REL_DIR/1.out"; echo 2 > "$REL_DIR/1.rc"
+cat > "${TMP}/rel_err.sh" <<'ERREOF'
+#!/usr/bin/env bash
+echo "첫 줄" >&2; echo "fr_relations.sh: 마지막 오류 줄" >&2
+exec bash "$RD_REL_STUB" "$@"
+ERREOF
+run_case "slugs_unavailable_stderr" 1 "0" RD_RALPH_SLUGS="b" RD_RALPH_RELATIONS_CMD="bash ${TMP}/rel_err.sh" RD_REL_STUB="$REL_STUB" RD_REL_DIR="$REL_DIR"
+assert_contains "stderr: fr_relations.sh: 마지막 오류 줄"
+
+# 프로젝트 경로에 공백이 있어도 기본 관계 판정(훅 미설정)이 실제 fr_relations.sh 로 돈다.
+SP="${TMP}/with space"; mkdir -p "$SP/scripts/lifecycle" "$SP/proj/rd-workflow-workspace/backlog/items"
+cp "${SCRIPT_DIR}/ralph_drain.sh" "${SCRIPT_DIR}/fr_relations.sh" "${SCRIPT_DIR}/_fr_status.sh" "$SP/scripts/"
+cp "${SCRIPT_DIR}/lifecycle/cleanup_pending.sh" "$SP/scripts/lifecycle/"
+printf '# 2026-01-01 b\n- status: validated\n- kind: feature\n- summary: fixture\n' > "$SP/proj/rd-workflow-workspace/backlog/items/2026-01-01-b.md"
+{ printf '## 인덱스\n\n| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 관계 | 상세 |\n|------|------|------|------|------|----------|------|------|\n'
+  printf '| 2026-01-01 | b | 요약 | feature | validated | P1 | - | [상세](items/2026-01-01-b.md) |\n'; } > "$SP/proj/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
+DRAIN_SAVED="$DRAIN"; DRAIN="$SP/scripts/ralph_drain.sh"; cd "$SP/proj" || exit 1
+SENV3="${TMP}/slugenv3"; : > "$SENV3"
+run_case "slugs_space_path_default_relations" 0 "0" RD_RALPH_SLUGS="b" RD_STUB_ENVLOG="$SENV3"
+cd "$SCRIPT_DIR" || exit 1; DRAIN="$DRAIN_SAVED"
+assert_contains "queue-empty (지정 목록 소진)"
+if [ "$(cat "$SENV3")" = "FR=b MODE=A FINISH=merge" ]; then echo "  ok [slugs] 공백 경로에서 FR=b 선택"; else echo "  FAIL [slugs] envlog: $(cat "$SENV3")"; fail=1; fi
+
+COUNTER_EMPTY="${TMP}/counter"
+run_case "slugs_empty_set" 1 "0" RD_RALPH_SLUGS="" RD_RALPH_RELATIONS_CMD="bash $REL_STUB" RD_REL_DIR="$TMP"
+assert_contains "RD_RALPH_SLUGS 가 비어 있습니다"
+if [ "$LAST_INVOCATIONS" = "0" ]; then echo "  ok [slugs] 빈 목록 wrapper 호출 0회"; else echo "  FAIL [slugs] wrapper 호출 ${LAST_INVOCATIONS}회"; fail=1; fi
+
+SENV2="${TMP}/slugenv2"; : > "$SENV2"
+run_case "slugs_unset_keeps_auto" 0 "30" RD_STUB_ENVLOG="$SENV2"
+if grep -q "FR=auto" "$SENV2"; then echo "  ok [slugs] 미설정은 FR=auto"; else echo "  FAIL [slugs] envlog: $(cat "$SENV2")"; fail=1; fi
 
 if [ "$fail" -ne 0 ]; then echo "test_ralph_drain: FAIL"; exit 1; fi
 echo "test_ralph_drain: PASS"

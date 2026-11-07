@@ -1044,7 +1044,7 @@ eq "$rc" "1" "(b) 증거 exit-code=1: seal 거부"
 # (c) 증거 tree-hash 불일치
 put_evidence "$RV" 0
 CUR8="$(kv_get() { awk -F'=' -v k="$2" '$1==k{sub(/^[^=]+=/,"");print;exit}' "$1"; }; kv_get "$EVF" tree-hash | cut -c1-8)"
-sed -i 's/^tree-hash=.*/tree-hash=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/; s/^command=.*/command=bash x.sh --y/' "$EVF"
+sed -i.bak 's/^tree-hash=.*/tree-hash=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/; s/^command=.*/command=bash x.sh --y/' "$EVF" && rm -f "$EVF.bak"
 seal "$RV" "${SV#${RV}/}"; rc=$?
 eq "$rc" "1" "(c) 증거 트리 불일치: seal 거부"
 has "증거 deadbeef ≠ 현재 ${CUR8}" "$(cat "${OUT}/seal.err")" "(c) 증거 앞 8자 ≠ 현재 앞 8자 표기"
@@ -1052,7 +1052,7 @@ has "verify_record.sh -- bash x.sh --y" "$(cat "${OUT}/seal.err")" "(c) 증거�
 
 # (d) schema 키만 빠진 증거 — 나머지는 유효해도 거부
 put_evidence "$RV" 0
-sed -i '/^schema=/d' "$EVF"
+sed -i.bak '/^schema=/d' "$EVF" && rm -f "$EVF.bak"
 seal "$RV" "${SV#${RV}/}"; rc=$?
 eq "$rc" "1" "(d) schema 키 누락: seal 거부"
 has "손상" "$(cat "${OUT}/seal.err")" "(d) malformed 안내"

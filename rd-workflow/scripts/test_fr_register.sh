@@ -53,7 +53,8 @@ reg() { ( cd "$1" && TMPDIR="$TMPD" bash rd-workflow/scripts/rd task fr-register
 line1() { printf '%s\n' "$1" | sed -n 1p; }
 refs_count() { ( cd "$1" && git for-each-ref | wc -l | tr -d ' ' ); }
 wt_count() { ( cd "$1" && git worktree list | wc -l | tr -d ' ' ); }
-tmp_clean() { [[ -z "$(ls -A "$TMPD")" ]] && pass "$1: helper 임시 파일(TMPDIR) 잔존 없음" || fail "$1: TMPDIR 잔존 — $(ls -A "$TMPD")"; }
+# xcrun_db 는 macOS xcrun shim(/usr/bin/git) 의 캐시라 helper 잔존물이 아니다(일부 샌드박스 환경에서 TMPDIR 에 생김).
+tmp_clean() { local rest; rest="$(ls -A "$TMPD" | grep -vx 'xcrun_db' || true)"; [[ -z "$rest" ]] && pass "$1: helper 임시 파일(TMPDIR) 잔존 없음" || fail "$1: TMPDIR 잔존 — $rest"; }
 on_main_has() { ( cd "$1" && git cat-file -e "main:$2" 2>/dev/null ); }
 main_blob_eq() { [[ "$(cd "$1" && git rev-parse "main:$2")" == "$(cd "$1" && git hash-object "$3")" ]]; }
 in_fr() { ( cd "$1" && git checkout -q -b "$2" main ); }
@@ -439,6 +440,15 @@ out="$(reg "$R" hd1)"; rc=$?
 [[ "$out" == *"6-a"* && "$out" == *"rd task fr-register --slug hd1"* ]] && pass "머리행 불일치: 6-a 와 재실행 명령 안내" || fail "안내 문장 — $out"
 [[ "$(cd "$R" && git rev-parse main)" == "$old_h" ]] && pass "머리행 불일치: main ref 불변 (회귀 확인)" || fail "main ref 가 움직임"
 tmp_clean "머리행 불일치"
+
+# macOS awk 는 en_US.UTF-8 에서 한글끼리 == 를 strcoll 로 비교해 "날짜"=="제목" 을 참으로 본다 — 제목 칸 판정이 로캘과 무관해야 한다
+if LC_ALL=en_US.UTF-8 awk 'BEGIN{exit !("상세"=="제목")}' 2>/dev/null; then
+  printf '| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |\n' > "$T/hdr-en.md"
+  got="$(source "$SCRIPT_DIR/lifecycle/_lifecycle_common.sh"; LC_ALL=en_US.UTF-8 index_title_field "$T/hdr-en.md")"
+  [[ "$got" == 3 ]] && pass "index_title_field: en_US.UTF-8 에서도 제목 칸 3" || fail "index_title_field: en_US.UTF-8 에서도 제목 칸 3 — got $got"
+else
+  echo "  skip: en_US.UTF-8 에서 한글 collation 결함이 재현되지 않음"
+fi
 
 [[ "$(fx_snap "$TPL")" == "$SNAP0" ]] || fail "복제 원본이 시나리오 중 바뀜"
 echo "fr_register: PASS=$PASS FAIL=$FAIL"

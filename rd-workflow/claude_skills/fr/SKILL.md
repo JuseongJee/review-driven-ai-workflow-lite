@@ -2,10 +2,10 @@
 name: fr
 description: >
   Manage future requests — add, list, prioritize, lifecycle, sync with GitHub Issues.
-  Subcommands: /fr add, /fr list, /fr pri, /fr inspect, /fr archive, /fr park, /fr status, /fr pull, /fr push, /fr sync, /fr batch.
+  Subcommands: /fr add, /fr list, /fr pri, /fr inspect, /fr archive, /fr park, /fr status, /fr pull, /fr push, /fr sync, /fr do (/fr batch is an alias of /fr do --headless until the next release).
   Use when the user wants to manage backlog items.
   Model self-invocation is limited to list / pri / inspect / pull and local-only add; publishing to GitHub (add while fr_github is enabled, push, sync)
-  and batch, archive, park, status all require an explicit user request.
+  and do (batch alias), archive, park, status all require an explicit user request.
 user-invocable: true
 ---
 
@@ -26,6 +26,8 @@ Typical user requests:
 - "N번 검토해줘" / "N번 autopilot 가능한지 봐줘" → 직전 `/fr list` 출력에서 N번 행의 short-title을 찾아 `/fr inspect <short-title>`로 라우팅 (번호는 inspect의 공식 인자가 아니라 라우팅 단계 변환용)
 - "done 항목 정리해줘" → `/fr archive`로 라우팅
 - "이거 parked로 옮겨줘" → `/fr park`로 라우팅
+- "착수 가능한 것들 띄워" / "더 띄울 FR 없나" → `/fr do`로 라우팅
+- "/fr do --headless" / "준비된 FR 무인으로 돌려줘" → `/fr do --headless`로 라우팅
 
 사용자가 `/fr <subcommand> [args]` 형식으로 호출하거나, 위의 자연어 요청으로 호출합니다.
 
@@ -39,7 +41,7 @@ Typical user requests:
 
 ```bash
 bash -s <<'RD_SKILL_COMPAT'
-RD_SKILL_BASE=2026-11-04-203832 RD_SKILL_NAME=fr
+RD_SKILL_BASE=2026-11-07-210251 RD_SKILL_NAME=fr
 vf="rd-workflow/VERSION"
 if [ ! -f "$vf" ] && [ -f "_ROOT_FILES/rd-workflow/VERSION" ]; then exit 0; fi
 v=""; [ -f "$vf" ] && v="$(cat "$vf")"; v="${v#lite-}"
@@ -66,10 +68,11 @@ RD_SKILL_COMPAT
 - `pull` → Read `rd-workflow/claude_skills/fr/pull.md` and follow it.
 - `push` → Read `rd-workflow/claude_skills/fr/push.md` and follow it.
 - `sync` → Read `rd-workflow/claude_skills/fr/sync.md` and follow it.
-- `batch` → Read `rd-workflow/claude_skills/fr/batch.md` and follow it.
+- `do` → Read `rd-workflow/claude_skills/fr/do.md` and follow it.
+- `batch` → 별칭입니다. Read `rd-workflow/claude_skills/fr/do.md` 의 「`/fr batch` 별칭」 절 and follow it.
 - 그 외 / 인자 없음 → 아래 사용법 출력 후 종료 (파일 수정 없음 보장)
 
-**Legacy call 처리**: 첫 번째 단어가 `add`, `list`, `pri`, `inspect`, `archive`, `park`, `status`, `pull`, `push`, `sync`, `batch` 중 어느 것도 아니면 사용법 help를 출력합니다. 파일을 절대 수정하지 않습니다.
+**Legacy call 처리**: 첫 번째 단어가 `add`, `list`, `pri`, `inspect`, `archive`, `park`, `status`, `pull`, `push`, `sync`, `do`, `batch` 중 어느 것도 아니면 사용법 help를 출력합니다. 파일을 절대 수정하지 않습니다.
 
 ### 사용법 출력
 
@@ -85,7 +88,9 @@ RD_SKILL_COMPAT
 - `/fr pull` — GitHub Issues → 로컬 FR 가져오기
 - `/fr push [제목]` — 로컬 FR → GitHub Issue 내보내기
 - `/fr sync` — 연결된 항목 status 동기화
-- `/fr batch <slug들>` — FR 묶음을 큐레이션 후 순차 autopilot 완주
+- `/fr do [<slug들>]` — 여러 FR 을 줄기로 묶어 병렬로 띄우고 감시·발행 허가·마감까지 처리 (터미널 herdr)
+- `/fr do --headless [--finish push|merge|none] [<slug들>]` — 고른 FR 을 무인으로 순차 완주
+- `/fr batch <인자>` — `/fr do --headless` 의 별칭 (별칭, 다음 배포에서 제거)
 
 예: `/fr add autopilot에서 review gate 자동화`
 ```
@@ -154,5 +159,5 @@ RD_SKILL_COMPAT
 - 결함 보고 전달은 FR 경로와 분리됩니다 — 라벨은 `defect-report`, 도구는 `defect_reports.sh`, 실패는 종료가 아니라 미전달 표시입니다.
 - **모델 자기호출 경계**: 모델이 사용자의 명시 요청 없이 이 skill 을 스스로 호출한 경우 `list`·`pri`·`inspect`·`pull` 과 **로컬 전용 `add`** 만 수행합니다.
   - `add` 는 자기호출일 때 **유효 backend 와 무관하게 로컬로만 등록**합니다. GitHub 연동이 활성이어도 `gh issue create` 로 넘어가지 않고, 로컬 등록을 마친 뒤 "GitHub Issue 발행은 사용자 요청이 필요합니다 — 발행하려면 `/fr push <제목>` 를 요청해 주십시오" 를 알립니다. `add` 의 `GitHub 연동` 절차는 사용자가 직접 호출한 경우에만 실행합니다.
-  - `push`(외부 저장소 Issue 발행)·`sync`(원격 label 변경·Issue close)·`batch`(무인 autopilot 완주)·`archive`·`park`·`status` 는 사용자의 명시 요청을 요구하며, 요청이 없으면 수행하지 않고 어떤 요청이 필요한지 알립니다.
+  - `push`(외부 저장소 Issue 발행)·`sync`(원격 label 변경·Issue close)·`do`(여러 FR 처리. 별칭 `batch` 포함)·`archive`·`park`·`status` 는 사용자의 명시 요청을 요구하며, 요청이 없으면 수행하지 않고 어떤 요청이 필요한지 알립니다.
   - 플래그가 skill 단위여서 부분 개방이 불가하므로 이 경계는 문서 계약이며 harness 강제가 아닙니다 (`AUTONOMY.md` 「실행 모드와 skill 호출 권한」).

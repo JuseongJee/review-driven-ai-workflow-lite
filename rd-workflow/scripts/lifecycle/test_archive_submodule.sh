@@ -557,6 +557,99 @@ ok_if "G4b: fetch 완료 안내" out_has "fetch 완료"
 ok_if "G4b: 판정 불가 안내" out_has "판정 불가"
 ok_if "G4b: 기본 브랜치 HEAD 불변" eq "$(gl_head)" "$g4b_head"
 
+# ---- promote 의 submodule 초기화 (FR promote-submodule-worktree-init) ----
+# copy_case <name> — 템플릿을 복사만 한다(promote 없음). 전역: CASE_NAME CASE_REPO CASE_WT
+copy_case() {
+  CASE_NAME="$1"; mkdir -p "$TMP/$1"
+  cp -R "$TEMPLATE_DIR/repo" "$TMP/$1/repo"; cp -R "$TEMPLATE_DIR/overlay.git" "$TMP/$1/overlay.git"
+  CASE_REPO="$TMP/$1/repo"; CASE_WT="$CASE_REPO/.worktrees/$1"
+  git -C "$CASE_REPO" remote set-url origin "$TMP/$1/overlay.git"
+}
+run_promote() {  # <slug> — stdout 은 PR_OUT, stderr 는 PR_ERR, rc 는 PR_RC
+  PR_RC=0
+  PR_OUT="$(bash "$CASE_REPO/rd-workflow/scripts/lifecycle/promote.sh" --short-title "$1" --size large --source-fr - 2>"$TMP/pr.err")" || PR_RC=$?
+  PR_ERR="$(cat "$TMP/pr.err")"
+}
+
+echo "== P1: promote 가 새 worktree 의 submodule 을 중첩까지 초기화한다 =="
+copy_case p1; run_promote p1
+if [[ "$PR_RC" == 0 && -f "$CASE_WT/libs/prod/p.txt" && -f "$CASE_WT/libs/prod/vendor/v.txt" && "$PR_OUT" == *"submodule 초기화 완료"* ]]; then
+  pass "P1: rc=0, libs/prod·libs/prod/vendor 체크아웃됨"
+else
+  fail "P1: rc=$PR_RC — $PR_OUT / $PR_ERR"
+fi
+
+echo "== P2: submodule 원격에 닿지 못해도 promote 는 착수를 마치고 복구 명령을 알린다 =="
+copy_case p2
+git -C "$CASE_REPO" config submodule.libs/prod.url "$TMP/p2/missing.git"
+run_promote p2
+if [[ "$PR_RC" == 0 && -d "$CASE_WT" && "$(git -C "$CASE_WT" rev-parse --abbrev-ref HEAD)" == fr/p2 \
+      && "$PR_ERR" == *"submodule 초기화 실패"* \
+      && "$PR_ERR" == *"복구: git -C $(printf '%q' "$CASE_WT") submodule update --init --recursive"* ]]; then
+  pass "P2: rc=0, worktree 생성, 실패 안내·복구 명령 출력"
+else
+  fail "P2: rc=$PR_RC — $PR_OUT / $PR_ERR"
+fi
+
+# ---- 미push 판정의 원격 tag (FR submodule-unpushed-check-remote-tags) ----
+tree_clean() {  # stdout 은 TC_OUT, stderr 는 TC_ERR, rc 는 TC_RC
+  TC_RC=0; TC_OUT="$(rd_submodule_tree_clean "$1" --require-pushed 2>"$TMP/tc.err")" || TC_RC=$?
+  TC_ERR="$(cat "$TMP/tc.err")"
+}
+
+echo "== U1: 원격에 push 한 annotated tag 로만 닿는 submodule 커밋은 미push 가 아니다 =="
+prep_case u1
+sub_commit "$CASE_WT"
+git -C "$CASE_WT/libs/prod" tag -a "u1-t1" -m t1; git -C "$CASE_WT/libs/prod" push -q origin "refs/tags/u1-t1"
+record_gitlink "$CASE_WT"
+tree_clean "$CASE_WT"
+if [[ "$TC_RC" == 0 ]]; then pass "U1: clean"; else fail "U1: rc=$TC_RC — $TC_OUT"; fi
+
+echo "== U2: push 하지 않은 로컬 tag 로 닿는 커밋은 여전히 미push 다 =="
+sub_commit "$CASE_WT"
+git -C "$CASE_WT/libs/prod" tag -a "u1-t2" -m t2
+record_gitlink "$CASE_WT"
+tree_clean "$CASE_WT"
+if [[ "$TC_RC" == 1 && "$TC_OUT" == "unpushed"$'\t'"libs/prod" ]]; then pass "U2: unpushed"; else fail "U2: rc=$TC_RC — $TC_OUT"; fi
+
+echo "== U3: 원격 tag 조회(ls-remote)가 실패하면 미push 로 본다 =="
+prep_case u3
+sub_commit "$CASE_WT"
+git -C "$CASE_WT/libs/prod" tag -a "u3-t1" -m t1; git -C "$CASE_WT/libs/prod" push -q origin "refs/tags/u3-t1"
+record_gitlink "$CASE_WT"
+git -C "$CASE_WT/libs/prod" remote set-url origin "$TMP/u3/missing.git"
+tree_clean "$CASE_WT"
+if [[ "$TC_RC" == 1 && "$TC_OUT" == "unpushed"$'\t'"libs/prod" && "$TC_ERR" == *"submodule libs/prod: 원격 origin tag 조회 실패"* ]]; then
+  pass "U3: unpushed, 조회 실패 안내"
+else
+  fail "U3: rc=$TC_RC — $TC_OUT / $TC_ERR"
+fi
+
+echo "== U4: 저장소의 core.sshCommand 로만 닿는 원격도 tag 를 조회한다 (사용자 전송 설정을 덮어쓰지 않음) =="
+# u3 의 worktree 를 이어 쓴다: tag u3-t1 은 prod.git 에 push 돼 있다. 원격 주소는 ssh 로 바꾸고,
+# 저장소 설정의 sshCommand 래퍼만 실제 prod.git 의 upload-pack 으로 잇는다.
+printf '#!/bin/sh\nexec git-upload-pack "%s"\n' "$TEMPLATE_DIR/prod.git" > "$TMP/u3/ssh-wrap.sh"; chmod +x "$TMP/u3/ssh-wrap.sh"
+git -C "$CASE_WT/libs/prod" remote set-url origin "ssh://127.0.0.1:1/prod.git"
+git -C "$CASE_WT/libs/prod" config core.sshCommand "$TMP/u3/ssh-wrap.sh"
+git -C "$CASE_WT/libs/prod" config ssh.variant ssh
+tree_clean "$CASE_WT"
+if [[ "$TC_RC" == 0 ]]; then pass "U4: clean"; else fail "U4: rc=$TC_RC — $TC_OUT / $TC_ERR"; fi
+
+echo "== U5: 응답하지 않는 원격은 대기 상한에서 멈추고 미push 로 본다 — TERM 을 무시하는 실행에서도 (공유 락을 오래 붙잡지 않음) =="
+printf '#!/bin/sh\nexec sleep 30\n' > "$TMP/u3/ssh-hang.sh"; chmod +x "$TMP/u3/ssh-hang.sh"
+git -C "$CASE_WT/libs/prod" config core.sshCommand "$TMP/u3/ssh-hang.sh"
+u5_t0=$SECONDS
+# 호출 셸이 TERM 을 무시하면 git·래퍼도 무시를 상속합니다. 그래도 상한 + 유예(2초) 안에 돌아와야 합니다.
+trap '' TERM
+RD_LSREMOTE_TIMEOUT=2 tree_clean "$CASE_WT"
+trap - TERM
+u5_el=$((SECONDS - u5_t0))
+if [[ "$TC_RC" == 1 && "$TC_OUT" == "unpushed"$'\t'"libs/prod" && "$TC_ERR" == *"2초 안에 끝나지 않아 멈췄습니다"* && "$u5_el" -lt 10 ]]; then
+  pass "U5: ${u5_el}초 만에 unpushed, 시간 초과 안내"
+else
+  fail "U5: rc=$TC_RC 경과=${u5_el}초 — $TC_OUT / $TC_ERR"
+fi
+
 
 DONE=1
 echo "test_archive_submodule: PASS=$PASS FAIL=$FAIL"

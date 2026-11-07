@@ -308,14 +308,26 @@ task_resolve_target() {
       local idx_path="" idx_exists=0
       idx_path="$(tasks_index_path 2>/dev/null)" || idx_path=""
       [[ -n "$idx_path" && -f "$idx_path" ]] && idx_exists=1
-      local blocked=0
+      local blocked=0 cur_branch=""
       if [[ "$idx_exists" -eq 1 ]]; then
-        local cur_branch=""
         cur_branch="$(git -C "${project_root}" symbolic-ref --quiet --short HEAD 2>/dev/null)" || cur_branch=""
         [[ "$cur_branch" != fr/* ]] && blocked=1
       fi
       if [[ "$blocked" -eq 1 ]]; then
+        # 막는 동작은 유지하고 원인과 복구 방법을 알린다. 정리 대기 수 = 전체 행 − 진행 중 행.
+        local all_n=0 act_n=0 pend_n=0 _l
+        while IFS= read -r _l; do [[ -n "$_l" ]] && all_n=$((all_n + 1)); done <<< "$cwd_candidates"
+        while IFS= read -r _l; do [[ -n "$_l" ]] && act_n=$((act_n + 1)); done <<< "$slugs"
+        pend_n=$((all_n - act_n))
         echo "진행 중인 작업이 없습니다." >&2
+        echo "  원인: 이 저장소는 worktree 작업 색인(${idx_path})을 쓰므로, fr 브랜치가 아닌 체크아웃(${cur_branch:-detached})을 작업 대상으로 고르지 않습니다 — 기본 브랜치의 기준 상태를 작업처럼 바꾸지 않기 위해서입니다." >&2
+        echo "  새 작업 시작: bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug> --size small|large --source-fr <FR 경로|->" >&2
+        if [[ "$pend_n" -gt 0 ]]; then
+          echo "  기본 브랜치에서 직접(no-fr) 작업하려면: 정리 대기 작업 ${pend_n}건이 남아 있습니다 — 먼저 bash rd-workflow/scripts/rd task list 로 정리한 뒤 다시 실행하십시오" >&2
+        else
+          # 빈 색인을 지우면 「색인을 써 본 적 없는 저장소」 와 같아져 기존 fallback 이 적용된다.
+          echo "  기본 브랜치에서 직접(no-fr) 작업하려면: 색인에 남은 작업이 없으므로 색인 파일을 지우면 됩니다: rm '${idx_path}'" >&2
+        fi
         return 1
       fi
       if [[ "$op" == "write" ]]; then
@@ -410,6 +422,10 @@ task_resolve_launch() {
       *) echo "resolve-launch: 알 수 없는 인자: $1" >&2; return 1 ;;
     esac
   done
+  # 저장 실패 때 안내하는 재시도 명령은 원래 플래그를 유지한다 — `launch=ok --assume-ended` 가
+  # alive 갈래로 가도 플래그 없는 재시도는 `ok` 거부로 끝나기 때문이다.
+  local retry_suffix=""
+  [[ "$assume_ended" -eq 1 ]] && retry_suffix=" --assume-ended"
 
   local launch token pid
   launch="$(tasks_index_get "$slug" launch 2>/dev/null)" || launch=""
@@ -424,6 +440,16 @@ task_resolve_launch() {
     # `--force` 는 생존 가드와 함께 미커밋 작업물 보호까지 해제한다 — 「세션 종료만 확인하고
     # 파일 보호는 유지」하는 정상 취소 경로가 사라진다. 그 경로를 여기서 연다.
     # 플래그 없이 부른 `ok` 는 여전히 거부한다 — 그때는 해소할 것이 없다.
+    # `failed` 는 손으로 띄운 세션(이름이 slug 가 아님)이 살아 있음을 확인했을 때만 ok 로
+    # 확정한다. 종료를 확정할 것은 없으므로 --assume-ended 는 거부한다.
+    failed)
+      if [[ "$assume_ended" -eq 1 ]]; then
+        echo "resolve-launch: '${slug}' 는 이미 기동 실패(failed)로 확정돼 있습니다 — 종료를 확정할 것이 없습니다." >&2
+        return 1
+      fi
+      _task_resolve_launch_failed "$slug"
+      return $?
+      ;;
     ok)
       if [[ "$assume_ended" -ne 1 ]]; then
         echo "resolve-launch: '${slug}' 는 이미 기동 성공(ok)으로 확정돼 있어 해소할 것이 없습니다." >&2
@@ -440,8 +466,10 @@ task_resolve_launch() {
   # pid 검사는 **예약(launching)에만** 적용한다. unknown 은 예약 없이(기동 함수가 판정에
   # 실패해 결과만 unknown 으로 기록된 경우) 도달할 수 있어 token 이 비어 있거나, 남아
   # 있더라도 이미 끝난 예약의 잔재라 "진행 중" 의 근거가 되지 못한다.
+  # token 자체는 상태와 무관하게 관측 전에 읽는다 — 확정 때 같은 slug 로 다시 만든 작업을 가리는
+  # 기대값이다(_task_resolve_launch_commit).
+  token="$(tasks_index_get "$slug" launch-token 2>/dev/null)" || token=""
   if [[ "$launch" == "launching" ]]; then
-    token="$(tasks_index_get "$slug" launch-token 2>/dev/null)" || token=""
     pid="${token##*-}"
     if [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
       echo "resolve-launch: '${slug}' 기동이 아직 진행 중입니다 (pid=${pid}) — 해소하지 않습니다." >&2
@@ -476,23 +504,14 @@ task_resolve_launch() {
           echo "resolve-launch: '${slug}' 세션은 살아 있지만 인계가 처리됐는지 확인되지 않아 launch 를 바꾸지 않았습니다(launch=${launch} 유지)." >&2
           return 1
         fi
-        tasks_lock_acquire "resolve-launch" "$slug" || {
-          echo "resolve-launch: 락을 얻지 못했습니다 — 잠시 후 다시 시도하세요." >&2
-          return 1
-        }
-        tasks_index_upsert "$slug" launch=ok
-        tasks_lock_release
+        _task_resolve_launch_commit "$slug" "$launch" "$wt" "$token" ok "$retry_suffix" || return 1
         echo "resolve-launch: '${slug}' 세션이 살아 있고 인계가 처리돼 launch=ok 로 확정했습니다."
         echo "resolve-launch: $(session_launch_status_hint ok "$slug")"
         echo "resolve-launch: 인계가 처리됐습니다 (worktree=${wt})."
         return 0
       fi
-      tasks_lock_acquire "resolve-launch" "$slug" || {
-        echo "resolve-launch: 락을 얻지 못했습니다 — 잠시 후 다시 시도하세요." >&2
-        return 1
-      }
-      tasks_index_upsert "$slug" launch=ok
-      tasks_lock_release
+      # 확정에 실패하면 인계를 보내지 않는다 — 행이 바뀌었으면 그 세션이 이 작업의 것이라고 단정할 수 없다.
+      _task_resolve_launch_commit "$slug" "$launch" "$wt" "$token" ok "$retry_suffix" || return 1
       echo "resolve-launch: '${slug}' 세션이 살아 있어 launch=ok 로 확정했습니다."
       echo "resolve-launch: $(session_launch_status_hint ok "$slug")"
       # 인계 전달 (F4) — 락 **밖**에서 한다. 전달은 herdr 응답을 기다리는 일이라 락 안에
@@ -524,18 +543,13 @@ task_resolve_launch() {
       return 0
       ;;
     dead)
-      tasks_lock_acquire "resolve-launch" "$slug" || {
-        echo "resolve-launch: 락을 얻지 못했습니다 — 잠시 후 다시 시도하세요." >&2
-        return 1
-      }
-      tasks_index_upsert "$slug" launch=failed
-      tasks_lock_release
+      _task_resolve_launch_commit "$slug" "$launch" "$wt" "$token" failed "$retry_suffix" || return 1
       if [[ "$assume_ended" -eq 1 ]]; then
         echo "resolve-launch: 사용자 확인(--assume-ended)에 따라 '${slug}' 를 launch=failed 로 확정했습니다." >&2
       else
         echo "resolve-launch: '${slug}' 세션을 찾을 수 없어 launch=failed 로 확정했습니다." >&2
       fi
-      echo "resolve-launch: $(session_launch_status_hint failed)" >&2
+      echo "resolve-launch: $(session_launch_status_hint failed "$slug")" >&2
       if [[ -n "$wt" ]]; then
         echo "  수동 기동: $(session_launch_command "$wt" "$slug")" >&2
       fi
@@ -563,6 +577,95 @@ task_resolve_launch() {
       return 1
       ;;
   esac
+}
+
+# _task_session_cwd_alive <slug> <worktree> <backend> — cwd 관측으로 그 worktree 의 세션 생존을 판정한다.
+#   cwd 가 worktree 안인 herdr 에이전트(agent list)나 claude 프로세스(ps·lsof)를 찾는다 — 이름이
+#   slug 가 아닌, 손으로 띄운 세션을 잡기 위해서다. 판정은 session_ended_judge 를 그대로 쓴다.
+#   이름 판정(session_probe)은 하지 않는다 — 호출부가 조합한다.
+#   rc 0: 살아 있음 확인, stdout 근거 한 줄(예: `claude 프로세스 cwd 일치`).
+#   rc 1: 확인 못함, stdout 사유 한 줄(ended → `관측된 세션 없음`, unknown → judge 의 사유).
+#   같은 worktree 에서 도는 다른 claude 프로세스도 살아 있음으로 본다 — 오인은 「지우지 않음」 쪽으로 기운다.
+_task_session_cwd_alive() {
+  local slug="${1-}" wt="${2-}" backend="${3:-herdr}" d ast pst verdict
+  if [[ -z "$wt" ]]; then printf 'worktree 경로 없음\n'; return 1; fi
+  d="$(mktemp -d)" || { printf '관측 임시 디렉터리 생성 실패\n'; return 1; }
+  [[ -n "$d" && -d "$d" ]] || { printf '관측 임시 디렉터리 경로 검증 실패\n'; return 1; }
+  ast="$(session_observe_agents "$d/agents")"
+  pst="$(session_observe_procs "$d/procs")"
+  verdict="$(session_ended_judge "$slug" "$wt" "$ast" "$d/agents" "$pst" "$d/procs" "$backend")"
+  rm -rf "$d"
+  case "$verdict" in
+    alive$'\t'*)   printf '%s\n' "${verdict#alive$'\t'}"; return 0 ;;
+    ended)         printf '관측된 세션 없음\n'; return 1 ;;
+    unknown$'\t'*) printf '%s\n' "${verdict#unknown$'\t'}"; return 1 ;;
+    *)             printf '관측 상태 이상\n'; return 1 ;;
+  esac
+}
+
+# _task_resolve_launch_commit <slug> <exp_launch> <exp_wt> <exp_token> <new_launch> [<retry_suffix>]
+#   — resolve-launch 의 모든 확정 갈래가 쓰는 공용 확정. 관측은 락 밖에서 했으므로, 락 아래에서
+#   행이 있고 launch·worktree-path·launch-token 이 관측 전 값과 같을 때만 launch=<new_launch> 를 쓴다.
+#   그사이 rollback 이 행을 지웠거나, 같은 slug 로 새 작업이 promote 됐거나(새 token), promote·다른
+#   호출이 launch 를 기록했으면 쓰지 않는다 — upsert 는 없는 행도 만들어 취소한 작업을 되살린다.
+#   행 존재는 slug 칸으로 본다 — launch 키가 없는 행도 있는 행이다.
+#   <retry_suffix> 는 저장 실패 때 안내하는 재시도 명령 끝에 붙인다(예: ` --assume-ended`).
+#   rc 0: 확정. rc 1: 락 실패·색인 변경·저장 실패 — 색인은 그대로이고 문구는 이 함수가 stderr 로 낸다.
+_task_resolve_launch_commit() {
+  local slug="$1" exp_launch="$2" exp_wt="$3" exp_token="$4" new_launch="$5" retry_suffix="${6-}"
+  tasks_lock_acquire "resolve-launch" "$slug" || {
+    echo "resolve-launch: 락을 얻지 못했습니다 — 잠시 후 다시 시도하세요." >&2
+    return 1
+  }
+  local cur_row="" cur_launch="" cur_wt="" cur_token=""
+  cur_row="$(tasks_index_get "$slug" slug 2>/dev/null)" || cur_row=""
+  cur_launch="$(tasks_index_get "$slug" launch 2>/dev/null)" || cur_launch=""
+  cur_wt="$(tasks_index_get "$slug" worktree-path 2>/dev/null)" || cur_wt=""
+  cur_token="$(tasks_index_get "$slug" launch-token 2>/dev/null)" || cur_token=""
+  if [[ -z "$cur_row" || "$cur_launch" != "$exp_launch" || "$cur_wt" != "$exp_wt" || "$cur_token" != "$exp_token" ]]; then
+    tasks_lock_release
+    echo "resolve-launch: '${slug}' 의 색인이 확인 중에 바뀌어(launch=${cur_launch:-없음}) 확정하지 않았습니다 — bash rd-workflow/scripts/rd task status 로 상태를 본 뒤 다시 실행하십시오." >&2
+    return 1
+  fi
+  if ! tasks_index_upsert "$slug" "launch=${new_launch}"; then
+    tasks_lock_release
+    echo "resolve-launch: '${slug}' 색인 저장에 실패해 launch=${exp_launch:-(빈 값)} 가 남아 있습니다 — 같은 명령으로 다시 시도하십시오: bash rd-workflow/scripts/rd task resolve-launch ${slug}${retry_suffix}" >&2
+    return 1
+  fi
+  tasks_lock_release
+  return 0
+}
+
+# _task_resolve_launch_failed <slug> — task_resolve_launch 의 failed 갈래.
+#   이름 판정이 alive 이거나 cwd 판정이 rc 0 이면 락 아래에서 launch=ok 로 확정한다. 인계는 보내지
+#   않는다 — 손으로 띄운 세션은 사용자가 직접 지시했고, 이름이 slug 가 아니라 보낼 대상도 없다.
+#   둘 다 확인하지 못하면 색인을 바꾸지 않고 rc 1 이다.
+_task_resolve_launch_failed() {
+  local slug="$1" wt token backend probe evidence="" cwd_msg="" cwd_rc=1
+  wt="$(tasks_index_get "$slug" worktree-path 2>/dev/null)" || wt=""
+  # launch-token 은 기동 예약마다 promote 가 새로 쓴다 — 관측 뒤 같은 slug·경로로 다시 만든 작업을 가린다.
+  token="$(tasks_index_get "$slug" launch-token 2>/dev/null)" || token=""
+  backend="$(tasks_index_get "$slug" launch-backend 2>/dev/null)" || backend=""
+  [[ -n "$backend" ]] || backend="herdr"
+  probe="$(session_probe "$slug" "$wt" "$backend")"
+  if [[ "$probe" == "alive" ]]; then
+    evidence="herdr 에이전트 ${slug} 생존"
+  else
+    cwd_msg="$(_task_session_cwd_alive "$slug" "$wt" "$backend")" && cwd_rc=0 || cwd_rc=1
+    [[ "$cwd_rc" -eq 0 ]] && evidence="$cwd_msg"
+  fi
+  if [[ -n "$evidence" ]]; then
+    _task_resolve_launch_commit "$slug" failed "$wt" "$token" ok "" || return 1
+    echo "resolve-launch: '${slug}' 세션이 살아 있어(${evidence}) launch=ok 로 확정했습니다."
+    echo "resolve-launch: $(session_launch_status_hint ok "$slug")"
+    return 0
+  fi
+  echo "resolve-launch: '${slug}' 세션이 살아 있음을 확인하지 못해 launch=failed 를 유지합니다 (이름 조회=${probe}, cwd 관측=${cwd_msg})." >&2
+  if [[ -n "$wt" ]]; then
+    echo "  수동 기동: $(session_launch_command "$wt" "$slug")" >&2
+  fi
+  echo "  세션을 띄운 뒤 같은 명령으로 확정하십시오: bash rd-workflow/scripts/rd task resolve-launch ${slug}" >&2
+  return 1
 }
 
 # _task_source_fr_slug_from_path <canonical-path> — canonical source-fr 경로에서 slug 를
@@ -1364,7 +1467,9 @@ _fr_done_index_step() {
   [[ -n "$tmp" && -f "$tmp" ]] || { printf '  인덱스: 실패 — 임시 파일 경로 검증 실패\n'; return 1; }
   sf="$(mktemp)" || { rm -f "$tmp"; printf '  인덱스: 실패 — 임시 파일 생성 실패 (mktemp)\n'; return 1; }
   [[ -n "$sf" && -f "$sf" ]] || { rm -f "$tmp" "$sf"; printf '  인덱스: 실패 — 임시 파일 경로 검증 실패\n'; return 1; }
-  awk -v slug="$slug" -v newv="done" -v sf="$sf" '
+  # LC_ALL=C — 한글 칸 이름(`제목`·`상태`)을 바이트로 비교한다. macOS awk 는 `==` 를 strcoll 로
+  # 비교하므로 en_US.UTF-8 에서는 서로 다른 한글 문자열이 같다고 나와 머리행을 잘못 읽는다.
+  LC_ALL=C awk -v slug="$slug" -v newv="done" -v sf="$sf" '
     function esc_split(line, arr,    t, i, n) {
       t = line
       gsub(/\\\|/, "@@ESCPIPE@@", t)
@@ -1421,6 +1526,22 @@ _fr_done_index_step() {
   rm -f "$sf"
   if [[ "$found" != "1" ]]; then
     rm -f "$tmp"
+    # 행을 못 찾았어도 slug 와 정확히 같은 셀이 인덱스 어딘가에 있으면 「행 부재」 가 아니라
+    # 머리행(제목·상태 칸)을 해석하지 못한 것이다 — 실패로 알려 요약의 실패 수에 넣는다.
+    if LC_ALL=C awk -v slug="$slug" '
+      /^\|/ {
+        t = $0; gsub(/\\\|/, "", t)
+        n = split(t, c, "|")
+        for (i = 1; i <= n; i++) {
+          v = c[i]; gsub(/^[ \t]+/, "", v); gsub(/[ \t]+$/, "", v)
+          if (v == slug) { hit = 1; exit }
+        }
+      }
+      END { exit !hit }
+    ' "$f"; then
+      printf "  인덱스: 실패 — '%s' 셀이 인덱스에 있으나 제목 칸에서 찾지 못했습니다 (머리행 해석 실패 — 제목·상태 칸 이름을 확인하십시오)\n" "$slug"
+      return 1
+    fi
     printf '  인덱스: 행 부재 (slug=%s)\n' "$slug"
     return 3
   fi

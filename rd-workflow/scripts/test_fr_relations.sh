@@ -181,60 +181,75 @@ out="$(validate_out)"
 check_contains "priority-drift 를 보고한다" "priority-drift" "$out"
 check_contains "priority-drift 만이면 rc=0" "rc=0" "$out"
 
-echo "== 케이스 14: batch-draft 3분기와 short-title↔stem 변환 =="
+echo "== 케이스 14: candidates 정렬 (priority → 등록일) =="
 reset_fx
-item 2026-01-14 fin done
-item 2026-01-14 outside validated
-item 2026-01-14 inside validated
-item 2026-01-14 target validated "- depends-on: 2026-01-14-inside, 2026-01-14-fin, 2026-01-14-outside"
-row 2026-01-14 outside validated P3 -
-row 2026-01-14 inside validated P3 -
-row 2026-01-14 target validated P3 'dep:2026-01-14-inside,2026-01-14-fin,2026-01-14-outside' '**[선행: inside]** 요약'
-draft="$(bash "$TARGET" batch-draft --root "$fx" --slugs "inside target")"
-check "집합 안 선행은 short-title 로 낸다" "inside" \
-  "$(printf '%s\n' "$draft" | awk -F'\t' '$1=="target" && $2=="depends_on" {print $3}')"
-check "집합 밖 충족 선행은 stem 으로 낸다" "2026-01-14-fin" \
-  "$(printf '%s\n' "$draft" | awk -F'\t' '$1=="target" && $2=="external-satisfied" {print $3}')"
-check "집합 밖 미충족 선행은 stem 으로 낸다" "2026-01-14-outside" \
-  "$(printf '%s\n' "$draft" | awk -F'\t' '$1=="target" && $2=="external-unmet" {print $3}')"
+item 2026-02-05 p2 validated
+item 2026-02-01 none validated
+item 2026-02-09 p1late validated
+item 2026-02-03 p1early validated
+row 2026-02-05 p2 validated P2 -
+row 2026-02-01 none validated - -
+row 2026-02-09 p1late validated P1 -
+row 2026-02-03 p1early validated P1 -
+check "P1(이른 날짜) → P1(늦은 날짜) → P2 → -" \
+  "2026-02-03-p1early 2026-02-09-p1late 2026-02-05-p2 2026-02-01-none" \
+  "$(bash "$TARGET" candidates --root "$fx" | cut -f1 | tr '\n' ' ' | sed 's/ $//')"
+check "한 줄 4칸(stem status priority 판정)" \
+  "2026-02-03-p1early	validated	P1	ready" \
+  "$(bash "$TARGET" candidates --root "$fx" | head -n1)"
 
-echo "== 케이스 15: batch-draft 초안이 실제 manifest validate 를 통과한다 =="
-if command -v jq >/dev/null 2>&1; then
-  mf="${fx}/manifest.json"
-  deps="$(printf '%s\n' "$draft" | awk -F'\t' '$1=="target" && $2=="depends_on" {print $3}')"
-  jq -n --arg d "$deps" '{
-    finish_policy: "merge", status: "preparing",
-    items: [
-      {slug:"inside", order:1, depends_on:[], state:"pending", feasibility:"eligible"},
-      {slug:"target", order:2, depends_on:($d|split(" ")), state:"pending", feasibility:"eligible"}
-    ]}' > "$mf"
-  if bash "${SCRIPT_DIR}/batch/batch_manifest.sh" validate "$mf" >/dev/null 2>&1; then
-    echo "  ok: 초안으로 만든 manifest 가 validate 를 통과"
-  else
-    echo "  FAIL: 초안 manifest 가 batch_manifest.sh validate 에서 거부됨" >&2; FAIL=1
-  fi
-else
-  echo "  skip: jq 없음 — manifest 연결 검사 생략"
-fi
-
-echo "== 케이스 16: batch-draft 의 관계 오류는 rc=1 =="
+echo "== 케이스 15: candidates --slugs 필터 =="
 reset_fx
-item 2026-01-16 broken validated "- depends-on: 2026-01-16-nope"
-row 2026-01-16 broken validated P3 'dep:2026-01-16-nope' '**[선행: nope]** 요약'
-out="$(bash "$TARGET" batch-draft --root "$fx" --slugs "broken" 2>&1; echo "rc=$?")"
-check_contains "관계 오류를 error 로 낸다" "error" "$out"
-check_contains "관계 오류는 rc=1" "rc=1" "$out"
+item 2026-02-01 a validated
+item 2026-02-01 b validated
+item 2026-02-01 c validated
+row 2026-02-01 a validated P1 -
+row 2026-02-01 b validated P2 -
+row 2026-02-01 c validated P3 -
+check "--slugs \"b c\" 는 b·c 줄만" "2026-02-01-b 2026-02-01-c" \
+  "$(bash "$TARGET" candidates --root "$fx" --slugs "b c" | cut -f1 | tr '\n' ' ' | sed 's/ $//')"
 
-echo "== 케이스 17: slug 미존재·복수 매칭은 rc=2 =="
+echo "== 케이스 16: candidates --slugs 미해결은 rc=2 =="
+out="$(bash "$TARGET" candidates --root "$fx" --slugs "nope" 2>&1; echo "rc=$?")"
+check_contains "stderr 에 미해결 slug" "--slugs 에 없는 FR: nope" "$out"
+check_contains "rc=2" "rc=2" "$out"
+
+echo "== 케이스 17: auto-pick --slugs 는 지정한 FR 로 제한 =="
 reset_fx
-item 2026-01-17 only validated
-row 2026-01-17 only validated P3 -
-out="$(bash "$TARGET" batch-draft --root "$fx" --slugs "nosuch" 2>&1; echo "rc=$?")"
-check_contains "미존재 slug 는 rc=2" "rc=2" "$out"
-item 2026-01-18 only validated
-row 2026-01-18 only validated P3 -
-out="$(bash "$TARGET" batch-draft --root "$fx" --slugs "only" 2>&1; echo "rc=$?")"
-check_contains "복수 매칭은 rc=2" "rc=2" "$out"
+item 2026-02-01 a validated
+item 2026-02-01 b validated
+row 2026-02-01 a validated P1 -
+row 2026-02-01 b validated P2 -
+check "--slugs 없으면 P1 인 a" "select	2026-02-01-a" "$(bash "$TARGET" auto-pick --root "$fx" | head -n1)"
+check "--slugs b 면 P1 인 a 를 두고 b" "select	2026-02-01-b" "$(bash "$TARGET" auto-pick --root "$fx" --slugs "b" | head -n1)"
+out="$(bash "$TARGET" auto-pick --root "$fx" --slugs "nope" 2>&1; echo "rc=$?")"
+check "미해결 slug 는 unavailable" "unavailable" "$(printf '%s\n' "$out" | head -n1)"
+check_contains "미해결 slug 는 rc=2" "rc=2" "$out"
+check_contains "미해결 slug 안내 칸은 --slugs 확인" "--slugs 값을 확인하십시오" "$out"
+
+echo "== 케이스 17b: --slugs 의 done FR 은 미해결이 아님 (auto-pick 은 제외, candidates 는 판정 - 로 냄) =="
+reset_fx
+item 2026-02-01 a done
+item 2026-02-01 b validated
+row 2026-02-01 b validated P1 -
+check "done 인 a 만 지정하면 활성 b 가 있어도 queue-empty" "queue-empty" "$(bash "$TARGET" auto-pick --root "$fx" --slugs "a" | head -n1)"
+check "candidates 는 rc=0 이고 지정한 done FR 을 판정 - 로 냄" "rc=0 out=[2026-02-01-a	done	-	-]" \
+  "$(o="$(bash "$TARGET" candidates --root "$fx" --slugs "a" 2>&1)"; echo "rc=$? out=[$o]")"
+
+echo "== 케이스 17c: --slugs 는 같은 short-title 의 여러 날짜 중 하나만 고름 =="
+reset_fx
+item 2026-01-01 z validated
+item 2026-03-01 z validated
+item 2026-05-01 z done
+row 2026-03-01 z validated P1 -
+check "인덱스에 행이 있는 날짜 하나만 (candidates)" "2026-03-01-z" \
+  "$(bash "$TARGET" candidates --root "$fx" --slugs "z" | cut -f1 | tr '\n' ' ' | sed 's/ $//')"
+check "인덱스에 행이 있는 날짜 하나만 (auto-pick)" "select	2026-03-01-z" "$(bash "$TARGET" auto-pick --root "$fx" --slugs "z" | head -n1)"
+reset_fx
+item 2026-01-01 y done
+item 2026-03-01 y validated
+check "인덱스 행이 없으면 가장 늦은 날짜 하나만" "2026-03-01-y" \
+  "$(bash "$TARGET" candidates --root "$fx" --slugs "y" | cut -f1 | tr '\n' ' ' | sed 's/ $//')"
 
 echo "== 케이스 18: auto-pick 의 네 갈래 =="
 reset_fx

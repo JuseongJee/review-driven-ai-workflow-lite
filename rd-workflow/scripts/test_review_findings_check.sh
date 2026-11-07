@@ -90,6 +90,40 @@ run_case "$(head_of '`src/long.js:1` — `const target = 1;`')"
 run_case "$(head_of '`src/a.sh:6` — `v=`pwd``')"
 [ "$(warns)" = "0" ]; chk $? "cite-backtick: 원문 안 백틱 허용"
 
+# cite-wrap — 2026-11-07 측정의 오탐 유형. 맞는 원문은 통과하고, 원문을 틀리게 바꾸면 그대로 경고한다.
+run_case "$(head_of '`src/a.sh:6` — `` v=`pwd` ``')"
+[ "$(warns)" = "0" ]; chk $? "cite-double-backtick: 이중 백틱으로 감싼 원문 통과"
+run_case "$(head_of '`src/a.sh:6` — `` v=`cwd` ``')"
+has 'cite-mismatch'; chk $? "cite-double-backtick: 틀린 원문은 경고"
+run_case "$(head_of '`src/a.sh:5` — `echo "target` (해당 행 안의 원문)')"
+[ "$(warns)" = "0" ]; chk $? "cite-trailing-note: 인용 뒤 설명은 대조에서 뺌"
+run_case "$(head_of '`src/a.sh:5` — `echo "other` (해당 행 안의 원문)')"
+has 'cite-mismatch'; chk $? "cite-trailing-note: 틀린 원문은 경고"
+run_case "$(head_of '`src/a.sh:6` — `v=\`pwd\``')"
+[ "$(warns)" = "0" ]; chk $? "cite-escaped-backtick: \\\` 를 백틱으로 되돌려 대조"
+run_case "$(head_of '`src/a.sh:6` — `v=\`cwd\``')"
+has 'cite-mismatch'; chk $? "cite-escaped-backtick: 틀린 원문은 경고"
+
+# cite-trailing-blank — 파일 끝 빈 줄도 줄 수에 든다 (4행 인용, 원문은 앞 3줄 안의 1행)
+printf 'target\n\n\n\n' > "$TMP/src/blank.txt"
+run_case "$(head_of '`src/blank.txt:4` — `target`')"
+[ "$(warns)" = "0" ]; chk $? "cite-trailing-blank: 파일 끝 빈 줄 인용 통과"
+
+# cite-head-oid — 리뷰 대상 커밋의 내용을 인용하면 작업 트리가 바뀐 뒤에도 통과한다. oid 가 없으면 작업 트리만 읽는다.
+G="$TMP/g"; mkdir -p "$G"
+git -C "$G" init -q && printf 'status: 구현 중\n' > "$G/c.md" && git -C "$G" add c.md \
+  && git -C "$G" -c user.name=t -c user.email=t@t commit -qm c
+OID="$(git -C "$G" rev-parse HEAD)"
+printf 'status: 검증 중\n' > "$G/c.md"
+printf '# S\n\n## Branch Context\n- review-head-oid: %s\n\n## Status\nx\n' "$OID" > "$TMP/sd/SESSION.md"
+run_case "$(head_of '`c.md:1` — `status: 구현 중`')" "$G"
+[ "$(warns)" = "0" ]; chk $? "cite-head-oid: 리뷰 대상 커밋 원문 통과"
+run_case "$(head_of '`c.md:1` — `status: 완료`')" "$G"
+has 'cite-mismatch'; chk $? "cite-head-oid: 커밋에도 작업 트리에도 없는 원문은 경고"
+rm -f "$TMP/sd/SESSION.md"
+run_case "$(head_of '`c.md:1` — `status: 구현 중`')" "$G"
+has 'cite-mismatch'; chk $? "cite-head-oid-legacy: oid 없는 세션은 작업 트리만 읽음"
+
 # confidence-missing
 run_case '- F1 t
   - 근거: `src/a.sh:5` — `echo "target line"`'

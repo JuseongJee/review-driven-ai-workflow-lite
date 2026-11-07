@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 # test_archive_worktree.sh — archive.sh 를 작업 worktree/제3 worktree 에서 호출하는
 # 경로(Task 6, spec D5·D8·D13)를 검증한다.
-# 이름 주의: scripts/batch/test_archive_state.sh 는 전혀 다른 파일(FR batch 의
-# archive-state 판정 검증)이다 — self_test.sh 가 이미 그 이름표로 등록해 두었으므로
-# 같은 이름을 쓰면 라벨이 같은 두 스텝이 생겨 한쪽 실패를 다른 쪽으로 오독한다.
 set -euo pipefail
 trap 'ec=$?; echo "  FAIL: 스위트가 line ${LINENO} 에서 rc=${ec} 로 중단됐습니다 (조용한 중단)" >&2' ERR
 DONE=0

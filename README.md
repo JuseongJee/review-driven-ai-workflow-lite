@@ -10,6 +10,19 @@ REQUEST → 리뷰 → spec/plan → 실행 → 검증 → 최종 리뷰까지, 
 
 최근 세 발행에서 달라진 것입니다. 내 프로젝트의 `rd-workflow/VERSION` 보다 뒤의 절이 `/tpl update` 로 받을 변화입니다. 전체 이력은 [`rd-workflow/CHANGELOG.md`](rd-workflow/CHANGELOG.md) 에 있습니다.
 
+### 2026-11-08-065139
+
+- **`/fr do` 추가**: 여러 FR 을 한 번에 처리하는 진입점입니다. `/fr do [<slug들>]` 는 대화형으로 FR 마다 줄기(세션)를 띄워 동시에 진행하고, `/fr do --headless [--finish push|merge|none] [<slug들>]` 는 무인으로 순서대로 완주합니다. 대화형의 동시 줄기 수 상한은 `workflow.json` 의 새 키 `fr_do_max_streams`(기본 `4`)로 정합니다.
+- **`/fr batch` 별칭화**: `/fr batch` 는 `/fr do --headless` 로 바뀌었습니다. 이번 발행까지 별칭으로 동작하고 다음 발행에서 없어집니다.
+- **batch manifest 폐지**: `rd-workflow-workspace/.batch-manifest.json` 과 `scripts/batch/` 의 `batch_manifest.sh`·`headless_result.sh` 를 없앴습니다. `fr_relations.sh batch-draft` 도 없앴습니다. 처리 대상은 slug 목록으로 지정합니다.
+- **`resume_candidates.sh` 경로 이동**: `scripts/batch/resume_candidates.sh` 가 `scripts/resume_candidates.sh` 로 옮겨졌습니다.
+- **후속 FR 확인**: REQUEST `## Constraints` 에 범위 밖 후속을 `- 후속 FR: <slug> — <설명>` 으로 적으면, `archive.sh` 가 등록되지 않은 slug 를 `archive: 후속 FR 확인` 경고로 알립니다. Source FR 과 서로 언급하는 dropped FR 이 있으면 `archive: 흡수 확인` 을 냅니다. 발행은 막지 않습니다. final diff review 의 최종 출력에도 같은 확인이 들어갑니다.
+- **submodule 저장소의 promote·정리**: `.gitmodules` 가 있으면 promote 가 새 worktree 의 submodule 을 중첩까지 초기화합니다. 실패해도 착수는 끝나고 복구 명령을 안내합니다. 원격 tag 로 닿는 submodule 커밋은 worktree 정리에서 더 이상 「원격에 없는 커밋」 으로 보류되지 않습니다.
+- **로캘과 무관한 FR 인덱스 처리**: 한글 collation 이 없는 로캘(`en_US.UTF-8` 등)에서도 `rd task fr-done`·`/fr add` 가 인덱스 칸을 바르게 찾습니다.
+- **작업 색인이 막을 때 안내**: 작업 색인이 있는 저장소의 기본 브랜치에서 `rd task` 쓰기가 거부되면, 색인 경로·원인·복구 방법을 함께 보입니다.
+- **손으로 띄운 세션 기록**: 자동 기동이 실패한(`launch=failed`) 작업도 `rd task resolve-launch <slug>` 로 손 기동 세션을 확정할 수 있습니다. 자동 기동 실패 안내가 이 방법을 알립니다. 확인 중 색인이 바뀌었거나 저장이 실패하면 확정했다고 보고하지 않고 다시 실행할 명령을 안내합니다. 세션이 살아 있으면 `promote_rollback.sh` 가 worktree 를 지우지 않습니다(`--force` 는 경고 후 계속).
+- **리뷰 인용 경고 정확도**: 리뷰어 턴 뒤의 `cite-mismatch` 경고가 맞는 인용에는 나오지 않습니다. 리뷰어는 재현 명령과 출력을 `## Reproduction` 절에 적습니다.
+
 ### 2026-11-07-210251
 
 - **팀 overlay 가이드**: rd-workflow 가 없는 기존 팀 저장소 클론을 새로 clone 하지 않고 overlay 아래로 옮겨 submodule 로 등록하는 짧은 경로를 이관 가이드에 더했습니다(브랜치·stash·미커밋 작업 유지). 예시 이름을 overlay `rd-myproject` 아래 submodule `myproject` 로 맞추고, 기존 클론 안의 세션에서 진행하지 말고 끝나면 overlay 루트에서 새 세션을 띄우라는 실행 위치 안내를 넣었습니다.
@@ -47,22 +60,6 @@ REQUEST → 리뷰 → spec/plan → 실행 → 검증 → 최종 리뷰까지, 
 - **lite 보완**: lite 의 세션 시작 화면에 진행 중 작업 표와 `rd task list` 안내가 나옵니다. lite autopilot 리뷰 턴의 `command not found: build_attempt_history` 를 고쳤습니다. lite 설치 직후 `self_test.sh consumer` 가 통과합니다. `subagent-git-safety.md` 가 lite 에 들어갑니다.
 - **`/fr batch` 재개**(full): 신호로 멈춘 batch 를 다시 돌리면 재개 확인에 판정 불가 사유가 보입니다. batch 밖 의존 FR 때문에 착수할 수 없는 FR 은 `blocked` 로 기록하고 독립 FR 은 계속합니다.
 - **`/fr batch` 원격 시간 상한**(full): 원격 조회가 30초 안에 응답하지 않으면 batch 를 `paused` 로 멈추고 `remote-timeout` 을 남깁니다. `RD_BATCH_REMOTE_TIMEOUT`(1~600초)으로 바꿉니다.
-
-### 2026-11-04-203832
-
-2026-11-01-202303 이후의 변화입니다. 같은 날 앞선 발행(2026-11-04-101302 ~ 195042)의 변화도 여기에 있습니다.
-
-- **발행 요청 큐**: promote 로 띄운 작업 세션이 호출 세션에 발행을 요청합니다(`rd publish request·wait·run`). 지연 정리(`rd task list`)가 세션이 끝난 작업 탭을 닫습니다.
-- **herdr app 기동**: promote 가 herdr app 안에서도 작업 세션을 자동으로 띄웁니다.
-- **세션 이름 충돌 거부**: promote 가 다른 작업과 세션 이름이 같은 slug 를 거부합니다.
-- **`rd task set-status`**: 커밋할 파일을 알립니다. `rd task guard --dry-run` 이 생겼습니다.
-- **seal 위치**: seal 뒤 fr 브랜치에 기본 브랜치를 병합하면 seal 이 깨집니다. 문서가 그 순서를 안내합니다.
-- **submodule 저장소**: 제품 코드가 submodule 안에 있어도 seal·발행·worktree 정리가 끝까지 돕니다.
-- **sync 보존 규칙**: `/tpl update` 가 행이 있는 표 파일(FUTURE_REQUESTS·PARKED·tier-log)과 템플릿 본이 아닌 REQUEST·CURRENT_TASK 를 보존합니다.
-- **`prepare_review_pipeline.sh diff main`**: 리뷰한 커밋을 고정한 세션을 만듭니다. `rd review seal <세션 이름>` 이 표준 위치에서 세션을 찾습니다.
-- **병렬 발행 충돌**: `archive.sh` 가 `verify-evidence` 충돌을 자동으로 풉니다.
-- **세션 기동 대기**: promote 가 기동이 느린 세션에도 시작 프롬프트를 전달합니다(`RD_LAUNCH_START_TIMEOUT` 기본 60초). autopilot 이 승격한 자식 세션에 autopilot 지시를 넘깁니다.
-- **FR 인덱스 칸**: 맨 앞에 칸을 더한 FR 인덱스에서도 `/fr add` 등록 커밋이 성공합니다.
 
 ## 전제 조건
 

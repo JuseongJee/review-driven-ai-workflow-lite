@@ -459,6 +459,28 @@ else
   fi
 fi
 
+# Step 2b — 범위 밖 후속·흡수 확인 (경고만, 발행을 막지 않음)
+# 아카이브 사본은 REQUEST.md 를 비우기 전의 내용이므로 그 사본의 「후속 FR:」 줄과 Source FR 을 읽는다.
+# 대상 사본: fr 모드는 Step 2 가 모은 기본 브랜치 이후 추가 목록, no-fr 모드는 마지막 커밋의 추가 목록.
+# 등록 대조 ref 는 작업 tip 과 기본 브랜치다 — 호출 세션이 기본 브랜치에 먼저 등록한 후속도 등록으로 센다.
+if [[ -f "$SCRIPT_DIR/followup_check.sh" ]]; then
+  if [[ "$BRANCH_MODE" == "no-fr" ]]; then
+    _fc_ref="HEAD"; _fc_def="$(get_default_branch 2>/dev/null)" || _fc_def=""
+    _fc_added="$(git log -1 --diff-filter=A --name-only --pretty=format: HEAD 2>/dev/null || true)"
+  else
+    _fc_ref="$FR_BRANCH"; _fc_def="${_cd_default:-}"; _fc_added="${_cd_added:-}"
+  fi
+  # git log 는 최신 커밋부터 나열하므로 첫 항목이 이번 마감의 사본이다(앞선 사본이 남은 브랜치에서 옛 사본을 고르지 않는다).
+  _fc_path="$(grep -E 'rd-workflow-workspace/backlog/request-archive/[^/]+\.md$' <<<"$_fc_added" | grep -v '/README\.md$' | head -1 || true)"
+  if [[ -n "$_fc_path" ]]; then
+    _fc_tmp="$(mktemp "${TMPDIR:-/tmp}/rd-followup.XXXXXX" 2>/dev/null)" || _fc_tmp=""
+    if [[ -n "$_fc_tmp" ]] && git show "$_fc_ref:$_fc_path" > "$_fc_tmp" 2>/dev/null; then
+      RD_FC_PREFIX=archive bash "$SCRIPT_DIR/followup_check.sh" "$_fc_tmp" "$_fc_ref" ${_fc_def:+"$_fc_def"} || true
+    fi
+    if [[ -n "$_fc_tmp" ]]; then rm -f "$_fc_tmp"; fi
+  fi
+fi
+
 # Step 3 이 이번 실행에서 직접 병합했으면 1 (D5 는 그때 검사하지 않는다: archive.sh 가 만든 병합은 자동 병합과 네 파일 해소뿐이다).
 ARCHIVE_MERGED_THIS_RUN=0
 

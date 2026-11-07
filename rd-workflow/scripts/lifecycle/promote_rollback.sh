@@ -242,13 +242,23 @@ case "$_launch" in
     # (launching·unknown) 막고 "살아 있음이 확인됐을 때"(ok) 통과시켰다 — 정상 기동된
     # 세션이 미커밋 코드를 쓰고 있는 동안 그 worktree 를 통째로 지우는 경로였다(AC 16).
     # 지금 생존을 다시 확인해, 살아 있거나 판정이 서지 않으면 보존한다.
-    _rb_probe="$(session_probe "$SLUG" "${TARGET_DIR:-}" "$(tasks_index_get "$SLUG" launch-backend 2>/dev/null || true)")"
+    _rb_backend="$(tasks_index_get "$SLUG" launch-backend 2>/dev/null || true)"
+    _rb_probe="$(session_probe "$SLUG" "${TARGET_DIR:-}" "$_rb_backend")"
+    _rb_evidence=""
+    # 이름 판정이 dead 여도 cwd 판정을 한 번 더 한다. failed 를
+    # resolve-launch 로 ok 확정한 손 기동 세션은 herdr 이름이 slug 가 아니라 이름 판정이 늘 dead 다.
+    # 근거는 판정값에 섞지 않는다 — 아래 안내 분기가 판정값 `alive` 를 그대로 비교한다.
+    if [[ "$_rb_probe" == "dead" ]] \
+       && _rb_cwd_msg="$(_task_session_cwd_alive "$SLUG" "${TARGET_DIR:-}" "${_rb_backend:-herdr}")"; then
+      _rb_probe="alive"
+      _rb_evidence=" — ${_rb_cwd_msg}"
+    fi
     if [[ "$_rb_probe" == "dead" ]]; then
       printf 'rollback: '"'"'%s'"'"' 세션이 이미 종료된 것으로 확인됐습니다 — 취소를 계속합니다.\n' "$SLUG"
     elif [[ "$FORCE" -eq 1 ]]; then
-      printf 'rollback: WARNING — '"'"'%s'"'"' 세션이 살아 있거나 판정이 서지 않습니다(probe=%s). --force 로 계속합니다.\n' "$SLUG" "$_rb_probe" >&2
+      printf 'rollback: WARNING — '"'"'%s'"'"' 세션이 살아 있거나 판정이 서지 않습니다(probe=%s%s). --force 로 계속합니다.\n' "$SLUG" "$_rb_probe" "$_rb_evidence" >&2
     else
-      printf 'rollback: '"'"'%s'"'"' 에 기동된 에이전트 세션이 있습니다(launch=ok, probe=%s) — 그 세션의 작업을 지우지 않기 위해 취소하지 않습니다 (상태 변경 없음).\n' "$SLUG" "$_rb_probe" >&2
+      printf 'rollback: '"'"'%s'"'"' 에 기동된 에이전트 세션이 있습니다(launch=ok, probe=%s%s) — 그 세션의 작업을 지우지 않기 위해 취소하지 않습니다 (상태 변경 없음).\n' "$SLUG" "$_rb_probe" "$_rb_evidence" >&2
       # **안내는 probe 결과에 따라 갈라야 한다** (final diff review F9 잔여). 예전에는
       # 어느 경우든 「세션을 끝내고 같은 명령을 재시도」만 제시했는데, probe 가 unknown
       # 이면(herdr 밖 셸 등) 실제로 끝낸 뒤 재시도해도 판정이 그대로라 **같은 거부가
@@ -268,6 +278,33 @@ case "$_launch" in
       printf '  세션째 버려도 된다면: bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task %s --force\n' "$SLUG" >&2
       printf '    주의 — --force 는 세션 보호뿐 아니라 **커밋되지 않은 작업물 보호까지** 함께 해제합니다.\n' >&2
       exit 1
+    fi
+    ;;
+  failed)
+    # 기동 실패 뒤 사용자가 안내의 수동 기동 명령으로 띄운 세션이 이 worktree 에서 일하고 있을 수
+    # 있다. 이름 판정(늦게 성공한 기동)과 cwd 판정(손 기동 세션)
+    # 중 하나라도 살아 있음을 확인하면 지우지 않는다. 확인하지 못하면 지금처럼 계속한다 —
+    # failed 는 자동 기동된 세션이 없다는 기록이므로, 판정 불가로 막으면 herdr 밖 셸에서
+    # 실패한 작업을 취소할 길이 --force(미커밋 보호 해제)뿐이 된다.
+    _rb_backend="$(tasks_index_get "$SLUG" launch-backend 2>/dev/null || true)"
+    _rb_probe="$(session_probe "$SLUG" "${TARGET_DIR:-}" "$_rb_backend")"
+    _rb_evidence=""
+    if [[ "$_rb_probe" == "alive" ]]; then
+      _rb_evidence="herdr 에이전트 ${SLUG} 생존"
+    elif _rb_cwd_msg="$(_task_session_cwd_alive "$SLUG" "${TARGET_DIR:-}" "${_rb_backend:-herdr}")"; then
+      _rb_evidence="$_rb_cwd_msg"
+    fi
+    if [[ -n "$_rb_evidence" ]]; then
+      if [[ "$FORCE" -eq 1 ]]; then
+        printf 'rollback: WARNING — '"'"'%s'"'"' 세션이 살아 있습니다(launch=failed, %s). --force 로 계속합니다.\n' "$SLUG" "$_rb_evidence" >&2
+      else
+        printf 'rollback: '"'"'%s'"'"' 의 worktree 에서 세션이 살아 있습니다(launch=failed, %s) — 그 세션의 작업을 지우지 않기 위해 취소하지 않습니다 (상태 변경 없음).\n' "$SLUG" "$_rb_evidence" >&2
+        printf '  먼저 그 세션을 끝내십시오 (herdr 또는 앱 화면에서 그 작업의 tab 을 종료).\n' >&2
+        printf '  종료 뒤 재시도: bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task %s\n' "$SLUG" >&2
+        printf '  세션째 버려도 된다면: bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task %s --force\n' "$SLUG" >&2
+        printf '    주의 — --force 는 세션 보호뿐 아니라 **커밋되지 않은 작업물 보호까지** 함께 해제합니다.\n' >&2
+        exit 1
+      fi
     fi
     ;;
 esac
