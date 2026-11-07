@@ -3,6 +3,7 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RD="${SCRIPT_DIR}/rd"
+source "${SCRIPT_DIR}/fixtures/review_run_fixture.sh"
 FAIL=0
 t() { # t <설명> <기대exit> <기대stdout|-> cmd...
   local desc="$1" want_rc="$2" want_out="$3"; shift 3
@@ -39,7 +40,7 @@ EOF
   # 함수 환경이 없으므로 직접 case 로 처리
   case "$2" in
     "대기 중"|"REQUEST review 대기"|"spec/plan 작성 중"|"spec/plan review 대기"|\
-    "구현 대기"|"구현 중"|"검증 중"|"diff review 대기"|"완료"|"실행 중")
+    "구현 대기"|"구현 중"|"검증 중"|"diff review 대기"|"아카이브 보류"|"완료"|"실행 중")
       # canonical 또는 legacy alias → task-state 생성
       local _ts_status="$2"
       # legacy alias '실행 중' → canonical '구현 중' 으로 정규화 (마이그레이션 계약)
@@ -132,9 +133,9 @@ t "alias 실행 중→검증 중 허용 (task-state='구현 중'으로 정규화
 mk_task_file "$TMP" "실행 중" "x"
 t "alias 실행 중→완료 차단 (task-state='구현 중')" 4 "-" bash "$RD" task set-status "완료"
 
-# 전이표 전수 (8×8): 허용 목록 외 전부 차단인지 기계 검증
-ALLOWED="대기 중→REQUEST review 대기|대기 중→구현 중|REQUEST review 대기→spec/plan 작성 중|spec/plan 작성 중→spec/plan review 대기|spec/plan review 대기→spec/plan 작성 중|spec/plan review 대기→구현 대기|구현 대기→구현 중|구현 대기→spec/plan 작성 중|구현 중→spec/plan 작성 중|구현 중→검증 중|검증 중→구현 중|검증 중→diff review 대기|diff review 대기→구현 중|diff review 대기→완료"
-STATUSES=("대기 중" "REQUEST review 대기" "spec/plan 작성 중" "spec/plan review 대기" "구현 대기" "구현 중" "검증 중" "diff review 대기" "완료")
+# 전이표 전수 (10×10, 자기 전이 제외 90건): 허용 목록 외 전부 차단인지 기계 검증
+ALLOWED="대기 중→REQUEST review 대기|대기 중→구현 중|REQUEST review 대기→spec/plan 작성 중|REQUEST review 대기→구현 중|spec/plan 작성 중→spec/plan review 대기|spec/plan 작성 중→구현 중|spec/plan review 대기→spec/plan 작성 중|spec/plan review 대기→구현 대기|spec/plan review 대기→구현 중|구현 대기→구현 중|구현 대기→spec/plan 작성 중|구현 중→spec/plan 작성 중|구현 중→검증 중|검증 중→구현 중|검증 중→diff review 대기|diff review 대기→구현 중|diff review 대기→완료|diff review 대기→아카이브 보류|아카이브 보류→완료|아카이브 보류→구현 중|아카이브 보류→검증 중"
+STATUSES=("대기 중" "REQUEST review 대기" "spec/plan 작성 중" "spec/plan review 대기" "구현 대기" "구현 중" "검증 중" "diff review 대기" "아카이브 보류" "완료")
 for from in "${STATUSES[@]}"; do
   for to in "${STATUSES[@]}"; do
     [[ "$from" == "$to" ]] && continue
@@ -145,7 +146,15 @@ for from in "${STATUSES[@]}"; do
   done
 done
 
-# --- 연속 전이 스모크 (spec/plan review 턴 002 R2): fixture 재초기화 없이 저장값·미러 확인 ---
+# 리뷰 단계→구현 중(하향)은 Risk Tier 이력 기록을 안내한다. 같은 목적지라도 구현 대기에서 오면 안내하지 않는다.
+mk_task_file "$TMP" "spec/plan review 대기" "x"
+dg_err="$(bash "$RD" task set-status "구현 중" 2>&1 >/dev/null)"
+[[ "$dg_err" == *"override·상향 이력"* ]] && echo "ok: 하향 전이 — Risk Tier 이력 기록 안내" || { echo "FAIL: 하향 전이 안내 누락 '$dg_err'"; FAIL=1; }
+mk_task_file "$TMP" "구현 대기" "x"
+dg_err="$(bash "$RD" task set-status "구현 중" 2>&1 >/dev/null)"
+[[ "$dg_err" != *"override·상향 이력"* ]] && echo "ok: 구현 대기→구현 중 — 하향 안내 없음" || { echo "FAIL: 구현 대기→구현 중 에 하향 안내 '$dg_err'"; FAIL=1; }
+
+# --- 연속 전이 스모크: fixture 재초기화 없이 저장값·미러 확인 ---
 mirror_status() { awk '/^## Status$/{getline; print; exit}' "$1/CURRENT_TASK.md"; }
 mk_task_file "$TMP" "spec/plan review 대기" "seq-task"
 t "연속 전이 1/2: spec/plan review 대기→구현 대기" 0 "-" bash "$RD" task set-status "구현 대기"
@@ -548,10 +557,8 @@ out_force_err="$(env project_root="$TMP2" bash "$RD" task set-status "완료" --
 rc_force=$?
 [[ "$rc_force" == "0" ]] && echo "ok: T3-d --force 우회 exit 0" || { echo "FAIL: T3-d --force 우회 exit $rc_force"; FAIL=1; }
 [[ -n "$out_force_err" ]] && echo "ok: T3-e --force stderr 경고 있음" || { echo "FAIL: T3-e --force stderr 경고 없음"; FAIL=1; }
-# 아카이브 보류→검증 중 (외부 검증 대기). mk_task_file 은 아카이브 보류를 canonical 로 보지 않아
-# task-state 를 지우므로 미러 → 권위 상태 순서로 만든다.
-mk_task_file "$TMP2" "구현 중" "ts-task"
-mk_task_state "$TMP2" "아카이브 보류" "ts-task"
+# 아카이브 보류→검증 중 (외부 검증 대기).
+mk_task_file "$TMP2" "아카이브 보류" "ts-task"
 t "T3-f 허용 전이: 아카이브 보류→검증 중" 0 "-" env project_root="$TMP2" bash "$RD" task set-status "검증 중"
 ts_status_f="$(awk -F'=' '$1=="status"{sub(/^[^=]+=/,"");print;exit}' "${TMP2}/rd-workflow-workspace/.lifecycle/task-state")"
 [[ "$ts_status_f" == "검증 중" ]] && echo "ok: T3-g 아카이브 보류→검증 중 task-state 갱신됨" || { echo "FAIL: T3-g task-state 미갱신 (got='${ts_status_f}')"; FAIL=1; }
@@ -641,7 +648,7 @@ env project_root="$TMP4" bash "$RD" task status >/dev/null 2>&1; rc_bad=$?
 [[ ! -f "${TMP4}/rd-workflow-workspace/.lifecycle/task-state" ]] && echo "ok: T5-f 손상 legacy → task-state 미생성" || { echo "FAIL: T5-f 손상 legacy → task-state 생성됨"; FAIL=1; }
 
 # ===========================================================================
-# --- TC-FIX: 리뷰 지적 사항 fix 검증 (v2-state-file-unification Task 3 리뷰) ---
+# --- TC-FIX: 손상된 task-state 에서 fr-add 가드가 막히거나 set-status 쓰기 실패가 exit 0 으로 새는 실수를 잡는다 ---
 # ===========================================================================
 
 echo "--- TC-FIX-1: fr-add guard + task-state 존재 + short-title 손상 → proceed-readonly ---"
@@ -712,9 +719,9 @@ SRC_OK2="rd-workflow-workspace/backlog/items/2026-02-02-new.md"
 mk_task_file "$TMP" "대기 중" "-"
 t "set-source-fr 유효 path" 0 - bash "$RD" task set-source-fr "$SRC_OK"
 t "source-fr 조회" 0 "$SRC_OK" bash "$RD" task source-fr
+# 형식별 거부(.. · slug · items 밖 등)는 test_state_common 의 source_fr_validate 케이스가 본다.
+# 여기서는 CLI 가 그 판정을 거쳐 거부하고 값을 바꾸지 않는지만 대표 1건으로 확인한다.
 t "set-source-fr 절대경로 거부" 1 - bash "$RD" task set-source-fr "/etc/passwd"
-t "set-source-fr .. 거부" 1 - bash "$RD" task set-source-fr "rd-workflow-workspace/backlog/items/../evil.md"
-t "set-source-fr slug 거부" 1 - bash "$RD" task set-source-fr "some-slug"
 t "set-source-fr 거부 후 값 불변" 0 "$SRC_OK" bash "$RD" task source-fr
 t "set-source-fr sentinel '-'" 0 - bash "$RD" task set-source-fr "-"
 t "sentinel 후 조회 '-'" 0 "-" bash "$RD" task source-fr
@@ -851,6 +858,69 @@ fd5_out="$(fd5_rd task fr-done 2>&1)"; fd5_out_rc=$?
 grep -q '^- status: idea$' "$FD5/outside.md" \
   && echo "ok: F5 손상 저장값에도 프로젝트 밖 파일 불변" \
   || { echo "FAIL: F5 손상 저장값이 프로젝트 밖 파일을 바꿨다"; FAIL=1; }
+
+# --- fr-done 옛 형식·형식 정리 ---
+FDO="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$FDO" && -d "$FDO" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+mkdir -p "$FDO/proj/rd-workflow-workspace/backlog/items" "$FDO/proj/rd-workflow-workspace/.lifecycle"
+printf '# Current Task\n\n## Status\n구현 중\n\n## Short Title\nx\n\n## Source FR\n-\n' > "$FDO/proj/CURRENT_TASK.md"
+fdo_rd() { env project_root="$FDO/proj" bash "$RD" "$@"; }
+fdo_dir="rd-workflow-workspace/backlog/items"
+# fdo_run <n> <상세 본문(printf 형식)> — fixture 를 만들고 fr-done 을 실행해 FDO_OUT·FDO_RC·FDO_F 를 채운다.
+fdo_run() {
+  FDO_F="$FDO/proj/$fdo_dir/2026-03-1$1-case.md"
+  printf "$2" > "$FDO_F"
+  FDO_SUM="$(cksum < "$FDO_F")"
+  FDO_OUT="$(fdo_rd task fr-done "$fdo_dir/2026-03-1$1-case.md" 2>&1)"; FDO_RC=$?
+}
+fdo_gate() { awk '/^- status:/{sub(/^- status:[[:space:]]*/,"");print;exit}' "$FDO_F"; }
+fdo_ok() { # fdo_ok <설명> <조건 rc>
+  if [[ "$2" -eq 0 ]]; then echo "ok: fr-done $1"; else echo "FAIL: fr-done $1 (rc=${FDO_RC} out='${FDO_OUT}')"; FAIL=1; fi
+}
+# 1. 옛 키 → 새 키, 다른 줄 바이트 동일
+fdo_run 1 '# t\n- 상태: idea\n- kind: feature\n'
+[[ "$FDO_RC" -eq 0 && "$(cat "$FDO_F")" == "$(printf '# t\n- status: done\n- kind: feature')" && "$(fdo_gate)" == "done" ]]; fdo_ok "옛 키 '- 상태: idea' → '- status: done', 다른 줄 불변" $?
+# 2. 덧붙인 설명 → note 줄
+fdo_run 2 '# t\n- status: dropped (사유 a\\tb C:\\temp\\new)\n- kind: feature\n'
+[[ "$FDO_RC" -eq 0 && "$(cat "$FDO_F")" == "$(printf '# t\n- status: dropped\n- status note: (사유 a\\tb C:\\temp\\new)\n- kind: feature')" && "$(wc -l < "$FDO_F" | tr -d ' ')" == 4 && "$(fdo_gate)" == "dropped" ]]; fdo_ok "dropped (사유) → dropped + status note" $?
+# 3. 이미 done → 건너뜀
+fdo_run 3 '# t\n- status: done\n'
+[[ "$FDO_RC" -eq 0 && "$FDO_OUT" == *"건너뜀 (이미 done)"* && "$(cksum < "$FDO_F")" == "$FDO_SUM" ]]; fdo_ok "이미 done → 건너뜀·파일 불변" $?
+# 4. 두 키 없음 → 실패 안내에 두 키
+fdo_run 4 '# t\n- kind: feature\n'
+[[ "$FDO_RC" -eq 1 && "$FDO_OUT" == *"- status:"* && "$FDO_OUT" == *"- 상태:"* ]]; fdo_ok "두 키 없음 → 실패·안내에 두 키" $?
+# 5. 빈 '- status:' 가 앞서고 '- 상태: idea' 가 뒤
+fdo_run 5 '# t\n- status:\n- 상태: idea\n'
+[[ "$FDO_RC" -eq 0 && "$(fdo_gate)" == "done" ]]; fdo_ok "빈 '- status:' + '- 상태: idea' → 첫 '- status:' 줄이 done" $?
+# 6. 빈 '- status:' 가 앞서고 '- status: idea' 가 뒤
+fdo_run 6 '# t\n- status:\n- status: idea\n'
+[[ "$FDO_RC" -eq 0 && "$(fdo_gate)" == "done" ]]; fdo_ok "빈 '- status:' + '- status: idea' → 첫 '- status:' 줄이 done" $?
+# 7. 비표준 obsolete → done, 이전값 보고
+fdo_run 7 '# t\n- status: obsolete\n'
+[[ "$FDO_RC" -eq 0 && "$(fdo_gate)" == "done" && "$FDO_OUT" == *"이전값: obsolete"* ]]; fdo_ok "obsolete → done·이전값 보고" $?
+# 8. parked → done, 이전값 보고
+fdo_run 8 '# t\n- status: parked\n'
+[[ "$FDO_RC" -eq 0 && "$(fdo_gate)" == "done" && "$FDO_OUT" == *"이전값: parked"* ]]; fdo_ok "parked → done·이전값 보고" $?
+# 9. 두 키 모두 빈 값 → 실패·파일 불변
+fdo_run 9 '# t\n- status:\n- 상태:\n'
+[[ "$FDO_RC" -eq 1 && "$FDO_OUT" == *"- status:"* && "$FDO_OUT" == *"- 상태:"* && "$(cksum < "$FDO_F")" == "$FDO_SUM" ]]; fdo_ok "두 키 모두 빈 값 → 실패·파일 불변" $?
+# 10. 권한 보존: 0644 파일이 fr-done 뒤에도 0644
+FDO_F="$FDO/proj/$fdo_dir/2026-03-20-case.md"
+printf '# t\n- status: idea\n' > "$FDO_F"; chmod 0644 "$FDO_F"
+FDO_OUT="$(fdo_rd task fr-done "$fdo_dir/2026-03-20-case.md" 2>&1)"; FDO_RC=$?
+[[ "$FDO_RC" -eq 0 && "$(ls -l "$FDO_F" | cut -c1-10)" == "-rw-r--r--" && "$(fdo_gate)" == "done" ]]; fdo_ok "권한 0644 유지" $?
+# 11. 심링크 보존: 링크는 남고 대상 파일이 갱신된다
+FDO_T="$FDO/target-11.md"
+printf '# t\n- status: idea\n' > "$FDO_T"
+FDO_F="$FDO/proj/$fdo_dir/2026-03-21-case.md"
+ln -s "$FDO_T" "$FDO_F"
+FDO_OUT="$(fdo_rd task fr-done "$fdo_dir/2026-03-21-case.md" 2>&1)"; FDO_RC=$?
+[[ "$FDO_RC" -eq 0 && -L "$FDO_F" && "$(awk '/^- status:/{sub(/^- status:[[:space:]]*/,"");print;exit}' "$FDO_T")" == "done" ]]; fdo_ok "심링크 유지·대상 갱신" $?
+# 12. 끝 개행 없는 마지막 줄 유지
+FDO_F="$FDO/proj/$fdo_dir/2026-03-22-case.md"
+printf '# t\n- status: idea' > "$FDO_F"
+FDO_OUT="$(fdo_rd task fr-done "$fdo_dir/2026-03-22-case.md" 2>&1)"; FDO_RC=$?
+[[ "$FDO_RC" -eq 0 && -n "$(tail -c1 "$FDO_F")" && "$(cat "$FDO_F")" == "$(printf '# t\n- status: done')" ]]; fdo_ok "개행 없는 마지막 줄 유지" $?
 
 # --- final diff review F1~F4 회귀 ---
 FDR="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
@@ -1216,7 +1286,7 @@ t "set-title: 비-ASCII 거부" 1 "-" st_rd task set-title 한글제목
 t "set-title: 인자 누락은 usage" 1 "-" st_rd task set-title
 t "set-title: 잉여 인자는 usage" 1 "-" st_rd task set-title a b c
 # slug 자리의 option token — 이 케이스가 없으면 val='--force' 가 'force' 로 정규화되어
-# 실제 제목으로 기록된다 (Turn 004 Finding 3)
+# 실제 제목으로 기록된다
 t "set-title: slug 없이 --force 만 주면 usage" 1 "-" st_rd task set-title --force
 t "set-title: slug 자리의 알 수 없는 옵션은 usage" 1 "-" st_rd task set-title --nope x
 # 이 블록 진입 시점의 값은 (4) 가 --force 로 기록한 other-task 다. 거부 케이스는
@@ -1240,7 +1310,6 @@ t "set-title: 대문자·공백을 정규화한다" 0 "-" st_rd task set-title "
 [[ "$(st_state)" == "my-task" ]] && echo "ok: set-title: 정규화" || { echo "FAIL: set-title: 정규화 결과 '$(st_state)'"; FAIL=1; }
 
 # (8) 미러에 '## Short Title' 섹션이 없으면 **아무것도 쓰지 않고** 실패한다
-#     (final diff review Finding 4)
 #
 # 종전에는 `_task_section_write` 가 섹션을 못 찾아도 입력을 그대로 복사하고 0 을 반환해,
 # CLI 가 "기록 성공" 을 보고하면서 미러는 계속 부재했다. 게다가 task-state 는 이미
@@ -1360,7 +1429,6 @@ rgit_rebind_d="$(printf '%s\n' "$rgit_rebind_out" | awk -F= '$1=="decision"{prin
 rm -rf "$RST_GIT"
 
 # --- set-status 도 같은 계약이다 — 미러에 '## Status' 가 없으면 **권위도 쓰지 않는다**
-#     (final diff review 2라운드 Finding 2)
 #
 # `_task_section_write` 가 섹션 부재를 실패로 바꾼 뒤부터, 선검사가 없으면 task-state 는
 # 새 값이고 미러는 그대로인 부분 갱신이 남는다. `task_read_status` 로는 못 잡는다 —
@@ -1439,7 +1507,7 @@ printf 'bash rd-workflow/scripts/lifecycle/promote.sh --short-title x --no-workt
 bash "$CK" "$CK_ROOT" >/dev/null 2>&1 && echo "ok: check: 고친 뒤 통과" \
   || { echo "FAIL: check: 고쳤는데 여전히 위반"; FAIL=1; }
 
-# (7) 없는 root 는 실패한다 — fail-open 회귀 (Turn 004 Finding 4)
+# (7) 없는 root 는 실패한다 — fail-open 회귀
 # 이 케이스가 없으면 경로 오타가 "위반 0건 통과" 로 보여 게이트가 조용히 죽는다.
 bash "$CK" "$CK_ROOT/does-not-exist-$$" >/dev/null 2>&1; ck_rc=$?
 [[ "$ck_rc" == "2" ]] && echo "ok: check: 없는 root 는 exit 2" \
@@ -1516,7 +1584,6 @@ bash "$CK" "$CK_PROSE" >/dev/null 2>&1 && echo "ok: check: 설명 문장 속 pro
 rm -rf "$CK_PROSE"
 
 # (13) 파일을 읽지 못하면 exit 2 다 — "위반 0건" 으로 소실되지 않는다
-#      (final diff review Finding 5)
 #
 # `find` 가 이름은 찾았지만 `awk` 가 읽지 못하는 상황을 만든다. 종전에는 awk 종료 상태를
 # 검사하지 않아 `joined` 가 비고 pipeline 이 0 으로 끝나서, 검사하지 못한 파일이
@@ -1541,7 +1608,7 @@ rm -rf "$CK_UNREAD"
 
 rm -rf "$CK_ROOT"
 
-# --- autopilot 승격 명령 계약 정적 점검 (final diff review 4라운드 Finding 3) ---
+# --- autopilot 승격 명령 계약 정적 점검 ---
 #
 # 판정 로직을 스크립트로 분리한 이유가 바로 이 회귀다 — 실제 SKILL.md 를 오염시켜
 # 확인하면 같은 작업의 다른 변경과 로컬 변경을 함께 날린다. fixture 로 시험한다.
@@ -1626,7 +1693,7 @@ bash "$AP" "$AP_DIR/no_order.md" >/dev/null 2>&1; ap_rc=$?
 [[ "$ap_rc" == "1" ]] && echo "ok: ap: §1 순서 관계 서술 제거를 잡는다" \
   || { echo "FAIL: ap: §1 순서 관계 제거에서 exit $ap_rc (1 이어야 한다)"; FAIL=1; }
 
-# (8) 값 prefix 통과 차단 — `--size largeish` 는 large 가 아니다 (5라운드 Finding 2)
+# (8) 값 prefix 통과 차단 — `--size largeish` 는 large 가 아니다
 ap_write "$AP_DIR/prefix.md"
 sed -i.bak 's/--size large /--size largeish /' "$AP_DIR/prefix.md"; rm -f "$AP_DIR/prefix.md.bak"
 bash "$AP" "$AP_DIR/prefix.md" >/dev/null 2>&1; ap_rc=$?
@@ -1651,7 +1718,7 @@ bash "$AP" "$AP_DIR/sfr_noval.md" >/dev/null 2>&1; ap_rc=$?
   || { echo "FAIL: ap: --source-fr 값 누락에서 exit $ap_rc (1 이어야 한다)"; FAIL=1; }
 
 # (11a~11d) **같은 옵션 중복** — 파서는 마지막 값을 쓰므로 기대값의 존재만 보면 뚫린다
-#           (6라운드 Finding 2). 앞뒤 순서를 바꾼 네 형태를 모두 고정한다.
+# 앞뒤 순서를 바꾼 네 형태를 모두 고정한다.
 ap_dup() { # ap_dup <이름> <sed 식> <설명>
   ap_write "$AP_DIR/$1.md"
   sed -i.bak "$2" "$AP_DIR/$1.md"; rm -f "$AP_DIR/$1.md.bak"
@@ -1669,12 +1736,12 @@ ap_dup dup_sfr2 \
   "--source-fr - 뒤 canonical 중복"
 
 # (11e~11f) **옵션명 왼쪽 경계** — `x--size` 는 파서가 unknown arg 로 거부하는데,
-#           오른쪽 경계만 보면 정상 1회로 세어진다 (7라운드 Finding 3).
+#           오른쪽 경계만 보면 정상 1회로 세어진다.
 ap_dup pre_size 's/ --size large/ x--size large/' "--size 앞 prefix 오타(x--size)"
 ap_dup pre_sfr 's| --source-fr rd-workflow| x--source-fr rd-workflow|' \
   "--source-fr 앞 prefix 오타(x--source-fr)"
 
-# (11) 읽기 불가 파일은 exit 2 — 계약 위반(1)으로 오분류하지 않는다 (5라운드 Finding 3)
+# (11) 읽기 불가 파일은 exit 2 — 계약 위반(1)으로 오분류하지 않는다
 ap_write "$AP_DIR/unreadable.md"
 chmod 000 "$AP_DIR/unreadable.md"
 if [[ -r "$AP_DIR/unreadable.md" ]]; then
@@ -1779,6 +1846,10 @@ GSESS
       >> "$sd/SESSION.md"
   fi
   printf '# Review Checkpoint\n\n## Open Issues\n- 없음\n' > "$sd/CHECKPOINT.md"
+  # 일반 seal 은 리뷰어 턴 실행 기록을 대조합니다. legacy 세션(head 없음)은 대조 대상이 아닙니다.
+  if [[ -n "${2:-}" ]]; then
+    fixture_reviewer_turn "$sd" "$SCRIPT_DIR" || return 1
+  fi
   printf '%s\n' "$sd"
 }
 
@@ -1845,6 +1916,8 @@ g_has "재리뷰 필요" "$G_ERR" "안내(해시 불일치): 재리뷰 필요"
 #           ①만으로는 이 상태 자체가 만들어지지 않아 초안의 우선순위 오류가 재발합니다.
 sed -i.bak "s|^- review-head-oid: .*|- review-head-oid: $(git -C "$G" rev-parse HEAD)|" \
   "$GS1/SESSION.md" && rm -f "$GS1/SESSION.md.bak"
+# 재리뷰 — head 가 바뀌었으므로 새 head 에서 리뷰어 턴이 다시 실행된 기록이 있어야 reseal 됩니다.
+fixture_reviewer_turn "$GS1" "$SCRIPT_DIR"
 g_seal "$GS1"
 g_status
 g_has "seal 과 archive 기록을 커밋하세요" "$G_ERR" "안내(reseal 직후): 커밋하세요"

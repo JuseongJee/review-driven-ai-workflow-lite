@@ -57,7 +57,9 @@ set -uo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ADAPTER="${1:-${script_dir}/adapter_codex.sh}"
 FAILS=0
-CAP=8          # 파이프 EOF 상한(초)
+# 파이프 EOF 상한(초). 결함은 파이프를 WAIT_TIMEOUT(1억 초대)까지 붙잡고 정상은 수 초 안에 닫으므로
+# 상한을 크게 잡아도 정상 경로 시간은 늘지 않는다(닫히는 즉시 끝남). 부하에서도 정상이 넘지 않을 여유로 60초.
+CAP=60
 
 # 판정별 WAIT_TIMEOUT 값. 타임아웃이 발화하면 안 되는 판정은 충분히 큰 값을 쓴다.
 #
@@ -101,6 +103,16 @@ group_size() {  # $1: pgid → 살아 있는 구성원 수
 }
 
 SELF_PGID="$(own_pgid $$)"
+
+# 호출자 파이프 EOF(.piped_done)를 0.1초 간격으로 기다린다. 상한은 CAP 초(반복 횟수·SECONDS 경과 중 먼저).
+# 경과 초를 소수 1자리로 W_ELAPSED 에 둔다.
+wait_pipe_eof() {  # $1: sandbox
+  local n=0 start=$SECONDS
+  while [ "$n" -lt $((CAP * 10)) ] && [ $((SECONDS - start)) -lt "$CAP" ] && [ ! -f "$1/.piped_done" ]; do
+    sleep 0.1; n=$((n + 1))
+  done
+  W_ELAPSED="$((n / 10)).$((n % 10))"
+}
 
 # 테스트 셸($$)이 띄운 프로세스를 회수한다 (spec §3.3).
 # (1) 자손 트리 스냅숏 — 어댑터를 먼저 죽이면 그 자식(도구의 별도 그룹)이 init 으로 넘어가 트리에서 빠진다.
@@ -177,7 +189,14 @@ reap_on_signal() {  # $1: 종료 코드
   reap_descendants
   exit "$REAP_SIGNAL_RC"
 }
-trap 'reap_descendants' EXIT
+# 이 실행의 임시 파일·디렉터리는 모두 RUN_TMP 아래에 만들고, 종료(신호 포함) 때 회수 뒤 통째로 지운다.
+# 케이스별 rm 은 정상 경로만 지우므로 신호로 끊기면 sandbox 가 남는다. SIGKILL 은 trap 이 돌지 않아 범위 밖이다.
+# macOS 기본 mktemp 는 템플릿 없이 부르면 TMPDIR 을 따르지 않으므로(Darwin 25 실측) 호출마다 템플릿을 준다.
+# TMPDIR 도 바꿔, 어댑터가 "${TMPDIR:-/tmp}" 아래에 만드는 디렉터리까지 함께 지운다.
+RUN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/rd-test-watchdog.XXXXXX")" || { echo "test_watchdog_portability.sh: 실행 전용 임시 디렉터리 생성 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+export RUN_TMP TMPDIR="$RUN_TMP"
+drop_run_tmp() { rm -rf "$RUN_TMP" 2>/dev/null || true; }
+trap 'reap_descendants; drop_run_tmp' EXIT
 trap 'reap_on_signal 129' HUP
 trap 'reap_on_signal 130' INT
 trap 'reap_on_signal 143' TERM
@@ -276,7 +295,7 @@ child_alive() {  # $1: child.pid 경로
 #   stubborn_child   : TERM 을 무시하는 자식 (escalation 검증)
 make_sandbox() {
   local kind="$1" sb
-  sb="$(mktemp -d)" || { echo "test_watchdog_portability.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  sb="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_watchdog_portability.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$sb" && -d "$sb" ]] || { echo "test_watchdog_portability.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   mkdir -p "$sb/turns" "$sb/mock_bin" "$sb/tmp"
   printf '## Current Owner\nAuthor\n\n## Status\nawaiting-author\n\n## Turn Limit\n20\n' > "$sb/SESSION.md"
@@ -345,10 +364,16 @@ echo "=== watchdog 계약·이식성 probe ($(uname -s) / bash ${BASH_VERSION}) 
 echo "어댑터: $ADAPTER"
 
 # --- 0. ps 신뢰성 ---
+# ps 를 쓸 수 없는 환경(리뷰어 샌드박스 등)에서는 고아·소유권 판정이 성립하지 않고, 판정마다 띄운 프로세스를
+# 회수할 근거(process group)도 없다. 그대로 진행하면 결함 판정용 mock 의 sleep(T_MOCK 등)이 고아로 몇 년씩 남는다
+# (2026-11-07 리뷰어 샌드박스 실행 뒤 `sleep 7xxxxxxxx` 고아 확인). 그래서 아무것도 띄우기 전에 건너뛴다.
 if ps_trustworthy && [ -n "$SELF_PGID" ]; then
   ok "0. ps 가 자기 PID·PGID 를 관측 (고아·소유권 판정 신뢰 가능)"
 else
-  bad "0. ps 가 자기 PID/PGID 를 관측하지 못함 — 이하 고아·소유권 판정을 신뢰할 수 없음"
+  echo "env-skip: test_watchdog_portability 전체 — ps 가 자기 PID/PGID 를 관측하지 못하는 환경(고아·소유권 판정과 회수 불가)" >&2
+  echo "  SKIP 모든 판정 — ps 를 쓸 수 없어 판정하지 않음, 프로세스를 띄우지 않고 끝냄"
+  REAP_RAN=2   # 띄운 프로세스가 없으므로 종료 회수(과 그 실패 경고)를 하지 않는다
+  exit 0
 fi
 
 # --- 1. 고아 타이머 자손 0개 (AC1) ---
@@ -357,7 +382,9 @@ sb="$(make_sandbox quick)" || { bad "sandbox 생성 실패: 1. 고아 타이머 
 spawn_group "$sb/o.log" run_adapter "$sb" "$T_ORPHAN" env TMPDIR="$sb/tmp"
 g="$GROUP_PGID"
 wait "$JOB" 2>/dev/null
-sleep 1
+# 어댑터 종료 직후 그룹 구성원이 사라질 때까지 기다린다(결함이면 고아가 남아 상한까지 감).
+n=0
+while [ "$n" -lt 50 ] && [ -n "$g" ] && [ "$(group_size "$g")" -gt 0 ]; do sleep 0.1; n=$((n + 1)); done
 if [ -z "$g" ]; then
   bad "1. 판정 그룹을 확정하지 못해 고아 판정 불가"
 else
@@ -375,10 +402,9 @@ drop_sandbox "$sb"
 sb="$(make_sandbox quick)" || { bad "sandbox 생성 실패: 2. 호출자 파이프 EOF(AC2)"; exit 1; }
 spawn_group "$sb/wrap.log" piped_body "$sb" "$T_PIPE"
 job="$JOB"; g="$GROUP_PGID"
-w=0
-while [ "$w" -lt "$CAP" ] && [ ! -f "$sb/.piped_done" ]; do sleep 1; w=$((w + 1)); done
+wait_pipe_eof "$sb"
 if [ -f "$sb/.piped_done" ]; then
-  ok "2. stderr 파이프 수신 시 턴 완료와 함께 파이프 닫힘 (${w}초, 상한 ${CAP}초)"
+  ok "2. stderr 파이프 수신 시 턴 완료와 함께 파이프 닫힘 (${W_ELAPSED}초, 상한 ${CAP}초)"
 else
   bad "2. 턴 완료 후에도 파이프가 ${CAP}초 이상 열린 채 유지"
 fi
@@ -487,12 +513,13 @@ while [ "$i" -lt 20 ] && [ ! -f "$sb/codex_ran" ]; do sleep 0.5; i=$((i + 1)); d
 if [ ! -f "$sb/codex_ran" ]; then
   bad "8. TERM 계약: codex 가 시작되지 않아 판정 불가 (sentinel 미생성)"
 else
-  sleep 1
+  # mock 이 자손 pid 를 기록할 때까지 기다린다(조건 없는 고정 대기 대신).
+  n=0
+  while [ "$n" -lt 50 ] && [ "$(child_recorded "$sb/child.pid")" -lt 1 ]; do sleep 0.1; n=$((n + 1)); done
   pre_child="$(child_alive "$sb/child.pid")"
   apid="$(cat "$sb/adapter.pid" 2>/dev/null || echo)"
   kill -TERM "$apid" 2>/dev/null || true
-  w=0
-  while [ "$w" -lt "$CAP" ] && [ ! -f "$sb/.piped_done" ]; do sleep 1; w=$((w + 1)); done
+  wait_pipe_eof "$sb"
   closed="$([ -f "$sb/.piped_done" ] && echo 예 || echo 아니오)"
   arc="$(cat "$sb/adapter.rc" 2>/dev/null || echo 미기록)"
   post_child="$(child_alive "$sb/child.pid")"
@@ -500,7 +527,7 @@ else
   if [ "$pre_child" -lt 1 ]; then
     bad "8. TERM 계약: mock 이 자손을 만들지 못해 계약 검증 불가"
   elif [ "$arc" = "143" ] && [ "$post_child" -eq 0 ] && [ "$closed" = "예" ] && [ "$left" -eq 0 ]; then
-    ok "8. TERM → rc 143 / codex 자손 소멸 / 파이프 ${w}초 내 닫힘 / 전용 TMPDIR 잔존 0"
+    ok "8. TERM → rc 143 / codex 자손 소멸 / 파이프 ${W_ELAPSED}초 내 닫힘 / 전용 TMPDIR 잔존 0"
   else
     bad "8. TERM → rc=${arc} 자손잔존=${post_child} 파이프닫힘=${closed} 잔존=${left}"
   fi
@@ -527,15 +554,14 @@ for kind in hang_with_child exit_with_child stubborn_child; do
     bad "${i}. ${label} — codex 미실행 (sentinel 없음)"
   else
     pre="$(child_recorded "$sb/child.pid")"
-    w=0
-    while [ "$w" -lt "$CAP" ] && [ ! -f "$sb/.piped_done" ]; do sleep 1; w=$((w + 1)); done
+    wait_pipe_eof "$sb"
     closed="$([ -f "$sb/.piped_done" ] && echo 예 || echo 아니오)"
     post="$(child_alive "$sb/child.pid")"
     left="$(leftover_in "$sb/tmp")"
     if [ "$pre" -lt 1 ]; then
       bad "${i}. ${label} — mock 이 자손을 만들지 못해 검증 불가"
     elif [ "$post" -eq 0 ] && [ "$closed" = "예" ] && [ "$left" -eq 0 ]; then
-      ok "${i}. ${label} — 자손 소멸 / 파이프 ${w}초 내 닫힘 / 잔존 0"
+      ok "${i}. ${label} — 자손 소멸 / 파이프 ${W_ELAPSED}초 내 닫힘 / 잔존 0"
     else
       bad "${i}. ${label} — 자손잔존=${post} 파이프닫힘=${closed} 잔존=${left}"
     fi

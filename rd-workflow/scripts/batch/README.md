@@ -5,6 +5,8 @@
 - `batch_manifest.sh` — manifest JSON을 읽어 결정적 파생값만 반환하는 SSOT 헬퍼 (validate/next/set-state/skip-dependents/restore-dependents/summary/verify-done/archive-state/resolve-slug). bash 3.2 호환(연관배열 미사용), jq 전제.
 - `test_batch_manifest.sh` — 헬퍼 단위 테스트.
 - `test_archive_state.sh` — `archive-state`·`restore-dependents` 단위 테스트.
+- `headless_result.sh` — wrapper 결과(outcome·exit)를 batch 처리 토큰으로, 비용 기록을 국면 3 표기로 바꾸는 헬퍼
+- `test_headless_result.sh` — 그 단위 테스트
 
 오케스트레이션 지능(선별·brainstorming 보강·의존 확정·요약)은 `claude_skills/fr/batch.md`(살아있는 Claude 세션) 소관입니다. 이 디렉토리는 규칙의 단일 출처이며 skill 문서는 여기로 위임합니다.
 

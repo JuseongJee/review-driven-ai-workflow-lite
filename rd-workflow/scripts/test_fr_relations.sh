@@ -358,6 +358,13 @@ check "주입 파일명은 판정 대상이 아니다" "" "$(readiness_of '2026-
 check_contains "validate 가 파일명 위반을 보고" "item-filename" "$out"
 check_contains "파일명 위반은 비-0" "rc=1" "$out"
 
+echo "== 케이스 21b: items/README.md 는 FR 상세가 아니다 (lite 가 넣는 폴더 안내) =="
+reset_fx
+item 2026-01-27 good validated
+row 2026-01-27 good validated P2 -
+printf 'Future Request 상세 파일\n' > "${ITEMS}/README.md"
+check_contains "README.md 는 파일명 위반이 아니다" "rc=0" "$(validate_out)"
+
 echo "== 케이스 22: depends-on 값의 셸 메타문자 주입 =="
 reset_fx
 FX_MARK="${fx}/PWNED"
@@ -491,6 +498,114 @@ reset_fx
 item 2026-02-05 s1 done "- series: ok #1/2"
 item 2026-02-05 s2 parked "- series: ok #2/2"
 check_contains "정상 비활성 시리즈는 위반 없음" "rc=0" "$(validate_out)"
+
+# ---------------------------------------------------------------- status 판정
+
+echo "== 케이스 28: 과거 '- 상태:' 키와 CRLF =="
+reset_fx
+printf '# x\n- 상태: done\n- kind: bug\n' > "${ITEMS}/2026-03-01-legacy.md"           # S1
+printf '# x\n- status:\n- 상태: dropped\n' > "${ITEMS}/2026-03-01-emptyst.md"       # S1b
+printf '# x\r\n- status: done\r\n' > "${ITEMS}/2026-03-01-crlf.md"                   # S1c
+printf '# x\n- status:\n- status: idea\n- 상태: done\n' > "${ITEMS}/2026-03-01-order.md"  # S1d
+check "옛 키 done 은 비활성" "" "$(readiness_of 2026-03-01-legacy)"
+check "빈 status 는 옛 키로 보충" "" "$(readiness_of 2026-03-01-emptyst)"
+check "CRLF done 은 비활성" "" "$(readiness_of 2026-03-01-crlf)"
+check "값 있는 status 줄이 옛 키보다 우선" "ready" "$(readiness_of 2026-03-01-order)"
+
+echo "== 케이스 28b: 개행 없는 마지막 줄·CRLF·탭 구분 =="
+reset_fx
+printf '# x\n- 상태: done' > "${ITEMS}/2026-03-01-nonl.md"
+printf '# x\r\n- status: done\r\n' > "${ITEMS}/2026-03-01-crlf2.md"
+printf '# x\n- status:\tdone\t(설명)\n' > "${ITEMS}/2026-03-01-tab.md"
+check "옛 키 개행 없음은 비활성" "" "$(readiness_of 2026-03-01-nonl)"
+check "CRLF done 은 비활성" "" "$(readiness_of 2026-03-01-crlf2)"
+check "탭 구분 첫 토큰" "" "$(readiness_of 2026-03-01-tab)"
+# shellcheck source=/dev/null
+. "${SCRIPT_DIR}/_fr_status.sh"
+scan="$(fr_status_scan "${ITEMS}/2026-03-01-nonl.md" "${ITEMS}/2026-03-01-crlf2.md" "${ITEMS}/2026-03-01-tab.md")"
+check "fr_status_scan 개행 없음 레코드" $'0\034done\034inactive' "$(printf '%s\n' "$scan" | sed -n 1p)"
+check "fr_status_scan CRLF 레코드" $'0\034done\034inactive' "$(printf '%s\n' "$scan" | sed -n 2p)"
+check "fr_status_scan 탭 레코드" $'0\034done\034inactive' "$(printf '%s\n' "$scan" | sed -n 3p)"
+check "fr_status_scan 파일 수" $'#N\0343' "$(printf '%s\n' "$scan" | sed -n 4p)"
+
+echo "== 케이스 29: 설명이 붙은 status 는 첫 토큰 =="   # S2
+reset_fx
+item 2026-03-02 old "dropped (2026-08-05 결정)"
+item 2026-03-02 next validated "- depends-on: 2026-03-02-old"
+check "dropped (설명) 은 비활성" "" "$(readiness_of 2026-03-02-old)"
+check "dropped 선행은 check" "check:2026-03-02-old" "$(readiness_of 2026-03-02-next)"
+
+echo "== 케이스 30: 없거나 모르는 status 는 error:parse:status =="   # S3
+reset_fx
+printf '# x\n- kind: bug\n' > "${ITEMS}/2026-03-03-nost.md"
+item 2026-03-03 wip wip
+check "status 없음" "error:parse:status" "$(readiness_of 2026-03-03-nost)"
+check "모르는 값" "error:parse:status" "$(readiness_of 2026-03-03-wip)"
+out="$(validate_out)"
+check_contains "없음 위반" $'parse\t2026-03-03-nost\tstatus 값 오류 (값: 없음)' "$out"
+check_contains "모르는 값 위반" $'parse\t2026-03-03-wip\tstatus 값 오류 (값: wip)' "$out"
+check_contains "status 위반은 rc=1" "rc=1" "$out"
+
+echo "== 케이스 31: status 오류와 관계 오류를 함께 보고 =="   # S4
+reset_fx
+item 2026-03-04 both wip "- depends-on: 2026-03-04-absent"
+out="$(validate_out)"
+check_contains "dangling 보고" $'dangling\t2026-03-04-both' "$out"
+check_contains "status 보고" $'parse\t2026-03-04-both\tstatus 값 오류' "$out"
+
+# ---------------------------------------------------------------- add.md 인덱스 행 추가 명령
+
+row_cmd() { # add.md 의 fr-index-row 블록을 뽑아 실행한다. 환경 변수는 호출자가 넘긴다.
+  local blk
+  blk="$(awk '/fr-index-row:begin/{f=1} f&&/^ *```bash/{g=1;next} g&&/^ *```/{exit} g{print}' "${SCRIPT_DIR}/../claude_skills/fr/add.md" | sed 's/^   //')"
+  if [ -z "$blk" ]; then echo "  FAIL: 명령 블록 없음" >&2; FAIL=1; return 9; fi
+  bash -c "$blk"
+}
+
+echo "== 케이스 32: 종류 없는 머리행에 칸 이름대로 행 추가 =="   # R1
+reset_fx
+printf '## 인덱스\n\n| 날짜 | 제목 | 요약 | 상태 | 우선순위 | 관계 | GitHub | 상세 |\n|---|---|---|---|---|---|---|---|\n|2026-01-01|  a  | 요약 |idea| P2 | - | o/r#1 | [상세](items/2026-01-01-a.md) |\n\n## 다른 절\n\n| x | y |\n' > "$INDEX"
+cp "$INDEX" "${fx}/before"
+FR_DATE=2026-04-01 FR_TITLE=new FR_SUMMARY=요약새 FR_KIND=bug FR_STATUS=idea FR_PRIORITY=- FR_RELATION=- FR_GITHUB=o/r#9 INDEX="$INDEX" row_cmd; check "rc" "0" "$?"
+check "새 행" "| 2026-04-01 | new | 요약새 | idea | - | - | o/r#9 | [상세](items/2026-04-01-new.md) |" "$(sed -n 6p "$INDEX")"
+sed '6d' "$INDEX" > "${fx}/after-minus-new"
+cmp -s "${fx}/before" "${fx}/after-minus-new"; check "기존 줄 불변 (바이트)" "0" "$?"
+
+echo "== 케이스 33: 모르는 칸이면 쓰지 않고 멈춤 =="   # R2
+reset_fx
+printf '## 인덱스\n\n| 날짜 | 제목 | 비고 | 상세 |\n|---|---|---|---|\n\n## 다른 절\n' > "$INDEX"; cp "$INDEX" "${fx}/before"
+err="$(FR_MODE=check INDEX="$INDEX" row_cmd 2>&1 >/dev/null)"; check "check rc" "3" "$?"
+check_contains "문제 칸 안내" "비고" "$err"
+check_contains "다음 조치 안내" "다음 조치:" "$err"
+err="$(FR_DATE=2026-04-02 FR_TITLE=z INDEX="$INDEX" row_cmd 2>&1 >/dev/null)"; check "쓰기 rc" "3" "$?"
+cmp -s "${fx}/before" "$INDEX"; check "파일 불변 (바이트)" "0" "$?"
+
+echo "== 케이스 34: 파이프 이스케이프 =="   # R3
+reset_fx
+FR_DATE=2026-04-03 FR_TITLE=p FR_SUMMARY='a | b \| c' FR_KIND=bug FR_STATUS=idea INDEX="$INDEX" row_cmd
+check_contains "이스케이프" "| a \| b \| c |" "$(tail -n1 "$INDEX")"
+check "칸 수 유지" "$(sed -n 3p "$INDEX" | awk -F' [|] ' '{print NF}')" "$(tail -n1 "$INDEX" | sed 's/\\|/X/g' | awk -F' [|] ' '{print NF}')"
+
+# ---------------------------------------------------------------- add.md 6-a 이관 명령
+
+migrate_cmd() { # add.md 의 fr-index-migrate 블록을 뽑아 실행한다.
+  local blk
+  blk="$(awk '/fr-index-migrate:begin/{f=1} f&&/^ *```bash/{g=1;next} g&&/^ *```/{exit} g{print}' "${SCRIPT_DIR}/../claude_skills/fr/add.md" | sed 's/^   //')"
+  if [ -z "$blk" ]; then echo "  FAIL: 이관 명령 블록 없음" >&2; FAIL=1; return 9; fi
+  bash -c "$blk"
+}
+
+echo "== 케이스 35: 6-a 이관 — 옛 머리행 변환, 재실행 불변, 잔존물 없음 =="
+reset_fx
+printf '## 인덱스\n\n| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |\n|---|---|---|---|---|---|---|\n| 2026-01-01 | a | 요약 | bug | idea | P2 | [상세](items/2026-01-01-a.md) |\n' > "$INDEX"
+INDEX="$INDEX" migrate_cmd; check "이관 rc" "0" "$?"
+printf '## 인덱스\n\n| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 관계 | 상세 |\n|---|---|---|---|---|---|------|---|\n| 2026-01-01 | a | 요약 | bug | idea | P2 | - | [상세](items/2026-01-01-a.md) |\n' > "${fx}/expect"
+cmp -s "${fx}/expect" "$INDEX"; check "이관 결과 텍스트" "0" "$?"
+sum1="$(cksum < "$INDEX")"
+INDEX="$INDEX" migrate_cmd; check "재실행 rc" "0" "$?"
+check "이미 이관된 인덱스 불변" "$sum1" "$(cksum < "$INDEX")"
+check "잠금 잔존 없음" "no" "$([ -e "$INDEX.lock" ] && echo yes || echo no)"
+check "임시 파일 잔존 없음" "0" "$(ls "$INDEX".?????? 2>/dev/null | wc -l | tr -d ' ')"
 
 if [ "$FAIL" -eq 0 ]; then echo "test_fr_relations.sh: PASS"; else echo "test_fr_relations.sh: FAIL" >&2; fi
 exit "$FAIL"

@@ -16,6 +16,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export HERDR_ENV=
 export RD_CHILD_SESSION=1
 unset project_root TASK_STATE_PATH
+
+# 실제 ps 를 쓸 수 없는 환경(Codex 샌드박스는 /bin/ps 실행과 프로세스 목록 조회를 막는다)에서는
+# 점유 판정이 늘 판정불가로 보류돼 정상 정리 흐름을 검증할 수 없다. 그때만 lsof 가 본 pid 를 내는
+# 대역 ps 를 PATH 앞에 둔다. 대역 디렉터리는 fixture 저장소 밖에 둔다(기본 체크아웃 미커밋 판정에 섞이지 않게).
+if ! ps -U "$(id -u)" -o pid=,uid=,stat= >/dev/null 2>&1; then
+  PS_STUB_DIR="$(mktemp -d)" || { echo "$(basename "$0"): 대역 ps 디렉터리 생성 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+  _cleanup+=("$PS_STUB_DIR")
+  cat > "$PS_STUB_DIR/ps" <<'PS_STUB_EOF'
+#!/usr/bin/env bash
+# 대역 ps — tasks_path_occupied 의 `ps -U <uid> -o pid=,uid=,stat=` 호출에만 답한다.
+# 그 밖의 형식은 샌드박스의 실제 ps 처럼 실패한다(publish_queue.sh·session_launch.sh 의 다른 ps 호출).
+if [[ "$#" -ne 4 || "$1" != "-U" || "$3" != "-o" || "$4" != "pid=,uid=,stat=" ]]; then
+  echo "ps(대역): 지원하지 않는 형식: $*" >&2; exit 1
+fi
+"${RD_TEST_REAL_LSOF:-lsof}" -a -u "$2" -d cwd -Fp 2>/dev/null | sed -n 's/^p//p' | awk -v u="$2" '{ print $1, u, "S" }'
+PS_STUB_EOF
+  chmod +x "$PS_STUB_DIR/ps"
+  # 대역 ps 는 준비 시점의 실제 lsof 를 쓴다 — 케이스가 PATH 에 넣는 실패용 lsof(O2)가 프로세스 열거까지 망가뜨리지 않게.
+  RD_TEST_REAL_LSOF="$(command -v lsof || true)"; export RD_TEST_REAL_LSOF
+  export PATH="$PS_STUB_DIR:$PATH"
+  echo "  NOTE: 실제 ps 를 쓸 수 없는 환경 — lsof 기반 대역 ps 로 정상 정리 흐름을 검증합니다"
+fi
 # 로컬 file 프로토콜 submodule 을 하위 프로세스(promote·archive 포함)까지 허용한다.
 export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
@@ -23,6 +45,26 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1" >&2; }
+
+# 지연 정리가 「점유 판정불가」 로 보류됐을 때 그 보류가 환경 탓인지 제품과 별개로 확인한다.
+# 내 계정(유효 uid 도 나)의 살아 있는 프로세스를 ps 로 보고, lsof 로 그 CWD 를 모두 읽을 수 있으면 0(판정 가능한 환경)이다.
+# 0 이면 제품의 판정불가는 회귀이므로 env-skip 으로 세지 않고 FAIL 한다.
+occ_env_judgeable() {
+  local u ps_live cwd_seen
+  u="$(id -u)"
+  ps_live="$(ps -U "$u" -o pid=,uid=,stat= 2>/dev/null | awk -v me="$u" '$1 ~ /^[0-9]+$/ && $2 == me && $3 !~ /^Z/ {print $1}')"
+  [[ -n "$ps_live" ]] || return 1
+  command -v lsof >/dev/null 2>&1 || return 1
+  # `n/proc/<pid>/cwd (readlink: Permission denied)` 처럼 괄호 오류 설명이 붙은 n 줄은 읽은 것으로 치지 않는다.
+  cwd_seen="$(lsof -a -u "$u" -d cwd -Fpn 2>/dev/null | awk '/^p/ {c = substr($0, 2)} /^n\// && !/\(.*\)$/ && c != "" {print c}')"
+  [[ -n "$cwd_seen" ]] || return 1
+  printf '%s\n' "$ps_live" | CWD_SEEN="$cwd_seen" awk '
+    BEGIN { n = split(ENVIRON["CWD_SEEN"], a, "\n"); for (i = 1; i <= n; i++) seen[a[i]] = 1 }
+    !($1 in seen) { print $1 }' | while IFS= read -r pid; do
+      kill -0 "$pid" 2>/dev/null || continue   # 그사이 끝난 프로세스는 세지 않는다
+      exit 1
+    done
+}
 
 TMP="$(mktemp -d)" || { echo "test_archive_submodule.sh: mktemp 실패" >&2; exit 1; }
 [[ -n "$TMP" && -d "$TMP" ]] || { echo "test_archive_submodule.sh: 임시 경로 검증 실패" >&2; exit 1; }
@@ -129,6 +171,11 @@ else
   tl="$( cd "$CASE_REPO" && bash rd-workflow/scripts/rd task list 2>&1 )" || true
   if [[ ! -d "$CASE_WT" ]] && ! git -C "$CASE_REPO" rev-parse --verify --quiet refs/heads/fr/w1b >/dev/null; then
     pass "W1b: rd task list 가 submodule worktree 와 브랜치를 지연 정리했다"
+  elif w1b_hold="$(printf '%s\n' "$tl" | grep -m1 '정리 보류: w1b — 점유 판정불가')" && ! occ_env_judgeable \
+    && [[ -d "$CASE_WT" ]] && git -C "$CASE_REPO" rev-parse --verify --quiet refs/heads/fr/w1b >/dev/null; then
+    # 점유 판정을 할 수 없는 환경(ps·lsof 불가 샌드박스)에서는 제품이 정리를 보류하는 것이 맞다 — 그 환경을 따로 확인했고
+    # worktree·브랜치가 그대로 남았을 때만 env-skip 으로 센다. 판정 가능한 환경의 판정불가는 아래 FAIL 이다.
+    printf 'env-skip: test_archive_submodule W1b 지연 정리 — 점유 판정을 할 수 없는 환경(%s)\n' "${w1b_hold#*정리 보류: w1b — }" >&2
   else
     fail "W1b: 지연 정리 안 됨 — $tl"
   fi
@@ -315,6 +362,201 @@ if [[ "$ARCH_RC" == 0 && "$ARCH_OUT" != *"리뷰 대상 불일치"* ]]; then
 else
   fail "W4a: rc=$ARCH_RC — $ARCH_OUT"
 fi
+
+# ---- submodule gitlink 누락 검사 (change spec 2026-11-06-2215 D1~D4) ----
+# prep_gitlink_conflict <name> [extra] — 기본 브랜치가 libs/prod 를 A 로 전진, 작업 브랜치가 갈라진 B 로 전진한 뒤
+# 작업 worktree 에서 `git merge main` 으로 gitlink 충돌을 만든다. A·B 는 submodule 원격에 push 한다.
+#   전역: CASE_NAME CASE_REPO CASE_WT GL_A GL_B
+prep_gitlink_conflict() {
+  local n="$1" s
+  prep_case "$n"
+  git -C "$CASE_REPO/libs/prod" config user.email t@t; git -C "$CASE_REPO/libs/prod" config user.name t
+  echo "a-$n" > "$CASE_REPO/libs/prod/a.txt"; git -C "$CASE_REPO/libs/prod" add a.txt; git -C "$CASE_REPO/libs/prod" commit -q -m "main side A"
+  GL_A="$(git -C "$CASE_REPO/libs/prod" rev-parse HEAD)"
+  git -C "$CASE_REPO/libs/prod" push -q origin "HEAD:refs/heads/$n-a"
+  git -C "$CASE_REPO" add libs/prod; git -C "$CASE_REPO" commit -q -m "main: gitlink A"
+  sub_commit "$CASE_WT"; sub_push "$CASE_WT"; GL_B="$(git -C "$CASE_WT/libs/prod" rev-parse HEAD)"
+  record_gitlink "$CASE_WT"
+  if [[ "${2:-}" == extra ]]; then   # 작업 브랜치가 새 submodule libs/extra 를 추가한다
+    git init -q --bare -b main "$TMP/$n/extra.git"
+    s="$TMP/$n/extra-src"; git init -q -b main "$s"
+    ( cd "$s" && echo e > e.txt && git add -A && git commit -q -m extra && git push -q "$TMP/$n/extra.git" main )
+    git -C "$CASE_WT" submodule add -q "$TMP/$n/extra.git" libs/extra
+    git -C "$CASE_WT" commit -q -m "구현: libs/extra 추가"
+  fi
+  git -C "$CASE_WT" merge main >/dev/null 2>&1 || true
+  [[ "$(git -C "$CASE_WT" diff --name-only --diff-filter=U)" == "libs/prod" ]] || { echo "준비 실패: $n 의 충돌 경로가 libs/prod 하나가 아님" >&2; exit 1; }
+}
+# gl_resolve <oid> — 충돌한 libs/prod 를 oid 로 풀어 병합 커밋을 만든다.
+gl_resolve() {
+  git -C "$CASE_WT" update-index --add --cacheinfo "160000,$1,libs/prod"
+  git -C "$CASE_WT" commit -q --no-edit
+}
+# gl_commit_gitlink <oid> — 일반 커밋으로 libs/prod gitlink 를 oid 로 올린다.
+gl_commit_gitlink() {
+  git -C "$CASE_WT" update-index --add --cacheinfo "160000,$1,libs/prod"
+  git -C "$CASE_WT" commit -q -m "gitlink 갱신: ${1:0:7}"
+}
+# gl_make_c — 작업 worktree 의 submodule 에서 A·B 를 모두 담은 커밋 C 를 만들어 push 한다. GL_C.
+gl_make_c() {
+  git -C "$CASE_WT/libs/prod" fetch -q origin "$CASE_NAME-a"
+  git -C "$CASE_WT/libs/prod" merge -q --no-edit FETCH_HEAD >/dev/null
+  GL_C="$(git -C "$CASE_WT/libs/prod" rev-parse HEAD)"
+  git -C "$CASE_WT/libs/prod" push -q origin "HEAD:refs/heads/$CASE_NAME-c"
+}
+# gl_make_c_clone [push] — 별도 clone(케이스 디렉터리 안)에서 C 를 만든다. push 를 주면 submodule 원격에만 올린다. GL_C.
+gl_make_c_clone() {
+  local c="$TMP/$CASE_NAME/clone"
+  git clone -q "$TEMPLATE_DIR/prod.git" "$c"
+  git -C "$c" config user.email t@t; git -C "$c" config user.name t
+  git -C "$c" checkout -q -b cc "origin/$CASE_NAME"
+  git -C "$c" merge -q --no-edit "origin/$CASE_NAME-a" >/dev/null
+  GL_C="$(git -C "$c" rev-parse HEAD)"
+  [[ "${1:-}" != push ]] || git -C "$c" push -q origin "HEAD:refs/heads/$CASE_NAME-c"
+}
+run_gl_wt() {    # 작업 worktree 안에서 archive (기본 체크아웃으로 재실행된다)
+  ARCH_RC=0
+  ARCH_OUT="$( cd "$CASE_WT" && bash rd-workflow/scripts/lifecycle/archive.sh \
+    --force-skip-review-check 테스트 --allow-status-mismatch 테스트 2>&1 )" || ARCH_RC=$?
+}
+run_gl_repo() {  # 기본 체크아웃에서 --task 로 archive
+  ARCH_RC=0
+  ARCH_OUT="$( cd "$CASE_REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task "$CASE_NAME" \
+    --force-skip-review-check 테스트 --allow-status-mismatch 테스트 2>&1 )" || ARCH_RC=$?
+}
+gl_snap() { printf '%s|%s|%s' "$(git -C "$CASE_REPO" rev-parse HEAD)" "$(git -C "$TMP/$CASE_NAME/overlay.git" rev-parse refs/heads/main 2>/dev/null)" "$(git -C "$CASE_REPO" tag --list | tr '\n' ,)"; }
+gl_head() { git -C "$CASE_REPO" rev-parse HEAD; }
+gl_remote() { git -C "$TMP/$CASE_NAME/overlay.git" rev-parse refs/heads/main 2>/dev/null; }
+gl_tags() { git -C "$CASE_REPO" tag --list | tr '\n' ,; }
+# ok_if <라벨> <명령...> — 명령이 참이면 PASS, 아니면 FAIL(스위트는 멈추지 않는다).
+ok_if() { local l="$1"; shift; if "$@"; then pass "$l"; else fail "$l — rc=$ARCH_RC $ARCH_OUT"; fi; }
+out_has() { [[ "$ARCH_OUT" == *"$1"* ]]; }
+out_lacks() { [[ "$ARCH_OUT" != *"$1"* ]]; }
+eq() { [[ "$1" == "$2" ]]; }
+neq() { [[ "$1" != "$2" ]]; }
+remote_gitlink() { git -C "$TMP/$CASE_NAME/overlay.git" ls-tree refs/heads/main libs/prod 2>/dev/null | awk '{print $3}'; }
+
+echo "== G1: 누락 병합(A 로 풀음) — 작업 worktree 에서 archive 가 병합 전에 막는다 =="
+prep_gitlink_conflict g1; gl_resolve "$GL_A"
+g1_head="$(gl_head)"; g1_rem="$(gl_remote)"; g1_tags="$(gl_tags)"
+run_gl_wt
+ok_if "G1: rc≠0" test "$ARCH_RC" -ne 0
+ok_if "G1: 출력에 libs/prod" out_has "libs/prod"
+ok_if "G1: 출력에 빠진 B 짧은 해시" out_has "${GL_B:0:7}"
+ok_if "G1: 복구 안내" out_has "복구:"
+ok_if "G1: 기본 브랜치 HEAD 불변" eq "$(gl_head)" "$g1_head"
+ok_if "G1: 원격 main 불변" eq "$(gl_remote)" "$g1_rem"
+ok_if "G1: tag 불변" eq "$(gl_tags)" "$g1_tags"
+ok_if "G1: 우회 옵션 안내" out_has "--allow-gitlink-drop"
+echo "== G1b: 같은 상태로 다시 실행 =="
+run_gl_wt
+ok_if "G1b: 두 번째 실행도 rc≠0" test "$ARCH_RC" -ne 0
+ok_if "G1b: 기본 브랜치 HEAD 불변" eq "$(gl_head)" "$g1_head"
+# G5 — 같은 누락을 사유와 함께 우회하면 발행되고 audit 로그에 남는다(squash·rebase submodule 의 출구).
+ARCH_RC=0
+ARCH_OUT="$( cd "$CASE_WT" && bash rd-workflow/scripts/lifecycle/archive.sh \
+  --force-skip-review-check 테스트 --allow-status-mismatch 테스트 --allow-gitlink-drop "squash 병합 확인" 2>&1 )" || ARCH_RC=$?
+ok_if "G5: 우회 발행 rc 0" test "$ARCH_RC" -eq 0
+ok_if "G5: 원격 main 갱신" test "$(gl_remote)" != "$g1_rem"
+ok_if "G5: audit 기록" grep -qF "[gitlink:rc1] squash 병합 확인" "$CASE_REPO/rd-workflow-workspace/.lifecycle/review-skip-audit.log"
+
+echo "== G1c: 기본 체크아웃이 먼저 병합해 둔 경우 — 병합 뒤 검사가 막는다 =="
+prep_gitlink_conflict g1c; gl_resolve "$GL_A"
+git -C "$CASE_REPO" merge -q --no-ff fr/g1c -m "merge: g1c (archive)" >/dev/null
+g1c_rem="$(gl_remote)"; g1c_tags="$(gl_tags)"
+run_gl_repo
+ok_if "G1c: 첫 실행 rc≠0" test "$ARCH_RC" -ne 0
+ok_if "G1c: 병합 뒤 검사가 막았다(출력에 libs/prod)" out_has "libs/prod"
+ok_if "G1c: 3.6b 가 거부하지 않음(리뷰하지 않은 변경 없음)" out_lacks "리뷰하지 않은 변경"
+ok_if "G1c: 되돌림 안내 git reset --keep" out_has "git reset --keep"
+run_gl_repo
+ok_if "G1c: 두 번째 실행도 rc≠0" test "$ARCH_RC" -ne 0
+ok_if "G1c: 두 번째도 되돌림 안내" out_has "git reset --keep"
+ok_if "G1c: tag 불변" eq "$(gl_tags)" "$g1c_tags"
+ok_if "G1c: 원격 main 불변" eq "$(gl_remote)" "$g1c_rem"
+
+echo "== G2: 누락 병합 뒤 A·B 를 담은 C 로 gitlink 를 더하면 발행된다 =="
+prep_gitlink_conflict g2; gl_resolve "$GL_A"; gl_make_c; gl_commit_gitlink "$GL_C"
+run_gl_wt
+ok_if "G2: rc 0" test "$ARCH_RC" -eq 0
+ok_if "G2: 원격 main gitlink == C" eq "$(remote_gitlink)" "$GL_C"
+
+echo "== G2d: 정상 병합(C) 뒤 일반 커밋으로 gitlink 를 B 로 되돌려도 발행된다 =="
+prep_gitlink_conflict g2d; gl_make_c; gl_resolve "$GL_C"; gl_commit_gitlink "$GL_B"
+run_gl_wt
+ok_if "G2d: rc 0" test "$ARCH_RC" -eq 0
+
+echo "== G2e: 누락 병합 → C → A 로 되돌림 — 발행된다 =="
+prep_gitlink_conflict g2e; gl_resolve "$GL_A"; gl_make_c; gl_commit_gitlink "$GL_C"; gl_commit_gitlink "$GL_A"
+run_gl_wt
+ok_if "G2e: rc 0" test "$ARCH_RC" -eq 0
+
+
+echo "== G2c: 새 submodule 추가 + 충돌한 libs/prod 를 삭제로 풂 — 발행된다 =="
+prep_gitlink_conflict g2c extra
+git -C "$CASE_WT" rm -q -f libs/prod; git -C "$CASE_WT" commit -q --no-edit
+run_gl_wt
+ok_if "G2c: rc 0" test "$ARCH_RC" -eq 0
+
+echo "== G2f: 누락 병합 뒤 libs/prod 를 일반 커밋으로 삭제(발행 끝에 libs/extra 가 남음) — 발행된다 =="
+prep_gitlink_conflict g2f extra; gl_resolve "$GL_A"
+git -C "$CASE_WT" rm -q -f libs/prod; git -C "$CASE_WT" commit -q -m "libs/prod 삭제"
+run_gl_wt
+ok_if "G2f: rc 0" test "$ARCH_RC" -eq 0
+
+echo "== G2g: 한쪽만 gitlink 를 바꾼 정상 병합 — 작업 브랜치가 libs/prod 를 이전 커밋으로 롤백, 기본 브랜치는 무관한 파일만 전진 =="
+prep_case g2g
+record_gitlink "$CASE_WT"
+g2g_y="$(git -C "$CASE_WT" ls-tree HEAD libs/prod | awk '{print $3}')"
+g2g_y="$(git -C "$CASE_WT/libs/prod" rev-parse "${g2g_y}^")"
+gl_commit_gitlink "$g2g_y"
+echo main-only > "$CASE_REPO/main-only.txt"; git -C "$CASE_REPO" add main-only.txt; git -C "$CASE_REPO" commit -q -m "main: 무관한 파일"
+run_gl_wt
+ok_if "G2g: rc 0" test "$ARCH_RC" -eq 0
+ok_if "G2g: 원격 main libs/prod gitlink == 작업 브랜치 값" eq "$(remote_gitlink)" "$g2g_y"
+
+echo "== G2h: 후손 갈래(topic)를 병합하면서 gitlink 를 이전 값으로 고름 — 부모가 조상 관계여도 막는다 =="
+prep_case g2h
+g2h_old="$(git -C "$CASE_WT" rev-parse HEAD:libs/prod)"
+git -C "$CASE_WT" checkout -qb topic
+sub_commit "$CASE_WT"; sub_push "$CASE_WT"; record_gitlink "$CASE_WT"
+git -C "$CASE_WT" checkout -q fr/g2h
+git -C "$CASE_WT" merge --no-ff --no-commit topic >/dev/null 2>&1 || true
+git -C "$CASE_WT" update-index --cacheinfo "160000,$g2h_old,libs/prod"
+git -C "$CASE_WT" commit -qm "merge topic (이전 gitlink 선택)"
+g2h_head="$(gl_head)"
+run_gl_wt
+ok_if "G2h: rc≠0" test "$ARCH_RC" -ne 0
+ok_if "G2h: 기본 브랜치 HEAD 불변" eq "$(gl_head)" "$g2h_head"
+
+echo "== G3: C 가 submodule 원격에만 있음 — fetch 로 확인하고 발행된다 =="
+prep_gitlink_conflict g3; gl_resolve "$GL_A"; gl_make_c_clone push; gl_commit_gitlink "$GL_C"
+run_gl_wt
+ok_if "G3: rc 0" test "$ARCH_RC" -eq 0
+ok_if "G3: fetch 시작 안내" out_has "원격에서 받습니다 (git fetch)"
+ok_if "G3: fetch 완료 안내" out_has "fetch 완료"
+
+echo "== G4: C 를 push 하지 않고 submodule 원격 주소도 접근 불가 — fetch 실패, 판정 불가로 멈춘다 =="
+prep_gitlink_conflict g4; gl_resolve "$GL_A"; gl_make_c_clone; gl_commit_gitlink "$GL_C"
+git -C "$CASE_REPO/libs/prod" remote set-url origin "$TMP/g4/missing.git"
+g4_head="$(gl_head)"
+run_gl_wt
+ok_if "G4: rc≠0" test "$ARCH_RC" -ne 0
+ok_if "G4: fetch 시작 안내" out_has "원격에서 받습니다 (git fetch)"
+ok_if "G4: fetch 실패 안내" out_has "fetch 실패"
+ok_if "G4: 판정 불가 안내" out_has "판정 불가"
+ok_if "G4: 기본 브랜치 HEAD 불변" eq "$(gl_head)" "$g4_head"
+
+echo "== G4b: C 를 push 하지 않음(원격은 정상) — fetch 가 성공해도 객체가 없어 판정 불가로 멈춘다 =="
+prep_gitlink_conflict g4b; gl_resolve "$GL_A"; gl_make_c_clone; gl_commit_gitlink "$GL_C"
+g4b_head="$(gl_head)"
+run_gl_wt
+ok_if "G4b: rc≠0" test "$ARCH_RC" -ne 0
+ok_if "G4b: fetch 시작 안내" out_has "원격에서 받습니다 (git fetch)"
+ok_if "G4b: fetch 완료 안내" out_has "fetch 완료"
+ok_if "G4b: 판정 불가 안내" out_has "판정 불가"
+ok_if "G4b: 기본 브랜치 HEAD 불변" eq "$(gl_head)" "$g4b_head"
+
 
 DONE=1
 echo "test_archive_submodule: PASS=$PASS FAIL=$FAIL"

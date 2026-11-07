@@ -93,7 +93,7 @@ _skref_main() {
       --root)
         # 값 누락 가드(F2) — 다음 토큰이 없거나 옵션처럼 보이면 값 누락으로 취급하고
         # 즉시 종료한다. 그러지 않으면 `shift 2`가 실패해도 `set -e`가 없어 while이
-        # 같은 인자를 영원히 재검사하는 무한 반복이 된다(Reviewer Turn 002 F2 실측).
+        # 같은 인자를 영원히 재검사하는 무한 반복이 된다(실측).
         case "${2-}" in
           ""|-?*)
             echo "check_skill_reference_existence.sh: --root 에 값이 없습니다." >&2

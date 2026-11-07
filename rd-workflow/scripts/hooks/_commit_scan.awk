@@ -152,7 +152,7 @@ function ansi_c(s,   i, n, c, nx, out, v, d, cnt) {
     }
     # **알려지지 않은 escape 는 백슬래시를 보존한다** — bash 3.2 실측: $'com\mit' 의 argv 는
     # `com\mit` 이지 `commit` 이 아니다. 백슬래시를 지우면 실행되지도 않는 명령을 차단하는
-    # 오탐이 된다(Turn 006 지적).
+    # 오탐이 된다.
     else out = out "\\" nx
   }
   return out
@@ -478,7 +478,7 @@ BEGIN {
   # 닫히지 않은 인용·치환, 길이 불변식 위반 -> 판정 불가.
   # **heredoc 이 종료 델리미터 없이 EOF 로 끝나는 것은 bash 에서 정상**이다(실측: exit 0,
   # body 는 그대로 데이터). 이를 rc=2 로 보내면 폴백의 legacy 글롭이 body 의 커밋 문자열을
-  # 오탐해 이 작업의 1순위 목표인 오탐 해소가 깨진다(Turn 006 지적). 따라서 st/pend_on 은
+  # 오탐해 이 작업의 1순위 목표인 오탐 해소가 깨진다. 따라서 st/pend_on 은
   # 판정 불가 조건에서 제외한다 — 그 시점까지의 body 는 이미 데이터로 마스킹돼 있다.
   if (sp > 0 || cs > 0 || bt > 0 || length(masked) != n) {
     print "gate=0 uncertain=0 ncand=0"; exit 2

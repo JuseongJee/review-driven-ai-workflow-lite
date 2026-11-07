@@ -664,7 +664,7 @@ issue_body() {
   # **필수 읽기는 전부 heredoc 밖에서 변수로 받고 실패를 비영으로 전파한다.**
   # heredoc 안의 명령 치환(`$(cat "$file")`)은 실패해도 바깥 `cat <<EOF` 의 성공 상태에
   # 가려진다. 그대로 두면 호출부의 `if ! issue_body ...` 가 통과해 원문이 빠진 Issue 를
-  # 발행할 수 있다 (final diff review Turn 004 Finding 2).
+  # 발행할 수 있다.
   local file="$1" id="$2" version target_artifact original
   version="$(read_field "$file" "rd-workflow VERSION")" || return 1
   target_artifact="$(read_field "$file" "대상 산출물")" || return 1
@@ -692,7 +692,7 @@ print_pending_hint() {
 print_failure_hint() {
   # $1=file $2=재시도 시 보존할 옵션 문자열(빈 문자열 가능)
   #
-  # **원래 대상과 승인 상태를 보존한다** (final diff review Turn 006 Finding 1).
+  # **원래 대상과 승인 상태를 보존한다**.
   # - `--upstream` 을 떨어뜨리면 재시도가 config 대상으로 바뀌어 **다른 저장소에 발행**된다.
   #   config 가 `A/B` 인데 사용자가 `--upstream C/D` 로 실행했다가 실패한 경우가 그렇다.
   # - 승인 화면을 끝까지 보지 못한 실패에 `--yes` 를 붙이면 이 기능의 핵심인 발행 전 사람
@@ -729,7 +729,7 @@ render_preview() {
 
 # 옵션 파서 — preview/publish 공용.
 # `--upstream` 뒤 값이 없을 때 `shift 2` 는 실패하고, `set -e` 가 아니므로 같은 인자가
-# 남아 while 이 무한 반복한다 (final diff review Finding 4). 값 유무와 미지원 옵션을
+# 남아 while 이 무한 반복한다. 값 유무와 미지원 옵션을
 # 명시적으로 검증해 즉시 종료한다.
 _parse_publish_opts() {
   # 결과를 전역 OPT_UPSTREAM / OPT_YES 에 담는다. 인자 오류면 return 2.
@@ -786,7 +786,7 @@ cmd_preview() {
   local existing_id
   existing_id="$(read_field "$file" "report-id")"
   # 화면 생성 실패를 성공으로 보고하지 않는다 — publish 와 달리 이 경로에는 앞선 크기
-  # 검사가 없어, 원문이 빠진 화면이 그대로 승인 근거가 될 수 있다 (Turn 004 Finding 2).
+  # 검사가 없어, 원문이 빠진 화면이 그대로 승인 근거가 될 수 있다.
   render_preview "$file" "$host" "$repo" "$visibility" "$existing_id" || return 7
   return 0
 }
@@ -808,7 +808,7 @@ cmd_publish() {
   fi
 
   # 실패 안내가 **이번 실행이 실제로 겨냥한 대상(effective target)** 과 승인 상태를 잃지
-  # 않게 보존한다 (Turn 006 Finding 1, Turn 008 Finding 1).
+  # 않게 보존한다.
   #
   # `--upstream` 을 준 경우만 보존하면 부족하다. config 로 대상을 정한 실행이 실패한 뒤
   # config 가 바뀌면(사람 편집·템플릿 동기화), 대상 없는 안내를 그대로 따라 **사용자가
@@ -865,7 +865,7 @@ cmd_publish() {
   # 6. 본문 크기 (60,000 byte)
   #
   # **발행 시점의 최종 본문을 재야 한다.** 현재 파일로만 재면 한도 바로 아래인 보고서가
-  # 검사를 통과한 뒤 한도를 넘겨 발행될 수 있다 (final diff review Finding 2).
+  # 검사를 통과한 뒤 한도를 넘겨 발행될 수 있다.
   #
   # 최종 본문 = 머리말(실제 id 삽입) + **8번 ensure-id 직후의 파일 내용**.
   # `attempting:` 기록(10-b)은 payload 생성(10-a) **뒤**이므로 본문에 들어가지 않는다.
@@ -922,7 +922,7 @@ cmd_publish() {
   # 9. 식별자 정확 일치 검색
   #
   # 조회 실패와 "0건" 을 반드시 분리한다. 실패를 0건으로 오인하면 기존 Issue 가 있어도
-  # 새로 만들어 중복이 생긴다 (final diff review Finding 1).
+  # 새로 만들어 중복이 생긴다.
   local search_out search_rc match_count
   search_out="$(search_matches "$host" "$repo" "$id")"; search_rc=$?
   if [[ $search_rc -ne 0 ]]; then
@@ -941,7 +941,6 @@ cmd_publish() {
     echo "오류: report-id $id 와 일치하는 Issue 가 여러 건 발견되어 자동으로 연결하지 않습니다. 후보:" >&2
     printf '%s\n' "$search_out" >&2
     # 일반 재시도는 같은 모호함을 반복할 뿐이다 — 후보 선택 후 연결을 안내한다
-    # (final diff review Finding 5).
     echo "  조치 : 위 후보 중 하나를 고른 뒤 아래를 실행하십시오." >&2
     echo "         bash rd-workflow/scripts/defect_reports.sh set-issue $file <고른-url>" >&2
     echo "  참고 : 미전달 목록 — bash rd-workflow/scripts/defect_reports.sh list-pending" >&2
@@ -977,7 +976,7 @@ EOF
   # 10-a. payload 준비 — attempting 기록보다 **앞**에 온다.
   #
   # 순서를 뒤집으면 mktemp·본문 생성 실패만으로 파일에 attempting: 이 남아, 생성된 적
-  # 없는 원격 Issue 를 사람이 찾아 헤매게 된다 (final diff review Finding 3).
+  # 없는 원격 Issue 를 사람이 찾아 헤매게 된다.
   # 여기서 실패하면 로컬·원격 모두 무변경이므로 재시도가 안전하다.
   local tmp_body title created_url create_rc
   tmp_body="$(mktemp)" || {

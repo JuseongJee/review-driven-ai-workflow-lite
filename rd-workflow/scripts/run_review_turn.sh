@@ -337,7 +337,7 @@ resnapshot_review_head() {
   if [[ -z "$base_oid" && -z "$old_head" ]]; then
     return 0
   fi
-  # **한쪽만 있는 세션은 legacy 가 아니라 손상입니다** (final diff review turn 006 Finding 1).
+  # **한쪽만 있는 세션은 legacy 가 아니라 손상입니다**.
   # 종전에는 이것도 조용한 no-op 이었는데, `rd review seal` 은 head 가 있다는 이유만으로
   # 일반 `verified=yes` 경로를 허용하므로 base 없는 세션이 검증된 것처럼 봉인됩니다.
   if [[ -z "$base_oid" || -z "$old_head" ]]; then
@@ -361,7 +361,7 @@ resnapshot_review_head() {
   # ① resolve · 계보 검증
   #
   # **정책은 갱신 여부만 가릅니다 — 대상 무결성 검증은 두 정책 모두 받습니다**
-  # (final diff review turn 004 Finding 2). `pinned` 을 검증 앞에서 조기 반환시키면,
+  # `pinned` 을 검증 앞에서 조기 반환시키면,
   # 명시 ref 삭제 후 객체 정리·저장소 교체·SESSION 의 부분 수정으로 기록 OID 가 더 이상
   # resolve 되지 않는 세션이 그대로 reviewer dispatch 까지 가고, 사용자는 `git diff
   # <invalid>..<invalid>` 로 돈 결과를 **성공한 리뷰 턴처럼** 받게 됩니다.
@@ -405,7 +405,7 @@ resnapshot_review_head() {
     return 1
   fi
 
-  # **raw 필드는 저장소 native full OID 여야 합니다** (final diff review turn 006 Finding 1).
+  # **raw 필드는 저장소 native full OID 여야 합니다**.
   # `rd_resolve_commit_oid` 는 `branch-B` 같은 이동 ref 와 축약 OID 도 해석하므로, 필드에
   # 그런 값이 들어 있으면 reviewer 시점과 seal 시점 사이에 대상이 다시 움직일 수 있습니다.
   # resolve 결과와 원본이 같은지 확인해 그 창을 닫습니다.
@@ -490,6 +490,109 @@ resnapshot_review_head() {
 
   # ④ 여기부터가 어댑터 호출이 허용되는 지점입니다.
   echo "review head 재snapshot: ${old_head} → ${new_head} (base ${resolved_base} 는 불변)" >&2
+  return 0
+}
+
+# classify_session_for_reviewer <session-dir> — Reviewer 턴 시작 전 세션 상태를 판정합니다.
+#   rc 0  = 이미 awaiting-reviewer·Reviewer (기존 경로 그대로 진행)
+#   rc 10 = awaiting-author 이고 형식을 갖춘 최신 Author 턴이 있음 → 전환 예약 (HANDOFF_TURN_FILE 에 그 경로)
+#   rc 1  = 거부 (다음 행동 안내를 stderr 에 냄)
+# 이 함수는 SESSION 을 쓰지 않습니다 (전환은 apply_author_handoff, 모든 검사 통과 뒤).
+# 전역 STATUS·CURRENT_OWNER·TURNS_DIR 를 읽습니다. 서브셸로 부르면 HANDOFF_TURN_FILE 이 사라집니다.
+classify_session_for_reviewer() {
+  local session_dir="$1" rel latest base num role next
+  HANDOFF_TURN_FILE=""
+  rel="${session_dir#${project_root}/}"
+
+  if [[ "$STATUS" == "awaiting-reviewer" && "$CURRENT_OWNER" == "Reviewer" ]]; then
+    return 0
+  fi
+
+  case "$STATUS" in
+    awaiting-user)
+      echo "리뷰 세션이 사람 결정을 기다립니다 (status=awaiting-user). ${rel}/USER_ACTION.md 의 질문에 사람이 답한 뒤 진행하십시오. 자동으로 넘기지 않습니다." >&2
+      return 1
+      ;;
+    closed)
+      echo "리뷰 세션이 종결됐습니다 (status=closed). 다시 리뷰하려면 bash rd-workflow/scripts/prepare_review_pipeline.sh 로 새 세션을 만드십시오." >&2
+      return 1
+      ;;
+    awaiting-author)
+      if [[ "$CURRENT_OWNER" != "Author" && "$CURRENT_OWNER" != "Claude" ]]; then
+        echo "리뷰 세션 상태가 맞지 않습니다 (status=${STATUS}, owner=${CURRENT_OWNER}). SESSION.md 의 Status·Current Owner 를 확인하십시오." >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "리뷰 세션 상태가 맞지 않습니다 (status=${STATUS}, owner=${CURRENT_OWNER}). SESSION.md 의 Status·Current Owner 를 확인하십시오." >&2
+      return 1
+      ;;
+  esac
+
+  # awaiting-author + Author·Claude: 최신 턴(compute_next_turn 과 같은 정렬 기준)이 형식을 갖춘 Author 턴이어야 합니다.
+  latest="$(find "$TURNS_DIR" -maxdepth 1 -name '*.md' | sort | tail -n 1)"
+  if [[ -n "$latest" ]]; then
+    base="$(basename "$latest")"
+    if [[ "$base" =~ ^[0-9]{3}_(author|claude)\.md$ ]]; then
+      if [[ -f "$latest" && ! -L "$latest" ]] && grep -q '[^[:space:]]' "$latest"; then
+        HANDOFF_TURN_FILE="$latest"
+        return 10
+      fi
+      echo "리뷰 세션이 Author 턴을 기다립니다 (status=awaiting-author). ${rel}/turns/${base} 가 비었거나 일반 파일이 아닙니다. 내용을 채운 일반 파일로 고친 뒤 같은 명령을 다시 실행하십시오." >&2
+      return 1
+    fi
+    num="${base%%_*}"
+    if [[ "$num" =~ ^[0-9]{3}$ ]]; then
+      next="$(printf '%03d' "$((10#${num} + 1))")"
+    else
+      next="001"
+    fi
+  else
+    next="001"
+  fi
+  echo "리뷰 세션이 Author 턴을 기다립니다 (status=awaiting-author). Author 턴을 ${rel}/turns/${next}_author.md 에 쓴 뒤 같은 명령을 다시 실행하십시오." >&2
+  return 1
+}
+
+# apply_author_handoff <session-file> <turn-file> — SESSION 의 Status·Current Owner 만 바꿉니다.
+#   rc 0 = 교체 성공 + 알림 한 줄 / rc 1 = SESSION 원본 그대로 + 사유 한 줄
+# 같은 디렉터리 임시 파일에 전체를 렌더링하고, 두 값을 다시 읽어 확인한 뒤 mv 로 교체합니다.
+apply_author_handoff() {
+  local session_file="$1" turn_file="$2" tmp rc st ow
+  tmp="$(mktemp "$(dirname "$session_file")/.SESSION.md.XXXXXX")" || {
+    echo "review turn: 임시 파일 생성 실패 — SESSION 을 바꾸지 않고 중단합니다." >&2
+    return 1
+  }
+  # 마지막 줄의 개행 유무도 원본 그대로 둡니다 (두 값 밖의 바이트를 바꾸지 않는 계약).
+  # awk 의 print 는 마지막 줄에도 개행을 붙이므로, 줄 사이에만 개행을 넣고 끝 개행은 원본을 따릅니다.
+  local trail_nl=1
+  [[ -s "$session_file" && -n "$(tail -c 1 "$session_file")" ]] && trail_nl=0
+  awk -v trail_nl="$trail_nl" '
+    function emit(line) { if (started) printf "\n"; printf "%s", line; started = 1 }
+    /^## / { sec = $0; seen = 0; emit($0); next }
+    sec == "## Status" && !seen && NF { emit("awaiting-reviewer"); seen = 1; next }
+    sec == "## Current Owner" && !seen && NF { emit("Reviewer"); seen = 1; next }
+    { emit($0) }
+    END { if (started && trail_nl) printf "\n" }' "$session_file" > "$tmp"
+  rc=$?
+  if [[ "$rc" != "0" || ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    echo "review turn: SESSION 렌더링 실패 (awk exit ${rc}) — SESSION 을 바꾸지 않고 중단합니다." >&2
+    return 1
+  fi
+  st="$(extract_section "$tmp" "Status" | trim_blank_lines)"
+  ow="$(extract_section "$tmp" "Current Owner" | trim_blank_lines)"
+  if [[ "$st" != "awaiting-reviewer" || "$ow" != "Reviewer" ]]; then
+    rm -f "$tmp"
+    echo "review turn: 전환 결과 검증 실패 (status='${st}', owner='${ow}') — SESSION 을 바꾸지 않고 중단합니다." >&2
+    return 1
+  fi
+  if ! mv "$tmp" "$session_file"; then
+    rm -f "$tmp"
+    echo "review turn: SESSION 교체(mv) 실패 — SESSION 을 바꾸지 않고 중단합니다." >&2
+    return 1
+  fi
+  echo "리뷰 세션 상태: Author 턴($(basename "$turn_file"))을 확인해 Status 를 awaiting-reviewer, Current Owner 를 Reviewer 로 넘겼습니다." >&2
   return 0
 }
 
@@ -675,15 +778,14 @@ if declare -f validate_branch_context >/dev/null 2>&1; then
   fi
 fi
 
-if [[ "$STATUS" != "awaiting-reviewer" ]]; then
-  echo "session is not awaiting reviewer: status=$STATUS" >&2
-  exit 1
-fi
-
-if [[ "$CURRENT_OWNER" != "Reviewer" ]]; then
-  echo "current owner is not Reviewer: owner=$CURRENT_OWNER" >&2
-  exit 1
-fi
+handoff_pending=0
+classify_rc=0
+classify_session_for_reviewer "$session_dir" || classify_rc=$?
+case "$classify_rc" in
+  0) ;;
+  10) handoff_pending=1 ;;
+  *) exit 1 ;;
+esac
 
 load_review_config "$REVIEW_TYPE"
 compute_next_turn "$TURNS_DIR" "reviewer"
@@ -711,6 +813,15 @@ fi
 if ! resnapshot_review_head "$session_dir" "$SESSION_FILE" "$REVIEW_TYPE"; then
   echo "review turn: head 재snapshot 실패로 턴을 시작하지 않습니다." >&2
   exit 1
+fi
+# 어댑터 실행 직전 head — 실행 기록(reviewer_runs.tsv)의 head 열. 값이 없는 세션은 `-`.
+RUN_HEAD="$(session_branch_field "$SESSION_FILE" review-head-oid 2>/dev/null || true)"
+[[ -n "$RUN_HEAD" ]] || RUN_HEAD="-"
+# 모든 거부 검사를 통과한 뒤에만 Author→Reviewer 상태 전환을 씁니다 (spec 3.2).
+if [[ "$handoff_pending" == "1" ]]; then
+  if ! apply_author_handoff "$SESSION_FILE" "$HANDOFF_TURN_FILE"; then
+    exit 1
+  fi
 fi
 # 갱신된 Review Target 을 프롬프트에 반영합니다 — 기록된 OID 와 reviewer 가 읽는 diff 를 같게 유지합니다.
 load_session_state "$SESSION_FILE"
@@ -896,7 +1007,7 @@ for tool in $PRIORITY; do
           # 트랩되지 않으므로, **어댑터만 죽고 별도 process group 의 codex 와 자손은 계속
           # 실행·수정할 수 있다.** 그 상태에서도 "턴 파일 부재 + Owner=Reviewer/awaiting-reviewer"
           # 는 그대로 참이므로, 세션 상태만 보고 재실행을 권하면 두 agent 가 같은 세션과
-          # 워크스페이스를 동시에 건드린다(final diff review 턴 004 Important 2).
+          # 워크스페이스를 동시에 건드린다.
           case "$adapter_rc" in
             129|130|143) sig_cleanup_guaranteed=1 ;;
             *)           sig_cleanup_guaranteed=0 ;;
@@ -963,6 +1074,10 @@ for tool in $PRIORITY; do
                        cause_hints+=("도구 로그인 상태와 API 키를 확인하십시오 (로그인 후 재실행).") ;;
             model)     cause_labels="${cause_labels:+$cause_labels, }모델 없음"
                        cause_hints+=("rd-workflow/config/review-tools.json 의 모델 지정을 확인하십시오.") ;;
+            spendcap)  cause_labels="${cause_labels:+$cause_labels, }지출 한도·크레딧 소진"
+                       cause_hints+=("지출 상한 도달 또는 크레딧 소진입니다. 시간이 지나도 풀리지 않습니다. 워크스페이스 소유자(관리자)가 상한을 올리거나 크레딧을 채운 뒤, 아래 「세션」 안내에 따라 재개하십시오.") ;;
+            usagelimit) cause_labels="${cause_labels:+$cause_labels, }사용량 한도"
+                       cause_hints+=("요금제 사용량 한도입니다. 바로 재시도해도 풀리지 않습니다. 한도가 재설정된 뒤(오류 문구에 시각이 있으면 그 시각) 아래 「세션」 안내에 따라 재개하십시오.") ;;
           esac
         done
         case "$cause_kind" in
@@ -1001,13 +1116,27 @@ fi
 
 # --- 출력 검증 ---
 updated_status="$(validate_turn_output "$SESSION_FILE" "$EXPECTED_TURN_FILE" "$NEXT_TURN_INDEX" "$turn_limit" "$used_tool")"
+report_nested_git "$session_dir" "$relative_session_dir"
 
-# --- Tool History 기록 ---
+# --- 실행 기록 (reviewer_runs.tsv) — Tool History 보다 먼저, 쓰기 실패면 턴을 실패로 끝냅니다 ---
 if [[ "$used_tool" == "claude" ]]; then
   mode="self-review"
 else
   mode="reviewer"
 fi
+if ! append_reviewer_run "$session_dir" "$NEXT_TURN_NUMBER" "$used_tool" "$mode" "$RUN_HEAD" "$EXPECTED_TURN_FILE"; then
+  cat >&2 <<EOM
+오류: 리뷰어 턴 실행 기록(reviewer_runs.tsv)을 쓰지 못했습니다 — ${relative_session_dir}
+    이 턴은 seal 대조에 쓰이지 않습니다. 이대로는 rd review seal 이 이 턴을 실행된 턴으로 인정하지 않습니다.
+조치: 쓰기 권한·디스크 공간을 확인한 뒤 같은 턴을 다시 실행하십시오.
+    1. 턴 파일을 세션 밖으로 옮깁니다: ${relative_expected_turn_file}
+    2. SESSION.md 의 Status 를 awaiting-reviewer, Current Owner 를 Reviewer 로 되돌립니다.
+    3. 같은 명령으로 다시 실행합니다: bash rd-workflow/scripts/run_review_turn.sh ${relative_session_dir}
+EOM
+  exit 1
+fi
+
+# --- Tool History 기록 ---
 append_tool_history "$SESSION_FILE" "$NEXT_TURN_NUMBER" "$used_tool" "$mode"
 
 # --- 결과 출력 ---

@@ -17,7 +17,7 @@ FUTURE_REQUESTS에서 작업을 선택하고 파이프라인을 자율 실행한
 
 ```bash
 bash -s <<'RD_SKILL_COMPAT'
-RD_SKILL_BASE=2026-11-01-202303 RD_SKILL_NAME=autopilot
+RD_SKILL_BASE=2026-11-04-203832 RD_SKILL_NAME=autopilot
 vf="rd-workflow/VERSION"
 if [ ! -f "$vf" ] && [ -f "_ROOT_FILES/rd-workflow/VERSION" ]; then exit 0; fi
 v=""; [ -f "$vf" ] && v="$(cat "$vf")"; v="${v#lite-}"
@@ -74,7 +74,7 @@ digraph autopilot {
 autopilot 실행 중에는 **자율 실행 공용 규칙**(`rd-workflow/docs/flows/AUTONOMY.md`)이 모든 하위 skill·prompt·기본 행동보다 우선한다 — "절대 멈추지 않는다"·"자율 판단 기준"·"중단 조건"을 그대로 따른다 (review 50턴, 디버깅 3회, loop-guard 등 중단 조건 포함).
 
 **autopilot 특화 예외 게이트 (AUTONOMY.md 공용 규칙보다 우선):**
-- §1의 작업 선택은 AskUserQuestion으로 **사용자가 결정한다**. 실행 모드는 등급 판정이 정하며 사용자는 이의가 있을 때만 바꾼다(하향은 사용자만 — "실행 모드" 섹션). 이 게이트 이후부터 AUTONOMY.md 규칙이 적용된다.
+- §1의 작업 선택은 AskUserQuestion으로 **사용자가 결정한다**. 실행 모드는 등급 판정이 정하며 사용자는 이의가 있을 때만 바꾼다(하향 조건은 "실행 모드" 섹션). 이 게이트 이후부터 AUTONOMY.md 규칙이 적용된다.
 
 ## autopilot 적합성 기준
 
@@ -105,7 +105,7 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 `
 ### 모드 결정 규칙
 
 - 작업 선택 직후 autopilot 이 등급과 근거 신호를 판정해 그 등급의 모드로 진행한다. 시작 보고 블록은 1회만 낸다 — 모드 A(`full`) 는 판정 직후이되 WORKFLOW.md 의 비변경 preflight `bash rd-workflow/scripts/lifecycle/start_preflight.sh` 를 먼저 실행해 그 `push 예정`·`미병합 브랜치 FR 후보` 줄을 블록에 적고, 모드 B 는 §3 promote 직전에 시작 계약 5항을 확인한 직후(`push 예정 = archive.sh 경유`) 낸다. 두 모드 모두 preflight exit 10(등록 커밋 형태가 아닌 ahead·behind·diverged·fetch 실패) 이면 autopilot 은 지시 대기가 없으므로 시작하지 않고 인계한다 — ahead 가 전부 FR 등록 커밋이면 자동 채택(exit 0) 되어 시작한다. preflight 의 fetch 실패는 `미push 수 판정 실패: 사유` 로 적고 무인 모드에서는 인계한다. 의미 신호로 판정 불가면 `full`(모드 A), 인접 두 등급 사이가 모호하면 높은 등급이다(`light`↔`standard` 는 `standard`/모드 B, `standard`↔`full` 은 `full`/모드 A).
-- 상향은 언제나 가능하다. 하향은 사용자만 할 수 있고(`RD_AUTOPILOT_MODE=B` 또는 대화형 지시), 되돌리기 어려운 효과가 있는 FR 은 어떤 하향으로도 모드 B 가 될 수 없다. 사용자 하향은 REQUEST `## Risk Tier` 이력에 기록한다.
+- 상향은 언제나 가능하다. 하향은 WORKFLOW.md 위험 등급 절의 하향 조건을 따르며 autopilot 도 근거를 적고 모드 B 로 내릴 수 있다. `RD_AUTOPILOT_MODE=B` 는 사용자 하향이다. 되돌리기 어려운 효과가 있는 FR 은 어떤 하향으로도 모드 B 가 될 수 없다. 하향은 주체와 함께 REQUEST `## Risk Tier` 이력에 적는다.
 
 ### 모드 B 실행 규칙
 
@@ -117,7 +117,7 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 `
 
 ### 범위 이탈 시 중간 승격 (모드 B → 모드 A)
 
-구현 중 `WORKFLOW.md` 위험 등급 절의 `full` 신호(되돌리기 어려운 효과, 워크플로 인프라 동작 변경, 인터페이스·데이터 모델·기존 동작 변경, 새 기능)가 하나라도 실제로 나타나면 **멈추지 않고** 모드 A로 승격한다. 감지 시점은 각 구현 사이클 시작 시와 구현 중 새 요구 발견 시다.
+구현 중 `WORKFLOW.md` 위험 등급 절의 `full` 신호(되돌리기 어려운 효과, 워크플로 인프라 동작 변경, 인터페이스·데이터 모델·기존 동작 변경, 새 기능)가 하나라도 실제로 나타나면(하향 근거에 적은 신호는 제외 — WORKFLOW.md 「커밋 전 재분류와 상향」. 새 신호·되돌리기 어려운 효과는 승격) **멈추지 않고** 모드 A로 승격한다. 감지 시점은 각 구현 사이클 시작 시와 구현 중 새 요구 발견 시다.
 
 승격 절차 (5단계):
 
@@ -181,14 +181,35 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 `
    waiting: final diff review 턴 003 / run_review_turn.sh / started 17:42
    ```
 
+### 실행 비용 줄
+
+wrapper 는 claude 를 부른 실행마다 비용 줄 하나를 stdout 에 낸다. 출력 순서는 결과 요약 줄 → 발행 줄(`autopilot_headless: 발행 …`, 발행 단계가 돈 경우만) → 비용 줄 → outcome 상세 줄이다. 이 줄은 exit code 판정에 쓰지 않는다.
+
+```
+autopilot_headless: 완료 (completed) [exit 0]
+autopilot_headless: 실행 비용 $0.4213 (정가 환산) · 토큰 입력 1,204 · 출력 38,910 · 캐시 쓰기 210,334 · 캐시 읽기 5,812,007 · 소요 37.2분 · 턴 58
+```
+
+- 값은 `claude -p --output-format json` 결과의 `total_cost_usd`·`usage`·`duration_ms`·`num_turns` 다. `python3` 실행 검사가 통과한 경로만 JSON 으로 띄우고, 사람에게 보이는 본문(`result`)은 종전 text 출력 자리에 그대로 낸다.
+- 비용은 정가 환산값이다. 구독 계정의 실제 청구액이 아니다.
+- 자식 세션이 따로 띄운 리뷰 도구(codex, claude 리뷰 어댑터)의 비용은 들어가지 않는다.
+- 값을 읽지 못하면 `autopilot_headless: 실행 비용 확인 불가 — <사유>` 를 낸다. 시간 상한 강제 종료·크래시(`claude 결과 출력 없음`), JSON 형식 변화, `python3` 를 쓸 수 없는 환경(`python3 를 쓸 수 없음 (text 출력으로 실행)`)이 여기에 해당한다.
+- 값은 wrapper 호출 1회 기준이다. 한 FR 이 `resume` 으로 여러 번 호출되면 호출마다 줄이 하나씩 나온다.
+- 발행 단계는 `archive.sh` 를 돌리기 직전에 stderr 로 `autopilot_headless: 발행 시작 — task <이름> · <정책> 정책 · 로그 <경로>` 한 줄을 낸다. 로그는 `<git 공용 디렉터리>/rd-workflow/autopilot-publish/<이름>-<시각>.log` 에 실시간으로 쌓인다(같은 초에 같은 이름이 있으면 `-<n>` 을 붙인다).
+- `RD_AUTOPILOT_COST_FILE` 이 비어 있지 않으면 wrapper 가 claude 실행 뒤(발행 단계 뒤에도) 이 파일에 기계 판독 줄 하나를 덧붙인다. 값을 읽었으면 `cost<TAB>ok<TAB><USD 6자리>`, 읽지 못했으면 `cost<TAB>unknown<TAB><사유>` 다(사유는 사람용 줄의 「확인 불가 — 」 뒤 문구). 덮어쓰지 않고 덧붙이므로 한 FR 의 `resume` 호출이 한 파일에 쌓인다. 쓰기에 실패하면 stderr 에 `autopilot_headless: 경고 — 비용 기록 실패: <경로>` 만 내고 outcome 과 exit code 는 바꾸지 않는다. NO_INVOKE 는 아무것도 쓰지 않는다.
+- `ralph_drain.sh` 는 드레인마다 파일 하나를 넘기고(자체 임시 파일, 또는 호출자의 `RD_AUTOPILOT_COST_FILE` 에서 드레인 시작 뒤 추가된 줄만 센다) 최종 요약에 `실행 비용 합계: …` 를 낸다. 합계는 달러(소수 4자리)·wrapper 호출 수·확인 불가 수를 담는다. 비용 기록이 없는 호출이 있으면 「비용 기록 없는 호출 N회 — 일부 호출 누락, 실제 비용은 더 큼」 을 덧붙이고, 파일을 만들거나 읽지 못하면 「집계 불가 — <사유>」 를 낸다. 합계도 정가 환산값이며 리뷰 도구 비용은 빠진다.
+- §7 완료 보고 파일에는 이 값을 넣지 않는다. 보고 파일은 세션이 끝나기 전에 커밋·발행되고, 값은 세션이 끝난 뒤에야 wrapper 가 얻는다.
+
 ### 환경변수 계약
 
 | 변수 | 값 | 역할 |
 |------|-----|------|
 | `RD_AUTOPILOT_FR` | `<slug>` \| `auto` | 존재=무인 활성화. `<slug>`=명시 FR, `auto`=priority 자동선택 |
 | `RD_AUTOPILOT_MODE` | `A` \| `B` | 미지정이면 등급 판정이 모드를 정한다. 지정하면 사용자 override 로 취급한다(`B` 는 하향 — 되돌리기 어려운 효과가 있는 FR 에는 적용되지 않고 A 로 진행 + 보고) |
-| `RD_FINISH_POLICY` | `push` \| `merge` \| `none` | 미지정 시 `push`. `push`=정규 archive.sh 전체, `merge`=로컬 merge+tag(push 생략), `none`=fr branch 커밋만 |
+| `RD_FINISH_POLICY` | `push` \| `merge` \| `none` | 미지정 시 `push`. `push`=정규 archive.sh 전체, `merge`=로컬 merge+tag(push 생략), `none`=fr branch 커밋만. wrapper 가 해석해 `archive.sh` 인자로 옮긴다(`merge`=`--no-remote`). 무인 front-end 를 띄울 때 고른 이 값이 발행 승인이며, 무인 경로는 발행 요청 큐(`rd publish request`)를 쓰지 않는다 |
 | `RD_AUTOPILOT_OUTCOME_FILE` | 경로 | outcome 기록 대상. wrapper 가 설정해 주입 (기본 `rd-workflow-workspace/.autopilot-outcome`) |
+| `RD_AUTOPILOT_COST_FILE` | 경로 | 비어 있지 않으면 wrapper 가 실행마다 `cost<TAB>ok<TAB><USD>` 또는 `cost<TAB>unknown<TAB><사유>` 줄을 덧붙인다(덮어쓰지 않음). worktree 밖 경로나 gitignore 된 경로만 쓴다 — 미추적 파일은 다음 발행의 clean 검사를 막는다. batch 류 호출자 권장: `$(git rev-parse --path-format=absolute --git-common-dir)/rd-workflow/batch-cost/<slug>.tsv` |
+| `RD_PUBLISH_WALL_MINUTES` | 분(소수 허용) | 발행 단계(`archive.sh`)의 경과 시간 상한. 미지정 시 `loop-guard.json` 의 `publish_wall_minutes` 키, 그것도 없으면 기본 30분 순으로 정한다. `0`=상한 없음. 초과하면 TERM → 유예 → KILL 이고 유예는 `RD_FR_WALL_GRACE_SECONDS` 를 공유한다 |
 
 ### 무인 분기 작업 선택 (§1 게이트 대체)
 
@@ -216,13 +237,21 @@ autopilot은 두 실행 모드를 제공한다. 모드는 작업 선택 직후 `
 
 | outcome 토큰 | 의미 |
 |--------------|------|
-| `completed` | FR 완료 + `RD_FINISH_POLICY` 대로 archive 수행 |
+| `completed` | FR 완료 + `RD_FINISH_POLICY` 대로 발행 완료. `none` 정책이면 세션이 쓴다. `push`·`merge` 정책이면 wrapper 가 발행 성공 뒤 쓴다. 정리 잔여 기록이 실패했지만 발행은 끝난 경우에는 둘째 줄에 `cleanup-record-failed` 를 덧붙인다. 무인 경로는 wrapper 가 `cleanup-record-failed <slug> <발행 로그 경로>` 를 쓴다. 정리 잔여가 있으면 wrapper 는 기록 실패가 아닌 정상 완료에도 발행 로그의 `archive: CLEANUP-PENDING` 블록을 outcome 뒤에 옮긴다. 대화형 경로는 세션이 `cleanup-record-failed <slug> <autopilot 보고서 경로>` 를 쓴다(§6 7단계 판정) |
+| `publish-ready` | 세션→wrapper 내부 토큰. 기록 커밋까지 끝났고 발행만 남음. 둘째 줄 `task <작업 이름>`. `push`·`merge` 정책에서만 세션이 쓴다. wrapper 가 발행한 뒤 아래 결과 토큰으로 바꾸므로 front-end 에는 나오지 않는다 |
+| `blocked:publish-failed` | wrapper 가 씀. `archive.sh` 가 merge 전에 실패함. 기본 브랜치는 그대로이고 worktree 는 보존된다. exit 20 |
+| `blocked:publish-incomplete` | wrapper 가 씀. merge 는 됐지만 tag·push·정리가 끝나지 않음. 「다음:」 줄은 사유 줄의 원인을 해소한 뒤 `archive.sh --fr-branch fr/<이름>[ --no-remote]` 로 이어붙이라고 안내한다. exit 20 |
+| `blocked:publish-unsafe` | wrapper 가 씀. 발행은 됐지만 안전 불변식 위반으로 ref 정리가 멈춤. `archive.sh` 를 다시 돌리지 말고 ref 를 수동 정리한다. exit 20 |
 | `resume` | 세션 한계 도달, CURRENT_TASK 저장, 잔여 작업 있음 |
 | `blocked:<reason>` | AUTONOMY 중단조건 도달. `<reason>` 은 하이픈 식별자(예: `review-50turn`, `debug-3fail`, `loop-guard`, `human-decision`) |
 | `queue-empty` | auto-pick 후보 없음 |
 | `queue-blocked` | 착수 가능 FR 없음 — 남은 FR 이 전부 의존 대기·확인 필요·관계 오류 |
 | `blocked:relations-unavailable` | `fr_relations.sh` 관계 판정이 rc=2 로 실패 — 판정 불가 |
 | `blocked:resume-undetermined` | 재개 후보 판정 불가 — 생존·소유를 확인할 수 없는 작업만 있음(전역 실패, 대상 FR 없음) |
+
+발행 시간 상한 초과·발행 중 신호도 위 `blocked:publish-failed`·`publish-incomplete`·`publish-unsafe` 세 토큰으로 나옵니다(사유 첫 줄에 원인).
+
+`blocked:publish-*` 는 둘째 줄 이후에 `사유:`·`로그:`·`다음:` 줄을 싣는다(`로그:` 는 로그를 만들기 전의 조기 실패에는 없다. `다음:` 은 `unsafe` 와 조기 실패를 포함한 모든 발행 실패에 있다). `ralph_drain.sh` 는 이 세 사유에서 즉시 멈춘다(다음 FR 로 넘어가지 않음). 시간 상한 전에 `publish-ready` 를 기록했고 자손 프로세스를 정리했으면 wrapper 는 그대로 발행한다. 발행 단계는 claude 종료 뒤에 돌며 시간 상한이 감시하지 않는다. 종료 코드 표는 바뀌지 않는다. 종전처럼 세션이 직접 `archive.sh` 를 돌리고 `completed` 를 쓰는 경우도 exit 0 으로 매핑한다.
 
 ### 중단조건 → blocked 매핑 (무인 특화)
 
@@ -371,24 +400,25 @@ compact 후에도 한계에 가까워지면:
 
   6. **fr stage capture archive**: Source FR 의 status 가 `done` 으로 변경되었으므로 `/fr archive` 를 호출하여 같은 short-title 의 `fr` stage 캡처를 `raw-captures/archive/` 로 이동한다. (autopilot REQUEST archive 에서 `request`/`spec`/`plan` 캡처는 3단계에서 이미 이동됨. `fr` stage 는 이 단계에서 `/fr archive` 에 위임)
 
-  7. **lifecycle 일괄 마무리**: 위 1–6단계(archive content commit)가 fr branch에서 완료된 후 실행한다. **§3 에서 어느 경로로 왔는지에 따라 갈린다** — 두 경로를 섞으면 실행되지 않는다.
+  7. **lifecycle 일괄 마무리**: 위 1–6단계(archive content commit)가 fr branch에서 완료된 후 실행한다.
+
+     **무인 분기 (`RD_AUTOPILOT_FR` 설정):** 세션은 `archive.sh` 를 부르지 않는다. 발행은 wrapper 가 한다. `RD_FINISH_POLICY` 로 갈린다.
+     - `none`: outcome 첫 줄에 `completed` 를 기록하고 종료한다.
+     - `push`·`merge`: `bash rd-workflow/scripts/autopilot_driver.sh end` 를 실행한 뒤, outcome 첫 줄에 `publish-ready`, 둘째 줄에 `task <SHORT_TITLE>` 를 기록하고 종료한다. `<SHORT_TITLE>` 은 1단계에서 읽은 값이다(5단계가 Short Title 을 reset 하므로 그 뒤에 다시 읽지 않는다).
+
+     wrapper 는 claude 종료 뒤 기본 worktree 에서 `archive.sh --task <이름>`(`merge` 는 `--no-remote` 추가)을 실행하고, 결과에 따라 `completed` 또는 `blocked:publish-*` 를 쓴다. 정리 잔여 기록 실패 판정도 wrapper 가 한다. 무인 분기에서는 이 판정 문단을 따르지 않는다. 보고 파일은 1~6단계의 기록 커밋 전에 쓰고 그 커밋에 넣는다(§7).
+
+     **대화형 경로:** **§3 에서 어느 경로로 왔는지에 따라 (a)·(b) 중 하나로 갈린다** — (a)·(b) 두 경로를 섞으면 실행되지 않는다.
 
      `archive.sh` 호출 직전에 `bash rd-workflow/scripts/autopilot_driver.sh end` 를 실행해 실행 주체 표식을 지운다(아래 (a)·(b) 공통).
 
-     **(a) 별도 worktree 로 진행한 경우 (무인 실행의 기본):** 지금 있는 자리에서 `git checkout main` 을 하지 않는다. 기본 브랜치는 기본 worktree 가 이미 점유하고 있어 git 이 거부한다. 기본 worktree 로 **이동**한 뒤, 대상 작업을 `--task` 로 명시해 호출한다:
-     ```bash
-     cd "$(git rev-parse --path-format=absolute --git-common-dir)/.."   # 기본 worktree 루트
-     bash rd-workflow/scripts/lifecycle/archive.sh --task <slug>
-     ```
-     `--task` 를 붙이는 이유는 기본 worktree 의 `task-state` 가 baseline 이기 때문이다 — promote 가 작업 상태를 fr worktree 안에만 쓰므로, 인자가 없으면 archive 가 대상을 확정하지 못한다.
+     **(a) 별도 worktree 로 진행한 경우 (무인 실행의 기본):** 지금 있는 작업 worktree 에서 `bash rd-workflow/scripts/lifecycle/archive.sh` 를 인자 없이 호출한다. archive 가 기본 worktree 로 옮겨 merge·tag·push 를 한다.
 
-     **(b) `--no-worktree` 로 진행한 경우:** 현재 체크아웃이 곧 작업 브랜치다. 기본 브랜치로 switch 한 뒤 인자 없이 호출한다:
-     ```bash
-     git checkout main  # 기본 브랜치 (master/trunk 프로젝트는 해당 브랜치 — workflow.json default_branch 참조)
-     bash rd-workflow/scripts/lifecycle/archive.sh
-     ```
+     **(b) `--no-worktree` 로 진행한 경우:** 현재 체크아웃이 곧 작업 브랜치다. 기본 브랜치(`workflow.json` 의 `default_branch`)로 switch 한 뒤 `bash rd-workflow/scripts/lifecycle/archive.sh --task <slug>` 로 대상을 명시해 호출한다(WORKFLOW.md 「`--no-worktree` 작업의 마감 경로」).
 
-     `archive.sh` 가 merge + tag + push + branch/worktree 정리를 일괄 처리한다. 이 단계 실패 시 현재 상태를 보고하고 사용자에게 넘긴다. (a) 경로에서 호출자 worktree 와 로컬 fr 브랜치는 보존되어 정리 대기가 되고, 기본 체크아웃의 `rd task list` 가 안전할 때 지연 정리한다 — 이 단계의 책임이 아니다.
+     `archive.sh` 가 merge + tag + push 를 일괄 처리한다. 이 단계 실패 시 현재 상태를 보고하고 사용자에게 넘긴다. 정리는 이 단계의 책임이 아니다(`WORKFLOW.md` 「REQUEST 아카이브」 절).
+
+     **정리 잔여 기록 실패 판정 (대화형 경로)**: `archive.sh` 를 stdout 과 stderr 를 따로 캡처해 실행하고, `archive.sh` 가 exit 1 이어도 다음 셋이 모두 맞으면 발행 완료로 본다. ① stderr 에 `archive: CLEANUP-RECORD-FAILED <write|clear> <사유>` 줄이 있다. ② stdout 에 `archive: core 완료` 또는 `archive: 완료. tag=` 줄이 있다. ③ 출력에 `안전 불변식 위반` 이 없다. 이때 outcome 첫 줄을 `completed` 로 쓰고 둘째 줄에 `cleanup-record-failed <slug> <autopilot 보고서 경로>` 를 덧붙인다. 보고서 `## 정리 잔여` 절에는 그 실행의 stdout `archive: CLEANUP-PENDING` 블록을 옮긴다. `안전 불변식 위반` 이 있거나 ②가 없으면 종전대로 실패로 다룬다.
 
 **책임 경계**: `fr` stage 캡처는 `/fr archive` 책임이다. `request`/`spec`/`plan` stage 캡처는 REQUEST archive(autopilot 또는 수동) 책임이다.
 
@@ -396,7 +426,9 @@ compact 후에도 한계에 가까워지면:
 
 보고 파일을 `rd-workflow-workspace/reports/autopilot/YYYY-MM-DD-HHMM-작업명.md`에 저장하고, 내용을 사용자에게도 출력한다.
 
-**완료 보고 마지막에 `/clear` 안내 (필수)**: 최종 보고를 출력한 뒤, lifecycle archive(§6 step 7 `archive.sh` = merge + push)까지 완료되어 모든 산출물이 손실 없이 보존됐으면 마지막에 컨텍스트 `/clear` 가능 여부를 반드시 한 줄 명시한다. 사용자가 추가 FR 등록 의사를 보이면 FR 등록을 먼저 처리한 뒤 안내한다.
+**무인 분기**: 발행은 세션이 끝난 뒤 wrapper 가 하므로 보고 파일을 §6 1~6단계의 기록 커밋 전에 쓰고 그 커밋에 넣는다. `## 정리 잔여` 절에는 「무인 발행 — 결과는 wrapper 출력과 발행 로그에 남습니다」 를 적고 `cleanup_pending.sh show` 를 부르지 않는다. `/clear` 안내는 내지 않는다. 아래 `/clear` 안내와 `show` 주석은 대화형 경로에만 적용한다.
+
+**완료 보고 마지막에 `/clear` 안내 (대화형 경로, 필수)**: 최종 보고를 출력한 뒤, lifecycle archive(§6 step 7 `archive.sh` = merge + push)까지 완료되어 모든 산출물이 손실 없이 보존됐으면 마지막에 컨텍스트 `/clear` 가능 여부를 반드시 한 줄 명시한다. 사용자가 추가 FR 등록 의사를 보이면 FR 등록을 먼저 처리한 뒤 안내한다.
 
 보고 파일 형식:
 
@@ -405,6 +437,9 @@ compact 후에도 한계에 가까워지면:
 
 - 일시: YYYY-MM-DD HH:MM
 - REQUEST 아카이브: `rd-workflow-workspace/backlog/request-archive/YYYY-MM-DD-HHMM-작업명.md`
+
+## 사용자에게 달라진 것
+<!-- final diff review 의 `## PR 본문` 절을 담은 가장 최근 Author 턴에서 `User-visible Changes` 를 그대로 옮긴다 (무엇이 달라졌나 / 어떻게 확인하나 / 아직 확인되지 않은 것, 또는 `없음 — <이유>`). -->
 
 ## 선택한 작업
 - 항목: [제목]
@@ -426,9 +461,15 @@ compact 후에도 한계에 가까워지면:
 - Spec/Plan review: [한줄 요약 | 생략 (모드 B)] → [`rd-workflow-workspace/reports/reviews/...-spec-plan-review.md` | -]
 - Final diff review: [한줄 요약] → `rd-workflow-workspace/reports/reviews/...-diff-review.md`
 
+## 정리 후보
+<!-- final-diff-review Final output 의 정리 후보를 옮긴다. 후보마다 `FR 등록: <slug>` 또는 `목록만` 을 붙인다. 없으면 `없음`. 등록한 FR 을 언제 할지는 사람이 정한다. -->
+
+## 정리 잔여
+<!-- 무인 분기: `무인 발행 — 결과는 wrapper 출력과 발행 로그에 남습니다` 한 줄만 적는다. 대화형 경로: `bash rd-workflow/scripts/lifecycle/cleanup_pending.sh show <slug>` 출력을 그대로 옮긴다. 기록이 없으면 `없음`. rc 2 면 `조회 실패 — <사유>`.
+     기록 실패(§6 7단계)였으면 발행 결과 한 줄(merge·tag·push, tag 이름)과 기록 실패 한 줄을 나눠 쓰고, stdout `archive: CLEANUP-PENDING` 블록을 옮긴다. -->
+
 ## 실행 메트릭
 - 소요 시간: [HH시간 MM분 또는 MM분 — `CURRENT_TASK.md` Notes의 `started_at` 기준으로 시스템 시계(로컬 시간대) 계산. started_at 없음 또는 형식 오류 시: `N/A (started_at 없음 또는 형식 오류)`]
-- 토큰 사용량: N/A (Claude Code CLI 출력에서 확인)
 
 ## Rollback
 - 브랜치: `fr/<slug>` (promote.sh 생성)

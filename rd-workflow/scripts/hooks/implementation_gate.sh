@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 원시 입력에 subagent 표식(agent_type·agent_id)과 \u 이스케이프가 모두 없으면 판정 결과는 항상 통과다.
+_hook_input="$(cat)"; _hook_input_read=1
+[[ "$_hook_input" == *agent_type* || "$_hook_input" == *agent_id* || "$_hook_input" == *\\u* ]] || exit 0
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd "${script_dir}/../../.." && pwd)"
 source "${script_dir}/_guard_common.sh"

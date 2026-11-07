@@ -10,6 +10,9 @@
 #   셀이 쪼개지므로 계속 거부하며, 이때 구분자로 센 `|` 를 표시한 행을 함께 낸다(그 거부가 잡던
 #   실수는 test_merge_fr_index.sh 8~12).
 #   규칙: 서문·헤더·구분선·꼬리 = 한쪽만 바뀌면 그쪽, 양쪽 다르면 충돌 / 행 = 키별 (b,o,t): o==t→o, o==b→t, t==b→o, 그 외 충돌.
+#   기존 행이 이 규칙으로 충돌하면 칸 단위로 같은 규칙을 다시 적용한다(cellpick) — 한쪽은 우선순위만,
+#   다른 쪽은 상태만 바꾼 행이 합쳐진다. 행 삭제 대 수정, 세 판 헤더 줄 불일치(칸 의미가 다를 수 있음)는
+#   칸 단위로 풀지 않고 충돌이다. 같은 칸을 양쪽이 다르게 바꾸면 충돌 칸 이름을 헤더 순서대로 알린다.
 #   순서: base 순서 → ours 신규(ours 순서) → theirs 신규(theirs 순서). 출력은 줄 끝 개행으로 정규화된다.
 #   stdout = 병합 결과 (rc 0). 충돌·malformed = stderr 한 줄 + rc 1 (stdout 없음).
 set -uo pipefail
@@ -35,6 +38,26 @@ function role(i) { return (i == 1 ? "base" : (i == 2 ? "ours" : "theirs")) }
 function key(l,   a, s) { xsplit(l, a); s = a[3]; gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
 function bad(msg) { ABORT = 1; print "merge_fr_index: " msg > "/dev/stderr"; exit 1 }
 function pick(b, o, t) { if (o == t) return o; if (o == b) return t; if (t == b) return o; CONF = 1; return "" }
+# 칸 단위 재판정. 결과 종류는 CELLST 하나로 알린다(ok / conf / skip) — 칸 이름 문자열로 판정하지 않으므로
+# 이름이 비거나 "-" 여도 충돌 행이 조용히 빠지지 않는다. conf 면 CELLNAMES 에 충돌 칸 이름을 헤더 순서대로 담는다.
+# 각 입력의 행은 자기 헤더와 칸 수가 같으므로(본문 검증) 세 헤더가 같으면 세 행의 칸 수도 같다.
+function cellpick(b, o, t,   ab, ao, at, ah, n, i, r, out, nm) {
+  CELLNAMES = ""
+  if (o == "" || t == "" || hdr[1] != hdr[2] || hdr[1] != hdr[3]) { CELLST = "skip"; return "" }
+  n = xsplit(b, ab); xsplit(o, ao); xsplit(t, at); xsplit(hdr[1], ah)
+  out = ""
+  for (i = 1; i <= n; i++) {
+    CONF = 0; r = pick(ab[i], ao[i], at[i])
+    if (CONF) {
+      nm = ah[i]; gsub(/^[ \t]+|[ \t]+$/, "", nm); if (nm == "") nm = (i - 1) "번째 칸"
+      CELLNAMES = CELLNAMES (CELLNAMES == "" ? "" : ", ") nm
+    }
+    out = out (i > 1 ? "|" : "") r
+  }
+  CONF = 0
+  if (CELLNAMES != "") { CELLST = "conf"; return "" }
+  CELLST = "ok"; return out
+}
 # 컬럼 수가 어긋난 행의 사유 설명. 어느 `|` 가 여분인지는 도구가 알 수 없다(무엇이 본문이고
 # 무엇이 칸 경계인지는 쓴 사람의 의도다). 그래서 지목을 추측하지 않고 **구분자로 센 `|` 를 전부
 # >|< 로 표시한 행**을 보여 준다 — 사람이 본문이어야 할 것을 바로 짚을 수 있고, 코드 스팬 문법을
@@ -81,7 +104,11 @@ END {
     k = ord[1, i]
     b = row[1, k]; o = ((2, k) in row) ? row[2, k] : ""; t = ((3, k) in row) ? row[3, k] : ""
     r = pick(b, o, t)
-    if (CONF) bad("행 충돌(양쪽 상이 수정): " k)
+    if (CONF) {
+      CONF = 0; r = cellpick(b, o, t)
+      if (CELLST == "skip") bad("행 충돌(양쪽 상이 수정): " k)
+      if (CELLST == "conf") bad("행 충돌(같은 칸을 양쪽이 다르게 수정): " k " — 칸: " CELLNAMES)
+    }
     if (r != "") res[++n] = r
   }
   for (i = 1; i <= cnt[2]; i++) {

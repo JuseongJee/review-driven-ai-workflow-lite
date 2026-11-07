@@ -60,6 +60,10 @@ grep -q '본문 라인' "$P1";           chk $? "AC28 latest turn 내용이 인�
 grep -q 'Create exactly one new turn file' "$P1";        chk $? "AC29 턴 파일 1개 계약 존재"
 grep -q 'Do not leave Current Owner as Reviewer' "$P1";  chk $? "AC29 Current Owner 계약 존재"
 grep -q 'Do NOT modify' "$P1";                           chk $? "AC29 harness 관리 섹션 계약 존재"
+grep -Fqx -- '- Inside the project, write only inside SESSION_DIR. Read other project files only to review the target.' "$P1"; chk $? "프롬프트: 프로젝트 안 쓰기 범위"
+grep -Fqx -- '- Exception: do reproduction work (a scratch git repository, running scripts) in a temporary directory outside the project, created with `mktemp -d`. Remove it when you are done.' "$P1"; chk $? "프롬프트: 임시 디렉터리 예외"  # mktemp-scan: literal
+grep -Fqx -- '- Never create a `.git` directory or file inside SESSION_DIR. In SESSION_DIR, keep only the commands you ran and their output, as text.' "$P1"; chk $? "프롬프트: 세션 안 .git 금지"
+! grep -q 'Do not modify files outside the review session' "$P1"; chk $? "프롬프트: 충돌하는 옛 금지 줄 제거"
 grep -q 'Use EXPECTED_TURN_FILE exactly as given' "$P1"; chk $? "AC29 EXPECTED_TURN_FILE 계약 존재"
 
 grep -q '===== BEGIN AUTHORITATIVE RULES: rd-workflow/docs/flows/FILE_BASED_REVIEW_PIPELINE.md =====' "$P1"
@@ -144,6 +148,64 @@ grep -qF 'after one blank line, as a separate paragraph' "$TMP/p7_request-review
 chk $? "AC3 (b) 마커 아래 빈 줄 뒤 독립 문단 지시"
 grep -qF 'do not write "- 없음". Keep each open objection as a list item' "$TMP/p7_request-review.txt"
 chk $? "AC3 (c) 미해결 이의는 리스트 유지 지시"
+
+echo "=== 프로젝트 리뷰 표준 파일 (diff-review 전용) ==="
+STD_REL="rd-workflow-workspace/review-standards.md"
+STD="$TMP/$STD_REL"
+printf 'diff 기준 문서 본문.\n' > "$TMP/rd-workflow/docs/prompts/review/diff_review.md"
+mkdir -p "$TMP/rd-workflow-workspace"
+
+rm -f "$STD"
+PS1="$TMP/ps1.txt"; gen "$PS1" diff-review
+grep -qF 'review-standards.md' "$PS1"; [ $? -ne 0 ]; chk $? "standards-absent 파일이 없으면 프롬프트에 언급이 없음"
+
+printf '<!-- 안내 -->\n\n   \n<!--\n여러 줄 주석\n-->\n' > "$STD"
+PS2="$TMP/ps2.txt"; gen "$PS2" diff-review
+grep -qF 'review-standards.md' "$PS2"; [ $? -ne 0 ]; chk $? "standards-comment-only 주석·공백뿐이면 프롬프트에 언급이 없음"
+
+{ printf '<!-- 안내 -->\nSTD-MARKER\n'; i=0; while [ $i -lt 20 ]; do printf 'standard filler line %s ----------------------------------------\n' "$i"; i=$((i+1)); done; } > "$STD"
+PS3="$TMP/ps3.txt"; gen "$PS3" diff-review
+b_crit="$(grep -n 'BEGIN AUTHORITATIVE RULES: rd-workflow/docs/prompts/review/diff_review.md' "$PS3" | head -1 | cut -d: -f1)"
+b_std="$(grep -n "BEGIN AUTHORITATIVE RULES: $STD_REL" "$PS3" | head -1 | cut -d: -f1)"
+b_pipe="$(grep -n 'BEGIN AUTHORITATIVE RULES: rd-workflow/docs/flows/FILE_BASED_REVIEW_PIPELINE.md' "$PS3" | head -1 | cut -d: -f1)"
+[ -n "$b_crit" ] && [ -n "$b_std" ] && [ -n "$b_pipe" ]; chk $? "standards-inlined 세 규범 블록이 모두 인라인됨"
+[ -n "$b_crit" ] && [ -n "$b_std" ] && [ -n "$b_pipe" ] && [ "$b_crit" -lt "$b_std" ] && [ "$b_std" -lt "$b_pipe" ]
+chk $? "standards-inlined 순서: 기준 문서 < 리뷰 표준 < 파이프라인 (${b_crit:-?} < ${b_std:-?} < ${b_pipe:-?})"
+grep -qF '<!-- 안내 -->' "$PS3"; chk $? "standards-inlined 주석을 지우지 않은 원문이 들어감"
+grep -q 'STD-MARKER' "$PS3"; chk $? "standards-inlined 본문이 들어감"
+
+# 기준 문서까지는 들어가고 표준은 못 들어가는 상한: 앞선 블록들의 렌더 크기 합.
+# _rp_try_inline 은 acc + sz > cap 일 때만 넘기므로 합과 같은 cap 이면 표준(sz>0)이 넘친다.
+cap=0
+for spec in "data $SD/SESSION.md" "data $SD/CHECKPOINT.md" "data $SD/USER_ACTION.md" "data $SD/turns/001_claude.md" "rules rd-workflow/docs/prompts/review/diff_review.md"; do
+  read -r kind_ path_ <<< "$spec"
+  blk="$(_rp_render_block "$kind_" "$path_" "$TMP/$path_")"
+  cap=$((cap + $(printf '%s' "$blk" | wc -c | tr -d '[:space:]')))
+done
+PS4="$TMP/ps4.txt"; gen "$PS4" diff-review "$cap"
+sec "$PS4" 'NOT inlined' | grep -qF "$STD_REL (size)"
+chk $? "standards-oversize 예산 초과 시 디스크 읽기 목록에 (size) 로 표시 (cap=$cap)"
+grep -qF 'BEGIN AUTHORITATIVE RULES: rd-workflow/docs/prompts/review/diff_review.md' "$PS4"; chk $? "standards-oversize 기준 문서는 같은 상한에서 인라인됨"
+grep -q 'STD-MARKER' "$PS4"; [ $? -ne 0 ]; chk $? "standards-oversize 초과한 표준 본문은 프롬프트에 없음"
+
+PS5="$TMP/ps5.txt"; gen "$PS5" request-review
+grep -qF 'review-standards.md' "$PS5"; [ $? -ne 0 ]; chk $? "standards-not-for-request diff-review 외 종류에는 넣지 않음"
+
+# 큰 표준: pipefail 아래에서 내용 판정이 SIGPIPE 로 거짓이 되면 표준이 프롬프트에서 조용히 빠진다.
+{ printf 'STD-MARKER\n'; i=0; while [ $i -lt 2000 ]; do printf 'Coding standard with nonempty content %s\n' "$i"; i=$((i+1)); done; } > "$STD"
+_rp_standards_has_content "$STD"; chk $? "standards-large 큰 표준 파일도 내용 있음으로 판정"
+PS6="$TMP/ps6.txt"; gen "$PS6" diff-review 24000
+sec "$PS6" 'NOT inlined' | grep -qF "$STD_REL (size)"
+chk $? "standards-large 예산을 넘는 큰 표준은 디스크 읽기 목록에 남음"
+rm -f "$STD"
+
+echo "=== 기준 문서 크기 상한 (4096 B) ==="
+# 기준 문서가 커지면 최신 Author 턴이 조용히 디스크 읽기로 밀려나는데 다른 곳에는 이를 잡는 장치가 없다.
+CRIT_DIR="${script_dir}/../docs/prompts/review"
+for f in diff_review.md spec_review.md request_review.md project_context_review.md; do
+  sz="$(wc -c < "$CRIT_DIR/$f" | tr -d ' ')"
+  [ "$sz" -le 4096 ]; chk $? "criteria-size $f (${sz} B <= 4096)"
+done
 
 echo
 if [ "$FAIL" -eq 0 ]; then echo "test_review_prompt_inline: ALL PASS"; else echo "test_review_prompt_inline: FAILED"; fi

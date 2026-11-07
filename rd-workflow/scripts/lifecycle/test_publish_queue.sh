@@ -242,7 +242,7 @@ test_live_lock_blocks() {
   local d
   d="$(pqf "$R" pq_dir)"
   mkreq "$R" f state=requested
-  sleep 30 & local lp=$!
+  sleep 600 & local lp=$!
   mkdir "$d/.lock"; printf '%s\n' "$lp" >"$d/.lock/pid"
   OUT="$(cd "$R" && project_root="$R" RD_PQ_LOCK_TRIES=2 bash "$PQ" cancel f 2>&1)"; RC=$?
   kill "$lp" 2>/dev/null; wait "$lp" 2>/dev/null
@@ -262,7 +262,7 @@ test_stale_guard_cleared() {
 test_lock_reclaim_rechecks_pid() {
   local dead d lp rc; ( exit 0 ) & dead=$!; wait "$dead" 2>/dev/null
   d="$(pqf "$R" pq_dir)"
-  sleep 30 & lp=$!
+  sleep 600 & lp=$!
   mkdir "$d/.lock"; printf '%s\n' "$lp" >"$d/.lock/pid"
   rc=0; pqf "$R" "_pq_lock_reclaim '$d' '$dead'" || rc=$?
   kill "$lp" 2>/dev/null; wait "$lp" 2>/dev/null
@@ -359,12 +359,50 @@ test_request_preconditions() {
   [[ "$RC" -eq 1 && "$OUT" == *code.txt* ]] && pass "양쪽이 같은 코드 파일을 고침 → rc 1, 경로 출력" || fail "코드 충돌 사례: rc=$RC out=$OUT"
   [[ ! -f "$(pqf "$W" pq_dir)/pq-c.req" ]] && pass "사전 확인 실패는 요청을 만들지 않음" || fail "실패인데 요청 파일 생김"
 }
-test_request_auto_files_ok() {
-  local W R2; W="$(mk_work rq4 pq-d)"; R2="$TMP/rq4"
-  printf 'm\n' >"$R2/CURRENT_TASK.md"; git -C "$R2" commit -q -am "main ct"
-  printf 'w\n' >"$W/CURRENT_TASK.md"; git -C "$W" commit -q -am "work ct"
+test_request_hangul_conflict() {
+  local W R2; W="$(mk_work rq9 pq-h)"; R2="$TMP/rq9"
+  mkdir -p "$R2/d"; printf 'base\n' >"$R2/d/한글.md"; git -C "$R2" add -A; git -C "$R2" commit -q -m "add hangul"
+  git -C "$W" merge -q --no-edit master >/dev/null 2>&1
+  printf 'm\n' >"$R2/d/한글.md"; git -C "$R2" commit -q -am "main hangul"
+  printf 'w\n' >"$W/d/한글.md"; git -C "$W" commit -q -am "work hangul"
   pq "$W" request
-  [[ "$RC" -eq 0 && "$(pqf "$W" "pq_get pq-d state")" == requested ]] && pass "자동 해소 경로만 충돌 → 요청 생성" || fail "자동 해소 사례: rc=$RC out=$OUT"
+  [[ "$RC" -eq 1 && "$OUT" == *"d/한글.md"* && "$OUT" != *'\355'* ]] && pass "한글 충돌 경로가 인용 없이 나옴 (T2 경로)" || fail "T2 경로: rc=$RC out=$OUT"
+  [[ "$OUT" == *'set-status "구현 중"'* ]] && pass "요청 충돌에 해소 안내가 나옴 (T2 안내)" || fail "T2 안내: rc=$RC out=$OUT"
+}
+test_request_auto_files_ok() {
+  local W R2 p; W="$(mk_work rq4 pq-d)"; R2="$TMP/rq4"
+  for p in CURRENT_TASK.md rd-workflow-workspace/.lifecycle/stage_metrics.tsv rd-workflow-workspace/backlog/FUTURE_REQUESTS.md rd-workflow-workspace/.lifecycle/review-seals/verify-evidence; do
+    mkdir -p "$R2/$(dirname "$p")" "$W/$(dirname "$p")"
+    printf 'm\n' >"$R2/$p"; printf 'w\n' >"$W/$p"
+  done
+  git -C "$R2" add -A; git -C "$R2" commit -q -m "main auto"
+  git -C "$W" add -A; git -C "$W" commit -q -m "work auto"
+  pq "$W" request
+  [[ "$RC" -eq 0 && "$(pqf "$W" "pq_get pq-d state")" == requested ]] && pass "자동 해소 네 경로가 모두 충돌 → 요청 생성 (T4)" || fail "T4 자동 해소 사례: rc=$RC out=$OUT"
+}
+test_request_auto_plus_code() {
+  local W R2; W="$(mk_work rq10 pq-i)"; R2="$TMP/rq10"
+  printf 'm\n' >"$R2/CURRENT_TASK.md"; printf 'm\n' >"$R2/code.txt"; git -C "$R2" commit -q -am "main both"
+  printf 'w\n' >"$W/CURRENT_TASK.md"; printf 'w\n' >"$W/code.txt"; git -C "$W" commit -q -am "work both"
+  pq "$W" request
+  [[ "$RC" -eq 1 && "$OUT" == *code.txt* ]] && pass "자동 해소 + 코드 충돌 → 코드 경로 나열, rc 1 (T4b 포함)" || fail "T4b 포함: rc=$RC out=$OUT"
+  [[ "$OUT" != *"- CURRENT_TASK.md"* ]] && pass "자동 해소 경로는 나열하지 않음 (T4b 제외)" || fail "T4b 제외: out=$OUT"
+}
+test_request_newline_path() {
+  # 줄바꿈을 품은 경로의 조각이 자동 해소 대상과 같아도 충돌로 잡는다 (final diff review F1).
+  local W R2 n; W="$(mk_work rq12 pq-k)"; R2="$TMP/rq12"; n=$'CURRENT_TASK.md\nCURRENT_TASK.md'
+  printf 'm\n' >"$R2/$n"; git -C "$R2" add -A; git -C "$R2" commit -q -m "main nl"
+  printf 'w\n' >"$W/$n"; git -C "$W" add -A; git -C "$W" commit -q -m "work nl"
+  pq "$W" request
+  [[ "$RC" -eq 1 && "$OUT" == *'CURRENT_TASK.md\nCURRENT_TASK.md'* ]] && pass "줄바꿈 경로는 자동 해소에서 빠지지 않고 충돌로 나열 (T6)" || fail "T6: rc=$RC out=$OUT"
+}
+test_request_undecidable() {
+  local W; W="$(mk_work rq11 pq-j)"
+  mkdir -p "$W/rd-workflow/config"
+  printf '{"default_branch": "no-such-branch"}\n' >"$W/rd-workflow/config/workflow.json"
+  git -C "$W" add -A; git -C "$W" commit -q -m "bad default branch"
+  pq "$W" request
+  [[ "$RC" -eq 3 && ! -f "$(pqf "$W" pq_dir)/pq-j.req" ]] && pass "판정 불가 → rc 3, 요청 파일 없음 (T5)" || fail "T5: rc=$RC out=$OUT"
 }
 test_request_caller_lost() {
   local W; W="$(mk_work rq5 pq-e)"
@@ -449,7 +487,7 @@ cat >"$TMP/archive_double.sh" <<'AEOF'
 #!/usr/bin/env bash
 echo "called" >>"$PQ_ARCH_LOG"
 if [[ -n "${PQ_ARCH_WAIT:-}" ]]; then
-  for _i in $(seq 1 100); do [[ -f "$PQ_ARCH_WAIT" ]] && break; sleep 0.1; done
+  for _i in $(seq 1 3000); do [[ -f "$PQ_ARCH_WAIT" ]] && break; sleep 0.1; done
 fi
 cd "$PQ_MAIN" || exit 1
 git merge-base --is-ancestor "fr/$PQ_SLUG" master 2>/dev/null || git merge -q --no-ff -m merge "fr/$PQ_SLUG" || exit 1
@@ -472,10 +510,13 @@ mkstate() {
   pqf "$W" "pq_set '$slug' state=$st head=$(git -C "$W" rev-parse HEAD) seq=1 worktree='$W' fr-branch=fr/$slug $*"
   case "$st" in granted|running|partial) pqf "$W" "pq_slot_set '$slug'" ;; esac
 }
+# 시간 상한은 hang 방지로만 쓴다. 생존 역할 프로세스(sleep 600)·표식 대기·waitfor·wait/watch --timeout 은
+# 성공 경로에서 사건 즉시 끝나므로 넉넉히 둔다 — 동시 실행 부하(평균 40 이상)에서 한 단계가 30초를 넘어
+# sleep 30 이 먼저 끝나 「죽은 pid」 로 판정되거나 8초 대기가 먼저 끝나는 FAIL 이 반복됐다.
 logn() { [[ -f "$PQ_ARCH_LOG" ]] && wc -l <"$PQ_ARCH_LOG" | tr -d ' ' || echo 0; }
 deadpid() { local p; ( exit 0 ) & p=$!; wait "$p" 2>/dev/null; echo "$p"; }
-# waitfor <식>: 최대 5초 동안 식이 참이 되길 기다린다.
-waitfor() { local i; for i in $(seq 1 50); do eval "$1" && return 0; sleep 0.1; done; return 1; }
+# waitfor <식>: 최대 30초 동안 식이 참이 되길 기다린다.
+waitfor() { local i; for i in $(seq 1 300); do eval "$1" && return 0; sleep 0.1; done; return 1; }
 getk() { pqf "$W" "pq_get '$1' $2"; }
 
 test_run_without_grant() {
@@ -560,7 +601,7 @@ test_partial_reverify_keeps_slot() {
 }
 test_recover_alive_pid() {
   setup_run rn7 rg
-  bash -c 'sleep 30; : publish_queue.sh' & local lp=$!
+  bash -c 'sleep 600; : publish_queue.sh' & local lp=$!
   mkstate rg running "run-pid=$lp"
   pq "$W" recover rg
   local rc=$RC st; st="$(getk rg state)"
@@ -588,7 +629,7 @@ test_status_points_recover() {
 }
 test_recover_orphan_archive() {
   setup_run rn10 rj
-  set -m; sleep 30 & local lp=$!; set +m
+  set -m; sleep 600 & local lp=$!; set +m
   local pg; pg="$(ps -o pgid= -p "$lp" | tr -d ' ')"
   mkstate rj running "run-pid=$(deadpid)" "archive-pgid=$pg"
   pq "$W" recover rj
@@ -598,7 +639,7 @@ test_recover_orphan_archive() {
 }
 test_recover_lock_owner() {
   setup_run rn11 rk
-  sleep 30 & local lp=$!
+  sleep 600 & local lp=$!
   mkstate rk running "run-pid=$(deadpid)"
   local ld; ld="$(pqf "$W" tasks_shared_dir)/tasks.lock"
   mkdir "$ld"; printf 'pid=%s\ncmd=archive\nslug=rk\nstarted-at=x\n' "$lp" >"$ld/owner"
@@ -687,7 +728,7 @@ bgend() { local p="$1"; kill "$p" 2>/dev/null; pkill -P "$p" 2>/dev/null; wait "
 test_wait_wakes_on_grant() {
   local W2 M2 rc; W2="$(mk_work wt1 wa)"; M2="$TMP/wt1"
   mkreq "$W2" wa state=requested seq=1
-  bgrun "$W2" "$TMP/wt1.out" wait --timeout 8; local p=$BGPID
+  bgrun "$W2" "$TMP/wt1.out" wait --timeout 60; local p=$BGPID
   sleep 0.5
   pq "$M2" next
   wait "$p"; rc=$?
@@ -699,11 +740,11 @@ test_wait_wakes_on_grant() {
   bgend "$p"
 }
 test_wait_timeout() {
-  local W2 t0 rc out; W2="$(mk_work wt2 wb)"
+  local W2 rc out; W2="$(mk_work wt2 wb)"
   mkreq "$W2" wb state=requested seq=1
-  t0=$SECONDS
-  runlim 5 "$W2" wait --timeout 1; rc=$RC; out="$OUT"
-  if [[ "$rc" -eq 4 && "$out" == *"큐 확인을 요청"* && $((SECONDS-t0)) -le 5 ]]; then
+  # --timeout 을 지키지 않으면 runlim 이 죽여 rc 124 가 된다. 상한은 hang 방지라 부하에서 걸리지 않게 넉넉히 둔다
+  runlim 60 "$W2" wait --timeout 1; rc=$RC; out="$OUT"
+  if [[ "$rc" -eq 4 && "$out" == *"큐 확인을 요청"* ]]; then
     pass "wait --timeout 1 → rc 4, 호출 세션 확인 안내"
   else
     fail "wait 시간 초과: rc=$rc out=$out"
@@ -712,20 +753,21 @@ test_wait_timeout() {
 test_wait_caller_lost() {
   local W2 rc; W2="$(mk_work wt3 wc)"
   pqf "$W2" "tasks_index_upsert wc caller-id=wX:p9" >/dev/null
-  mkreq "$W2" wc state=requested seq=1
-  bgrun "$W2" "$TMP/wt3.out" wait --timeout 8; local p=$BGPID
+  mkreq "$W2" wc state=requested seq=1 bypass-gitlink=gx bypass-basis=bx
+  bgrun "$W2" "$TMP/wt3.out" wait --timeout 60; local p=$BGPID
   wait "$p"; rc=$?
   if [[ "$rc" -eq 11 && "$(getk_in "$W2" wc state)" == user-approval && "$(cat "$TMP/wt3.out")" == *"rd publish approve"* ]]; then
     pass "wait 중 호출 세션 소실 → rc 11, user-approval, 승인 안내"
   else
     fail "wait 소실: rc=$rc state=$(getk_in "$W2" wc state) out=$(cat "$TMP/wt3.out")"
   fi
+  [[ "$(cat "$TMP/wt3.out")" == *"--allow-gitlink-drop (사유: gx) · 근거: bx"* ]] && pass "표시:wait 소실" || fail "표시:wait 소실: $(cat "$TMP/wt3.out")"
   bgend "$p"
 }
 getk_in() { pqf "$1" "pq_get '$2' $3"; }
 test_watch_on_request() {
   local M2 rc; M2="$(mk_repo wt4)"
-  bgrun "$M2" "$TMP/wt4.out" watch --timeout 8; local p=$BGPID
+  bgrun "$M2" "$TMP/wt4.out" watch --timeout 60; local p=$BGPID
   sleep 0.5
   mkreq "$M2" r1 state=requested seq=1
   wait "$p"; rc=$?
@@ -740,7 +782,7 @@ test_watch_on_result() {
   local M2 rc; M2="$(mk_repo wt5)"
   mkreq "$M2" a state=running seq=1
   pqf "$M2" "pq_slot_set a"
-  bgrun "$M2" "$TMP/wt5.out" watch --timeout 8; local p=$BGPID
+  bgrun "$M2" "$TMP/wt5.out" watch --timeout 60; local p=$BGPID
   sleep 0.5
   mkreq "$M2" a state=done
   pqf "$M2" pq_slot_clear
@@ -758,8 +800,10 @@ test_watch_result_between_watches() {
   pq "$M2" next
   mkreq "$M2" a state=done
   pqf "$M2" pq_slot_clear
-  runlim 5 "$M2" watch --timeout 3; rc1=$RC; out1="$OUT"
-  runlim 5 "$M2" watch --timeout 1; rc2=$RC; out2="$OUT"
+  # runlim 은 hang 방지용이다. 결과는 watch 자체 상한(--timeout)이 정하므로, 모든 사례를 한꺼번에 띄우는
+  # 부하에서 걸리지 않게 넉넉히 둔다(5초는 부하 16, 20초는 부하 40 이상에서 먼저 걸렸다)
+  runlim 60 "$M2" watch --timeout 3; rc1=$RC; out1="$OUT"
+  runlim 60 "$M2" watch --timeout 1; rc2=$RC; out2="$OUT"
   if [[ "$rc1" -eq 0 && "$out1" == *a* && "$out1" == *"성공"* && "$rc2" -eq 4 ]]; then
     pass "감시 사이에 끝난 결과를 다음 watch 가 즉시 보고하고 두 번 보고하지 않음"
   else
@@ -846,7 +890,7 @@ mk_psfail() { mkdir -p "$TMP/psfail"; printf '#!/bin/sh\necho "ps: Operation not
 mk_psfail
 test_recover_ps_fail() {
   setup_run rn17 rq
-  sleep 30 & local lp=$!
+  sleep 600 & local lp=$!
   mkstate rq running "run-pid=$lp"
   OUT="$(cd "$W" && PATH="$TMP/psfail:$PATH" project_root="$W" bash "$PQ" recover rq 2>&1)"; RC=$?
   local st slot; st="$(getk rq state)"; slot="$(pqf "$W" pq_slot_get)"
@@ -860,12 +904,138 @@ test_exec_ps_fail() {
   [[ "$RC" -eq 1 && "$(logn)" == 0 && -z "$(getk rr archive-pgid)" ]] && pass "ps 실패로 pgid 가 없으면 _exec 가 archive 에 들어가지 않음" || fail "ps 실패 _exec: rc=$RC archive=$(logn) pgid=$(getk rr archive-pgid) out=$OUT"
 }
 
+# --- 큐의 archive 우회 옵션 (publish-location-docs 변경 2)
+BP_R1=$'sq\'s "병합" $HOME `x`'
+BP_BASIS='2026-11-07 주성님 — "건너뛰어"'
+test_request_bypass_rejects() {
+  local W; W="$(mk_work rq20 pq-x)"
+  rej() {
+    local n="$1"; shift
+    rm -f "$(pqf "$W" pq_dir)/pq-x.req"
+    pq "$W" request "$@"
+    if [[ "$RC" -eq 2 && ! -f "$(pqf "$W" pq_dir)/pq-x.req" ]]; then pass "거부:$n"; else fail "거부:$n rc=$RC out=$OUT"; fi
+  }
+  rej unknown --bogus
+  rej no-reason --basis x --allow-gitlink-drop
+  rej dash-reason --allow-gitlink-drop -x --basis y
+  rej empty-reason --allow-gitlink-drop "" --basis x
+  rej empty-basis --allow-gitlink-drop a --basis ""
+  rej blank-reason --allow-gitlink-drop "  " --basis x
+  rej multiline-reason --allow-gitlink-drop $'a\nb' --basis x
+  rej multiline-basis --allow-gitlink-drop a --basis $'x\ny'
+  rej no-basis --allow-gitlink-drop a
+  rej basis-only --basis x
+  rej duplicate --allow-gitlink-drop a --allow-gitlink-drop b --basis x
+  rej status-mismatch --allow-status-mismatch a --basis x
+  [[ "$OUT" == *"archive.sh --allow-status-mismatch"* ]] && pass "거부:status-mismatch 안내" || fail "거부:status-mismatch 안내 문구 없음: $OUT"
+  # user 모드: 인자 검사가 승인 판정보다 먼저, 안내 명령은 인자를 원문대로 복원
+  mkdir -p "$W/rd-workflow/config"
+  printf '{"publish_approval":"user"}\n' >"$W/rd-workflow/config/workflow.json"
+  git -C "$W" add -A && git -C "$W" commit -q -m "approval=user"
+  pq "$W" request --bogus
+  [[ "$RC" -eq 2 ]] && pass "거부:user모드 오타" || fail "거부:user모드 오타 rc=$RC out=$OUT"
+  OUT="$(cd "$W" && LC_ALL=ko_KR.UTF-8 project_root="$W" bash "$PQ" request --allow-gitlink-drop "$BP_R1" --basis "$BP_BASIS" 2>&1)"; RC=$?
+  local tail line i want got="" ok=0
+  line="$(printf '%s\n' "$OUT" | grep '승인 뒤 실행할 명령: ' | head -1)"
+  tail="${line#*승인 뒤 실행할 명령: }"
+  if [[ "$RC" -eq 10 && -n "$line" ]]; then
+    eval "set -- $tail"
+    for i in "$@"; do
+      if [[ "$got" == flag ]]; then [[ "$i" == "$BP_R1 (근거: $BP_BASIS)" ]] && ok=1; got=""; fi
+      [[ "$i" == --allow-gitlink-drop ]] && got=flag
+    done
+  fi
+  [[ "$ok" -eq 1 ]] && pass "user모드 안내: 승인 뒤 명령이 합친 사유를 원문대로 복원" || fail "user모드 안내: rc=$RC out=$OUT"
+  if printf '%s\n' "$line" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 && [[ "$line" == *주성님* ]]; then
+    pass "user모드 안내 UTF-8: 유효한 UTF-8 이고 한글 근거가 원문 그대로"
+  else
+    fail "user모드 안내 UTF-8: 한글이 깨짐: $line"
+  fi
+}
+test_request_bypass_passes() {
+  setup_run rn20 rx
+  local arch="$TMP/rn20.arch" argv="$TMP/rn20.argv" c want got
+  : >"$argv"
+  printf '#!/usr/bin/env bash\n{ echo "--- call"; for a in "$@"; do printf "%%s\\n" "$a"; done; } >>"%s"\nexec "%s"\n' "$argv" "$TMP/archive_double.sh" >"$arch"
+  chmod +x "$arch"
+  export RD_PQ_ARCHIVE="$arch"
+  pq "$W" request --allow-gitlink-drop "$BP_R1" --force-skip-review-check 수동리뷰 --basis "$BP_BASIS"
+  [[ "$RC" -eq 0 ]] && pass "우회 요청 rc 0" || fail "우회 요청: rc=$RC out=$OUT"
+  chk() {  # <이름> — 직전 $OUT 에 다섯 문자열이 모두 있는지
+    local s ok=1
+    for s in --allow-gitlink-drop --force-skip-review-check "$BP_R1" 수동리뷰 "$BP_BASIS"; do [[ "$OUT" == *"$s"* ]] || ok=0; done
+    [[ "$ok" -eq 1 ]] && pass "표시:$1" || fail "표시:$1 — 옵션·사유·근거 누락: $OUT"
+  }
+  pq "$W" status; chk status
+  pq "$M" watch --timeout 3; chk watch
+  pq "$M" next; chk next
+  touch "$B/REJECT"
+  pq "$W" run
+  [[ "$RC" -eq 1 && "$(getk rx state)" == partial ]] && pass "첫 run partial" || fail "첫 run: rc=$RC state=$(getk rx state) out=$OUT"
+  rm -f "$B/REJECT"
+  pq "$W" run
+  [[ "$RC" -eq 0 && "$(getk rx state)" == done ]] && pass "재run done" || fail "재run: rc=$RC state=$(getk rx state) out=$OUT"
+  want="$(printf '%s\n%s\n%s\n%s' --allow-gitlink-drop "$BP_R1 (근거: $BP_BASIS)" --force-skip-review-check "수동리뷰 (근거: $BP_BASIS)")"
+  for c in 1 2; do
+    got="$(awk -v n="$c" '/^--- call$/{i++; next} i==n{print}' "$argv")"
+    [[ "$got" == "$want" ]] && pass "전달:$([[ $c -eq 1 ]] && echo 첫 실행 || echo 재실행)" || fail "전달:호출 $c 인자 불일치: $got"
+  done
+}
+test_request_bypass_cleared() {
+  local W; W="$(mk_work rq21 pq-y)"
+  pq "$W" request --allow-gitlink-drop "$BP_R1" --basis "$BP_BASIS"
+  [[ "$RC" -eq 0 && "$(pqf "$W" "pq_get pq-y bypass-gitlink")" == "$BP_R1" && "$(pqf "$W" "pq_get pq-y bypass-basis")" == "$BP_BASIS" ]] \
+    && pass "기록: 요청 파일에 사유·근거" || fail "기록: rc=$RC out=$OUT"
+  pq "$W" cancel
+  pq "$W" request
+  if [[ "$RC" -eq 0 && -z "$(pqf "$W" "pq_get pq-y bypass-gitlink")" && -z "$(pqf "$W" "pq_get pq-y bypass-review")" && -z "$(pqf "$W" "pq_get pq-y bypass-basis")" ]]; then
+    pass "초기화: 우회 없이 다시 요청하면 이전 값이 남지 않음"
+  else
+    fail "초기화: rc=$RC gl=$(pqf "$W" "pq_get pq-y bypass-gitlink") out=$OUT"
+  fi
+}
+# 호출 세션 소실로 사용자 승인에 넘어가도 승인자가 우회 옵션·사유·근거를 본다 (request rc 11·watch·approve)
+test_user_approval_bypass_shown() {
+  local W want; W="$(mk_work rq22 pq-u)"
+  want="--allow-gitlink-drop (사유: $BP_R1), --force-skip-review-check (사유: 수동리뷰) · 근거: $BP_BASIS"
+  pqf "$W" "tasks_index_upsert pq-u caller-id=wX:p9" >/dev/null
+  pq "$W" request --allow-gitlink-drop "$BP_R1" --force-skip-review-check 수동리뷰 --basis "$BP_BASIS"
+  [[ "$RC" -eq 11 && "$OUT" == *"$want"* ]] && pass "표시:소실 request" || fail "표시:소실 request: rc=$RC out=$OUT"
+  pq "$W" watch --timeout 60   # 사용자 승인 사건이 있으면 바로 끝난다. runlim 상한은 병렬 부하에서 먼저 걸려 쓰지 않는다
+  [[ "$OUT" == *"사용자 승인 대상"*"$want"* ]] && pass "표시:소실 watch" || fail "표시:소실 watch: rc=$RC out=$OUT"
+  pq "$W" approve pq-u
+  [[ "$RC" -eq 0 && "$OUT" == *"$want"* ]] && pass "표시:approve" || fail "표시:approve: rc=$RC out=$OUT"
+}
+test_run_bypass_hint() {
+  setup_run rn21 ry
+  mkstate ry granted
+  printf '#!/usr/bin/env bash\necho '"'"'archive:   ... --allow-gitlink-drop "<사유>" 로 이 검사만 건너뛸 수 있습니다'"'"'\necho 끝\nexit 1\n' >"$TMP/rn21.arch"
+  chmod +x "$TMP/rn21.arch"
+  export RD_PQ_ARCHIVE="$TMP/rn21.arch"
+  pq "$W" run
+  printf '%s\n' "$OUT" | grep -q 'rd publish request --allow-gitlink-drop.*--basis' && pass "안내: 큐 경로 재요청 명령" || fail "안내: rc=$RC out=$OUT"
+}
+
 SEQ_CASES="test_config_default_caller test_config_invalid_user test_config_file_without_key test_cancel_granted_releases_slot test_cancel_running_refused test_cancel_terminal_and_missing test_cancel_more_states test_status_line test_status_orders_by_seq test_corrupt_req_is_undecidable test_stale_lock_reclaimed test_stale_guard_cleared test_lock_reclaim_rechecks_pid test_lock_without_pid test_unlock_not_owner test_live_lock_blocks test_unimplemented_and_usage"
-PAR_CASES="test_slot_state_must_hold test_prune_done_path_with_space test_request_user_mode test_request_no_caller test_request_preconditions test_request_auto_files_ok test_request_caller_lost test_request_duplicate_updates test_next_blocked_by_merge_head test_next_oldest_first test_next_parallel_single_grant test_next_refuses_with_corrupt test_approve_user_approval test_run_without_grant test_run_twice test_run_head_changed test_run_success test_partial_retry test_partial_reverify_keeps_slot test_recover_alive_pid test_recover_not_merged test_status_points_recover test_recover_orphan_archive test_recover_lock_owner test_exec_refused_after_recover test_exec_records_pgid_then_recover_refused test_exec_stale_token_next_generation test_exec_refused_non_running_state test_run_failed_reason_last_line test_wait_wakes_on_grant test_wait_timeout test_wait_caller_lost test_watch_on_request test_watch_on_result test_watch_result_between_watches test_real_archive_partial_recovery test_status_wait_reason test_recover_ps_fail test_exec_ps_fail"
+PAR_CASES="test_slot_state_must_hold test_prune_done_path_with_space test_request_user_mode test_request_no_caller test_request_preconditions test_request_auto_files_ok test_request_hangul_conflict test_request_auto_plus_code test_request_newline_path test_request_undecidable test_request_caller_lost test_request_duplicate_updates test_next_blocked_by_merge_head test_next_oldest_first test_next_parallel_single_grant test_next_refuses_with_corrupt test_approve_user_approval test_run_without_grant test_run_twice test_run_head_changed test_run_success test_partial_retry test_partial_reverify_keeps_slot test_recover_alive_pid test_recover_not_merged test_status_points_recover test_recover_orphan_archive test_recover_lock_owner test_exec_refused_after_recover test_exec_records_pgid_then_recover_refused test_exec_stale_token_next_generation test_exec_refused_non_running_state test_run_failed_reason_last_line test_wait_wakes_on_grant test_wait_timeout test_wait_caller_lost test_watch_on_request test_watch_on_result test_watch_result_between_watches test_real_archive_partial_recovery test_status_wait_reason test_recover_ps_fail test_exec_ps_fail test_request_bypass_rejects test_request_bypass_passes test_request_bypass_cleared test_run_bypass_hint test_user_approval_bypass_shown"
 want() { [[ -z "${PQ_TEST_ONLY:-}" || "$PQ_TEST_ONLY" == "$1" ]]; }
+# 실제 ps 를 한 번 실행해 쓸 수 있는지 정한다(샌드박스 등에서는 실패).
+PQ_PS_OK=0
+ps -o pgid= -p $$ >/dev/null 2>&1 && PQ_PS_OK=1
+# ps 로 프로세스 그룹을 확인해야 하는 사례. 병렬 사례만 담는다(순차 루프는 표식이 stderr 에 닿지 않음).
+PQ_NEEDS_PS="test_run_twice test_run_success test_partial_retry test_partial_reverify_keeps_slot test_recover_alive_pid test_recover_orphan_archive test_exec_records_pgid_then_recover_refused test_run_failed_reason_last_line test_real_archive_partial_recovery test_request_bypass_passes test_run_bypass_hint"
+# pq_env_skip <사례>: ps 불가 환경이고 목록에 있으면 건너뜀 표식을 내고 0 을 반환한다.
+pq_env_skip() {
+  [[ "$PQ_PS_OK" -eq 0 ]] || return 1
+  case " $PQ_NEEDS_PS " in *" $1 "*) ;; *) return 1 ;; esac
+  printf 'env-skip: test_publish_queue %s — ps 를 쓸 수 없는 환경(프로세스 그룹 확인 불가)\n' "$1" >&2
+  printf 'S\n' >>"$TMP/cnt"
+  return 0
+}
 for t in $SEQ_CASES $PAR_CASES; do
   case " $SEQ_CASES " in *" $t "*) continue ;; esac
   want "$t" || continue
+  pq_env_skip "$t" && continue
   "$t" >"$TMP/out.$t" 2>&1 &
 done
 (
@@ -874,8 +1044,8 @@ done
 wait
 for f in "$TMP/out.0seq" "$TMP"/out.test_*; do [[ -f "$f" ]] && cat "$f"; done
 [[ -z "${PQ_TEST_ONLY:-}" ]] && check_no_input_injection
-PASS="$(grep -c '^P$' "$TMP/cnt")"; FAIL="$(grep -c '^F$' "$TMP/cnt")"
+PASS="$(grep -c '^P$' "$TMP/cnt")"; FAIL="$(grep -c '^F$' "$TMP/cnt")"; SKIP="$(grep -c '^S$' "$TMP/cnt")"
 
-printf 'publish_queue: PASS=%d FAIL=%d (%ds)\n' "$PASS" "$FAIL" "$((SECONDS-T0))"
+printf 'publish_queue: PASS=%d FAIL=%d SKIP=%d (%ds)\n' "$PASS" "$FAIL" "$SKIP" "$((SECONDS-T0))"
 [[ "$FAIL" -eq 0 ]] && echo "ALL PASS"
 [[ "$FAIL" -eq 0 ]]

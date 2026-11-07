@@ -128,6 +128,8 @@ make_fx_base() {
     || { echo "test_pre_commit_archive_gate.sh: _commit_scan.awk 복사 실패 (HOOK_DIR='$HOOK_DIR')" >&2; return 1; }
   cp "$HOOK_DIR/_open_issues.awk" "$b/rd-workflow/scripts/hooks/" \
     || { echo "test_pre_commit_archive_gate.sh: _open_issues.awk 복사 실패 (HOOK_DIR='$HOOK_DIR')" >&2; return 1; }
+  cp "$SCRIPTS_DIR/_fr_status.sh" "$b/rd-workflow/scripts/" \
+    || { echo "test_pre_commit_archive_gate.sh: _fr_status.sh 복사 실패" >&2; return 1; }
   mkdir -p "$b/rd-workflow-workspace/.lifecycle"
   cat > "$b/rd-workflow-workspace/.lifecycle/task-state" <<'TSEOF'
 schema=1
@@ -193,7 +195,7 @@ run_scenario 11 "markdown 링크 + status done → 통과" \
 run_scenario 12 "종결 세션 + 해석 불가 값 → 차단(fail-closed)" \
   "없는-항목-입니다" "__NONE__" "-" 2 "없는-항목-입니다"
 
-# --- fail-closed 적용 범위 (final diff review Finding 1) ---
+# --- fail-closed 적용 범위 ---
 # 해석 실패 차단은 archive 커밋에만 적용되어야 한다. review 세션이 없거나 미종결이면
 # 그 커밋은 아직 archive 단계가 아니므로(구현 중 iteration commit 등) 통과시킨다.
 # 이 경계가 없으면 Source FR 표기가 어긋난 REQUEST 에서 모든 git commit 이 막힌다.
@@ -222,6 +224,100 @@ run_scenario 15 "FR 등록 helper 호출 → 통과(정규 예외)" \
 run_scenario 16 "같은 차단 상태의 일반 커밋 → 차단 유지" \
   '`'"$ITEM"'`' "$ITEM" "idea" 2 "done/dropped 필요" \
   "git commit -m x"
+
+# --- 앞당긴 검사의 상위집합 (JSON 직렬화된 쪼갠 표기의 커밋도 차단) ---
+# 없으면 새는 실수: 앞당긴 검사를 좁게 고쳐 쪼갠 표기의 커밋이 조용히 통과하는 것.
+# cmd 인자는 JSON 문자열 안에 그대로 들어가므로 이스케이프된 형태로 넘긴다.
+run_scenario P1 "인용 쪼갠 커밋 com'mit' → 차단" \
+  '`'"$ITEM"'`' "$ITEM" "idea" 2 "done/dropped 필요" \
+  "git com'mit' -m x"
+run_scenario P2 "이중 인용 쪼갠 커밋 → 차단" \
+  '`'"$ITEM"'`' "$ITEM" "idea" 2 "done/dropped 필요" \
+  'git com\"mit\" -m x'
+run_scenario P3 "줄 이음 쪼갠 커밋 → 차단" \
+  '`'"$ITEM"'`' "$ITEM" "idea" 2 "done/dropped 필요" \
+  'git com\\\nmit -m x'
+run_scenario P4 "ANSI-C 쪼갠 커밋 → 차단" \
+  '`'"$ITEM"'`' "$ITEM" "idea" 2 "done/dropped 필요" \
+  'git $'"'"'com\\x6dit'"'"' -m x'
+run_scenario P5 "같은 fixture 의 ls -la → 통과" \
+  '`'"$ITEM"'`' "$ITEM" "idea" 0 "-" \
+  "ls -la"
+
+# --- FR status 공용 판정 (fr-status-readers) ---
+# 없으면 새는 실수: 게이트가 공용 판정(_fr_status.sh)을 안 쓰고 한 줄 awk 로 되돌아가는 것,
+# 로드를 조기 통과 경로보다 앞당겨 iteration commit 을 막는 것.
+run_scenario S1 "status 'done (설명)' → 통과" \
+  '`'"$ITEM"'`' "$ITEM" "done (설명)" 0 "-"
+run_scenario S2 "status 'idea (메모)' → 차단·원문 표시" \
+  '`'"$ITEM"'`' "$ITEM" "idea (메모)" 2 "'idea' (원문: 'idea (메모)')"
+
+# run_custom <num> <name> <FR 본문 printf 형식> <세션모드> <rm_lib 0|1> <expected_exit> <err_sub(-=검사안함)>
+# make_fixture 로 만든 뒤 FR 본문을 바꾸고, rm_lib=1 이면 사본의 _fr_status.sh 를 지운다.
+run_custom() {
+  local num="$1" name="$2" body="$3" sess_mode="$4" rm_lib="$5" expected="$6" err_sub="$7"
+  local fixture
+  fixture="$(make_fixture '`'"$ITEM"'`' "$ITEM" "x" "$sess_mode")" || {
+    echo "[FAIL] scenario ${num}: ${name} — fixture 생성 실패 (make_fixture rc=$?)" >&2
+    FAIL=$((FAIL + 1))
+    return 1
+  }
+  _current_fixture="$fixture"
+  # shellcheck disable=SC2059
+  printf "$body" > "$fixture/$ITEM"
+  [[ "$rm_lib" == "1" ]] && rm -f "$fixture/rd-workflow/scripts/_fr_status.sh"
+  run_hook "$fixture"
+  local ok=1
+  [[ "$_hook_last_exit" == "$expected" ]] || ok=0
+  if [[ "$err_sub" != "-" ]]; then
+    case "$_hook_last_err" in *"$err_sub"*) ;; *) ok=0 ;; esac
+  fi
+  if [[ "$ok" == 1 ]]; then
+    echo "[PASS] scenario ${num}: ${name} (exit=$_hook_last_exit)"
+    PASS=$((PASS + 1))
+  else
+    echo "[FAIL] scenario ${num}: ${name} — expected exit=$expected actual=$_hook_last_exit err=[${_hook_last_err}]" >&2
+    FAIL=$((FAIL + 1))
+  fi
+  cleanup_fixture
+}
+run_custom S3 "'- 상태: done' 만 → 통과" '# fr item\n- 상태: done\n' resolved 0 0 "-"
+run_custom S4 "status 키 없음 → 차단·값 없음" '# fr item\n- kind: x\n' resolved 0 2 "(값 없음)"
+run_custom S5 "판정 파일 없음 + 종결 세션 → 차단" '# fr item\n- status: done\n' resolved 1 2 "_fr_status.sh"
+if tail -n1 "$RD_GUARD_BLOCK_LOG" 2>/dev/null | grep -qE 'reason=pre_commit_archive_gate\.fr-status-lib-missing$'; then
+  echo "[PASS] scenario S5 reason 검증"
+  PASS=$((PASS + 1))
+else
+  echo "[FAIL] scenario S5 reason 검증 — 감사 로그에 reason=pre_commit_archive_gate.fr-status-lib-missing 가 없습니다" >&2
+  FAIL=$((FAIL + 1))
+fi
+run_custom S6 "판정 파일 없음 + 미종결 세션 → 통과" '# fr item\n- status: done\n' open 1 0 "-"
+
+# 원시 JSON 을 그대로 stdin 에 쓰는 helper (\uXXXX 이스케이프 입력용)
+run_hook_raw() {
+  local fixture="$1" raw="$2"
+  _hook_last_exit=0
+  _hook_last_err="$(printf '%s' "$raw" | \
+    bash "$fixture/rd-workflow/scripts/hooks/pre_commit_archive_gate.sh" 2>&1 >/dev/null)" \
+    || _hook_last_exit=$?
+}
+if command -v jq >/dev/null 2>&1; then
+  _fx="$(make_fixture '`'"$ITEM"'`' "$ITEM" "idea")" || { echo "[FAIL] scenario P6 fixture 실패" >&2; FAIL=$((FAIL + 1)); _fx=""; }
+  if [[ -n "$_fx" ]]; then
+    _current_fixture="$_fx"
+    run_hook_raw "$_fx" '{"tool_input":{"command":"git com\u006dit -m x"}}'
+    if [[ "$_hook_last_exit" == 2 ]]; then
+      echo "[PASS] scenario P6: 원시 JSON 유니코드 이스케이프 커밋 → 차단 (exit=2)"
+      PASS=$((PASS + 1))
+    else
+      echo "[FAIL] scenario P6: 원시 JSON 유니코드 이스케이프 커밋 — expected exit=2 actual=$_hook_last_exit err=[${_hook_last_err}]" >&2
+      FAIL=$((FAIL + 1))
+    fi
+    cleanup_fixture
+  fi
+else
+  echo "skip: jq 없음 (scenario P6)"
+fi
 
 # --- 복수 Source FR — 부분 미완료 전부 열거 (task-guard-source-fr-contract T4) ---
 # 없으면 새는 실수: 게이트 범위 안에서도 여러 건 중 1건만 보고 나머지 미완료 FR을
@@ -422,7 +518,7 @@ assert_eq "gate 1b: 보류 상태 + 보호 경로 변경 staged → 차단" "1" 
 # incomplete-source-fr 이다(아래 gate 1d 가 FR→done 으로 만들어 pending-out-of-scope 를
 # 유발한다) — reason 값 대응 검증은 실제로 그 분기를 유발하는 gate 1d 뒤에서 한다.
 
-# --- final diff review Finding 3: 보류 분기가 `done` 조기 통과보다 먼저 적용되는가 ---
+# --- 보류 분기가 `done` 조기 통과보다 먼저 적용되는가 ---
 # 없으면 새는 실수: 정상 archive content commit 은 **같은 커밋에서** FR 을 done 으로 바꾸므로,
 # `done` 조기 통과가 앞에 있으면 「기록 경로만 커밋」 제한이 통째로 우회됩니다. 또 hook 은
 # 커밋 전에 돌기 때문에 index 만 보면 `git commit -a`·`git commit <경로>` 가 그냥 통과합니다.
@@ -624,7 +720,7 @@ assert_eq "fail-closed 4a: ls-tree 실패 시 빈 해시를 내지 않고 nonzer
 
 # 제외 목록 exact-match — spec §2.1 의 9개 항목(디렉터리 5·파일 4).
 # 목록을 넓히려면 이 기대값을 함께 고쳐야 합니다. 실행 비트 검사는 설정·source 되는 조각을
-# 걸러내지 못해 신뢰 경계를 강제하지 못하므로 쓰지 않습니다 (spec §2.1 Finding 6).
+# 걸러내지 못해 신뢰 경계를 강제하지 못하므로 쓰지 않습니다.
 expected_record_paths="$(printf '%s\n' \
   "CURRENT_TASK.md" \
   "REQUEST.md" \

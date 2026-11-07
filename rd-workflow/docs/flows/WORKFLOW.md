@@ -9,11 +9,11 @@
 
 이 판정이 전체 흐름의 핵심 분기입니다. 작업 착수 시 AI 가 아래 신호표로 등급을 판정하고 **시작 보고 블록**(등급 / 근거 신호 / 경로 / 생략 단계 / 필수 단계 / 실행 모드 / push 예정 / 미병합 브랜치 FR 후보) 을 **한 번** 냅니다. **이 괄호 안의 목록이 필드 정본입니다** — 아래 `light` 체크리스트 1항과 `/small-task-implement` 1단계·Final output 을 비롯한 모든 생산자는 목록을 다시 열거하지 않고 이 목록을 그대로 상속하며, 그 자리에서 값이 갈리는 필드(예: `push 예정` 의 경우별 문구)만 덧붙입니다. `실행 모드` 필드는 판정된 모드와 그 출처를 병기하며, 출처 값은 `workflow.json` / `키 부재 기본값` / `파일 부재 기본값` / `세션 지시` / `판정 불가 fallback` 다섯뿐입니다(판정 규칙과 경고 문구는 `AUTONOMY.md`). 생산자와 시점은 등급별로 하나씩입니다 — `light`·`standard` 는 아래 시작 계약 5항을 확인한 **직후**(생산자: `light` 체크리스트 1항 / `/small-task-implement` 1단계 / autopilot 모드 B 는 §3 promote 직전의 시작 계약 확인 직후), `full` 은 시작 계약이 없으므로 **등급 판정 직후**(생산자: 대화 Intake 규칙 또는 autopilot 모드 결정). `full` 의 블록은 FR 등록·지시 대기보다 앞서며, 블록 직전에 **비변경 preflight** `bash rd-workflow/scripts/lifecycle/start_preflight.sh` 를 실행합니다(원격 모드면 fetch 포함) — 출력의 `push 예정` 줄과 `미병합 브랜치 FR 후보` 줄을 블록에 그대로 옮기며, ahead 수를 읽어 `push 예정` 을 `archive.sh 경유(기본 브랜치 미push N개 포함)` 로 적고, fetch 실패·upstream 부재면 `archive.sh 경유(미push 수 판정 실패: 사유)` 로 적습니다(워킹트리·브랜치는 바꾸지 않습니다). 대화 Intake 의 `full` 은 블록 뒤 "다음 단계를 지정해주세요" 로 지시를 기다리므로 사용자가 그 자리에서 ahead 커밋 발행을 막거나 채택할 수 있고, autopilot 모드 A 는 지시 대기가 없으므로 ahead N>0 이면 시작하지 않고 인계합니다(사용자 명시 채택 시 진행·채택 수 병기 — `standard` 와 같은 규칙). `/workflow-router` 는 등급과 근거 신호만 말하고 블록을 내지 않습니다. `light`·`standard` 는 블록 뒤 승인을 기다리지 않고 진행하고 `full` 은 현행 실행 모드 규칙(manual 은 단계별 확인, semi-auto·autopilot 은 `AUTONOMY.md`) 을 따릅니다. 마감 시 **종료 보고 블록**(검증 결과 / review 결과 / 커밋·archive·push 상태 / 남은 조치) 을 냅니다. `push 예정` 은 원격 모드에서 필수 필드입니다 — 마감 push 방식(`light` 는 커밋 직후 push, `standard`·`full` 은 `archive.sh` 경유) 과 그 push 에 함께 올라갈 기본 브랜치 미push 커밋 수를 적고, 로컬 전용 모드는 `없음` 으로 적습니다. 자율 실행 모드의 `light` 마감 push 는 이 필드가 있어야 허용됩니다(`AUTONOMY.md` 중단 조건 6 예외 ②). `미병합 브랜치 FR 후보` 줄은 모든 등급에서 필수이며 경고 성격입니다 — 후보가 있어도 흐름을 막지 않고, 검사 실패는 `검사 실패 — 사유` 로 적고 진행합니다. 사용자가 매 작업 시작마다 이 줄을 보므로 방치 브랜치의 FR 이 사람이 찾지 않아도 드러납니다.
 
-등급 변경은 발생 즉시 한 줄로 표시합니다. **상향은 언제나 가능**하고, **하향은 사용자만** 할 수 있으며 AI 는 하향을 제안만 합니다. 되돌리기 어려운 효과는 어떤 하향으로도 `full` 고정, 워크플로 인프라 동작 변경은 사용자가 명시 지시할 때만 `standard` 까지(지시는 감사 기록에 남김), `light` 로의 하향은 이 두 신호가 없을 때만 가능합니다.
+등급 변경은 발생 즉시 한 줄로 표시합니다. **상향은 언제나 가능**합니다. **하향은 사용자와 AI 모두 할 수 있습니다.** AI 가 하향하면 근거를 적습니다. 근거는 하위 등급의 규모 신호(예: `standard` 는 변경 파일 ≤ 3·기존 테스트로 검증 가능)와 되돌리기 어려운 효과가 없다는 확인입니다. 하향의 주체(AI·사용자)와 근거는 감사 기록의 `override·상향 이력` 에 적습니다(`light` 는 tier-log 행의 같은 칸). 바닥은 둘입니다. 되돌리기 어려운 효과가 있으면 어떤 하향으로도 `full` 입니다. 워크플로 인프라 동작 변경은 `standard` 아래로 내리지 않습니다. 사용자는 AI 의 하향을 언제든 되돌릴 수 있습니다.
 
 ### 판정 신호표
 
-판정 순서: ① 의미 기반 신호로 **기본 등급**을 정한다 → ② 경로·규모 신호는 **상향에만** 쓴다 — 기본 등급의 규모 한도를 넘으면 **한 단계** 올리고, 낮은 등급의 규모 신호는 하향 근거가 아니다 → ③ 인접 두 등급 사이가 모호하면 높은 쪽 → ④ 의미 신호로 기본 등급을 정할 수 없으면 `full`. 파일 수는 정본만 세고 build 산출물(루트 `rd-workflow/` 미러) 과 워크플로 생성 파일(tier-log 행·FR done 처리·task-state) 은 세지 않습니다. 경로는 역할 명칭으로 판정합니다(소비 프로젝트도 `rd-workflow/` 설치 위치가 같습니다).
+판정 순서: ① 의미 기반 신호로 **기본 등급**을 정한다 → ② 경로·규모 신호는 **상향에만** 쓴다 — 기본 등급의 규모 한도를 넘으면 **한 단계** 올리고, 기본 등급 판정에서 낮은 등급의 규모 신호는 하향 근거가 아니다(판정 뒤의 하향은 위 하향 규칙) → ③ 인접 두 등급 사이가 모호하면 높은 쪽 → ④ 의미 신호로 기본 등급을 정할 수 없으면 `full`. 파일 수는 정본만 세고 build 산출물(루트 `rd-workflow/` 미러) 과 워크플로 생성 파일(tier-log 행·FR done 처리·task-state) 은 세지 않습니다. 경로는 역할 명칭으로 판정합니다(소비 프로젝트도 `rd-workflow/` 설치 위치가 같습니다).
 
 | 등급 (token) | 의미 기반 신호 (우선) | 경로·규모 신호 (보조) |
 |---|---|---|
@@ -33,6 +33,7 @@
 | REQUEST | 생략 | 필수 — 축약형 | 필수 |
 | REQUEST review | 생략 | 생략 | 필수 |
 | spec / plan | 생략 | 생략 — 필요하면 REQUEST `Change Description` 안에 한 문단 spec + 한 목록 plan | 필수 (별도 파일) |
+| 동작 질문 시제품 (아래 「설계 중 동작 질문 — 일회용 시제품」) | 생략 | 선택 | 선택 |
 | spec/plan review | 생략 | 생략 | 필수 |
 | 구현 | 필수 | 필수 | 필수 |
 | 검증 (고친 영역) | 필수 | 필수 | 필수 |
@@ -203,7 +204,7 @@ herdr app 에서 띄운 작업 세션은 앱 왼쪽 Agents 패널에 부모 세�
 
 - **시점**: `light` 는 유일한 커밋 직전, `standard`·`full` 은 final diff review 세션 생성 직전.
 - **대상**: baseline 이후의 실제 변경 집합 = `git status --porcelain`(staged·unstaged·untracked) + `git diff --name-only <baseline>..HEAD`. 워크플로 생성 파일은 제외.
-- **판정**: 변경 집합에 현재 등급의 신호를 벗어나는 항목이 있으면 상향하고, 상향된 등급의 필수 단계 중 생략한 것을 그 시점부터 수행합니다.
+- **판정**: 변경 집합에 현재 등급의 신호를 벗어나는 항목이 있으면 상향하고, 상향된 등급의 필수 단계 중 생략한 것을 그 시점부터 수행합니다. 하향했으면 그 하향 근거에 적은 신호는 상향 사유로 다시 세지 않습니다. 하향 뒤 새로 생긴 신호는 종전대로 상향 사유입니다. 되돌리기 어려운 효과가 새로 보이면 `full` 로 올립니다.
   - `light → standard`: `promote.sh --size small --source-fr <FR|->` (dirty 변경은 `git switch` 로 새 fr 브랜치에 실림) → 축약 REQUEST 작성(`## Risk Tier` 의 baseline HEAD 는 tier-log 행과 같은 값, 이력에 상향 사유) → 변경 + REQUEST 를 **같은 커밋** → final diff review → `archive.sh`. tier-log 에는 이 시점에 확정 행 1개를 append 합니다(최종 등급 `standard`, 이력 `light → standard`) — 같은 커밋에 포함하며 canonical token 밖의 값은 쓰지 않습니다.
   - `standard → full`: 별도 spec/plan 파일 작성 → spec/plan review → final diff review. 브랜치 유지.
 - **사후 발견** (`light` 커밋이 이미 기본 브랜치에 있음): `bash rd-workflow/scripts/prepare_review_pipeline.sh diff "git diff <오분류 커밋>^..HEAD"` 로 세션 1개를 만들고 iteration commit 규칙으로 진행합니다. Finding 이 있으면 `이의 없음` 까지 새 작업 착수·발행을 차단하고 force-push 는 금지합니다. revert 는 리뷰가 권고할 때 사용자가 결정합니다. Finding 이 없으면 tier-log 에 사후 리뷰 결과 한 줄을 추가합니다.
@@ -222,6 +223,26 @@ herdr app 에서 띄운 작업 세션은 앱 왼쪽 Agents 패널에 부모 세�
 3. 커밋 전 재분류 → tier-log 에 확정 행 1개 append(최종 등급 `light`, 변경 파일 요약). 상향이면 위 절차로(행은 `standard` / `light → standard` 로 append).
 4. 기존 FR 이 있으면 done 처리(인덱스 행 삭제 + 상세 `status: done`).
 5. 커밋 1회(한국어 한 줄 요약) → 원격 모드면 push(`push 예정` 이 보류였고 채택이 없으면 push 하지 않고 "미push" 로 보고) → 종료 보고 블록.
+
+### 설계 중 동작 질문 — 일회용 시제품
+
+`full` 의 brainstorming·spec 작성 중, 또는 `standard` 의 축약 REQUEST 작성 뒤 구현 전에, 실제로 실행해 봐야 답이 나오는 질문을 만나면 일회용 시제품으로 확인합니다. 시제품 코드는 결정을 기록한 뒤 버립니다.
+
+1. **동작 질문 판정 기준**: 정적 목업이나 말로는 답이 갈리고, 실행해 봐야 고를 수 있는 질문입니다. 예는 드래그·스크롤 연동의 손맛, 애니메이션 타이밍, 실제 데이터 양·지연에서의 흐름입니다. 화면 배치·색상처럼 정적으로 보이는 질문은 brainstorming 의 Visual Companion 목업으로 충분하므로 대상이 아닙니다.
+2. **판정 주체**: 모델이 "시제품으로 확인할 질문" 을 한 문장으로 제안하고, 사용자가 승인하면 만듭니다. 사용자가 먼저 요청해도 만듭니다. `standard` 는 축약 REQUEST 를 쓴 뒤 구현에 들어가기 전에 판정합니다.
+3. **전제 조건**: `rd-workflow/claude_skills/tpl/status.md` 3b 의 판정 블록이 `run=작성됨` 을 낼 때만 만듭니다. `미작성`·`절 없음` 이면 제안하지 않고 "앱 실행 방법이 `PROJECT_CONTEXT.md` 의 `## Run` 절에 없어 시제품 경로를 쓸 수 없습니다" 를 알립니다.
+4. **만드는 곳과 기준 커밋**: fr 브랜치가 아닌 `proto/<slug>` 브랜치의 별도 worktree 에 만듭니다. 기준 커밋은 현재 작업 worktree 의 HEAD(fr 브랜치)입니다. 시제품이 실제 구현과 같은 코드 위에서 돌게 하기 위해서입니다. 작업 worktree 에서 `git worktree add -b proto/<slug> <경로> HEAD` 를 실행합니다. 경로는 기본 체크아웃의 `.worktrees/proto-<slug>` 입니다. 만든 뒤 기준 커밋(`git rev-parse --short HEAD`)과 경로를 사용자에게 알립니다.
+5. **확인**: 사용자가 `## Run` 절의 명령으로 시제품을 띄워 직접 확인합니다. 테스트와 리뷰는 하지 않습니다.
+6. **결정 기록 위치**: 결과는 "시제품으로 확인한 결정" 소제목 아래에 질문·확인한 사실·결정을 적습니다. 코드는 옮기지 않습니다. `full` 은 spec 의 결정 절에, `standard` 는 축약 REQUEST 의 `Change Description` 에 적습니다.
+7. **정리**: 결정을 기록한 뒤 아래 순서로 버립니다. 시제품 worktree 에는 커밋하지 않은 수정·새 파일이 남는 것이 정상이므로 `--force` 가 필요합니다.
+   1. 사용자에게 "시제품 `<경로>`(브랜치 `proto/<slug>`)의 코드를 버립니다" 를 알리고 승인을 받습니다. 코드를 지우는 비가역 행동이기 때문입니다.
+   2. 시제품으로 띄운 프로세스(개발 서버 등)를 끝냅니다.
+   3. 원래 작업 worktree 로 돌아가 `git worktree list --porcelain` 에서 그 경로의 브랜치가 `refs/heads/proto/<slug>` 인지 확인합니다. 다르면 멈추고 보고합니다.
+   4. `git worktree remove --force <경로>` 를 실행하고, 성공했을 때만 `git branch -D proto/<slug>` 를 실행합니다.
+   5. 어느 하나가 실패하면 남은 경로·브랜치와 실패 출력을 사용자에게 알리고, 다시 실행할 명령(4 의 두 명령)을 적습니다. 원래 단계로의 복귀는 막지 않습니다.
+   - 시제품 코드를 남기고 싶다는 요청은 새 작업 요청으로 다룹니다(Intake 규칙).
+8. **복귀**: `full` 은 spec 작성으로, `standard` 는 구현으로 돌아갑니다. 등급은 바뀌지 않습니다.
+9. **design-review 와의 차이** (full 배포본만 — `rd-workflow/extensions/design-review` 가 있을 때): 시제품 경로는 spec 확정 전에 동작을 확인합니다. design-review 는 spec/plan review 뒤에 확정된 디자인 레퍼런스를 점검합니다. 시제품으로 확인한 결정은 design-review 의 레퍼런스로 쓸 수 있습니다.
 
 ## 입력 소스
 
@@ -280,7 +301,10 @@ autopilot 에서는 이 분기가 모드 A(`full`)/모드 B(`standard`) 로 나�
 - 파일명: `YYYY-MM-DD-HHMM-${SHORT_TITLE}.md` (`SHORT_TITLE` 은 `CURRENT_TASK.md ## Short Title` 에서 read — canonical regex 검증된 값)
 - 새 REQUEST로 덮어쓰기 전에 먼저 아카이브합니다
 - 아카이브 후 `REQUEST.md`는 빈 템플릿으로 되돌립니다
-- `full`·`standard`(fr 브랜치 작업): fr branch에서 archive content commit 후 main으로 switch, `bash rd-workflow/scripts/lifecycle/archive.sh` 호출로 merge + tag + push + branch 정리를 일괄 처리한다.
+- `full`·`standard`(fr 브랜치 작업): fr branch에서 archive content commit 후 발행한다.
+  - 발행은 작업 worktree 에서 부른다(`rd publish run` 또는 `archive.sh`). archive 가 기본 체크아웃에서 merge + tag + push 를 하고 작업 worktree 는 남긴다.
+  - 세션은 자기 worktree 를 직접 지우지 않는다. 세션이 끝난 뒤 기본 체크아웃의 `rd task list` 가 worktree 와 branch 를 정리한다.
+  - 기본 체크아웃에서 다른 작업을 `--task` 로 발행해도, 그 작업의 세션이 worktree 안에 있으면 archive 가 지우지 않고 정리 대기로 남긴다.
 
 ### `아카이브 보류` — 리뷰 종결과 발행 사이
 

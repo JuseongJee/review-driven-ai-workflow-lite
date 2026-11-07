@@ -45,7 +45,7 @@ rc=0
 # (1) 승격 명령 개수 — 모드별 분리
 # `grep -c` 는 0건일 때 rc 1, **오류일 때 rc 2 이상**이다. `|| true` 로 뭉개면 읽기 오류가
 # "0건" 이 되어 뒤의 검사들이 실패하고, 결과가 exit 1(계약 위반)로 오분류된다
-# (final diff review 5라운드 Finding 3). 읽기 오류는 exit 2 다.
+# 읽기 오류는 exit 2 다.
 promote_lines="$(grep -c 'promote\.sh --short-title' "$SKILL")" || {
   _grc=$?
   if [[ "$_grc" -ge 2 ]]; then
@@ -62,7 +62,7 @@ fi
 
 # (2)(3) 모드 라벨-size 대응 + --source-fr **값**. 논리 줄로 이어붙여 판정한다.
 #
-# **토큰 경계와 값을 함께 본다** (final diff review 5라운드 Finding 2).
+# **토큰 경계와 값을 함께 본다**.
 #   - 부분 문자열로 보면 `--size largeish` 도 통과한다 → 값 뒤가 공백이나 줄끝이어야 한다.
 #   - `--source-fr` 를 이름 존재만 보고 canonical 예시를 문서 전체에서 한 번만 확인하면,
 #     한쪽 모드를 `--source-fr -` 나 값 누락으로 바꿔도 통과한다. 전자는 선택한 FR 연결을
@@ -88,7 +88,7 @@ if ! viol="$(awk '
     if (line ~ /promote\.sh --short-title/) {
       # **옵션명의 양쪽 토큰 경계를 요구한다.** 오른쪽(값 뒤)만 보면 prefix 오타
       # `x--size large` 가 통과하는데, 실제 파서는 `x--size` 를 unknown arg 로 거부한다
-      # (final diff review 7라운드 Finding 3). 왼쪽은 줄 시작 또는 공백이어야 한다.
+      # 왼쪽은 줄 시작 또는 공백이어야 한다.
       hasLarge = (line ~ /(^|[[:space:]])--size large([[:space:]]|$)/)
       hasSmall = (line ~ /(^|[[:space:]])--size small([[:space:]]|$)/)
       # **같은 옵션이 두 번 나오면 거부한다(--size 만).** `promote.sh` 파서는 순서대로

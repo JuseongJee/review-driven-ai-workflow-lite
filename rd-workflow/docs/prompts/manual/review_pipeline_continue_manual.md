@@ -1,5 +1,7 @@
 붙어 있는 세션 경로(예: `rd-workflow-workspace/handoffs/review_pipeline/YYYYMMDD_HHMMSS_세션명`)와 `rd-workflow/docs/flows/FILE_BASED_REVIEW_PIPELINE.md`를 읽고 파일 기반 review를 이어줘.
 
+수동으로 쓴 리뷰어 턴은 실행 기록을 남기지 않습니다. 수동으로만 리뷰한 final diff 세션은 `rd review seal` 이 거부하며, 발행은 `archive.sh --force-skip-review-check <사유>`(audit 기록)로 합니다.
+
 절차:
 1. `SESSION.md`, `CHECKPOINT.md`, 최신 턴 파일 1개, 검토 대상을 읽는다. 이전 턴은 `turns/` 디렉토리에서 필요할 때만 참조한다
 2. 자기 차례가 아니면 상태만 짧게 알린다

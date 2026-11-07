@@ -48,7 +48,7 @@ make_iso() {
   cleanup
   # 템플릿을 쓸 수 없다: 실패를 `bad` 로 집계해야 FAIL 카운터에 반영된다. 마커는 집계 보존을
   # 위한 것이라 경로 안전성을 대신하지 않으므로 경로 검증을 같은 규약으로 따로 둔다 — 없으면
-  # `rc=0 + 빈 출력`에서 아래 `ln -s "$src" "$ISO_DIR/$b"` 가 `/bash` 를 만든다 (Turn 002 F2).
+  # `rc=0 + 빈 출력`에서 아래 `ln -s "$src" "$ISO_DIR/$b"` 가 `/bash` 를 만든다.
   ISO_DIR="$(mktemp -d)" || { bad "환경: mktemp 실패 — 격리 PATH 를 만들 수 없습니다"; return 1; }   # mktemp-scan: custom-handler
   [[ -n "$ISO_DIR" && -d "$ISO_DIR" ]] || { bad "환경: mktemp 경로 검증 실패 (TMPDIR='${TMPDIR:-}')"; return 1; }   # mktemp-scan: custom-handler
   for b in $ISO_BASE_DEPS $extra; do

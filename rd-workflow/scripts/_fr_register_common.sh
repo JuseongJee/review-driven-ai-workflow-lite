@@ -59,6 +59,18 @@ _frr_rows_for() { # <file|-> <slug>
       for (i = 1; i <= n; i++) if (i != f) { c = a[i]; gsub(/^[ \t]+|[ \t]+$/, "", c); if (c == s) other = 1 } }
     END { exit (cnt == 0 && other) ? 5 : 0 }'
 }
+# 인덱스 머리행의 칸 이름을 앞뒤 공백 없이 `|` 로 이어 stdout 으로 낸다. 머리행 = `## 인덱스` 절 아래 첫 `|` 줄, 그 절이 없으면 파일의 첫 `|` 줄.
+_frr_header_names() { # <file>
+  awk '
+    /^## 인덱스/ { sec = 1; next }
+    /^\|/ { if (!sec && !first) first = $0 }
+    sec && /^\|/ && !h { h = $0 }
+    END { if (!h) h = first
+      if (h == "") exit 0
+      gsub(/\\\|/, "\001", h); n = split(h, a, "|"); out = ""
+      for (i = 2; i < n; i++) { c = a[i]; gsub(/^[ \t]+|[ \t]+$/, "", c); out = out (i > 2 ? "|" : "") c }
+      print out }' "$1"
+}
 # base 인덱스(파일) 의 마지막 표 행 뒤에 행 1개 삽입 → stdout (출력은 줄 끝 개행으로 정규화된다)
 _frr_insert_row() { # <base-file> <row>
   # awk -v 는 값의 백슬래시 이스케이프(`\|` 등)를 해석해 지우므로 ENVIRON 으로 넘긴다 — 요약의 `\|` 가 합성 행에서 구분자로 바뀌는 것을 막는다.
@@ -230,7 +242,7 @@ _frr_create_noclobber() { # <src> <dst>
 
 fr_register_run() { # <slug> → exit 0 (committed|already) / 3 (skipped)
   local slug="$1" root default ref old row n detail cap="" base_f="" new_f="" idx_blob det_blob cap_blob="" tmpidx="" tree new wt_real="" rd_idx="" rd_det="" rd_cap=""
-  local mode="none" p rc base_row sync_ok cap_on_default=0 wt_list st_out cur wt
+  local hdr_base hdr_cur mode="none" p rc base_row sync_ok cap_on_default=0 wt_list st_out cur wt
   _frr_slug="$slug"; _frr_state="none"; _frr_wt=""; _frr_bak="-"; _frr_orig_ls=""; _frr_paths=(); _frr_created=(); _frr_ref=""; _frr_new=""; _frr_idx_old=""; _frr_idx_new=""; _frr_idx_want=""; _frr_parked=()
   _frr_install_traps
   case "$slug" in ""|-*|*-|*[!a-z0-9-]*) _frr_skip "${slug:--}" - bad-slug "slug 가 kebab-case(영숫자 시작·끝, 사이 '-') 가 아닙니다: '$slug'"; _frr_restore_traps; return 3 ;; esac
@@ -298,6 +310,9 @@ fr_register_run() { # <slug> → exit 0 (committed|already) / 3 (skipped)
   git cat-file -p "${ref}:${FR_IDX_PATH}" > "$base_f" 2>/dev/null || { _frr_skip "$slug" "$default" git-error "기본 브랜치의 인덱스를 읽을 수 없습니다"; _frr_restore_traps; return 3; }
   # base 가 개행으로 끝나지 않으면 합성 출력(개행 정규화)이 마지막 행을 수정으로 만들어 자기 검증(shape-mismatch) 에 영구히 걸린다 — 재실행으로 풀리지 않으므로 실행 가능한 사유로 낸다.
   [[ -z "$(tail -c1 "$base_f")" ]] || { _frr_skip "$slug" "$default" index-no-newline "기본 브랜치($default)의 인덱스 파일이 개행으로 끝나지 않습니다. 기본 브랜치에서 파일 끝 개행을 추가해 커밋한 뒤 재실행하십시오"; _frr_restore_traps; return 3; }
+  # 기본 브랜치 머리행과 현재 워킹트리 머리행이 다르면(예: 6-a 이관이 기본 브랜치에 아직 없음) 합성하면 칸 수가 어긋나 shape-mismatch 로 끝난다 — 먼저 알기 쉬운 사유로 건너뛴다.
+  hdr_base="$(_frr_header_names "$base_f")"; hdr_cur="$(_frr_header_names "$FR_IDX_PATH")"
+  [[ "$hdr_base" == "$hdr_cur" ]] || { _frr_skip "$slug" "$default" index-header-mismatch "기본 브랜치($default) 인덱스 머리행이 현재 워킹트리와 다릅니다 (기본 브랜치: $hdr_base / 현재: $hdr_cur). 옛 머리행 이관(\`/fr add\` 6-a)이 기본 브랜치에 아직 없습니다. 기본 브랜치 체크아웃에서 \`rd-workflow/claude_skills/fr/add.md\` 6-a 명령을 실행해 인덱스만 커밋한 뒤 재실행하십시오"; _frr_restore_traps; return 3; }
   _frr_mktemp_into new_f || { _frr_skip "$slug" "$default" git-error "임시 파일 생성 실패"; _frr_restore_traps; return 3; }
   _frr_insert_row "$base_f" "$row" > "$new_f" || { _frr_skip "$slug" "$default" git-error "인덱스 합성 실패"; _frr_restore_traps; return 3; }
 

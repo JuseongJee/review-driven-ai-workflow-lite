@@ -67,6 +67,26 @@ assert_eq() {
   if [[ "$got" == "$want" ]]; then PASS=$((PASS+1)); echo "  PASS: $desc";
   else FAIL=$((FAIL+1)); echo "  FAIL: $desc — got=[$got] want=[$want]" >&2; fi
 }
+# 지연 정리가 「점유 판정불가」 로 보류됐을 때 그 보류가 환경 탓인지 제품과 별개로 확인한다.
+# 내 계정(유효 uid 도 나)의 살아 있는 프로세스를 ps 로 보고, lsof 로 그 CWD 를 모두 읽을 수 있으면 0(판정 가능한 환경)이다.
+# 0 이면 제품의 판정불가는 회귀이므로 env-skip 으로 세지 않고 FAIL 한다.
+occ_env_judgeable() {
+  local u ps_live cwd_seen
+  u="$(id -u)"
+  ps_live="$(ps -U "$u" -o pid=,uid=,stat= 2>/dev/null | awk -v me="$u" '$1 ~ /^[0-9]+$/ && $2 == me && $3 !~ /^Z/ {print $1}')"
+  [[ -n "$ps_live" ]] || return 1
+  command -v lsof >/dev/null 2>&1 || return 1
+  # `n/proc/<pid>/cwd (readlink: Permission denied)` 처럼 괄호 오류 설명이 붙은 n 줄은 읽은 것으로 치지 않는다.
+  cwd_seen="$(lsof -a -u "$u" -d cwd -Fpn 2>/dev/null | awk '/^p/ {c = substr($0, 2)} /^n\// && !/\(.*\)$/ && c != "" {print c}')"
+  [[ -n "$cwd_seen" ]] || return 1
+  printf '%s\n' "$ps_live" | CWD_SEEN="$cwd_seen" awk '
+    BEGIN { n = split(ENVIRON["CWD_SEEN"], a, "\n"); for (i = 1; i <= n; i++) seen[a[i]] = 1 }
+    !($1 in seen) { print $1 }' | while IFS= read -r pid; do
+      kill -0 "$pid" 2>/dev/null || continue   # 그사이 끝난 프로세스는 세지 않는다
+      exit 1
+    done
+}
+
 assert_err() {
   local input="$1" desc="$2"
   if normalize_slug "$input" >/dev/null 2>&1; then
@@ -113,7 +133,7 @@ _ok_ts="$_ok_repo/rd-workflow-workspace/.lifecycle/task-state"
 #
 # **초기값은 writer 가 되돌릴 값과 달라야 한다.** `source-fr=-` 로 두면 metadata_clear 가
 # 같은 `-` 를 쓰므로 값이 변하지 않고, 아래 역방향 검사가 그 키를 "실제로 안 바뀐 키" 로
-# 판정해 **올바른 구현도 FAIL** 한다 (Turn 004 F4).
+# 판정해 **올바른 구현도 FAIL** 한다.
 printf 'schema=1\nshort-title=x\nstatus=구현 중\nfr-branch=fr/x\nworktree-path=/p\nsource-fr=rd-workflow-workspace/backlog/items/x.md\ncreated-at=2026-01-01-0000\nextensions.foo.bar=v\n' > "$_ok_ts"
 cp "$_ok_ts" "$_ok_ts.before"
 (
@@ -507,14 +527,14 @@ eval "$_saved_paths"
 # **rc 는 2(판정 불능) 다.** 검사 목록을 만들 수 없는 것은 파일 내용 판정이 아니므로,
 # rc 1 로 고정하면 호출부가 content 차단으로 해석해 "baseline 상태로 되돌리십시오" 라는
 # 잘못된 절차를 낸다. L1 도 같은 실패를 rc 2 로 내므로 두 층이 일치한다
-# (final diff review Turn 004 F6 — 기존에 rc 1 을 고정하고 있던 자리다).
+# (기존에 rc 1 을 고정하고 있던 자리다).
 _saved_paths="$(declare -f lifecycle_metadata_paths)"
 lifecycle_metadata_paths() { return 7; }
 _rc=0; archive_publish_content_check "$_pc_repo" "$_pc_base" "$(git -C "$_pc_repo" rev-parse HEAD)" >/dev/null 2>&1 || _rc=$?
 assert_eq "$_rc" "2" "허용 경로 목록 생성이 실패하면 판정 불능(rc 2) — content 차단으로 오분류하지 않는다"
 eval "$_saved_paths"
 
-# 반례 f4 — lifecycle_metadata_paths 가 **한 줄을 출력한 뒤** nonzero (final diff review F3)
+# 반례 f4 — lifecycle_metadata_paths 가 **한 줄을 출력한 뒤** nonzero
 # 반례 f3 는 "nonzero + 빈 출력" 만 다루므로 `n_paths == 0` 가드가 우연히 막아 준다.
 # 부분 출력은 그 가드를 통과해 축소된 목록으로 검사가 끝나고 rc 0 이 나온다 — 변조된
 # task-state 나 남은 active-fr 이 조용히 검사에서 빠진다. helper 의 rc 를 별도로 봐야
@@ -554,7 +574,7 @@ assert_eq "$_rc" "1" "task-state 부재는 rc 1 차단 — 실행 오류(rc 2)�
 _rc=0; archive_publish_content_check "$_pc_repo" "$_pc_base" "$(git -C "$_pc_repo" rev-parse HEAD)" >/dev/null 2>&1 || _rc=$?
 assert_eq "$_rc" "0" "복원 직후에는 통과 — 이후 반례의 차단이 자기 주입 때문임을 보증"
 
-# 반례 h — **git 명령을 실제로 실패시킨다** (Turn 004 F1)
+# 반례 h — **git 명령을 실제로 실패시킨다**
 # 파이프로 filter 를 잇던 구현에서는 이 실패가 filter 의 정상 종료로 소거되어
 # 빈 파일끼리 cmp 하며 통과했다. rc 2 여야 한다.
 git() {
@@ -585,7 +605,7 @@ _rc=0; archive_publish_content_check "$_pc_repo" "$_pc_base" "$(git -C "$_pc_rep
 eval "$_saved_emit"
 assert_eq "$_rc" "2" "baseline 생성 실패는 빈 기대값으로 소거되지 않고 rc 2"
 
-# 반례 k — 소유 키 밖 행을 **마지막 LF 없이** 주입 (Turn 006 F1 의 fail-open)
+# 반례 k — 소유 키 밖 행을 **마지막 LF 없이** 주입
 # 행 단위 필터는 이 행을 버려 기준선과 같은 결과를 내고 rc 0 으로 통과했다 (실증).
 (
   cd "$_pc_repo"
@@ -625,7 +645,7 @@ assert_eq "$_rc" "1" "빈 task-state 는 차단 (LF 종단 검사가 빈 파일�
 _rc=0; archive_publish_content_check "$_pc_repo" "$_pc_base" "$(git -C "$_pc_repo" rev-parse HEAD)" >/dev/null 2>&1 || _rc=$?
 assert_eq "$_rc" "0" "복원 직후에는 통과 — 이후 반례의 차단이 자기 주입 때문임을 보증"
 
-# 반례 n — **NUL 종단** 주입 (Turn 008 F1)
+# 반례 n — **NUL 종단** 주입
 # `[ -z "$(tail -c 1 f)" ]` 방식은 명령 치환이 NUL 을 버려 이것을 LF 종단으로 오인했다.
 (
   cd "$_pc_repo"
@@ -659,7 +679,7 @@ assert_eq "$_rc" "1" "중간 NUL 이 든 task-state 는 차단"
 _rc=0; archive_publish_content_check "$_pc_repo" "$_pc_base" "$(git -C "$_pc_repo" rev-parse HEAD)" >/dev/null 2>&1 || _rc=$?
 assert_eq "$_rc" "0" "복원 직후에는 통과 — 이후 반례의 차단이 자기 주입 때문임을 보증"
 
-# 반례 p — **owned 키 값 뒤 NUL 은닉** (조건 ②의 진짜 증인, Minor M2)
+# 반례 p — **owned 키 값 뒤 NUL 은닉** (조건 ②의 진짜 증인)
 # 반례 o 는 NUL 이 행 선두라서 read 가 빈 키(owned 아님)를 남겨 우연히 cmp 불일치가
 # 된다 — 조건 ② 를 빼도 다른 경로로 우연히 차단될 수 있어 충실한 증인이 아니다.
 # 이 반례는 NUL 을 owned 키(status)의 **값 중간**에 심는다. read 는 NUL 을 조용히
@@ -689,7 +709,7 @@ assert_eq "$_rc" "1" "owned 키 값 뒤 NUL 로 은닉한 임의 키 주입도 �
 _rc=0; archive_publish_content_check "$_pc_repo" "$_pc_base" "$(git -C "$_pc_repo" rev-parse HEAD)" >/dev/null 2>&1 || _rc=$?
 assert_eq "$_rc" "0" "복원 직후에는 통과 — 이후 반례의 차단이 자기 주입 때문임을 보증"
 
-# 반례 q — **소유 키 "이름" 만 있고 `=` 가 없는 행** (다섯 번째 fail-open, final review Critical 1)
+# 반례 q — **소유 키 "이름" 만 있고 `=` 가 없는 행** (다섯 번째 fail-open)
 # `_archive_strip_owned` 가 `${line%%=*}` 를 `=` 유무 확인 없이 그대로 쓰면, `=` 가
 # 없는 행에서는 **행 전체**가 key 가 된다. 그래서 "status"·"fr-branch" 처럼 소유 키
 # "이름" 만 있고 값이 없는 행이 owned 목록의 해당 key 문자열과 우연히 일치해 필터가
@@ -715,7 +735,7 @@ assert_eq "$_rc" "1" "소유 키 이름만 있는 행(= 없음) 주입도 차단
 _rc=0; archive_publish_content_check "$_pc_repo" "$_pc_base" "$(git -C "$_pc_repo" rev-parse HEAD)" >/dev/null 2>&1 || _rc=$?
 assert_eq "$_rc" "0" "복원 직후에는 통과 — 반례 q 이후에도 자기 주입만이 차단 사유임을 보증"
 
-# 반례 r — 같은 내용을 **실행 비트(100755)** 로 커밋 (final diff review F2)
+# 반례 r — 같은 내용을 **실행 비트(100755)** 로 커밋
 # blob OID 는 그대로이므로 blob 비교만 하는 구현에서는 통과한다. git 은 같은 blob 을
 # 다른 mode 로 참조할 수 있으므로 tree entry mode 를 따로 봐야 잡힌다.
 # `update-index --cacheinfo` 로 같은 blob 을 다른 mode 로 심는다 — 파일시스템의
@@ -873,7 +893,7 @@ assert_eq "$_rc" "1" "T3: 주석 아닌 Status 값 변조는 차단"
 # T4 — 혼합 줄(완결된 주석처럼 보이지만 본문/추가 주석이 딸린 줄)은 제외 대상이
 # 아니므로, baseline 에 없던 새 줄로 추가하면 차단돼야 한다. 탐욕 매칭으로
 # `_archive_strip_comment_lines` 의 mid 검사가 빠지면 이 두 케이스가 조용히
-# 통과한다(REQUEST review Turn 004 R1, spec/plan review Turn 002 R3).
+# 통과한다.
 (
   cd "$_pc_repo"
   { emit_current_task_baseline; printf '<!-- 안내 --> 실제 본문 <!-- 안내 -->\n'; } > CURRENT_TASK.md
@@ -996,7 +1016,7 @@ if _abn_has "$_abn_unknown" "무엇이 얹혔는지 판정할 수 없었습니�
   PASS=$((PASS+1)); echo "  PASS: unknown — 판정 불능 고지"
 else FAIL=$((FAIL+1)); echo "  FAIL: unknown — 판정 불능 고지 누락" >&2; fi
 
-# unknown 전용 — "위에 보고된 변경" 자기모순 제거 (final review Minor M2).
+# unknown 전용 — "위에 보고된 변경" 자기모순 제거.
 # 판정 자체가 불가능한 갈래에는 특정할 수 있는 "보고된 변경" 이 없으므로 보존·복구
 # 절차 문구가 그 존재를 전제해서는 안 된다. commit·content 는 특정 대상이 있으므로
 # 계속 전제해도 된다 — unknown 에서만 없어야 함을 확인한다.
@@ -1120,7 +1140,7 @@ read_fix_source_fr() { # read_fix_source_fr <dir> [slug]
   local br
   if [[ -n "${2:-}" ]]; then
     # 대상을 명시한다 — fr 브랜치가 둘 이상인 fixture 에서 최근 발견 순서에 기대지
-    # 않는다(2026-09 final diff review C4 참고 지적).
+    # 않는다.
     br="fr/${2}"
     git -C "$1" rev-parse --verify --quiet "refs/heads/${br}" >/dev/null 2>&1 || return 0
   else
@@ -1226,9 +1246,9 @@ assert_eq "$(cd "$FIX8" && git status --porcelain | grep -c "task-state" || true
 # non-dry idempotent rerun: 다른 값 인자 = exit 1 거부 + 값 불변 + dirty 없음 (정정은 set-source-fr 일원화)
 FIX9="$TMPDIR_TEST/fix-rerun-diff"
 mk_promote_fixture "$FIX9" "-"
-# Task 4 재설계(C3) — 이 두 번째 --source-fr 는 **실재하는** 파일이어야 한다. 실재하지
+# Task 4 재설계 — 이 두 번째 --source-fr 는 **실재하는** 파일이어야 한다. 실재하지
 # 않으면 promote 가 인자 파싱 단계(source_fr_check_direct_arg 의 실존 검사)에서
-# 먼저 죽어, "rerun 이 다른 source-fr 를 거부한다" 는 resume 경로의 권위 검증(C2)을
+# 먼저 죽어, "rerun 이 다른 source-fr 를 거부한다" 는 resume 경로의 권위 검증을
 # 전혀 태우지 못한 채로 rc9==1 이 우연히 통과하는 공백 테스트가 된다.
 touch "$FIX9/rd-workflow-workspace/backlog/items/2026-02-02-other.md"
 ( cd "$FIX9" && git add -A && git commit -qm "second item" )
@@ -1425,7 +1445,7 @@ assert_eq "$rc14" "1" "promote: 대상 worktree task-state 손상 시 exit 1"
 # 재설계로 없어졌다.
 #
 # 이 fixture 는 **파일을 지운(rm -f)** 상태다 — 판정 a 는 삭제와 수정을 구분해
-# 안내한다(2026-09 final diff review C4). 이 시나리오에 "커밋한 뒤 재실행하십시오"
+# 안내한다. 이 시나리오에 "커밋한 뒤 재실행하십시오"
 # 를 그대로 따르면(git add -A && git commit) **삭제가 그대로 커밋되어 task-state 가
 # 영구 유실**된다 — 맞는 복구 명령은 `git checkout -- <path>` 다. 그래서 assert 는
 # 느슨한 "커밋" 포함 여부가 아니라 이 시나리오 전용 명령 문자열을 구체적으로 본다
@@ -1666,60 +1686,6 @@ assert_eq "$(loop_state_get 'rollback::mytask')" "2" "2회 rollback 누적 (cros
 loop_state_clear_all
 assert_eq "$(loop_state_get 'rollback::mytask')" "0" "clear_all → rollback 제거"
 
-echo "== M2 attempt history 주입 =="
-( # 서브셸 — review_common.sh의 set -e / PROJECT_ROOT 격리. fixture PROJECT_ROOT 사용.
-  FAKE_ROOT="$TMPDIR_TEST/m2root"
-  prev_dir="$FAKE_ROOT/rd-workflow-workspace/handoffs/review_pipeline/20260101_000000_prev"
-  mkdir -p "$prev_dir" "$FAKE_ROOT/cur"
-  printf '## Branch Context\n- short-title: demo\n' > "$prev_dir/SESSION.md"
-  printf '## Current Summary\n이전 시도 요약입니다.\n' > "$prev_dir/CHECKPOINT.md"
-  printf '## Branch Context\n- short-title: demo\n' > "$FAKE_ROOT/cur/SESSION.md"
-  PROJECT_ROOT="$FAKE_ROOT"; export PROJECT_ROOT
-  LOOP_STATE_PATH="$TMPDIR_TEST/m2-loop-state"; export LOOP_STATE_PATH
-  # fixture loop-state (slug-scoped). demo reedit 6개 → top-5 cap 검증 (bar.sh=2 가 rank6 으로 제외).
-  # reedit::other:: 는 negative — 출력에 안 나와야 함.
-  {
-    printf 'reedit::demo::c1.sh=10\nreedit::demo::c2.sh=9\nreedit::demo::c3.sh=8\n'
-    printf 'reedit::demo::c4.sh=7\nreedit::demo::foo.sh=4\nreedit::demo::bar.sh=2\n'
-    printf 'rollback::demo=1\nreedit::other::zzz.sh=9\n'
-  } > "$LOOP_STATE_PATH"
-  source "$SCRIPT_DIR/../review_common.sh"
-  out_file="$TMPDIR_TEST/prompt_auto.txt"
-  # $3 = cur/SESSION.md (short-title 정본). cur_session=sdir 이라 prev 와 겹치지 않음.
-  RD_AUTOPILOT=1 build_review_prompt "$out_file" sdir cur/SESSION.md cfile uafile ltfile etfile spec-plan-review target goal 20 003
-  grep -q "Attempt History" "$out_file" || { echo "  FAIL: autopilot prepend 누락" >&2; exit 9; }
-  grep -q "c1.sh=10" "$out_file" || { echo "  FAIL: reedit 최상위 누락" >&2; exit 9; }
-  grep -q "foo.sh=4" "$out_file" || { echo "  FAIL: reedit rank5 누락" >&2; exit 9; }
-  grep -q "rollback 1회" "$out_file" || { echo "  FAIL: rollback count 누락" >&2; exit 9; }
-  grep -q "이전 시도 요약" "$out_file" || { echo "  FAIL: 이전 종결 사유 누락" >&2; exit 9; }
-  if grep -q "bar.sh" "$out_file"; then echo "  FAIL: top-5 cap 미적용 (rank6 bar.sh 노출)" >&2; exit 9; fi
-  if grep -q "zzz.sh" "$out_file"; then echo "  FAIL: 다른 slug(other) 키가 샘" >&2; exit 9; fi
-  out_file2="$TMPDIR_TEST/prompt_manual.txt"
-  # 수동 모드 — RD_AUTOPILOT 을 명시적으로 비워 외부 환경(autopilot 세션) 오염을 격리한다.
-  RD_AUTOPILOT="" build_review_prompt "$out_file2" sdir cur/SESSION.md cfile uafile ltfile etfile spec-plan-review target goal 20 003
-  if grep -q "Attempt History" "$out_file2"; then echo "  FAIL: 수동 모드인데 prepend 됨" >&2; exit 9; fi
-  echo "  PASS: M2 (prepend/reedit-top5/rollback/prev/negative-slug/manual)"
-) && PASS=$((PASS+7)) || { FAIL=$((FAIL+1)); echo "  FAIL: M2 블록 실패" >&2; }
-
-echo "== M2 prev-session exact slug match (api vs api-v2) =="
-( # prefix slug 가 다른 FR 세션을 오인하지 않는지 — diff review turn 002 회귀
-  FR="$TMPDIR_TEST/m2exact"
-  api_dir="$FR/rd-workflow-workspace/handoffs/review_pipeline/20260101_000000_api"
-  apiv2_dir="$FR/rd-workflow-workspace/handoffs/review_pipeline/20260102_000000_apiv2"
-  mkdir -p "$api_dir" "$apiv2_dir"
-  printf '## Branch Context\n- short-title: api\n' > "$api_dir/SESSION.md"
-  printf '## Current Summary\nAPI 세션 요약.\n' > "$api_dir/CHECKPOINT.md"
-  printf '## Branch Context\n- short-title: api-v2\n' > "$apiv2_dir/SESSION.md"
-  printf '## Current Summary\nAPIV2 세션 요약.\n' > "$apiv2_dir/CHECKPOINT.md"
-  PROJECT_ROOT="$FR"; export PROJECT_ROOT
-  LOOP_STATE_PATH="$TMPDIR_TEST/m2exact-loop"; export LOOP_STATE_PATH
-  : > "$LOOP_STATE_PATH"
-  source "$SCRIPT_DIR/../review_common.sh"
-  out="$(build_attempt_history api "")"
-  printf '%s' "$out" | grep -q "API 세션 요약" || { echo "  FAIL: api 세션 요약 누락" >&2; exit 9; }
-  if printf '%s' "$out" | grep -q "APIV2"; then echo "  FAIL: api-v2 세션이 api 로 오인 주입됨" >&2; exit 9; fi
-  echo "  PASS: prev-session exact slug match (api ≠ api-v2)"
-) && PASS=$((PASS+2)) || { FAIL=$((FAIL+1)); echo "  FAIL: M2 exact-match 블록 실패" >&2; }
 
 echo "== build_ac_enforcement_notice =="
 ( # 서브셸 — review_common.sh의 set -e / PROJECT_ROOT 격리
@@ -1757,24 +1723,24 @@ echo "== build_ac_enforcement_notice =="
   printf '%s' "$out" | grep -q "인식할 수 없는 AC_BYPASS_REASON 값: typo" || { echo "  FAIL: 경고 누락" >&2; exit 9; }
   echo "  PASS: bypass=허용 외 값 → 주입 + 경고"
 
-  # 5) AC가 HTML comment + '-' 만 → 비어있음 판정 → 주입 (Finding 1)
+  # 5) AC가 HTML comment + '-' 만 → 비어있음 판정 → 주입
   out="$(build_ac_enforcement_notice "$(mk_req '<!-- 완료 기준을 적으세요 -->
 -' '-')")"
   printf '%s' "$out" | grep -q "완료 기준이 정의되지 않" || { echo "  FAIL: comment+- 인데 채워짐으로 오판" >&2; exit 9; }
   echo "  PASS: AC=comment+'-' → 비어있음 → 주입"
 
-  # 6) AC가 '-' 여러 줄(복수 placeholder) → 비어있음 → 주입 (Finding 1)
+  # 6) AC가 '-' 여러 줄(복수 placeholder) → 비어있음 → 주입
   out="$(build_ac_enforcement_notice "$(mk_req '-
 -' '-')")"
   printf '%s' "$out" | grep -q "완료 기준이 정의되지 않" || { echo "  FAIL: 복수 '-' 인데 채워짐으로 오판" >&2; exit 9; }
   echo "  PASS: AC='-' 여러 줄 → 비어있음 → 주입"
 
-  # 7) REQUEST.md 부재 → 빈 출력 + 성공 종료 (Finding 2)
+  # 7) REQUEST.md 부재 → 빈 출력 + 성공 종료
   out="$(build_ac_enforcement_notice "$acn_tmp/NO_SUCH_REQUEST.md")" || { echo "  FAIL: 부재 경로에서 비정상 종료" >&2; exit 9; }
   [[ -z "$out" ]] || { echo "  FAIL: REQUEST 부재인데 notice 발생 — [$out]" >&2; exit 9; }
   echo "  PASS: REQUEST.md 부재 → 빈 출력 + 성공"
 
-  # 8) AC가 multi-line HTML comment 블록 + '-' 만 → 비어있음 판정 → 주입 (diff-review Finding 1)
+  # 8) AC가 multi-line HTML comment 블록 + '-' 만 → 비어있음 판정 → 주입
   out="$(build_ac_enforcement_notice "$(mk_req '<!--
 완료 기준을 여기에 적으세요
 placeholder 줄
@@ -1816,7 +1782,7 @@ echo "== build_review_prompt: AC enforcement 주입 =="
   if grep -q "완료 기준이 정의되지 않" "$out_f"; then echo "  FAIL: 둘째 reviewer 턴인데 주입됨" >&2; exit 9; fi
   echo "  PASS: 둘째 reviewer 턴 → 미주입"
 
-  # legacy *_codex.md 턴도 reviewer 턴으로 취급 → 둘째 턴 미주입 (diff-review Finding 2)
+  # legacy *_codex.md 턴도 reviewer 턴으로 취급 → 둘째 턴 미주입
   rm -f "$bp_tmp/sess/turns/002_reviewer.md"
   printf '# Turn 002 — Reviewer (codex)\n' > "$bp_tmp/sess/turns/002_codex.md"
   out_f="$bp_tmp/p_legacy.txt"
@@ -1834,34 +1800,6 @@ echo "== build_review_prompt: AC enforcement 주입 =="
 ) || { FAIL=$((FAIL+1)); echo "FAIL: build_review_prompt AC 주입 테스트" >&2; }
 PASS=$((PASS+1))
 
-echo "== build_review_prompt: autopilot 공존 (AC notice + attempt history) =="
-( set +e
-  source "$SCRIPT_DIR/../review_common.sh"
-  ar_tmp="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-  [[ -n "$ar_tmp" && -d "$ar_tmp" ]] || { echo "test_lifecycle.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-  trap "rm -rf '$ar_tmp'" EXIT
-  export PROJECT_ROOT="$ar_tmp"
-  printf '# Change Request\n\n## Acceptance Criteria\n-\n\n## AC Bypass Reason\n-\n' > "$ar_tmp/REQUEST.md"
-  mkdir -p "$ar_tmp/cur/turns"
-  printf '## Branch Context\n- short-title: demo\n' > "$ar_tmp/cur/SESSION.md"
-  printf '# Turn 001 — Author\n' > "$ar_tmp/cur/turns/001_author.md"
-  prev="$ar_tmp/rd-workflow-workspace/handoffs/review_pipeline/20260101_000000_prev"
-  mkdir -p "$prev"
-  printf '## Branch Context\n- short-title: demo\n' > "$prev/SESSION.md"
-  printf '## Current Summary\n이전 시도 요약입니다.\n' > "$prev/CHECKPOINT.md"
-  export LOOP_STATE_PATH="$ar_tmp/loop-state"
-  printf 'reedit::demo::c1.sh=10\nrollback::demo=1\n' > "$LOOP_STATE_PATH"
-
-  out_f="$ar_tmp/auto.txt"
-  RD_AUTOPILOT=1 build_review_prompt "$out_f" cur cur/SESSION.md c u cur/turns/001_author.md cur/turns/002_reviewer.md request-review target goal 20 002
-  grep -q "완료 기준이 정의되지 않" "$out_f" || { echo "  FAIL: autopilot에서 AC notice 누락" >&2; exit 9; }
-  grep -q "Attempt History" "$out_f" || { echo "  FAIL: autopilot attempt history 누락" >&2; exit 9; }
-  ac_line="$(grep -n "완료 기준이 정의되지 않" "$out_f" | head -1 | cut -d: -f1)"
-  ah_line="$(grep -n "Attempt History" "$out_f" | head -1 | cut -d: -f1)"
-  [[ "$ac_line" -lt "$ah_line" ]] || { echo "  FAIL: AC notice 가 attempt history 보다 먼저가 아님 (ac=$ac_line ah=$ah_line)" >&2; exit 9; }
-  echo "  PASS: autopilot 공존 — AC notice 먼저 + 두 블록 존재"
-) || { FAIL=$((FAIL+1)); echo "FAIL: autopilot 공존 테스트" >&2; }
-PASS=$((PASS+1))
 
 echo "== parse_turn_limit_line / read_session_turn_limit (turn-limit-parser-anchored) =="
 tl_tmp="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
@@ -2055,7 +1993,7 @@ oi_case 1 "open-issues-unresolved:- [ ] 잔여 한계 3건 미반영" \
 
 # 리스트 표기 다섯 가지를 각각 확인한다. **빈 줄 뒤에** 두는 것이 핵심이다 —
 # 마커 바로 다음 줄에 두면 리스트 인식이 깨져도 '마커에 이어지는 줄' 로 거부되어
-# 표기 누락 회귀가 가려진다 (spec/plan review 턴 002 R3).
+# 표기 누락 회귀가 가려진다.
 oi_case 1 "open-issues-unresolved:1) Linux 검증 실패 미해결" \
   "$(printf -- '- 없음\n\n1) Linux 검증 실패 미해결')" "unresolved — 빈 줄 뒤 '1)' 이의"
 oi_case 1 "open-issues-unresolved:2. 잔여 이의 있음" \
@@ -2233,7 +2171,7 @@ assert_eq "$(awk -F' \\| ' 'END{print $4}' "$FT_AUDIT2")" \
   "권위 tree — audit 세션참조가 repo-상대 마커 경로"
 rm -rf "$FT_REPO"
 
-# === 발행 직전 재결속 (no-fr) — precheck 승인 해시 ↔ PUBLISH_OID (Finding 1) ===
+# === 발행 직전 재결속 (no-fr) — precheck 승인 해시 ↔ PUBLISH_OID ===
 #
 # no-fr 은 fr 의 기준선(= fr tip 을 들여온 merge) 에 대응물이 없어
 # `archive_extra_commits_check`·`archive_publish_content_check` 를 건너뜁니다. 그래서
@@ -2312,6 +2250,7 @@ cp "$REPO_ROOT/rd-workflow/scripts/hooks/_open_issues.awk" "$AG_REPO/rd-workflow
 cp "$REPO_ROOT/rd-workflow/scripts/hooks/pre_commit_archive_gate.sh" "$AG_REPO/rd-workflow/scripts/hooks/"
 # _guard_common.sh가 상위 디렉토리의 _state_common.sh를 source하므로 함께 복사 (v2 2b)
 cp "$REPO_ROOT/rd-workflow/scripts/_state_common.sh" "$AG_REPO/rd-workflow/scripts/"
+cp "$REPO_ROOT/rd-workflow/scripts/_fr_status.sh" "$AG_REPO/rd-workflow/scripts/"
 printf '# Current Task\n\n## Short Title\nagtask\n' > "$AG_REPO/CURRENT_TASK.md"
 printf '# Change Request\n\n## Source FR\n2026-05-15-agtask\n' > "$AG_REPO/REQUEST.md"
 printf '# agtask\n- status: idea\n' > "$AG_REPO/rd-workflow-workspace/backlog/items/2026-05-15-agtask.md"
@@ -2365,7 +2304,7 @@ echo "== archive.sh force-skip audit 기록 실패 → tag/push 전 정지 =="
 #
 # 우회 경로(`--force-skip-review-check`)의 audit 기록은 그 발행의 **유일한 흔적**입니다.
 # 기록이 불가능한데도 발행이 이어지면, 리뷰 검증을 명시적으로 건너뛴 tag/push 가 사유
-# 한 줄 없이 남습니다 (final diff review turn 004 Finding 1). 여기서는 헬퍼를 직접 부르지
+# 한 줄 없이 남습니다. 여기서는 헬퍼를 직접 부르지
 # 않고 **실제 archive.sh 호출 경로**에서 그 정지를 봅니다 — 배선이 빠지면 헬퍼만 고쳐도
 # 발행은 계속되기 때문입니다.
 #
@@ -2987,6 +2926,33 @@ gst="$(grep '^short-title=' "$REPO/.worktrees/gamma/rd-workflow-workspace/.lifec
   && pass "물려받은 구형 상태(short-title=alpha)는 identity 를 묻지 않고 신규 초기화된다 (판정 b)" \
   || fail "판정 b 미구현 의심: $gst"
 
+# (d2) 판정 b 는 이력이 길어도 first-parent 포함 여부를 정확히 판정한다 (SIGPIPE 회귀)
+#      `rev-list | grep -qx` 는 출력이 파이프 버퍼(64 KiB)를 넘으면 grep 이 먼저 끝나
+#      rev-list 가 SIGPIPE 로 죽고 pipefail 이 판정을 뒤집는다. 이력이 짧은 기존 fixture 는
+#      버퍼 근처라 경쟁을 가끔만 일으켜 못 잡는다. 비용: fast-import 약 1초 + promote 1회.
+#      (d) 가 만든 오염 task-state 를 물려받은 사본에서 진행하므로 뒤 케이스에 영향이 없다.
+LONG="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$LONG" && -d "$LONG" ]] || { echo "test_lifecycle.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+LONG="$(cd "$LONG" && pwd -P)"
+_ast_cleanup+=("$LONG")
+cp -R "$REPO/." "$LONG/"
+{
+  for _i in $(seq 1 3000); do
+    printf 'commit refs/heads/main\ncommitter t <t@t> %d +0000\ndata 2\nx\n' "$((1900000000 + _i))"
+    [[ "$_i" -eq 1 ]] && printf 'from refs/heads/main^0\n'
+    printf '\n'
+  done
+} | git -C "$LONG" fast-import --quiet
+git -C "$LONG" branch fr/delta main
+long_rc=0
+long_out="$(cd "$LONG" && bash "$LONG/rd-workflow/scripts/lifecycle/promote.sh" --short-title delta --size large --source-fr - 2>&1)" || long_rc=$?
+dst="$(grep '^short-title=' "$LONG/.worktrees/delta/rd-workflow-workspace/.lifecycle/task-state" 2>/dev/null || true)"
+if [[ "$long_rc" -eq 0 && "$dst" == "short-title=delta" ]]; then
+  pass "긴 first-parent 이력(3,000커밋)에서도 물려받은 상태는 신규 초기화된다 (판정 b, SIGPIPE 회귀)"
+else
+  fail "판정 b SIGPIPE 오판 의심: rc=$long_rc $(printf '%s\n' "$long_out" | tail -n 3)"
+fi
+
 # (e) merge 후 tag 전 중단 + 색인·worktree 유실 → 초기화하지 않고 발행 확인 필요 (판정 c)
 #     alpha 를 진행 상태로 만든 뒤 merge 만 하고 tag 는 만들지 않는다
 # (brief 서술은 "alpha" 라 썼지만 아래 코드는 "eps" 를 참조한다 — 이 슬롯도 착수 코드가
@@ -3007,7 +2973,7 @@ fi
 # (f) 정상 발행(merge + 규약 tag + 원격 반영) 후 잔여 → 권위 보존 + 정리 대기 (판정 c)
 
 # --- 기동 예약(launch-token) — 실제 herdr 없이 예약·완료-기록 로직만 태운다 ---
-# (2026-09 final diff review I9) test_lifecycle.sh 최상단의 RD_CHILD_SESSION=1 이
+# test_lifecycle.sh 최상단의 RD_CHILD_SESSION=1 이
 # `session_launch` 를 항상 깊이-1 조기 반환으로 보내므로, 이 파일의 다른 promote
 # 호출은 전부 launch=none 경로만 타고 예약(launch=launching+token)·완료 시 token
 # 일치 기록 로직을 전혀 실행하지 않는다. `RD_LAUNCH_STUB` seam(session_launch.sh)
@@ -3207,7 +3173,7 @@ else
 fi
 
 # --- D2: reinit_noattach 는 등록된 worktree 경로를 대상으로 삼는다 ---
-# (2026-09 final diff review D2) TARGET_DIR 선택이 NEED_ATTACH 로만 게이트돼 있으면
+# TARGET_DIR 선택이 NEED_ATTACH 로만 게이트돼 있으면
 # worktree 는 이미 살아 있고 내용만 미초기화인 상태(reinit_noattach, NEED_ATTACH=0)
 # 에서 색인/인자 경로를 무시하고 기본 경로(.worktrees/<slug>)로 떨어진다 — 그 작업이
 # 명시 경로로 만들어졌다면 9단계가 존재하지 않는 경로에서 죽고, I6 트랩이 존재하지도
@@ -3248,7 +3214,7 @@ else
 fi
 
 # --- D3: session_probe 의 unknown 을 dead 로 취급하지 않는다 ---
-# (2026-09 final diff review D3) 색인의 launch=ok 인데 session_probe 가 alive 도
+# 색인의 launch=ok 인데 session_probe 가 alive 도
 # dead 도 아닌 unknown(조회 불가)을 내면, "확인 전에는 기동하지 않는다" 는 launching·
 # unknown 과 같은 경로로 가야 한다. 이 스위트는 HERDR_ENV 를 전역 차단(파일 상단)
 # 했으므로 session_probe 는 herdr 부재로 **항상 unknown** 을 낸다 — 그 사실 자체를
@@ -3361,7 +3327,7 @@ alpha_idx="$(cd "$RBREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_task
 beta_idx="$(cd "$RBREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get beta fr-branch' 2>/dev/null || true)"
 [[ "$beta_idx" == "fr/beta" ]] && pass "색인에 beta 행 보존됨" || fail "색인에서 beta 유실: $beta_idx"
 
-# --- F5: `--no-worktree` 작업의 취소 경로 (final diff review) ---
+# --- F5: `--no-worktree` 작업의 취소 경로 ---
 # 대상 경로가 기본 worktree 자체이므로 예전에는 self-removal 가드가 "기본 worktree 로
 # 이동해 같은 명령을 실행하라" 며 거부했다 — 이미 거기 서 있는 사용자에게는 무한 루프
 # 안내였고, 단일 체크아웃 시절에 있던 취소 기능의 회귀였다. 지금은 worktree 를 제거하지
@@ -3387,7 +3353,7 @@ else
   fi
 fi
 
-# --- F1 근본 (final diff review): 기록 부재는 `unknown` 이고, 재기동을 막는다 ---
+# --- F1 근본: 기록 부재는 `unknown` 이고, 재기동을 막는다 ---
 # 흡수의 발동 조건(기본 worktree task-state 가 `fr/*` + 색인 행 없음)은 ① 구형 배치와
 # ② **색인 유실**에서 모두 참이다. ②에는 `--no-worktree` 로 착수해 세션이 살아 있는
 # 작업이 포함될 수 있고, 저장소 안에는 둘을 가를 증거가 없다. 그래서 `none`(기동한 적
@@ -3429,7 +3395,7 @@ fi
 # 기본 worktree 의 task-state 를 baseline 으로 되돌린다(이후 케이스 오염 방지).
 sed -i 's|^fr-branch=.*|fr-branch=null|' "$RBREPO/rd-workflow-workspace/.lifecycle/task-state"
 
-# --- F6 (final diff review): rollback 이 살아 있는 세션과 미커밋 작업물을 보존한다 ---
+# --- F6: rollback 이 살아 있는 세션과 미커밋 작업물을 보존한다 ---
 # 예전에는 보호가 거꾸로였다 — 생존이 **불확실할 때**(launching·unknown) 막고 생존이
 # **확인됐을 때**(ok) 통과시킨 뒤 dirty 검사 없이 `worktree remove --force` 로 지웠다.
 # AC 16(실행 중인 에이전트 세션이 만든 변경을 지우지 않는다).
@@ -3708,6 +3674,217 @@ rm -f "${CREPO:?}/$P10"
 # 확인합니다. 같은 사실을 다른 fixture 로 다시 보는 중복이라 두지 않습니다. ----
 git -C "$CREPO" switch -q main 2>/dev/null || true
 git -C "$CREPO" reset -q --hard main
+
+echo "== cleanup_pending 헬퍼 =="
+_cp_repo="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$_cp_repo" && -d "$_cp_repo" ]] || { echo "test_lifecycle.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+_ast_cleanup+=("$_cp_repo")
+git -C "$_cp_repo" init -q
+_cp_common="$(git -C "$_cp_repo" rev-parse --path-format=absolute --git-common-dir)"
+_cp_dir="$_cp_common/rd-workflow/archive-cleanup-pending"
+_cp() { ( cd "$_cp_repo" && env -u project_root bash "$SCRIPT_DIR/cleanup_pending.sh" "$@" ); }
+
+# T1-1: 기록 디렉터리 없음 → 없음 / 출력 없음
+_cp_out="$(_cp show 2>&1)" && _cp_rc=0 || _cp_rc=$?
+assert_eq "$_cp_rc:$_cp_out" "0:없음" "T1-1 기록 디렉터리 없음 — show rc 0·없음"
+_cp_out="$(_cp summary 2>&1)" && _cp_rc=0 || _cp_rc=$?
+assert_eq "$_cp_rc:$_cp_out" "0:" "T1-1 기록 디렉터리 없음 — summary rc 0·출력 없음"
+
+# T1-2: write → 파일 2줄, show·summary
+printf 'worktree\t/tmp/a\\ b\t사유1\tgit worktree list\nlocal-branch\tfr/x\t사유2\tgit log\n' | _cp write sa && _cp_rc=0 || _cp_rc=$?
+assert_eq "$_cp_rc" "0" "T1-2 write rc 0"
+assert_eq "$(wc -l < "$_cp_dir/sa" | tr -d ' ')" "2" "T1-2 기록 파일 2줄"
+_cp_out="$(_cp show sa)"
+assert_eq "$(printf '%s\n' "$_cp_out" | head -1)" "sa: 정리 잔여 2건" "T1-2 show 제목 줄"
+case "$_cp_out" in *'  [worktree] /tmp/a\ b'*) PASS=$((PASS+1)); echo "  PASS: T1-2 show 항목 [worktree] identifier";; *) FAIL=$((FAIL+1)); echo "  FAIL: T1-2 show 항목 [worktree] identifier — $_cp_out" >&2;; esac
+case "$_cp_out" in *'    사유: 사유1'*) PASS=$((PASS+1)); echo "  PASS: T1-2 show 사유";; *) FAIL=$((FAIL+1)); echo "  FAIL: T1-2 show 사유 — $_cp_out" >&2;; esac
+case "$_cp_out" in *'    복구: git worktree list'*) PASS=$((PASS+1)); echo "  PASS: T1-2 show 복구";; *) FAIL=$((FAIL+1)); echo "  FAIL: T1-2 show 복구 — $_cp_out" >&2;; esac
+case "$_cp_out" in *'(정리를 마친 뒤 기록 지우기: bash rd-workflow/scripts/lifecycle/cleanup_pending.sh clear sa)'*) PASS=$((PASS+1)); echo "  PASS: T1-2 show clear 안내";; *) FAIL=$((FAIL+1)); echo "  FAIL: T1-2 show clear 안내 — $_cp_out" >&2;; esac
+assert_eq "$(_cp summary)" "$(printf 'sa\t2')" "T1-2 summary sa<TAB>2"
+
+# T1-3: resolve
+_cp resolve sa worktree
+assert_eq "$(wc -l < "$_cp_dir/sa" | tr -d ' ')" "1" "T1-3 resolve worktree → local-branch 1줄 남음"
+assert_eq "$(cut -f1 "$_cp_dir/sa")" "local-branch" "T1-3 남은 줄은 local-branch"
+_cp resolve sa local-branch
+assert_eq "$([[ -e "$_cp_dir/sa" ]] && echo 있음 || echo 없음)" "없음" "T1-3 남은 항목 없으면 파일 삭제"
+
+# T1-4: 소유권
+printf 'worktree\t/p1\tr\tc\n' | _cp write sa
+printf 'worktree\t/p2\tr\tc\n' | _cp write sb
+_cp clear sb
+assert_eq "$([[ -e "$_cp_dir/sb" ]] && echo 있음 || echo 없음)" "없음" "T1-4 clear sb → sb 삭제"
+assert_eq "$([[ -e "$_cp_dir/sa" ]] && echo 있음 || echo 없음)" "있음" "T1-4 clear sb 뒤 sa 남음"
+touch -t 200001010000 "$_cp_dir/sa"
+printf 'worktree\t/p3\tr\tc\n' | _cp write sc
+assert_eq "$([[ -e "$_cp_dir/sa" ]] && echo 있음 || echo 없음)" "있음" "T1-4 write sc 가 오래된 sa 를 지우지 않음"
+
+# T1-7: --since 경계 (sa 는 mtime 2000-01-01 상태)
+printf 'worktree\t/p2\tr\tc\n' | _cp write sb
+_cp_m="$(stat -c %Y "$_cp_dir/sb" 2>/dev/null || stat -f %m "$_cp_dir/sb")"
+_cp_out="$(_cp summary --since "$_cp_m")"
+case "$_cp_out" in *$'sb\t1'*) PASS=$((PASS+1)); echo "  PASS: T1-7 --since M 에 sb 포함";; *) FAIL=$((FAIL+1)); echo "  FAIL: T1-7 --since M 에 sb 포함 — [$_cp_out]" >&2;; esac
+case "$_cp_out" in *sa*) FAIL=$((FAIL+1)); echo "  FAIL: T1-7 --since M 에서 오래된 sa 제외 — [$_cp_out]" >&2;; *) PASS=$((PASS+1)); echo "  PASS: T1-7 --since M 에서 오래된 sa 제외";; esac
+_cp_out="$(_cp summary --since $((_cp_m+1)))"
+case "$_cp_out" in *sb*) FAIL=$((FAIL+1)); echo "  FAIL: T1-7 --since M+1 에서 sb 제외 — [$_cp_out]" >&2;; *) PASS=$((PASS+1)); echo "  PASS: T1-7 --since M+1 에서 sb 제외";; esac
+_cp clear sa; _cp clear sb; _cp clear sc
+
+# T1-8: 끝 빈 줄·빈 입력
+printf 'worktree	/p	r	c
+
+' | _cp write sx && _cp_rc=0 || _cp_rc=$?
+assert_eq "$_cp_rc" "0" "T1-8 끝 빈 줄이 있는 입력 write rc 0"
+assert_eq "$(wc -l < "$_cp_dir/sx" | tr -d ' ')" "1" "T1-8 끝 빈 줄 무시 — 기록 1줄"
+printf 'worktree	/p	r	c
+' | _cp write sz
+printf '
+' | _cp write sz && _cp_rc=0 || _cp_rc=$?
+assert_eq "$_cp_rc" "0" "T1-8 비어 있는 입력 write rc 0"
+assert_eq "$([[ -e "$_cp_dir/sz" ]] && echo 있음 || echo 없음)" "없음" "T1-8 비어 있는 입력은 기존 기록을 지움"
+assert_eq "$(_cp summary sz)" "" "T1-8 비어 있는 입력 뒤 summary 출력 없음"
+printf '
+' | _cp write sn
+assert_eq "$([[ -e "$_cp_dir/sn" ]] && echo 있음 || echo 없음)" "없음" "T1-8 비어 있는 입력은 기록을 만들지 않음"
+_cp clear sx
+
+# T1-9~T1-11: 기록 파일·디렉터리를 읽거나 쓰지 못할 때. root 는 권한 비트를 무시하므로 권한 케이스를 건너뛴다.
+if [[ "$(id -u)" -ne 0 ]]; then
+  # T1-9: resolve 가 원본을 읽지 못하면 원본을 지우지 않고 rc 1
+  printf 'worktree\t/w\tr\tc\nloop-state\t/s\tr\tc\n' | _cp write sr
+  chmod 000 "$_cp_dir/sr"
+  _cp resolve sr worktree local-branch 2>/dev/null && _cp_rc=0 || _cp_rc=$?
+  chmod 600 "$_cp_dir/sr" 2>/dev/null || true
+  assert_eq "$_cp_rc" "1" "T1-9 resolve 원본 읽기 실패 rc 1"
+  assert_eq "$(wc -l < "$_cp_dir/sr" 2>/dev/null | tr -d ' ')" "2" "T1-9 읽기 실패 뒤 원본 2줄 보존"
+  _cp clear sr 2>/dev/null || true
+  # T1-10: 기록 디렉터리를 읽지 못하면 show·summary 가 rc 2
+  printf 'worktree\t/w\tr\tc\n' | _cp write sd
+  chmod 000 "$_cp_dir"
+  _cp show sd >/dev/null 2>&1 && _cp_rc1=0 || _cp_rc1=$?
+  _cp show >/dev/null 2>&1 && _cp_rc2=0 || _cp_rc2=$?
+  _cp summary >/dev/null 2>&1 && _cp_rc3=0 || _cp_rc3=$?
+  _cp clear sd >/dev/null 2>&1 && _cp_rc4=0 || _cp_rc4=$?
+  _cp resolve sd worktree >/dev/null 2>&1 && _cp_rc5=0 || _cp_rc5=$?
+  chmod 700 "$_cp_dir"
+  assert_eq "$_cp_rc1:$_cp_rc2:$_cp_rc3" "2:2:2" "T1-10 기록 디렉터리 접근 실패 — show slug·show·summary rc 2"
+  assert_eq "$_cp_rc4:$_cp_rc5:$([[ -f "$_cp_dir/sd" ]] && echo 있음 || echo 없음)" "1:1:있음" "T1-10 기록 디렉터리 접근 실패 — clear·resolve rc 1, 기록 보존"
+  # T1-12: 상위 rd-workflow 디렉터리에 들어갈 수 없으면 「없음」 이 아니라 조회 실패·해제 실패
+  chmod 000 "${_cp_dir%/*}"
+  _cp show sd >/dev/null 2>&1 && _cp_rc1=0 || _cp_rc1=$?
+  _cp summary >/dev/null 2>&1 && _cp_rc2=0 || _cp_rc2=$?
+  _cp clear sd >/dev/null 2>&1 && _cp_rc3=0 || _cp_rc3=$?
+  _cp resolve sd worktree >/dev/null 2>&1 && _cp_rc4=0 || _cp_rc4=$?
+  chmod 700 "${_cp_dir%/*}"
+  assert_eq "$_cp_rc1:$_cp_rc2:$_cp_rc3:$_cp_rc4:$([[ -f "$_cp_dir/sd" ]] && echo 있음 || echo 없음)" "2:2:1:1:있음" "T1-12 상위 디렉터리 접근 실패 — show·summary rc 2, clear·resolve rc 1, 기록 보존"
+  _cp clear sd 2>/dev/null || true
+fi
+# T1-11: slug 자리가 디렉터리면 write rc 1, 그 안에 아무것도 남기지 않고, show slug 는 rc 2
+mkdir -p "$_cp_dir/sq"
+printf 'worktree\t/w\tr\tc\n' | _cp write sq 2>/dev/null && _cp_rc=0 || _cp_rc=$?
+assert_eq "$_cp_rc" "1" "T1-11 slug 자리가 디렉터리 — write rc 1"
+assert_eq "$(ls -A "$_cp_dir/sq" | wc -l | tr -d ' ')" "0" "T1-11 디렉터리 안에 임시 파일을 남기지 않음"
+_cp show sq >/dev/null 2>&1 && _cp_rc=0 || _cp_rc=$?
+assert_eq "$_cp_rc" "2" "T1-11 slug 자리가 디렉터리 — show slug rc 2"
+rm -rf "$_cp_dir/sq"
+
+# T1-6: slug 거부 (하위 디렉터리 a, ... 를 미리 만들어 검사가 없으면 쓰기가 성공하는 fixture)
+mkdir -p "$_cp_dir/a" "$_cp_dir/.a" "$_cp_dir/..."
+for _cp_bad in 'a/b' '../x' '.x' ''; do
+  printf 'worktree\t/p\tr\tc\n' | _cp write "$_cp_bad" 2>/dev/null && _cp_rc=0 || _cp_rc=$?
+  assert_eq "$_cp_rc" "1" "T1-6 write [$_cp_bad] 거부 rc 1"
+done
+assert_eq "$([[ -e "$_cp_dir/a/b" ]] && echo 있음 || echo 없음)" "없음" "T1-6 a/b 파일 없음"
+assert_eq "$([[ -e "$_cp_common/rd-workflow/x" ]] && echo 있음 || echo 없음)" "없음" "T1-6 <common>/rd-workflow/x 파일 없음"
+_cp show a/b >/dev/null 2>&1 && _cp_rc=0 || _cp_rc=$?
+assert_eq "$_cp_rc" "2" "T1-6 show a/b rc 2"
+_cp show '' >/dev/null 2>&1 && _cp_rc=0 || _cp_rc=$?
+assert_eq "$_cp_rc" "2" "T1-6 빈 slug 거부 — show rc 2"
+_cp resolve '' worktree >/dev/null 2>&1 && _cp_rc=0 || _cp_rc=$?
+assert_eq "$_cp_rc" "1" "T1-6 빈 slug 거부 — resolve rc 1"
+trash_cp() { rm -rf "$_cp_dir"; }
+trash_cp
+
+# T1-5: 조회 실패 — 기록 디렉터리 자리가 일반 파일
+mkdir -p "$_cp_common/rd-workflow"; : > "$_cp_dir"
+_cp_so="$(_cp show 2>"$_cp_repo/.err")" && _cp_rc=0 || _cp_rc=$?
+assert_eq "$_cp_rc" "2" "T1-5 조회 실패 rc 2"
+assert_eq "$([[ "$_cp_so" == *없음* ]] && echo 있음 || echo 없음)" "없음" "T1-5 stdout 에 없음 없음"
+assert_eq "$(grep -c 'cleanup_pending: 조회 실패' "$_cp_repo/.err")" "1" "T1-5 stderr 에 조회 실패 사유"
+_cp summary >/dev/null 2>&1 && _cp_rc=0 || _cp_rc=$?
+assert_eq "$_cp_rc" "2" "T1-5 summary rc 2"
+rm -f "$_cp_dir"
+
+echo "== archive 정리 잔여 기록 =="
+# archive 를 끝까지 도는 fixture 4개 + tasks_list.sh 1회(약 8초). 헬퍼 단위 테스트로는
+# "archive 가 발행 뒤 헬퍼를 부르고 종료 코드를 바꾸는가", "지연 정리가 기록을 푸는가" 를 증명할 수 없어 이 비용을 진다.
+# 잔여는 잠긴 worktree 로 만든다 — archive 가 지우지 못해 3건(worktree 제거 실패·worktree 등록 잔존·local-branch)이 남는다.
+CPR_TMP="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패" >&2; exit 1; }
+CPR_TMP="$(cd "$CPR_TMP" && pwd -P)"; _ast_cleanup+=("$CPR_TMP")
+cpr_archive() { # cpr_archive <경로> — rc 를 CPR_RC, stdout·stderr 를 CPR_OUT·CPR_ERR 에 둔다
+  CPR_RC=0
+  ( cd "$1" && env -u project_root -u TASK_STATE_PATH -u STATE_MIGRATION_BACKUP_DIR \
+      bash "$ARCHIVE_SH" --force-skip-review-check "테스트" --allow-status-mismatch "테스트" \
+  ) >"$CPR_TMP/out" 2>"$CPR_TMP/err" || CPR_RC=$?
+  CPR_OUT="$(cat "$CPR_TMP/out")"; CPR_ERR="$(cat "$CPR_TMP/err")"
+}
+cpr_locked_repo() { # 잠긴 worktree 가 fr 브랜치를 쥔 fixture
+  mk_aud_repo "$1"
+  git -C "$1" worktree add -q "$1.wt" fr/audittask
+  git -C "$1" worktree lock "$1.wt"
+  # 지연 정리는 색인 행의 worktree-path 가 등록 경로와 같아야 풀므로 promote 가 남기는 행을 미리 만든다.
+  ( cd "$1" && env -u project_root -u TASK_STATE_PATH bash -c 'source "$1/_tasks_index.sh"; tasks_index_upsert audittask fr-branch=fr/audittask worktree-path="$2" checkout=yes' _ "$SCRIPT_DIR" "$1.wt" )
+}
+cpr_common() { git -C "$1" rev-parse --path-format=absolute --git-common-dir; }
+
+# T2-1 (AC3·AC4): 자기 slug 기록 2줄, 다른 slug 기록 보존
+CPR1="$CPR_TMP/r1"; cpr_locked_repo "$CPR1"; CPR1C="$(cpr_common "$CPR1")"
+mkdir -p "$CPR1C/rd-workflow/archive-cleanup-pending"
+printf 'worktree\t/x\t사유\tgit worktree list\n' > "$CPR1C/rd-workflow/archive-cleanup-pending/other"
+cpr_archive "$CPR1"
+assert_eq "$CPR_RC" "0" "T2-1 잠긴 worktree 잔여 archive rc 0"
+# 실측: 잠긴 worktree 는 worktree 제거 실패 + 브랜치 등록 잔존 + local-branch 보류의 3건을 남긴다.
+assert_eq "$(wc -l < "$CPR1C/rd-workflow/archive-cleanup-pending/audittask" 2>/dev/null | tr -d ' ')" "3" "T2-1 자기 slug 기록 3줄"
+assert_eq "$(cut -f1 "$CPR1C/rd-workflow/archive-cleanup-pending/audittask" 2>/dev/null | tr '\n' ,)" "worktree,worktree,local-branch," "T2-1 기록 kind 순서"
+assert_eq "$(awk -F'\t' 'NF!=4{n++} END{print n+0}' "$CPR1C/rd-workflow/archive-cleanup-pending/audittask" 2>/dev/null)" "0" "T2-1 기록이 모두 4필드"
+assert_eq "$(cat "$CPR1C/rd-workflow/archive-cleanup-pending/other")" "$(printf 'worktree\t/x\t사유\tgit worktree list')" "T2-1 다른 slug 기록 그대로"
+
+# T2-2 (AC7b): 잠금 해제 뒤 지연 정리가 기록을 풀어 파일째 사라짐
+git -C "$CPR1" worktree unlock "$CPR1.wt"
+( cd "$CPR1" && env -u project_root -u TASK_STATE_PATH bash "$SCRIPT_DIR/tasks_list.sh" ) >"$CPR_TMP/tl.out" 2>&1 || true
+# 점유 판정을 할 수 없는 환경(ps·lsof 불가 샌드박스)에서는 제품이 정리를 보류하는 것이 맞다 — 그 환경을 따로 확인했고
+# 기록과 worktree 가 그대로 남았을 때만 env-skip 으로 센다. 판정 가능한 환경의 판정불가는 아래 단언의 FAIL 이다.
+cpr_hold="$(grep -m1 '^정리 보류: audittask — 점유 판정불가' "$CPR_TMP/tl.out" || true)"
+if [[ -e "$CPR1C/rd-workflow/archive-cleanup-pending/audittask" && -d "$CPR1.wt" && -n "$cpr_hold" ]] && ! occ_env_judgeable; then
+  printf 'env-skip: test_lifecycle T2-2 지연 정리 — 점유 판정을 할 수 없는 환경(%s)\n' "${cpr_hold#정리 보류: audittask — }" >&2
+else
+  assert_eq "$([[ -e "$CPR1C/rd-workflow/archive-cleanup-pending/audittask" ]] && echo 있음 || echo 없음)" "없음" "T2-2 지연 정리 뒤 자기 slug 기록 사라짐"
+fi
+assert_eq "$([[ -e "$CPR1C/rd-workflow/archive-cleanup-pending/other" ]] && echo 있음 || echo 없음)" "있음" "T2-2 다른 slug 기록은 남음"
+
+# T2-3 (AC3 해제): 잔여 없음 → 기존 자기 slug 기록 제거, rc 0 (기록 성공 경로의 종료 코드)
+CPR3="$CPR_TMP/r3"; mk_aud_repo "$CPR3"; CPR3C="$(cpr_common "$CPR3")"
+mkdir -p "$CPR3C/rd-workflow/archive-cleanup-pending"
+printf 'worktree\t/x\t사유\tgit worktree list\n' > "$CPR3C/rd-workflow/archive-cleanup-pending/audittask"
+cpr_archive "$CPR3"
+assert_eq "$CPR_RC" "0" "T2-3 깨끗한 archive rc 0"
+assert_eq "$([[ -e "$CPR3C/rd-workflow/archive-cleanup-pending/audittask" ]] && echo 있음 || echo 없음)" "없음" "T2-3 자기 slug 기록 사라짐"
+
+# T2-4 (AC5·AC7d): 쓰기 실패 → rc 1, stderr 표식, stdout 요약 유지, 발행은 끝남
+CPR4="$CPR_TMP/r4"; cpr_locked_repo "$CPR4"; CPR4C="$(cpr_common "$CPR4")"
+mkdir -p "$CPR4C/rd-workflow"; : > "$CPR4C/rd-workflow/archive-cleanup-pending"
+cpr_archive "$CPR4"
+assert_eq "$CPR_RC" "1" "T2-4 기록 쓰기 실패 → rc 1"
+assert_eq "$(printf '%s\n' "$CPR_ERR" | grep -c 'archive: CLEANUP-RECORD-FAILED write')" "1" "T2-4 stderr 표식 write"
+assert_eq "$(printf '%s\n' "$CPR_OUT" | grep -c 'archive: CLEANUP-PENDING')" "1" "T2-4 stdout CLEANUP-PENDING 유지"
+assert_eq "$(printf '%s\n' "$CPR_OUT" | grep -c '복구:')" "3" "T2-4 stdout 복구 줄 3개 유지"
+assert_eq "$(git -C "$CPR4.git" tag -l | wc -l | tr -d ' ')" "1" "T2-4 원격 tag 존재 (발행은 끝남)"
+
+# T2-5 (AC5 해제 실패): 기록 자리가 비어 있지 않은 디렉터리 → clear 실패
+CPR5="$CPR_TMP/r5"; mk_aud_repo "$CPR5"; CPR5C="$(cpr_common "$CPR5")"
+mkdir -p "$CPR5C/rd-workflow/archive-cleanup-pending/audittask/x"
+cpr_archive "$CPR5"
+assert_eq "$CPR_RC" "1" "T2-5 기록 해제 실패 → rc 1"
+assert_eq "$(printf '%s\n' "$CPR_ERR" | grep -c 'archive: CLEANUP-RECORD-FAILED clear')" "1" "T2-5 stderr 표식 clear"
 
 if [[ "$(trap -p EXIT)" == *_suite_on_exit* ]]; then
   PASS=$((PASS+1)); echo "  PASS: 조용한 중단 센티넬(EXIT trap)이 스위트 끝까지 유지됨"

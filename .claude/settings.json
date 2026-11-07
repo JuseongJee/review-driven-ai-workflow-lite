@@ -6,6 +6,10 @@
                     {
                         "type": "command",
                         "command": "bash \"${CLAUDE_PROJECT_DIR:-.}\"/rd-workflow/scripts/hooks/session_start.sh"
+                    },
+                    {
+                        "type": "command",
+                        "command": ": rd-hook-sentinel v1; i=$(cat); d=\"${CLAUDE_PROJECT_DIR:-.}\"; t=\"${TMPDIR:-/tmp}\"; n=; p=; for h in session_start pre_commit_archive_gate headless_background_gate implementation_gate self_worktree_delete_gate; do [ -r \"$d/rd-workflow/scripts/hooks/$h.sh\" ] && continue; [ -n \"$p\" ] || { p=1; s=$(printf '%s' \"$i\" | sed -n 's/.*\"session_id\" *: *\"\\([A-Za-z0-9_-]*\\)\".*/\\1/p'); e=$(printf '%s' \"$i\" | sed -n 's/.*\"hook_event_name\" *: *\"\\([A-Za-z]*\\)\".*/\\1/p'); }; if [ \"$e\" != SessionStart ] && [ -n \"$s\" ]; then m=\"$t/rd-hook-missing.$s.$h\"; if mkdir \"$m\" 2>/dev/null; then :; elif [ -d \"$m\" ]; then continue; fi; fi; n=\"$n $h\"; done; [ -n \"$n\" ] || exit 0; w=; [ -d \"$d\" ] || w=' 작업 폴더가 없습니다(archive 뒤 worktree 삭제 등).'; printf '{\"systemMessage\":\"[rd-workflow] gate hook 파일이 없어 이 세션에서 꺼졌습니다:%s.%s\",\"hookSpecificOutput\":{\"hookEventName\":\"%s\",\"additionalContext\":\"[rd-workflow] 다음 gate hook 이 실행되지 않습니다:%s.%s 이 세션에서 위 hook 의 검사·안내는 실행되지 않으므로, 그 검사가 필요한 작업(커밋·archive·발행 등)은 사용자에게 먼저 알리십시오.\"}}' \"$n\" \"$w\" \"${e:-PreToolUse}\" \"$n\" \"$w\"; exit 0"
                     }
                 ]
             }
@@ -21,6 +25,14 @@
                     {
                         "type": "command",
                         "command": "bash \"${CLAUDE_PROJECT_DIR:-.}\"/rd-workflow/scripts/hooks/headless_background_gate.sh"
+                    },
+                    {
+                        "type": "command",
+                        "command": "bash \"${CLAUDE_PROJECT_DIR:-.}\"/rd-workflow/scripts/hooks/self_worktree_delete_gate.sh"
+                    },
+                    {
+                        "type": "command",
+                        "command": ": rd-hook-sentinel v1; i=$(cat); d=\"${CLAUDE_PROJECT_DIR:-.}\"; t=\"${TMPDIR:-/tmp}\"; n=; p=; for h in session_start pre_commit_archive_gate headless_background_gate implementation_gate self_worktree_delete_gate; do [ -r \"$d/rd-workflow/scripts/hooks/$h.sh\" ] && continue; [ -n \"$p\" ] || { p=1; s=$(printf '%s' \"$i\" | sed -n 's/.*\"session_id\" *: *\"\\([A-Za-z0-9_-]*\\)\".*/\\1/p'); e=$(printf '%s' \"$i\" | sed -n 's/.*\"hook_event_name\" *: *\"\\([A-Za-z]*\\)\".*/\\1/p'); }; if [ \"$e\" != SessionStart ] && [ -n \"$s\" ]; then m=\"$t/rd-hook-missing.$s.$h\"; if mkdir \"$m\" 2>/dev/null; then :; elif [ -d \"$m\" ]; then continue; fi; fi; n=\"$n $h\"; done; [ -n \"$n\" ] || exit 0; w=; [ -d \"$d\" ] || w=' 작업 폴더가 없습니다(archive 뒤 worktree 삭제 등).'; printf '{\"systemMessage\":\"[rd-workflow] gate hook 파일이 없어 이 세션에서 꺼졌습니다:%s.%s\",\"hookSpecificOutput\":{\"hookEventName\":\"%s\",\"additionalContext\":\"[rd-workflow] 다음 gate hook 이 실행되지 않습니다:%s.%s 이 세션에서 위 hook 의 검사·안내는 실행되지 않으므로, 그 검사가 필요한 작업(커밋·archive·발행 등)은 사용자에게 먼저 알리십시오.\"}}' \"$n\" \"$w\" \"${e:-PreToolUse}\" \"$n\" \"$w\"; exit 0"
                     }
                 ]
             },
@@ -30,6 +42,10 @@
                     {
                         "type": "command",
                         "command": "bash \"${CLAUDE_PROJECT_DIR:-.}\"/rd-workflow/scripts/hooks/implementation_gate.sh"
+                    },
+                    {
+                        "type": "command",
+                        "command": ": rd-hook-sentinel v1; i=$(cat); d=\"${CLAUDE_PROJECT_DIR:-.}\"; t=\"${TMPDIR:-/tmp}\"; n=; p=; for h in session_start pre_commit_archive_gate headless_background_gate implementation_gate self_worktree_delete_gate; do [ -r \"$d/rd-workflow/scripts/hooks/$h.sh\" ] && continue; [ -n \"$p\" ] || { p=1; s=$(printf '%s' \"$i\" | sed -n 's/.*\"session_id\" *: *\"\\([A-Za-z0-9_-]*\\)\".*/\\1/p'); e=$(printf '%s' \"$i\" | sed -n 's/.*\"hook_event_name\" *: *\"\\([A-Za-z]*\\)\".*/\\1/p'); }; if [ \"$e\" != SessionStart ] && [ -n \"$s\" ]; then m=\"$t/rd-hook-missing.$s.$h\"; if mkdir \"$m\" 2>/dev/null; then :; elif [ -d \"$m\" ]; then continue; fi; fi; n=\"$n $h\"; done; [ -n \"$n\" ] || exit 0; w=; [ -d \"$d\" ] || w=' 작업 폴더가 없습니다(archive 뒤 worktree 삭제 등).'; printf '{\"systemMessage\":\"[rd-workflow] gate hook 파일이 없어 이 세션에서 꺼졌습니다:%s.%s\",\"hookSpecificOutput\":{\"hookEventName\":\"%s\",\"additionalContext\":\"[rd-workflow] 다음 gate hook 이 실행되지 않습니다:%s.%s 이 세션에서 위 hook 의 검사·안내는 실행되지 않으므로, 그 검사가 필요한 작업(커밋·archive·발행 등)은 사용자에게 먼저 알리십시오.\"}}' \"$n\" \"$w\" \"${e:-PreToolUse}\" \"$n\" \"$w\"; exit 0"
                     }
                 ]
             },
@@ -39,9 +55,27 @@
                     {
                         "type": "command",
                         "command": "bash \"${CLAUDE_PROJECT_DIR:-.}\"/rd-workflow/scripts/hooks/implementation_gate.sh"
+                    },
+                    {
+                        "type": "command",
+                        "command": ": rd-hook-sentinel v1; i=$(cat); d=\"${CLAUDE_PROJECT_DIR:-.}\"; t=\"${TMPDIR:-/tmp}\"; n=; p=; for h in session_start pre_commit_archive_gate headless_background_gate implementation_gate self_worktree_delete_gate; do [ -r \"$d/rd-workflow/scripts/hooks/$h.sh\" ] && continue; [ -n \"$p\" ] || { p=1; s=$(printf '%s' \"$i\" | sed -n 's/.*\"session_id\" *: *\"\\([A-Za-z0-9_-]*\\)\".*/\\1/p'); e=$(printf '%s' \"$i\" | sed -n 's/.*\"hook_event_name\" *: *\"\\([A-Za-z]*\\)\".*/\\1/p'); }; if [ \"$e\" != SessionStart ] && [ -n \"$s\" ]; then m=\"$t/rd-hook-missing.$s.$h\"; if mkdir \"$m\" 2>/dev/null; then :; elif [ -d \"$m\" ]; then continue; fi; fi; n=\"$n $h\"; done; [ -n \"$n\" ] || exit 0; w=; [ -d \"$d\" ] || w=' 작업 폴더가 없습니다(archive 뒤 worktree 삭제 등).'; printf '{\"systemMessage\":\"[rd-workflow] gate hook 파일이 없어 이 세션에서 꺼졌습니다:%s.%s\",\"hookSpecificOutput\":{\"hookEventName\":\"%s\",\"additionalContext\":\"[rd-workflow] 다음 gate hook 이 실행되지 않습니다:%s.%s 이 세션에서 위 hook 의 검사·안내는 실행되지 않으므로, 그 검사가 필요한 작업(커밋·archive·발행 등)은 사용자에게 먼저 알리십시오.\"}}' \"$n\" \"$w\" \"${e:-PreToolUse}\" \"$n\" \"$w\"; exit 0"
                     }
                 ]
             }
+        ]
+    },
+    "permissions": {
+        "allow": [
+            "Bash(bash rd-workflow/scripts/prepare_review_pipeline.sh:*)",
+            "Bash(REVIEW_TURN_LIMIT=* bash rd-workflow/scripts/prepare_review_pipeline.sh *)",
+            "Bash(bash rd-workflow/scripts/run_review_turn.sh:*)",
+            "Bash(WAIT_TIMEOUT=* bash rd-workflow/scripts/run_review_turn.sh *)",
+            "Bash(RD_AUTOPILOT=1 bash rd-workflow/scripts/run_review_turn.sh *)",
+            "Bash(bash rd-workflow/scripts/self_test.sh:*)",
+            "Bash(bash rd-workflow/scripts/test.sh:*)",
+            "Bash(bash rd-workflow/scripts/lint.sh:*)",
+            "Bash(bash rd-workflow/scripts/typecheck.sh:*)",
+            "Bash(bash rd-workflow/scripts/build.sh:*)"
         ]
     }
 }

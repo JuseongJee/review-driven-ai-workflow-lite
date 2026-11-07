@@ -511,7 +511,7 @@ rd_seal_evidence_check() {
   return 0
 }
 
-# _rd_seal_legacy_warning — legacy 마커 지속 고지 (§3.3 Finding 5).
+# _rd_seal_legacy_warning — legacy 마커 지속 고지.
 # 통과할 때마다 냅니다 — 생성 시점 1회 고지로는 나중에 실행하는 사람이 알 수 없습니다.
 _rd_seal_legacy_warning() {
   echo "경고: 이 마커는 검증되지 않은 legacy 전환입니다 (verified=legacy-unverified)." >&2
@@ -611,7 +611,7 @@ archive_review_precheck() {
   fi
   # audit 기록은 이 우회 경로의 **유일한 흔적**입니다. `mkdir -p` 와 append 의 종료 상태를
   # 확인하지 않으면 기록이 통째로 사라진 채 "audit log 기록" 이라고 잘못 알리고 발행이
-  # 계속됩니다 (final diff review turn 004 Finding 1). 실패는 차단으로 전파합니다 —
+  # 계속됩니다. 실패는 차단으로 전파합니다 —
   # 리뷰 검증을 명시적으로 우회하면서 사유조차 남지 않는 발행은 허용하지 않습니다.
   local audit_dir
   audit_dir="$(dirname "$audit_log")"
@@ -1147,10 +1147,12 @@ guard_deny() {
 
 # --- JSON 파싱 ---
 
-_hook_input=""
+_hook_input="${_hook_input-}"
 
 read_hook_input() {
+  [[ "${_hook_input_read:-0}" == 1 ]] && return 0
   _hook_input="$(cat)"
+  _hook_input_read=1
 }
 
 extract_json_field() {
@@ -1166,12 +1168,95 @@ extract_json_field() {
     local tmp="${_hook_input#*\"${field}\"}"
     if [[ "$tmp" != "$_hook_input" ]]; then
       tmp="${tmp#*:}"     # : 이후
-      tmp="${tmp#*\"}"    # 첫 번째 " 이후
-      value="${tmp%%\"*}" # 다음 " 까지
+      tmp="${tmp#*\"}"    # 첫 번째 " 이후 — 여기부터 값 문자열 본문
+      # 값은 이스케이프를 해독하며 닫는 따옴표까지 읽는다. 다음 " 에서 자르면 \" 가 든
+      # 경로(`/p/a\"b/../CURRENT_TASK.md`)를 `/p/a\` 로 읽어 차단 대상을 놓친다(fail-open).
+      #
+      # 해독할 수 없는 값은 통과시키지 않고 막는다(fail-closed). guard_deny 는 이 명령 치환
+      # 서브셸만 exit 2 로 끝내므로, 호출측 hook 이 `set -e` 로 그 2 를 hook 종료 코드로
+      # 전파한다 — implementation_gate.sh · pre_commit_archive_gate.sh 가 그렇다.
+      if ! value="$(printf '%s\n' "$tmp" | _json_string_decode)"; then
+        echo "[guard] hook 입력의 ${field} 값을 해석할 수 없어 막습니다 (jq 없이 읽는 경로)." >&2
+        echo "        jq 를 설치하면 이 경로를 쓰지 않습니다." >&2
+        # reason: jq 폴백이 JSON 문자열 값을 해독하지 못한 분기 (fail-closed).
+        guard_deny "extract_json_field.undecodable"
+      fi
     fi
   fi
 
   printf '%s' "$value"
+}
+
+# _json_string_decode — stdin 첫 줄을 「여는 따옴표 뒤의 JSON 문자열 본문」으로 읽어,
+# 닫는 따옴표까지 해독한 값을 stdout 으로 낸다. 해독할 수 없으면 rc 3 으로 끝난다.
+#
+# 첫 줄만 보는 이유: JSON 문자열 안에는 날 개행이 올 수 없다. 닫기 전에 줄이 끝나면
+# 닫히지 않은 문자열이다. 이스케이프는 RFC 8259 의 8종과 \uXXXX 이며 \uXXXX 는 UTF-8
+# 바이트로 낸다(서로게이트 쌍은 합친다). 경로의 '/'·'.' 를 \u 로 감춘 입력도 jq 와 같은
+# 값으로 읽어야 정규화가 같은 판정을 낸다.
+# 해독 불가로 보는 것: 모르는 이스케이프, 4자리 16진이 아닌 \u, \u0000(bash 변수에 담을
+# 수 없다), 짝 없는 서로게이트, 닫히지 않은 문자열.
+# 문자 단위가 아니라 match 로 다음 \ 또는 " 까지 덩어리로 건너뛰므로 값 길이에 선형이다.
+# LC_ALL=C 는 바이트 단위 처리와 %c 의 바이트 출력을 보장한다.
+_json_string_decode() {
+  LC_ALL=C awk '
+    function hexval(h,   i, n, d) {
+      if (h !~ /^[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]$/) return -1
+      n = 0
+      for (i = 1; i <= 4; i++) {
+        d = index("0123456789abcdef", tolower(substr(h, i, 1))) - 1
+        n = n * 16 + d
+      }
+      return n
+    }
+    function utf8(c) {
+      if (c < 128) return sprintf("%c", c)
+      if (c < 2048) return sprintf("%c%c", 192 + int(c / 64), 128 + c % 64)
+      if (c < 65536) return sprintf("%c%c%c", 224 + int(c / 4096), 128 + int(c / 64) % 64, 128 + c % 64)
+      return sprintf("%c%c%c%c", 240 + int(c / 262144), 128 + int(c / 4096) % 64, \
+        128 + int(c / 64) % 64, 128 + c % 64)
+    }
+    # 값 본문 s 를 해독해 전역 res 에 담는다. 반환 0 = 성공, 3 = 해독 불가.
+    function decode(s,   p, ch, e, c, lo, out) {
+      out = ""
+      while (1) {
+        p = match(s, /[\\"]/)
+        if (p == 0) return 3                   # 닫는 따옴표 없음
+        out = out substr(s, 1, p - 1)
+        ch = substr(s, p, 1)
+        if (ch == "\"") { res = out; return 0 }
+        e = substr(s, p + 1, 1)
+        s = substr(s, p + 2)
+        if (e == "\"" || e == "\\" || e == "/") out = out e
+        else if (e == "b") out = out "\b"
+        else if (e == "f") out = out "\f"
+        else if (e == "n") out = out "\n"
+        else if (e == "r") out = out "\r"
+        else if (e == "t") out = out "\t"
+        else if (e == "u") {
+          c = hexval(substr(s, 1, 4)); s = substr(s, 5)
+          if (c <= 0) return 3                 # 형식 오류(-1) 또는 \u0000
+          if (c >= 56320 && c <= 57343) return 3 # 짝 없는 하위 서로게이트
+          if (c >= 55296 && c <= 56319) {
+            if (substr(s, 1, 2) != "\\u") return 3
+            lo = hexval(substr(s, 3, 4)); s = substr(s, 7)
+            if (lo < 56320 || lo > 57343) return 3
+            c = 65536 + (c - 55296) * 1024 + (lo - 56320)
+          }
+          out = out utf8(c)
+        }
+        else return 3                          # 모르는 이스케이프 또는 줄 끝의 역슬래시
+      }
+    }
+    # 답은 첫 줄에서 정해지지만 둘째 줄부터도 끝까지 읽는다. 먼저 끝내면 pretty JSON 의
+    # 큰 후행 필드를 쓰던 printf 가 SIGPIPE(141)를 받고, 호출측 pipefail 이 그 실패를
+    # 해독 실패로 읽어 정상 입력을 막는다.
+    NR == 1 { rc = decode($0) }
+    END {
+      if (NR == 0 || rc != 0) exit 3
+      printf "%s", res
+    }
+  '
 }
 
 # hook_input_bool_true <key>

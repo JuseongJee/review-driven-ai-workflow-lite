@@ -96,16 +96,17 @@ _session_launch_run_with_timeout() {  # <timeout-secs> <outfile> <cmd...>
 #   허용 범위는 정수 6~300 이다. 하한 6: herdr 는 `--timeout` 이 5초 이하이면
 #   `agent_prompt_stalled` 대신 `timeout` 을 낸다. 상한 300: herdr 의 최대값이다.
 #   범위 밖·정수 아님이면 stderr 에 한 줄 경고를 내고 기본값을 쓴다. 변수 미설정은 경고 없이 기본값이다.
-_session_launch_timeout_secs() {  # <env-name> <default>
-  local name="$1" def="$2" val
+#   <min> <max> 를 주면 그 범위로 판정한다(예: busy 재시도 창은 0~120 — 0 은 재시도 안 함).
+_session_launch_timeout_secs() {  # <env-name> <default> [<min> <max>]
+  local name="$1" def="$2" lo="${3:-6}" hi="${4:-300}" val
   val="${!name-}"
   if [[ -z "${!name+x}" ]]; then
     printf '%s\n' "$def"; return 0
   fi
-  if [[ "$val" =~ ^[0-9]+$ ]] && (( 10#$val >= 6 && 10#$val <= 300 )); then
+  if [[ "$val" =~ ^[0-9]+$ ]] && (( 10#$val >= lo && 10#$val <= hi )); then
     printf '%s\n' "$((10#$val))"; return 0
   fi
-  printf '대기 설정(%s=%s)이 허용 범위(6~300초)를 벗어나 기본값 %s초를 씁니다.\n' "$name" "$val" "$def" >&2
+  printf '대기 설정(%s=%s)이 허용 범위(%s~%s초)를 벗어나 기본값 %s초를 씁니다.\n' "$name" "$val" "$lo" "$hi" "$def" >&2
   printf '%s\n' "$def"
 }
 
@@ -520,37 +521,61 @@ session_launch() {  # <worktree-path> <slug> <request-path> [<model>] [<backend>
     printf 'failed\n'; return 0
   fi
 
-  outfile="$(mktemp)" || {
-    # tab 은 이미 만들어졌고 agent 는 아직 안 붙었다 — 위 갈래와 같은 정리를 한다.
-    _session_launch_close_tab_best_effort "$tab_id"
-    printf '자동 기동에 실패했습니다(%s). 아래 명령으로 시작하십시오.\n' "임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2
-    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model")" >&2
-    printf 'failed\n'; return 0
-  }
-  local errfile=""
-  errfile="$(mktemp)" || errfile=""
   # agent start 는 에이전트가 입력을 받을 준비가 될 때까지 herdr 가 막았다가 응답한다. 그 대기를
   # herdr `--timeout` 에 맡기고 스크립트 상한은 5초 더 길게 둔다(짧은 호출 상한 RD_LAUNCH_TIMEOUT
   # 에 묶으면 claude 준비가 늦을 때 클라이언트를 응답 전에 죽인다). `--timeout` 은 `--` 앞이다.
   local ssecs
   ssecs="$(_session_launch_timeout_secs RD_LAUNCH_START_TIMEOUT 60)"
   printf '세션 기동 대기: %s — 세션이 입력을 받을 준비가 될 때까지 최대 %s초 기다립니다.\n' "$slug" "$((ssecs + 5))" >&2
-  if [[ -n "$model" ]]; then
-    RD_SL_ERRFILE="${errfile:-/dev/null}" _session_launch_run_with_timeout "$((ssecs + 5))" "$outfile" \
-      herdr agent start "$agent_name" --kind claude --pane "$pane_id" --timeout "$((ssecs * 1000))" -- --model "$model"
-  else
-    RD_SL_ERRFILE="${errfile:-/dev/null}" _session_launch_run_with_timeout "$((ssecs + 5))" "$outfile" \
-      herdr agent start "$agent_name" --kind claude --pane "$pane_id" --timeout "$((ssecs * 1000))"
+  # **`agent_pane_busy` 는 짧게 다시 부른다** (2026-11-06 실측). 새 tab 의 셸이 시작 스크립트의
+  # 자식 프로세스(path_helper·fnm·ls 등)를 포그라운드로 돌리는 순간에 부르면 herdr 가 이 코드로
+  # 거부한다. 거부는 아무것도 입력하지 않고 이름도 점유하지 않으므로 같은 pane·이름으로 다시 부른다.
+  #   창(bsecs)은 「새 시도를 시작해도 되는 시간」 이다. 0.5초 쉬기 전과 뒤에 검사한다. 이미 시작한
+  #   시도는 창과 관계없이 기존 상한까지 기다리고, 그 결과는 아래 기존 분기가 처리한다(결과 우선).
+  #   rc=124 는 busy 본문이 있어도 「결과를 모름」 이라 재시도하지 않는다.
+  local bsecs bstart bdeadline nretry=0 bnotice=""
+  bsecs="$(_session_launch_timeout_secs RD_LAUNCH_BUSY_RETRY_SECS 30 0 120)"
+  bstart=$SECONDS; bdeadline=$((SECONDS + bsecs))
+  local errfile="" start_body="" _cls_out="" _cls_err=""
+  while :; do
+    outfile="$(mktemp)" || {
+      # tab 은 이미 만들어졌고 agent 는 아직 안 붙었다 — 위 갈래와 같은 정리를 한다.
+      _session_launch_close_tab_best_effort "$tab_id"
+      printf '자동 기동에 실패했습니다(%s). 아래 명령으로 시작하십시오.\n' "임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2
+      printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model")" >&2
+      printf 'failed\n'; return 0
+    }
+    errfile="$(mktemp)" || errfile=""
+    if [[ -n "$model" ]]; then
+      RD_SL_ERRFILE="${errfile:-/dev/null}" _session_launch_run_with_timeout "$((ssecs + 5))" "$outfile" \
+        herdr agent start "$agent_name" --kind claude --pane "$pane_id" --timeout "$((ssecs * 1000))" -- --model "$model"
+    else
+      RD_SL_ERRFILE="${errfile:-/dev/null}" _session_launch_run_with_timeout "$((ssecs + 5))" "$outfile" \
+        herdr agent start "$agent_name" --kind claude --pane "$pane_id" --timeout "$((ssecs * 1000))"
+    fi
+    rc=$?
+    # 오류 JSON 은 stderr 로 나온다(2026-10-29 실측) — stdout 파일만 읽으면 start_body 가 늘 비어
+    # `agent_not_ready` 분기가 타지 않는다. 판정은 두 파일을 각각 분류해 하고, start_body 는
+    # 진단 출력용으로 둘을 이어 붙인다.
+    _cls_out="$(_session_launch_json_classify "$outfile")"
+    _cls_err=""
+    [[ -n "$errfile" ]] && _cls_err="$(_session_launch_json_classify "$errfile")"
+    start_body="$(cat "$outfile" ${errfile:+"$errfile"} 2>/dev/null)"
+    rm -f "$outfile" ${errfile:+"$errfile"}
+    [[ $rc -ne 0 && $rc -ne 124 ]] || break
+    [[ "$_cls_out" == $'error\tagent_pane_busy' || "$_cls_err" == $'error\tagent_pane_busy' ]] || break
+    (( SECONDS < bdeadline )) || break
+    if [[ -z "$bnotice" ]]; then
+      printf 'agent start: 새 탭의 셸이 아직 준비 중입니다(agent_pane_busy) — 최대 %s초 동안 다시 시도합니다.\n' "$bsecs" >&2
+      bnotice=1
+    fi
+    sleep 0.5
+    (( SECONDS < bdeadline )) || break
+    nretry=$((nretry + 1))
+  done
+  if [[ -n "$bnotice" ]]; then
+    printf 'agent start: 셸이 아직 준비 중이라(agent_pane_busy) %s회 다시 시도했습니다(%s초).\n' "$nretry" "$((SECONDS - bstart))" >&2
   fi
-  rc=$?
-  # 오류 JSON 은 stderr 로 나온다(2026-10-29 실측) — stdout 파일만 읽으면 start_body 가 늘 비어
-  # `agent_not_ready` 분기가 타지 않는다. 판정은 두 파일을 각각 분류해 하고, start_body 는
-  # 진단 출력용으로 둘을 이어 붙인다.
-  local start_body="" _cls_out="" _cls_err=""
-  _cls_out="$(_session_launch_json_classify "$outfile")"
-  [[ -n "$errfile" ]] && _cls_err="$(_session_launch_json_classify "$errfile")"
-  start_body="$(cat "$outfile" ${errfile:+"$errfile"} 2>/dev/null)"
-  rm -f "$outfile" ${errfile:+"$errfile"}
   if [[ $rc -ne 0 ]]; then
     # 원인 확인용 계측 — 연속 기동 때 관측된 rc=1 은 응답이 버려져 원인을 알 수 없었다.
     printf 'agent start 응답(rc=%s): %s\n' "$rc" "$(printf '%s' "$start_body" | tr '\n' ' ' | cut -c1-500)" >&2

@@ -382,7 +382,7 @@ else
 fi
 unset project_root
 
-# --- B12: 숫자형 short-title 회차 분리 (Reviewer Turn 002 F1) ---
+# --- B12: 숫자형 short-title 회차 분리 ---
 B12="$TMPROOT/b12.tsv"
 cat > "$B12" <<'EOF'
 # short_title	from_status	to_status	epoch

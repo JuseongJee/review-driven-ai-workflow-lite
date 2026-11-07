@@ -145,6 +145,31 @@ eq "$(sed -n 2p "$S1/turn_metrics.tsv" | cut -f10)" "ok" "통합 ok: status=ok �
 eq "$(sed -n 2p "$S1/turn_metrics.tsv" | cut -f2)" "spec-plan-review" "통합 ok: review_type 기록"
 grep -q '^turn time: [0-9][0-9]*s$' "$TMP/last_out.txt"; chk $? "가시성 ok: stdout turn time"
 grep -q 'turn time: [0-9][0-9]*s (status: ok)' "$TMP/last_err.txt"; chk $? "가시성 ok: stderr turn time (status: ok)"
+! grep -q '리뷰 세션 폴더 안에 git 저장소' "$TMP/last_err.txt"; chk $? "중첩 git: .git 없으면 경고 없음"
+
+# RR1: 실행 기록 — 성공한 리뷰어 턴이 reviewer_runs.tsv 에 정확히 한 줄 남는다 (seal 대조의 근거)
+RR_FILE="$S1/reviewer_runs.tsv"
+RR_ROWS="$(grep -vc '^#' "$RR_FILE" 2>/dev/null || true)"
+eq "${RR_ROWS:-0}" "1" "RR1: reviewer_runs.tsv 데이터 줄 1"
+RR_LINE="$(grep -v '^#' "$RR_FILE" 2>/dev/null | head -n 1)"
+eq "$(printf '%s' "$RR_LINE" | cut -f1)" "002" "RR1: 턴 번호"
+eq "$(printf '%s' "$RR_LINE" | cut -f2)" "codex" "RR1: tool"
+eq "$(printf '%s' "$RR_LINE" | cut -f3)" "reviewer" "RR1: mode"
+eq "$(printf '%s' "$RR_LINE" | cut -f5)" "$(git hash-object "$S1/turns/002_reviewer.md")" "RR1: turn-blob 불일치 검사"
+case "$(printf '%s' "$RR_LINE" | cut -f6)" in ok|unresolved|unknown) pass "RR1: open-issues 값";; *) fail "RR1: open-issues 값 ($(printf '%s' "$RR_LINE" | cut -f6))";; esac
+
+# 경로 1g: ok + 세션 안 중첩 git (경고만, 턴 결과 불변)
+S1g="$TMP/it_ok_git"; mk_full_session "$S1g"
+rc="$(run_with_mock_adapter "$S1g" "mkdir -p \"\${SESSION_PATH}/evidence/repro\" && git init -q \"\${SESSION_PATH}/evidence/repro\" && : > \"\${SESSION_PATH}/.git\"
+$OK_BODY")"
+eq "$rc" "0" "중첩 git: 턴 결과 불변(rc 0)"
+grep -q '리뷰 세션 폴더 안에 git 저장소' "$TMP/last_err.txt"; chk $? "중첩 git: 경고 출력"
+# 하네스의 project_root 는 사본 디렉터리(`$TMP` 와 같은 부모 아래 mktemp) 기준 `../..` 라 $TMP 가 그 안에 듭니다.
+# 표시용 세션 경로는 project_root 를 뗀 상대 경로입니다.
+D1g="${S1g#"$(cd "$(dirname "$TMP")/.." && pwd)"/}"
+grep -Fqx -- "    - ${D1g}/evidence/repro" "$TMP/last_err.txt"; chk $? "중첩 git: 경로 표시"
+grep -Fqx -- "    - ${D1g}" "$TMP/last_err.txt"; chk $? "중첩 git: 세션 루트 경로"
+grep -q '^status: awaiting-author$' "$TMP/last_out.txt"; chk $? "중첩 git: SESSION 상태 불변"
 
 # 경로 2: fail — mock exit 1
 S2="$TMP/it_fail"; mk_full_session "$S2"
@@ -188,7 +213,7 @@ eq "$rc" "0" "fail-open E2E: 계측 쓰기 확정 실패에도 턴 성공"
 grep -q '기록 실패' "$TMP/last_err.txt"; chk $? "fail-open E2E: 기록 실패가 stderr 경고로 표시됨 (무음 아님)"
 
 # 경로 6: 시간 원천 실패 — date +%s 만 실패시키는 shim 을 PATH 에 주입해도
-# 유효 mock 턴은 부모 rc=0 (fail-open 이 시간 수집 단계까지 확장 — diff review 턴 002 Finding 1)
+# 유효 mock 턴은 부모 rc=0 (fail-open 이 시간 수집 단계까지 확장)
 S6="$TMP/it_datefail"; mk_full_session "$S6"
 DATE_SHIM="$(mktemp -d)" || { echo "test_review_metrics.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$DATE_SHIM" && -d "$DATE_SHIM" ]] || { echo "test_review_metrics.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
@@ -389,6 +414,7 @@ grep -q '^세션: (나)' "$TMP/last_err.txt"; chk $? "T11: unverified 발행은 
 ! grep -q '재실행하면 이어집니다' "$TMP/last_err.txt"; chk $? "T11: 재실행 보장 문구 부재"
 grep -q 'writer 종료: 미확인' "$TMP/last_err.txt"; chk $? "T11: 관측 줄에 writer 종료 미확인"
 
+SPEND_LINE_T10='ERROR: You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.'
 # T10: 4원인 처방 연결
 t10_check() { # $1=이름 $2=오류 줄 $3=처방 문구 $4=(선택) 이미 얻은 stderr 파일 — 있으면 실행을 건너뜀
   local err="$TMP/last_err.txt"
@@ -406,9 +432,19 @@ t10_check capacity "$CAP_LINE" '재시도' "$TMP/cap_err.txt"
 t10_check rate 'ERROR: rate limit exceeded, too many requests' '재시도'
 t10_check auth 'ERROR: unauthorized: not logged in' '로그인'
 t10_check model 'ERROR: model not found: gpt-x' '모델 지정'
+t10_check spendcap "$SPEND_LINE_T10" '소유자'
+! grep -q '잠시 뒤' "$TMP/last_err.txt"; chk $? "T10(spendcap): 잠시 뒤 재시도 권고 없음"
+t10_check usagelimit 'ERROR: You’ve hit your usage limit. Try again later.' '재설정'
+! grep -q '잠시 뒤' "$TMP/last_err.txt"; chk $? "T10(usagelimit): 잠시 뒤 재시도 권고 없음"
+
+# 한도 오류: 처방이 재실행을 직접 말하지 않고 세션 판정 줄이 정한다
+sess="$TMP/spend_manual"; mk_full_session "$sess"
+run_with_mock_adapter "$sess" "$(mk_log_body "$SPEND_LINE_T10" 0)" >/dev/null
+grep -q '^세션: (나)' "$TMP/last_err.txt"; chk $? "한도(나): 세션 (나) 판정"
+! grep -q '재실행하면 이어집니다' "$TMP/last_err.txt"; chk $? "한도(나): 무조건 재실행 지시 없음"
 
 # ---------------------------------------------------------------------------
-# 137(SIGKILL) — cleanup 을 보장하지 못하는 신호 (final diff review 턴 004 Important 2)
+# 137(SIGKILL) — cleanup 을 보장하지 못하는 신호
 # 어댑터가 cleanup(= 리뷰 도구 process group 종료)을 보장하는 것은 명시적으로 트랩한
 # HUP(129)·INT(130)·TERM(143) 뿐이다. SIGKILL 은 트랩 불가이므로 **어댑터만 죽고 자손은
 # 계속 실행·수정할 수 있다.** 그런데도 세션 상태(턴 파일 부재 + Owner=Reviewer/
@@ -480,6 +516,12 @@ echo "=== 원인·세션 판정 함수 ==="
   eq "$(cls "$D/auth.log" codex)" "confirmed auth" "F-auth"
   mk_codex_log "$D/model.log" "ERROR: model not found: gpt-xyz"
   eq "$(cls "$D/model.log" codex)" "confirmed model" "F-model"
+  SPEND_LINE='ERROR: You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.'
+  mk_codex_log "$D/spend.log" "$SPEND_LINE"
+  eq "$(cls "$D/spend.log" codex)" "confirmed spendcap" "F-spendcap: 실제 사례 문구"
+  # 재현 원형: 푸터 없음, 같은 ERROR 줄 두 번, 곡선 아포스트로피
+  { printf 'warning: Model metadata for `gpt-x` not found.\n'; printf 'ERROR: You’ve hit your usage limit. Try again later.\nERROR: You’ve hit your usage limit. Try again later.\n'; } > "$D/usage-raw.log"
+  eq "$(cls "$D/usage-raw.log" codex)" "confirmed usagelimit" "F-usagelimit: 재현 원형(푸터 없음)"
   { printf 'body\n\n'; printf 'ERROR: Selected model is at capacity.\nERROR: Rate limit exceeded\ntokens used\n5\n'; } > "$D/multi.log"
   eq "$(cls "$D/multi.log" codex)" "candidates capacity,ratelimit" "F-multi: 끝 블록의 두 원인 → candidates 병기"
   mk_codex_log "$D/qmid.log" "ERROR: something unrelated failed" "ERROR: Selected model is at capacity. (본문 인용)"
@@ -493,6 +535,8 @@ echo "=== 원인·세션 판정 함수 ==="
   { printf '{"type":"assistant","message":"ERROR: model is at capacity"}\n'; printf '{"type":"result","is_error":true,"result":"API Error: rate limit reached"}\n'; } > "$D/claude.log"
   if command -v jq >/dev/null 2>&1; then
     eq "$(cls "$D/claude.log" claude)" "confirmed ratelimit" "F-claude: 어시스턴트 본문 줄 무시, result 오류 줄만"
+    { printf '{"type":"assistant","message":"spend cap 문구 인용"}\n'; printf '{"type":"result","is_error":true,"result":"You'"'"'ve hit your limit · resets 3pm (Asia/Seoul)"}\n'; } > "$D/claude-limit.log"
+    eq "$(cls "$D/claude-limit.log" claude)" "confirmed usagelimit" "F-claude-limit: result 줄만, 본문 spend cap 무시"
   else
     pass "F-claude: jq 없음 — 건너뜀"
   fi

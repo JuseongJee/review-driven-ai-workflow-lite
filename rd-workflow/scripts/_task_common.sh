@@ -82,14 +82,19 @@ assert_no_symlink_in_path() {
 # '구현 대기'(change-spec 2026-09-24-1836-task-status-no-implementation-pending)는 spec/plan
 # review 종결과 구현 착수 사이의 상태다. 'spec/plan review 대기' 에서 들어와 '구현 중' 으로
 # 나가며, 'spec/plan 작성 중' 으로 되돌아갈 수도 있다 — 리뷰 후 변경이 필요해진 경우다.
+# 리뷰 단계 3종('REQUEST review 대기'·'spec/plan 작성 중'·'spec/plan review 대기')→'구현 중'
+# 은 full→standard 하향 경로다. '대기 중' 을 거치면 진행 중 판정(Status ≠ 대기 중)에서 빠진다.
+# 하향 사유의 정본은 REQUEST.md ## Risk Tier 이력이고, task_set_status 가 그 기록을 안내한다.
+TASK_DOWNGRADE_FROM_STATUSES="REQUEST review 대기|spec/plan 작성 중|spec/plan review 대기"
 task_transition_allowed() {
   local from="$1" to="$2"
   [[ "$to" == "대기 중" ]] && return 0
   case "${from}→${to}" in
     "대기 중→REQUEST review 대기"|"대기 중→구현 중"|\
-    "REQUEST review 대기→spec/plan 작성 중"|\
-    "spec/plan 작성 중→spec/plan review 대기"|\
+    "REQUEST review 대기→spec/plan 작성 중"|"REQUEST review 대기→구현 중"|\
+    "spec/plan 작성 중→spec/plan review 대기"|"spec/plan 작성 중→구현 중"|\
     "spec/plan review 대기→spec/plan 작성 중"|"spec/plan review 대기→구현 대기"|\
+    "spec/plan review 대기→구현 중"|\
     "구현 대기→구현 중"|"구현 대기→spec/plan 작성 중"|\
     "구현 중→spec/plan 작성 중"|\
     "구현 중→검증 중"|"검증 중→구현 중"|"검증 중→diff review 대기"|\
@@ -127,7 +132,7 @@ task_set_status() {
       return 4
     fi
   fi
-  # 미러 섹션 부재를 **권위 쓰기 전에** 잡는다 (final diff review Finding 2).
+  # 미러 섹션 부재를 **권위 쓰기 전에** 잡는다.
   # `_task_section_write` 가 섹션 부재를 실패로 바꾼 뒤부터, 뒤에서 잡으면 task-state 는
   # 새 값이고 미러는 그대로인 부분 갱신이 남는다. `|| rc=$?` 는 코드를 보존할 뿐
   # 선행 쓰기를 되돌리지 않는다.
@@ -144,6 +149,9 @@ task_set_status() {
   fi
   _task_section_write "Status" "$to" || rc=$?
   [[ "$rc" -eq 0 ]] && state_log_stage_transition "$(state_read_field "short-title")" "$from" "$to"
+  if [[ "$rc" -eq 0 && "$to" == "구현 중" && "|${TASK_DOWNGRADE_FROM_STATUSES}|" == *"|${from}|"* ]]; then
+    echo "안내: 리뷰 단계(${from})에서 구현 중으로 바로 옮겼습니다. 등급을 낮췄다면 REQUEST.md ## Risk Tier 의 'override·상향 이력' 에 주체와 근거를 적으십시오." >&2
+  fi
   return "$rc"
 }
 
@@ -969,7 +977,7 @@ task_archive_captures() {
 # 섹션 값 재기록 — 해당 섹션의 첫 비어있지 않은 줄만 교체, 나머지 byte 보존.
 # 섹션이 비어 있으면 다음 헤더 직전(또는 EOF)에 값 삽입.
 # **섹션 헤더 자체가 없으면 return 1.** 종전에는 입력을 그대로 복사하고 0 으로 끝나서,
-# 호출자가 "미러 갱신 성공" 을 받고도 미러는 계속 부재했다 (final diff review Finding 4).
+# 호출자가 "미러 갱신 성공" 을 받고도 미러는 계속 부재했다.
 # 헤더를 임의 위치에 새로 만들지는 않는다 — 미러의 섹션 순서는 baseline 계약이고,
 # 없다는 것은 파일이 baseline 이 아니라는 신호이므로 사람이 볼 일이다.
 _task_section_write() {
@@ -1167,7 +1175,7 @@ task_set_title() {
     return 2
   fi
   # 미러 섹션 부재를 **task-state 쓰기 전에** 잡는다. 뒤에서 잡으면 권위는 갱신되고
-  # 미러만 안 된 partial state 가 남는다 (final diff review Finding 4).
+  # 미러만 안 된 partial state 가 남는다.
   if ! _task_section_exists "Short Title"; then
     echo "set-title: CURRENT_TASK.md 에 '## Short Title' 섹션이 없어 중단합니다 (상태 변경 없음)." >&2
     echo "  미러가 baseline 형식이 아닙니다. 확인: grep -n '^## ' '${project_root}/CURRENT_TASK.md'" >&2
@@ -1226,38 +1234,115 @@ task_reset_title() {
 # §2.5.1·§2.5.2, 리뷰 F1·F2)
 # ---------------------------------------------------------------------------
 
-# _fr_done_items_step <canonical-path> — items/<file>.md 의 '- status:' 를 done 으로.
+# _fr_done_read <abs> — 공용 판정 규칙(_fr_status.sh)으로 한 번에 읽는다.
+# stdout: 값\034분류\034첫 '- status:' 줄 번호(없으면 0)\034값을 준 줄 번호\034값을 준 줄의 값 전체
+_fr_done_read() {
+  fr_status_awk_vars
+  awk "${FR_STATUS_AWK_ARGS[@]}" "$FR_STATUS_AWK"'
+    BEGIN { frs_init(); frs_reset() }
+    { frs_feed($0, NR) }
+    END {
+      v = frs_value()
+      sl = frs_status_line(); if (sl == 0) sl = frs_src_line()
+      printf "%s\034%s\034%d\034%d\034%s\n", v, frs_class(v), sl, frs_src_line(), frs_src_raw()
+    }' "$1"
+}
+
+# _fr_done_restore <abs> <bak> <원인> <rel> — 백업으로 되돌리고 한 줄 보고를 낸다(항상 return 0).
+# 성공하면 백업을 지우고 "원래 내용으로 되돌림", 실패하면 백업을 남기고 그 경로를 보고한다.
+_fr_done_restore() {
+  local abs="$1" bak="$2" why="$3" rel="$4"
+  if cp "$bak" "$abs" 2>/dev/null; then
+    rm -f "$bak"
+    printf '  items: 실패 — %s (원래 내용으로 되돌림) (%s)\n' "$why" "$rel"
+  else
+    printf '  items: 실패 — %s, 되돌리기 실패 — 백업: %s (%s)\n' "$why" "$bak" "$rel"
+  fi
+  return 0
+}
+
+# _fr_done_items_step <canonical-path> — items/<file>.md 의 status 를 done 으로.
+# 현재 값은 공용 판정 규칙(_fr_status.sh)으로 읽는다. `- status:` 줄이 하나라도 있으면 그 첫
+# 줄을, 없으면 값이 있는 첫 `- 상태:` 줄을 `- status: done` 으로 바꾼다(change spec 3.3).
 # stdout: 사람이 보는 한 줄 보고 ("  items: ..."). return: 0=변경함 / 1=실패 / 2=건너뜀(이미 종료 상태)
 _fr_done_items_step() {
-  local rel="${1-}" abs cur tmp
+  local rel="${1-}" abs rd_out tmp bak tok cls tgt srcl raw rest line want chk prev_raw prev_line body wrc tidy=0
   abs="${project_root}/${rel}"
   if [[ ! -f "$abs" ]]; then
     printf '  items: 실패 — 파일을 찾을 수 없습니다 (%s)\n' "$rel"
     return 1
   fi
-  cur="$(awk -F': *' '/^- status:/{print $2; exit}' "$abs" 2>/dev/null)"
-  cur="$(_sfr_trim "$cur")"
-  if [[ -z "$cur" ]]; then
-    printf "  items: 실패 — '- status:' 필드를 찾을 수 없습니다 (%s)\n" "$rel"
+  # shellcheck source=/dev/null
+  if ! source "${_TC_DIR}/_fr_status.sh" 2>/dev/null; then
+    printf '  items: 실패 — 판정 파일을 읽지 못했습니다\n'
     return 1
   fi
-  if [[ "$cur" == "done" || "$cur" == "dropped" ]]; then
-    printf '  items: 건너뜀 (이미 %s)\n' "$cur"
-    return 2
+  rd_out="$(_fr_done_read "$abs")" || { printf '  items: 실패 — 판독(awk) 실패 (%s)\n' "$rel"; return 1; }
+  IFS=$'\034' read -r tok cls tgt srcl raw <<< "$rd_out"
+  if [[ -z "$raw" || "$tgt" == "0" ]]; then
+    printf "  items: 실패 — '- status:'·'- 상태:' 필드를 찾을 수 없습니다 (%s)\n" "$rel"
+    return 1
+  fi
+  line="$(sed -n "${tgt}p" "$abs")"
+  prev_raw="$raw"; prev_line="$line"
+  want="done"; rest=""
+  if [[ "$tok" == "done" || "$tok" == "dropped" ]]; then
+    if [[ "$line" == "- status: ${tok}" ]]; then
+      printf '  items: 건너뜀 (이미 %s)\n' "$tok"
+      return 2
+    fi
+    want="$tok"; tidy=1
+    rest="${raw#"$tok"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
   fi
   tmp="$(mktemp)" || { printf '  items: 실패 — 임시 파일 생성 실패 (mktemp)\n'; return 1; }
   [[ -n "$tmp" && -f "$tmp" ]] || { printf '  items: 실패 — 임시 파일 경로 검증 실패\n'; return 1; }
-  if ! awk 'BEGIN{done=0} /^- status:/ && !done { print "- status: done"; done=1; next } { print }' "$abs" > "$tmp"; then
-    rm -f "$tmp"
+  bak="$(mktemp)" || { rm -f "$tmp"; printf '  items: 실패 — 임시 파일 생성 실패 (mktemp)\n'; return 1; }
+  if ! cp "$abs" "$bak"; then
+    rm -f "$tmp" "$bak"
+    printf '  items: 실패 — 원본 백업 실패 (%s)\n' "$rel"
+    return 1
+  fi
+  # 설명은 사용자 데이터라 -v 로 넘기지 않는다(-v 는 백슬래시 이스케이프를 해석해 설명을 훼손한다).
+  if ! FR_DONE_NOTE="$rest" awk -v tgt="$tgt" -v want="$want" \
+    'BEGIN { note = ENVIRON["FR_DONE_NOTE"] } NR == tgt { print "- status: " want; if (note != "") print "- status note: " note; next } { print }' \
+    "$abs" > "$tmp"; then
+    rm -f "$tmp" "$bak"
     printf '  items: 실패 — 쓰기 처리(awk) 실패 (%s)\n' "$rel"
     return 1
   fi
-  if ! mv "$tmp" "$abs"; then
+  # 제자리 쓰기: 원본 inode 에 써서 권한·심링크를 보존한다. 원본 끝에 개행이 없으면 awk 가 붙인 개행 1개를 뺀다.
+  # 명령 치환 안의 cat 실패는 printf 의 rc 에 가려지므로, 내용을 먼저 변수로 읽어 읽기 실패를 따로 확인한다.
+  wrc=0
+  if [[ -s "$abs" && -n "$(tail -c1 "$abs")" ]]; then
+    if body="$(cat "$tmp")"; then
+      printf '%s' "$body" > "$abs" || wrc=1
+    else
+      wrc=1
+    fi
+  else
+    cat "$tmp" > "$abs" || wrc=1
+  fi
+  if (( wrc )); then
     rm -f "$tmp"
-    printf '  items: 실패 — 쓰기 실패 (%s)\n' "$rel"
+    _fr_done_restore "$abs" "$bak" "쓰기 실패" "$rel"
     return 1
   fi
-  printf '  items: done (이전값: %s)\n' "$cur"
+  rm -f "$tmp"
+  # 쓰기 뒤 확인: 공용 규칙 재판독 값과 첫 '- status:' 줄의 값 전체가 기대 토큰이어야 한다.
+  rd_out="$(_fr_done_read "$abs")"
+  IFS=$'\034' read -r chk cls tgt srcl raw <<< "$rd_out"
+  line="$(awk '/^- status:/{sub(/^- status:[ \t]*/,""); sub(/[ \t\r]+$/,""); print; exit}' "$abs")"
+  if [[ "$chk" != "$want" || "$line" != "$want" ]]; then
+    _fr_done_restore "$abs" "$bak" "쓴 뒤 재판독 값이 기대와 다릅니다" "$rel"
+    return 1
+  fi
+  rm -f "$bak"
+  if (( tidy )); then
+    printf '  items: 형식 정리 — %s 유지 (이전 줄: %s)\n' "$want" "$prev_line"
+  else
+    printf '  items: done (이전값: %s)\n' "$prev_raw"
+  fi
   return 0
 }
 

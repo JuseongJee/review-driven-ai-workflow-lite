@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 판정이 필요 없는 입력은 라이브러리를 source 하기 전에 끝낸다 (도구 호출 대기 감소).
+# 기존 1단 필터(command_targets_our_commit)의 상위집합이다 — 과탐은 기존 경로가 판정한다.
+_hook_input="$(cat)"; _hook_input_read=1
+_probe="${_hook_input//\\\\\\n/}"            # JSON 의 `\\\n`(원 명령의 백슬래시+개행) 제거
+_probe="${_probe//\\/}"; _probe="${_probe//\'/}"; _probe="${_probe//\"/}"
+[[ "$_probe" == *commit* || "$_hook_input" == *\$\'* || "$_hook_input" == *\\u* ]] || exit 0
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd "${script_dir}/../../.." && pwd)"
 source "${script_dir}/_guard_common.sh"
@@ -22,6 +29,8 @@ command_targets_our_commit "$cmd" "archive_gate" || exit 0
 # 아카이브 커밋을 시도하는 경우」 하나이며, 이 변경의 값은 그 범위 안에서 1건만
 # 보던 것을 전부 보게 하는 것이다. 최종 보장은 절차(`rd task fr-done` 호출)와
 # 발행 후 보고에 있다.
+# 판정 파일(`_fr_status.sh`)은 모든 조기 통과 경로를 지난 뒤, Source FR status 판정 직전에만
+# 로드한다. 로드 실패는 그 시점의 차단 사유다.
 
 # REQUEST.md에서 Source FR 추출
 request_file="${project_root}/REQUEST.md"
@@ -101,7 +110,7 @@ esac
 #
 # **이 분기는 아래 `done|dropped` 조기 통과보다 반드시 앞에 있어야 합니다.** 정상 archive
 # content commit 은 바로 그 커밋에서 FR status 를 `done` 으로 바꾸므로, 순서가 뒤바뀌면
-# 워킹트리의 `done` 표기 하나로 이 제한이 통째로 우회됩니다 (final diff review Finding 3).
+# 워킹트리의 `done` 표기 하나로 이 제한이 통째로 우회됩니다.
 #
 # 상태는 워킹트리의 task-state 파일에서 읽습니다(index도 HEAD 도 아님) — 전이가 커밋 없이
 # 즉시 반영되어야 순환이 생기지 않기 때문입니다.
@@ -147,16 +156,48 @@ pending_out_of_scope_guidance() {
 # 실존은 source_fr_resolve_list 가 이미 보장하므로 여기서 다시 확인하지 않는다.
 # done/dropped 가 아닌 FR 이 하나라도 있으면 첫 건에서 멈추지 않고 전부 모은다 —
 # 사람이 REQUEST 아카이브 전에 한 번에 고칠 수 있어야 한다.
+# 판정 규칙은 공용 `_fr_status.sh` 가 소유한다 (값 = 첫 `- status:` 줄의 첫 토큰, 없으면
+# `- 상태:` 보충). 이 로드를 위쪽 조기 통과 경로보다 앞에 두지 않는 것이 계약이다 — 앞에
+# 두면 REQUEST·세션이 없는 iteration commit 까지 판정 파일 부재로 막힌다. 여기서는
+# 이미 archive 커밋 경로이므로, 판정 파일을 못 읽으면 통과시키지 않고 차단한다.
+fr_status_lib="${script_dir}/../_fr_status.sh"
+# shellcheck disable=SC1090
+# 없는 파일을 바로 source 하면 set -e 아래에서 bash 3.2 가 `if !` 안에서도 셸을 끝내므로
+# 읽을 수 있는지를 먼저 본다.
+if ! { [[ -r "$fr_status_lib" ]] && source "$fr_status_lib" 2>/dev/null; } || [[ -z "${FR_STATUS_AWK:-}" ]]; then
+  echo "[guard] FR status 판정 파일을 읽지 못해 아카이브 커밋을 막습니다: ${fr_status_lib}" >&2
+  echo "[guard] rd-workflow 배치가 불완전합니다 — rd-workflow/scripts/_fr_status.sh 가 있는지 확인하세요." >&2
+  # reason: FR status 판정 파일(_fr_status.sh)을 읽지 못해 아카이브 커밋을 막은 분기.
+  guard_deny "pre_commit_archive_gate.fr-status-lib-missing"
+fi
+fr_status_awk_vars
+
 incomplete=""
 while IFS= read -r fr; do
   [[ -z "$fr" ]] && continue
   fr_file="${project_root}/${fr}"
-  fr_status="$(awk '
-    /^- status:/ { gsub(/^- status:[[:space:]]*/, ""); print; exit }
-  ' "$fr_file")"
-  if [[ "$fr_status" != "done" && "$fr_status" != "dropped" ]]; then
-    incomplete="${incomplete:+${incomplete}$'\n'}${fr}"$'\t'"${fr_status}"
+  frs_out=""
+  if [[ -r "$fr_file" ]] && frs_out="$(awk "${FR_STATUS_AWK_ARGS[@]}" "$FR_STATUS_AWK"'
+      BEGIN { frs_init(); frs_reset() }
+      { frs_feed($0, NR) }
+      END { printf "%s\034%s\n", frs_value(), frs_src_raw() }
+    ' "$fr_file")"; then
+    frs_v="${frs_out%%$'\034'*}"
+    frs_raw="${frs_out#*$'\034'}"
+    if [[ "$frs_v" == "done" || "$frs_v" == "dropped" ]]; then
+      continue
+    fi
+    if [[ -z "$frs_v" ]]; then
+      frs_shown="(값 없음)"
+    elif [[ "$frs_raw" != "$frs_v" ]]; then
+      frs_shown="'${frs_v}' (원문: '${frs_raw}')"
+    else
+      frs_shown="'${frs_v}'"
+    fi
+  else
+    frs_shown="(읽기 실패)"
   fi
+  incomplete="${incomplete:+${incomplete}$'\n'}${fr}"$'\t'"${frs_shown}"
 done <<< "$source_fr_list"
 
 if [[ -z "$incomplete" ]]; then
@@ -173,7 +214,7 @@ fi
 echo "[guard] diff review가 통과했지만 REQUEST 아카이브가 완료되지 않았습니다." >&2
 while IFS=$'\t' read -r fr fr_status; do
   [[ -z "$fr" ]] && continue
-  echo "[guard] Source FR '${fr}'의 status가 '${fr_status}'입니다 (done/dropped 필요)." >&2
+  echo "[guard] Source FR '${fr}'의 status가 ${fr_status}입니다 (done/dropped 필요)." >&2
 done <<< "$incomplete"
 if [[ "$pending_block" == "1" ]]; then
   # 아카이브 보류 + 기록 경로 밖 변경: 지금 아카이브하라는 안내는 틀린 다음 행동이다 (외부 검증이

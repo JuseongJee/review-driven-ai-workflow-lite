@@ -130,10 +130,12 @@ git status --short
 
 이 단계에서 처리되는 항목:
 - PROJECT_CONTEXT.md 채우기
-- 검증 스크립트(build/test/lint/typecheck) 채우기
+- 검증 스크립트(build/test/lint/typecheck) 채우기 — full 배포본만
 - Skill 설치
 - 리뷰 도구 감지
-- 확장 기능 설치 (선택)
+- 확장 기능 설치 (선택) — full 배포본만
+
+lite 배포본의 `setup_with_claude.md` 에는 「full 배포본만」 표시한 단계가 없다.
 
 <a id="project-context"></a>
 ## PROJECT_CONTEXT 규약 추가

@@ -136,6 +136,7 @@ G -C "$X/top" submodule deinit -q -f libs/prod; rm -rf "$X/top/.git/modules"; sx
 # ===========================================================================
 
 RD_SRC="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/fixtures/review_run_fixture.sh"
 
 # nested_copy <dir> — 한 번 만든 3단 저장소 틀(tpl)을 복사해 시간을 아낀다. top 경로를 출력한다.
 # submodule 의 .git 파일·core.worktree 가 상대 경로라 복사해도 동작하고, url 은 틀 안의 원본을 가리킨다.
@@ -226,8 +227,10 @@ set_awaiting_reviewer() {
 }
 # close_session <session> — 종결 상태 (Status=closed, Open Issues 없음)
 close_session() {
-  set_session_state "$1" closed Author
   printf '# Review Checkpoint\n\n## Open Issues\n- 없음\n\n## Suggested Next Owner\nAuthor\n' > "$1/CHECKPOINT.md"
+  # seal 은 리뷰어 턴 실행 기록을 대조하므로 제품 함수로 기록을 남깁니다 (복사본 repo 의 scripts 사용).
+  fixture_reviewer_turn "$1" "${1%/${SESS_REL}/*}/rd-workflow/scripts"
+  set_session_state "$1" closed Author
 }
 # seal_with_evidence <repo> <session> — verify_record 증거를 직접 깔고 rd review seal. rc 는 SEAL_RC, 출력은 OUT/seal.{out,err}.
 seal_with_evidence() {

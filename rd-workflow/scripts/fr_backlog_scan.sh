@@ -75,7 +75,10 @@ for sha in ${tips[@]+"${tips[@]}"}; do
     case "$p" in
       "$BACKLOG"/items/*.md)
         b="$(basename "$p" .md)"; slug="${b#[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-}"
-        if git show "${sha}:${BACKLOG}/FUTURE_REQUESTS.md" 2>/dev/null | grep -q "| ${slug} |"; then rowtxt="있음"; else rowtxt="없음"; fi
+        # pipefail 아래 `git show | grep -q` 는 큰 인덱스에서 grep 이 먼저 끝나 git show 가 SIGPIPE 로 죽고
+        # 파이프 전체가 실패로 뒤집힌다. 출력을 다 받은 뒤 판정한다.
+        idx="$(git show "${sha}:${BACKLOG}/FUTURE_REQUESTS.md" 2>/dev/null || true)"
+        if [[ "$idx" == *"| ${slug} |"* ]]; then rowtxt="있음"; else rowtxt="없음"; fi
         d="$(git log -1 --format=%cs "$sha" -- "$p" 2>/dev/null || true)"
         block="${block}  FR ${slug} (인덱스 행 ${rowtxt}, 마지막 커밋 ${d})${note}"$'\n'; cand=$((cand+1)) ;;
       *) block="${block}  기타: ${p}${note}"$'\n'; other=$((other+1)) ;;

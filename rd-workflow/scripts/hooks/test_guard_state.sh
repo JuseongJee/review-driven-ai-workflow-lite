@@ -494,7 +494,7 @@ echo "--- fixture 9: seal 선택 규칙 ---"
 # Fixture 10: force-skip 우회의 audit 기록 실패 → 차단
 #   잡는 실수: `mkdir -p` 와 append 의 종료 상태를 확인하지 않고 항상 `return 0` 하는 것.
 #   그러면 우회의 **유일한 흔적**이 통째로 사라진 채 "audit log 기록" 이라고 잘못 알리고
-#   발행이 계속됩니다 (final diff review turn 004 Finding 1).
+#   발행이 계속됩니다.
 #   실패는 권한이 아니라 경로 형태로 만듭니다 — root 실행에서도 결과가 같아야 합니다.
 # ---------------------------------------------------------------------------
 echo "--- fixture 10: force-skip audit 기록 실패 ---"

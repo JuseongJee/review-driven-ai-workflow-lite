@@ -103,12 +103,18 @@ autopilot 모드와 반자율(semi-auto) 모드가 공통으로 따르는 자율
 - final diff review 가 `이의 없음` 으로 종결되면 `rd review seal <세션 경로>` → `rd task set-status "아카이브 보류"` → archive 기록 커밋(seal 파일 포함) 까지는 **묻지 않고 진행한다.** 이 셋은 되돌릴 수 있는 로컬 작업이다.
 - **발행 승인 주체는 `rd-workflow/config/workflow.json` 의 `publish_approval` 이 정한다.** 값은 `caller`(기본 — 키·파일 없음 포함) 또는 `user` 이고, 허용 밖 값·파싱 실패는 `user` 로 보고 경고한다. 승인(허가) 전에는 `archive.sh` 를 호출하지 않는다. 허가 이후의 merge·tag·push 만 중단 조건 6의 예외 ①(정규 archive lifecycle)에 포함된다.
   - **호출 세션 허가** — `caller` 이고 promote 가 호출 세션을 기록한 작업(색인 `caller-id` 있음, `launch=ok`): 기록 커밋 뒤 `bash rd-workflow/scripts/rd publish request` 로 발행 요청 큐에 넣고, `rd publish wait` 를 백그라운드로 실행해 허가를 기다린다. 허가되면 `rd publish run` 으로 발행한다(`archive.sh` 를 직접 부르지 않는다). 사용자에게 묻지 않는다. 결과가 「부분 완료」 면 같은 `rd publish run` 으로 복구하고, 「발행 중」 으로 멈췄으면 `rd publish recover` 로 판정한다. 상태는 `rd publish status` 로 본다.
-  - **사용자 승인** — `user` 이거나 호출 세션이 없는 작업(직접 띄운 세션, 자동 기동 실패·미지원): `rd publish request` 가 종료 코드 10 으로 이 경로를 알린다. **`archive.sh` 호출 직전에 사용자에게 1회 묻고** 승인 뒤 `archive.sh` 를 실행한다. 호출 세션이 사라져 요청이 「사용자 승인 대상」 이 되면(종료 코드 11) 사용자에게 묻고, 승인 뒤 `rd publish approve` → `rd publish run` 으로 진행한다.
+    - archive 우회(`--allow-gitlink-drop`, `--force-skip-review-check`)가 필요하면 `rd publish request [--allow-gitlink-drop <사유>] [--force-skip-review-check <사유>] --basis <근거>` 로 옵션과 사유를 붙인다. 큐는 `--allow-status-mismatch` 를 받지 않는다.
+    - 우회는 사람만 내릴 수 있는 판단이다(중단 조건 3). 자율 모드는 스스로 우회 옵션을 넣지 않고 멈춰 막힌 사유와 선택지를 보고한다.
+    - 사람이 답하면 AI 가 그 말을 `--basis` 로 옮긴다. 권장 형식은 `user-override` 근거 줄과 같다: `<날짜> <결정한 사람> — "<그 사람이 한 말>"`. 사용자가 작업 세션에 이미 지시한 결정이면 다시 묻지 않고 그 지시를 옮긴다.
+    - `archive.sh` 는 사유를 `<사유> (근거: <근거>)` 로 합친 값으로 받아 audit 에 남긴다.
+    - 호출 세션은 `rd publish watch`·`next` 출력에 우회가 보이면 허가 사실과 함께 옵션·사유·근거를 사용자에게 알린다. 사용자는 인용된 근거로 자기 결정인지 확인한다.
+  - **사용자 승인** — `user` 이거나 호출 세션이 없는 작업(직접 띄운 세션, 자동 기동 실패·미지원): `rd publish request` 가 종료 코드 10 으로 이 경로를 알린다. **`archive.sh` 호출 직전에 사용자에게 1회 묻고** 승인 뒤 `archive.sh` 를 실행한다(우회가 필요하면 같은 옵션과 `<사유> (근거: <근거>)` 로 합친 사유를 붙인다). 호출 세션이 사라져 요청이 「사용자 승인 대상」 이 되면(종료 코드 11) 사용자에게 묻고, 승인 뒤 `rd publish approve` → `rd publish run` 으로 진행한다.
   - **호출 세션의 몫** — 작업을 띄운 호출 세션은 `rd publish watch` 를 백그라운드로 두고, 끝나면 출력된 사건을 처리한 뒤 다시 띄운다. 요청이 오면 `rd publish next` 로 가장 오래된 요청 하나만 허가한다. 결과·부분 완료·사용자 승인 대상은 사용자에게 알리고, 자동 해소 밖 충돌·발행 실패는 사용자에게 올린다. 요청·허가·결과는 큐 파일로만 주고받고 어느 세션의 입력창에도 글을 넣지 않는다.
 - 사용자 승인 질문에는 실제 효과를 드러낸다. 표시값의 의미는 현행 `archive.sh` 와 일치시킨다 — 지금 확정할 수 있는 것만 확정값으로 적고, 확정할 수 없는 것은 그렇게 적는다.
 
 | 표시 항목 | 확정성 | 비고 |
 |---|---|---|
+| 변경 요약 | **PR 본문에서 옮김** | 무엇을·왜(`## Summary`)와 되돌리기와 영향 범위(`## 되돌리기와 영향 범위`)를 각 한 줄로, PR 본문 위치(`## PR 본문` 절을 담은 가장 최근 Author 턴 경로)와 함께 적는다. 새로 쓰지 않는다 — PR 본문과 어긋난다. |
 | merge 대상 | **확정값 — branch 모드별** | 아래 모드 표 |
 | push 대상 | **확정값 — remote 모드별** | 아래 모드 표 |
 | tag | **이름 규칙과 예상값**(정확한 ref 아님) | 실제 이름은 merge·metadata cleanup 커밋 뒤 현재 분 시각과 충돌 회피 결과로 정해진다. **정확한 ref 를 약속하지 않는다.** |
@@ -125,8 +131,13 @@ autopilot 모드와 반자율(semi-auto) 모드가 공통으로 따르는 자율
 
 `local-only` 에서는 「기본 브랜치 미push 커밋 수」도 **`해당 없음`** 으로 표시한다 — 발행할 원격이 없으므로 그 수가 의미를 갖지 않는다.
 
+- 질문 끝에 「승인 전에 변경을 퀴즈나 그림 설명으로 확인할 수 있습니다」 한 줄을 둔다. 기본은 바로 승인이고, 확인은 사용자가 원할 때만 한다.
 - `아카이브 보류` 는 「리뷰 종결·발행 대기」이며 **완료가 아니다.** 사용자가 승인을 보류하거나 큐 허가를 기다리면 이 상태와 기록 커밋이 그대로 유지되어 나중에 재개할 수 있고, 이 상태로 세션이 끝나면 완료 보고에 "발행 미완" 으로 남긴다.
 - seal 이 「리뷰 종결 후 보호 경로가 변경되었습니다」로 거부되면 그것은 실패가 아니라 정상 판정이다. 같은 세션에서 재리뷰를 이어 종결시킨 뒤 seal 을 다시 실행한다 (마커는 4검사를 모두 통과할 때만 교체되고, 실패하면 기존 마커가 보존된다).
+- seal 은 세션의 `reviewer_runs.tsv` 실행 기록을 대조한다. 기록이 없거나(`run-missing`) 마지막 리뷰어 턴이 이의 없이 끝났다는 기록이 없으면(`reason-unproven`) 거부한다. 거부되면 `run_review_turn.sh` 로 리뷰어 턴을 다시 돌린다. 사람이 남은 이의를 덮고 종결하기로 정한 경우에만 SESSION 의 `## Closure Reason` 에 `user-override` 를 적는다.
+  - 이 결정은 중단 조건 3(사람만 내릴 수 있는 판단)이다. 자율 모드는 스스로 `user-override` 를 정하지 않고 `awaiting-user` 로 멈춰 남은 이의와 선택지를 보고한다.
+  - 사람이 답하면(예: autopilot 이 멈춘 뒤 사람이 「덮고 종결해」 라고 답함) AI 가 그 말을 `근거:` 줄로 옮겨 적고 seal 한다. 이 경로는 막히지 않는다.
+  - seal 은 근거 줄이 없으면 거부한다(`override-basis-missing`, `FILE_BASED_REVIEW_PIPELINE.md` 「종결 사유 (Closure Reason)」 절).
 
 **legacy 세션 — `--legacy-unverified` 는 자율 진행 대상이 아니다**:
 - **legacy 의 정의는 기계적이다.** 세션 `SESSION.md` 의 `## Branch Context` 에 `review-head-oid` 가 **없는** 세션이 legacy 다. 사람도 AI 도 "오래된 세션 같다" 로 판단하지 않는다. 이런 세션은 리뷰 당시 커밋이 어디에도 기록되어 있지 않아 일반 `rd review seal` 이 검사 3에서 거부한다.
@@ -163,13 +174,13 @@ autopilot 모드와 반자율(semi-auto) 모드가 공통으로 따르는 자율
 3. 사람의 우선순위 결정이 반드시 필요한 경우 (기술적 판단이 아닌 비즈니스 판단 — REQUEST/FR의 전제가 깨지는 요구사항·범위 변화 포함)
 4. 세션 한계 도달
 5. brainstorming에서 모든 옵션이 필수 제약을 위반하거나 판단 근거가 전혀 없는 경우
-6. **파괴적·비가역 작업** — 데이터 삭제, 외부 배포·공개 릴리즈 발행, 권한/계정 변경 등은 자율 진행하지 않고 멈춘다. **예외 두 가지**: ① **사용자 승인 또는 호출 세션 허가 이후** 현재 FR의 정규 archive lifecycle(`archive.sh`, 큐 경유면 `rd publish run`)에서 수행되는 merge·tag·push — 「종결 마커(seal)와 발행 승인」 절의 승인·허가를 받은 뒤의 단계다. **사용자 승인 경로에서는 승인 자체를 이 조건의 일반 규칙대로 반드시 묻는다.** ② `light` 등급 마감의 기본 브랜치 커밋 1개 직후 push — 원격 모드이고, 시작 보고 블록의 `push 예정` 필드에 `light` 마감 push 를 적었고, 커밋 전 재분류가 `light` 를 확정한 경우에 한한다(WORKFLOW.md 시작 계약·마감 상태 계약). 시작 계약 4항이 ahead 를 감지해 `push 예정` 을 보류로 적었으면 사용자의 명시 채택 없이는 이 push 도 하지 않고 "미push" 로 인계한다. 실패하면 push 를 재시도하지 않고 종료 보고에 "미push" 로 넘긴다. 그 밖의 lifecycle script 밖 push·배포·릴리즈·삭제는 착수 지시가 있어도 항상 중단 대상이다.
+6. **파괴적·비가역 작업** — 데이터 삭제, 외부 배포·공개 릴리즈 발행, 권한/계정 변경 등은 자율 진행하지 않고 멈춘다. **예외 두 가지**: ① **사용자 승인 또는 호출 세션 허가 이후** 현재 FR의 정규 archive lifecycle(`archive.sh`, 큐 경유면 `rd publish run`)에서 수행되는 merge·tag·push — 「종결 마커(seal)와 발행 승인」 절의 승인·허가를 받은 뒤의 단계다. **사용자 승인 경로에서는 승인 자체를 이 조건의 일반 규칙대로 반드시 묻는다.** 무인(headless) 실행에서는 front-end(`ralph_drain.sh`·`/fr batch`)를 띄울 때 사람이 고른 `RD_FINISH_POLICY` 가 그 실행의 발행 승인이며, wrapper 가 발행 요청 큐 없이 `archive.sh` 를 실행한다. ② `light` 등급 마감의 기본 브랜치 커밋 1개 직후 push — 원격 모드이고, 시작 보고 블록의 `push 예정` 필드에 `light` 마감 push 를 적었고, 커밋 전 재분류가 `light` 를 확정한 경우에 한한다(WORKFLOW.md 시작 계약·마감 상태 계약). 시작 계약 4항이 ahead 를 감지해 `push 예정` 을 보류로 적었으면 사용자의 명시 채택 없이는 이 push 도 하지 않고 "미push" 로 인계한다. 실패하면 push 를 재시도하지 않고 종료 보고에 "미push" 로 넘긴다. 그 밖의 lifecycle script 밖 push·배포·릴리즈·삭제는 착수 지시가 있어도 항상 중단 대상이다.
 
-8. **FR 경과 시간 상한** — 무인(headless) 실행에만 적용한다. 기준은 `autopilot_headless.sh` 호출 1회의 경과 시간이고, 기본 상한은 240분이다. 상한은 환경변수 `RD_FR_WALL_MINUTES` > `loop-guard.json` 의 `wall_minutes` 키(분 단위 정수) > 기본값 순으로 정하며, `0` 은 상한 없음이다. 대화형 autopilot·반자율에는 적용하지 않는다. 무인에서는 `awaiting-user` 대신 outcome `blocked:time-cap` 을 기록한다.
+8. **FR 경과 시간 상한** — 무인(headless) 실행에만 적용한다. 기준은 `autopilot_headless.sh` 호출 1회에서 claude 세션이 도는 경과 시간이고(세션 종료 뒤 wrapper 의 발행 단계는 포함하지 않는다), 기본 상한은 240분이다. 상한은 환경변수 `RD_FR_WALL_MINUTES` > `loop-guard.json` 의 `wall_minutes` 키(분 단위 정수) > 기본값 순으로 정하며, `0` 은 상한 없음이다. 대화형 autopilot·반자율에는 적용하지 않는다. 무인에서는 `awaiting-user` 대신 outcome `blocked:time-cap` 을 기록한다. 발행 단계는 별도 상한을 가진다. 상한은 환경변수 `RD_PUBLISH_WALL_MINUTES` > `loop-guard.json` 의 `publish_wall_minutes` 키 > 기본 30분 순으로 정하며, 분 단위이고 소수를 허용한다. `0` 은 상한 없음이다. 유예는 `RD_FR_WALL_GRACE_SECONDS` 를 공유한다. 상한을 넘기면 발행 그룹에 TERM 을 보내고 유예 뒤 KILL 한다. 결과는 병합 전이면 `blocked:publish-failed`, 병합 후이면 `blocked:publish-incomplete`(이어붙이기)이다. KILL 뒤에도 프로세스가 남으면 `blocked:publish-unsafe` 이며 재실행하지 않는다. 발행 중 wrapper 가 INT·TERM·HUP 을 받으면 같은 회수·분류를 한 뒤 128+신호 번호로 끝난다. 발행 그룹 밖으로 스스로 빠져나간 후손(`setsid` 를 직접 부른 프로세스)은 회수 대상이 아니다.
 
 ## 무인(headless) 모드 outcome 매핑
 
-무인 진입(autopilot SKILL.md "무인 진입" 섹션)에서는 위 중단조건에 도달해도 사람을 기다릴 수 없다. 따라서 `awaiting-user` 로 멈춰 대기하는 대신, outcome 토큰 `blocked:<reason>` 을 `$RD_AUTOPILOT_OUTCOME_FILE` 에 기록하고 종료한다(중단조건 도달 시 skill 은 해당 FR status 를 `blocked` 로 기록한다. fr 브랜치가 활성인 작업의 `CURRENT_TASK.md`·task-state 는 reset 하지 않고 보존하며, 재개 후보 제외는 FR 의 blocked 항목이 맡는다. 상세는 autopilot SKILL.md "중단조건 → blocked 매핑"). 정상 완주는 `completed`, 세션 한계는 `resume`, 큐 빔은 `queue-empty` 다. wrapper `rd-workflow/scripts/autopilot_headless.sh` 가 이를 exit code(0/10/20/30/40)로 매핑한다. exit code 해석은 front-end(ralph/batch) 소관이다.
+무인 진입(autopilot SKILL.md "무인 진입" 섹션)에서는 위 중단조건에 도달해도 사람을 기다릴 수 없다. 따라서 `awaiting-user` 로 멈춰 대기하는 대신, outcome 토큰 `blocked:<reason>` 을 `$RD_AUTOPILOT_OUTCOME_FILE` 에 기록하고 종료한다(중단조건 도달 시 skill 은 해당 FR status 를 `blocked` 로 기록한다. fr 브랜치가 활성인 작업의 `CURRENT_TASK.md`·task-state 는 reset 하지 않고 보존하며, 재개 후보 제외는 FR 의 blocked 항목이 맡는다. 상세는 autopilot SKILL.md "중단조건 → blocked 매핑"). 정상 완주는 `completed`, 세션 한계는 `resume`, 큐 빔은 `queue-empty` 다. wrapper `rd-workflow/scripts/autopilot_headless.sh` 가 이를 exit code(0/10/20/30/40)로 매핑한다. exit code 해석은 front-end(ralph/batch) 소관이다. `push`·`merge` 정책의 발행은 세션이 아니라 wrapper 가 한다. 세션은 기록 커밋 뒤 내부 토큰 `publish-ready` 를 남기고 끝나며, wrapper 가 `archive.sh` 를 실행한 결과로 `completed` 또는 `blocked:publish-failed`·`blocked:publish-incomplete`·`blocked:publish-unsafe` 를 쓴다. exit code 표는 바뀌지 않는다.
 
 **재개 판정과 `blocked:resume-undetermined`**: 무인 진입은 새 작업을 고르기 전에 진행 중인 fr 작업이 있는지 `rd-workflow/scripts/batch/resume_candidates.sh` 로 판정한다. 출처는 tasks 색인(`<git-common-dir>/rd-workflow/tasks.local`)과 각 worktree 의 `task-state` 이며 메인 `CURRENT_TASK.md` 가 아니다. 판정은 읽기 전용이다. `launch=ok`(대화형 세션 기동 이력) 작업은 무조건 제외하지 않고 세 갈래로 판정한다. herdr 에이전트 목록·이름과 로컬 `claude` 프로세스 cwd 를 읽기 전용으로 관측해 세 관측이 모두 완전하고 세션이 없으면 종료로 보고 후보에 넣는다(색인의 launch 값은 바꾸지 않는다). herdr app 으로 기동한 작업(색인 `launch-backend=hc`)은 이름 조회를 `hc get` 으로 한다. 세션이 살아 있다는 근거가 있으면 제외한다. 판정할 수 없으면(herdr 없음·조회 실패·시간 초과·불완전 관측) 제외하고 `rd task resolve-launch <slug> --assume-ended` 로 수동 확정하라고 안내한다. `완료`·정리 대기·worktree 부재·source FR 이 `blocked` 인 작업은 후보가 아니다. 생존·소유를 확인할 수 없는 작업(`launch` 가 `unknown`·`launching`·빈 값, 단계 판정 불가, 색인과 작업 파일 불일치, 색인 읽기 실패)이 있고 검증된 후보가 없으면 새 FR 을 고르지 않고 outcome `blocked:resume-undetermined` 로 멈춘다. FR status 와 `CURRENT_TASK.md` 는 바꾸지 않는다(대상 FR 이 없는 전역 실패). 재개 대상·제외 사유·다음 조치는 outcome 둘째 줄 이후에 남고 wrapper 가 이를 출력한다. exit code 표(0/10/20/30/40)는 바뀌지 않는다.
 

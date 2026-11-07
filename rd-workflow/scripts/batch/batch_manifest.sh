@@ -327,8 +327,10 @@ cmd_verify_done() {
   [[ "$slug" =~ ^[a-z0-9-]+$ ]] || die2 "비정규 slug: '${slug}' (허용: ^[a-z0-9-]+$)"
   local fr_file
   fr_file="$(_fr_items_file "$slug")" || { echo "verify-done: items 파일 없음: ${slug}" >&2; return 1; }
-  local status
-  status="$(awk '/^- status:/{gsub(/^- status:[[:space:]]*/,"");print;exit}' "$fr_file")"
+  local frs_file="${BM_DIR}/../_fr_status.sh" status _c _k
+  [ -r "$frs_file" ] && . "$frs_file" && [ -n "${FR_STATUS_AWK:-}" ] \
+    || die2 "FR status 판정 파일을 읽지 못했습니다: ${frs_file}"
+  IFS=$'\034' read -r _c status _k <<< "$(fr_status_scan "$fr_file" | head -1)"
   [ "$status" = "done" ] || { echo "verify-done: status=${status} (≠done): ${slug}" >&2; return 1; }
   [ -n "$(_archive_tasks_for_fr "$fr_file")" ] && return 0
   echo "verify-done: archive 파일 없음(Source FR 일치 없음): ${slug}" >&2; return 1
@@ -385,6 +387,49 @@ _as_emit() {
     not-archived)       printf 'archive-state: merge 근거 없음 — 일반 재시도 대상\n' ;;
     unknown)            printf 'archive-state: 판정 불가 (%s) — 상태를 보존하고 중단합니다. 완료로도 미병합으로도 취급하지 않습니다\n' "${4:--}" ;;
   esac
+}
+
+# --- 원격 조회 시간 상한 ---
+# 무인 batch 는 사람이 지켜보지 않으므로 원격이 응답하지 않으면 판정과 오케스트레이터가
+# 함께 무기한 멈춘다. macOS 에는 `timeout` 이 없어 session_launch.sh 의
+# _session_launch_run_with_timeout 과 같은 방식(백그라운드 + 폴링 + kill)을 쓴다.
+# 대상은 exec 로 띄워 PID 가 명령 자신이 되게 하고, 상한을 넘으면 그 직계 자식
+# (git 의 ssh·git-remote-https)을 먼저 끝낸 뒤 명령을 끝낸다 — 고아 연결을 남기지 않는다.
+# 상한: RD_BATCH_REMOTE_TIMEOUT 초(정수 1~600, 그 밖·미설정은 30).
+_bm_remote_timeout_secs() {
+  local v="${RD_BATCH_REMOTE_TIMEOUT:-}"
+  case "$v" in ''|*[!0-9]*) printf '30\n'; return 0 ;; esac
+  # 산술 변환 전에 자릿수로 거른다 — 큰 값이 정수 오버플로로 범위 안에 들어오지 않게 한다.
+  v="${v#"${v%%[!0]*}"}"
+  if [ -z "$v" ] || [ "${#v}" -gt 3 ]; then printf '30\n'; return 0; fi
+  v=$((10#$v))
+  if [ "$v" -lt 1 ] || [ "$v" -gt 600 ]; then printf '30\n'; else printf '%s\n' "$v"; fi
+}
+
+# _bm_run_with_timeout <secs> <outfile> <cmd...> — stdout 은 outfile, stderr 는 버린다.
+# 리턴: 명령의 종료 코드, 상한 초과면 124.
+_bm_run_with_timeout() {
+  local secs="$1" outfile="$2"; shift 2
+  : > "$outfile"
+  ( exec "$@" >"$outfile" 2>/dev/null ) &
+  local pid=$! start="$SECONDS"
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ $((SECONDS - start)) -ge "$secs" ]; then
+      # 자식 PID 를 신호 전에 확보한다 — 부모가 먼저 끝나면 자식이 재부모화돼
+      # `pkill -P` 로는 다시 찾을 수 없다. KILL 도 확보한 PID 로 보낸다.
+      local kids k
+      kids="$(pgrep -P "$pid" 2>/dev/null)"
+      for k in $kids; do kill -TERM "$k" 2>/dev/null || true; done
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 0.2
+      for k in $kids; do kill -KILL "$k" 2>/dev/null || true; done
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 0.2
+  done
+  wait "$pid"
 }
 
 cmd_archive_state() {
@@ -485,11 +530,20 @@ cmd_archive_state() {
     fi
 
     # 원격 ref 를 한 번의 호출로 함께 읽는다 — 실패 지점이 하나로 모인다.
-    local ls_out
-    if ! ls_out="$(git ls-remote origin \
-          "refs/heads/${default_branch}" \
-          "refs/tags/${tag:-__none__}" \
-          "refs/heads/fr/${task}" 2>/dev/null)"; then
+    # 시간 상한 초과(remote-timeout)와 즉시 실패(remote-unreachable)를 구별한다 —
+    # 다음 행동(연결 확인 vs 상한 조정)이 다르다.
+    local ls_out ls_file ls_rc
+    ls_file="$(mktemp)" || { _as_emit unknown "$policy" "${missing:--}" "tmpfile-failed"; return 0; }
+    _bm_run_with_timeout "$(_bm_remote_timeout_secs)" "$ls_file" git ls-remote origin \
+      "refs/heads/${default_branch}" \
+      "refs/tags/${tag:-__none__}" \
+      "refs/heads/fr/${task}"
+    ls_rc=$?
+    ls_out="$(cat "$ls_file" 2>/dev/null)"
+    rm -f "$ls_file"
+    if [ "$ls_rc" -eq 124 ]; then
+      _as_emit unknown "$policy" "${missing:--}" "remote-timeout"; return 0
+    elif [ "$ls_rc" -ne 0 ]; then
       _as_emit unknown "$policy" "${missing:--}" "remote-unreachable"; return 0
     fi
 

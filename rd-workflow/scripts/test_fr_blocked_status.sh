@@ -22,7 +22,7 @@ must_contain "$LIST_MD" 'set-aside' "list.md set-aside 요약 푸터 존재"
 must_contain "$FR_MD" '`blocked`' "FUTURE_REQUESTS.md 상태 값에 blocked"
 # auto-pick 화이트리스트는 여전히 validated/ready-for-request 만 (blocked 자동 제외 보장)
 must_contain "$AP_MD" 'validated / ready-for-request 후보' "auto-pick 화이트리스트 유지"
-# Finding 1: 파일 분리 문서가 blocked 인덱스 잔류를 명시해 상태값 목록과 모순되지 않는지
+# 파일 분리 문서가 blocked 인덱스 잔류를 명시해 상태값 목록과 모순되지 않는지
 if grep -A4 '## 파일 분리' "$FR_MD" | grep -q 'blocked'; then echo "  ok  파일 분리에 blocked 잔류 명시"; else echo "  FAIL 파일 분리에 blocked 미명시 ($FR_MD)"; fail=1; fi
 PRI_MD="${ROOT}/rd-workflow/claude_skills/fr/pri.md"
 PUSH_MD="${ROOT}/rd-workflow/claude_skills/fr/push.md"

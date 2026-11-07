@@ -7,6 +7,8 @@ source "$SCRIPT_DIR/../_submodule_common.sh"
 # 색인·락(Task 1) — launching 예약 확인·발행 기록(state=cleanup-pending)에 쓴다.
 # 가볍고 project_root 를 요구하지 않아 항상 source 해 둔다(호출 시점에만 git 저장소면 된다).
 source "$SCRIPT_DIR/_tasks_index.sh"
+# 병합 충돌 사전 판정 공용 함수(발행 큐와 공유) — 자동 해소 대상 목록·충돌 판정·해소 안내.
+source "$SCRIPT_DIR/_merge_precheck.sh"
 
 # _archive_read_field_at <worktree-path> <key> — 다른 worktree 의 task-state 를
 # **cd 없이 경로로 직접** 읽는다. `state_read_field` 는 source 시점에 확정된
@@ -33,7 +35,7 @@ _archive_read_field_at() {
 # 이 배열을 그대로 전달한다.
 ORIG_ARGS=("$@")
 
-DRY_RUN=0; FORCE_DIRTY=0; NO_REMOTE=0; FR_BRANCH_OVERRIDE=""; FORCE_SKIP_REVIEW=0; SKIP_REASON=""; ALLOW_STATUS=0; STATUS_REASON=""; TASK_SLUG_ARG=""
+DRY_RUN=0; FORCE_DIRTY=0; NO_REMOTE=0; FR_BRANCH_OVERRIDE=""; FORCE_SKIP_REVIEW=0; SKIP_REASON=""; ALLOW_STATUS=0; STATUS_REASON=""; ALLOW_GITLINK=0; GITLINK_REASON=""; TASK_SLUG_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fr-branch) FR_BRANCH_OVERRIDE="$2"; shift 2 ;;
@@ -51,7 +53,12 @@ while [[ $# -gt 0 ]]; do
       # --force-skip-review-check 와 같은 모양 — 사유 누락은 빈 값으로 두고 헬퍼가 차단한다.
       if [[ $# -ge 2 && "$2" != -* ]]; then STATUS_REASON="$2"; shift 2; else shift 1; fi
       ;;
-    -h|--help) printf '%s\n' "usage: archive.sh [--fr-branch <ref>] [--task <slug>] [--no-remote] [--force-dirty] [--force-skip-review-check <사유>] [--allow-status-mismatch <사유>] [--dry-run]"; exit 0 ;;
+    --allow-gitlink-drop)
+      ALLOW_GITLINK=1
+      # 같은 모양 — 사유 누락은 빈 값으로 두고 archive_gitlink_gate 가 차단한다.
+      if [[ $# -ge 2 && "$2" != -* ]]; then GITLINK_REASON="$2"; shift 2; else shift 1; fi
+      ;;
+    -h|--help) printf '%s\n' "usage: archive.sh [--fr-branch <ref>] [--task <slug>] [--no-remote] [--force-dirty] [--force-skip-review-check <사유>] [--allow-status-mismatch <사유>] [--allow-gitlink-drop <사유>] [--dry-run]"; exit 0 ;;
     *) printf 'archive: unknown arg: %s\n' "$1" >&2; exit 1 ;;
   esac
 done
@@ -75,8 +82,8 @@ done
 # rc** 만 보고, git 이 실패해 빈 문자열을 내도 `dirname ""` → "." 는 rc=0 이라 에러
 # 분기가 실행되지 않는다(`--path-format` 은 git 2.31+ 이라 구버전에서 이 경로를 실제로
 # 탄다). 그러면 PUBLISH_WT="." 가 되어 CALLER_WT 와 달라 mismatch 분기로 들어가고,
-# `cd "."`(=호출자 worktree) 후 그 자리에서 재실행돼 **작업 worktree 안에서 발행**된다
-# (리뷰 지적) — 그래서 git 명령의 rc 와 출력값을 직접 검증한다. stderr 도 가리지 않는다
+# `cd "."`(=호출자 worktree) 후 그 자리에서 재실행돼 **작업 worktree 안에서 발행**된다.
+# 그래서 git 명령의 rc 와 출력값을 직접 검증한다. stderr 도 가리지 않는다
 # (2>/dev/null 제거) — 실패 시 git 의 원래 진단이 그대로 보여야 원인을 알 수 있다.
 _archive_git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir)" || {
   printf 'archive: git-common-dir 조회 실패(git repo 외부이거나 --path-format 미지원 구버전 git) — 중단합니다.\n' >&2
@@ -98,7 +105,7 @@ CALLER_WT="$(git rev-parse --show-toplevel)" || {
 # `TASK_STATE_PATH` 를 source 시점의 `$PWD` 로 굳히므로(FR archive-cwd-dependent-state-path),
 # 여기서 그대로 진행하면 상태 파일이 하위 디렉터리 밑에 생긴다. 예전에는 metadata 를
 # 읽지 못해 "active fr 없음" 으로 **우연히** 조기 종료했지만, 대상 판정이 git 대조로
-# 정확해진 뒤(final diff review F2)로는 그 우연이 사라졌다 — 우연에 기대지 않고 막는다.
+# 정확해진 뒤로는 그 우연이 사라졌다 — 우연에 기대지 않고 막는다.
 # (재실행 자식은 기본 worktree 루트에서 시작하므로 이 검사를 그대로 통과한다.)
 _archive_cwd_real="$(pwd -P)"
 _archive_caller_real="$(cd "$CALLER_WT" && pwd -P)"
@@ -171,7 +178,7 @@ if [[ -z "${RD_ARCHIVE_REEXEC:-}" ]]; then
 
     # PUBLISH_WT 판정 자체가 틀렸을 가능성(구버전 git·예기치 못한 git-common-dir 형태)을
     # 재실행 직전에 한 번 더 막는다 — 대상 스크립트가 없으면 잘못된 위치에서 재실행을
-    # 시도하는 대신 여기서 멈춘다(리뷰 지적).
+    # 시도하는 대신 여기서 멈춘다.
     if [[ ! -f "$PUBLISH_WT/rd-workflow/scripts/lifecycle/archive.sh" ]]; then
       printf 'archive: 재실행 대상 스크립트를 찾을 수 없습니다: %s — 기본 worktree 판정이 잘못됐을 수 있습니다. 중단합니다.\n' \
         "$PUBLISH_WT/rd-workflow/scripts/lifecycle/archive.sh" >&2
@@ -284,7 +291,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 공유 락 — 여기서 **한 번** 잡고 스크립트가 끝날 때까지 쥔다 (final diff review F7).
+# 공유 락 — 여기서 **한 번** 잡고 스크립트가 끝날 때까지 쥔다.
 #
 # 예전에는 기동 상태 조회·색인 기록·행 삭제 세 군데에서 짧게 잡고 바로 놓았다. 그래서
 # Step 3 merge → Step 4 metadata cleanup → Step 6 publish 가 전부 락 밖이었고, 두
@@ -346,7 +353,7 @@ fi
 #   빈 값(색인에 행이 없는 legacy 단일 worktree 사용)은 발행을 막지 않는다.
 # dry-run 은 이 가드를 우회한다(경고만 내고 통과) — 가드의 목적은 "무변경 중단" 인데
 # dry-run 은 애초에 아무것도 바꾸지 않는다. 오히려 tasks_list.sh 가 「⚠ 발행 확인 필요」
-# 진단 명령으로 안내하는 바로 그 `archive.sh --dry-run` 이 이 가드에 막히면(리뷰 지적)
+# 진단 명령으로 안내하는 바로 그 `archive.sh --dry-run` 이 이 가드에 막히면
 # 사용자가 진단 자체를 할 수 없게 된다.
 # 락은 이미 위에서 잡았다(dry-run 은 잡지 않는다 — 읽기는 원래 락이 필요 없다).
 if [[ "$BRANCH_MODE" == "fr" ]]; then
@@ -452,23 +459,15 @@ else
   fi
 fi
 
-# 병합 단계의 자동 해소 대상 네 파일 (줄바꿈 구분). Step 3 의 자동 해소 분기와 충돌 사전 감지(D4)가 같은 값을 쓴다.
-#   publish_queue.sh 의 PQ_AUTO_RESOLVE_PATHS 는 다른 줄기 소유라 이 값과 따로 둔다.
-ARCHIVE_AUTO_RESOLVE_PATHS="CURRENT_TASK.md
-rd-workflow-workspace/.lifecycle/stage_metrics.tsv
-rd-workflow-workspace/backlog/FUTURE_REQUESTS.md
-rd-workflow-workspace/.lifecycle/review-seals/verify-evidence"
 # Step 3 이 이번 실행에서 직접 병합했으면 1 (D5 는 그때 검사하지 않는다: archive.sh 가 만든 병합은 자동 병합과 네 파일 해소뿐이다).
 ARCHIVE_MERGED_THIS_RUN=0
 
 # archive_conflict_precheck <default_branch> <fr_branch> <worktree> — 병합 전 코드 충돌 사전 감지 (change spec D4)
 #   rc 0 진행 / 1 충돌(안내 출력 후, HEAD·인덱스·워킹트리를 바꾸지 않음) / 3 판정 불가(경고 출력 후 진행)
-#   merge-tree 출력: 첫 항목은 트리 OID 라 건너뛰고 나머지가 충돌 경로다. -z 로 받아 경로 인용(core.quotePath)을 피한다 —
-#   인용된 한글 기록 경로가 자동 해소 대상과 어긋나 거짓 거부가 나지 않게 한다. 줄바꿈을 품은 경로는 조각이 대상과
-#   맞지 않아 충돌로 잡혀 멈추는 쪽으로 기운다.
+#   판정은 공용 rd_merge_conflicts(_merge_precheck.sh)가 한다(경로 인용·자동 해소 대상 제외 포함).
 archive_conflict_precheck() {
-  local def="$1" fr="$2" wt="$3" out rc=0 p a auto keep=""
-  out="$(git merge-tree --write-tree --name-only --no-messages -z HEAD "$fr" 2>/dev/null | tr '\0' '\n'; exit "${PIPESTATUS[0]}")" || rc=$?
+  local def="$1" fr="$2" wt="$3" keep rc=0 p
+  keep="$(rd_merge_conflicts "$PWD" HEAD "$fr")" || rc=$?
   case "$rc" in
     0) return 0 ;;
     1) ;;
@@ -476,15 +475,6 @@ archive_conflict_precheck() {
       printf 'archive: WARNING — 충돌 사전 확인을 할 수 없습니다(git 2.38 이상 필요) — 병합을 진행합니다\n' >&2
       return 3 ;;
   esac
-  while IFS= read -r p; do
-    [[ -n "$p" ]] || continue
-    auto=0
-    while IFS= read -r a; do [[ "$p" == "$a" ]] && auto=1; done <<EOF2
-$ARCHIVE_AUTO_RESOLVE_PATHS
-EOF2
-    [[ "$auto" -eq 1 ]] || keep="${keep}${p}"$'\n'
-  done < <(printf '%s\n' "$out" | sed 1d | sort -u)
-  [[ -n "$keep" ]] || return 0
   # 작업 worktree 경로: fr 브랜치가 체크아웃된 worktree. 못 찾으면 호출자 worktree, 그것도 없으면 자리표시.
   local fr_wt
   fr_wt="$(git worktree list --porcelain 2>/dev/null | awk -v b="refs/heads/$fr" '
@@ -498,12 +488,7 @@ EOF2
   done <<EOF2
 $keep
 EOF2
-  printf 'archive:   리뷰한 코드와 main 의 변경을 합친 결과는 리뷰를 거쳐야 발행할 수 있습니다. 작업 worktree(%s)에서:\n' "$fr_wt" >&2
-  printf 'archive:     1. bash rd-workflow/scripts/rd task set-status "구현 중"\n' >&2
-  printf 'archive:     2. git merge %s   — 충돌을 풀고 커밋합니다\n' "${def:-<기본 브랜치>}" >&2
-  printf 'archive:     3. bash rd-workflow/scripts/rd task set-status "검증 중" 후 검증, bash rd-workflow/scripts/verify_record.sh -- <검증 명령>\n' >&2
-  printf 'archive:     4. bash rd-workflow/scripts/rd task set-status "diff review 대기" 후 새 final diff review 세션을 종결합니다\n' >&2
-  printf 'archive:     5. bash rd-workflow/scripts/rd review seal <새 세션> → set-status "아카이브 보류" → 기록 커밋 → 다시 발행\n' >&2
+  rd_merge_conflict_guide 'archive:   ' "$fr" "$def" "$fr_wt" >&2
   return 1
 }
 
@@ -537,6 +522,194 @@ EOF2
   return 0
 }
 
+# archive_gitlink_merge_check <tip> <exclude> <stage> — 병합 커밋이 submodule 커밋을 빠뜨리지 않았는가 (change spec 2026-11-06-2215 D1~D4)
+#   범위 `<tip> --not <exclude>` 의 병합 커밋 M 마다, 각 부모 Pi 의 submodule gitlink 가 M 의 gitlink 에 담겼는지(조상 관계) 본다.
+#   M 결과에서 빠졌어도 M 뒤 커밋(M..tip)에서 담으면 통과한다. M·tip·Pi 중 한쪽에 gitlink 가 없는 경로는 건너뛴다(추가·삭제·이동).
+#   stage: pre(병합 전) | post(병합 뒤) — 안내 문구만 다르다.
+#   rc 0 통과 / 1 누락 / 2 판정 불가. 안내는 표준 오류로 낸다. 통과하면 아무것도 내지 않는다.
+_ARCHIVE_GL_FETCHED=""
+
+# _archive_gl_oid <commit> <path> — commit 의 path gitlink OID (gitlink 가 아니면 빈 출력)
+_archive_gl_oid() {
+  git ls-tree -r -z --full-tree "$1" -- "$2" 2>/dev/null | tr '\0' '\n' | awk -F'\t' '$1 ~ /^160000 /{split($1, a, " "); print a[3]; exit}' || true
+}
+
+# _archive_gl_select <path> <oid>... — 모든 oid 를 읽을 수 있는 submodule 저장소를 고른다(rc 0). 없으면 rc 1.
+#   1) 기본 체크아웃의 submodule 저장소 2) 공통 git dir + 모든 submodule 객체 디렉터리(rd_gitlink_content_id 와 같은 방식)
+_archive_gl_select() {
+  local p="$1" o root cdir pool ok; shift
+  _GL_MODE=""; _GL_DIR=""; _GL_CDIR=""; _GL_POOL=""
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  _GL_DIR="$root/$p"
+  if _rd_is_repo_root "$_GL_DIR"; then
+    ok=1; for o in "$@"; do git -C "$_GL_DIR" cat-file -e "${o}^{commit}" 2>/dev/null || ok=0; done
+    if [[ "$ok" == 1 ]]; then _GL_MODE=repo; return 0; fi
+  fi
+  cdir="$(_rd_git_common_dir "$root" 2>/dev/null)" || return 1
+  pool="$(_rd_submodule_object_pool "$cdir")" || return 1
+  ok=1
+  for o in "$@"; do
+    GIT_ALTERNATE_OBJECT_DIRECTORIES="${GIT_ALTERNATE_OBJECT_DIRECTORIES:+$GIT_ALTERNATE_OBJECT_DIRECTORIES:}$pool" \
+      git --git-dir="$cdir" cat-file -e "${o}^{commit}" 2>/dev/null || ok=0
+  done
+  [[ "$ok" == 1 ]] || return 1
+  _GL_MODE=pool; _GL_CDIR="$cdir"; _GL_POOL="$pool"
+  return 0
+}
+# _archive_gl_git <git 인자...> — _archive_gl_select 가 고른 저장소에서 git 을 실행한다.
+_archive_gl_git() {
+  if [[ "$_GL_MODE" == repo ]]; then
+    git -C "$_GL_DIR" "$@"
+  else
+    GIT_ALTERNATE_OBJECT_DIRECTORIES="${GIT_ALTERNATE_OBJECT_DIRECTORIES:+$GIT_ALTERNATE_OBJECT_DIRECTORIES:}$_GL_POOL" git --git-dir="$_GL_CDIR" "$@"
+  fi
+}
+
+# _archive_gitlink_is_ancestor <path> <a> <b> — submodule path 에서 a 가 b 의 조상인가 (D3)
+#   rc 0 조상(같은 커밋 포함) / 1 아님 / 2 판정 불가. 객체가 없으면 경로마다 한 번만 fetch 해 다시 조회한다.
+_archive_gitlink_is_ancestor() {
+  local p="$1" a="$2" b="$3" root dir o miss="" ferr frc=0 rc=0
+  [[ "$a" != "$b" ]] || return 0
+  if ! _archive_gl_select "$p" "$a" "$b"; then
+    root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 2
+    dir="$root/$p"
+    if _rd_is_repo_root "$dir" && ! printf '%s\n' "$_ARCHIVE_GL_FETCHED" | grep -qxF -- "$p"; then
+      for o in "$a" "$b"; do
+        if [[ -z "$miss" ]] && ! git -C "$dir" cat-file -e "${o}^{commit}" 2>/dev/null; then miss="$o"; fi
+      done
+      _ARCHIVE_GL_FETCHED="${_ARCHIVE_GL_FETCHED}${p}"$'\n'
+      printf 'archive: submodule %s 에 판정할 커밋(%s)이 없어 원격에서 받습니다 (git fetch)\n' "$p" "$(printf '%s' "${miss:-$a}" | cut -c1-7)" >&2
+      ferr="$(GIT_TERMINAL_PROMPT=0 git -C "$dir" fetch --quiet --no-recurse-submodules 2>&1)" || frc=$?
+      if [[ "$frc" -eq 0 ]]; then
+        printf 'archive: submodule %s fetch 완료\n' "$p" >&2
+      else
+        printf 'archive: submodule %s fetch 실패 — %s\n' "$p" "$(printf '%s\n' "$ferr" | sed -n 1p)" >&2
+      fi
+      _archive_gl_select "$p" "$a" "$b" || return 2
+    else
+      return 2
+    fi
+  fi
+  _archive_gl_git merge-base --is-ancestor "$a" "$b" 2>/dev/null || rc=$?
+  case "$rc" in 0|1) return "$rc" ;; *) return 2 ;; esac
+}
+
+archive_gitlink_merge_check() {
+  local tip="$1" excl="$2" stage="$3" merges m ms tl p gm gt gi pi parents cand c cands step1 ok crc miss=0 unk=0 one mbase gb
+  local -a par
+  merges="$(git rev-list --merges "$tip" --not "$excl" 2>/dev/null)" || {
+    printf 'archive: submodule gitlink 검사 범위를 읽지 못했습니다 (판정 불가) — 발행하지 않습니다.\n' >&2; return 2; }
+  [[ -n "$merges" ]] || return 0
+  tl="$(git ls-tree -r -z --full-tree "$tip" 2>/dev/null | tr '\0' '\n' | awk '/^160000 /{n=1} END{if(n) print "x"}')" || tl=""
+  [[ -n "$tl" ]] || return 0
+  while IFS= read -r m; do
+    [[ -n "$m" ]] || continue
+    ms="$(git rev-parse --short "$m" 2>/dev/null)" || ms="$m"
+    parents="$(git rev-list --parents -n 1 "$m" 2>/dev/null)" || parents=""
+    read -r -a par <<<"$parents"
+    # 병합 기준(부모 2개일 때 merge-base) — 한 부모가 p 를 바꾸지 않았으면 병합은 반대쪽 변경만 가져온 것이라 빠뜨림이 아니다.
+    # 계산에 실패하면 기준 없음으로 두고 예외를 적용하지 않는다(통과로 새지 않게).
+    mbase=""
+    if [[ "${#par[@]}" -eq 3 ]]; then mbase="$(git merge-base "${par[1]}" "${par[2]}" 2>/dev/null)" || mbase=""; fi
+    while IFS= read -r p; do
+      [[ -n "$p" ]] || continue
+      gt="$(_archive_gl_oid "$tip" "$p")"
+      [[ -n "$gt" ]] || continue
+      gm="$(_archive_gl_oid "$m" "$p")"
+      [[ -n "$gm" ]] || continue
+      for pi in "${par[@]:1}"; do
+        gi="$(_archive_gl_oid "$pi" "$p")"
+        [[ -n "$gi" ]] || continue
+        [[ "$gi" != "$gm" ]] || continue
+        # 이 부모가 병합 기준과 같은 gitlink 면 이 쪽은 p 를 바꾸지 않았다 — 기준에 p gitlink 가 없으면 적용하지 않는다.
+        if [[ -n "$mbase" ]]; then
+          gb="$(_archive_gl_oid "$mbase" "$p")"
+          [[ -z "$gb" || "$gi" != "$gb" ]] || continue
+        fi
+        # 1단계: 병합 결과가 부모 쪽 gitlink 를 담는가
+        step1=0; _archive_gitlink_is_ancestor "$p" "$gi" "$gm" || step1=$?
+        [[ "$step1" -ne 0 ]] || continue
+        # 2단계: 병합 뒤 커밋(M..tip)이 담았는가
+        cands="$gt"
+        while IFS= read -r c; do
+          [[ -n "$c" ]] || continue
+          cand="$(_archive_gl_oid "$c" "$p")"
+          [[ -n "$cand" ]] || continue
+          printf '%s\n' "$cands" | grep -qxF -- "$cand" || cands="${cands}"$'\n'"${cand}"
+        done < <(git rev-list --ancestry-path "$m..$tip" -- "$p" 2>/dev/null)
+        ok=0; crc=0
+        while IFS= read -r cand; do
+          [[ -n "$cand" ]] || continue
+          c=0; _archive_gitlink_is_ancestor "$p" "$gi" "$cand" || c=$?
+          if [[ "$c" -eq 0 ]]; then ok=1; break; fi
+          [[ "$c" -eq 1 ]] || crc=2
+        done <<EOF2
+$cands
+EOF2
+        [[ "$ok" -eq 0 ]] || continue
+        if [[ "$step1" -eq 2 || "$crc" -eq 2 ]]; then
+          unk=1
+          printf 'archive: submodule %s 의 커밋 %s 가 병합 커밋 %s 에 담겼는지 판정 불가입니다 — 발행하지 않습니다.\n' "$p" "$(printf '%s' "$gi" | cut -c1-7)" "$ms" >&2
+          printf 'archive:   원인: submodule 이 초기화되지 않았거나, 원격에서 받은 뒤에도 커밋 객체가 없습니다.\n' >&2
+          printf 'archive:   조치: 기본 체크아웃에서 git submodule update --init -- %s 를 실행하거나 그 커밋을 submodule 원격에 push 한 뒤 다시 발행하십시오.\n' "$p" >&2
+        else
+          miss=1
+          one=""
+          if _archive_gl_select "$p" "$gi"; then one="$(_archive_gl_git log --oneline -1 "$gi" 2>/dev/null)" || one=""; fi
+          printf 'archive: 병합 커밋 %s 가 submodule %s 의 커밋을 빠뜨렸습니다 — 발행하지 않습니다.\n' "$ms" "$p" >&2
+          printf 'archive:   빠진 gitlink: %s%s\n' "$(printf '%s' "$gi" | cut -c1-7)" "${one:+ ($one)}" >&2
+        fi
+      done
+    done < <(git ls-tree -r -z --full-tree "$m" 2>/dev/null | tr '\0' '\n' | awk -F'\t' '$1 ~ /^160000 /{print substr($0, index($0, "\t") + 1)}')
+  done <<EOF
+$merges
+EOF
+  if [[ "$miss" -eq 1 ]]; then
+    printf 'archive:   작업 브랜치의 병합이 submodule 한쪽 커밋만 골라, 다른 쪽 커밋이 기본 브랜치 이력에 들어오지 않습니다. 복구:\n' >&2
+    if [[ "$stage" == post ]]; then
+      printf 'archive:     1. 기본 체크아웃에서 이번 병합을 되돌립니다: git reset --keep %s\n' "$excl" >&2
+      printf 'archive:        (먼저 git log --oneline %s..HEAD 로 되돌릴 커밋이 이 병합과 archive 정리 커밋뿐인지 확인하십시오)\n' "$excl" >&2
+      printf 'archive:     2. 작업 worktree 의 submodule 에서 두 커밋을 모두 담은 커밋을 만들고(예: git -C <경로> merge <빠진 커밋>) submodule 원격에 push 합니다.\n' >&2
+      printf 'archive:     3. 작업 worktree 에서 gitlink 를 그 커밋으로 갱신하는 커밋을 더합니다(과거 병합은 다시 쓰지 않습니다). 이후 검증 → 새 final diff review → seal → 다시 발행\n' >&2
+    else
+      printf 'archive:     1. 작업 worktree 의 submodule 에서 두 커밋을 모두 담은 커밋을 만들고(예: git -C <경로> merge <빠진 커밋>) submodule 원격에 push 합니다.\n' >&2
+      printf 'archive:     2. 작업 worktree 에서 gitlink 를 그 커밋으로 갱신하는 커밋을 더합니다(과거 병합은 다시 쓰지 않습니다). 이후 검증 → 새 final diff review → seal → 다시 발행\n' >&2
+    fi
+    return 1
+  fi
+  [[ "$unk" -eq 0 ]] || return 2
+  return 0
+}
+
+# archive_gitlink_gate <tip> <exclude> <stage> — gitlink 검사를 돌리고, 막히면 --allow-gitlink-drop 우회를 처리한다.
+#   submodule 저장소가 squash·rebase 로 병합하면 작업 브랜치의 submodule 커밋이 기본 브랜치 커밋의 조상이 되지 않아,
+#   내용이 이미 담겼어도 누락·판정 불가로 막힌다. 그런 경우의 출구다. 사유 필수, audit 기록, 기록 실패는 차단.
+#   병합 전에 우회했으면 같은 실행의 병합 뒤 검사는 다시 기록하지 않는다. return 0=진행, 1=차단.
+_ARCHIVE_GL_BYPASSED=0
+archive_gitlink_gate() {
+  local rc=0 audit_dir
+  archive_gitlink_merge_check "$1" "$2" "$3" || rc=$?
+  [[ "$rc" -ne 0 ]] || return 0
+  [[ "$_ARCHIVE_GL_BYPASSED" -eq 0 ]] || return 0
+  if [[ "$ALLOW_GITLINK" -ne 1 ]]; then
+    printf 'archive:   submodule 저장소가 squash·rebase 로 병합해 내용이 이미 기본 브랜치에 들어 있다면, 확인한 뒤 --allow-gitlink-drop "<사유>" 로 이 검사만 건너뛸 수 있습니다 (audit 기록).\n' >&2
+    return 1
+  fi
+  if [[ -z "$GITLINK_REASON" ]]; then
+    printf 'archive: --allow-gitlink-drop 사유 필수\n' >&2
+    return 1
+  fi
+  audit_dir="$(dirname "$AUDIT_LOG")"
+  if ! mkdir -p "$audit_dir" 2>/dev/null \
+    || ! printf '%s | %s | [gitlink:rc%s] %s | %s\n' "$(date '+%Y-%m-%d %H:%M')" "$SLUG" "$rc" "$GITLINK_REASON" "<세션없음>" >> "$AUDIT_LOG" 2>/dev/null; then
+    printf 'archive: audit log 기록에 실패했습니다 (%s) — 우회 사유를 남길 수 없어 차단합니다.\n' "$AUDIT_LOG" >&2
+    return 1
+  fi
+  _ARCHIVE_GL_BYPASSED=1
+  printf 'archive: WARNING — submodule gitlink 검사 우회 (사유: %s). audit log 기록.\n' "$GITLINK_REASON" >&2
+  return 0
+}
+
 # Step 3 — merge (idempotent)
 # no-fr 모드는 합칠 브랜치가 없습니다 — 작업 커밋이 이미 기본 브랜치 위에 있습니다 (§5.1).
 if [[ "$BRANCH_MODE" == "no-fr" ]]; then
@@ -549,6 +722,8 @@ else
   _pc_rc=0
   archive_conflict_precheck "$_pc_def" "$FR_BRANCH" "$CURRENT_WT" || _pc_rc=$?
   [[ "$_pc_rc" -ne 1 ]] || exit 1
+  # submodule gitlink 누락 검사 (병합 전) — 작업 브랜치의 병합이 submodule 커밋을 빠뜨렸으면 main 을 바꾸지 않고 멈춘다.
+  archive_gitlink_gate "$FR_BRANCH" HEAD pre || exit 1
   # git merge 출력은 변수에 잡아 둔다. 충돌이 자동 해소되면 git 의 「자동 병합이 실패했습니다」 가 거짓 실패로 읽히므로
   # 성공·멈춤 경로에서만 낸다. 해소 성공 경로는 내지 않는다. 대입 단독 실행은 set -e 로 종료하므로 if 조건에 둔다.
   _merge_out=""
@@ -560,13 +735,13 @@ else
     #   등록 커밋이 기본 브랜치에 먼저 쌓이는 구조에서 fr 브랜치와 기본 브랜치가 표 끝에 서로 다른 행을
     #   append 하면 git 줄 병합은 반드시 충돌한다. 인덱스는 제목을 키로 하는 행 집합이므로 집합 병합이 맞다.
     #   다른 경로가 함께 충돌하거나 집합 병합도 실패하면 종전대로 사람이 해결한다 (충돌 상태 유지).
-    # 네 파일 경로는 ARCHIVE_AUTO_RESOLVE_PATHS(위)와 같은 값이다 — 목록이 갈라지지 않게 거기서 꺼낸다.
-    _CT="$(printf '%s\n' "$ARCHIVE_AUTO_RESOLVE_PATHS" | sed -n 1p)"
-    _SM="$(printf '%s\n' "$ARCHIVE_AUTO_RESOLVE_PATHS" | sed -n 2p)"
-    _IDX="$(printf '%s\n' "$ARCHIVE_AUTO_RESOLVE_PATHS" | sed -n 3p)"
+    # 네 파일 경로는 RD_MERGE_AUTO_RESOLVE_PATHS(_merge_precheck.sh)와 같은 값이다 — 목록이 갈라지지 않게 거기서 꺼낸다.
+    _CT="$(printf '%s\n' "$RD_MERGE_AUTO_RESOLVE_PATHS" | sed -n 1p)"
+    _SM="$(printf '%s\n' "$RD_MERGE_AUTO_RESOLVE_PATHS" | sed -n 2p)"
+    _IDX="$(printf '%s\n' "$RD_MERGE_AUTO_RESOLVE_PATHS" | sed -n 3p)"
     # verify-evidence 는 모든 작업이 같은 경로에 쓰는 검증 증거다. seal 시점(rd_seal_evidence_check)에만 읽히고
     #   병합 뒤에는 아무도 읽지 않으므로, 발행 줄기가 seal 에 쓴 증거(stage 3)를 남긴다 (change spec 2026-11-02-0740 D1).
-    _VE="$(printf '%s\n' "$ARCHIVE_AUTO_RESOLVE_PATHS" | sed -n 4p)"
+    _VE="$(printf '%s\n' "$RD_MERGE_AUTO_RESOLVE_PATHS" | sed -n 4p)"
     _conf="$(git diff --name-only --diff-filter=U 2>/dev/null)"
     if [[ "$_conf" == "$_IDX" ]]; then
       _mb="$(mktemp)" || { echo "archive: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; _merge_dump; exit 1; }
@@ -776,6 +951,16 @@ EOF
   fi
 fi
 
+# submodule gitlink 누락 검사 (병합 후) — 재실행으로 이미 병합된 경우와 archive 의 병합 자신을 본다.
+# 기준선이 fr tip 을 둘째 부모로 가진 병합이면 병합 전 기본 브랜치(기준선^1)를, 아니면(fast-forward 폴백) 기준선을 제외한다.
+if [[ "$BRANCH_MODE" == "fr" ]]; then
+  _gl_excl="$BASELINE_OID"
+  if [[ "$(git rev-parse --verify --quiet "${BASELINE_OID}^2" 2>/dev/null)" == "$(git rev-parse "$FR_BRANCH" 2>/dev/null)" ]]; then
+    _gl_excl="${BASELINE_OID}^1"
+  fi
+  archive_gitlink_gate "$MERGE_BASE_COMMIT" "$_gl_excl" post || exit 1
+fi
+
 # Step 3.5 (제거, 2026-09-03) — 이 자리에서 self_test consumer 전수를 강제하고 증명을 대조하던
 # 게이트를 걷어냈다. 검증은 구현 직후 사람이 self_test.sh (그룹 지정) 로 돌리고 final diff review 가
 # 그 결과를 확인한다. 아카이브가 같은 검증을 다시 돌려 얻는 것은 없었고 매번 15~20분을 썼다.
@@ -839,7 +1024,7 @@ if metadata_exists || [[ "$BRANCH_MODE" == "no-fr" ]]; then
   #
   # **목록을 먼저 캡처하고 helper 의 rc 를 따로 본다.** heredoc 안 명령 치환은 그 함수의
   # 종료 코드를 소거하므로 "일부 출력 후 실패" 가 정상 목록으로 취급된다 — 축소된 목록으로
-  # staging·커밋을 진행하면 남은 경로가 조용히 빠진다 (final diff review Turn 002 F3).
+  # staging·커밋을 진행하면 남은 경로가 조용히 빠진다.
   _lc_paths_out="$(lifecycle_metadata_paths)" && _lc_paths_rc=0 || _lc_paths_rc=$?
   if [[ "$_lc_paths_rc" -ne 0 ]]; then
     printf 'archive: 허용 경로 목록 생성 실패 (lifecycle_metadata_paths rc %s) — 중단\n' "$_lc_paths_rc" >&2
@@ -856,7 +1041,7 @@ if metadata_exists || [[ "$BRANCH_MODE" == "no-fr" ]]; then
         # best-effort 로그다 — 이 회차에서 로그가 한 번도 안 남았으면(최초 회차에서
         # append 자체가 실패했거나, from==to 라 기록할 전이가 없었던 경우) 파일이
         # 없을 수 있다. 존재하지 않는 pathspec 을 git add 에 넘기면 실패해 archive
-        # 전체가 중단된다(spec/plan review Turn 004 F1 잔여) — 존재할 때만 포함한다.
+        # 전체가 중단된다 — 존재할 때만 포함한다.
         [[ -f "$CURRENT_WT/$_lc_rel" ]] || continue
         ;;
     esac
@@ -898,7 +1083,7 @@ fi
 #
 # **여기서 캡처한 OID 가 발행 대상이다.** 이후 tag 와 push 는 HEAD 나 브랜치 tip 을
 # 다시 해석하지 않고 이 값을 소비한다. "다시 검사" 가 아니라 **"검사한 객체를 발행"**
-# 이어야 검사와 발행 사이의 경쟁 창이 닫힌다 (REQUEST review Turn 004 Finding 2).
+# 이어야 검사와 발행 사이의 경쟁 창이 닫힌다.
 PUBLISH_OID="$(git rev-parse HEAD)" || {
   printf 'archive: 발행 후보 commit 결정 실패 — 중단\n' >&2
   # archive_block_notice 의 복구 절차는 "fr 브랜치에서 다시 만들라" 를 전제하므로
@@ -934,7 +1119,7 @@ fi
 if [[ "$_pc_rc" -eq 2 ]]; then
   # rc 2 는 git 실행 오류와 **허용 경로 목록 생성 실패**를 함께 담는다 — 둘 다 "검사
   # 자체가 불가능" 이며, 파일 내용을 되돌려서 해결되는 상태가 아니다. 그래서 사유를
-  # git 오류로 단정하지 않는다 (final diff review Turn 004 F6).
+  # git 오류로 단정하지 않는다.
   printf 'archive: 발행 내용을 판정할 수 없습니다 (git 실행 오류 또는 허용 경로 목록 생성 실패) — 중단합니다\n' >&2
   archive_block_notice "$FR_BRANCH" "$CURRENT_WT" unknown
   exit 1
@@ -1005,7 +1190,7 @@ fi
 # 실행 시점의 로컬 tag ref 를 다시 해석하므로, 위 검증 이후 다른 프로세스가 tag 를
 # force-move 하면 기본 브랜치는 $PUBLISH_OID 로 안전하게 나가도 **원격 tag 만 미검증
 # 커밋을 가리킨다.** 기본 브랜치 push 와 같은 이유(검사한 객체를 발행)이며, tag 쪽에도
-# 같은 결속이 있어야 check→publish 경쟁 창이 닫힌다 (final diff review Turn 002 F1).
+# 같은 결속이 있어야 check→publish 경쟁 창이 닫힌다.
 TAG_OID="$(git rev-parse --verify --quiet "refs/tags/$TARGET_TAG")" || {
   printf 'archive: tag %s 의 OID 를 읽지 못했습니다 — 수동 해결 후 재실행: git tag -d %s\n' "$TARGET_TAG" "$TARGET_TAG" >&2
   exit 1
@@ -1068,8 +1253,7 @@ if [[ "$REMOTE_MODE" == "remote" ]]; then
   #
   # **여기서 차단하지 않는다.** 원격 발행이 이미 정상 완료된 지점이라, 실패시키면
   # 아카이브가 반쯤 끝난 상태(원격은 나갔고 로컬 정리는 안 된 상태)로 남아 더 나쁘다.
-  # 그래서 막지 않고 두 OID 와 로컬을 맞추는 명령을 명시적으로 보여 준다
-  # (final diff review Turn 004 F5).
+  # 그래서 막지 않고 두 OID 와 로컬을 맞추는 명령을 명시적으로 보여 준다.
   #
   # 로컬 tag 를 **읽지 못하는 경우**(ref 삭제 등)도 같은 경고 경로로 보낸다 — 조용히
   # 넘기면 사용자는 로컬에 검증된 tag 가 남아 있다고 오해한다.
@@ -1178,13 +1362,13 @@ git_supports_lease() {  # git >= 1.8.5 이면 0. 미지원·판정 불능이면 
 if [[ "$BRANCH_MODE" == "fr" ]]; then
   # tasks_publish_evidence 가 단일 출처다 — 그냥 기록하면 --no-remote(로컬만 완료,
   # 원격 미반영)에서도 "정리 대기" 가 영구히 고정돼 tasks_list.sh 의 needs-verify
-  # (⚠ 발행 확인 필요) 경로를 조용히 지운다(리뷰 지적).
+  # (⚠ 발행 확인 필요) 경로를 조용히 지운다.
   # **REMOTE_MODE 가 아니라 REMOTE_MODE_RAW 를 쓴다.** REMOTE_MODE 는 --no-remote 로
   # local-only 로 덮여 있을 수 있는데, tasks_list.sh 는 --no-remote 라는 archive.sh
   # 전용 플래그를 모르고 항상 detect_remote_mode() 로만 판정한다(:40). origin 이 있는
   # 저장소에서 --no-remote 로 마감하면 이 재확인이 remote_mode="local-only" 로 원격
   # 검사를 건너뛰어 merge+tag 만으로 cleanup-pending 을 내고, tasks_list.sh 는
-  # remote_mode="remote" 로 「⚠ 발행 확인 필요」를 내야 할 상황을 놓친다(2차 리뷰 지적).
+  # remote_mode="remote" 로 「⚠ 발행 확인 필요」를 내야 할 상황을 놓친다.
   _archive_publish_default_branch="$(get_default_branch 2>/dev/null)" || _archive_publish_default_branch=""
   _archive_publish_fr_tip="$(git rev-parse --verify --quiet "$FR_BRANCH" 2>/dev/null)" || _archive_publish_fr_tip=""
   _archive_publish_evidence=""
@@ -1192,7 +1376,7 @@ if [[ "$BRANCH_MODE" == "fr" ]]; then
     _archive_publish_evidence="$(tasks_publish_evidence "$SLUG" "$_archive_publish_fr_tip" "$_archive_publish_default_branch" "$REMOTE_MODE_RAW")"
   fi
   if [[ "$_archive_publish_evidence" == "cleanup-pending" ]]; then
-    # 락은 이 스크립트 시작 지점에서 이미 쥐고 있다 (F7) — 다시 잡으면 자기 자신과 교착한다.
+    # 락은 이 스크립트 시작 지점에서 이미 쥐고 있다 — 다시 잡으면 자기 자신과 교착한다.
     tasks_index_upsert "$SLUG" \
       "state=cleanup-pending" \
       "published-at=$(date -u '+%Y-%m-%d-%H%M')" \
@@ -1310,10 +1494,25 @@ elif [[ "$WT_COUNT_BEFORE" -gt 0 ]]; then
       if [[ "$_archive_frwt_norm" == "$_archive_caller_norm" ]]; then
         printf 'archive: %s 는 이 archive 를 호출한 worktree 라 제거하지 않습니다 — 기본 체크아웃에서 `rd task list` 를 실행하면 세션이 이 worktree 를 나온 뒤 자동으로 정리됩니다\n' "$fr_wt" >&2
         cleanup_add "worktree" "$fr_wt" \
-          "실행 중인 worktree(호출자)라 이 프로세스에서 제거하지 않았습니다. 기본 체크아웃에서 rd task list 를 실행하면 세션이 이 worktree 를 나온 뒤 자동으로 정리됩니다" \
-          "git -C $(printf '%q' "$PUBLISH_WT") worktree remove $(printf '%q' "$fr_wt")"
+          "세션이 이 worktree 안에 있어 지우지 않았습니다(호출자 worktree). 세션 안에서 이 worktree 를 직접 지우지 마십시오. 세션이 끝난 뒤 기본 체크아웃에서 rd task list 를 실행하면 정리됩니다" \
+          "cd $(printf '%q' "$PUBLISH_WT") && bash rd-workflow/scripts/rd task list"
         continue
       fi
+    fi
+    # 점유 검사 — 다른 프로세스(세션)의 CWD 가 이 worktree 안이면 지우지 않는다. 지우면 그 세션의
+    # gate hook 이 꺼진다. 서브셸 없이 불러야 TASKS_OCCUPIED_REASON 을 읽는다. rc 1(점유 없음)만 지운다.
+    _oc_rc=0; tasks_path_occupied "$fr_wt" || _oc_rc=$?
+    if [[ "$_oc_rc" -eq 0 || "$_oc_rc" -eq 2 ]]; then
+      if [[ "$_oc_rc" -eq 0 ]]; then
+        _oc_reason="세션이 이 worktree 안에 있어 지우지 않았습니다(내 계정 프로세스의 작업 디렉터리가 이 worktree 안). 세션 안에서 이 worktree 를 직접 지우지 마십시오. 세션이 끝난 뒤 기본 체크아웃에서 rd task list 를 실행하면 정리됩니다"
+      else
+        _oc_why="$(printf '%s' "${TASKS_OCCUPIED_REASON:-사유 불명}" | tr '\t\r\n' '   ')"
+        _oc_reason="세션이 있는지 확인하지 못해 지우지 않았습니다(${_oc_why}). 세션 안에서 이 worktree 를 직접 지우지 마십시오. 세션이 끝난 뒤 기본 체크아웃에서 rd task list 를 실행하면 정리됩니다"
+      fi
+      printf 'archive: worktree %s 를 지우지 않았습니다 — %s\n' "$fr_wt" "$_oc_reason" >&2
+      cleanup_add "worktree" "$fr_wt" "$_oc_reason" \
+        "cd $(printf '%q' "$PUBLISH_WT") && bash rd-workflow/scripts/rd task list"
+      continue
     fi
     _rm_rc=0; _rm_out="$(rd_worktree_remove_safe "$fr_wt")" || _rm_rc=$?
     if [[ "$_rm_rc" -eq 1 ]]; then
@@ -1490,9 +1689,30 @@ fi
 # 있는 worktree/branch 를 다시 "진행 중" 으로 재구성한다. 락 획득 실패는 조용한 경고로
 # 남긴다 — 정리 완료 자체(worktree·branch 제거)는 이미 끝난 뒤라 되돌릴 것이 없다.
 if [[ "$BRANCH_MODE" == "fr" && "$WORKTREE_PENDING" -eq 0 && "$SAFETY_VIOLATION" -eq 0 ]]; then
-  # 락은 이 스크립트가 계속 쥐고 있다 (F7) — 종료 trap 이 해제한다.
+  # 락은 이 스크립트가 계속 쥐고 있다 — 종료 trap 이 해제한다.
   tasks_index_remove "$SLUG" \
     || printf 'archive: WARNING — 정리 완료 후 색인 행 제거 실패 — rd task list 에 완료된 작업이 남아 보일 수 있습니다\n' >&2
+fi
+
+# ---- 정리 잔여 기록 (slug 별 파일) ----
+# 요약 출력 직전에 자기 slug 기록을 남기거나(잔여 있음) 지운다(잔여 없음). 기록 실패는 발행을 되돌리지 않고
+# stderr 표식과 종료 코드 1 로만 알린다 — stdout 요약·완료 줄은 그대로 낸다.
+RECORD_FAILED=0
+_cp_helper="$SCRIPT_DIR/cleanup_pending.sh"
+_cp_op="clear"; [[ -n "$CLEANUP_PENDING" ]] && _cp_op="write"
+if [[ ! -f "$_cp_helper" ]]; then
+  printf 'archive: CLEANUP-RECORD-FAILED %s 헬퍼 파일이 없음 (%s)\n' "$_cp_op" "$_cp_helper" >&2
+  RECORD_FAILED=1
+elif [[ "$_cp_op" == "write" ]]; then
+  if ! printf '%s' "$CLEANUP_PENDING" | bash "$_cp_helper" write "$SLUG"; then
+    printf 'archive: CLEANUP-RECORD-FAILED write 정리 잔여 기록을 남기지 못함 (%s)\n' "$SLUG" >&2
+    RECORD_FAILED=1
+  fi
+else
+  if ! bash "$_cp_helper" clear "$SLUG"; then
+    printf 'archive: CLEANUP-RECORD-FAILED clear 정리 잔여 기록을 지우지 못함 (%s)\n' "$SLUG" >&2
+    RECORD_FAILED=1
+  fi
 fi
 
 # ---- 정리 잔여 요약 (stdout) ----
@@ -1520,3 +1740,9 @@ if [[ "$SAFETY_VIOLATION" -eq 1 ]]; then
   printf 'archive:   앞서 검증을 통과해 삭제된 ref 는 복구하지 않습니다 (해당 커밋은 merge 대상에 모두 포함되어 손실 없음).\n' >&2
   exit 1
 fi
+
+# 기록 실패 종료 — `[[ ... ]] && exit 1` 꼴은 값이 0 일 때 마지막 명령 상태가 1 이라 쓰지 않는다.
+if [[ "$RECORD_FAILED" -eq 1 ]]; then
+  exit 1
+fi
+exit 0

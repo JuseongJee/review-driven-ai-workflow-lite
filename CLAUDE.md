@@ -14,6 +14,7 @@ rd-workflow 의 워크플로 규칙은 `.claude/rules/rd-workflow/` 의 파일�
 
 - `core.md` — 기본 인터페이스, 우선 원칙, Intake 규칙, Workflow 우선순위, 핵심 절차(REQUEST 아카이브 포함), 절대 규칙, Review 규칙, Always Read
 - `task-tracking.md` — Task Tracking, Spec / Plan Naming
+- `judgment.md` — 판단 원칙 (본질과 객관, 사용자 편의성 우선)
 - `writing-style.md` — 문서 작성 스타일
 - `efficiency.md` — 토큰 효율 규칙, 세션 한계 대응
 - `commit.md` — 커밋 메시지

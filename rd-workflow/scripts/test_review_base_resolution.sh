@@ -17,6 +17,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # fixture 에 통째로 복사할 rd-workflow 원본. canonical(_ROOT_FILES/rd-workflow/) 과
 # mirror(rd-workflow/) 어느 쪽에서 실행해도 자기 옆의 배포 트리를 씁니다.
 RD_SRC="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# 손으로 종결한 세션은 seal 이 거부하므로, 리뷰어 턴 실행 기록을 제품 함수로 남기는 fixture.
+. "${SCRIPT_DIR}/fixtures/review_run_fixture.sh"
 
 # 전역·시스템 git 설정 간섭 차단 (test_integration.sh 와 같은 이유).
 export GIT_CONFIG_GLOBAL=/dev/null
@@ -205,10 +207,12 @@ set_session_state() { # set_session_state <session-dir> <status> <owner>
   rm -f "${1}/.session.tmp"
 }
 
-close_session() { # close_session <session-dir> — 종결(Status=closed + Open Issues 없음)
-  set_session_state "$1" "closed" "Author"
+close_session() { # close_session <session-dir> — 종결(Status=closed + Open Issues 없음 + 리뷰어 턴 실행 기록)
+  local repo="${1%/${SESS_REL}/*}"
   printf '# Review Checkpoint\n\n## Open Issues\n- 없음\n\n## Suggested Next Owner\nAuthor\n' \
     > "${1}/CHECKPOINT.md"
+  fixture_reviewer_turn "$1" "${repo}/rd-workflow/scripts" || return 1
+  set_session_state "$1" "closed" "Author"
 }
 
 next_turn_index() { # next_turn_index <session-dir> — 다음 턴 번호를 3자리로
@@ -396,7 +400,7 @@ eq "$(session_section "$SP3" "Review Target")" "git -C sub diff main...HEAD" \
 has "--legacy-unverified 가 필요합니다" "$(cat "${OUT}/prep.err")" \
   "위치 인자(파싱 불가): 봉인 경로를 고지"
 
-# --- 위치 인자로 지정한 head 가 현재 HEAD 가 아닐 때 (Finding 2) ---
+# --- 위치 인자로 지정한 head 가 현재 HEAD 가 아닐 때 ---
 # 브랜치 A 를 checkout 한 채 `git diff <base>..branch-B` 를 넘기면, 세션의 target 은 branch-B
 # 인데 첫 reviewer dispatch 직전에 A 의 HEAD 로 바뀌는 결함이 있었습니다. 사용자가 명시한
 # 검토 대상과 reviewer 가 실제로 보는 대상이 갈리고, 내부 OID 와 프롬프트끼리는 일치하므로
@@ -447,7 +451,7 @@ reviewer_turn "$RA" "$SA"; rc=$?
 eq "$rc" "0" "auto 통제군: reviewer 턴 성공"
 eq "$(bc_field "$SA" review-head-oid)" "$A2" "auto 통제군: head 가 새 커밋으로 재snapshot"
 
-# --- 동일 tree · 다른 OID (Finding 4) ---
+# --- 동일 tree · 다른 OID ---
 # base 뒤에 변경 커밋과 완전 revert 커밋을 두면 OID 는 다르지만 트리가 같아 diff 가 비어
 # 있습니다. "OID 가 서로 다름" 만 보는 구현은 이 빈 diff 를 리뷰 대상으로 기록합니다 (AC 4 위반).
 RE="$(mk_repo)" || { echo "  FAIL  동일 tree·다른 OID: fixture 생성 실패"; exit 1; }
@@ -667,7 +671,7 @@ git -C "$RS" add -A && git -C "$RS" commit -q -m "reseal 기록"
 precheck "$RS"; rc=$?
 eq "$rc" "0" "⑤ reseal: 커밋 후 precheck 통과 (복구 완료)"
 
-# ⑤-b seal 쪽 묶음 검증 (turn 006 Finding 1). 턴 경로만 막으면, 손상된 세션을 그대로
+# ⑤-b seal 쪽 묶음 검증. 턴 경로만 막으면, 손상된 세션을 그대로
 # 봉인하는 경로가 남습니다 — seal 은 종전에 `review-head-oid` 하나만 봤습니다.
 cp "${SS}/SESSION.md" "${OUT}/seal-session-base.md"
 # 저장소에 없는 OID — 각 16진 숫자를 뒤집어 길이·형식은 유지한 채 실재하지 않게 만듭니다.
@@ -813,7 +817,7 @@ eq "$rc" "0" "⑥(a) 계보 단절: SESSION 무변화"
 eq "$(ls "${S6}/turns" | wc -l | tr -d ' ')" "1" "⑥(a) 계보 단절: 턴 파일 미생성"
 if [ -f "${OUT}/adapter-called" ]; then fail "⑥(a) 계보 단절: 어댑터 미호출"; else pass "⑥(a) 계보 단절: 어댑터 미호출"; fi
 
-# --- ⑧ iteration 중 트리가 base 로 되돌아간 경우 (Finding 4, resnapshot 쪽) ---
+# --- ⑧ iteration 중 트리가 base 로 되돌아간 경우 (resnapshot 쪽) ---
 # 생성 시점만 막으면 부족합니다 — reviewer iteration 중 변경이 완전히 revert 되면 조상 관계는
 # 유지된 채 diff 만 비어, 빈 target 으로 재snapshot 됩니다. 정상 턴(통제군) → 빈 diff 턴(차단)
 # 순서로 확인해 "무조건 막는" 구현과 구분합니다.
@@ -836,7 +840,7 @@ eq "$(bc_field "$SV" review-head-oid)" "$V1" "⑧ 빈 diff 재snapshot: head 가
 has "변경이 없습니다" "$(cat "${OUT}/turn.err")" "⑧ 빈 diff 재snapshot: 사유 안내"
 if [ -f "${OUT}/adapter-called" ]; then fail "⑧ 빈 diff 재snapshot: 어댑터 미호출"; else pass "⑧ 빈 diff 재snapshot: 어댑터 미호출"; fi
 
-# --- ⑨ pinned 세션도 대상 무결성 검증을 받는다 (Finding 2) ---
+# --- ⑨ pinned 세션도 대상 무결성 검증을 받는다 ---
 # 정책은 **갱신 여부만** 가릅니다. `pinned` 을 검증 앞에서 조기 반환시키면, 기록 OID 가
 # resolve 되지 않거나(ref 삭제 후 객체 정리·저장소 교체·SESSION 의 부분 수정) 계보가 끊기거나
 # 트리가 base 와 같아진 세션이 그대로 reviewer dispatch 까지 가고, 사용자는 빈·엉뚱한 diff 로
@@ -895,7 +899,7 @@ pinned_fail_case "계보 끊긴 pinned" "$PNOTHER" \
 pinned_fail_case "빈 diff pinned" "$PNREV" \
   "세션에 고정된 head (${PNREV}) 사이에 변경이 없습니다"
 
-# --- ⑨-b OID 묶음과 실제 dispatch target 의 결속 (turn 006 Finding 1) ---
+# --- ⑨-b OID 묶음과 실제 dispatch target 의 결속 ---
 # reviewer 에게 전달되는 것은 OID 두 줄이 아니라 `## Review Target` 섹션입니다. `auto` 는
 # 이 섹션을 재렌더링하며 결속하지만 `pinned` 은 아무것도 다시 쓰지 않으므로, 이 세 상태가
 # 막히지 않으면 **OID 가 가리키지 않는 diff** 가 리뷰되고도 `verified=yes` 로 봉인됩니다.
@@ -951,6 +955,14 @@ else
   eq "$rc" "0" "⑦ SHA-256: seal 성공"
   eq "$(seal_field "$(marker_path "$R7" "$(basename "$S7")")" verified)" "yes" \
     "⑦ SHA-256: verified=yes"
+  # cwd 가 저장소 밖이어도 turn-blob 을 저장소 object format(sha256)으로 대조해야 합니다.
+  rm -f "$(marker_path "$R7" "$(basename "$S7")")"
+  ( cd / && bash "${R7}/rd-workflow/scripts/rd" review seal "$S7" ) >"${OUT}/seal.out" 2>"${OUT}/seal.err"; rc=$?
+  eq "$rc" "0" "⑦ SHA-256: 저장소 밖 cwd 에서 seal 성공 (turn-blob 대조가 cwd 비의존)"
+  # 저장소의 부모 디렉터리에서 상대 세션 경로로 부르는 경우 — 경로를 저장소 루트 기준으로 다시 해석하면 안 됩니다.
+  rm -f "$(marker_path "$R7" "$(basename "$S7")")"
+  ( cd "$(dirname "$R7")" && bash "$(basename "$R7")/rd-workflow/scripts/rd" review seal "$(basename "$R7")/${S7#${R7}/}" ) >"${OUT}/seal.out" 2>"${OUT}/seal.err"; rc=$?
+  eq "$rc" "0" "⑦ SHA-256: 저장소 부모 cwd 에서 상대 세션 경로로 seal 성공"
 fi
 
 # --- 11b. seal 인자 해석 (change-spec 3) ---
@@ -1209,6 +1221,191 @@ eq "$(cat "${NT}/cpath" 2>/dev/null)" "libs/my sub" "13 D6b: 안내 줄을 실�
 
 # D7(경로 특수 문자가 든 [커밋된 포인터] 안내 줄의 셸 인용)은 그 안내 줄이 사라져(spec D10) 대상이 없어 지웁니다.
 # [체크아웃] 안내 줄의 인용은 D6b 가 본다.
+
+# --- 14. 리뷰어 턴 실행 기록 대조 (review-integrity change-spec 4.3·4.6) ---
+# 이 절이 막는 실수: 리뷰어 턴을 실제로 돌리지 않고 손으로 종결한 세션이 seal 을 통과하는 것.
+echo "=== 14. seal 의 리뷰어 턴 실행 기록 대조 (R1~R10) ==="
+RRR="$(mk_repo)" || { echo "  FAIL  14: fixture 생성 실패"; exit 1; }
+RRRB="$(git -C "$RRR" rev-parse HEAD)"
+commit_code "$RRR" rr1
+state_set "$RRR" base-commit "$RRRB"
+prep "$RRR"; rc=$?
+eq "$rc" "0" "14: 세션 생성"
+SRR14="$(session_dir "$RRR")"
+SRR14ID="$(basename "$SRR14")"
+RRR_SCRIPTS="${RRR}/rd-workflow/scripts"
+
+rr_reset() { # rr_reset — 턴·기록·마커를 비우고 Author 턴 001 만 남긴 종결 상태로 되돌립니다.
+  rm -f "${SRR14}"/turns/* "${SRR14}/reviewer_runs.tsv" "$(marker_path "$RRR" "$SRR14ID")"
+  mkdir -p "${SRR14}/turns"
+  printf '# Turn 001 — Author\n반영했습니다.\n' > "${SRR14}/turns/001_author.md"
+  printf '# Review Checkpoint\n\n## Open Issues\n- 없음\n\n## Suggested Next Owner\nAuthor\n' > "${SRR14}/CHECKPOINT.md"
+  set_session_state "$SRR14" "closed" "Author"
+}
+rr_seal() { seal "$RRR" "${SRR14#${RRR}/}"; RR_RC=$?; RR_ERR="$(cat "${OUT}/seal.err")"; }
+
+rr_set_reason() { # rr_set_reason <값> — 템플릿의 주석 줄 아래 `-` 줄을 값으로 바꿉니다.
+  awk -v v="$1" '$0=="## Closure Reason"{f=1; print; next} f&&/^## /{f=0} f&&NF&&!/^<!--/{print v; f=0; next} {print}' "${SRR14}/SESSION.md" > "${OUT}/sess.tmp" \
+    && cat "${OUT}/sess.tmp" > "${SRR14}/SESSION.md"
+}
+rr_set_basis() { # rr_set_basis <줄> — Closure Reason 절의 값 줄 뒤를 비우고 인자 줄 하나를 넣습니다(빈 인자는 줄을 넣지 않음).
+  awk -v b="$1" '$0=="## Closure Reason"{f=1; print; next} f&&/^## /{if(b!=""&&seen)print b; f=0; seen=0; print; next} f&&seen{next} f&&NF&&!/^<!--/{seen=1; print; next} {print}' "${SRR14}/SESSION.md" > "${OUT}/sess.tmp" \
+    && cat "${OUT}/sess.tmp" > "${SRR14}/SESSION.md"
+}
+
+# R1: 기록 0건 + 손으로 쓴 리뷰어 턴 (S4c)
+rr_reset
+printf '# Turn 002 — Reviewer\n이의 없음\n' > "${SRR14}/turns/002_reviewer.md"
+rr_seal
+ne "$RR_RC" "0" "R1: 기록 0건 + 손 종결 — rc≠0"
+has "실제로 실행된 리뷰어 턴 기록이 없습니다" "$RR_ERR" "R1: run-missing 문구"
+has "archive.sh --force-skip-review-check" "$RR_ERR" "R1: 수동 fallback 줄"
+
+# R1b: 머리줄만 있는 기록 파일
+printf '# turn\ttool\tmode\thead\tturn-blob\topen-issues\tepoch\n' > "${SRR14}/reviewer_runs.tsv"
+rr_seal
+ne "$RR_RC" "0" "R1b: 머리줄만 있는 기록 — rc≠0"
+has "실제로 실행된 리뷰어 턴 기록이 없습니다" "$RR_ERR" "R1b: run-missing 문구"
+
+# R2: 리뷰어 턴 + 기록(ok), 비어 있는 Closure Reason
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS"
+rr_seal
+eq "$RR_RC" "0" "R2: 기록된 리뷰어 턴 + 이의 없음 — rc=0"
+MK14="$(marker_path "$RRR" "$SRR14ID")"
+eq "$(grep -cx 'closure-reason=reviewer-no-objection' "$MK14")" "1" "R2: 마커에 closure-reason 줄이 정확히 1줄"
+eq "$(grep -cx 'verified=yes' "$MK14")" "1" "R2: 마커에 verified=yes 줄이 정확히 1줄 (줄바꿈 회귀)"
+
+# R2b: 같은 turn 두 줄 — 앞 줄 무효, 마지막 줄 유효
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS"
+{ head -1 "${SRR14}/reviewer_runs.tsv"; printf '002\tcodex\tbroken\n'; tail -1 "${SRR14}/reviewer_runs.tsv"; } > "${OUT}/runs.tmp"
+cat "${OUT}/runs.tmp" > "${SRR14}/reviewer_runs.tsv"
+rr_seal
+eq "$RR_RC" "0" "R2b: 같은 turn 중 마지막 줄이 유효하면 rc=0"
+
+# R2c: 지난 턴(002) 파일을 바꿨어도 마지막 턴(004)의 기록이 유효하면 봉인
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS"
+printf '# Turn 003 — Author\n반영했습니다.\n' > "${SRR14}/turns/003_author.md"
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS"
+printf 'edited\n' >> "${SRR14}/turns/002_reviewer.md"
+rr_seal
+eq "$RR_RC" "0" "R2c: 지난 턴 기록 손상은 거부 사유가 아님 — rc=0"
+has "무효 실행 기록 1건" "$RR_ERR" "R2c: 무효 기록 경고"
+
+# R3: 기록 시점 Open Issues 미해결 → 뒤늦게 CHECKPOINT 만 고침
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS" "- 이의가 남았습니다"
+printf '# Review Checkpoint\n\n## Open Issues\n- 없음\n\n## Suggested Next Owner\nAuthor\n' > "${SRR14}/CHECKPOINT.md"
+rr_seal
+ne "$RR_RC" "0" "R3: 기록 당시 미해결 — rc≠0"
+has "마지막 리뷰어 턴이 이의 없이 끝났다는 실행 기록이 없습니다" "$RR_ERR" "R3: reason-unproven 문구"
+has "종료 시 Open Issues 미해결" "$RR_ERR" "R3: 어긋난 항목"
+
+# R6: 지난 턴 기록은 유효, 마지막 리뷰어 턴 파일을 기록 뒤에 수정
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS"
+printf '# Turn 003 — Author\n반영했습니다.\n' > "${SRR14}/turns/003_author.md"
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS"
+printf 'edited\n' >> "${SRR14}/turns/004_reviewer.md"
+rr_seal
+ne "$RR_RC" "0" "R6: 마지막 턴 파일 수정 — rc≠0"
+has "파일이 실행 기록 뒤 바뀜" "$RR_ERR" "R6: 어긋난 항목"
+
+# R8: 마지막 턴이 Author 턴
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS"
+printf '# Turn 003 — Author\n반영했습니다.\n' > "${SRR14}/turns/003_author.md"
+rr_seal
+ne "$RR_RC" "0" "R8: 마지막 턴이 Author — rc≠0"
+has "마지막 턴이 리뷰어 턴이 아님" "$RR_ERR" "R8: 어긋난 항목"
+
+# R8b: R2 + 턴이 아닌 파일 (turns/notes.md)
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS"
+printf 'memo\n' > "${SRR14}/turns/notes.md"
+rr_seal
+eq "$RR_RC" "0" "R8b: turns/ 의 비턴 파일은 마지막 턴 판정에서 제외 — rc=0"
+
+# R9: 기록의 head 가 SESSION 의 review-head-oid 와 다름
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS"
+awk -F'\t' -v OFS='\t' 'NR > 1 && !/^#/ { $4 = "0000000000000000000000000000000000000000" } { print }' \
+  "${SRR14}/reviewer_runs.tsv" > "${OUT}/runs.tmp"
+cat "${OUT}/runs.tmp" > "${SRR14}/reviewer_runs.tsv"
+rr_seal
+ne "$RR_RC" "0" "R9: head 불일치 — rc≠0"
+has "head 가 review-head-oid 와 다름" "$RR_ERR" "R9: 어긋난 항목"
+
+# R10: (R2 이후 SESSION 은 템플릿 그대로입니다) 새로 만든 세션의 SESSION.md 에 Closure Reason 절과 값 '-'
+eq "$(grep -cx '## Closure Reason' "${SRR14}/SESSION.md")" "1" "R10: SESSION 템플릿에 Closure Reason 절"
+eq "$(awk '$0=="## Closure Reason"{f=1;next} f&&/^## /{exit} f&&$0=="-"{print}' "${SRR14}/SESSION.md")" "-" "R10: 절의 값 줄은 -"
+
+# R4: 기록 당시 이의 미해결 + user-override + 근거 줄 → 봉인, 마커에 사유, stderr 에 근거
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS" "- 이의가 남았습니다"
+printf '# Review Checkpoint\n\n## Open Issues\n- 없음\n\n## Suggested Next Owner\nAuthor\n' > "${SRR14}/CHECKPOINT.md"
+rr_set_reason "user-override"; rr_set_basis '- 근거: 2026-11-06 사용자 — "덮고 종결"'
+rr_seal
+eq "$RR_RC" "0" "R4: user-override + 근거 — rc=0"
+eq "$(grep -cx 'closure-reason=user-override' "$MK14")" "1" "R4: 마커에 closure-reason=user-override 가 정확히 1줄"
+has 'user-override 근거 — 2026-11-06 사용자 — "덮고 종결"' "$RR_ERR" "R4: 근거 내용 출력"
+
+# R4b: 절 안 근거 줄 없음 + 다음 절(## Current Owner) 아래에만 근거 줄 (절 경계)
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS" "- 이의가 남았습니다"
+printf '# Review Checkpoint\n\n## Open Issues\n- 없음\n\n## Suggested Next Owner\nAuthor\n' > "${SRR14}/CHECKPOINT.md"
+rr_set_reason "user-override"; rr_set_basis ""
+cp "${SRR14}/SESSION.md" "${OUT}/sess.bak"
+awk '{print} $0=="## Current Owner"{print "근거: 다음 절의 메모"}' "${OUT}/sess.bak" > "${OUT}/sess.tmp" && cat "${OUT}/sess.tmp" > "${SRR14}/SESSION.md"
+rr_seal
+ne "$RR_RC" "0" "R4b: 절 밖 근거 줄 — rc≠0"
+has "사람의 결정 근거 줄이 없습니다" "$RR_ERR" "R4b: override-basis-missing 문구"
+cat "${OUT}/sess.bak" > "${SRR14}/SESSION.md"
+
+# R4c: 근거 줄은 있으나 내용이 공백뿐
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS" "- 이의가 남았습니다"
+printf '# Review Checkpoint\n\n## Open Issues\n- 없음\n\n## Suggested Next Owner\nAuthor\n' > "${SRR14}/CHECKPOINT.md"
+rr_set_reason "user-override"; rr_set_basis '- 근거:   '
+rr_seal
+ne "$RR_RC" "0" "R4c: 내용 빈 근거 줄 — rc≠0"
+has "사람의 결정 근거 줄이 없습니다" "$RR_ERR" "R4c: override-basis-missing 문구"
+
+# R4d: 근거 줄이 주석 안
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS" "- 이의가 남았습니다"
+printf '# Review Checkpoint\n\n## Open Issues\n- 없음\n\n## Suggested Next Owner\nAuthor\n' > "${SRR14}/CHECKPOINT.md"
+rr_set_reason "user-override"; rr_set_basis '<!-- 근거: 덮고 종결 -->'
+rr_seal
+ne "$RR_RC" "0" "R4d: 주석 안 근거 줄 — rc≠0"
+has "사람의 결정 근거 줄이 없습니다" "$RR_ERR" "R4d: override-basis-missing 문구"
+
+# R4e: 근거 줄의 내용이 작성 안내 주석뿐
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS" "- 이의가 남았습니다"
+printf '# Review Checkpoint\n\n## Open Issues\n- 없음\n\n## Suggested Next Owner\nAuthor\n' > "${SRR14}/CHECKPOINT.md"
+rr_set_reason "user-override"; rr_set_basis '- 근거: <!-- 사람이 답하면 채우기 -->'
+rr_seal
+ne "$RR_RC" "0" "R4e: 내용이 주석뿐인 근거 줄 — rc≠0"
+has "사람의 결정 근거 줄이 없습니다" "$RR_ERR" "R4e: override-basis-missing 문구"
+rr_set_basis ""
+
+# R5: 기록 0건 + user-override → 공통 run-missing 검사에 걸림
+rr_reset
+rr_set_reason "user-override"
+rr_seal
+ne "$RR_RC" "0" "R5: 기록 0건 + user-override — rc≠0"
+has "실제로 실행된 리뷰어 턴 기록이 없습니다" "$RR_ERR" "R5: run-missing 문구"
+
+# R7: 허용 값 밖
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS"
+rr_set_reason "foo"
+rr_seal
+ne "$RR_RC" "0" "R7: 허용 값 밖 — rc≠0"
+has "Closure Reason 값이 올바르지 않습니다: 'foo'" "$RR_ERR" "R7: reason-invalid 문구"
 
 if [ "$FAIL" = 0 ]; then
   echo "test_review_base_resolution: ALL PASS"

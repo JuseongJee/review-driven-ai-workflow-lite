@@ -34,8 +34,10 @@ fail() {
   FAIL=$((FAIL + 1))
 }
 
+# 이 파일의 SKIP 은 모두 환경 제약(ps 불가)이다. self_test 집계에 들어가도록 env-skip 표식을 stderr 에 함께 낸다.
 skip() {
   echo "SKIP $1"
+  printf 'env-skip: test_review_wait %s\n' "${1/: / — }" >&2
   SKIP=$((SKIP + 1))
 }
 
@@ -47,7 +49,7 @@ ADAPTER_CLAUDE="$SCRIPT_DIR/adapter_claude.sh"
 # --- sandbox 공통 함수 ---
 make_sandbox() {
   local d
-  d="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  d="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$d" && -d "$d" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   mkdir -p "$d/turns"
   echo "$d"
@@ -110,7 +112,7 @@ ps_is_trustworthy() {
   [ "$n" -ge 1 ]
 }
 
-# --- 프로세스 소유권 (케이스 14·15 의 고아 검출·정리 근거) ---
+# --- 프로세스 소유권 (고아 검출·정리 근거) ---
 # 고아를 명령행 패턴(`sleep <값>`)으로 식별하지 않는다. 패턴 일치는 소유권 증거가 아니며,
 # 같은 값을 쓰는 다른 사용자·테스트·프로젝트의 프로세스를 종료할 수 있다.
 # 대신 어댑터를 자체 process group 리더로 띄운다. process group 은 자손에게 상속되고
@@ -205,7 +207,14 @@ reap_on_signal() {  # $1: 종료 코드
   reap_descendants
   exit "$REAP_SIGNAL_RC"
 }
-trap 'reap_descendants' EXIT
+# 이 실행의 임시 파일·디렉터리는 모두 RUN_TMP 아래에 만들고, 종료(신호 포함) 때 회수 뒤 통째로 지운다.
+# 케이스별 rm 은 정상 경로만 지우므로 신호로 끊기면 sandbox 가 남는다. SIGKILL 은 trap 이 돌지 않아 범위 밖이다.
+# macOS 기본 mktemp 는 템플릿 없이 부르면 TMPDIR 을 따르지 않으므로(Darwin 25 실측) 호출마다 템플릿을 준다.
+# TMPDIR 도 바꿔, 어댑터가 "${TMPDIR:-/tmp}" 아래에 만드는 디렉터리까지 함께 지운다.
+RUN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/rd-test-review-wait.XXXXXX")" || { echo "test_review_wait.sh: 실행 전용 임시 디렉터리 생성 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+export RUN_TMP TMPDIR="$RUN_TMP"
+drop_run_tmp() { rm -rf "$RUN_TMP" 2>/dev/null || true; }
+trap 'reap_descendants; drop_run_tmp' EXIT
 trap 'reap_on_signal 129' HUP
 trap 'reap_on_signal 130' INT
 trap 'reap_on_signal 143' TERM
@@ -291,7 +300,7 @@ reap_mock_group() {  # $1=<sandbox>
 }
 
 # 케이스 이름 목록: ps 가 없으면 판정할 수 없는 케이스 (케이스 전체 건너뜀)
-PS_REQUIRED=(14 36a 36b 39 47 48)
+PS_REQUIRED=(36a 36b 39 47 48)
 PS_OK=1
 
 run() {  # $1=케이스 이름 — 선택·건너뜀 판정 뒤 run_case<이름> 호출
@@ -749,7 +758,7 @@ run_parse_harness() {
   local extra_path="${3:-}"
 
   local harness_dir
-  harness_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  harness_dir="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$harness_dir" && -d "$harness_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   # run_review_turn.sh 와 동일 디렉토리에서 실행해야 source 경로가 맞음 — 불필요
   # 함수만 inline으로 실행
@@ -807,7 +816,7 @@ run_case7() {
   fi
 
   local sandbox
-  sandbox="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  sandbox="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$sandbox" && -d "$sandbox" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   local count_file="$sandbox/jq_count"
   touch "$count_file"
@@ -861,7 +870,7 @@ run_case8() {
   fi
 
   local sandbox
-  sandbox="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  sandbox="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$sandbox" && -d "$sandbox" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   cat > "$sandbox/review-tools.json" <<'RJSON'
 {
@@ -901,7 +910,7 @@ run_case9() {
   fi
 
   local sandbox
-  sandbox="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  sandbox="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$sandbox" && -d "$sandbox" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   # bin 값에 공백·= 포함 (예: 경로 with spaces, model=xxx 형식)
   cat > "$sandbox/review-tools.json" <<'RJSON'
@@ -953,7 +962,7 @@ run_case10() {
   fi
 
   local sandbox
-  sandbox="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  sandbox="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$sandbox" && -d "$sandbox" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   # codex: model 필드 아예 없음(missing), claude: model = null
   cat > "$sandbox/review-tools.json" <<'RJSON'
@@ -973,7 +982,7 @@ RJSON
 
   # codex model(missing) 과 claude model(null) 모두 기본값 반환 확인
   local harness_dir
-  harness_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  harness_dir="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$harness_dir" && -d "$harness_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   local harness_script="$harness_dir/harness10.sh"
   cat > "$harness_script" <<HARNESS10_BODY
@@ -1035,7 +1044,7 @@ HARNESS10_BODY
 run_case11() {
   # 11a: jq 부재 — PRIORITY 기본값 사용
   local sandbox
-  sandbox="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  sandbox="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$sandbox" && -d "$sandbox" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   cat > "$sandbox/review-tools.json" <<'RJSON'
 {"default_priority": ["codex", "claude"], "tools": {}, "overrides": {}}
@@ -1052,7 +1061,7 @@ FAKE_JQ
   chmod +x "$no_jq_dir/jq"
 
   local harness_dir
-  harness_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  harness_dir="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$harness_dir" && -d "$harness_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   local harness_script="$harness_dir/harness11a.sh"
   cat > "$harness_script" <<HARNESS11A_BODY
@@ -1093,7 +1102,7 @@ HARNESS11A_BODY
   local bad_json="$sandbox/bad.json"
   echo 'NOT VALID JSON {{{' > "$bad_json"
 
-  harness_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  harness_dir="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$harness_dir" && -d "$harness_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   harness_script="$harness_dir/harness11b.sh"
   cat > "$harness_script" <<HARNESS11B_BODY
@@ -1116,9 +1125,11 @@ echo "PRIORITY=\$PRIORITY"
 HARNESS11B_BODY
   chmod +x "$harness_script"
 
-  local out11b stderr11b
-  out11b="$(bash "$harness_script" 2>/tmp/test_case11b_stderr)" || true
-  stderr11b="$(cat /tmp/test_case11b_stderr 2>/dev/null || true)"
+  local out11b stderr11b errf11b
+  errf11b="$(mktemp "$RUN_TMP/f.XXXXXX")" || { echo "test_review_wait.sh: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  out11b="$(bash "$harness_script" 2>"$errf11b")" || true
+  stderr11b="$(cat "$errf11b" 2>/dev/null || true)"
+  rm -f "$errf11b"
   rm -rf "$harness_dir"
 
   local priority11b
@@ -1146,7 +1157,7 @@ run_case12() {
   fi
 
   local sandbox
-  sandbox="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  sandbox="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$sandbox" && -d "$sandbox" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
 
   # .tools 없는 축약 config — 기존 구현에서는 "null has no keys" 오류로
@@ -1187,7 +1198,7 @@ run_case13() {
   fi
 
   local sandbox
-  sandbox="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  sandbox="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$sandbox" && -d "$sandbox" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
 
   # .overrides 필드 자체 없음 — (.overrides // {})[$rt] 이 null 로 안전하게 처리되어야 함
@@ -1217,140 +1228,6 @@ RJSON
 }
 
 # ===========================================================================
-# 케이스 14: 정상 완료 후 watchdog 타이머 자손 생존 금지 + 자원 누수 금지
-#   관측 창 분리가 핵심 — 호출자 파이프 없이 실행해 즉시 반환시킨 뒤 관측한다.
-#   케이스 15(파이프)와 한 케이스로 합치면, 파이프 대기로 WAIT_TIMEOUT 을 소모하는
-#   동안 고아가 제 수명을 다 채우고 사라져 결함 코드에서도 통과하는 위음성이 발생한다(실측).
-# ===========================================================================
-run_case14() {
-  local sandbox turn_file mock_bin uniq_timeout survivors leftover g
-  sandbox="$(make_sandbox)"
-  mkdir -p "$sandbox/tmp"
-  turn_file="$sandbox/turns/turn-001-reviewer.md"
-  uniq_timeout=$(( 100000000 + RUN_SALT ))
-
-  write_session "$sandbox" "Author" "awaiting-author"
-
-  mock_bin="$(setup_mock "$sandbox" "
-touch '$turn_file'
-cat > '$sandbox/SESSION.md' <<'SESS_EOF'
-## Current Owner
-Author
-
-## Status
-awaiting-author
-
-## Turn Limit
-20
-SESS_EOF
-exit 0
-")"
-
-  # 어댑터를 자체 process group 리더로 띄운다 — 종료 후 그 그룹에 남은 구성원이 곧 고아다.
-  spawn_group "$sandbox/out.log" \
-    env TMPDIR="$sandbox/tmp" WAIT_TIMEOUT="$uniq_timeout" TOOL_BIN="$mock_bin/codex" \
-        SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null EXPECTED_TURN_FILE="$turn_file" \
-        PROJECT_ROOT="$sandbox" bash "$ADAPTER"
-  g="$GROUP_PGID"
-  wait "$JOB" 2>/dev/null || true
-
-  sleep 0.5
-
-  if ! ps_is_trustworthy || [ -z "$g" ]; then
-    fail "케이스 14a: ps 가 자기 PID/PGID 를 관측하지 못해 고아 판정을 신뢰할 수 없음 (busybox 등 ps 구현 확인 필요)"
-  else
-    survivors="$(group_size "$g")"
-    if [ "$survivors" -eq 0 ]; then
-      pass "케이스 14a: 정상 완료 후 잔존 타이머 자손 0개"
-    else
-      fail "케이스 14a: 잔존 타이머 자손 ${survivors}개 — watchdog 자손이 호출자 fd 를 계속 보유"
-    fi
-  fi
-  # 소유권이 확인된 그룹만 회수한다 (pkill -f·패턴 종료 금지 — 무관한 프로세스에 닿는다)
-  reap_group "$g"
-
-  # 누수는 이 케이스 전용 TMPDIR 안에서 절대 개수 0 으로 본다 (동시 실행 무관).
-  # 현행 코드에는 fifo 자체가 없어 이 어서션은 결함 코드에서도 통과한다 — 결함 검출용이
-  # 아니라 새 기법이 도입하는 자원의 누수 방지용 가드다 (AC4).
-  leftover="$(leftover_watchdog_in "$sandbox/tmp")"
-  if [ "$leftover" -eq 0 ]; then
-    pass "케이스 14b: 전용 TMPDIR 에 watchdog 임시 자원 잔존 0개"
-  else
-    fail "케이스 14b: 전용 TMPDIR 에 watchdog 임시 자원 ${leftover}개 잔존"
-  fi
-
-  rm -rf "$sandbox"
-}
-
-# ===========================================================================
-# 케이스 15: 호출자가 stderr 를 파이프로 받아도 턴 완료와 함께 파이프가 닫힌다
-#   판정에 kill -0 를 쓰지 않는다 — 종료된 자식이 reap 전 좀비로 남으면 kill -0 가
-#   성공해 오판할 수 있다. 파이프라인 뒤에 sentinel 파일을 기록하고 그 존재를 폴링한다.
-#   sentinel 은 cat 이 종료된 뒤에만(= 파이프가 닫힌 뒤에만) 기록되므로 측정 대상과 일치한다.
-#   상한 폴링이라 결함이 있어도 WAIT_TIMEOUT 전체가 아니라 상한만 소모한다.
-# ===========================================================================
-
-# 케이스 15 파이프 본체. spawn_group 이 이 함수를 자체 process group 으로 띄우므로
-# 어댑터·watchdog·cat 이 모두 그 그룹에 들어가고, 회수를 그룹 단위로 할 수 있다.
-# sentinel 은 파이프라인 **뒤에** 기록되므로 cat 종료(= 파이프 EOF)와 시점이 일치한다.
-case15_body() {  # $1=sandbox $2=WAIT_TIMEOUT $3=mock_bin $4=turn_file
-  env TMPDIR="$1/tmp" WAIT_TIMEOUT="$2" TOOL_BIN="$3/codex" SESSION_PATH="$1" \
-      PROMPT_FILE=/dev/null EXPECTED_TURN_FILE="$4" PROJECT_ROOT="$1" \
-      bash "$ADAPTER" 2>&1 | cat > "$1/piped.log" || true
-  echo done > "$1/.piped_done"
-}
-
-run_case15() {
-  local sandbox turn_file mock_bin uniq_timeout cap job waited g
-  sandbox="$(make_sandbox)"
-  mkdir -p "$sandbox/tmp"
-  turn_file="$sandbox/turns/turn-001-reviewer.md"
-  uniq_timeout=$(( 200000000 + RUN_SALT ))
-  cap=6             # 상한(초)
-
-  write_session "$sandbox" "Author" "awaiting-author"
-
-  mock_bin="$(setup_mock "$sandbox" "
-touch '$turn_file'
-cat > '$sandbox/SESSION.md' <<'SESS_EOF'
-## Current Owner
-Author
-
-## Status
-awaiting-author
-
-## Turn Limit
-20
-SESS_EOF
-exit 0
-")"
-
-  spawn_group "$sandbox/wrap.log" case15_body "$sandbox" "$uniq_timeout" "$mock_bin" "$turn_file"
-  job="$JOB"
-  g="$GROUP_PGID"
-
-  waited=0
-  while [ "$waited" -lt "$cap" ] && [ ! -f "$sandbox/.piped_done" ]; do
-    sleep 1
-    waited=$((waited + 1))
-  done
-
-  if [ -f "$sandbox/.piped_done" ]; then
-    pass "케이스 15: stderr 파이프 수신 시에도 턴 완료와 함께 파이프 닫힘 (${waited}초, 상한 ${cap}초)"
-  else
-    fail "케이스 15: 턴 완료 후에도 호출자 파이프가 ${cap}초 이상 열린 채 유지 (WAIT_TIMEOUT=${uniq_timeout})"
-  fi
-
-  # fd 보유자를 먼저 회수한 뒤 job 을 reap 한다 — 순서를 바꾸면 cat 이 EOF 를 못 받아
-  # wait 가 무한 대기한다. 회수는 소유권이 확인된 그룹 단위로만 하며, 그 그룹에
-  # 어댑터·watchdog 고아·cat 이 모두 들어 있다 (pkill -f·패턴 종료 금지).
-  # 블록 전체의 stderr 를 버리는 것은 kill -9 후 bash 가 내는 job 상태 알림
-  # (`... Killed: 9 ...`) 이 판정 로그를 가리는 것을 막기 위함이다.
-  { reap_group "$g"; wait "$job" || true; } 2>/dev/null
-  rm -rf "$sandbox"
-}
-
-# ===========================================================================
 # 케이스 16: writable surface 세션 하위 폐쇄 (codex-adapter-writable-root)
 #   (a) last-message 파일은 세션 하위 mktemp 템플릿 — 세션에 미리 놓인 고정명 symlink
 #       `.last_message` 를 따라가 세션 밖 파일을 truncate 하지 않는다 (final diff review 002턴).
@@ -1364,13 +1241,13 @@ run_case16() {
   sess_real="$(cd "$sandbox" && pwd -P)"
 
   # team-overlay 재현: PROJECT_ROOT 안의 symlink 가 세션 실제 위치를 가리킨다
-  link_root="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  link_root="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$link_root" && -d "$link_root" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   sess_link="$link_root/sess"
   ln -s "$sess_real" "$sess_link"
 
   # 세션 밖 피해 후보 + 고정명 symlink 사전 배치 (checkout·이전 비정상 실행 상황 재현)
-  victim_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  victim_dir="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$victim_dir" && -d "$victim_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   victim="$victim_dir/victim.txt"
   printf 'KEEP\n' > "$victim"
@@ -1471,14 +1348,15 @@ run_case17() {
   # mock: 즉시 턴 파일을 만들고 끝낸다 (대기 로직을 타지 않게)
   mock_bin="$(setup_mock "$sandbox" "printf 'x' > \"$expected_turn\"; exit 0")"
 
-  # 해석 결과를 stderr 에서 읽는다. 형식: "wait config: cap=<N>s idle=<N>s"
+  # a~e: 어댑터를 실행하지 않고 review_wait.sh 의 해석 함수를 직접 부른다 — 어댑터가 같은 함수·같은 기본값
+  # (cap 7200, idle 600)으로 "wait config: cap=<N>s idle=<N>s" 줄을 만든다. 같은 형식으로 비교한다.
   # 주의: BSD/macOS env 는 옵션을 환경 대입보다 **앞**에 두어야 한다.
   #       `env NAME=v -u OTHER` 형태는 -u 를 실행할 명령으로 해석할 수 있다.
   probe() {  # $1..: env 인자(-u 옵션이 먼저, 그다음 NAME=value) → stdout 에 config 줄
-    env "$@" \
-      TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
-      EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
-      bash "$ADAPTER" 2>&1 | grep -o 'wait config: cap=[0-9]*s idle=[0-9]*s' || true
+    env "$@" bash -c '
+      source "$1"
+      printf "wait config: cap=%ss idle=%ss\n" "$(rw_resolve_abs_cap 7200 2>/dev/null)" "$(rw_resolve_idle 600 2>/dev/null)"
+    ' _ "$SCRIPT_DIR/review_wait.sh" || true
   }
 
   local out
@@ -1512,23 +1390,22 @@ run_case17() {
     && pass "케이스 17e: IDLE=0 유효(비활성)" \
     || fail "케이스 17e: 기대 idle=0 — 실제 [$out]"
 
-  # (f) IDLE 무효 → 기본값 + 경고
-  local warn
-  warn="$(env -u WAIT_TIMEOUT -u POLL_TIMEOUT RD_REVIEW_IDLE_TIMEOUT=xyz \
-    TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
-    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
-    bash "$ADAPTER" 2>&1 | grep -c 'RD_REVIEW_IDLE_TIMEOUT' || true)"
-  [ "$warn" -ge 1 ] \
-    && pass "케이스 17f: IDLE 무효값 경고 출력" \
-    || fail "케이스 17f: 경고 미출력"
-
-  # (g) 조정 변수 두 개의 무효값도 경고한다
+  # (f)(g) 무효값 경고 — 어댑터 실행 1회에 세 조건을 함께 주고 경고를 각각 확인한다
   local w2
-  w2="$(env -u WAIT_TIMEOUT -u POLL_TIMEOUT \
+  w2="$(env -u WAIT_TIMEOUT -u POLL_TIMEOUT RD_REVIEW_IDLE_TIMEOUT=xyz \
     RD_REVIEW_OBSERVER_FALLBACK_CAP=abc RD_REVIEW_HEARTBEAT=-3 \
     TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
     EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
     bash "$ADAPTER" 2>&1)" || true
+
+  # (f) IDLE 무효 → 기본값 + 경고
+  if echo "$w2" | grep -q 'RD_REVIEW_IDLE_TIMEOUT'; then
+    pass "케이스 17f: IDLE 무효값 경고 출력"
+  else
+    fail "케이스 17f: 경고 미출력"
+  fi
+
+  # (g) 조정 변수 두 개의 무효값도 경고한다
   if echo "$w2" | grep -q 'RD_REVIEW_OBSERVER_FALLBACK_CAP' \
      && echo "$w2" | grep -q 'RD_REVIEW_HEARTBEAT'; then
     pass "케이스 17g: 조정 변수 무효값 경고"
@@ -1599,6 +1476,7 @@ run_case19() {
       bash "$ADAPTER" 2>&1
   )" || rc=$?
   elapsed=$(( $(date +%s) - start ))
+  C19_OUT="$output"   # 케이스 23 의 메시지 단언이 이 출력을 쓴다
 
   if [ "$rc" -eq 124 ] && echo "$output" | grep -q "유휴"; then
     pass "케이스 19: 무활동 → 유휴 사유로 exit 124 (${elapsed}초)"
@@ -1633,6 +1511,7 @@ run_case20() {
     WAIT_TIMEOUT=4 RD_REVIEW_IDLE_TIMEOUT=600 \
       bash "$ADAPTER" 2>&1
   )" || rc=$?
+  C20_OUT="$output"   # 케이스 23 의 메시지 단언이 이 출력을 쓴다
 
   if [ "$rc" -eq 124 ] && echo "$output" | grep -q "상한"; then
     pass "케이스 20: 활동 중에도 절대 상한에서 exit 124"
@@ -1779,19 +1658,14 @@ run_case22() {
 # 케이스 23: 타임아웃 메시지 — 오염 단정 금지 + 재개 가능 판정
 # ===========================================================================
 run_case23() {
-  local sandbox expected_turn mock_bin rc=0 output
-  sandbox="$(make_sandbox)"
-  expected_turn="$sandbox/turns/turn-001-reviewer.md"
-  write_session "$sandbox" "Reviewer" "awaiting-reviewer"
-  write_checkpoint "$sandbox" "Author"
-  mock_bin="$(setup_mock "$sandbox" "echo begin; exec sleep 60")"
-
-  output="$(
-    TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
-    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
-    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=3 \
-      bash "$ADAPTER" 2>&1
-  )" || rc=$?
+  # 메시지 단언은 케이스 19(idle, WAIT_TIMEOUT=60 IDLE=3)·20(cap, WAIT_TIMEOUT=4 IDLE=600)가 만든 어댑터 출력에
+  # 적용한다 — 같은 mock·같은 세션 조건으로 같은 타임아웃을 내며 메시지 문구는 숫자에 의존하지 않는다.
+  # 23 만 선택해 실행하면 출력이 없으므로 19·20 을 먼저 실행한다.
+  local sandbox output output3 sandbox2 output2 rc2=0 mock2
+  [ -n "${C19_OUT:-}" ] || run_case19
+  [ -n "${C20_OUT:-}" ] || run_case20
+  output="$C19_OUT"
+  output3="$C20_OUT"
 
   # (a) 오염을 단정하지 않는다
   echo "$output" | grep -q '오염' \
@@ -1820,18 +1694,7 @@ run_case23() {
     && fail "케이스 23d2: idle 사유에 절대 상한 조정을 안내함 (재발하는 조치)" \
     || pass "케이스 23d2: idle 사유에 절대 상한 안내 없음"
 
-  # (d3) cap 사유에는 WAIT_TIMEOUT 을 안내하고, 증명되지 않은 단정을 하지 않는다
-  local sandbox3 output3 rc3=0 mock3
-  sandbox3="$(make_sandbox)"
-  write_session "$sandbox3" "Reviewer" "awaiting-reviewer"
-  write_checkpoint "$sandbox3" "Author"
-  mock3="$(setup_mock "$sandbox3" "while :; do echo tick; sleep 1; done")"
-  output3="$(
-    TOOL_BIN="$mock3/codex" SESSION_PATH="$sandbox3" PROMPT_FILE=/dev/null \
-    EXPECTED_TURN_FILE="$sandbox3/turns/turn-001-reviewer.md" PROJECT_ROOT="$sandbox3" \
-    WAIT_TIMEOUT=3 RD_REVIEW_IDLE_TIMEOUT=600 \
-      bash "$ADAPTER" 2>&1
-  )" || rc3=$?
+  # (d3) cap 사유에는 WAIT_TIMEOUT 을 안내하고, 증명되지 않은 단정을 하지 않는다 (케이스 20 출력)
   echo "$output3" | grep -q 'WAIT_TIMEOUT=<더 큰 값>' \
     && pass "케이스 23d3: cap 사유에 절대 상한 조정 안내" \
     || fail "케이스 23d3: cap 사유에 절대 상한 안내 없음"
@@ -1841,14 +1704,11 @@ run_case23() {
   echo "$output3" | grep -q '오염' \
     && fail "케이스 23d5: cap 경로에도 '오염' 단정이 남아 있음" \
     || pass "케이스 23d5: cap 경로에 오염 단정 없음"
-  rm -rf "$sandbox3"
 
   # (e) 상태가 어긋나면 재개 가능하다고 말하지 않는다
-  local sandbox2 output2 rc2=0
   sandbox2="$(make_sandbox)"
   write_session "$sandbox2" "Bogus" "awaiting-reviewer"
   write_checkpoint "$sandbox2" "Author"
-  local mock2
   mock2="$(setup_mock "$sandbox2" "echo begin; exec sleep 60")"
   output2="$(
     TOOL_BIN="$mock2/codex" SESSION_PATH="$sandbox2" PROMPT_FILE=/dev/null \
@@ -1864,8 +1724,6 @@ run_case23() {
     && fail "케이스 23e2: 상태 불일치인데 재개 명령을 출력함" \
     || pass "케이스 23e2: 상태 불일치 시 재개 명령 없음"
   rm -rf "$sandbox2"
-
-  rm -rf "$sandbox"
 }
 
 # ===========================================================================
@@ -2010,11 +1868,11 @@ run_case26() {
   expected_turn="$sandbox/turns/turn-001-reviewer.md"
   write_session "$sandbox" "Author" "awaiting-author"
 
-  victim_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  victim_dir="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$victim_dir" && -d "$victim_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   victim="$victim_dir/sentinel.txt"
   printf 'SENTINEL-KEEP\n' > "$victim"
-  leak_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  leak_dir="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$leak_dir" && -d "$leak_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
 
   bin_dir="$sandbox/mock_bin"
@@ -2126,7 +1984,7 @@ run_case27() {
   expected2="$sandbox2/turns/turn-001-reviewer.md"
   write_session "$sandbox2" "Author" "awaiting-author"
   mock2="$(setup_mock "$sandbox2" "echo leaky; printf 'x' > \"$expected2\"; exit 0")"
-  leak_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  leak_dir="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$leak_dir" && -d "$leak_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   ln -sfn "$leak_dir" "$sandbox2/.codex_output.log"
 
@@ -2162,9 +2020,9 @@ run_case28() {
   expected_turn="$sandbox/turns/turn-001-reviewer.md"
   write_session "$sandbox" "Reviewer" "awaiting-reviewer"
   write_checkpoint "$sandbox" "Author"
-  leak_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  leak_dir="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$leak_dir" && -d "$leak_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
-  victim_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  victim_dir="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$victim_dir" && -d "$victim_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   victim="$victim_dir/sentinel.txt"
   printf 'SENTINEL-KEEP\n' > "$victim"
@@ -2233,7 +2091,7 @@ MOCK_EOF
   sb2="$(make_sandbox)"
   write_session "$sb2" "Reviewer" "awaiting-reviewer"
   write_checkpoint "$sb2" "Author"
-  leak2="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  leak2="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$leak2" && -d "$leak2" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   local mock2
   mock2="$(setup_mock "$sb2" 'ln -sfn "$C28E_LEAKDIR" "$SESSION_PATH/.wait_timeout" 2>/dev/null; exec sleep 60')"
@@ -2273,7 +2131,7 @@ run_case29() {
   sandbox="$(make_sandbox)"
   expected_turn="$sandbox/turns/turn-001-reviewer.md"
   write_session "$sandbox" "Author" "awaiting-author"
-  out_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  out_dir="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$out_dir" && -d "$out_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   outside="$out_dir/outside.txt"
   printf 'OUTSIDE-CONTENT\n' > "$outside"
@@ -2450,7 +2308,7 @@ run_case31() {
   expected_turn="$sandbox/turns/turn-001-reviewer.md"
   write_session "$sandbox" "Reviewer" "awaiting-reviewer"
   write_checkpoint "$sandbox" "Author"
-  out_dir="$(mktemp -d)" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  out_dir="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { echo "test_review_wait.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$out_dir" && -d "$out_dir" ]] || { echo "test_review_wait.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   sentinel="$out_dir/secret.txt"
   printf 'RDLEAK-SENTINEL-9f3a2b\n' > "$sentinel"
@@ -2474,13 +2332,19 @@ for f in "$SESSION_PATH"/.codex_output.?????? "$SESSION_PATH"/.last_message.????
   rm -f "$f" 2>/dev/null
   ln -sfn "$RD31_SENTINEL" "$f" 2>/dev/null
 done
-# ④ heartbeat(1초)가 여러 번 지나가게 기다린 뒤 **턴 파일 없이** 종료 → 조기 종료 보고 경로
-sleep 3
+# ④ heartbeat(1초)가 2회 이상 stderr 에 찍힐 때까지 기다린 뒤 **턴 파일 없이** 종료 → 조기 종료 보고 경로.
+#    고정 3초 대기는 부하(load 43)에서 heartbeat 가 1회만 찍혀 31c 가 간헐 FAIL 했다. 조건을 직접 보고,
+#    heartbeat 가 끝내 안 찍히면 15초 뒤 그대로 끝내 31c 가 FAIL 하게 한다(유휴 상한 20초보다 짧게).
+w=0
+while [ "$w" -lt 75 ]; do
+  [ "$(grep -c '^\[review wait\]' "$RD31_ERR" 2>/dev/null || true)" -ge 2 ] && break
+  sleep 0.2; w=$((w+1))
+done
 exit 3
 MOCK_EOF
   chmod +x "$bin_dir/codex"
 
-  RD31_SENTINEL="$sentinel" \
+  RD31_SENTINEL="$sentinel" RD31_ERR="$err" \
   TOOL_BIN="$bin_dir/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
   EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
   WAIT_TIMEOUT=30 RD_REVIEW_IDLE_TIMEOUT=20 RD_REVIEW_HEARTBEAT=1 \
@@ -2600,7 +2464,7 @@ WRAPEOF
 # 케이스 33 (V1): claude 유휴 임계 발동 → exit 124
 #   V4(d) 겸용 — TERM 을 무시하지 않는 리더는 즉시 죽어 watchdog 의 grace(3초)가 끝나기
 #   전에 부모가 watchdog 을 kill 한다. 그 취소 경로에서 타이머 자원이 남지 않는지 여기서
-#   함께 확인한다(전용 TMPDIR 로 절대 개수 0을 본다 — 케이스 14b 와 같은 근거).
+#   함께 확인한다(전용 TMPDIR 로 절대 개수 0을 본다).
 # ===========================================================================
 run_case33() {
   local sandbox expected_turn mock_bin rc=0 output start elapsed leftover
@@ -2764,7 +2628,7 @@ exit 0
 #     (어댑터에 장애를 주입하지 않는다 — review_wait.sh 의 rw_watchdog_loop 을 직접 호출)
 # ===========================================================================
 run_case36a() {
-  local sandbox expected_turn mock_bin rc=0 waited cap survivors
+  local sandbox expected_turn mock_bin rc=0 waited cap survivors i
   sandbox="$(make_sandbox)"
   expected_turn="$sandbox/turns/turn-001.md"
   # TERM 을 무시하는 리더 — trap '' 의 SIG_IGN 은 exec 뒤에도 유지된다(POSIX)
@@ -2778,10 +2642,11 @@ run_case36a() {
     bash "$ADAPTER_CLAUDE"
 
   waited=0
-  while [ "$waited" -lt "$cap" ] && kill -0 "$JOB" 2>/dev/null; do
-    sleep 1
+  while [ "$waited" -lt $((cap * 10)) ] && kill -0 "$JOB" 2>/dev/null; do
+    sleep 0.1
     waited=$((waited + 1))
   done
+  waited=$((waited / 10))   # 0.1초 틱 → 초 (상한 cap 초는 그대로)
 
   if kill -0 "$JOB" 2>/dev/null; then
     fail "케이스 36a: 외부 안전망 ${cap}초에 도달 — 어댑터 자체 회수 실패"
@@ -2794,7 +2659,8 @@ run_case36a() {
       fail "케이스 36a: 기대 rc=124 — 실제 rc=$rc"
     fi
 
-    sleep 0.5
+    # 그룹이 비는 것을 조건으로 기다린다 (최대 5초, 0.05초 간격)
+    for i in $(seq 1 100); do [ "$(group_size "$GROUP_PGID")" -eq 0 ] && break; sleep 0.05; done
     survivors="$(group_size "$GROUP_PGID")"
     [ "$survivors" -eq 0 ] \
       && pass "케이스 36a(보조1): 그룹 소멸 확인" \
@@ -2878,10 +2744,10 @@ run_case36c() {
   bash -c 'trap "" TERM; exec sleep 60' &
   leader_pid=$!
 
-  timer_dir="$(mktemp -d)" || { fail "케이스 36c: 타이머 디렉터리 mktemp 실패"; kill "$leader_pid" 2>/dev/null; return; }
+  timer_dir="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { fail "케이스 36c: 타이머 디렉터리 mktemp 실패"; kill "$leader_pid" 2>/dev/null; return; }
   mkfifo "$timer_dir/timer"
   exec 9<> "$timer_dir/timer"
-  marker_file="$(mktemp)" || { fail "케이스 36c: 마커 파일 mktemp 실패"; kill "$leader_pid" 2>/dev/null; rm -rf "$timer_dir"; return; }
+  marker_file="$(mktemp "$RUN_TMP/f.XXXXXX")" || { fail "케이스 36c: 마커 파일 mktemp 실패"; kill "$leader_pid" 2>/dev/null; rm -rf "$timer_dir"; return; }
   exec 7>> "$marker_file"
 
   (
@@ -2908,10 +2774,11 @@ run_case36c() {
   wd_pid=$!
 
   waited=0
-  while [ "$waited" -lt "$cap" ] && kill -0 "$leader_pid" 2>/dev/null; do
-    sleep 1
+  while [ "$waited" -lt $((cap * 10)) ] && kill -0 "$leader_pid" 2>/dev/null; do
+    sleep 0.1
     waited=$((waited + 1))
   done
+  waited=$((waited / 10))   # 0.1초 틱 → 초 (상한 cap 초는 그대로)
 
   if kill -0 "$leader_pid" 2>/dev/null; then
     fail "케이스 36c: 외부 안전망 ${cap}초에도 pgid 미확보 리더가 회수되지 않음"
@@ -2950,10 +2817,11 @@ run_case36d() {
     bash "$ADAPTER"
 
   waited=0
-  while [ "$waited" -lt "$cap" ] && kill -0 "$JOB" 2>/dev/null; do
-    sleep 1
+  while [ "$waited" -lt $((cap * 10)) ] && kill -0 "$JOB" 2>/dev/null; do
+    sleep 0.1
     waited=$((waited + 1))
   done
+  waited=$((waited / 10))   # 0.1초 틱 → 초 (상한 cap 초는 그대로)
 
   if kill -0 "$JOB" 2>/dev/null; then
     fail "케이스 36d: 외부 안전망 ${cap}초에 도달 — 어댑터 자체 회수 실패"
@@ -2987,10 +2855,10 @@ run_case37() {
 
   sleep 60 &
   dummy_pid=$!
-  timer_dir="$(mktemp -d)" || { fail "케이스 37: 타이머 디렉터리 mktemp 실패"; kill "$dummy_pid" 2>/dev/null; return; }
+  timer_dir="$(mktemp -d "$RUN_TMP/d.XXXXXX")" || { fail "케이스 37: 타이머 디렉터리 mktemp 실패"; kill "$dummy_pid" 2>/dev/null; return; }
   mkfifo "$timer_dir/timer"
   exec 9<> "$timer_dir/timer"
-  marker_file="$(mktemp)" || { fail "케이스 37: 마커 파일 mktemp 실패"; kill "$dummy_pid" 2>/dev/null; rm -rf "$timer_dir"; return; }
+  marker_file="$(mktemp "$RUN_TMP/f.XXXXXX")" || { fail "케이스 37: 마커 파일 mktemp 실패"; kill "$dummy_pid" 2>/dev/null; rm -rf "$timer_dir"; return; }
   exec 7>> "$marker_file"
   exec 6< "$marker_file"
 
@@ -3096,7 +2964,7 @@ run_case39() {
     && pass "케이스 39: TERM 수신 → exit 143" \
     || fail "케이스 39: 기대 rc=143 — 실제 rc=$rc"
 
-  sleep 0.5
+  for i in $(seq 1 100); do [ "$(group_size "$adapter_pgid")" -eq 0 ] && break; sleep 0.05; done
   survivors="$(group_size "$adapter_pgid")"
   [ "$survivors" -eq 0 ] \
     && pass "케이스 39(보조1): TERM 후 자손 프로세스 없음" \
@@ -3166,7 +3034,7 @@ run_case40() {
   long300="$(printf 'A%.0s' $(seq 1 300))"
 
   # ① 훅 미설정 + 300자 입력 → rw_display_line 이 원문 그대로 (codex 불변 조건)
-  harness="$(mktemp)" || { fail "케이스 40 ①: 하니스 mktemp 실패"; return; }
+  harness="$(mktemp "$RUN_TMP/f.XXXXXX")" || { fail "케이스 40 ①: 하니스 mktemp 실패"; return; }
   cat > "$harness" <<HARNESS_EOF
 #!/usr/bin/env bash
 source "$SCRIPT_DIR/review_wait.sh"
@@ -3184,7 +3052,7 @@ HARNESS_EOF
 
   # ② claude 미분류 300자 입력 → claude_format_line 결과가 200자 이하이고 끝이 …
   claude_fmt_src="$(sed -n '/^claude_format_line() {/,/^}/p' "$ADAPTER_CLAUDE")"
-  harness="$(mktemp)" || { fail "케이스 40 ②: 하니스 mktemp 실패"; return; }
+  harness="$(mktemp "$RUN_TMP/f.XXXXXX")" || { fail "케이스 40 ②: 하니스 mktemp 실패"; return; }
   {
     echo '#!/usr/bin/env bash'
     printf '%s\n' "$claude_fmt_src"
@@ -3204,8 +3072,27 @@ HARNESS_EOF
     fail "케이스 40b: 절단 계약 위반 — 길이 ${#out}, 말줄임=$([ "$suffix_ok" -eq 1 ] && echo 있음 || echo 없음)"
   fi
 
+  # ②' C 로캘 + 한글 300자 → 글자 중간에서 자르지 않는다(결과가 유효한 UTF-8 이고 끝이 …).
+  #     LANG 이 없는 무인 실행에서 bash 는 바이트로 자르므로 사용자에게 깨진 줄이 보인다.
+  harness="$(mktemp "$RUN_TMP/f.XXXXXX")" || { fail "케이스 40 ②': 하니스 mktemp 실패"; return; }
+  {
+    echo '#!/usr/bin/env bash'
+    printf '%s\n' "$claude_fmt_src"
+    printf 'claude_format_line "%s"\n' "$(printf '가%.0s' $(seq 1 300))"
+  } > "$harness"
+  out="$(LC_ALL=C bash "$harness")"
+  rm -f "$harness"
+  if printf '%s' "$out" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+    case "$out" in
+      *'…') pass "케이스 40d: C 로캘 한글 입력 → 유효한 UTF-8 + 말줄임(…)" ;;
+      *) fail "케이스 40d: C 로캘 한글 입력 → 말줄임 없음" ;;
+    esac
+  else
+    fail "케이스 40d: C 로캘 한글 입력 → 글자 중간에서 잘림(UTF-8 무효)"
+  fi
+
   # ③ tool_use 줄 → assistant: tool_use Grep
-  harness="$(mktemp)" || { fail "케이스 40 ③: 하니스 mktemp 실패"; return; }
+  harness="$(mktemp "$RUN_TMP/f.XXXXXX")" || { fail "케이스 40 ③: 하니스 mktemp 실패"; return; }
   {
     echo '#!/usr/bin/env bash'
     printf '%s\n' "$claude_fmt_src"
@@ -3313,12 +3200,12 @@ run_case43() {
 }
 
 # ===========================================================================
-# 케이스 44 (final diff review 턴 004 F2): 리더 pid 폴백이 spawn 전·pgid 확보 중 cleanup 을 깨지 않는다
+# 케이스 44 리더 pid 폴백이 spawn 전·pgid 확보 중 cleanup 을 깨지 않는다
 #   (a) spawn 전 부분 초기화 실패(mkfifo 실패 shim): cleanup 이 `RW_TARGET_PID: unbound variable` 로 죽지 않는다.
 #   (b) pgid 확보 중 SIGTERM(ps shim 이 진입을 표시하고 대기 뒤 실패): 신호 종료 코드 143 이 보존되고 unbound 오류가 없다.
 #   (c) trap 설치 후·spawn 전 SIGTERM(결정적): 테스트 전용 BASH_ENV 가 DEBUG trap 을 걸어, 어댑터가 spawn 직전의
 #       `set -m` 을 실행하려는 순간 자기 자신에게 SIGTERM 을 보낸다 → 143 보존·unbound 오류 없음. 이 창은 외부 명령이
-#       없어 시간으로 맞출 수 없으므로 DEBUG 계측으로 강제한다(final diff review 턴 006 F3, 변이 M27·M28 의 목표).
+#       없어 시간으로 맞출 수 없으므로 DEBUG 계측으로 강제한다(변이 M27·M28 의 목표).
 #   codex·claude 양쪽에 같은 하니스를 쓴다.
 # ===========================================================================
 init_guard_harness() {  # $1=codex|claude $2=a|b|c
@@ -3356,7 +3243,8 @@ init_guard_harness() {  # $1=codex|claude $2=a|b|c
       fail "케이스 44a(${tool}): 기대 rc=1·unbound 없음 — rc=$rc, $(grep -m1 'unbound' "$err" || echo '(unbound 없음)')"
     fi
   else
-    printf '#!/bin/sh\n: > "%s"\nsleep 3\nexit 1\n' "$marker" > "$shim/ps"; chmod +x "$shim/ps"  # 진입 표시 후 대기하는 별도 형태 — 헬퍼 모드 아님
+    # 진입 표시 후 release 파일이 생길 때까지 대기(0.05초 폴링, 최대 3초)하고 실패하는 별도 형태 — 헬퍼 모드 아님
+    printf '#!/bin/sh\n: > "%s"\ni=0\nwhile [ ! -e "%s" ] && [ "$i" -lt 60 ]; do sleep 0.05; i=$((i+1)); done\nexit 1\n' "$marker" "$sandbox/ps-release" > "$shim/ps"; chmod +x "$shim/ps"
     TMPDIR="$sandbox/tmp" PATH="$shim:$PATH" TOOL_BIN="$mock_bin/$tool" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
       EXPECTED_TURN_FILE="$sandbox/turns/turn-001.md" PROJECT_ROOT="$sandbox" \
       WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=60 \
@@ -3364,6 +3252,7 @@ init_guard_harness() {  # $1=codex|claude $2=a|b|c
     pid=$!
     for i in $(seq 1 100); do [ -e "$marker" ] && break; sleep 0.05; done
     kill -TERM "$pid" 2>/dev/null || true
+    : > "$sandbox/ps-release"   # 신호를 보낸 직후 shim 을 놓아 준다 (고정 3초 대기 제거)
     wait "$pid" 2>/dev/null || rc=$?
     if [ "$rc" -eq 143 ] && ! grep -q 'unbound variable' "$err"; then
       pass "케이스 44b(${tool}): pgid 확보 중 SIGTERM 에서 143 보존·unbound 오류 없음"
@@ -3744,12 +3633,6 @@ section "회귀 테스트 — .tools/.overrides 부재 방어 (fix: priority 폐
 
 run 12
 run 13
-
-section "회귀 테스트 — watchdog 자손 lifecycle (fix: 고아 sleep 이 호출자 파이프 점유)"
-
-run 14
-run 15
-
 section "회귀 테스트 — writable surface 세션 하위 폐쇄 (codex-adapter-writable-root)"
 
 run 16

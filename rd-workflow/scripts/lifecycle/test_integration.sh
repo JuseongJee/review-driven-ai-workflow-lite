@@ -266,7 +266,7 @@ rm -rf "$REPO"
 # 변경 전 절차는 archive content commit 에서 수동 reset 을 요구했으므로, 그 절차를 따른 FR·
 # 재실행·복구 흐름에서는 merge 시점에 미러가 이미 baseline 이다. archive 가 다시 baseline 을
 # 써도 HEAD 와 동일해 staged 변경이 없는데, 이를 실패로 판정하면 정상 경로가 막히고
-# merge 가 끝난 뒤라 사용자가 수동 복구를 해야 한다 (final diff review turn 002 Finding 1).
+# merge 가 끝난 뒤라 사용자가 수동 복구를 해야 한다.
 echo "== scenario 1b: 이미 baseline 인 미러로 archive =="
 REPO="$(setup_repo)"
 run_promote "$REPO" --short-title test-pre --no-worktree --status "구현 중" >/dev/null
@@ -1685,7 +1685,7 @@ pr7_set "검증 중" "검증 중"
 #
 # 권위 파일이 사라진 뒤 index 에서 되살리면 `source-fr` 가 승격 시점 값으로 돌아간다.
 # 실행은 성공하므로 유실이 드러나지 않고 archive 가 **다른 FR** 을 done 처리한다
-# (final diff review Turn 016 Finding 1). 미러가 `## Source FR` 을 담게 되어 이제
+# 미러가 `## Source FR` 을 담게 되어 이제
 # 대조가 가능하므로, promote 는 어느 쪽이 최신인지 고르지 않고 **멈춘다.**
 PR7_SFR_OLD="rd-workflow-workspace/backlog/items/2026-01-01-old.md"
 PR7_SFR_NEW="rd-workflow-workspace/backlog/items/2026-02-02-new.md"
@@ -1716,7 +1716,6 @@ assert_eq "$(pr7_mirror_sfr)" "$PR7_SFR_OLD" "promote D12: 씨앗 — 미러에 
 # 경로 하나이며, 그것은 아래 (p)(q) 가 그대로 봅니다.
 
 # (p)(q) worktree 부재 경로 — **권위와 미러의 출처가 짝지어져야 한다**
-#        (final diff review 9라운드 Finding 1)
 #
 # 권위를 브랜치 blob 에서 읽으면서 미러를 기본 worktree 파일에서 읽으면, 다른 git tree 의
 # 두 파일을 비교하게 된다. 기본 worktree 미러는 보통 baseline `-` 이므로 **정상 rerun 이
@@ -2248,6 +2247,7 @@ add_review_scripts() {
   cp "$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/init_review_pipeline.sh" "$1/rd-workflow/scripts/"
   cp "$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/verify_record.sh" "$1/rd-workflow/scripts/"
 }
+source "$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts/fixtures/review_run_fixture.sh"
 # close_session <session-dir> — Status=closed + Open Issues=`- 없음` (정상 종결 형태)
 close_session() {
   local t
@@ -2258,6 +2258,9 @@ close_session() {
   [[ -n "$t" && -f "$t" ]] || { echo "test_integration.sh: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   awk '/^## Open Issues$/{s=1; print; next} s && /^## /{s=0} s && $0=="-"{print "- 없음"; next} {print}' \
     "$1/CHECKPOINT.md" > "$t" && mv "$t" "$1/CHECKPOINT.md"
+  # seal 은 리뷰어 턴 실행 기록을 대조합니다. 복사본 repo 에는 review_common.sh 가 없어
+  # 원본 scripts 를 씁니다(기록을 쓰는 코드는 제품 함수 그대로).
+  fixture_reviewer_turn "$1" "$PROJECT_ROOT/_ROOT_FILES/rd-workflow/scripts" || return 1
 }
 # latest_diff_session <repo> — 최신 final-diff-review 세션 경로 (없으면 빈 문자열)
 latest_diff_session() {

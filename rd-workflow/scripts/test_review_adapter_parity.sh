@@ -201,49 +201,19 @@ cmp -s "$TMP/cap/c1_codex" "$TMP/cap/c2_codex"; [ $? -ne 0 ]
 chk $? "cap 이 다르면 프롬프트도 실제로 달라짐 (fixture 유효성)"
 
 echo "=== 케이스 3: effort scope — codex 전용인가 ==="
+# codex 에 effort 가 전달되고 claude 에는 새지 않는다는 보증(TOOL_EFFORT 전달·부재, 사전 export 누출 차단,
+# applied·not-applicable·none/global 보고)은 test_review_effort_override.sh 의 ISO 케이스 B·C·D 가
+# 같은 어댑터·stub 으로 봅니다(둘 다 self_test.sh review 그룹). 여기에는 그쪽이 보지 않는
+# EFFORT_SOURCE 전달과 결과 채널 제거만 codex 1회 실행으로 남깁니다.
 run_turn codex c3_codex xhigh 200000 >/dev/null
-eq "$(grep '^TOOL_EFFORT=' "$TMP/cap/codex.env")"        "TOOL_EFFORT=SET"        "codex stub 에 TOOL_EFFORT 전달"
 eq "$(grep '^EFFORT_SOURCE=' "$TMP/cap/codex.env")"      "EFFORT_SOURCE=SET"      "codex stub 에 EFFORT_SOURCE 전달"
 eq "$(grep '^EFFORT_RESULT_FILE=' "$TMP/cap/codex.env")" "EFFORT_RESULT_FILE=" \
    "결과 채널은 제거됨 — 자동 재시도가 없으므로 부모가 상태를 전부 계산한다"
-grep -q 'effort override: applied:xhigh' "$TMP/out_c3_codex"
-chk $? "AC23 완료 출력에 applied 상태 표시"
-
-run_turn claude c3_claude xhigh 200000 >/dev/null
-eq "$(grep '^TOOL_EFFORT=' "$TMP/cap/claude.env")"        "TOOL_EFFORT="        "claude stub 환경에 TOOL_EFFORT 부재"
-eq "$(grep '^EFFORT_SOURCE=' "$TMP/cap/claude.env")"      "EFFORT_SOURCE="      "claude stub 환경에 EFFORT_SOURCE 부재"
-grep -q 'effort override: not-applicable (tool=claude)' "$TMP/out_c3_claude"
-chk $? "AC23 claude 선택 시 codex 값을 보고하지 않음"
-
-echo "=== 케이스 4: 호출자가 내부 변수를 미리 export 한 환경 ==="
-# 깨끗한 환경만 검사하면 AC 32 의 "codex 전용" 보증이 입력 환경에 따라 깨지는 것을 놓친다.
-run_turn_with_env() { # run_turn_with_env <tool> <라벨>
-  reset_session
-  rm -f "$TMP/cap/codex" "$TMP/cap/claude" "$TMP/cap/codex.env" "$TMP/cap/claude.env"
-  write_cfg "$1" ""
-  (
-    cd "$TMP"
-    TOOL_EFFORT=leaked EFFORT_SOURCE=leaked-source REVIEW_PROMPT_INLINE_MAX_BYTES=200000 \
-      bash "$TMP/rd-workflow/scripts/run_review_turn.sh" sess >"$TMP/out_$2" 2>"$TMP/err_$2"
-    echo "rc=$?"
-  )
-}
-r="$(run_turn_with_env claude c4_claude)"
-eq "$r" "rc=0" "사전 export 환경에서도 claude 경로 정상 완료"
-eq "$(grep '^TOOL_EFFORT=' "$TMP/cap/claude.env")"   "TOOL_EFFORT="   "AC32 사전 export 된 TOOL_EFFORT 가 claude 로 새지 않음"
-eq "$(grep '^EFFORT_SOURCE=' "$TMP/cap/claude.env")" "EFFORT_SOURCE=" "AC32 사전 export 된 EFFORT_SOURCE 가 claude 로 새지 않음"
-
-r="$(run_turn_with_env codex c4_codex)"
-eq "$r" "rc=0" "사전 export 환경에서도 codex 경로 정상 완료"
-eq "$(grep '^TOOL_EFFORT=' "$TMP/cap/codex.env")" "TOOL_EFFORT=" \
-   "AC2 설정 부재 시 사전 export 된 값이 codex 로 새지 않음 (후퇴 없음)"
-grep -q 'effort override: none/global' "$TMP/out_c4_codex"
-chk $? "AC23 설정 부재 시 none/global 로 보고 (상속값에 오염되지 않음)"
 
 echo "=== 케이스 5: stub 고정 — 실 CLI 에 닿지 않았는가 ==="
-# 위 네 케이스는 stub 이 걷히면 결국 실패하지만, 실패하기까지 호출당 워치독 만료(600초)를
+# 위 세 케이스는 stub 이 걷히면 결국 실패하지만, 실패하기까지 호출당 워치독 만료(600초)를
 # 기다립니다. 그 대기 자체가 결함이므로 "실 CLI 를 부르려 했다" 를 별도로 단언합니다.
-assert_no_real_cli "케이스 1~4 전 구간에서 실제 codex·claude CLI 가 호출되지 않음 (stub 만 사용)"
+assert_no_real_cli "케이스 1~3 전 구간에서 실제 codex·claude CLI 가 호출되지 않음 (stub 만 사용)"
 
 echo "=== 케이스 6: 가드 자체가 살아 있는가 ==="
 # 이 결함의 본질은 "stub 이 걷혔는데도 테스트가 조용히 기다린 것" 입니다. 그래서 가드가
@@ -270,10 +240,14 @@ guard_elapsed=$(( $(date +%s) - guard_start ))
 chk $? "bin 미지정이면 턴이 실패한다 (실 CLI 로 조용히 넘어가지 않음)"
 grep -q '^codex$' "$TRIPWIRE_LOG"
 chk $? "이름 폴백이 tripwire 에 걸린다 — 가드가 죽어 있지 않음"
-# 상한은 WAIT_TIMEOUT(30초)보다 작아야 의미가 있습니다. 워치독을 한 번이라도 끝까지
-# 기다렸다면 이 단언이 깨집니다. tripwire 경로의 실측은 수 초입니다.
-[ "$guard_elapsed" -lt 20 ]
-chk $? "대기 없이 즉시 실패한다 — 워치독 만료를 기다리지 않음 (실측 ${guard_elapsed}초)"
+# "대기 없이 즉시 실패" 는 경과 초가 아니라 워치독이 만료되지 않았다는 상태로 판정합니다.
+# 경과 초는 run_review_turn.sh 1회 기동 비용이라 부하에 따라 늘어 상한 단언이 흔들립니다.
+# 워치독 만료는 어댑터가 exit 124 로 끝내고(adapter_codex.sh) run_review_turn.sh 가 그 코드와
+# 아래 두 문구를 냅니다. 결함이 있으면 WAIT_TIMEOUT(30초) 뒤 워치독이 끝내 이 둘이 FAIL 합니다.
+[ "$guard_rc" -ne 124 ]
+chk $? "워치독 만료로 끝나지 않는다 — 종료 코드 124 아님 (rc=${guard_rc}, 경과 ${guard_elapsed}초)"
+! grep -qE 'Codex 턴 대기 타임아웃|리뷰 턴 대기가 종료되었습니다' "$TMP/err_c6" "$TMP/out_c6"
+chk $? "출력에 워치독 만료 표시가 없다"
 : > "$TRIPWIRE_LOG"
 
 echo

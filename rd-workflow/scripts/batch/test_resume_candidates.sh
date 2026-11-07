@@ -75,7 +75,10 @@ fakes_reset() {
   unset FAKE_LIST_SLEEP FAKE_PS_SLEEP FAKE_LSOF_SLEEP FAKE_GET_OUT FAKE_HC T_HERDR_ENV T_TIMEOUT T_HC
 }
 fakes_reset
-run() { OUT="$(cd "$R" && PATH="$TMP/bin:$PATH" HERDR_ENV="${T_HERDR_ENV-1}" HC_TERMINAL_ID="${T_HC-}" RD_LAUNCH_TIMEOUT="${T_TIMEOUT:-5}" bash "$H" 2>&1)"; RC=$?; FIRST="${OUT%%$'\n'*}"; }
+# 조회 상한 기본값은 30초다. 대역은 즉시 답하므로 정상 경로는 기다리지 않는다. 5초였을 때 동시 실행 부하에서
+# 대역 herdr 기동만으로 상한을 넘겨 「agent list 시간 초과」 로 판정이 바뀐 적이 있다(R8, 2026-11-07).
+# 시간 초과 자체를 보는 사례(R7·R17)는 T_TIMEOUT 을 짧게 따로 준다.
+run() { OUT="$(cd "$R" && PATH="$TMP/bin:$PATH" HERDR_ENV="${T_HERDR_ENV-1}" HC_TERMINAL_ID="${T_HC-}" RD_LAUNCH_TIMEOUT="${T_TIMEOUT:-30}" bash "$H" 2>&1)"; RC=$?; FIRST="${OUT%%$'\n'*}"; }
 check() { # name expected-first expected-rc
   if [ "$FIRST" = "$2" ] && [ "$RC" -eq "$3" ]; then pass "$1"; else fail "$1 (first='$FIRST' rc=$RC, expected '$2' rc=$3)"; fi
 }
@@ -235,6 +238,9 @@ check "blocked 아님 재개" "select${TAB}a${TAB}$R/wt/a" 0
 new_repo; mk a none "대기 중"; add_src a fr-x idea; add_src a fr-y blocked; run
 check "복수 source-fr" "none" 0
 
+new_repo; mk a none "대기 중"; add_src a fr-x "blocked (사유)"; run
+check "blocked (사유) FR 제외" "none" 0
+
 new_repo; mk a none "대기 중"; add_src a fr-x nofile; run
 check "읽기 불가 무시" "select${TAB}a${TAB}$R/wt/a" 0
 
@@ -264,7 +270,8 @@ h2="$(git hash-object "$R/.git/rd-workflow/tasks.local")"
 if [ "$h1" = "$h2" ]; then pass "색인 내용 불변"; else fail "색인 내용 불변 (해시 변경)"; fi
 
 # --- H: herdr app(hc) 로 기동한 작업 (spec C6·T5). 색인 줄에 launch-backend 를 붙인다.
-mk_hc() { mk "$1" ok "구현 중"; sed -i "\$s/\$/${TAB}launch-backend=${2:-hc}/" "$R/.git/rd-workflow/tasks.local"; }
+# sed -i 는 BSD sed 에서 다음 인자를 백업 접미사로 읽어 실패한다(PATH 에 GNU sed 가 없는 환경). 임시 파일로 고쳐 쓴다.
+mk_hc() { mk "$1" ok "구현 중"; sed "\$s/\$/${TAB}launch-backend=${2:-hc}/" "$R/.git/rd-workflow/tasks.local" > "$TMP/idx.hc" && cp "$TMP/idx.hc" "$R/.git/rd-workflow/tasks.local"; }
 hc_json() { printf '%s' "$1" > "$TMP/fake.hc"; export FAKE_HC="$TMP/fake.hc"; }
 
 # H1 hc 종료 — herdr 없음(목록 관측 불완전)이어도 hc 이름 조회 부재 + 프로세스 부재면 후보

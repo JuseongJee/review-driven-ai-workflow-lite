@@ -177,7 +177,8 @@ _rb_print_dirty() {  # <porcelain-output>
   local lines="$1" n
   n="$(printf '%s\n' "$lines" | grep -c '[^[:space:]]' || true)"
   printf '  미커밋 변경 %s건 (앞 10건):\n' "$n" >&2
-  printf '%s\n' "$lines" | head -10 | sed 's/^/    /' >&2
+  # head 로 자르면 큰 목록에서 printf 가 SIGPIPE 를 받는다(pipefail·set -e 아래 종료). sed 가 끝까지 읽는다.
+  printf '%s\n' "$lines" | sed -n '1,10s/^/    /p' >&2
 }
 
 if [[ "$DRY_RUN" -eq 1 ]]; then

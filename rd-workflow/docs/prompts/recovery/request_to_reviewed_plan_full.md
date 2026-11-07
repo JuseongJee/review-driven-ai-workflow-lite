@@ -9,7 +9,7 @@
 3. `REQUEST.md`가 있으면 그대로 재사용하고 REQUEST review부터 시작한다. `REQUEST.md`를 새로 쓰지 않는다
 4. 범위를 넓히지 말고 꼭 필요한 정보만 질문한다
 5. `Execution Path`를 판단한다
-6. `full` 이 아니라고 보이면 하향을 제안만 하고 멈춘다 (하향은 사용자만)
+6. `full` 이 아니라고 보이면 WORKFLOW.md 위험 등급 절의 하향 조건을 확인한다. 조건을 채우면 주체·근거를 `## Risk Tier` 이력에 적고 하향해 `/small-task-implement` 의 「이어받기」 로 넘긴다(Status 를 되돌리는 방법은 `request-to-reviewed-plan` skill 의 하향 항목). 되돌리기 어려운 효과가 있으면 `full` 을 유지한다
 7. 큰 작업이면 `REQUEST review -> spec/change spec -> plan -> spec/plan review` 순서로 진행한다
 8. review는 `prepare_review_pipeline.sh`와 `run_review_turn.sh ...`를 사용한다
 9. Superpowers를 쓸 수 있으면 그 workflow를 실행하고, 아니면 같은 위치에 같은 산출물을 만든다

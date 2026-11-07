@@ -584,6 +584,7 @@ ${session_path}
 
 ## Step 2. Manual Codex Fallback
 Claude가 CLI를 실행할 수 없고, Claude가 첫 턴을 작성한 뒤 \`SESSION.md\`의 \`Current Owner\`가 \`Reviewer\`가 되면 아래를 Reviewer에게 넣는다.
+수동으로 쓴 리뷰어 턴은 실행 기록을 남기지 않습니다. 수동으로만 리뷰한 final diff 세션은 \`rd review seal\` 이 거부하며, 발행은 \`archive.sh --force-skip-review-check <사유>\`(audit 기록)로 합니다.
 
 \`\`\`text
 \`rd-workflow/docs/prompts/manual/review_pipeline_continue_manual.md\`대로 이어줘.

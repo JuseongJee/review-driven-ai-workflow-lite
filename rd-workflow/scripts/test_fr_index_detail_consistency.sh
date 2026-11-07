@@ -130,12 +130,68 @@ test_missing_fields() {
   _write_item "$fx" "2026-01-05-b.md" "# 2026-01-05 b" "- status: idea"
   err="$(bash "$TARGET" --root "$fx" 2>&1 >/dev/null)"; rc=$?
   if [[ "$rc" -eq 0 ]] \
-     && printf '%s' "$err" | grep -q "2026-01-05-a.md: 활성인데 - status: 필드 없음" \
+     && printf '%s' "$err" | grep -q "2026-01-05-a.md: 활성인데 - status:·- 상태: 필드 없음" \
      && printf '%s' "$err" | grep -q "2026-01-05-b.md: 활성인데 - kind: 필드 없음"; then
     pass "③: status/kind 필드 부재 각각 검출(fail-safe 활성 판정 포함)"
   else
     fail "③: rc=$rc err=$err"
   fi
+}
+
+# 5b. status 판정 — 공용 규칙(_fr_status.sh)과 비표준 유형
+_run_check() {  # _run_check <fx> -> OUT, ERR, RC
+  local e; e="$(mktemp)" || { fail "_run_check: mktemp 실패"; OUT=""; ERR=""; RC=2; return; }
+  OUT="$(bash "$TARGET" --root "$1" 2>"$e")"; RC=$?
+  ERR="$(cat "$e")"; rm -f "$e"
+}
+
+test_status_old_format() {
+  local fx
+  fx="$(_mk_fixture_root)"; _track_fx "$fx"
+  _write_item "$fx" "2026-02-01-a.md" "# a" "- 상태: done" "- kind: bug"
+  _run_check "$fx"
+  if [[ "$RC" -eq 0 ]] && printf '%s' "$OUT" | grep -q "활성 상세 0건.*불일치 0건, 비표준 status 0건"; then
+    pass "5b(a): '- 상태: done' 은 비활성, 인덱스 없어도 불일치 0"
+  else fail "5b(a): rc=$RC out=$OUT err=$ERR"; fi
+  fx="$(_mk_fixture_root)"; _track_fx "$fx"
+  _write_item "$fx" "2026-02-01-b.md" "# b" "- status: done (→ 설명)" "- kind: bug"
+  _run_check "$fx"
+  if [[ "$RC" -eq 0 ]] && printf '%s' "$OUT" | grep -q "활성 상세 0건.*불일치 0건, 비표준 status 0건"; then
+    pass "5b(b): '- status: done (→ 설명)' 은 첫 토큰으로 비활성"
+  else fail "5b(b): rc=$RC out=$OUT err=$ERR"; fi
+}
+
+test_status_nonstandard() {
+  local fx
+  fx="$(_mk_fixture_root)"; _track_fx "$fx"
+  _write_item "$fx" "2026-02-02-c.md" "# c" "- status: obsolete" "- kind: bug"
+  _write_index "$fx" '| 2026-02-02 | c | 요약 | bug | obsolete | - | [상세](items/2026-02-02-c.md) |'
+  _run_check "$fx"
+  if [[ "$RC" -eq 0 ]] \
+     && printf '%s' "$ERR" | grep -qF "items/2026-02-02-c.md: 비표준 status (값: obsolete) — 허용값: idea validated ready-for-request blocked done dropped parked" \
+     && ! printf '%s' "$ERR" | grep -q "비활성" \
+     && printf '%s' "$OUT" | grep -q "불일치 0건, 비표준 status 1건"; then
+    pass "5b(c): 비표준 값은 별도 유형 1줄, ② 비활성 줄 없음, 요약에 비표준 건수"
+  else fail "5b(c): rc=$RC out=$OUT err=$ERR"; fi
+
+  fx="$(_mk_fixture_root)"; _track_fx "$fx"
+  _write_item "$fx" "2026-02-02-d.md" "# d" "- kind: bug"
+  _run_check "$fx"
+  if [[ "$RC" -eq 0 ]] \
+     && printf '%s' "$ERR" | grep -qF "2026-02-02-d.md: 활성인데 - status:·- 상태: 필드 없음" \
+     && ! printf '%s' "$ERR" | grep -q "비표준 status" \
+     && printf '%s' "$OUT" | grep -q "활성 상세 1건"; then
+    pass "5b(d): 두 키 없음은 필드 없음 줄 + 활성 집계(비표준 아님)"
+  else fail "5b(d): rc=$RC out=$OUT err=$ERR"; fi
+
+  fx="$(_mk_fixture_root)"; _track_fx "$fx"
+  _write_item "$fx" "2026-02-02-e.md" "# e" "- status:" "- kind: bug"
+  _run_check "$fx"
+  if [[ "$RC" -eq 0 ]] \
+     && printf '%s' "$ERR" | grep -qF "items/2026-02-02-e.md: 비표준 status (값: (비어 있음))" \
+     && printf '%s' "$OUT" | grep -q "비표준 status 1건"; then
+    pass "5b(e): 빈 '- status:' 줄만 있으면 비표준(값: (비어 있음))"
+  else fail "5b(e): rc=$RC out=$OUT err=$ERR"; fi
 }
 
 # 6. ④(종류 불일치, R1b 회귀 anchor 겸용) — 인덱스 종류가 enum 밖(오타)이어도 잡힘
@@ -308,6 +364,7 @@ test_selftest_mutation_and_whitelist() {
   mkdir -p "${fx}/rd-workflow/scripts" "${fx}/rd-workflow-workspace/backlog/items"
   cp "${SCRIPT_DIR}/self_test.sh" "${fx}/rd-workflow/scripts/self_test.sh"
   cp "$TARGET" "${fx}/rd-workflow/scripts/check_fr_index_detail_consistency.sh"
+  cp "${SCRIPT_DIR}/_fr_status.sh" "${fx}/rd-workflow/scripts/_fr_status.sh"
   : > "${fx}/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
 
   # whitelist 등록 확인 — 등록 안 됐으면 "허용값이 아닙니다"로 거절되어 rc=2, 아래
@@ -356,6 +413,8 @@ test_index_missing
 test_index_orphan
 test_inactive_lingering
 test_missing_fields
+test_status_old_format
+test_status_nonstandard
 test_kind_mismatch_enum_outside
 test_parsefail_structural
 test_empty_kind_column

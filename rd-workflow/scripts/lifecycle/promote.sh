@@ -562,7 +562,10 @@ else
   if [[ -z "$DECISION" ]]; then
     # 판정 b — 물려받음: first-parent 이력에 있으면 identity 를 묻지 않고 신규 초기화.
     _inherited=0
-    if git rev-list --first-parent "refs/heads/${DEFAULT_BRANCH}" 2>/dev/null | grep -qx "$REF_OID"; then
+    # 출력을 변수에 모은 뒤 판정한다 — grep -q 가 먼저 끝나면 rev-list 가 SIGPIPE 로 죽고
+    # pipefail 이 판정을 뒤집는다. merge-base --is-ancestor 는 first-parent 의미가 아니라 쓰지 않는다.
+    _fp_list="$(git rev-list --first-parent "refs/heads/${DEFAULT_BRANCH}" 2>/dev/null || true)"
+    if grep -qxF -- "$REF_OID" <<<"$_fp_list"; then
       _inherited=1
     fi
     if [[ "$_inherited" -eq 1 ]]; then

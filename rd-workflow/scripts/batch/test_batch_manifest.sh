@@ -267,6 +267,10 @@ expect_code "resolve-task: 서로 다른 이름 2개 → 4" 4 "$rc"
 expect_out "resolve-task: 복수 후보는 stdout 비움" "" "$out"
 vd foo; expect_code "verify-done: 복수 후보여도 증거 있음 → 0" 0 $?
 clear_arch
+printf '# 2026-07-03 baz\n- status: done (설명)\n' > "$ITEMS/2026-07-03-baz.md"
+arch 2026-07-03-1200-baz.md "- $ITEMS/2026-07-03-baz.md"
+vd baz; expect_code "verify-done: done (설명) → 0" 0 $?
+clear_arch
 
 # --- resolve-slug ---
 RD_BATCH_ITEMS_DIR="$ITEMS" bash "$H" resolve-slug foo >/dev/null

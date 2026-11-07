@@ -17,17 +17,17 @@ fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1" >&2; }
 assert_eq() { if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1 (기대=[$2] 실제=[$3])"; fi; }
 assert_ne() { if [[ "$2" != "$3" ]]; then pass "$1"; else fail "$1 (두 값이 같음: [$2])"; fi; }
 
-_dirs=()
-cleanup() { local d; for d in ${_dirs[@]+"${_dirs[@]}"}; do [[ -z "$d" ]] || rm -rf "$d"; done; }
-trap cleanup EXIT
+# 임시 저장소는 모두 TROOT 아래에 만든다. mk_repo 는 `R="$(mk_repo)"` 처럼 서브셸에서 불리므로
+# 그 안에서 정리 목록에 추가해도 부모 셸에 전달되지 않는다 — 부모가 만든 상위 디렉터리 하나를 지운다.
+TROOT="$(mktemp -d)" || { echo "mktemp 실패" >&2; exit 1; }
+trap 'rm -rf "$TROOT"' EXIT
 
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 
 # mk_repo — main(a.txt 5행·b.txt·CURRENT_TASK.md) + fr/x(a.txt 1행 수정). 마지막에 fr/x 체크아웃. stdout: 경로
 mk_repo() {
   local d
-  d="$(mktemp -d)" || { echo "mktemp 실패" >&2; exit 1; }
-  _dirs+=("$d")
+  d="$(mktemp -d "$TROOT/repo.XXXXXX")" || { echo "mktemp 실패" >&2; exit 1; }
   git -C "$d" init -q -b main
   printf '1\n2\n3\n4\n5\n' > "$d/a.txt"; echo b > "$d/b.txt"; echo task > "$d/CURRENT_TASK.md"
   git -C "$d" add -A; git -C "$d" commit -qm seed

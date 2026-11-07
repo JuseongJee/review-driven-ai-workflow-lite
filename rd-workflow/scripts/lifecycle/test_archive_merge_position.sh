@@ -16,6 +16,8 @@ trap _suite_on_exit EXIT
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RDW_SRC="$(cd "$SCRIPT_DIR/../.." && pwd)"          # rd-workflow 디렉터리
 GITIGNORE_SRC="$RDW_SRC/../.gitignore"
+# seal 은 리뷰어 턴 실행 기록을 대조하므로 종결 helper 가 제품 함수로 기록을 남깁니다.
+source "$RDW_SRC/scripts/fixtures/review_run_fixture.sh"
 
 # 실제 herdr 호출 차단 — promote.sh 가 session_launch 를 부른다 (test_archive_worktree.sh 와 같은 사유).
 export HERDR_ENV=
@@ -52,6 +54,7 @@ printf 'schema=1\nshort-title=-\nstatus=대기 중\nfr-branch=null\nworktree-pat
 printf '# Change Request\n\n## Source FR\n-\n' > "$SEED/REQUEST.md"
 printf 'line1\nline2\nline3\n' > "$SEED/shared.txt"
 printf 'u1\n' > "$SEED/unrelated.txt"
+mkdir -p "$SEED/d" && printf 'h1\n' > "$SEED/d/한글.md"
 printf '# short_title\tfrom_status\tto_status\tepoch\n' > "$SEED/rd-workflow-workspace/.lifecycle/stage_metrics.tsv"
 git -C "$SEED" add -A && git -C "$SEED" commit -q -m seed
 
@@ -61,11 +64,13 @@ close_session() {
   awk '/^## Status$/{print; getline; print "closed"; next} {print}' "$1/SESSION.md" > "$t" && cat "$t" > "$1/SESSION.md"
   t="$(mktemp "$TMP/out.XXXXXXXX")" || return 1
   awk '/^## Open Issues$/{s=1; print; next} s && /^## /{s=0} s && $0=="-"{print "- 없음"; next} {print}' "$1/CHECKPOINT.md" > "$t" && cat "$t" > "$1/CHECKPOINT.md"
+  fixture_reviewer_turn "$1" "$RDW_SRC/scripts" || return 1
 }
 
-# mk_case <이름> [seal 전 훅 함수] — R·B·W·SES 를 전역으로 둔다. 훅은 구현 커밋·verify_record 뒤, seal 앞에 실행.
+# mk_case <이름> [seal 전 훅 함수] [fr_extra 함수] — R·B·W·SES 를 전역으로 둔다. 훅은 구현 커밋·verify_record 뒤, seal 앞에 실행.
+#   fr_extra 는 「구현」 커밋 직전에 W 안에서 실행한다(seal 이 그 변경을 포함하게).
 mk_case() {
-  local name="$1" hook="${2:-}" st
+  local name="$1" hook="${2:-}" fr_extra="${3:-}" st
   R="$TMP/$name"; B="$TMP/$name.bare"
   cp -R "$SEED" "$R"
   git init --bare -q -b main "$B"
@@ -76,6 +81,7 @@ mk_case() {
   [[ -d "$W" ]] || { fail "$name: promote 가 worktree 를 만들지 못했습니다"; return 1; }
   printf 'line1\nline2-FR\nline3\n' > "$W/shared.txt"
   printf 'fr-only\n' > "$W/fr.txt"
+  [[ -z "$fr_extra" ]] || "$fr_extra"
   git -C "$W" add -A && git -C "$W" commit -q -m "구현"
   ( cd "$W" && bash rd-workflow/scripts/prepare_review_pipeline.sh diff ) >/dev/null 2>&1 || true
   SES="$(ls -d "$W"/rd-workflow-workspace/handoffs/review_pipeline/*final-diff-review 2>/dev/null | tail -1)"
@@ -124,19 +130,22 @@ mk_case t2 && {
 }
 
 echo "== T3+T4: 코드 충돌 사전 감지, 손 병합 거부"
-mk_case t34 && {
-  printf 'line1\nline2-MAIN\nline3\n' > "$R/shared.txt"; main_commit "main: shared 충돌 변경"
+_fr_t3() { printf 'h-FR\n' > "$W/d/한글.md"; }
+mk_case t34 "" _fr_t3 && {
+  printf 'line1\nline2-MAIN\nline3\n' > "$R/shared.txt"; printf 'h-MAIN\n' > "$R/d/한글.md"; main_commit "main: shared 충돌 변경"
   before="$(state_hashes)"; origin_before="$(git -C "$B" rev-parse main)"
   archive_main
   after="$(state_hashes)"
   [[ "$ARC" -ne 0 ]]; mark $? "T3: archive rc≠0" "rc=${ARC}"
   rc=0; { has "$AOUT" "코드 충돌이 있습니다" && has "$AOUT" "archive:     - shared.txt" && has "$AOUT" 'set-status "구현 중"'; } || rc=1
   mark $rc "T3: 충돌 안내(첫 줄·경로·set-status 안내)" "$AOUT"
+  rc=0; has "$AOUT" "archive:     - d/한글.md" || rc=1
+  mark $rc "T3: 한글 경로가 인용 없이 출력됨" "$AOUT"
   [[ "$before" == "$after" && ! -e "$R/.git/MERGE_HEAD" ]]; mark $? "T3: main HEAD·인덱스·워킹트리 불변, MERGE_HEAD 없음" "before=${before} after=${after}"
   # T4: 기본 체크아웃이 손으로 병합 → 리뷰하지 않은 해결
   ( cd "$R" && git merge fr/t ) >/dev/null 2>&1 || true
-  printf 'line1\nline2-UNREVIEWED\nline3\nsneaky\n' > "$R/shared.txt"
-  git -C "$R" add shared.txt && git -C "$R" commit -q --no-edit
+  printf 'line1\nline2-UNREVIEWED\nline3\nsneaky\n' > "$R/shared.txt"; printf 'h-UNREVIEWED\n' > "$R/d/한글.md"
+  git -C "$R" add shared.txt d/한글.md && git -C "$R" commit -q --no-edit
   m_oid="$(git -C "$R" rev-parse --short HEAD)"; m_p1="$(git -C "$R" rev-parse HEAD^1)"
   archive_main
   [[ "$ARC" -ne 0 ]]; mark $? "T4: archive rc≠0" "rc=${ARC}"

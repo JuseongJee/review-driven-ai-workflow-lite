@@ -167,18 +167,56 @@ _tl_branch_regs() {
       if (m) print p "\t" l }'
 }
 
+# 색인 행을 한 번 읽어 전역 TL_* 를 채운다(서브셸 없이). 행이 없으면 모두 빈 값, rc 1.
+#   파싱 규칙은 tasks_index_get 과 같다 — 첫 번째로 일치하는 slug 행, 탭 분리 k=v, 같은 키는 첫 값.
+#   작업당 tasks_index_get 을 필드 수만큼 부르면 색인을 그 횟수만큼 다시 읽고 서브셸을 띄운다.
+#   색인을 쓴 뒤 같은 slug 의 값을 다시 읽어야 하면 이 함수를 다시 부른다.
+_tl_load_row() {  # <slug>
+  TL_FR_BRANCH=""; TL_STATE=""; TL_CHECKOUT=""; TL_WORKTREE=""; TL_LAUNCH=""; TL_LAUNCH_BACKEND=""
+  local slug="$1" path line fields f k v
+  _tasks_shared_dir_fill || :; path="$_TASKS_SD_VAL/tasks.local"
+  [[ -f "$path" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "slug=${slug}" || "$line" == "slug=${slug}"$'\t'* ]]; then
+      IFS=$'\t' read -r -a fields <<<"$line"
+      local seen=" "
+      for f in "${fields[@]}"; do
+        k="${f%%=*}"; v="${f#*=}"
+        case "$seen" in *" $k "*) continue ;; esac
+        seen="${seen}${k} "
+        case "$k" in
+          fr-branch) TL_FR_BRANCH="$v" ;;
+          state) TL_STATE="$v" ;;
+          checkout) TL_CHECKOUT="$v" ;;
+          worktree-path) TL_WORKTREE="$v" ;;
+          launch) TL_LAUNCH="$v" ;;
+          launch-backend) TL_LAUNCH_BACKEND="$v" ;;
+        esac
+      done
+      return 0
+    fi
+  done <"$path"
+  return 1
+}
+
 # 발행 증거가 cleanup-pending 인지. 아니면 rc 1 이고 판정값을 _TL_EV 에 둔다.
 _tl_evidence_ok() {  # <slug> <oid>
   _TL_EV="$(tasks_publish_evidence "$1" "$2" "$DEFAULT_BRANCH" "$REMOTE_MODE")"
   [[ "$_TL_EV" == "cleanup-pending" ]]
 }
 
+_tl_cp_resolve() {  # <slug> — 지연 정리가 worktree·로컬 브랜치를 풀었으므로 그 정리 잔여 기록을 푼다
+  bash "$SCRIPT_DIR/cleanup_pending.sh" resolve "$1" worktree local-branch >/dev/null 2>&1 \
+    || echo "tasks_list: 경고 — 정리 잔여 기록 해제 실패: $1" >&2
+}
+
 _tl_sweep_one() {  # <slug>
   local slug="$1" fr wt oid regs nregs rp lk rn wn st orc oid2 err
   local again="원인을 해소한 뒤 rd task list 를 다시 실행"
-  fr="$(tasks_index_get "$slug" fr-branch 2>/dev/null)" || fr=""
+  _tl_load_row "$slug" || :
+  fr="$TL_FR_BRANCH"
   [[ -z "$fr" ]] && fr="fr/${slug}"
-  wt="$(tasks_index_get "$slug" worktree-path 2>/dev/null)" || wt=""
+  wt="$TL_WORKTREE"
 
   # 1) 상태 수집
   oid="$(git rev-parse --verify --quiet "refs/heads/${fr}^{commit}" 2>/dev/null)" || oid=""
@@ -191,6 +229,7 @@ _tl_sweep_one() {  # <slug>
   # 2) 아무것도 안 남음 — 행만 지운다
   if [[ -z "$oid" && "$nregs" -eq 0 && ( -z "$wt" || ! -d "$wt" ) ]]; then
     if tasks_index_remove "$slug" >/dev/null 2>&1; then
+      _tl_cp_resolve "$slug"
       _SWEEP_REMOVED=$((_SWEEP_REMOVED + 1))
       if [[ -n "$_SWEEP_NAMES" ]]; then _SWEEP_NAMES="${_SWEEP_NAMES}, ${slug}"; else _SWEEP_NAMES="$slug"; fi
     else
@@ -301,6 +340,7 @@ _tl_sweep_one() {  # <slug>
     _tl_fail "$slug" "색인 행 삭제 실패" "rd task list --rebuild 뒤 다시 실행"
     return 0
   fi
+  _tl_cp_resolve "$slug"
   if [[ "$nregs" -eq 1 ]]; then
     _tl_note "정리됨: ${slug} — worktree·로컬 브랜치 제거, 색인 행 삭제"
   else
@@ -450,12 +490,13 @@ ANY=0
 
 while IFS= read -r slug; do
   [[ -z "$slug" ]] && continue
-  fr_ref="$(tasks_index_get "$slug" fr-branch 2>/dev/null)" || fr_ref=""
+  _tl_load_row "$slug" || :
+  fr_ref="$TL_FR_BRANCH"
   [[ -z "$fr_ref" ]] && fr_ref="fr/${slug}"
 
   # 색인에 남아 있지만 fr ref 가 실제로 없는(예: fabricated cleanup-pending fixture) 행은
   # "정리 대기" 로 남겨둔 채 별도 구역에 그대로 보여준다 — 삭제하지 않는다.
-  state_field="$(tasks_index_get "$slug" state 2>/dev/null)" || state_field=""
+  state_field="$TL_STATE"
   if [[ "$state_field" == "cleanup-pending" ]]; then
     ANY=1
     PUBLISH_ROWS="${PUBLISH_ROWS}${slug}	정리 대기 (기록)	-	-\n"
@@ -467,8 +508,8 @@ while IFS= read -r slug; do
   fi
   ANY=1
 
-  checkout="$(tasks_index_get "$slug" checkout 2>/dev/null)" || checkout=""
-  wt="$(tasks_index_get "$slug" worktree-path 2>/dev/null)" || wt=""
+  checkout="$TL_CHECKOUT"
+  wt="$TL_WORKTREE"
   if [[ "$checkout" == "yes" && -n "$wt" && -d "$wt" ]]; then
     checked_out="yes"
   else
@@ -494,7 +535,7 @@ while IFS= read -r slug; do
     wt_col="(worktree 없음)"
   fi
 
-  launch_raw="$(tasks_index_get "$slug" launch 2>/dev/null)" || launch_raw=""
+  launch_raw="$TL_LAUNCH"
 
   behind="-"
   if [[ -n "$DEFAULT_BRANCH" ]]; then
@@ -519,7 +560,7 @@ while IFS= read -r slug; do
   if [[ "$agent_name" != "$slug" ]]; then
     case "$launch_raw" in
       ok|unknown|launching|"")
-        if [[ "$(tasks_index_get "$slug" launch-backend 2>/dev/null)" == "hc" ]]; then
+        if [[ "$TL_LAUNCH_BACKEND" == "hc" ]]; then
           name_action="→ hc 세션 이름: ${agent_name}"
         else
           name_action="→ herdr 이름: ${agent_name}"

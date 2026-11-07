@@ -19,11 +19,13 @@
 #   PostToolUse 로 이관 결과 문구를 볼 수 있는지는 미확인이라 코드를 바꾸지 않았고, 별도 FR 로 다룬다.
 set -euo pipefail
 
+# 무인 실행이 아니면 라이브러리를 source 하기 전에 끝낸다 (판정 의미 동일).
+[[ -n "${RD_AUTOPILOT_FR:-}" ]] || exit 0
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd "${script_dir}/../../.." && pwd)"
 source "${script_dir}/_guard_common.sh"
 
-[[ -n "${RD_AUTOPILOT_FR:-}" ]] || exit 0
 
 read_hook_input
 hook_input_bool_true "run_in_background" || exit 0

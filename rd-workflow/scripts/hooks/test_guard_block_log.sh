@@ -23,8 +23,7 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL: $*" >&2; }
 # 템플릿을 쓸 수 없다: 실패 시 FAIL 진단과 `PASS=0 FAIL=1` 집계를 함께 내야 하는데
 # 가드 템플릿의 종결자 자리는 `exit N`·`return N` 하나만 허용한다. 마커는 **집계 보존**을 위한
 # 것이고 경로 안전성을 대신하지 않으므로, 템플릿 둘째 줄에 해당하는 경로 검증은 같은 집계
-# 규약으로 따로 둔다 — 없으면 `rc=0 + 빈 출력`에서 아래 `R="$WORK/ac1"` 이 `/ac1` 이 된다
-# (Turn 002 F2).
+# 규약으로 따로 둔다 — 없으면 `rc=0 + 빈 출력`에서 아래 `R="$WORK/ac1"` 이 `/ac1` 이 된다.
 WORK="$(mktemp -d)" || { echo "  FAIL: mktemp 실패 — 검증 불가" >&2; echo "test_guard_block_log: PASS=0 FAIL=1"; exit 1; }   # mktemp-scan: custom-handler
 [[ -n "$WORK" && -d "$WORK" ]] || { echo "  FAIL: mktemp 경로 검증 실패 (TMPDIR='${TMPDIR:-}') — 검증 불가" >&2; echo "test_guard_block_log: PASS=0 FAIL=1"; exit 1; }   # mktemp-scan: custom-handler
 LOG_REL="rd-workflow-workspace/.lifecycle/guard-block-audit.log"

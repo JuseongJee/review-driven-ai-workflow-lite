@@ -32,9 +32,53 @@ export RD_CHILD_SESSION=1
 # 고친다(2026-10-29 실제 저장소에 fr/alpha·fr/beta·fr/delta 가 생긴 사고).
 unset project_root TASK_STATE_PATH
 
+# 실제 ps 를 쓸 수 없는 환경(Codex 샌드박스는 /bin/ps 실행과 프로세스 목록 조회를 막는다)에서는
+# 점유 판정이 늘 판정불가로 보류돼 정상 정리 흐름을 검증할 수 없다. 그때만 lsof 가 본 pid 를 내는
+# 대역 ps 를 PATH 앞에 둔다. 대역 디렉터리는 fixture 저장소 밖에 둔다(기본 체크아웃 미커밋 판정에 섞이지 않게).
+if ! ps -U "$(id -u)" -o pid=,uid=,stat= >/dev/null 2>&1; then
+  PS_STUB_DIR="$(mktemp -d)" || { echo "$(basename "$0"): 대역 ps 디렉터리 생성 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+  _ast_cleanup+=("$PS_STUB_DIR")
+  cat > "$PS_STUB_DIR/ps" <<'PS_STUB_EOF'
+#!/usr/bin/env bash
+# 대역 ps — tasks_path_occupied 의 `ps -U <uid> -o pid=,uid=,stat=` 호출에만 답한다.
+# 그 밖의 형식은 샌드박스의 실제 ps 처럼 실패한다(publish_queue.sh·session_launch.sh 의 다른 ps 호출).
+if [[ "$#" -ne 4 || "$1" != "-U" || "$3" != "-o" || "$4" != "pid=,uid=,stat=" ]]; then
+  echo "ps(대역): 지원하지 않는 형식: $*" >&2; exit 1
+fi
+"${RD_TEST_REAL_LSOF:-lsof}" -a -u "$2" -d cwd -Fp 2>/dev/null | sed -n 's/^p//p' | awk -v u="$2" '{ print $1, u, "S" }'
+PS_STUB_EOF
+  chmod +x "$PS_STUB_DIR/ps"
+  # 대역 ps 는 준비 시점의 실제 lsof 를 쓴다 — 케이스가 PATH 에 넣는 실패용 lsof(O2)가 프로세스 열거까지 망가뜨리지 않게.
+  RD_TEST_REAL_LSOF="$(command -v lsof || true)"; export RD_TEST_REAL_LSOF
+  export PATH="$PS_STUB_DIR:$PATH"
+  echo "  NOTE: 실제 ps 를 쓸 수 없는 환경 — lsof 기반 대역 ps 로 정상 정리 흐름을 검증합니다"
+fi
+
 PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1" >&2; }
+# sed_inplace <sed 식> <파일> — `sed -i '식' 파일` 은 macOS 기본 sed 에서 실패하므로 임시 파일을 거쳐 바꾼다.
+sed_inplace() { sed -e "$1" "$2" > "$2.sedtmp" && mv "$2.sedtmp" "$2"; }
+
+# 지연 정리가 「점유 판정불가」 로 보류됐을 때 그 보류가 환경 탓인지 제품과 별개로 확인한다.
+# 내 계정(유효 uid 도 나)의 살아 있는 프로세스를 ps 로 보고, lsof 로 그 CWD 를 모두 읽을 수 있으면 0(판정 가능한 환경)이다.
+# 0 이면 제품의 판정불가는 회귀이므로 env-skip 으로 세지 않고 FAIL 한다.
+occ_env_judgeable() {
+  local u ps_live cwd_seen
+  u="$(id -u)"
+  ps_live="$(ps -U "$u" -o pid=,uid=,stat= 2>/dev/null | awk -v me="$u" '$1 ~ /^[0-9]+$/ && $2 == me && $3 !~ /^Z/ {print $1}')"
+  [[ -n "$ps_live" ]] || return 1
+  command -v lsof >/dev/null 2>&1 || return 1
+  # `n/proc/<pid>/cwd (readlink: Permission denied)` 처럼 괄호 오류 설명이 붙은 n 줄은 읽은 것으로 치지 않는다.
+  cwd_seen="$(lsof -a -u "$u" -d cwd -Fpn 2>/dev/null | awk '/^p/ {c = substr($0, 2)} /^n\// && !/\(.*\)$/ && c != "" {print c}')"
+  [[ -n "$cwd_seen" ]] || return 1
+  printf '%s\n' "$ps_live" | CWD_SEEN="$cwd_seen" awk '
+    BEGIN { n = split(ENVIRON["CWD_SEEN"], a, "\n"); for (i = 1; i <= n; i++) seen[a[i]] = 1 }
+    !($1 in seen) { print $1 }' | while IFS= read -r pid; do
+      kill -0 "$pid" 2>/dev/null || continue   # 그사이 끝난 프로세스는 세지 않는다
+      exit 1
+    done
+}
 
 REPO="$(mktemp -d)" || { echo "test_archive_worktree.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$REPO" && -d "$REPO" ]] || { echo "test_archive_worktree.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
@@ -57,7 +101,7 @@ mkdir -p "$REPO/rd-workflow-workspace/.lifecycle" "$REPO/rd-workflow-workspace/b
 # `_ROOT_FILES/.gitignore` 에 있다. 후자가 없으면 --force-skip-review-check 로 archive
 # 를 여러 번 연속 호출할 때(이 스위트의 핵심 시나리오) 그 로그가 untracked 로 쌓여
 # 다음 archive 호출의 clean 검증(Step 0)을 방해한다 — fixture 를 손으로 고치는 대신
-# 실배포 .gitignore 자체를 고쳤다(Task 6 리뷰 지적).
+# 실배포 .gitignore 자체를 고쳤다.
 cp "$SCRIPT_DIR/../../../.gitignore" "$REPO/.gitignore"
 bash -c "source '$SCRIPT_DIR/_lifecycle_common.sh'; emit_current_task_baseline" > "$REPO/CURRENT_TASK.md"
 printf 'schema=1\nshort-title=-\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\nbase-commit=null\nreview-session=null\n' \
@@ -88,7 +132,7 @@ for slug in alpha beta delta; do
 done
 
 # beta 를 "검증 중" 으로 만들어 둔다 — alpha archive 이후 beta 보존을 이 값으로 검증한다.
-sed -i 's/^status=.*/status=검증 중/' "$REPO/.worktrees/beta/rd-workflow-workspace/.lifecycle/task-state"
+sed_inplace 's/^status=.*/status=검증 중/' "$REPO/.worktrees/beta/rd-workflow-workspace/.lifecycle/task-state"
 git -C "$REPO/.worktrees/beta" add rd-workflow-workspace/.lifecycle/task-state
 git -C "$REPO/.worktrees/beta" commit -q -m "progress: 검증 중"
 
@@ -117,7 +161,7 @@ else
 fi
 
 # baseline 초기화가 기본 worktree 에 이뤄지고, 호출한 작업 worktree 는 바뀌지 않았다.
-if [[ "$(sed -n '/^## Short Title/{n;p;q}' "$REPO/CURRENT_TASK.md")" == "-" ]]; then
+if [[ "$(sed -n '/^## Short Title/{n;p;q;}' "$REPO/CURRENT_TASK.md")" == "-" ]]; then
   pass "기본 worktree(CURRENT_TASK.md)가 baseline 이 되었다"
 else
   fail "baseline 위치 — 기본 worktree 미초기화"
@@ -163,7 +207,7 @@ fi
 
 # archive 가 실제로 state=cleanup-pending 을 색인에 기록했는지 직접 증명한다. 목록 출력만으로는
 # 증명되지 않는다 — alpha 는 merge+tag 가 이미 끝나 tasks_publish_evidence 의 동적 판정만으로도
-# 같은 "정리 대기" 문구가 나오기 때문이다(리뷰 지적). 지연 정리가 행을 지우기 전에 읽는다.
+# 같은 "정리 대기" 문구가 나오기 때문이다. 지연 정리가 행을 지우기 전에 읽는다.
 alpha_state="$( cd "$REPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get alpha state' 2>/dev/null )" || alpha_state=""
 alpha_publish_tag="$( cd "$REPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get alpha publish-tag' 2>/dev/null )" || alpha_publish_tag=""
 if [[ "$alpha_state" == "cleanup-pending" && -n "$alpha_publish_tag" ]]; then
@@ -189,6 +233,11 @@ if [[ "$out" == *"정리됨: alpha"* && ! -d "$REPO/.worktrees/alpha" ]] \
   && ! git -C "$REPO" rev-parse --verify --quiet fr/alpha >/dev/null \
   && [[ -z "$( cd "$REPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get alpha state' 2>/dev/null )" ]]; then
   pass "호출자 worktree(alpha)는 변경이 없어지면 rd task list 가 worktree·브랜치·색인 행을 지연 정리한다"
+elif aw_hold="$(printf '%s\n' "$out" | grep -m1 '정리 보류: alpha — 점유 판정불가')" && ! occ_env_judgeable \
+  && [[ -d "$REPO/.worktrees/alpha" ]] && git -C "$REPO" rev-parse --verify --quiet fr/alpha >/dev/null; then
+  # 점유 판정을 할 수 없는 환경(ps·lsof 불가 샌드박스)에서는 제품이 정리를 보류하는 것이 맞다 — 그 환경을 따로 확인했고
+  # worktree·브랜치가 그대로 남았을 때만 env-skip 으로 센다. 판정 가능한 환경의 판정불가는 아래 FAIL 이다.
+  printf 'env-skip: test_archive_worktree 호출자 worktree 지연 정리 — 점유 판정을 할 수 없는 환경(%s)\n' "${aw_hold#*정리 보류: alpha — }" >&2
 else
   fail "호출자 worktree 지연 정리 실패 — 목록: $out"
 fi
@@ -238,6 +287,64 @@ fi
 # merge 확인은 archive 호출 전에 캡처해 둔 commit OID 기준으로 한다.
 git -C "$REPO" merge-base --is-ancestor "$nw_tip_before" main \
   && pass "D13 — 비체크아웃 작업을 fr tip 권위로 마감한다" || fail "D13 마감 경로 실패"
+
+echo "== archive.sh — 살아 있는 세션의 worktree 보호 (O1 점유, O2 판정 불가) =="
+
+# 작업 worktree 를 준비한다: promote → 구현 커밋 하나.
+o_prepare() {  # o_prepare <slug>
+  bash "$PROMOTE_SH" --short-title "$1" --size large --source-fr -
+  printf 'work-%s\n' "$1" >> "$REPO/.worktrees/$1/src-$1.txt"
+  git -C "$REPO/.worktrees/$1" add -A
+  git -C "$REPO/.worktrees/$1" commit -q -m "구현: $1"
+}
+
+# O1 — worktree 안에 CWD 를 둔 프로세스(세션 대역)가 살아 있으면 archive 가 지우지 않는다.
+o_prepare occ
+OCC_PID=""
+_occ_kill() { [[ -z "$OCC_PID" ]] || { kill "$OCC_PID" 2>/dev/null || true; wait "$OCC_PID" 2>/dev/null || true; OCC_PID=""; }; }
+trap '_occ_kill; _suite_on_exit' EXIT
+( cd "$REPO/.worktrees/occ" && exec sleep 300 ) &
+OCC_PID=$!
+sleep 0.5
+o1_tip="$(git -C "$REPO" rev-parse fr/occ)"
+o1_rc=0; o1_out="$( cd "$REPO" && bash "$ARCHIVE_SH" --task occ --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )" || o1_rc=$?
+[[ "$o1_rc" -eq 0 ]] && pass "O1: 점유 중인 작업의 발행이 rc=0 으로 끝난다" || fail "O1: rc=$o1_rc — $o1_out"
+git -C "$REPO" merge-base --is-ancestor "$o1_tip" main \
+  && pass "O1: 기본 브랜치에 병합된다" || fail "O1: 병합 누락"
+[[ -d "$REPO/.worktrees/occ" ]] \
+  && pass "O1: 세션이 있는 worktree 디렉터리를 지우지 않는다" || fail "O1: worktree 가 지워졌다"
+git -C "$REPO" rev-parse --verify -q refs/heads/fr/occ >/dev/null \
+  && pass "O1: fr/occ 로컬 브랜치를 지우지 않는다" || fail "O1: 로컬 브랜치가 지워졌다"
+[[ "$o1_out" == *"사유: 세션이 이 worktree 안에 있어"* ]] \
+  && pass "O1: 정리 잔여에 점유 사유가 있다" || fail "O1: 점유 사유 누락 — $o1_out"
+[[ "$o1_out" == *"복구: cd "*"&& bash rd-workflow/scripts/rd task list"* ]] \
+  && pass "O1: 출력에 rd task list 후속 명령이 있다" || fail "O1: 후속 명령 누락 — $o1_out"
+_occ_kill
+o1b_out="$( cd "$REPO" && bash rd-workflow/scripts/rd task list 2>&1 )" || true
+[[ ! -d "$REPO/.worktrees/occ" ]] \
+  && pass "O1: 세션 종료 뒤 rd task list 가 worktree 를 정리한다" || fail "O1: 지연 정리 뒤에도 worktree 가 남았다 — $o1b_out"
+git -C "$REPO" rev-parse --verify -q refs/heads/fr/occ >/dev/null \
+  && fail "O1: 지연 정리 뒤에도 fr/occ 브랜치가 남았다 — $o1b_out" || pass "O1: 세션 종료 뒤 rd task list 가 로컬 브랜치를 정리한다"
+
+# O2 — 점유를 판정할 수 없으면(lsof 실패) 지우지 않는다.
+o_prepare unk
+LSOF_STUB_DIR="$(mktemp -d)" || { echo "대역 lsof 디렉터리 생성 실패" >&2; exit 1; }
+_ast_cleanup+=("$LSOF_STUB_DIR")
+printf '#!/usr/bin/env bash\nexit 1\n' > "$LSOF_STUB_DIR/lsof"
+chmod +x "$LSOF_STUB_DIR/lsof"
+o2_tip="$(git -C "$REPO" rev-parse fr/unk)"
+o2_rc=0; o2_out="$( cd "$REPO" && PATH="$LSOF_STUB_DIR:$PATH" bash "$ARCHIVE_SH" --task unk --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )" || o2_rc=$?
+[[ "$o2_rc" -eq 0 ]] && pass "O2: 판정 불가여도 발행이 rc=0 으로 끝난다" || fail "O2: rc=$o2_rc — $o2_out"
+git -C "$REPO" merge-base --is-ancestor "$o2_tip" main \
+  && pass "O2: 기본 브랜치에 병합된다" || fail "O2: 병합 누락"
+[[ -d "$REPO/.worktrees/unk" ]] \
+  && pass "O2: 판정 불가 worktree 디렉터리를 지우지 않는다" || fail "O2: worktree 가 지워졌다"
+git -C "$REPO" rev-parse --verify -q refs/heads/fr/unk >/dev/null \
+  && pass "O2: fr/unk 로컬 브랜치를 지우지 않는다" || fail "O2: 로컬 브랜치가 지워졌다"
+[[ "$o2_out" == *"세션이 있는지 확인하지 못해"* && "$o2_out" == *"조회 실패"* ]] \
+  && pass "O2: 출력에 판정 불가 문구와 사유가 있다" || fail "O2: 판정 불가 문구·사유 누락 — $o2_out"
+[[ "$o2_out" == *"rd task list"* ]] \
+  && pass "O2: 출력에 rd task list 후속 명령이 있다" || fail "O2: 후속 명령 누락 — $o2_out"
 
 echo "== archive.sh — launching 예약은 발행하지 않는다 (spec D7·plan 1076행) =="
 
@@ -368,7 +475,7 @@ else
   fail "AC17 실패 — eps 의 seal 로 zeta 가 발행됐다(rc=0): $zeta_out"
 fi
 # "리뷰 대상 불일치"(hash-mismatch) 에도 같은 부분문자열이 있어 느슨한 매칭은 branch
-# 모드 검사를 제거해도 통과한다 — 정확한 사유 문구로 좁힌다(2차 리뷰 지적).
+# 모드 검사를 제거해도 통과한다 — 정확한 사유 문구로 좁힌다.
 [[ "$zeta_out" == *"마커 branch 모드 불일치"* ]] && pass "AC17 — 거부 사유가 branch 모드 불일치를 정확히 가리킨다" \
   || fail "AC17 — 거부 사유가 예상과 다르다: $zeta_out"
 
@@ -437,7 +544,7 @@ echo "== archive.sh — 인자 없이 호출해도 재실행 경로가 죽지 �
 # 이 Task 의 대표 사용 경로는 인자 0개 호출이다(CLAUDE.md·claude_skills 안내가 일관되게
 # 이 형태를 쓴다). bash 3.2 + set -u 에서 빈 배열의 "${arr[@]}" 는 unbound variable 로
 # 죽는다 — 재실행 직전의 `_reexec_args=("${ORIG_ARGS[@]}")` 에 가드가 없으면 인자 0개
-# 호출이 항상 이 경로로 죽는다(리뷰 지적, Critical). 진짜 seal 을 만들지 않아 review
+# 호출이 항상 이 경로로 죽는다. 진짜 seal 을 만들지 않아 review
 # precheck 는 정상적으로 거부하지만, **그 거부 메시지까지 도달한다는 것 자체가** 재실행
 # 경로(파싱→대상 확정→cd→재실행→자식의 인자 파싱)가 안 죽고 끝까지 갔다는 증거다.
 bash "$PROMOTE_SH" --short-title noarg --size large --source-fr -
@@ -736,7 +843,7 @@ mo_ct_diverge() {
   local slug="$1" extra="${2:-}" ct=1
   [[ "$extra" != veonly ]] || ct=0
   if ! grep -qx '대기 중' "$REPO/CURRENT_TASK.md"; then
-    sed -i 's/^구현 중$/대기 중/' "$REPO/CURRENT_TASK.md"
+    sed_inplace 's/^구현 중$/대기 중/' "$REPO/CURRENT_TASK.md"
     git -C "$REPO" add -A
     RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main: CURRENT_TASK 기준 복구 ($slug)"
   fi
@@ -752,7 +859,7 @@ mo_ct_diverge() {
     RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main: 증거 기준 ($slug)" || true ;;
   esac
   bash "$PROMOTE_SH" --short-title "$slug" --size large --source-fr - >/dev/null 2>&1
-  (( ct )) && sed -i 's/^대기 중$/아카이브 보류/' "$REPO/.worktrees/$slug/CURRENT_TASK.md"
+  (( ct )) && sed_inplace 's/^대기 중$/아카이브 보류/' "$REPO/.worktrees/$slug/CURRENT_TASK.md"
   printf 'work-%s\n' "$slug" > "$REPO/.worktrees/$slug/src-$slug.txt"
   [[ "$extra" != sm && "$extra" != ve ]] || printf '%s\t대기 중\t구현 중\t200\n' "$slug" >> "$REPO/.worktrees/$slug/$mo_sm"
   [[ "$extra" != x ]] || printf 'fr-side-%s\n' "$slug" > "$REPO/.worktrees/$slug/x.txt"
@@ -763,7 +870,7 @@ mo_ct_diverge() {
   [[ "$extra" != ve ]] || printf '| 2026-02-02 | fr-%s | s | tooling | idea | - | [상세](items/fr-%s.md) |\n' "$slug" "$slug" >> "$REPO/.worktrees/$slug/$mo_idx"
   git -C "$REPO/.worktrees/$slug" add -A
   git -C "$REPO/.worktrees/$slug" commit -q -m "구현: $slug"
-  (( ct )) && sed -i 's/^대기 중$/구현 중/' "$REPO/CURRENT_TASK.md"
+  (( ct )) && sed_inplace 's/^대기 중$/구현 중/' "$REPO/CURRENT_TASK.md"
   [[ "$extra" != sm && "$extra" != ve ]] || printf '%s-main\t대기 중\t구현 중\t300\n' "$slug" >> "$REPO/$mo_sm"
   [[ "$extra" != x ]] || printf 'main-side-%s\n' "$slug" > "$REPO/x.txt"
   case "$extra" in ve|vedel|veonly) mo_ev "main-$slug" "$REPO/$mo_ve" ;; esac
@@ -840,12 +947,12 @@ git -C "$REPO" merge --abort >/dev/null 2>&1 || true
 # T1b — main 이 CURRENT_TASK.md 를 삭제하고 fr 이 수정한 delete/modify 충돌은 stage 2 가 없어 멈춘다.
 if ! grep -qx '대기 중' "$REPO/CURRENT_TASK.md" 2>/dev/null; then
   git -C "$REPO" checkout -q HEAD -- CURRENT_TASK.md 2>/dev/null || true
-  sed -i 's/^구현 중$/대기 중/' "$REPO/CURRENT_TASK.md"
+  sed_inplace 's/^구현 중$/대기 중/' "$REPO/CURRENT_TASK.md"
   git -C "$REPO" add -A
   RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main: CURRENT_TASK 기준 복구 (ct1b)" || true
 fi
 bash "$PROMOTE_SH" --short-title ct1b --size large --source-fr - >/dev/null 2>&1
-sed -i 's/^대기 중$/아카이브 보류/' "$REPO/.worktrees/ct1b/CURRENT_TASK.md"
+sed_inplace 's/^대기 중$/아카이브 보류/' "$REPO/.worktrees/ct1b/CURRENT_TASK.md"
 printf 'work-ct1b\n' > "$REPO/.worktrees/ct1b/src-ct1b.txt"
 git -C "$REPO/.worktrees/ct1b" add -A
 git -C "$REPO/.worktrees/ct1b" commit -q -m "구현: ct1b"

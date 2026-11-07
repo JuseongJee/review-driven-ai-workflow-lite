@@ -13,7 +13,7 @@
 #
 # 판정 값: ready / waiting:<stem>,<stem> / check:<stem>,<stem> / error:<사유>
 #          우선순위는 error > waiting > check > ready 이고 하나만 낸다.
-#          error 사유는 parse:<필드명> / dangling:<csv> / series:<name> / cycle 이다.
+#          error 사유는 parse:<필드명>(depends-on·relates·series·status) / dangling:<csv> / series:<name> / cycle 이다.
 #
 # 종료 코드:
 #   readiness    0 정상 / 2 실행 불가
@@ -24,6 +24,10 @@
 # 데이터 원천의 권위:
 #   - 관계 필드·status 의 권위는 items/ 상세 파일이다.
 #   - priority 의 권위는 FUTURE_REQUESTS.md 인덱스 컬럼이다 (change spec D9).
+#   - status 판정 규칙은 `_fr_status.sh` 가 정본이다. 이 도구는 비표준(빈 값·허용값 밖)을
+#     활성으로 두고 `error:parse:status` 로 판정한다. 이 오류는 관계 오류(parse·dangling·
+#     series·cycle)보다 뒤, waiting/check/ready 계산보다 앞에서 본다. 그래서 읽지 못한
+#     status 가 `ready` 로 나오지 않는다.
 #   - 인덱스를 읽는 것은 `validate` 와 `auto-pick` 뿐이다. `readiness` 는 읽지 않는다 —
 #     인덱스가 깨져도 목록 판정이 막히지 않아야 한다.
 #   - 인덱스 구조가 손상되면(필수 헤더 부재·데이터 행 셀 수 부족·우선순위 셀 형식 오류)
@@ -68,6 +72,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_fr_status.sh"
 
 # ---------------------------------------------------------------- 인자 파싱
 
@@ -171,31 +177,39 @@ parse_items() {
     ERR_REASON="items 디렉터리 없음: ${ITEMS_DIR}"
     return 1
   fi
-  local files=() out rc stem st pri dep ser rel
-  files=( "$ITEMS_DIR"/*.md )
-  if [ ! -e "${files[0]}" ]; then
+  local files=() out rc stem st pri dep ser rel f
+  # items/README.md 는 FR 상세가 아니라 폴더 안내다(lite 가 [lite-add] 로 넣는다). 판정에서 뺀다.
+  for f in "$ITEMS_DIR"/*.md; do
+    [ -e "$f" ] || continue
+    [ "${f##*/}" = "README.md" ] && continue
+    files+=( "$f" )
+  done
+  if [ "${#files[@]}" -eq 0 ]; then
     return 0
   fi
-  out="$(awk '
+  fr_status_awk_vars
+  out="$(awk "${FR_STATUS_AWK_ARGS[@]}" "$FR_STATUS_AWK"'
     function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
     function nosp(s) { gsub(/[ \t\r]/, "", s); return s }
     function val(line) { return trim(substr(line, index(line, ":") + 1)) }
-    function flush() {
+    function flush(  st) {
       if (fname == "") return
+      st = frs_value()
       printf "%s\034%s\034%s\034%s\034%s\034%s\n", fname,
-        (status == "" ? "-" : status), (pri == "" ? "-" : pri),
+        (st == "" ? "-" : st), (pri == "" ? "-" : pri),
         (dep == "" ? "-" : dep), (ser == "" ? "-" : ser), (rel == "" ? "-" : rel)
     }
     FNR == 1 {
       flush()
       fname = FILENAME; sub(/.*\//, "", fname); sub(/\.md$/, "", fname)
-      status = ""; pri = ""; dep = ""; ser = ""; rel = ""
+      frs_reset(); pri = ""; dep = ""; ser = ""; rel = ""
     }
-    /^- status:/     { if (status == "") status = nosp(val($0)); next }
+    frs_feed($0, FNR) { next }
     /^- priority:/   { if (pri    == "") pri    = nosp(val($0)); next }
     /^- depends-on:/ { if (dep    == "") dep    = nosp(val($0)); next }
     /^- series:/     { if (ser    == "") ser    = nosp(val($0)); next }
     /^- relates:/    { if (rel    == "") rel    = nosp(val($0)); next }
+    BEGIN { frs_init() }
     END { flush() }
   ' "${files[@]}" 2>&1)"
   rc=$?
@@ -218,9 +232,16 @@ parse_items() {
     mput DEP "$stem" "$dep"
     mput REL "$stem" "$rel"
     mput SRAW "$stem" "$ser"
-    case "$st" in
-      done|dropped|parked) ;;
-      *) ACTIVE_STEMS="$ACTIVE_STEMS $stem" ;;
+    fr_status_class "$st"
+    case "$FR_STATUS_CLASS" in
+      inactive) ;;
+      active)
+        ACTIVE_STEMS="$ACTIVE_STEMS $stem" ;;
+      *)
+        # 비어 있거나 모르는 값. 활성으로 두고 error:parse:status 로 판정한다.
+        ACTIVE_STEMS="$ACTIVE_STEMS $stem"
+        mput HASBADST "$stem" 1
+        mput BADST "$stem" "$st" ;;
     esac
   done <<< "$out"
   return 0
@@ -409,6 +430,9 @@ compute_verdicts() {
     fi
     if [ -z "$v" ]; then
       mget CYC "$stem"; [ "$MV" = "1" ] && v="error:cycle"
+    fi
+    if [ -z "$v" ]; then
+      mget HASBADST "$stem"; [ "$MV" = "1" ] && v="error:parse:status"
     fi
     if [ -z "$v" ]; then
       waiting=""; checks=""
@@ -630,6 +654,16 @@ cmd_validate() {
 "
         viol=1 ;;
     esac
+
+    # status 오류는 판정 값과 별개로 전체 items 에서 보고한다 (관계 오류와 함께 낸다).
+    mget HASBADST "$stem"
+    if [ "$MV" = "1" ]; then
+      mget BADST "$stem"; sht="$MV"
+      [ "$sht" = "-" ] && sht="없음"
+      buf="${buf}parse	${stem}	status 값 오류 (값: ${sht}) — 허용값: idea validated ready-for-request blocked done dropped parked
+"
+      viol=1
+    fi
 
     mget IHAS "$stem"; [ "$MV" = "1" ] || continue
     mget IPRI "$stem"; ipri="$MV"

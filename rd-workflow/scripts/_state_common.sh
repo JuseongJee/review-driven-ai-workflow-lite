@@ -161,9 +161,9 @@ source_fr_request_missing() {
 #   absent    — 파일이 없거나 `## Risk Tier` 헤더가 없다 (옛 REQUEST → 호출자가 Execution Path 로 fallback)
 #   malformed — 헤더는 있는데 판독 줄이 0개 또는 2개 이상(빈 값 줄 포함), 값이 비었거나 `-`·토큰 밖, 헤더가 2개 이상
 # fallback 은 오직 absent 에만 허용한다. malformed 를 absent 로 흡수하면 옛 Execution Path=small-task 가
-# 살아나 effort 가 조용히 하향된다 (REQUEST review Turn 008 F2). 토큰 집합은 WORKFLOW.md 등급표와 같다.
+# 살아나 effort 가 조용히 하향된다. 토큰 집합은 WORKFLOW.md 등급표와 같다.
 # 헤더 수·필드 수·값을 awk 한 번에서 센다 — awk 출력을 command substitution 으로 받아 줄을 세면
-# trailing newline 과 빈 줄이 지워져 2필드가 1필드로 보인다 (spec/plan review Turn 002 F3).
+# trailing newline 과 빈 줄이 지워져 2필드가 1필드로 보인다.
 risk_tier_from_request() {
   local f="${1:-}" out
   [[ -f "$f" ]] || { printf 'absent\n'; return 0; }
@@ -397,7 +397,7 @@ source_fr_split() {
 # 미러의 허용 표기(`- ` 접두·앞뒤 공백)를 벗겨 canonical 목록으로 낸다. raw 추출
 # helper(`source_fr_from_request_list`)는 REQUEST 해석의 항목 경계를 지키기 위해 접두를
 # 남기므로, 그것을 그대로 집합 비교·복구 안내에 쓰면 권위 `…/a.md` 와 미러 `- …/a.md` 가
-# 다른 값으로 읽혀 **정상 상태가 divergence 로 차단**된다 (final diff review F6).
+# 다른 값으로 읽혀 **정상 상태가 divergence 로 차단**된다.
 # 실존 검사는 하지 않는다 — 비교·안내 경로에 새 실패 모드를 만들지 않기 위함이다.
 source_fr_mirror_read() {
   local line trimmed out=""
@@ -486,7 +486,7 @@ source_fr_recovery_cmd_repeat_opt() {
 # REQUEST 의 자유 표기 해석(`source_fr_resolve_list`)과 구분되는 경로다. CLI 옵션·위치
 # 인자는 이미 canonical 을 요구하므로 레이블·slug 같은 서술 표기를 통과시키지 않고,
 # 검증을 **인자 경계 그대로** 수행한다 — 값들을 개행 목록으로 합친 뒤 줄 단위로 보면
-# **개행이 든 인자 하나가 두 항목으로 승인**된다 (final diff review F4).
+# **개행이 든 인자 하나가 두 항목으로 승인**된다.
 #
 # 실패 사유는 stderr 로 낸다. 호출부는 첫 실패에서 멈추지 말고 전부 열거한 뒤 아무것도
 # 쓰지 않는다 (change-spec §2.4 전부-또는-전무).
@@ -946,8 +946,8 @@ rd_path_is_record() {
 #
 # **판정 대상은 index ∪ 워킹트리(추적 파일)** 입니다. 종전에는 index 만 봤는데, hook 은 커밋
 # 명령이 실행되기 **전에** 돌므로 `git commit -a`·`git commit <경로>` 처럼 커밋 집합을 명령
-# 실행 중에 만드는 형태에서는 index 가 비어 있어 공허참으로 통과했습니다
-# (final diff review Finding 3). raw command 를 파싱해 `-a`·pathspec 의미를 재현하는 방향은
+# 실행 중에 만드는 형태에서는 index 가 비어 있어 공허참으로 통과했습니다.
+# raw command 를 파싱해 `-a`·pathspec 의미를 재현하는 방향은
 # 택하지 않았습니다 — 인용·별칭·`-C`·`--` 조합마다 의미가 달라 파서가 곧 새는 반면,
 # 「아카이브 보류 상태에서 보호 경로가 수정되어 있다」는 사실 자체가 이미 정상이 아니어서
 # 명령 형태와 무관하게 차단하는 편이 계약(§4.3)에 더 가깝기 때문입니다.
@@ -1130,7 +1130,7 @@ state_log_stage_transition() {
 }
 
 # state_stage_metrics_report <short_title> [log_file] [now_epoch] — 회차 요약을 사람이
-#   읽을 수 있는 형태로 출력한다(change-spec D5, spec/plan review Turn 002 F2/F3/F4 수정).
+#   읽을 수 있는 형태로 출력한다.
 #   대상이 비어 있거나 '-' 면 "현재 진행 중인 작업이 없습니다" 안내. 파일 부재/빈
 #   대상이면 "기록 없음" 안내. 항상 return 0. now_epoch 생략 시 date +%s(테스트에서
 #   고정 시각을 주입할 수 있도록 3번째 인자로 뺐다 — sleep 없는 결정적 테스트용).
@@ -1160,7 +1160,7 @@ state_stage_metrics_report() {
   fi
   awk -F'\t' -v target="$target" -v now="$now" '
     /^#/ { next }
-    # F4 잔여(spec/plan review Turn 004) — epoch 컬럼이 잘린 행(NF==3)을 통째로
+    # epoch 컬럼이 잘린 행(NF==3)을 통째로
     # 버리면 그 행이 나타내는 종료/전이 자체가 없었던 것처럼 처리돼, 이미 종료된
     # 회차가 계속 "진행 중"으로 늘어난다(재현: 마지막 행의 epoch 만 잘린 경우).
     # short_title/from/to 세 필드는 있는데 epoch 만 없는 행은 버퍼에 그대로
@@ -1255,7 +1255,7 @@ state_stage_metrics_report() {
           } else {
             line = line ", 측정 불가"
           }
-          # F4 잔여(spec/plan review Turn 004) — 닫힌 방문의 불완전 표시(incomplete)와
+          # 닫힌 방문의 불완전 표시(incomplete)와
           # 열린 세그먼트의 손상(open_bad)은 서로 다른 사실이다. 열린 세그먼트가
           # 손상됐다고 닫힌 방문의 "(일부 구간 누락 가능)" 을 숨기면(이전 설계의 결함),
           # 확정 합계가 실제로는 불완전한데도 완전한 값처럼 보인다. 무조건 함께 보여준다.

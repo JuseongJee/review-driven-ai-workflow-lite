@@ -7,7 +7,7 @@ description: Implement a standard-tier change — promote to a fr branch, write 
 
 `manual` 모드에서는 사용자의 단계 진입 지시 없이 이 skill 을 스스로 시작하지 않는다. 판정 기준은 `rd-workflow/docs/flows/AUTONOMY.md` 의 「실행 모드와 skill 호출 권한」 절이다.
 
-`standard` 등급 작업의 구현 skill 입니다. 등급 판정은 이 skill 진입 **전**에 끝나 있어야 하고, 시작 보고 블록은 이 skill 의 1단계(시작 계약 확인) **직후**에 이 skill 이 1회 냅니다 — 라우터는 블록을 내지 않습니다 (`rd-workflow/docs/flows/WORKFLOW.md` 위험 등급 절). `light` 는 이 skill 을 쓰지 않고 WORKFLOW.md 의 light 체크리스트를 따르며, `full` 은 `/request-to-reviewed-plan` 입니다. 하향은 사용자만 할 수 있습니다 — 사용자가 `standard` 로 하향 지시했으면 그 지시를 `## Risk Tier` 이력에 적습니다.
+`standard` 등급 작업의 구현 skill 입니다. 등급 판정은 이 skill 진입 **전**에 끝나 있어야 하고, 시작 보고 블록은 이 skill 의 1단계(시작 계약 확인) **직후**에 이 skill 이 1회 냅니다 — 라우터는 블록을 내지 않습니다 (`rd-workflow/docs/flows/WORKFLOW.md` 위험 등급 절). `light` 는 이 skill 을 쓰지 않고 WORKFLOW.md 의 light 체크리스트를 따르며, `full` 은 `/request-to-reviewed-plan` 입니다. 하향은 WORKFLOW.md 위험 등급 절의 하향 규칙을 따르며, 하향했으면 주체와 근거를 `## Risk Tier` 이력에 적습니다.
 
 Typical user requests:
 - "standard 로 보고 바로 구현해줘"
@@ -23,7 +23,7 @@ Typical user requests:
 
 ```bash
 bash -s <<'RD_SKILL_COMPAT'
-RD_SKILL_BASE=2026-11-01-202303 RD_SKILL_NAME=small-task-implement
+RD_SKILL_BASE=2026-11-04-203832 RD_SKILL_NAME=small-task-implement
 vf="rd-workflow/VERSION"
 if [ ! -f "$vf" ] && [ -f "_ROOT_FILES/rd-workflow/VERSION" ]; then exit 0; fi
 v=""; [ -f "$vf" ] && v="$(cat "$vf")"; v="${v#lite-}"
@@ -54,12 +54,14 @@ RD_SKILL_COMPAT
 > **FR 없는 요청의 인계:** `--source-fr -` 이면 기동된 세션이 사용자 원문을 알 수 없으므로,
 > 사용자 원문을 인계 파일 `## 확정 결정` 의 첫 항목으로 그대로 적고 `--handoff` 로 넘깁니다(필수).
 
+**이어받기 (`full` 에서 하향한 작업):** `/request-to-reviewed-plan` 이 하향해 넘긴 작업은 이미 promote 돼 있습니다. Status 가 리뷰 단계(`REQUEST review 대기`·`spec/plan 작성 중`·`spec/plan review 대기`)이면 `bash rd-workflow/scripts/rd task set-status "구현 중"` 으로 바로 옮깁니다(`대기 중` 을 거치지 않습니다). 1~2단계를 건너뛰고 지금의 worktree·fr 브랜치·Source FR 을 그대로 씁니다. 3단계는 기존 `REQUEST.md` 를 축약형으로 정리하고, `## Risk Tier` 의 최초 등급(`full`)·baseline HEAD 는 그대로 두고 최종 등급을 `standard` 로, 이력에 하향 주체·근거를 적습니다. 그다음 4단계부터 진행합니다.
+
 3. **축약 REQUEST 작성**: `Task Type`·`Execution Path`·`User Goal`·`Change Description`·`Acceptance Criteria`·`Risk Tier`·`Source FR` 만 채우고 나머지는 `-`. `## Risk Tier` 는 `- 최종 등급: standard` 를 포함해 6항목을 **작성 즉시** 채웁니다(`-` 로 두지 않음 — 파서가 malformed 로 봅니다. 재분류 때 확인·갱신). 필요하면 `Change Description` 안에 한 문단 spec + 한 목록 plan 을 적습니다.
 4. **AC 확인**: Acceptance Criteria 가 비어 있거나(`-`) 모호하면 구현을 시작하지 않고 사용자에게 확인을 요청합니다.
-5. **구현**: 변경을 작고 직접적으로 유지합니다. 불필요한 구조·투기적 리팩터를 넣지 않습니다.
-6. **검증**: 고친 영역에 맞는 범위만. 제품 코드는 `bash rd-workflow/scripts/{test,lint,typecheck,build}.sh` (프로젝트가 교체한 경우), 워크플로 인프라는 해당 `self_test.sh` 그룹. 새로 만들거나 바꾼 필수 대상 단언(부정 명제·회귀)이 있으면 `rd-workflow/docs/guides/mutation-check.md` 「절차」로 변이를 확인하고 결과표를 남깁니다 — plan 은 쓰지 않으며, 결과표는 `/final-diff-review` 가 Author 첫 턴에 싣습니다.
-7. **커밋 전 재분류**: `git status --porcelain` + `git diff --name-only <baseline>..HEAD` 의 변경 집합을 신호표와 대조합니다. `full` 신호가 있으면 이 skill 을 멈추고 등급 상향을 한 줄로 알린 뒤 `/request-to-reviewed-plan` 으로 넘깁니다(브랜치 유지, spec/plan 정식 작성). 벗어나지 않으면 `## Risk Tier` 를 확정합니다.
-8. `CURRENT_TASK.md` 를 갱신하고 **`/final-diff-review` 로 넘깁니다. `standard` 는 이 단계를 건너뛰지 않습니다.**
+5. **구현**: `rd-workflow-workspace/review-standards.md` 에 주석 밖 내용이 있으면 구현 전에 읽고 따릅니다(리뷰 표준 — final diff review 리뷰어가 같은 표준으로 검토합니다). 변경을 작고 직접적으로 유지합니다. 불필요한 구조·투기적 리팩터를 넣지 않습니다.
+6. **검증**: 시작할 때 `bash rd-workflow/scripts/rd task set-status "검증 중"` 으로 전이합니다(`구현 중` 에서 `diff review 대기` 로 바로 갈 수 없습니다). 고친 영역에 맞는 범위만. 제품 코드는 `bash rd-workflow/scripts/{test,lint,typecheck,build}.sh` (프로젝트가 교체한 경우), 워크플로 인프라는 해당 `self_test.sh` 그룹. 증거를 남기는 `verify_record.sh` 는 커밋된 트리만 받으므로 그 전에 작업물을 커밋합니다(`git add`·`git commit` 분리). 새로 만들거나 바꾼 필수 대상 단언(부정 명제·회귀)이 있으면 `rd-workflow/docs/guides/mutation-check.md` 「절차」로 변이를 확인하고 결과표를 남깁니다 — plan 은 쓰지 않으며, 결과표는 `/final-diff-review` 가 Author 첫 턴에 싣습니다.
+7. **커밋 전 재분류**: `git status --porcelain` + `git diff --name-only <baseline>..HEAD` 의 변경 집합을 신호표와 대조합니다. `full` 신호가 있으면(하향 근거에 적은 신호는 제외 — WORKFLOW.md 「커밋 전 재분류와 상향」) 이 skill 을 멈추고 등급 상향을 한 줄로 알린 뒤 `/request-to-reviewed-plan` 으로 넘깁니다(브랜치 유지, spec/plan 정식 작성). 벗어나지 않으면 `## Risk Tier` 를 확정합니다.
+8. `bash rd-workflow/scripts/rd task set-status "diff review 대기"` 로 전이하고 `CURRENT_TASK.md` 를 갱신한 뒤, 작업물과 set-status 가 알린 「커밋할 파일」 을 커밋합니다(리뷰는 HEAD 를 보므로 커밋하지 않은 상태 파일은 낡은 채로 리뷰됩니다). 그다음 **`/final-diff-review` 로 넘깁니다. `standard` 는 이 단계를 건너뛰지 않습니다.**
 
 ## Final output
 

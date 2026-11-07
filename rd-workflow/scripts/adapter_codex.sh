@@ -305,8 +305,8 @@ cleanup() {
   # 보존해 두고, 여기서는 리더 생존 여부를 보지 않고 그 그룹을 종료한다.
   # grace 후 판단도 리더 PID 가 아니라 **그룹 생존**을 기준으로 한다 — TERM 을 무시하는
   # 자손이 남아 있는데 리더만 죽었다면 리더 기준 판단은 KILL 을 건너뛴다.
-  # 그룹에 살아 있는 프로세스가 있을 때만 종료 시퀀스를 수행한다. 무조건 grace 를 기다리면
-  # 이미 모두 종료된 정상·비정상 경로에서 KILL_GRACE 만큼 불필요하게 지연된다.
+  # 그룹에 살아 있는 프로세스가 있을 때만 종료 시퀀스를 수행하고, TERM 뒤에는 그룹이 사라지는 즉시
+  # 다음 단계로 간다(최대 KILL_GRACE). 무조건 grace 를 기다리면 불필요하게 지연된다.
   # 판정이 「없음」(1)이 아니면 신호를 보낸다 — ps 가 실패해 판정 불가(2)여도 보낸다.
   # 판정 불가의 대표 원인인 권한 거부는 kill 도 같은 EPERM 으로 실패하므로 남의 그룹에 닿지 않는다.
   local gs=0
@@ -314,15 +314,24 @@ cleanup() {
     gs=0; rw_group_alive "$codex_pgid" || gs=$?
     if [ "$gs" -ne 1 ]; then
       kill -- -"$codex_pgid" 2>/dev/null || true
-      sleep "$KILL_GRACE" || true  # 그룹 단위 신호로 sleep 이 먼저 끝나도 set -e 가 cleanup 을 끊지 않게 한다
-      gs=0; rw_group_alive "$codex_pgid" || gs=$?
-      [ "$gs" -ne 1 ] && { kill -9 -- -"$codex_pgid" 2>/dev/null || true; }
+      # TERM 뒤 최대 KILL_GRACE 까지만 기다린다 — 그룹이 먼저 사라지면 바로 다음 단계로 간다.
+      gs=0; rw_group_wait_gone "$codex_pgid" "$KILL_GRACE" || gs=$?
+      if [ "$gs" -ne 1 ]; then
+        kill -9 -- -"$codex_pgid" 2>/dev/null || true
+        # KILL 이 반영되기까지 몇 ms 걸린다 — 최대 2초 기다려 뒤의 발행 판정과 경쟁하지 않게 한다.
+        rw_group_wait_gone "$codex_pgid" 2 || true
+      fi
     fi
   elif [ -z "$codex_pgid" ] && [ -n "$codex_pid" ] && kill -0 "$codex_pid" 2>/dev/null; then
     # 그룹이 확인되지 않은 경우의 폴백 — 단일 프로세스만 종료한다
     kill "$codex_pid" 2>/dev/null || true
-    sleep "$KILL_GRACE" || true
-    kill -0 "$codex_pid" 2>/dev/null && kill -9 "$codex_pid" 2>/dev/null || true
+    _w=0; _lim=$(( KILL_GRACE * 10 ))
+    while kill -0 "$codex_pid" 2>/dev/null && [ "$_w" -lt "$_lim" ]; do sleep 0.1 || true; _w=$(( _w + 1 )); done
+    if kill -0 "$codex_pid" 2>/dev/null; then
+      kill -9 "$codex_pid" 2>/dev/null || true
+      _w=0
+      while kill -0 "$codex_pid" 2>/dev/null && [ "$_w" -lt 20 ]; do sleep 0.1 || true; _w=$(( _w + 1 )); done
+    fi
   fi
   if [ -n "$codex_pid" ]; then
     wait "$codex_pid" 2>/dev/null || true

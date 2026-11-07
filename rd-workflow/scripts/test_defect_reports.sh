@@ -197,7 +197,7 @@ case "$1 $2" in
   # --json/--jq 를 해석하지 않는다 (로컬 jq 의존 금지). 인자는 위 로그에 남으므로
   # 테스트가 --json url,body·--jq·정확 마커의 전달 여부를 인자 수준에서 검사한다.
   # FAKE_SEARCH=FAIL 은 조회 실패(네트워크·API 오류)를 주입한다. 이 실패를 "0건" 으로
-  # 오인하면 중복 Issue 가 생기므로 반드시 구별돼야 한다 (final diff review Finding 1).
+  # 오인하면 중복 Issue 가 생기므로 반드시 구별돼야 한다.
   "issue list")   [[ "${FAKE_SEARCH:-}" == "FAIL" ]] && exit 1
                   printf '%s' "${FAKE_SEARCH:-}" ;;
   "issue create") [[ "${FAKE_CREATE:-ok}" == "fail" ]] && exit 1
@@ -210,7 +210,7 @@ FAKE
 
   # fake mv — 원자적 쓰기 실패를 파일 권한에 기대지 않고 결정적으로 만든다.
   # chmod 기반은 root 에서 무시되어 컨테이너/CI 에서 필수 계약이 무검증으로 남는다
-  # (Turn 006 Finding 4). 패턴이 없으면 즉시 real mv 로 exec 하므로 평소엔 투명하다.
+  # 패턴이 없으면 즉시 real mv 로 exec 하므로 평소엔 투명하다.
   MV_COUNT="$WS/mv-count"; : > "$MV_COUNT"
   cat > "$FAKEBIN/mv" <<'FAKEMV'
 #!/usr/bin/env bash
@@ -244,7 +244,7 @@ FAKEMK
   chmod +x "$FAKEBIN/mktemp"
 
   # fake cat — 보고서 원문 읽기 실패를 주입한다. 이 실패는 heredoc 안에서 치환될 때
-  # 바깥 `cat <<EOF` 의 성공 상태에 가려지므로(Turn 004 Finding 2) 별도 주입이 필요하다.
+  # 바깥 `cat <<EOF` 의 성공 상태에 가려지므로 별도 주입이 필요하다.
   # **인자가 대상 파일과 일치하는 호출만** 실패시킨다: 인자 없는 heredoc `cat` 과
   # 설정 파일·fake gh 의 body-file 읽기는 그대로 통과해야 한다.
   # 카운터를 `$(< …)` 로 읽는 이유 — 여기서 `cat` 을 쓰면 자기 자신을 다시 호출한다.
@@ -273,7 +273,7 @@ run_dr() { (cd "$WS" && PATH="$FAKEBIN:$PATH" GH_LOG="$GH_LOG" GH_ARGV="$GH_ARGV
                        MV_COUNT="$MV_COUNT" CAT_COUNT="$CAT_COUNT" bash "$TARGET" "$@"); }
 
 # grep -c 는 0건일 때 '0' 을 출력하고 exit 1 을 반환한다. `|| echo 0` 을 붙이면
-# 출력이 '0\n0' 두 줄이 되어 모든 "0회" 비교가 깨진다 (Turn 004 Finding 3).
+# 출력이 '0\n0' 두 줄이 되어 모든 "0회" 비교가 깨진다.
 calls() {
   local n=0
   [[ -f "$GH_LOG" ]] && n="$(grep -c "ARGS=$1" "$GH_LOG")"
@@ -282,7 +282,7 @@ calls() {
 
 # PATH 에서 gh 를 가진 디렉토리만 제거한다. PATH 를 통째로 비우면 sed·grep 까지
 # 사라져 스크립트가 다른 이유로 죽고, 반대로 /usr/bin 을 남기면 CI 에서 real gh 가
-# 잡힐 수 있다 (Turn 004 Finding 3).
+# 잡힐 수 있다.
 path_without_gh() {
   local out="" d; local -a dirs
   IFS=: read -ra dirs <<< "$PATH"
@@ -478,7 +478,7 @@ setup_workspace; setup_fake_gh
 f="$(make_report "2026-08-12-2009-y.md")"
 # publish 는 같은 보고 파일에 두 번 쓴다 — 10번(attempting), 13번(set-issue).
 # AFTER=1 이면 앞의 쓰기는 성공하고 뒤의 쓰기만 실패해 exit 10 이 정확히 나온다.
-# 파일 권한에 기대지 않으므로 root 에서도 동일하게 실행된다 (Turn 006 Finding 4).
+# 파일 권한에 기대지 않으므로 root 에서도 동일하게 실행된다.
 err="$(FAKE_MV_FAIL_PATTERN="$(basename "$f")" FAKE_MV_FAIL_AFTER=1 \
        run_dr publish "$f" --upstream "O/R" --yes 2>&1 >/dev/null)"; rc=$?
 check "exit 10 (7 이 아니어야 함)" "$rc" "10"
@@ -503,7 +503,7 @@ snap="$(cat "$f")"
 run_dr publish "$f" --upstream "O/R" --yes >/dev/null 2>&1; rc=$?
 check "exit 7" "$rc" "7"
 # 서브커맨드별 0회가 아니라 로그 전체 0행 — auth status·repo view 조차 없어야 한다
-# (Turn 006 Finding 1). 검증이 gh 가용성 확인보다 앞에 있다는 계약의 관찰 지점이다.
+# 검증이 gh 가용성 확인보다 앞에 있다는 계약의 관찰 지점이다.
 check "gh 호출 0회 (로그 전체)" "$(wc -l < "$GH_LOG" | tr -d ' ')" "0"
 check "파일 무변경" "$(cat "$f")" "$snap"
 
@@ -521,7 +521,7 @@ done
 echo "-- 3 세그먼트 GHE 대상은 정상 통과한다 (과잉 거부 방지) --"
 setup_workspace; setup_fake_gh
 f="$(make_report "2026-08-12-2017-ghe-ok.md")"
-run_dr publish "$f" --upstream "ghes.navercorp.com/O/R" --yes >/dev/null 2>&1; rc=$?
+run_dr publish "$f" --upstream "ghe.example.com/O/R" --yes >/dev/null 2>&1; rc=$?
 check "exit 0" "$rc" "0"
 
 echo "-- 설정 없으면 보류 (AC 22) --"
@@ -561,8 +561,8 @@ check "파일 절단 없음" "$(wc -c < "$f")" "$size_before"
 echo "-- GHE 대상이면 GH_HOST 가 전달된다 --"
 setup_workspace; setup_fake_gh
 f="$(make_report "2026-08-12-2012-ghe.md")"
-run_dr publish "$f" --upstream "ghes.navercorp.com/O/R" --yes >/dev/null 2>&1
-grep -q 'HOST=ghes.navercorp.com' "$GH_LOG" && ok "GH_HOST 전달" || nok "GH_HOST 전달"
+run_dr publish "$f" --upstream "ghe.example.com/O/R" --yes >/dev/null 2>&1
+grep -q 'HOST=ghe.example.com' "$GH_LOG" && ok "GH_HOST 전달" || nok "GH_HOST 전달"
 
 # 인자 없는 `gh auth status` 는 등록된 **모든** host 를 점검하고 하나라도 실패하면 비-0 을
 # 낸다. 대상과 무관한 사내 host 의 VPN 미연결이 github.com 발행 전체를 막았다 (Issue #31).
@@ -573,8 +573,8 @@ run_dr preview "$f" --upstream "O/R" >/dev/null 2>&1
 grep -q '^HOST=github.com ARGS=auth status --hostname github.com$' "$GH_LOG" \
   && ok "github.com 대상: --hostname 전달" || nok "github.com 대상: --hostname 전달"
 setup_fake_gh
-run_dr preview "$f" --upstream "ghes.navercorp.com/O/R" >/dev/null 2>&1
-grep -q 'ARGS=auth status --hostname ghes.navercorp.com$' "$GH_LOG" \
+run_dr preview "$f" --upstream "ghe.example.com/O/R" >/dev/null 2>&1
+grep -q 'ARGS=auth status --hostname ghe.example.com$' "$GH_LOG" \
   && ok "GHE 대상: --hostname 전달" || nok "GHE 대상: --hostname 전달"
 
 echo "-- preview 는 대상·공개여부·경고·본문을 보여주고 아무것도 안 바꾼다 (AC 12·13) --"
@@ -594,7 +594,7 @@ f="$(make_report "2026-08-12-2014-exact.md")"
 which_gh="$(cd "$WS" && PATH="$FAKEBIN:$PATH" command -v gh)"
 check "gh 는 fake 경로" "$which_gh" "$FAKEBIN/gh"
 run_dr publish "$f" --upstream "O/R" --yes >/dev/null 2>&1
-# 줄 수만 비교하면 "잘못된 다섯 호출" 도 통과한다 (Turn 004 Finding 3).
+# 줄 수만 비교하면 "잘못된 다섯 호출" 도 통과한다.
 # host + 서브커맨드로 정규화한 전체 목록을 순서까지 비교한다.
 actual="$(sed -E 's/^HOST=([^ ]+) ARGS=([a-z]+ [a-z]+).*/\1 \2/' "$GH_LOG")"
 expected="github.com auth status

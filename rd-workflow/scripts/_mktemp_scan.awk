@@ -12,11 +12,25 @@
 # 목록에서 뺍니다). 이스케이프·백슬래시 parity·인용 구간
 # 판정을 하지 않습니다 — 그 판정을 세 번 고쳤고 매번 새 false negative 가 나왔습니다.
 #
+# ── 실행되지 않는 문구가 걸릴 때 ──────────────────────────────────────
+# 스캐너는 인용 구간을 보지 않으므로 프롬프트·경고·grep 문자열 안의 `mktemp -d` 도 후보로 셉니다.
+# 일반 줄이면 줄 끝에 `# mktemp-scan: literal` 마커를 붙입니다.
+# heredoc 본문 줄에는 마커를 붙일 수 없습니다 — 붙이면 그 주석이 문구의 일부로 출력됩니다.
+# 이때는 문구를 마커를 붙인 변수 줄로 분리하고, heredoc 에서는 변수를 씁니다.
+#   local _tmp_cmd='mktemp -d'  # mktemp-scan: literal
+#   cat <<EOF
+#   … created with ${_tmp_cmd} …
+#   EOF
+# 실제 사용 예: review_common.sh 의 build_review_prompt.
+#
 # ── 디렉터리 모드(mode=dir) 허용 형태 ──────────────────────────────────
 # ① 같은 줄 종료 핸들러: x="$(mktemp -d)" || { …; exit N; }  (또는 `|| exit N`, return [N], N=1~255)
 # ② 2줄 템플릿: 1줄째 `|| { echo "<라벨>: 임시 디렉터리 생성 실패 (…)" >&2; exit N; }` +
 #    2줄째 `[[ -n "$x" && -d "$x" ]] || { echo "<라벨>: … 검증 실패 (…)" >&2; exit N; }`
 # ③ 줄에 `mktemp-scan: custom-handler` 마커 (위 후보 제외 ③)
+# ①·② 의 `mktemp -d` 뒤에 템플릿 인자가 붙어도 같은 판정입니다: x="$(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX")" || …
+# macOS 의 템플릿 없는 `mktemp -d`(그리고 `-t`)는 TMPDIR 을 무시하고 사용자 임시 폴더에 만듭니다.
+# 특수 TMPDIR(공백·따옴표·역슬래시) 시나리오를 시험하는 테스트는 템플릿 형식을 씁니다.
 # `local`·`export` 로 시작하는 줄은 ①·② 어느 쪽도 인정하지 않습니다(decl-combined).
 # 2줄째 검증은 필수가 아닙니다 — 그 검증은 mktemp 가 rc 0 으로 빈 경로를 내는 경우를 막는데
 # 실재하는 실패 경로가 아닙니다. 막으려는 사고(실패를 놓쳐 빈 변수로 저장소 밖 경로를 만듦)는

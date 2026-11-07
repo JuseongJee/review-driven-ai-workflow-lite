@@ -67,7 +67,8 @@ _protected_dirty() {
 
 _dirty_msg() {
   echo "verify_record: 보호 경로에 미커밋 변경이 있어 증거가 HEAD 와 어긋납니다 — 커밋한 뒤 다시 실행하십시오." >&2
-  printf '%s' "$1" | head -n 5 | sed 's/^/  - /' >&2
+  # head 로 자르면 큰 목록에서 printf 가 SIGPIPE 를 받는다. sed 가 끝까지 읽는다.
+  printf '%s' "$1" | sed -n '1,5s/^/  - /p' >&2
 }
 
 dirty="$(_protected_dirty)" || {
@@ -106,7 +107,7 @@ dirty="$(_protected_dirty)" || {
 }
 if [[ "$before" != "$after" || -n "$dirty" ]]; then
   echo "verify_record: 검증 중 보호 경로가 바뀌었습니다 — 같은 명령을 다시 실행하십시오: bash rd-workflow/scripts/verify_record.sh -- ${cmd_line}" >&2
-  [[ -n "$dirty" ]] && printf '%s' "$dirty" | head -n 5 | sed 's/^/  - /' >&2
+  [[ -n "$dirty" ]] && printf '%s' "$dirty" | sed -n '1,5s/^/  - /p' >&2
   exit 1
 fi
 

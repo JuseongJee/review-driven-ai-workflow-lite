@@ -284,6 +284,14 @@ _rp_criteria_path() {
   esac
 }
 
+# 프로젝트 리뷰 표준 파일에 주석 밖 내용이 있는가 (없거나 주석·공백뿐이면 비었다고 본다)
+# 비었는데 인라인하면 프롬프트 예산만 쓰고, 없는 파일을 넘기면 (missing) 안내 줄이 생긴다.
+_rp_standards_has_content() {
+  [[ -f "$1" ]] || return 1
+  # grep -q 는 첫 일치에서 끝나 pipefail 아래 awk 가 SIGPIPE(141)로 죽고 판정이 거짓이 된다 — 입력을 끝까지 읽는 grep -c 를 쓴다.
+  _strip_html_comments < "$1" | grep -c '[^[:space:]]' >/dev/null
+}
+
 # 리뷰 응답 언어 — workflow.json 의 review_response_language (한 줄 문자열)
 # 파일·키 부재, 빈 값, 읽기 실패, 이스케이프(\)를 포함한 값은 지원하지 않는 입력으로 보고 한국어를 쓴다.
 get_review_response_language() {
@@ -296,7 +304,13 @@ get_review_response_language() {
 }
 
 # 리뷰 프롬프트 생성
+# 문구를 고칠 때 두 함정이 있습니다.
+# - 본문 heredoc 은 따옴표 없는 `<<EOF` 라 변수와 명령 치환이 전개됩니다. 문구에 넣는 백틱은 `\`` 로
+#   이스케이프합니다. 빼면 백틱 사이가 명령으로 실행되고, 그 문구는 오류 없이 사라집니다.
+# - mktemp 가드 스캐너는 heredoc 안의 `mktemp -d` 문구도 위반으로 셉니다. heredoc 줄에는 마커를 붙일 수
+#   없으므로 아래 `_rp_tmp_cmd` 처럼 마커를 붙인 변수 줄로 분리합니다(_mktemp_scan.awk 머리 주석).
 build_review_prompt() {
+  local _rp_tmp_cmd='mktemp -d'  # mktemp-scan: literal
   local output_file="$1"
   local session_dir_rel="$2"
   local session_file_rel="$3"
@@ -310,25 +324,7 @@ build_review_prompt() {
   local turn_limit="${11}"
   local next_turn_number="${12}"
 
-  # M2: autopilot 모드에서만 Attempt History prepend (Reviewer turn 002 Finding 2)
   local _attempt_history=""
-  if [[ "${RD_AUTOPILOT:-}" == "1" ]]; then
-    local _short_title=""
-    # 정본: review 대상 SESSION.md ($3 = session_file_rel) Branch Context short-title
-    if [[ -f "${PROJECT_ROOT:-.}/${session_file_rel}" ]]; then
-      _short_title="$(awk '/^## Branch Context/{f=1} f&&/^- short-title:/{sub(/^- short-title:[ \t]*/,"");sub(/[ \t]+$/,"");print;exit}' "${PROJECT_ROOT:-.}/${session_file_rel}")"
-    fi
-    # fallback: CURRENT_TASK.md
-    if [[ -z "$_short_title" || "$_short_title" == "unknown" || "$_short_title" == "-" ]]; then
-      if [[ -f "${PROJECT_ROOT:-.}/CURRENT_TASK.md" ]]; then
-        _short_title="$(awk '/^## Short Title/{f=1;next} f&&/^[^#]/{sub(/^[ \t]+/,"");sub(/[ \t]+$/,"");print;exit}' "${PROJECT_ROOT:-.}/CURRENT_TASK.md")"
-      fi
-    fi
-    # 유효 slug 일 때만 주입. unknown/-/빈 값이면 섹션 생략 (legacy session 기존 동작 유지)
-    if [[ -n "$_short_title" && "$_short_title" != "unknown" && "$_short_title" != "-" ]]; then
-      _attempt_history="$(build_attempt_history "$_short_title" "$session_dir_rel" || true)"
-    fi
-  fi
 
   # AC enforcement notice (safeguard-ac-enforcement)
   # request-review / diff-review 의 첫 reviewer 턴에만 주입.
@@ -403,6 +399,12 @@ build_review_prompt() {
     local _rp_before="$_rp_inline_ok"
     _rp_try_inline rules "$_rp_criteria"
     [[ "$_rp_inline_ok" != "$_rp_before" ]] && _rp_criteria_inlined=1
+  fi
+
+  # 코딩 표준은 코드 diff 를 볼 때만 쓰이므로 다른 리뷰 종류에는 예산을 쓰지 않는다.
+  local _rp_standards="rd-workflow-workspace/review-standards.md"
+  if [[ "$review_type" == "diff-review" ]] && _rp_standards_has_content "${_rp_root}/${_rp_standards}"; then
+    _rp_try_inline rules "$_rp_standards"
   fi
 
   local _rp_pipeline="rd-workflow/docs/flows/FILE_BASED_REVIEW_PIPELINE.md"
@@ -508,9 +510,12 @@ ${_rp_ctx_block}   - Previous turn files are available at ${session_dir_rel}/tur
 5. If unresolved objections remain after your review, default to Status=awaiting-author and hand the session back to Author.
 6. Only set Status=awaiting-user if one of these is true: you explicitly have no remaining objections, user input is required, or this turn reaches the ${turn_limit}-turn limit.
 7. If you have no remaining objections, say that explicitly in Disagreement and Proposed Decision.
+8. If the previous Author turn rejected a finding without evidence (a citation or a command result), keep that objection open.
 
 Constraints:
-- Do not modify files outside the review session except to read the review target.
+- Inside the project, write only inside SESSION_DIR. Read other project files only to review the target.
+- Exception: do reproduction work (a scratch git repository, running scripts) in a temporary directory outside the project, created with \`${_rp_tmp_cmd}\`. Remove it when you are done.
+- Never create a \`.git\` directory or file inside SESSION_DIR. In SESSION_DIR, keep only the commands you ran and their output, as text.
 - Do not create a second turn file.
 - Use EXPECTED_TURN_FILE exactly as given. Do not rename, renumber, or "fix" the turn file path.
 - Do not leave Current Owner as Reviewer.
@@ -525,6 +530,7 @@ Closing format for the "Open Issues" section of CHECKPOINT_FILE (a machine check
 - (a) If every objection is resolved, write the first line of the section as exactly "- 없음". Do not add any text on that line.
 - (b) Put the closing explanation below it, after one blank line, as a separate paragraph. Text on the next line directly after "- 없음" is rejected.
 - (c) If any objection remains, do not write "- 없음". Keep each open objection as a list item.
+  Format each open item as "- F2 (턴 004·006) — <issue> | 해소 조건: <condition> | 상태: <why open>".
 
 Required turn file sections:
 - Summary
@@ -535,6 +541,22 @@ Required turn file sections:
 - Proposed Decision
 - Next Owner
 
+Findings format (a script checks it after your turn; violations are shown to the Author):
+- Start each finding with a head line "- F<number> [confidence <1-10>/10] <one-line title>". Continue numbering from the highest number in CHECKPOINT_FILE; reuse the same number when you revisit an issue.
+- Give every main finding at least one line "  - 근거: \`path:line\` — \`verbatim text\`". The path is relative to the project root. Copy the text exactly from within 3 lines of that line.
+- Move a finding you cannot cite to a "### 부록: 인용하지 못한 발견" subsection, and give it confidence 4 or lower.
+- If there are no findings, write the single line "- 없음". Put resolutions and agreements in Agreement, not in Findings.
+- Removal candidates use the same head line, with "제거:" at the start of the title.
+Example:
+## Findings
+- F3 [confidence 8/10] <title>
+  - 근거: \`rd-workflow/scripts/review_common.sh:433\` — \`if [[ \$((_rp_acc + sz)) -gt \${REVIEW_PROMPT_INLINE_MAX_BYTES} ]]; then\`
+  - <explanation and request>
+
+### 부록: 인용하지 못한 발견
+- F4 [confidence 3/10] <title>
+  - 인용하지 못한 이유: <reason>
+
 If you cannot continue safely, record the blocker in CHECKPOINT_FILE and set Current Owner to User with Status awaiting-user.
 At the end, print a short summary of what you changed.
 EOF
@@ -542,6 +564,215 @@ EOF
       printf '\n%s' "$_rp_blocks"
     fi
   } > "$output_file"
+}
+
+# 근거 경로를 프로젝트 안 일반 파일의 절대 경로로 푼다. 실패하면 1 을 반환한다.
+_rf_resolve_cite_path() {
+  local p="$1" root rootp full dirp
+  root="${PROJECT_ROOT:-.}"
+  rootp="$(cd "$root" 2>/dev/null && pwd -P)" || return 1
+  while [[ "$p" == ./* ]]; do p="${p#./}"; done
+  if [[ "$p" == /* ]]; then
+    if [[ "$p" == "${root}/"* ]]; then
+      p="${p#"${root}"/}"
+    elif [[ "$p" == "${rootp}/"* ]]; then
+      p="${p#"${rootp}"/}"
+    else
+      return 1
+    fi
+  fi
+  [[ -n "$p" ]] || return 1
+  # 앞의 ./ 만 정규화로 허용하고, 남은 .. · . · 빈 구성 요소는 정본 경로가 아니라 거부한다.
+  case "/${p}/" in */../*|*/./*|*//*) return 1 ;; esac
+  full="${root}/${p}"
+  [[ -f "$full" && ! -L "$full" ]] || return 1
+  dirp="$(cd "$(dirname "$full")" 2>/dev/null && pwd -P)" || return 1
+  [[ "$dirp" == "$rootp" || "$dirp" == "${rootp}/"* ]] || return 1
+  printf '%s\n' "${dirp}/$(basename "$full")"
+}
+
+# ## Findings 절을 읽어 레코드로 낸다 (탭 구분).
+#   H section id conf   발견 머리 줄 (conf 가 없거나 1~10 이 아니면 -)
+#   C ref quote         직전 발견의 근거 줄 (ref 를 못 읽으면 ?)
+#   N text              발견도 "- 없음" 도 아닌 최상위 항목
+#   Z                   "- 없음"
+_rf_parse_findings() {
+  awk '
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+    $0 == "## Findings" { inf = 1; sec = "main"; next }
+    inf && /^## / { exit }
+    !inf { next }
+    /^### 부록/ { sec = "appendix"; next }
+    /^- F[0-9]+([ \t]|$)/ {
+      id = $0; sub(/^- /, "", id); sub(/[ \t].*$/, "", id)
+      conf = "-"
+      if (match($0, /\[confidence [0-9]+\/10\]/)) {
+        c = substr($0, RSTART + 12, RLENGTH - 12); sub(/\/10\]$/, "", c); c += 0
+        if (c >= 1 && c <= 10) conf = c
+      }
+      printf "H\t%s\t%s\t%s\n", sec, id, conf
+      next
+    }
+    /^- 없음[ \t]*$/ { print "Z"; next }
+    /^- / { t = $0; sub(/^- /, "", t); printf "N\t%s\n", t; next }
+    /^[ \t]+[-*] 근거:/ {
+      r = $0; sub(/^[ \t]+[-*] 근거:[ \t]*/, "", r)
+      ref = "?"; q = ""
+      if (substr(r, 1, 1) == "`") {
+        e = index(substr(r, 2), "`")
+        if (e > 0) {
+          ref = substr(r, 2, e - 1)
+          q = substr(r, e + 2)
+          sub(/^[ \t]*—[ \t]*/, "", q)
+          q = trim(q)
+          if (length(q) >= 2 && substr(q, 1, 1) == "`" && substr(q, length(q), 1) == "`") q = substr(q, 2, length(q) - 2)
+          q = trim(q)
+        }
+      }
+      printf "C\t%s\t%s\n", ref, q
+    }
+  ' "$1"
+}
+
+_rf_check_impl() {
+  local turn_file="$1" session_dir="$2" turn_no="$3" review_type="${4:--}"
+  local kind a b c
+  local cur_id="" cur_sec="" cur_conf="-" cur_ncites=0
+  local findings=0 main=0 appendix=0 cite_ok=0 violations=0 confs=""
+
+  _rf_warn() { # _rf_warn <id> <code> <detail>
+    violations=$((violations + 1))
+    printf '⚠️  발견 형식 (턴 %s %s): %s — %s. 기대 형식: "  - 근거: `경로:줄` — `원문`". 다음 조치: Author 는 이 발견(%s)을 코드로 직접 확인한 뒤 수용·반박하십시오.\n' \
+      "$turn_no" "$1" "$2" "$3" "$1" >&2
+  }
+
+  _rf_flush() {
+    [[ -n "$cur_id" ]] || return 0
+    if [[ "$cur_sec" == "appendix" ]]; then
+      if [[ "$cur_conf" == "-" ]]; then
+        _rf_warn "$cur_id" "confidence-missing" "머리 줄에 [confidence N/10] (N=1~10) 이 없습니다"
+      elif [[ "$cur_conf" -gt 4 ]]; then
+        _rf_warn "$cur_id" "appendix-confidence" "부록 발견의 confidence 는 4 이하여야 합니다 (현재 ${cur_conf})"
+      fi
+    else
+      if [[ "$cur_ncites" -eq 0 ]]; then
+        if [[ "$cur_conf" == "-" ]]; then
+          _rf_warn "$cur_id" "not-a-finding" "발견 머리 줄 형식이 아닙니다. 해소 확인·합의는 Agreement 에 적습니다"
+        else
+          _rf_warn "$cur_id" "cite-missing" "본문 발견에 근거 줄이 없습니다"
+        fi
+      elif [[ "$cur_conf" == "-" ]]; then
+        _rf_warn "$cur_id" "confidence-missing" "머리 줄에 [confidence N/10] (N=1~10) 이 없습니다"
+      fi
+    fi
+    cur_id=""
+    return 0
+  }
+
+  local line
+  while IFS= read -r line; do
+    IFS=$'\t' read -r kind a b c <<< "$line"
+    case "$kind" in
+      H)
+        _rf_flush
+        cur_sec="$a"; cur_id="$b"; cur_conf="$c"; cur_ncites=0
+        findings=$((findings + 1))
+        if [[ "$a" == "appendix" ]]; then appendix=$((appendix + 1)); else main=$((main + 1)); fi
+        confs="${confs:+${confs},}${c}"
+        ;;
+      N)
+        _rf_flush
+        _rf_warn "F?" "not-a-finding" "최상위 항목이 발견 머리 줄도 \"- 없음\" 도 아닙니다 (${a})"
+        ;;
+      C)
+        [[ -n "$cur_id" ]] || continue
+        cur_ncites=$((cur_ncites + 1))
+        # 인용 원문은 탭을 품을 수 있어 필드 분할 대신 원래 줄에서 ref 뒤 전체를 잘라 쓴다.
+        local rest="${line#C$'\t'}" ref quote cpath cline full total s win
+        ref="${rest%%$'\t'*}"; quote="${rest#*$'\t'}"
+        [[ "$rest" == *$'\t'* ]] || quote=""
+        cpath="${ref%:*}"; cline="${ref##*:}"
+        if [[ "$ref" == "?" || "$ref" != *:* ]] || ! [[ "$cline" =~ ^[0-9]+$ ]] || [[ "$cline" -lt 1 ]]; then
+          _rf_warn "$cur_id" "cite-path" "근거 경로:줄 형식을 읽지 못했거나 줄 번호가 1 이상 정수가 아닙니다 (${ref})"
+          continue
+        fi
+        if ! full="$(_rf_resolve_cite_path "$cpath")"; then
+          _rf_warn "$cur_id" "cite-path" "근거 경로가 프로젝트 안 일반 파일이 아닙니다 (${ref})"
+          continue
+        fi
+        total="$(awk 'END{print NR}' "$full")"
+        if [[ "$cline" -gt "$total" ]]; then
+          _rf_warn "$cur_id" "cite-path" "줄 번호가 파일 줄 수 ${total} 를 넘습니다 (${ref})"
+          continue
+        fi
+        s=$((cline - 3)); [[ "$s" -ge 1 ]] || s=1
+        win="$(sed -n "${s},$((cline + 3))p" "$full")"
+        # 파이프 대신 문자열 포함 비교를 쓴다 — grep -q 가 먼저 끝나면 긴 줄을 쓰던 printf 가 SIGPIPE 로 죽어 pipefail 아래 거짓이 된다.
+        if [[ -n "$quote" && "$win" == *"$quote"* ]]; then
+          cite_ok=$((cite_ok + 1))
+        else
+          _rf_warn "$cur_id" "cite-mismatch" "인용 원문이 $(basename "$cpath"):${cline} 앞뒤 3줄에 없습니다"
+        fi
+        ;;
+    esac
+  done < <(_rf_parse_findings "$turn_file")
+  _rf_flush
+
+  [[ -n "$confs" ]] || confs="-"
+  printf 'finding check (턴 %s): 발견 %s (본문 %s·부록 %s) · 인용 확인 %s · 위반 %s\n' \
+    "$turn_no" "$findings" "$main" "$appendix" "$cite_ok" "$violations" >&2
+
+  local tsv="${session_dir}/finding_metrics.tsv"
+  if ! {
+    [[ -s "$tsv" ]] || printf '# turn\treview_type\tfindings\tmain\tappendix\tcite_ok\tviolations\tconfidences\n'
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$turn_no" "$review_type" "$findings" "$main" "$appendix" "$cite_ok" "$violations" "$confs"
+  } >> "$tsv" 2>/dev/null; then
+    echo "⚠️  finding metric 기록 실패: $tsv" >&2
+  fi
+  return 0
+}
+
+# Reviewer 발견의 형식·인용을 검사해 경고한다. 턴은 막지 않으며 언제나 0 을 반환한다.
+# 서브셸에서 set +e 로 돌려 sourcing 쪽의 set -e 가 grep·awk 의 비0 종료로 호출자를 끊지 못하게 한다.
+check_reviewer_findings() {
+  ( set +e; _rf_check_impl "$@" ) || true
+  return 0
+}
+
+# awaiting-user 로 끝난 세션의 CHECKPOINT Open Issues 항목이 근거 턴·해소 조건을 갖췄는지 검사한다.
+# 종결 판정(_open_issues.awk)과 독립이며, 경고만 낸다.
+_uf_check_impl() {
+  local checkpoint="$1" turn_no="$2"
+  [[ -f "$checkpoint" ]] || return 0
+  local section first
+  # 안내 주석 줄은 종결 판정(_open_issues.awk)과 같이 건너뛴다.
+  section="$(extract_section "$checkpoint" "Open Issues" | awk '!/^[ \t]*<!--/')"
+  first="$(printf '%s\n' "$section" | awk 'NF { print; exit }')"
+  if printf '%s\n' "$first" | grep -Eq '^- (없음|None)\.?[ \t]*$'; then
+    return 0
+  fi
+  local item
+  # 최상위 목록 항목마다 이어지는 들여쓴 줄까지 한 줄로 합친다.
+  printf '%s\n' "$section" | awk '
+    function flush() { if (cur != "") print cur; cur = "" }
+    /^([-*+]|[0-9]+[.)]) / { flush(); cur = $0; next }
+    /^[ \t]+[^ \t]/ { if (cur != "") cur = cur " " $0; next }
+    { flush() }
+    END { flush() }
+  ' | while IFS= read -r item; do
+    if ! printf '%s\n' "$item" | grep -Eq '턴 [0-9]{3}' \
+      || ! printf '%s\n' "$item" | grep -Fq '해소 조건:'; then
+      printf '⚠️  미해결 형식 (턴 %s): %s — 근거 턴·해소 조건이 없습니다. 다음 조치: Author 가 CHECKPOINT 를 고쳐 남은 쟁점을 형식대로 적으십시오.\n' \
+        "$turn_no" "${item:0:40}" >&2
+    fi
+  done
+  return 0
+}
+
+# 언제나 0 을 반환한다. 서브셸에서 set +e 로 돌려 호출자의 set -e 를 보호한다.
+check_unresolved_format() {
+  ( set +e; _uf_check_impl "$@" ) || true
+  return 0
 }
 
 # 턴 실행 후 출력 검증
@@ -579,6 +810,16 @@ validate_turn_output() {
   if [[ "$next_turn_index" -eq "$turn_limit" && "$updated_status" == "awaiting-author" ]]; then
     echo "turn limit reached but ${tool_name} handed the session back to Author" >&2
     return 1
+  fi
+
+  local _vt_type _vt_turn
+  _vt_type="$(extract_section "$session_file" "Review Type" | trim_blank_lines)"
+  [[ -n "$_vt_type" ]] || _vt_type="-"
+  _vt_turn="$(basename "$expected_turn_file")"
+  _vt_turn="${_vt_turn:0:3}"
+  check_reviewer_findings "$expected_turn_file" "$(dirname "$session_file")" "$_vt_turn" "$_vt_type" || true
+  if [[ "$updated_status" == "awaiting-user" ]]; then
+    check_unresolved_format "$(dirname "$session_file")/CHECKPOINT.md" "$_vt_turn" || true
   fi
 
   echo "$updated_status"
@@ -686,6 +927,48 @@ append_tool_history() {
   printf '| %s | %s | %s |\n' "$turn_number" "$tool_name" "$mode" >> "$session_file"
 }
 
+# 리뷰어 실행 기록(reviewer_runs.tsv)에 한 줄 추가 — rd review seal 이 대조하는 근거입니다.
+# 사용: append_reviewer_run <session_dir> <turn> <tool> <mode> <head> <turn_file>
+# rc 0 = 기록 완료, rc 1 = 쓰기 실패 (set -e 로 호출자를 끊지 않도록 항상 rc 로만 알립니다).
+# 열: turn tool mode head turn-blob open-issues epoch (머리줄은 처음 쓸 때 생성)
+append_reviewer_run() {
+  local session_dir="$1" turn="$2" tool="$3" mode="$4" head="${5:-}" turn_file="$6"
+  local runs_file="${session_dir}/reviewer_runs.tsv"
+  local common_dir awk_file verdict open_issues blob epoch
+
+  [[ -n "$head" ]] || head="-"
+  common_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 1
+  awk_file="${common_dir}/hooks/_open_issues.awk"
+
+  blob="$(git hash-object "$turn_file" 2>/dev/null)" || return 1
+  [[ -n "$blob" ]] || return 1
+
+  open_issues="unknown"
+  if [[ -f "$awk_file" && -f "${session_dir}/CHECKPOINT.md" ]]; then
+    verdict="$(awk -f "$awk_file" "${session_dir}/CHECKPOINT.md" 2>/dev/null)" || verdict=""
+    if [[ "$verdict" == "ok" ]]; then
+      open_issues="ok"
+    else
+      open_issues="unresolved"
+    fi
+  fi
+
+  # 시각 원천 실패는 기록 실패가 아닙니다(턴 계측과 같은 fail-open) — epoch 만 0 으로 둡니다.
+  epoch="$(date +%s 2>/dev/null)" || epoch=""
+  [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=0
+
+  {
+    if [[ ! -s "$runs_file" ]]; then
+      printf '# turn\ttool\tmode\thead\tturn-blob\topen-issues\tepoch\n'
+    elif [[ -n "$(tail -c 1 "$runs_file")" ]]; then
+      # 앞선 쓰기가 줄 중간에서 끊겼으면 새 줄이 그 조각에 붙지 않게 줄바꿈을 먼저 씁니다.
+      printf '\n'
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$turn" "$tool" "$mode" "$head" "$blob" "$open_issues" "$epoch"
+  } 2>/dev/null >> "$runs_file" || return 1
+  return 0
+}
+
 # self-review 정책 해석 (순수 함수): policy 우선, 미설정/미인식이면 self_review_warning 하위호환.
 # 사용: resolve_self_review_policy "<policy_raw>" "<warning_raw>" → block|warn|off
 resolve_self_review_policy() {
@@ -748,13 +1031,37 @@ record_self_review_block() {
 EOF
 }
 
+# 성공한 턴 뒤 세션 폴더 안의 .git(디렉터리·파일)을 찾아 경고한다. 파일은 건드리지 않고 항상 rc 0.
+# 사용: report_nested_git "<session_dir 절대경로>" "<표시용 session_dir>"
+report_nested_git() {
+  local sdir="${1:-}" disp="${2:-}" hit parent rel found=""
+  [[ -n "$sdir" && -d "$sdir" ]] || return 0
+  while IFS= read -r hit; do
+    [[ -n "$hit" ]] || continue
+    parent="${hit%/.git}"
+    if [[ "$parent" == "$sdir" ]]; then
+      rel="$disp"
+    else
+      rel="${disp}/${parent#"${sdir}"/}"
+    fi
+    found="${found}    - ${rel}"$'\n'
+  done < <(find "$sdir" -mindepth 1 -name .git -prune -print 2>/dev/null || true)
+  [[ -n "$found" ]] || return 0
+  {
+    echo '경고: 리뷰 세션 폴더 안에 git 저장소가 있습니다. 이대로 커밋하면 `git add` 가 실패하거나 내용 없이 gitlink 로 기록됩니다.'
+    printf '%s' "$found"
+    echo '조치: 커밋 전에 그 폴더를 세션 폴더 밖(예: `mktemp -d`)으로 옮기거나, 그 안의 `.git` 만 지우십시오. 하네스는 파일을 옮기거나 지우지 않았습니다.'  # mktemp-scan: literal
+  } >&2
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # 어댑터 실패 진단 (run_review_turn.sh 일반 실패 분기에서 호출). 두 함수 모두 항상 rc 0.
 # ---------------------------------------------------------------------------
 
 # 로그 끝 블록(codex) 또는 result 오류 줄(claude)에서 원인 키를 판정한다.
 # 사용: classify_adapter_failure_cause "<log_path>" "<tool>"
-# 출력: "<confirmed|candidates|unknown> <키,키…>"  키 ∈ effort|capacity|ratelimit|auth|model
+# 출력: "<confirmed|candidates|unknown> <키,키…>"  키 ∈ effort|capacity|ratelimit|auth|model|spendcap|usagelimit
 classify_adapter_failure_cause() {
   local log_path="${1:-}" tool="${2:-}"
   local tail_text="" target="" line k keys="" count=0
@@ -783,7 +1090,7 @@ classify_adapter_failure_cause() {
     printf 'unknown \n'
     return 0
   fi
-  local f_effort=0 f_capacity=0 f_rate=0 f_auth=0 f_model=0
+  local f_effort=0 f_capacity=0 f_rate=0 f_auth=0 f_model=0 f_spend=0 f_usage=0
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     if printf '%s\n' "$line" | grep -qiE 'reasoning_effort' \
@@ -793,12 +1100,16 @@ classify_adapter_failure_cause() {
     printf '%s\n' "$line" | grep -qiE 'unauthorized|authentication|not logged in|invalid api key|401' && f_auth=1
     if printf '%s\n' "$line" | grep -qiE 'model not found|model_not_found' \
        || { printf '%s\n' "$line" | grep -qi 'model' && printf '%s\n' "$line" | grep -qi 'does not exist'; }; then f_model=1; fi
+    printf '%s\n' "$line" | grep -qiE 'spend cap|out of credits|credit balance (is )?too low|out of extra usage' && f_spend=1
+    printf '%s\n' "$line" | grep -qiE 'hit your usage limit|hit your limit|usage limit reached' && f_usage=1
   done <<< "$target"
   [[ $f_effort -eq 1 ]] && { keys="${keys:+$keys,}effort"; count=$((count+1)); }
   [[ $f_capacity -eq 1 ]] && { keys="${keys:+$keys,}capacity"; count=$((count+1)); }
   [[ $f_rate -eq 1 ]] && { keys="${keys:+$keys,}ratelimit"; count=$((count+1)); }
   [[ $f_auth -eq 1 ]] && { keys="${keys:+$keys,}auth"; count=$((count+1)); }
   [[ $f_model -eq 1 ]] && { keys="${keys:+$keys,}model"; count=$((count+1)); }
+  [[ $f_spend -eq 1 ]] && { keys="${keys:+$keys,}spendcap"; count=$((count+1)); }
+  [[ $f_usage -eq 1 ]] && { keys="${keys:+$keys,}usagelimit"; count=$((count+1)); }
   k=unknown
   [[ $count -eq 1 ]] && k=confirmed
   [[ $count -ge 2 ]] && k=candidates

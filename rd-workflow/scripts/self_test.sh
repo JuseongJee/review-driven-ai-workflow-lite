@@ -10,6 +10,10 @@
 #   consumer        — 소비 프로젝트에서 뜻이 있는 스텝만 (dev-only 정본 위생 검사 제외)
 #   RD_SELFTEST_DRYRUN=1 — 실행하지 않고 실행 예정 스텝만 출력
 #
+# 환경 제약 건너뜀 표식: 테스트가 환경 제약(예: 샌드박스에서 ps 불가)으로 사례를 실행하지 않으면
+#   stderr 에 `env-skip: <사례> — <사유>` 한 줄을 낸다. 줄 머리는 정확히 `env-skip: ` 이며 들여쓰기·접두를 붙이지 않는다.
+#   건너뜀은 FAIL 이 아니다. run_step 이 PASS·FAIL 줄과 최종 요약에 건수·항목을 집계한다.
+#
 # 2026-09-03: 변경 파일과 스텝의 참조 관계를 추적해 자동 감축하던 smoke 엔진과, 아카이브
 # 시점에 검증 통과 증명을 대조·강제하던 게이트를 걷어냈다. 엔진은 판정이 틀려 매번 전수로
 # 떨어졌고, 엔진 자신을 검사하는 테스트가 4분을 더 먹었다. 어느 스텝을 돌릴지는 사람이 그룹으로
@@ -32,8 +36,14 @@ fi
 # run_step 의 stderr 감시 디렉터리 — 첫 실제 실행 스텝에서 한 번만 만들고 종료 때 지웁니다.
 # `set -u` 하에서 trap 이 참조하므로 등록 전에 정의합니다.
 _SELFTEST_WDIR=""
+# 진행 중 스텝의 stderr 수집 프로세스(tee) PID. 스텝 도중 self_test 가 끝나면 종료 때 회수합니다.
+_SELFTEST_RPID=""
 _selftest_on_exit() {
   [[ "${_SELFTEST_OWN_GBL:-}" == 1 ]] && rm -f "$RD_GUARD_BLOCK_LOG"
+  if [[ -n "${_SELFTEST_RPID:-}" ]]; then
+    kill "$_SELFTEST_RPID" 2>/dev/null || true
+    wait "$_SELFTEST_RPID" 2>/dev/null || true
+  fi
   [[ -n "${_SELFTEST_WDIR:-}" ]] && rm -rf "$_SELFTEST_WDIR"
   return 0
 }
@@ -63,6 +73,8 @@ FAIL=0
 STEP_INDEX=0
 STEP_NAMES=()
 STEP_DURATIONS=()
+# 환경 제약으로 건너뛴 사례(`[스텝 설명] 사례 — 사유`). 최종 판정 직전에 출력한다.
+ENV_SKIPPED=()
 AUDIENCE_EXCLUDED=()
 GROUP_EXCLUDED=()
 
@@ -123,37 +135,101 @@ run_step() {
     STEP_DURATIONS+=(0)
     return 0
   fi
-  local _t0=$SECONDS elapsed rc _errf _donef _w _hit
+  local _t0=$SECONDS elapsed rc _errf _w _hit _fifo _openf _rpid _trc _nskip _line _skipnote
   echo ""
   echo "== ${desc} =="
   # 미정의 헬퍼를 호출한 테스트 스크립트는 FAIL 변수 누적으로 판정해 rc 0 으로 끝날 수 있다.
   # 그때도 bash 는 stderr 에 `...: command not found` 를 남기므로, stderr 를 원래 채널로 흘리면서
   # 사본을 받아 종료 후 그 줄을 찾는다. 대상은 전역 변수를 바꾸는 함수일 수 있어 파이프 좌변(서브셸)
-  # 이 아니라 현재 셸에서 실행한다. bash 3.2 는 프로세스 치환 종료를 wait 할 수 없으므로, tee 가
-  # 끝난 뒤에만 생기는 표식(_donef, 처음에는 없음)을 기다린다. rc 는 기존 if 문맥 그대로 받는다.
-  # 감시 디렉터리는 실행당 1회 만들고(스텝마다 mktemp·rm 하지 않음), 스텝 파일은 STEP_INDEX 로 구분한다.
-  # 늦게 끝난 tee 는 자기 스텝 파일에만 쓰므로 다음 스텝과 섞이지 않는다.
+  # 이 아니라 현재 셸에서 실행한다. 사본 수집은 이름 있는 파이프(FIFO)와 tee 로 한다 — 출력 쪽
+  # 프로세스 치환 `2> >(…)` 은 리뷰어 샌드박스가 막는다(입력 쪽 치환은 동작). 수집기 PID 는 곧
+  # tee 의 PID 이고(exec), 스텝 끝에 kill -0 으로 종료를 확인한 뒤 wait 로 회수한다. rc 는 기존
+  # if 문맥 그대로 받는다. 감시 디렉터리는 실행당 1회 만들고(스텝마다 mktemp·rm 하지 않음),
+  # 스텝 파일은 STEP_INDEX 로 구분한다.
   if [[ -z "$_SELFTEST_WDIR" ]]; then
     _SELFTEST_WDIR="$(mktemp -d)" || { _SELFTEST_WDIR=""; echo "  -> FAIL: 스텝 stderr 감시용 임시 디렉터리를 만들 수 없습니다: ${desc}" >&2; FAIL=1; return; }
   fi
   _errf="${_SELFTEST_WDIR}/${STEP_INDEX}.stderr"
-  _donef="${_SELFTEST_WDIR}/${STEP_INDEX}.done"
+  _fifo="${_SELFTEST_WDIR}/${STEP_INDEX}.fifo"
+  _openf="${_SELFTEST_WDIR}/${STEP_INDEX}.open"
   : > "$_errf"
-  if "$@" 2> >(tee -a "$_errf" >&2; : > "$_donef"); then rc=0; else rc=$?; fi
+  # 1. 준비 — 부모가 읽기·쓰기 겸용(fd 9)으로 먼저 열어 두면 열기가 막히지 않는다.
+  if ! { mkfifo "$_fifo" && exec 9<>"$_fifo"; } 2>/dev/null; then
+    echo "  -> FAIL: 스텝 stderr 감시용 파이프를 준비할 수 없습니다: ${desc}" >&2
+    exec 9>&-
+    rm -f "$_fifo"
+    FAIL=1
+    STEP_NAMES+=("$desc")
+    STEP_DURATIONS+=($((SECONDS - _t0)))
+    return 0
+  fi
+  # 2. 수집기 — 파이프를 연 뒤 표식을 남기고 tee 로 자신을 바꾼다.
+  { exec 9>&- 0<"$_fifo"; : > "$_openf"; exec tee -a "$_errf" >&2; } &
+  _rpid=$!
+  _SELFTEST_RPID=$_rpid
+  # 3. 연결 확인 — 최대 2초.
   _w=0
-  while [[ ! -e "$_donef" && $_w -lt 100 ]]; do
+  while [[ ! -e "$_openf" && $_w -lt 40 ]] && kill -0 "$_rpid" 2>/dev/null; do
     sleep 0.05
     _w=$((_w + 1))
   done
-  [[ -e "$_donef" ]] || echo "  경고: stderr 사본 기록 완료를 5초 안에 확인하지 못했습니다(미정의 명령 검사가 불완전할 수 있음): ${desc}" >&2
+  if [[ ! -e "$_openf" ]]; then
+    exec 9>&-
+    kill "$_rpid" 2>/dev/null || true
+    wait "$_rpid" 2>/dev/null || true
+    _SELFTEST_RPID=""
+    rm -f "$_fifo" "$_openf"
+    echo "  -> FAIL: 스텝 stderr 수집 프로세스가 시작·연결되지 않았습니다(스텝 미실행): ${desc}" >&2
+    FAIL=1
+    STEP_NAMES+=("$desc")
+    STEP_DURATIONS+=($((SECONDS - _t0)))
+    return 0
+  fi
+  # 4. 쓰기 끝(fd 8)을 부모가 열고 겸용 끝(fd 9)을 닫는다 — 읽는 쪽은 tee 하나만 남는다.
+  exec 8>"$_fifo"
+  exec 9>&-
+  # 5. 실행 — 스텝 동안만 PIPE 처리기를 건다(tee 가 죽은 뒤 함수 스텝의 쓰기가 self_test 를 끝내지 않게).
+  trap ':' PIPE
+  if "$@" 2>&8 8>&-; then rc=0; else rc=$?; fi
+  trap - PIPE
+  exec 8>&-
+  # 6. 완료 확인 — 최대 5초.
+  _w=0
+  while kill -0 "$_rpid" 2>/dev/null && [[ $_w -lt 100 ]]; do
+    sleep 0.05
+    _w=$((_w + 1))
+  done
+  _trc=0
+  if kill -0 "$_rpid" 2>/dev/null; then
+    kill "$_rpid" 2>/dev/null || true
+    wait "$_rpid" 2>/dev/null || true
+    echo "  경고: stderr 사본 기록 완료를 5초 안에 확인하지 못했습니다 — 미정의 명령 검사와 환경 제약 건너뜀 집계가 불완전할 수 있습니다: ${desc}" >&2
+  else
+    wait "$_rpid" 2>/dev/null || _trc=$?
+  fi
+  _SELFTEST_RPID=""
+  rm -f "$_fifo" "$_openf"
+  if [[ "$_trc" -ne 0 ]]; then
+    echo "  -> 스텝 stderr 수집 프로세스가 비정상 종료했습니다(rc=${_trc}) — 사본이 불완전합니다" >&2
+    rc=1
+  fi
   _hit="$(grep -m1 ': command not found$' "$_errf" || true)"
+  # 환경 제약 건너뜀 표식: 줄 머리 정확히 `env-skip: ` 인 줄만 센다.
+  _nskip=0
+  while IFS= read -r _line; do
+    [[ -n "$_line" ]] || continue
+    _nskip=$((_nskip + 1))
+    ENV_SKIPPED+=("[${desc}] ${_line#env-skip: }")
+  done < <(grep '^env-skip: ' "$_errf" || true)
   : > "$_errf"
   elapsed=$((SECONDS - _t0))
+  _skipnote=""
+  [[ "$_nskip" -eq 0 ]] || _skipnote=", 환경 제약으로 건너뜀 ${_nskip}건"
   [[ -z "$_hit" ]] || echo "  -> 미정의 명령 호출 검출: ${_hit}" >&2
   if [[ "$rc" -eq 0 && -z "$_hit" ]]; then
-    echo "  -> PASS: ${desc} (${elapsed}s)"
+    echo "  -> PASS: ${desc} (${elapsed}s${_skipnote})"
   else
-    echo "  -> FAIL: ${desc} (${elapsed}s)" >&2
+    echo "  -> FAIL: ${desc} (${elapsed}s${_skipnote})" >&2
     FAIL=1
   fi
   STEP_NAMES+=("$desc")
@@ -170,6 +246,16 @@ print_step_summary() {
     printf '%s\t%s\n' "${STEP_DURATIONS[i]}" "${STEP_NAMES[i]}"
   done | sort -t$'\t' -k1 -rn | while IFS=$'\t' read -r dur name; do
     printf '  %ss  %s\n' "$dur" "$name"
+  done
+}
+
+print_env_skip_summary() {
+  local item
+  [[ ${#ENV_SKIPPED[@]} -gt 0 ]] || return 0
+  echo ""
+  echo "== 환경 제약으로 건너뛴 사례 (${#ENV_SKIPPED[@]}건) — FAIL 이 아니며, 제약이 없는 환경에서 다시 확인해야 합니다 =="
+  for item in "${ENV_SKIPPED[@]}"; do
+    printf '  - %s\n' "$item"
   done
 }
 
@@ -222,13 +308,13 @@ _mktemp_scan_marker() {
 # 넘기지 않습니다(디렉터리 모드가 awk 의 기본 동작이라 그대로 두어야 변경이 없습니다).
 #
 # **명령 치환으로 호출하지 않습니다.** 명령 치환은 서브셸이라 전역 변경이 부모에 남지
-# 않습니다 (실측: `s="$(raw)"` 뒤 부모 값이 그대로였음 — Turn 004 Finding 1).
+# 않습니다 (실측: `s="$(raw)"` 뒤 부모 값이 그대로였음).
 # 호출부는 이 함수를 직접 부르고 `_SCAN_SITES`·`_SCAN_VIOLATIONS`·`_SCAN_DETAIL` 을 읽습니다.
 _mktemp_scan_raw() {
   local mode="$1"; shift
   local out summary
   _SCAN_SITES=""; _SCAN_VIOLATIONS=""; _SCAN_DETAIL=""; _SCAN_OUT=""
-  # 인자가 없으면 awk 가 stdin 을 읽으므로 실행 전에 막습니다 (Turn 004 Finding 2-D).
+  # 인자가 없으면 awk 가 stdin 을 읽으므로 실행 전에 막습니다.
   (( $# > 0 )) || return 1
   # 빈 배열 `"${arr[@]}"` 는 bash 3.2(macOS 기본)의 `set -u` 하에서 "unbound variable"을
   # 냅니다 — 배열로 옵션을 만들지 않고 분기로 피합니다.
@@ -238,7 +324,7 @@ _mktemp_scan_raw() {
     out="$(awk -v "mode=$mode" -f "$SCAN_AWK" "$@" 2>&1)" || return 1
   fi
   # SUMMARY 는 정확히 한 줄이고 필드가 3개이며 두 값이 십진 숫자여야 합니다.
-  # (Turn 004 Finding 2-C: 이전 case 검사는 `1`·`1 `·`1 2 3` 을 모두 통과시켰습니다.)
+  # (이전 case 검사는 `1`·`1 `·`1 2 3` 을 모두 통과시켰습니다.)
   summary="$(printf '%s\n' "$out" | awk -F'\t' '
     $1=="SUMMARY" { c++; if (NF==3 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/) { s=$2; v=$3; ok=1 } else ok=0 }
     END { if (c==1 && ok==1) print s"\t"v }')"
@@ -312,6 +398,7 @@ _mktemp_scan_guide() {
     printf '%s\n' '            ② 2줄 템플릿 (_mktemp_scan.awk 머리 주석)' >&2
     printf '%s\n' "            ③ 템플릿으로 표현할 수 없으면 줄 끝에 '# mktemp-scan: custom-handler'" >&2
   fi
+  printf '%s\n' "  실행되지 않는 문구는 줄 끝에 '# mktemp-scan: literal' 을 붙이고, heredoc 안 문구는 마커를 붙인 변수 줄로 분리합니다(_mktemp_scan.awk 머리 주석)." >&2   # mktemp-scan: literal
 }
 
 # 공통 판정. $1=step $2=mode(dir|file) $3=기대 후보 수(숫자 = 정확 일치, `nonzero` = 0 만 아니면 통과)
@@ -462,7 +549,7 @@ _mktemp_scan_snippet() {
     local sites=0 violations=0
     if (( ${#present[@]} > 0 )); then
       # 존재 파일 스캔이 실패하면 scanner-error 가 missing-file 보다 우선입니다
-      # (Turn 004 Finding 2-B: 이전 안은 오류를 버리고 missing-file 을 냈습니다).
+      # (이전 안은 오류를 버리고 missing-file 을 냈습니다).
       if ! _mktemp_scan_raw dir "${present[@]}"; then
         _mktemp_scan_marker "$step" fail scanner-error "${#present[@]}" 0 0 0 0
         printf '  없는 파일: %s\n' "${absent[*]}" >&2
@@ -500,7 +587,7 @@ mktemp_scan_sample_check() {
   [[ -f "$fx" ]] || { echo "  표본 파일이 없습니다: $fx" >&2; return 1; }
 
   # (a) SUMMARY 계약 + 총계. 단일성·3필드·숫자 검증은 `_mktemp_scan_raw` 가 단일 권위로
-  #     수행하므로 여기서 다시 세지 않습니다 (Turn 006 Finding 3). 대신 SUMMARY 가
+  #     수행하므로 여기서 다시 세지 않습니다. 대신 SUMMARY 가
   #     **마지막 줄**이라는 계약을 함께 확인합니다.
   if ! _mktemp_scan_raw dir "$fx"; then
     echo "  표본 스캔이 SUMMARY 계약(단일 · 3필드 · 숫자)에 맞지 않습니다" >&2; return 1
@@ -679,7 +766,7 @@ autopilot_skill_lifecycle_check() {
 
     # 승격 명령 계약은 별도 스크립트가 판정한다 — 인라인이면 테스트가 그 로직을
     # 재사용할 수 없어 "검사가 실제로 오용을 잡는가" 를 자동으로 확인할 수 없다
-    # (final diff review 4라운드 Finding 3). fixture 회귀는 test_task_cli.sh 에 있다.
+    # fixture 회귀는 test_task_cli.sh 에 있다.
     if ! bash "${SCRIPT_DIR}/check_autopilot_promote_contract.sh" "$skill"; then
       echo "  $skill: 승격 명령 계약 위반 (위 사유 참조)" >&2
       rc=1
@@ -768,10 +855,10 @@ _skill_flag_scan() {  # $1=SKILL.md → "<frontmatter 안 키 개수>\t<값들�
   ' "$1"
 }
 
-_skill_manual_guard_tree() {  # $1=트리 경로 — 단계 전환 6개가 각각 정확히 1개, 그리고 6곳이 문자 단위로 동일한지
+_skill_manual_guard_tree() {  # $1=트리 경로 — 단계 전환 skill(full 6개·lite 3개)이 각각 정확히 1개, 그리고 모두 문자 단위로 동일한지
   local tree="$1" name f rc=0 c uniq
-  local -a guarded=(request-to-reviewed-plan planning-design-intake implement-reviewed-plan \
-                    final-diff-review small-task-implement gap-check)
+  local -a guarded=(request-to-reviewed-plan final-diff-review small-task-implement)
+  # lite 빌드에 없는 skill 은 full 에서만 요구한다 (rules.conf [lite-exclude]).
   local -a files=()
   for name in "${guarded[@]}"; do
     f="$tree/$name/SKILL.md"
@@ -786,7 +873,7 @@ _skill_manual_guard_tree() {  # $1=트리 경로 — 단계 전환 6개가 각�
   done
   uniq=$(grep -h '^`manual` 모드에서는' "${files[@]}" | LC_ALL=C sort -u | wc -l | tr -d ' ')
   if [[ "$uniq" != "1" ]]; then
-    echo "  manual 자기 점검 문장이 ${uniq}종 — 6곳이 문자 단위로 동일해야 한다" >&2
+    echo "  manual 자기 점검 문장이 ${uniq}종 — ${#guarded[@]}곳이 문자 단위로 동일해야 한다" >&2
     rc=1
   fi
   return $rc
@@ -795,10 +882,10 @@ _skill_manual_guard_tree() {  # $1=트리 경로 — 단계 전환 6개가 각�
 _skill_authority_tree() {  # $1=트리 경로
   local tree="$1" rc=0 name f scan cnt val
   # 호출 가능으로 고정할 11개 — 제거 8 + 판정표의 "변경 없음" 3 (플래그가 다시 붙는 회귀도 잡는다)
-  local -a must_absent=(request-to-reviewed-plan planning-design-intake implement-reviewed-plan \
-                        final-diff-review small-task-implement gap-check fr review-config \
-                        autopilot model-strategy workflow-router)
-  local -a keep_always=(comprehensive-audit)
+  # lite 빌드에 없는 skill(rules.conf [lite-exclude])은 full 에서만 요구한다 — lite 는 6개, 유지 대상 없음.
+  local -a must_absent=(request-to-reviewed-plan final-diff-review small-task-implement fr \
+                        autopilot workflow-router)
+  local -a keep_always=()
   local -a keep_if_present=(tpl ship publish)
   [[ -d "$tree" ]] || { echo "  $tree: 필수 디렉터리 부재" >&2; return 1; }
   for name in "${must_absent[@]}"; do
@@ -811,7 +898,7 @@ _skill_authority_tree() {  # $1=트리 경로
     fi
     _skill_frontmatter_ok "$f" || { echo "  $f: frontmatter 무결성 위반" >&2; rc=1; }
   done
-  for name in "${keep_always[@]}"; do
+  for name in ${keep_always[@]+"${keep_always[@]}"}; do
     f="$tree/$name/SKILL.md"
     [[ -f "$f" ]] || { echo "  $f: 유지 대상 필수 파일 부재" >&2; rc=1; continue; }
     scan=$(_skill_flag_scan "$f"); cnt=${scan%%$'\t'*}; val=${scan#*$'\t'}
@@ -847,19 +934,6 @@ skill_invocation_canon_check() {
   local canon="${SCRIPT_DIR}/../../_ROOT_FILES/rd-workflow/claude_skills"
   [[ -d "$canon" ]] || { echo "  정본 트리 없음 — 설치본이므로 건너뜁니다"; return 0; }
   _skill_authority_tree "$canon"
-}
-
-plan_parallel_phase_check() {
-  local root guide skill
-  root="$(cd "$SCRIPT_DIR/../.." && pwd)"
-  guide="$root/rd-workflow/docs/guides/plan-parallel-phases.md"
-  skill="$root/rd-workflow/claude_skills/autopilot/SKILL.md"
-  [[ -f "$guide" ]] || { echo "  누락: plan-parallel-phases.md"; return 1; }
-  grep -q "phase 비중첩" "$guide" || { echo "  가이드에 phase 비중첩 게이트 누락"; return 1; }
-  grep -q "mechanical" "$guide" || { echo "  가이드에 mechanical 규약 누락"; return 1; }
-  grep -q "phase 병렬 실행" "$skill" || { echo "  autopilot SKILL에 phase 병렬 실행 규칙 누락"; return 1; }
-  grep -q "mechanical" "$skill" || { echo "  autopilot SKILL에 mechanical 리뷰 생략 누락"; return 1; }
-  echo "  OK: phase 병렬 규약 문서 정합"
 }
 
 
@@ -1326,15 +1400,22 @@ skill_reference_existence_check() {
     echo "  $md_dir: 대상 markdown 0건" >&2
     return 1
   fi
-  while IFS= read -r md; do
-    [[ -z "$md" ]] && continue
-    found=$((found + 1))
-    bash "${SCRIPT_DIR}/check_skill_reference_existence.sh" "$md" --root "$root"
-    skref_rc=$?
-    [[ "$skref_rc" -ne 0 ]] && { echo "  $md: 검사 실행 오류 (rc=${skref_rc})" >&2; rc=1; }
-  done <<< "$(printf '%s\n' "$find_out" | sort)"
-  [[ "$found" -gt 0 ]] || { echo "  $md_dir: 대상 markdown 0건" >&2; rc=1; }
-  return $rc
+  # 파일마다 bash 를 새로 띄우지 않는다. 스크립트를 한 서브셸에 한 번 source 하고(직접 실행이 아니면
+  # main 을 부르지 않는다) 파일마다 그 안에서 서브셸로 _skref_main 을 부른다. _skref_main 은 exit 로
+  # 끝나므로 서브셸이 종료 코드를 그대로 돌려준다. source 실패(스크립트 부재 등)도 실패로 잡는다.
+  (
+    # shellcheck source=/dev/null
+    source "${SCRIPT_DIR}/check_skill_reference_existence.sh" || { echo "  check_skill_reference_existence.sh: source 실패" >&2; exit 1; }
+    while IFS= read -r md; do
+      [[ -z "$md" ]] && continue
+      found=$((found + 1))
+      ( _skref_main "$md" --root "$root" )
+      skref_rc=$?
+      [[ "$skref_rc" -ne 0 ]] && { echo "  $md: 검사 실행 오류 (rc=${skref_rc})" >&2; rc=1; }
+    done <<< "$(printf '%s\n' "$find_out" | sort)"
+    [[ "$found" -gt 0 ]] || { echo "  $md_dir: 대상 markdown 0건" >&2; rc=1; }
+    exit $rc
+  )
 }
 
 # 활성 FR 상세 파일(rd-workflow-workspace/backlog/items/*.md)의 related files 가
@@ -1357,28 +1438,37 @@ fr_related_files_existence_check() {
     echo "  $items_dir: find 실패 (rc=${find_rc}): ${find_out}" >&2
     return 1
   fi
-  # 파일마다 검사기를 띄우지 않는다. 활성 여부는 builtin 으로 걸러 활성 파일만 검사기 1회에 넘긴다.
-  # 활성 판정은 fr_relations.sh parse_items 와 같다: 첫 `- status:` 줄의 값에서 공백·CR 을 지우고
-  # 값 전체를 비교한다. done|dropped|parked|obsolete 는 비활성, 누락·알 수 없는 값·읽기 실패는 활성이다
-  # (읽기 실패는 검사기가 실행 오류로 보고한다). 주석이 붙은 `done (→ …)` 값은 활성으로 남는다.
-  # `2>/dev/null` 은 `< "$it"` 앞에 둔다 — bash 3.2 에서 파일을 못 열 때의 오류 메시지를 숨기려면 이 순서여야 한다.
+  # 파일마다 검사기를 띄우지 않는다. 활성 여부는 공용 판정(_fr_status.sh)으로 한 번에 걸러 활성 파일만 검사기 1회에 넘긴다.
+  # 판정은 `_fr_status.sh`. 분류 inactive 만 건너뛰고, 비표준·읽기 실패(코드 2)는 검사 대상이다
+  # (읽기 실패는 검사기가 실행 오류로 보고한다).
+  local -a files=()
   while IFS= read -r it; do
     [[ -z "$it" ]] && continue
-    found=$((found + 1))
-    st=""
-    # `|| [[ -n "$line" ]]` — 개행 없는 마지막 줄(`- status: done` 으로 끝나는 파일)도 판독한다.
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      if [[ "$line" == '- status:'* ]]; then
-        st="${line#*:}"
-        st="${st//[$' \t\r']/}"
-        break
-      fi
-    done 2>/dev/null < "$it"
-    case "$st" in
-      done|dropped|parked|obsolete) ;;
-      *) active+=("$it") ;;
-    esac
+    files+=("$it")
   done <<< "$(printf '%s\n' "$find_out" | sort)"
+  found=${#files[@]}
+  (( found > 0 )) || return 0
+  if ! source "${SCRIPT_DIR}/_fr_status.sh"; then
+    echo "  ${SCRIPT_DIR}/_fr_status.sh: 공용 판정 파일을 읽지 못했습니다" >&2
+    return 1
+  fi
+  local scan_out cls n=0 total=""
+  scan_out="$(fr_status_scan "${files[@]}")" || { echo "  판독 실행 오류: fr_status_scan 실패" >&2; return 1; }
+  while IFS= read -r line; do
+    if [[ "$line" == '#N'* ]]; then
+      total="${line#*$'\034'}"
+      continue
+    fi
+    cls="${line##*$'\034'}"
+    if [[ "$cls" != inactive ]]; then
+      active+=("${files[$n]}")
+    fi
+    n=$((n + 1))
+  done <<< "$scan_out"
+  if [[ "$total" != "$found" || "$n" -ne "$found" ]]; then
+    echo "  판독 실행 오류: 파일 ${found}개에 레코드 ${n}개, #N=${total}" >&2
+    return 1
+  fi
   (( ${#active[@]} > 0 )) || return 0
   bash "${SCRIPT_DIR}/check_fr_related_files_existence.sh" "${active[@]}" --root "$root"
   rc2=$?
@@ -1540,9 +1630,11 @@ fi
 
 run_step hooks consumer "implementation_gate hook (test_implementation_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_implementation_gate.sh"
 run_step review consumer "리뷰 프롬프트 인라인 계약 (test_review_prompt_inline.sh)" bash "${SCRIPT_DIR}/test_review_prompt_inline.sh"
+run_step review consumer "리뷰 발견 형식 검사 (test_review_findings_check.sh)" bash "${SCRIPT_DIR}/test_review_findings_check.sh"
 run_step review consumer "reasoning effort override (test_review_effort_override.sh)" bash "${SCRIPT_DIR}/test_review_effort_override.sh"
 run_step review consumer "리뷰 턴 계측 계약 (test_review_metrics.sh)" bash "${SCRIPT_DIR}/test_review_metrics.sh"
 run_step review consumer "리뷰 턴 신호·보존 안내 (test_review_turn_signal.sh)" bash "${SCRIPT_DIR}/test_review_turn_signal.sh"
+run_step review consumer "Author 턴 뒤 상태 자동 전환 (test_review_turn_handoff.sh)" bash "${SCRIPT_DIR}/test_review_turn_handoff.sh"
 run_step review consumer "어댑터 프롬프트 parity (test_review_adapter_parity.sh)" bash "${SCRIPT_DIR}/test_review_adapter_parity.sh"
 run_step review consumer "diff review base 판정·seal 계약 (test_review_base_resolution.sh)" bash "${SCRIPT_DIR}/test_review_base_resolution.sh"
 run_step review consumer "submodule 리뷰 입력·내용 해시 (test_submodule_review.sh)" bash "${SCRIPT_DIR}/test_submodule_review.sh"
@@ -1552,6 +1644,8 @@ run_step hooks consumer "archive gate 테스트 (test_pre_commit_archive_gate.sh
 run_step hooks consumer "background dispatch 차단 hook (test_headless_background_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_headless_background_gate.sh"
 run_step hooks consumer "압축 뒤 안내 (test_session_start_compact.sh)" bash "${SCRIPT_DIR}/hooks/test_session_start_compact.sh"
 run_step hooks consumer "가드 차단 계측 (test_guard_block_log.sh)" bash "${SCRIPT_DIR}/hooks/test_guard_block_log.sh"
+run_step hooks consumer "hook 무성 실패 감시 (test_hook_sentinel.sh)" bash "${SCRIPT_DIR}/hooks/test_hook_sentinel.sh"
+run_step hooks consumer "자기 worktree 삭제 차단 (test_self_worktree_delete_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_self_worktree_delete_gate.sh"
 run_step lifecycle consumer "LC-19 3자 일치 검증 (TASK/STATE/task-tracking.md)" canonical_status_triple_drift_check
 run_step lifecycle consumer "task CLI 단위 테스트" bash "${SCRIPT_DIR}/test_task_cli.sh"
 run_step lifecycle consumer "stage_metrics 계측 테스트 (test_stage_metrics.sh)" bash "${SCRIPT_DIR}/test_stage_metrics.sh"
@@ -1559,6 +1653,7 @@ run_step skills consumer "install_claude_skills 단위 테스트" bash "${SCRIPT
 run_step skills consumer "skill 참조 경로 실재 (skill_reference_existence_check)" skill_reference_existence_check
 run_step skills consumer "FR related files 실재 (fr_related_files_existence_check)" fr_related_files_existence_check
 run_step skills consumer "FR 인덱스/상세 정합성 (fr_index_detail_consistency_check)" fr_index_detail_consistency_check
+run_step skills consumer "FR 인덱스/상세 정합성 검사기 단위 테스트 (test_fr_index_detail_consistency.sh)" bash "${SCRIPT_DIR}/test_fr_index_detail_consistency.sh"
 run_step skills consumer "FR 관계 무결성 (fr_relations_validate_check)" fr_relations_validate_check
 run_step skills consumer "FR 관계 헬퍼 테스트 (test_fr_relations.sh)" bash "${SCRIPT_DIR}/test_fr_relations.sh"
 run_step skills consumer "FR related files 변경 이력 테스트 (test_fr_related_history.sh)" bash "${SCRIPT_DIR}/test_fr_related_history.sh"
@@ -1584,17 +1679,18 @@ run_step review consumer "review 대기 계약 테스트 (test_review_wait.sh)" 
 run_step review consumer "watchdog 계약·이식성 probe (test_watchdog_portability.sh)" bash "${SCRIPT_DIR}/test_watchdog_portability.sh"
 run_step skills consumer "ralph_drain supervisor 테스트 (test_ralph_drain.sh)" bash "${SCRIPT_DIR}/test_ralph_drain.sh"
 run_step skills consumer "batch_manifest 헬퍼 테스트 (batch/test_batch_manifest.sh)" bash "${SCRIPT_DIR}/batch/test_batch_manifest.sh"
+run_step skills consumer "무인 실행 결과 해석 헬퍼 테스트 (batch/test_headless_result.sh)" bash "${SCRIPT_DIR}/batch/test_headless_result.sh"
 run_step skills consumer "blocked status 어휘 일관성 (test_fr_blocked_status.sh)" bash "${SCRIPT_DIR}/test_fr_blocked_status.sh"
 run_step skills consumer "autopilot blocked 계약 회귀 (test_autopilot_blocked_contract.sh)" bash "${SCRIPT_DIR}/test_autopilot_blocked_contract.sh"
 run_step skills consumer "sync_template 타입 가드 테스트 (test_sync_template.sh)" bash "${SCRIPT_DIR}/test_sync_template.sh"
+run_step skills consumer "verify 설정 점검 (test_verify_check.sh)" bash -c 'if [[ -f "$1" ]]; then bash "$1"; else echo "  (skip: extensions/verify 없음 — 설치본)"; fi' _ "${SCRIPT_DIR}/../extensions/verify/test_verify_check.sh"
 # 결함 보고 로컬 조작부. 다른 배포 테스트와 같은 관례로 **배포 사본**을 실행한다 —
 # 테스트가 형제 `defect_reports.sh` 를 대상으로 잡으므로 이 한 줄이 곧 설치본 구현 검증이다.
 # 정본/배포본 drift 는 dev repo 전용 `build_verify_check`(build_template.sh verify)가 이미
 # 트리 전체에 대해 잡는다 — 여기서 `_ROOT_FILES` 를 다시 참조하면 설치본에서 항상 실패한다
-# (final diff review Turn 004 Finding 1).
 #
 # 격리 `TMPDIR` 에서 돌려 **임시 디렉터리 증분 0** 까지 함께 판정한다. 이 스위트는 케이스가
-# 많아(48개 workspace) 누수가 쌓이면 self-test 를 돌릴수록 디스크를 먹는다 (Turn 010 Finding 2).
+# 많아(workspace 를 수십 개 만들어) 누수가 쌓이면 self-test 를 돌릴수록 디스크를 먹는다.
 defect_reports_test_check() {
   local t="${SCRIPT_DIR}/test_defect_reports.sh" tmproot rc=0 left
   tmproot="$(mktemp -d)" || { echo "defect_reports_test_check: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
@@ -1627,12 +1723,11 @@ run_step skills dev-only "skill 호출 권한 판정표 (정본)" skill_invocati
 run_step skills consumer "무인 wrapper 매핑 테스트 (test_autopilot_headless.sh)" bash "${SCRIPT_DIR}/test_autopilot_headless.sh"
 run_step skills consumer "재개 후보 helper 테스트 (test_resume_candidates.sh)" bash "${SCRIPT_DIR}/batch/test_resume_candidates.sh"
 run_step skills consumer "무인 wrapper 경과 시간 상한 테스트 (test_autopilot_headless_timecap.sh)" bash "${SCRIPT_DIR}/test_autopilot_headless_timecap.sh"
-run_step skills dev-only "phase 병렬 규약 문서 정합 (plan_parallel_phase_check)" plan_parallel_phase_check
 # dev-only 인 이유: 점검 대상에 `scripts/` 가 있고 배포본에는 그 디렉터리가 없다.
 # 루트는 `_hook_repo_root` 로 구한다 — `SELFTEST_ROOT` 는 정본 레이아웃에서
 # `_ROOT_FILES` 를 가리켜 점검 대상 판정이 어긋난다.
-run_step lifecycle dev-only "promote 활성 호출처가 시작 상태 인자를 갖는지 (AC 7)" \
-  bash "${SCRIPT_DIR}/check_promote_call_args.sh" "$(_hook_repo_root)"
+promote_call_args_check() { bash "${SCRIPT_DIR}/check_promote_call_args.sh" "$(_hook_repo_root)"; }
+run_step lifecycle dev-only "promote 활성 호출처가 시작 상태 인자를 갖는지 (AC 7)" promote_call_args_check
 
 # 템플릿 dev repo 한정: build 규칙 정합성·루트 drift 검증 (설치본에는 빌더 없음 → skip)
 # self_test.sh 위치는 <root>/rd-workflow/scripts/ 이므로 dev 빌더는 두 단계 위 scripts/
@@ -1734,6 +1829,7 @@ echo "== 스텝별 소요 시간 (느린 순) =="
 if ! print_step_summary; then
   echo "  (요약 출력 실패 — 최종 판정과 무관하게 계속 진행합니다)" >&2
 fi
+print_env_skip_summary
 
 echo ""
 if [[ "$FAIL" -eq 0 ]]; then

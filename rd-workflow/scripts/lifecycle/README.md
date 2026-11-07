@@ -106,7 +106,11 @@ bash rd-workflow/scripts/lifecycle/archive.sh \
 
 **락 대기:** 점유자가 `tasks-list-prune`(`rd task list` 의 지연 정리)이면 `RD_ARCHIVE_LOCK_WAIT_MAX` 초(기본 60, `0` 이면 대기 안 함) 안에서 기다립니다. 다른 점유자는 즉시 중단합니다.
 
-**호출 위치:** 기본 브랜치 worktree only.
+**submodule gitlink 검사:** 병합 전과 병합 뒤에 `archive_gitlink_merge_check` 가 병합 커밋이 submodule 커밋을 빠뜨렸는지 봅니다. 병합이 한쪽 gitlink 만 골랐고 그 뒤 커밋도 빠진 커밋을 담지 않으면 `exit 1` 로 멈춥니다(`--dry-run` 은 검사하지 않습니다). 판정에 필요한 객체가 없으면 submodule 경로마다 한 번 `git fetch` 하며, 그래도 없으면 판정 불가로 멈춥니다. submodule 저장소가 squash·rebase 로 병합하면 내용이 이미 들어 있어도 막힙니다. 확인한 뒤 `--allow-gitlink-drop <사유>` 로 이 검사만 건너뛸 수 있고, 사유는 audit 로그에 `[gitlink:rc<1|2>]` 로 남습니다. 발행 큐(`rd publish run`)는 이 옵션을 넘기지 않으므로 `archive.sh` 를 직접 부릅니다.
+
+**점유 검사:** Step 7 이 작업 worktree 를 지우기 전에 `tasks_path_occupied` 로 그 안에 작업 디렉터리를 둔 내 계정 프로세스(세션)가 있는지 봅니다. 점유이거나 판정 불가이면 지우지 않고 정리 잔여 `worktree` 로 기록하며(로컬 브랜치도 남음), 세션이 끝난 뒤 기본 체크아웃의 `rd task list` 가 지연 정리합니다. 복구 명령은 `cd <기본 체크아웃> && bash rd-workflow/scripts/rd task list` 입니다.
+
+**호출 위치:** 작업 worktree 에서 부르면 기본 체크아웃에서 다시 실행합니다(호출자 worktree·로컬 브랜치는 정리 대기). 기본 체크아웃에서 `--task <slug>` 로 불러도 됩니다.
 호출 전에 archive content commit
 (REQUEST.md 비우기, archive 파일, FR done 등) 완료해야 함 — fr 모드는 fr branch 에서, no-fr 모드는 기본 브랜치에서 커밋한다.
 CURRENT_TASK.md 미러는 archive.sh 가 baseline 으로 되돌리므로 호출 전 준비 대상이 아님.
@@ -211,6 +215,21 @@ worktree **제거 실패**나 **등록 잔존**(locked·prune 만료 등)은 이
 
 정리 미완 항목이 있으면 종료 직전 stdout 에 `archive: CLEANUP-PENDING` 마커로 시작하는 블록을 출력한다. 항목마다 `사유:` 와 `복구:` 두 줄이 따르며, **`복구:` 는 그대로 복사해 실행할 수 있는 셸 한 줄**이다. 복구 명령의 기본값은 상태 확인 같은 **비파괴 명령**이며, `git worktree remove --force` 나 `git branch -D` 처럼 데이터를 잃을 수 있는 명령은 기본값으로 제시하지 않고 필요 조건과 손실 범위를 `사유:` 에 적는다. 내부 레코드는 `<kind>\t<identifier>\t<reason>\t<command>` 4필드이고, `identifier` 는 `printf '%q'` 로 인코딩해 저장한다 (경로에 따옴표·TAB·개행이 있어도 레코드와 복사 실행이 깨지지 않게 하기 위함).
 
+#### 정리 잔여 기록
+
+`archive.sh` 는 종료 직전 정리 잔여를 파일로도 남긴다. stdout 블록은 그 실행에서만 보이므로, 무인 소비처(autopilot 보고서·`ralph_drain.sh` 요약·`/fr batch` 최종 요약)가 읽을 수 있게 하기 위해서다. 읽고 쓰는 명령은 `cleanup_pending.sh` 가 맡는다.
+
+- **위치**: `<git-common-dir>/rd-workflow/archive-cleanup-pending/<slug>`. git 추적 밖이므로 `.gitignore` 도 마이그레이션도 필요 없고, worktree 가 지워져도 남는다.
+- **항목 단위**: 파일은 잔여 항목 줄만 담는다. 한 줄이 위 요약 블록의 내부 레코드 하나(4필드, TAB 구분, identifier 는 `%q` 인코딩 그대로)이고, 잔여 항목 1건이 1줄이다.
+- **소유권**: `archive.sh` 실행은 자기 slug 파일만 쓰거나 지운다. 잔여가 있으면 `write`, 없으면 `clear` 를 부른다. 다른 slug 의 파일과 시간 경과는 보지 않는다.
+- **원자성**: 같은 디렉터리의 임시 파일(`.<slug>.tmp.<pid>`)에 쓴 뒤 `mv` 로 교체한다. 실행은 직렬이어야 한다. `archive.sh` 가 기본 브랜치 락 안에서 돌기 때문에 성립하는 전제이고, 이 파일을 쓰는 다른 경로를 락 밖에 두지 않는다.
+- **해제 경로**
+  - ① 지연 정리: 기본 체크아웃의 `rd task list` 가 정리를 끝내고 색인 행을 지우면 `resolve <slug> worktree local-branch` 로 그 kind 항목을 뺀다. 남은 항목이 없으면 파일째 지운다. 해제에 실패하면 stderr 에 경고만 내고 stdout·종료 코드는 바꾸지 않는다.
+  - ② 다음 `archive.sh` 실행: 같은 slug 의 잔여가 없으면 `clear` 가 파일을 지운다.
+  - 수동 해제: 직접 정리를 마친 뒤 `bash rd-workflow/scripts/lifecycle/cleanup_pending.sh clear <slug>`.
+- **조회**: `bash rd-workflow/scripts/lifecycle/cleanup_pending.sh show <slug>` 는 사람이 읽는 형식으로, `summary` 는 `<slug><TAB><항목 수>` 줄로 낸다. 기록이 없으면 `show` 는 `없음` 을 낸다. 조회 자체가 실패하면 rc 2 와 stderr `cleanup_pending: 조회 실패 — <사유>` 를 내며 `없음` 을 내지 않는다.
+- **기록 실패 종료 계약**: `write`·`clear` 가 실패하면 stderr 에 `archive: CLEANUP-RECORD-FAILED <write|clear> <사유>` 줄을 낸다. stdout 요약 블록과 `archive: core 완료` / `archive: 완료. tag=` 줄은 그대로 낸다. 안전 불변식 위반이 있으면 그 처리(exit 1)가 먼저이고, 위반이 없으면 기록 실패로 exit 1 한다. 발행(merge·tag·push)은 이미 끝났으므로 되돌리지 않는다. 호출자는 위 세 조건(표식 줄 + 완료 줄 + 위반 없음)을 「발행 완료 + 기록 실패」 로 읽는다.
+
 #### 보존 계약의 범위
 
 "보존" 은 **아직 삭제하지 않았거나 이동이 감지된 ref** 에만 적용된다. 순차 삭제 도중 앞선 ref 가 검증을 통과해 삭제된 뒤 뒤쪽에서 위반이 감지되면 **이미 삭제된 ref 는 복구하지 않는다**. 검증 통과는 그 ref 의 모든 커밋이 merge 대상 base 에 포함됨을 뜻하므로 커밋 손실이 없기 때문이다. 보상 복구(compensating restore)는 구현하지 않는다. 종료 메시지도 이 범위를 그대로 표현한다 — "모든 ref 를 보존했다" 가 아니라 "아직 삭제하지 않은 ref 를 보존했다" 이다.
@@ -239,6 +258,7 @@ bash merge_fr_index.sh <base> <ours> <theirs>   # stdout = 병합 결과, exit 0
 - 컬럼 분해는 GFM 과 같게 **이스케이프되지 않은 `|` 로만** 나눈다 — 셀 본문의 `\|` 는 코드 스팬 안이든 밖이든 구분자가 아니고, `\\|` 는 「본문 역슬래시 + 구분자」다. 이스케이프되지 않은 생 `|` 는 GFM 에서도 셀이 쪼개지는 깨진 행이므로 계속 거부하며, 이때 실패 메시지가 파일 역할·행 번호·실제/기대 컬럼 수와 **구분자로 센 `|` 를 `>|<` 로 표시한 행**을 함께 알린다(어느 `|` 가 본문 의도였는지는 도구가 알 수 없으므로 지목을 추측하지 않는다).
 - 서문·헤더: ours==theirs → 그대로 / 한쪽==base → 다른 쪽 / 둘 다 다르면 exit 1.
 - 행: 키별 (b,o,t) — o==t → o / o==b → t (theirs 의 추가·수정·삭제) / t==b → o / 그 외 exit 1. 부재는 "삭제" 값.
+- 칸: 기존 행이 위 규칙으로 충돌하면 칸마다 같은 규칙을 다시 적용한다 — 한쪽은 우선순위만, 다른 쪽은 상태만 바꾼 행이 합쳐진다. 행 삭제 대 수정, 세 판 헤더 줄 불일치(열 이름·순서가 바뀌면 같은 위치의 칸이 다른 의미일 수 있음)는 칸 단위로 풀지 않고 `행 충돌(양쪽 상이 수정): <제목>` 으로 exit 1. 같은 칸을 양쪽이 다르게 바꾸면 `행 충돌(같은 칸을 양쪽이 다르게 수정): <제목> — 칸: <칸 이름>[, …]`(헤더 순서) 으로 exit 1.
 - 순서: base 순서 유지 → ours 에만 새로 추가된 행(ours 순서) → theirs 에만 새로 추가된 행(theirs 순서).
 - `archive.sh` Step 3: `git merge --no-ff …` 실패 시 `git diff --name-only --diff-filter=U` 가 정확히 인덱스 경로 하나이면 `git show :1:/:2:/:3:` 로 세 판을 뽑아 병합 → 성공 시 파일에 쓰고 `git add` → `git commit --no-edit -m "merge: <slug> (archive)"` (기존 hook bypass 규약 `lifecycle_needs_hook_bypass` 와 동일 처리) → `archive: FUTURE_REQUESTS.md 충돌을 행 집합 병합으로 해결` 알림. 병합 실패(충돌·malformed) 또는 다른 경로 충돌 → 종전 메시지·exit 1 (충돌 상태 유지). 자동 해결 뒤 커밋 실패 → `git status` 확인 → `git commit --no-edit` 재시도 또는 `git merge --abort` 를 안내(재실행만 안내하면 이미 resolve 된 상태에서 다시 실패한다).
 

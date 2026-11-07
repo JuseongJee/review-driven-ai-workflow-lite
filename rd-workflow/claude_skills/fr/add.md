@@ -25,6 +25,8 @@
    충돌 시 `-2`, `-3` suffix.
    캡처 실패 시 경고만 — FR 등록 차단 안 함 — CLI 가 fail-open (exit 0) 으로 처리.
 
+3.5. **인덱스 머리행 사전 검사** — 4단계(상세 파일)·5단계(Short Title 기록)·6단계(인덱스)를 하기 전에, 아래 6-b 명령을 `FR_MODE=check` 로 한 번 실행합니다. 이 실행은 아무것도 쓰지 않습니다. rc 가 0 이 아니면 stderr 문장을 그대로 사용자에게 보이고 등록을 멈춥니다(4·5·6단계를 하지 않습니다). 상세 파일과 Short Title 이 바뀌지 않았으므로, 머리행을 고친 뒤 같은 short-title 로 다시 등록할 수 있습니다.
+
 4. 상세 파일 생성: `rd-workflow-workspace/backlog/items/YYYY-MM-DD-{short-title}.md`
 
 ```md
@@ -60,8 +62,22 @@
 
    **6-a. 헤더 이관 (행을 붙이기 전)** — `## 인덱스` 아래 첫 `|` 행에 `관계` 칸이 없으면 `관계` 이전 형식을 쓰던 기존 설치입니다. 이때는 헤더·구분선·기존 행을 먼저 한 번에 이관하고 그 뒤에 새 행을 붙입니다. 아래 명령을 그대로 실행합니다 — 헤더에 `관계` 가 이미 있으면 아무것도 바꾸지 않으므로 매번 실행해도 안전합니다:
 
+   <!-- fr-index-migrate:begin -->
    ```bash
-   INDEX=rd-workflow-workspace/backlog/FUTURE_REQUESTS.md
+   INDEX=${INDEX:-rd-workflow-workspace/backlog/FUTURE_REQUESTS.md}
+   rc=0; LOCK=""; OUT=""
+   tries=0
+   until mkdir "$INDEX.lock" 2>/dev/null; do
+     tries=$((tries + 1))
+     if [ "$tries" -ge 50 ]; then
+       echo "인덱스 이관 실패: 다른 등록이 인덱스를 쓰고 있습니다($INDEX.lock). 다음 조치: 잠시 뒤 다시 실행하십시오. 진행 중인 등록이 없는데 계속 실패하면 그 폴더를 지운 뒤 다시 실행하십시오. 아무것도 쓰지 않았습니다." >&2
+       rc=4; break
+     fi
+     sleep 0.2
+   done
+   [ "$rc" -eq 0 ] && LOCK="$INDEX.lock"
+   [ "$rc" -eq 0 ] && { OUT="$(mktemp "$INDEX.XXXXXX")" || { echo "인덱스 이관 실패: 임시 파일을 만들지 못했습니다. 다음 조치: 인덱스 폴더의 쓰기 권한을 확인한 뒤 다시 실행하십시오. 아무것도 쓰지 않았습니다." >&2; rc=1; }; }
+   if [ "$rc" -eq 0 ]; then
    awk '
    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
    function ins(line, val,   head, tail) {
@@ -90,24 +106,102 @@
      }
    }
    { print }
-   ' "$INDEX" > "$INDEX.tmp" && mv "$INDEX.tmp" "$INDEX"
+   ' "$INDEX" > "$OUT"; rc=$?
+   if [ "$rc" -eq 0 ] && ! cmp -s "$OUT" "$INDEX"; then mv "$OUT" "$INDEX" || { rc=$?; rm -f "$OUT"; }; else rm -f "$OUT"; fi
+   fi
+   [ -n "$LOCK" ] && rmdir "$LOCK"
+   (exit "$rc")
    ```
+   <!-- fr-index-migrate:end -->
 
-   `sed -i` 는 쓰지 않습니다 — BSD sed 는 `-i` 뒤에 백업 확장자를 요구해 기본 macOS 에서 실패하고, 대상이 심링크면 실제 파일로 바꿔 놓습니다.
+   `sed -i` 는 쓰지 않습니다 — BSD sed 는 `-i` 뒤에 백업 확장자를 요구해 기본 macOS 에서 실패하고, 대상이 심링크면 실제 파일로 바꿔 놓습니다. 잠금·고유 임시 파일을 쓰는 이유는 6-b 설명과 같습니다.
 
    이 명령은 헤더에서 `우선순위` 칸의 위치를 읽어 **그 바로 뒤**에 `관계` 칸을 넣고 기존 행의 `관계` 를 전부 `-` 로 채웁니다. 마지막 칸이 `상세` 인 기본 형식과 `상세 | GitHub` 변형 모두에서 같은 명령을 씁니다 — 삽입 지점을 줄 끝에서부터 세므로 요약 칸에 `\|` 가 섞여 있어도 밀리지 않습니다. `우선순위` 칸이 없는 인덱스면 rc=3 으로 멈추므로, 그때는 이관을 멈추고 사용자에게 알립니다. 실제 관계가 있는 기존 항목의 값은 이후 등록·편집에서 채웁니다. 같은 설치의 `FUTURE_REQUESTS.md` 머리말에 컬럼 순서가 적혀 있으면 그 문장도 함께 고칩니다.
 
-   **6-b. 행 조립** — 이관을 마친 뒤 새 행을 추가합니다:
+   **6-b. 행 추가** — 이관을 마친 뒤 아래 명령으로 새 행을 추가합니다. 명령은 `## 인덱스` 아래 첫 표의 **머리행을 읽고 칸 이름마다 값을 넣어** 표 끝에 행을 씁니다. 칸 순서를 직접 맞추지 않습니다. 명령을 실행하기 전에 `FR_DATE` `FR_TITLE` `FR_SUMMARY` `FR_KIND` `FR_STATUS` `FR_PRIORITY` `FR_RELATION` `FR_GITHUB` 환경 변수를 지정합니다. 값이 비면 `-` 가 들어갑니다.
 
-   ```
-   | {날짜} | {short-title} | {요약} | {kind} | idea | - | {관계} | [상세](items/YYYY-MM-DD-{short-title}.md) |
-   ```
+   | 칸 이름 | 값 |
+   |---|---|
+   | 날짜 | `FR_DATE` |
+   | 제목 | `FR_TITLE` (short-title) |
+   | 요약 | `FR_SUMMARY` (6-c 앞머리 포함) |
+   | 종류 | `FR_KIND` (2단계에서 추론한 `kind`) |
+   | 상태 | `FR_STATUS` (`/fr add` 는 `idea`) |
+   | 우선순위 | `FR_PRIORITY` (`/fr add` 는 `-`) |
+   | 관계 | `FR_RELATION` |
+   | GitHub | `FR_GITHUB` |
+   | 상세 | `[상세](items/{FR_DATE}-{FR_TITLE}.md)` (명령이 만듭니다) |
 
-   컬럼 순서: 날짜 | 제목 | 요약 | **종류** | 상태 | 우선순위 | **관계** | 상세. `상세 | GitHub` 변형이면 `… | 우선순위 | 관계 | 상세 | GitHub |` 로, `관계` 는 여기서도 `우선순위` 다음입니다. `종류` 값은 Step 2 에서 추론한 `kind` 를 그대로 사용합니다. **셀 본문의 `|` 는 코드 스팬 안이라도 반드시 `\|` 로 이스케이프합니다** — 이스케이프하지 않으면 GFM 이 그 자리에서 칸을 쪼개 표가 깨지고, `archive.sh` 의 인덱스 충돌 자동 병합(`merge_fr_index.sh`)이 그 행을 거부해 발행이 중단됩니다. 셸 코드를 인용할 때 특히 주의합니다. GitHub 연동이 활성이면 아래 `GitHub 연동` 섹션의 절차로 GitHub 정보를 추가합니다 (인덱스에 GitHub 컬럼이 별도로 있는 변형 형식을 쓰는 경우에만 해당).
+   <!-- fr-index-row:begin -->
+   ```bash
+   INDEX=${INDEX:-rd-workflow-workspace/backlog/FUTURE_REQUESTS.md}
+   rc=0; OUT=/dev/null; LOCK=""
+   if [ "${FR_MODE:-}" != check ]; then
+     tries=0
+     until mkdir "$INDEX.lock" 2>/dev/null; do
+       tries=$((tries + 1))
+       if [ "$tries" -ge 50 ]; then
+         echo "인덱스 행 추가 실패: 다른 등록이 인덱스를 쓰고 있습니다($INDEX.lock). 다음 조치: 잠시 뒤 다시 실행하십시오. 진행 중인 등록이 없는데 계속 실패하면 그 폴더를 지운 뒤 다시 실행하십시오. 아무것도 쓰지 않았습니다." >&2
+         rc=4; break
+       fi
+       sleep 0.2
+     done
+     [ "$rc" -eq 0 ] && LOCK="$INDEX.lock"
+     [ "$rc" -eq 0 ] && { OUT="$(mktemp "$INDEX.XXXXXX")" || { echo "인덱스 행 추가 실패: 임시 파일을 만들지 못했습니다. 다음 조치: 인덱스 폴더의 쓰기 권한을 확인한 뒤 다시 실행하십시오. 아무것도 쓰지 않았습니다." >&2; rc=1; }; }
+   fi
+   if [ "$rc" -eq 0 ]; then
+   awk '
+   function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+   function esc(s) { gsub(/\\\|/, "\001", s); gsub(/\|/, "\\|", s); gsub(/\001/, "\\|", s); return s }
+   function fail(why, fix) {
+     print "인덱스 머리행 검사 실패: " why ". 다음 조치: " fix ". 아무것도 쓰지 않았습니다." > "/dev/stderr"
+     bad = 1; exit 3
+   }
+   function validate(   i, nm, has) {
+     if (n < 2 || dv !~ /^\|[ \t]*:?-/) fail("## 인덱스 아래에서 머리행과 구분선을 찾지 못했습니다", "표 머리행과 구분선을 만든 뒤 다시 실행하십시오")
+     for (i = 2; i < hc; i++) {
+       nm = trim(h[i])
+       if (!(nm in VAL)) fail("알 수 없는 칸이 있습니다: " nm, "그 칸을 지우거나 날짜·제목·요약·종류·상태·우선순위·관계·GitHub·상세 중 하나로 바꾼 뒤 다시 실행하십시오")
+       has[nm] = 1
+     }
+     if (!("상세" in has)) fail("상세 칸이 없습니다", "상세 칸을 추가한 뒤 다시 실행하십시오")
+     if (!("관계" in has) && !("우선순위" in has)) fail("우선순위 칸이 없습니다", "우선순위 칸을 추가한 뒤 다시 실행하십시오")
+   }
+   function build(   i, v, out) {
+     out = "|"
+     for (i = 2; i < hc; i++) { v = VAL[trim(h[i])]; out = out " " (v == "" ? "-" : esc(v)) " |" }
+     return out
+   }
+   BEGIN {
+     VAL["날짜"] = ENVIRON["FR_DATE"]; VAL["제목"] = ENVIRON["FR_TITLE"]; VAL["요약"] = ENVIRON["FR_SUMMARY"]
+     VAL["종류"] = ENVIRON["FR_KIND"]; VAL["상태"] = ENVIRON["FR_STATUS"]; VAL["우선순위"] = ENVIRON["FR_PRIORITY"]
+     VAL["관계"] = ENVIRON["FR_RELATION"]; VAL["GitHub"] = ENVIRON["FR_GITHUB"]
+     VAL["상세"] = "[상세](items/" ENVIRON["FR_DATE"] "-" ENVIRON["FR_TITLE"] ".md)"
+   }
+   /^## 인덱스/ { sec = 1; print; next }
+   /^## / && sec == 1 && n == 0 { sec = 3 }
+   sec == 1 && /^\|/ { n++; if (n == 1) hc = split($0, h, /\|/); if (n == 2) dv = $0; print; next }
+   sec == 1 && n > 0 { validate(); print build(); done = 1; sec = 2 }
+   { print }
+   END {
+     if (bad) exit 3
+     if (!done) { validate(); print build() }
+   }
+   ' "$INDEX" > "$OUT"; rc=$?
+   if [ "$OUT" != /dev/null ]; then
+     if [ "$rc" -eq 0 ]; then mv "$OUT" "$INDEX" || { rc=$?; rm -f "$OUT"; }; else rm -f "$OUT"; fi
+   fi
+   fi
+   [ -n "$LOCK" ] && rmdir "$LOCK"
+   (exit "$rc")
+   ```
+   <!-- fr-index-row:end -->
+
+   명령은 쓰기 전에 머리행을 검사하고, 검사에 실패하면 rc=3 과 한 줄 안내를 stderr 로 내며 파일을 바꾸지 않습니다. 검사 항목은 네 가지입니다: 머리행과 구분선이 있음 / 모든 칸 이름이 위 표의 9개 중 하나임 / `상세` 칸이 있음 / `관계` 칸이 없으면 `우선순위` 칸이 있음(6-a 이관 조건). rc≠0 이면 안내 문장을 그대로 사용자에게 보이고 멈춥니다. 머리행에 없는 칸의 값은 넣지 않습니다(`종류` 칸이 없는 옛 설치에서는 `FR_KIND` 를 쓰지 않습니다). 값의 `|` 는 명령이 `\|` 로 이스케이프하고 이미 `\|` 인 것은 그대로 둡니다 — 이스케이프하지 않으면 GFM 이 그 자리에서 칸을 쪼개 표가 깨지고, `archive.sh` 의 인덱스 충돌 자동 병합(`merge_fr_index.sh`)이 그 행을 거부해 발행이 중단됩니다. 그래서 값은 `awk -v` 가 아니라 `ENVIRON` 으로 받습니다(`-v` 는 `\` 를 해석해 `\|` 를 망가뜨립니다). `sed -i` 는 쓰지 않습니다. 쓰기 모드는 `"$INDEX.lock"` 폴더를 `mkdir` 로 잡아 이 명령의 동시 실행을 한 번에 하나로 줄이고, 실행마다 고유한 임시 파일(`mktemp "$INDEX.XXXXXX"`)에 쓴 뒤 `mv` 로 교체하고 잠금을 풉니다. 같은 임시 파일을 여러 실행이 함께 쓰거나 읽기와 교체 사이에 다른 실행이 끼면 기존 행이나 다른 등록의 행을 잃기 때문입니다. 잠금을 10초 안에 잡지 못하면 rc=4 와 안내를 내고 아무것도 쓰지 않습니다. 강제 종료로 잠금 폴더가 남았으면 안내대로 그 폴더를 지운 뒤 다시 실행합니다. 이 잠금은 이 명령끼리만 직렬화합니다. GitHub 연동이 활성이면 아래 `GitHub 연동` 섹션의 절차로 GitHub 정보를 추가합니다 (인덱스에 GitHub 컬럼이 별도로 있는 변형 형식을 쓰는 경우에만 해당).
 
    `관계` 값 형식은 `series:<name>#N/M; dep:<stem>,<stem>` 이고 관계가 없으면 `-` 입니다. 상세 파일의 `depends-on`·`series` 와 정확히 일치해야 합니다.
 
-   **6-c. 요약 앞머리 생성** — `관계` 가 `-` 가 아니면 **인덱스 행의 요약 칸 맨 앞**에 `**[<표시명> N/M · 선행: <short-title>]**` 앞머리를 붙입니다. 상세 파일의 `- summary:` 는 그대로 두고 인덱스 행에만 붙입니다. 조각은 다음과 같이 만듭니다:
+   **6-c. 요약 앞머리 생성** — 6-b 보다 먼저 만들어 `FR_SUMMARY` 에 넣습니다. `관계` 가 `-` 가 아니면 **인덱스 행의 요약 칸 맨 앞**에 `**[<표시명> N/M · 선행: <short-title>]**` 앞머리를 붙입니다. 상세 파일의 `- summary:` 는 그대로 두고 인덱스 행에만 붙입니다. 조각은 다음과 같이 만듭니다:
 
    - `<표시명> N/M`: 상세의 `- series:` 에서 옮깁니다. `<표시명>` 은 그 시리즈를 사람이 알아보는 한국어 이름이고, 같은 시리즈의 다른 인덱스 행이 이미 쓰는 표시명이 있으면 그것을 그대로 재사용합니다. 없으면 `series:` 의 `<name>` 을 씁니다. `N/M` 은 `series:` 의 번호를 그대로 옮깁니다. 시리즈가 없으면 이 조각을 통째로 뺍니다.
    - `선행: <short-title>`: 상세의 `- depends-on:` 각 stem 에서 앞 11자(`YYYY-MM-DD-`)를 뗀 short-title 을 `·` 로 잇습니다. `depends-on` 이 `-` 면 이 조각을 통째로 뺍니다.
@@ -125,6 +219,7 @@
    - `committed`: 둘째 줄(`FR 등록 커밋: <기본 브랜치> <해시>`) 을 완료 메시지에 그대로 포함합니다. **AI 는 별도 등록 커밋을 만들지 않고 push 하지 않습니다** — 이 커밋이 등록 커밋이며, 그 작업의 `archive.sh` push 에 실립니다. fr 브랜치 세션이면 현재 워킹트리의 등록 파일은 그대로 두어(다음 iteration commit 에 동일 내용으로 실림) 즉시 보이게 합니다.
    - `already`: 이미 기본 브랜치에 있습니다 — 완료 메시지에 그 줄을 포함합니다.
    - `skipped` (exit 3): **등록은 성공**입니다(파일은 현재 워킹트리에 있음). 둘째 줄의 사유와 복구 명령을 경고로 그대로 보이고 계속합니다. 커밋 게이트·훅을 우회해 대신 커밋하지 않습니다.
+     `index-header-mismatch` 는 재실행만으로 풀리지 않습니다. 안내대로 기본 브랜치에서 6-a 이관을 먼저 커밋합니다.
    helper 는 인덱스 행 1개·상세 1개·캡처 1개(선택) 외 어떤 변경도 커밋할 수 없습니다. 규약 상세는 `rd-workflow/scripts/lifecycle/README.md` 의 `fr-register` 절.
 
 7. 완료 메시지 출력:

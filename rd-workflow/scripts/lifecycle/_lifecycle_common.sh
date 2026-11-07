@@ -468,7 +468,7 @@ _archive_cat_blob() {
 # 참이지만(emit_current_task_baseline 이 완전 재작성) **task-state 에는 거짓**이다 —
 # metadata_clear 는 3개 키만, Step 4 는 2개 키만 바꾸고 state_write_fields 는 나열하지
 # 않은 행을 보존한다. Step 4 자체도 metadata_exists 조건부다.
-# 그래서 여기서 최종 내용을 직접 본다 (REQUEST review Turn 004 Finding 1).
+# 그래서 여기서 최종 내용을 직접 본다.
 archive_publish_content_check() {
   local root="$1" baseline="$2" publish="$3"
   local rel blocked=0 want got td rc=0 b_oid p_oid n_paths=0
@@ -899,7 +899,7 @@ metadata_exists() {
   [[ -n "$v" && "$v" != "null" ]]
 }
 
-# CURRENT_TASK.md baseline form (Reviewer Turn 008 Issue 2 — runtime accessible inline heredoc)
+# CURRENT_TASK.md baseline form (runtime accessible inline heredoc)
 emit_current_task_baseline() {
   cat <<'EOF'
 # Current Task
@@ -1029,7 +1029,7 @@ loop_guard_threshold() {
 
 # loop_guard_check [slug] → 임계 초과 시 사유 stdout + return 1, 아니면 return 0
 # slug 미지정 시 metadata short-title 사용. slug 없으면 판정 대상 없음 → return 0.
-# 현재 slug 키만 판정한다 (FR scoping — Reviewer turn 002 Finding 1).
+# 현재 slug 키만 판정한다 (FR scoping).
 loop_guard_check() {
   loop_guard_enabled || return 0
   [[ -f "$LOOP_STATE_PATH" ]] || return 0

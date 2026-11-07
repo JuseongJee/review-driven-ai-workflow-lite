@@ -34,7 +34,19 @@
 
 ### 1. 버전 확인 및 템플릿 소스 확보
 
-먼저 버전 가드 스크립트를 실행합니다.
+먼저 프로젝트의 이전 VERSION 을 읽어 기록합니다. 9단계 완료 보고가 이 값으로 새로 받은 변경 이력을 고릅니다. 이후 단계(구조 마이그레이션·5단계 복사·6단계 버전 갱신)가 VERSION 을 바꾸므로 버전 가드보다 먼저 읽습니다.
+
+```bash
+pv="$(git rev-parse --git-path rd-tpl-prev-version)"
+{ cat rd-workflow/VERSION 2>/dev/null || cat ai/VERSION 2>/dev/null || true; } > "$pv"
+v="$(cat "$pv")"; echo "이전 VERSION: ${v:-없음}"
+```
+
+- 값은 git 디렉터리 안의 `rd-tpl-prev-version` 파일에 남습니다. 커밋되지 않고, 다음 update 의 1단계가 덮어씁니다.
+- 9단계 명령은 이 파일을 읽습니다. 값을 명령 문자열에 옮겨 적지 않습니다. VERSION 내용이 셸 명령으로 실행되는 일을 막기 위해서입니다.
+- full 판은 `YYYY-MM-DD-HHMMSS`, lite 판은 `lite-YYYY-MM-DD-HHMMSS` 형식입니다.
+
+이어서 버전 가드 스크립트를 실행합니다.
 
 ```bash
 bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
@@ -74,6 +86,7 @@ bash rd-workflow/scripts/sync_template.sh <배포 repo URL>
 - `CLAUDE.md` (프로젝트 소유 — `workflow.json` 과 같은 의미입니다. 경로가 없으면 배포본을 새로 두고, 있으면 5단계 복사가 손대지 않습니다. 기존 프로젝트의 내용 정리는 M013 이 따로 합니다)
 - `README.md` (프로젝트 고유 문서 — 배포 repo의 README는 GitHub 페이지 표시용이며 사용자 프로젝트에 적용 대상 아님)
 - `PROJECT_CONTEXT.md`
+- `rd-workflow-workspace/review-standards.md` (프로젝트 리뷰 표준 — 있으면 덮지 않고, 없으면 배포본을 새로 둡니다)
 - `rd-workflow-workspace/backlog/request-archive/` 안의 아카이브 파일
 - `rd-workflow-workspace/specs/`, `rd-workflow-workspace/plans/` 안의 작업 산출물 (README 제외)
 - `rd-workflow/scripts/{build,test,lint,typecheck}.sh` (프로젝트별 명령이 들어 있음)
@@ -180,10 +193,11 @@ END { if (c) printf "%s", buf }
 | `rd-workflow/config/review-tools.json` | 미전파 | 2절 보존 목록 | 프로젝트별 리뷰 도구 설정입니다. |
 | `rd-workflow/config/verification.json` | 미전파 | 2절 보존 목록 | 프로젝트별 검증 설정입니다. 8.6 절의 verify preset 머지가 verifier 단위로 수정합니다. |
 | `rd-workflow/config/workflow.json` | 부재 시 생성 | 2절 보존 목록, 5단계 복사 | 5.1 절이 `defect_report_upstream` 키 하나만, 값이 비어 있을 때에 한해 씁니다. 다른 키와 경로 종류는 바뀌지 않습니다. |
+| `rd-workflow/CHANGELOG.md` | 덮어쓰기 | 5단계 복사 | 없음. |
 | `rd-workflow/MIGRATIONS.md` | 덮어쓰기 | 5단계 복사 | 없음. |
 | `rd-workflow/VERSION` | 덮어쓰기 | 6단계 복사 | 없음. |
 | `.claude/rules/rd-workflow/` | 덮어쓰기 | 2절 동기화 대상, 5단계 복사, M013 | 템플릿에 없는 파일은 삭제 후보입니다. 이 폴더 밖의 `.claude/rules/` 파일은 프로젝트 소유이며 보존합니다. |
-| `.claude/settings.json` | 부재 항목 머지 | M005, M008, M003 | 템플릿 유래인데 가리키는 스크립트가 없어진 hook 등록은 제거됩니다(M005). 옛 표기 command 는 새 표기로 바뀌고 같은 group 안의 중복 등록은 접힙니다(M008). permissions 와 프로젝트 고유 hook 은 보존됩니다. |
+| `.claude/settings.json` | 부재 항목 머지 | M005, M008, M003, M015 | 템플릿 유래인데 가리키는 스크립트가 없어진 hook 등록은 제거됩니다(M005). 옛 표기 command 는 새 표기로 바뀌고 같은 group 안의 중복 등록은 접힙니다(M008). 템플릿 `permissions.allow` 의 부재 규칙은 추가됩니다(M015). 기존 permissions 와 프로젝트 고유 hook 은 보존됩니다. |
 | `.claudeignore` | 부재 시 생성 | 2절 신규 추가, 2절 보존 목록의 프로젝트 고유 설정 파일 | 경로가 있으면 건드리지 않습니다(보존 목록의 「… 등」에 속한다는 해석). |
 | `.gitignore` | 부재 항목 머지 | M003 | 부재한 라인만 파일 끝에 추가합니다. 기존 라인은 바꾸지 않습니다. 이미 추적 중인 파일은 건드리지 않습니다. 새 ignore 패턴에 걸리는 기존 추적 파일의 추적 해제는 해당 마이그레이션의 안내가 처리합니다(예: M014). |
 | `WORKING_WITH_AI.md` | 덮어쓰기 | 2절 동기화 대상, 5단계 복사 | 없음. |
@@ -194,6 +208,7 @@ END { if (c) printf "%s", buf }
 | `CURRENT_TASK.md` | 조건부 보존 | 2절 조건부 보존, 5단계 복사 | REQUEST.md 와 한 묶음으로 판정합니다. 두 파일 중 하나라도 템플릿 본 외의 줄이 남으면 둘 다 보존합니다(2절 A3). 조건 불충족이면 템플릿 본으로 바뀝니다. |
 | `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` | 조건부 보존 | 2절 조건부 보존, 5단계 복사 | 표에 행이 있으면 보존합니다(2절 A1). 조건 불충족이면 템플릿 본으로 바뀝니다. |
 | `rd-workflow-workspace/backlog/FUTURE_REQUESTS_PARKED.md` | 조건부 보존 | 2절 조건부 보존, 5단계 복사 | 표에 행이 있으면 보존합니다(2절 A1). 조건 불충족이면 템플릿 본으로 바뀝니다. |
+| `rd-workflow-workspace/review-standards.md` | 부재 시 생성 | 2절 보존 목록, 5단계 복사 | 프로젝트 리뷰 표준입니다. 경로가 있으면 건드리지 않습니다. |
 | `rd-workflow-workspace/backlog/request-archive/` | 미전파 | 2절 보존 목록 | 아카이브 파일을 덮어쓰거나 지우지 않습니다. |
 | `rd-workflow-workspace/backlog/request-archive/README.md` | 덮어쓰기 | 5단계 복사 | 없음. |
 | `rd-workflow-workspace/backlog/items/README.md` | 덮어쓰기 | 5단계 복사 (lite 전용) | 없음. |
@@ -359,7 +374,7 @@ END { if (c) printf "%s", buf }
 2. 아래 스니펫으로 제거 대상 식별·제거를 수행합니다 (프로젝트 루트에서 실행, `<임시 clone 경로>`를 실제 경로로 치환):
    ```bash
    python3 - "<임시 clone 경로>" <<'PY'
-   import json, os, re, sys
+   import json, os, re, sys, tempfile
 
    clone = sys.argv[1]
    proj_path = ".claude/settings.json"
@@ -406,9 +421,23 @@ END { if (c) printf "%s", buf }
            del hooks[event]
 
    if removed:
-       with open(proj_path, "w") as f:
-           json.dump(proj, f, indent=2, ensure_ascii=False)
-           f.write("\n")
+       rendered = (json.dumps(proj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+       # 같은 디렉터리 임시 파일에 다 쓴 뒤 원자 교체합니다 — 쓰는 도중 실패해도 원본이 남습니다.
+       tmp = None
+       try:
+           # 심링크면 링크가 가리키는 실제 파일 자리에서 교체합니다 — 링크 자리에 일반 파일을 두면 공유 설정이 끊깁니다.
+           target = os.path.realpath(proj_path)
+           fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".settings.json.m005.")
+           with os.fdopen(fd, "wb") as f:
+               f.write(rendered)
+           os.chmod(tmp, os.stat(target).st_mode & 0o7777)  # mkstemp 의 0600 대신 원본 권한을 잇습니다
+           os.replace(tmp, target)
+       except Exception as e:
+           if tmp is not None:
+               try: os.unlink(tmp)
+               except OSError: pass
+           print("M005 실패: 저장 중 오류 — 원본이 유지됩니다 (%s)" % e)
+           sys.exit(1)
        for event, matcher, cmd in removed:
            print(f"removed: {event} / {matcher or '(matcher 없음)'} / {cmd}")
    else:
@@ -719,8 +748,26 @@ manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
 | template | project | 결과 |
 |----------|---------|------|
 | 있음 | 있음 | **구조적 머지** (아래 참조) |
-| 있음 | 없음 | template에서 추가 |
+| 있음 | 없음 | **`seen_verifiers` 판정** (아래) |
 | 없음 | 있음 | **프로젝트 고유 항목 — 유지** |
+
+**`seen_verifiers` 판정 (template 에만 있는 verifier):**
+
+`rd-workflow/config/extensions.json` 의 `extensions.verify.seen_verifiers` 는 문자열 배열입니다. 「현재 프리셋에서 이 프로젝트가 template 으로부터 받은 적 있는 verifier 이름」 의 누적 집합입니다. 순서는 의미가 없고, 저장할 때 이름순으로 정렬합니다.
+
+기호: `T` = template preset 의 verifier 이름 집합, `P` = project `verification.json` 의 verifier 이름 집합, `S` = `seen_verifiers`.
+
+| `T` 에만 있는 이름 | `S` 가 유효함 | `S` 가 없거나 형식 오류 |
+|---|---|---|
+| 이름이 `S` 에 있음 | **추가하지 않음** — 사용자가 지움 | (해당 없음) |
+| 이름이 `S` 에 없음 | template 에서 추가 — 새 verifier | 이름마다 사용자에게 묻고 답대로 추가하거나 건너뜀 |
+
+- 형식 오류는 `seen_verifiers` 가 배열이 아니거나 문자열이 아닌 원소가 있는 경우입니다. 형식 오류면 기록 없음과 같이 처리합니다. 완료 보고는 실제 결과에 따라 둘 중 하나를 적습니다. 기록을 새로 저장했으면 「`seen_verifiers` 형식 오류 — 다시 만듦」, 아래 무인 실행 예외로 저장을 보류했으면 「`seen_verifiers` 형식 오류 — 초기화 보류, 다음 대화형 `/tpl update` 에서 확인」 을 적습니다.
+- 질문 문구: `템플릿 verifier '<이름>' 이 프로젝트 verification.json 에 없습니다. 추가할까요? (지운 것이면 건너뛰기 — 다음 update 부터는 묻지 않습니다)`
+- 무인 실행(autopilot 등)이라 물을 수 없으면 그 verifier 를 추가하지 않고, 이번 update 에서는 `seen_verifiers` 를 **만들지 않습니다**. 완료 보고에 「확인 필요 — 기록이 없어 묻지 못하고 추가하지 않은 verifier: <이름>. 다음 대화형 `/tpl update` 에서 다시 묻습니다」 로 적습니다. 응답 없음이 「사용자가 지움」 으로 굳지 않고, 다음 대화형 update 가 기록 없음 상태에서 다시 묻습니다.
+- 갱신 예외: `S` 가 없거나 형식 오류인 update 에서 무인 실행 때문에 묻지 못한 이름이 하나라도 있으면 `seen_verifiers` 를 만들지도 고치지도 않습니다(형식 오류 값도 그대로 둡니다). 물을 이름이 없으면(`T` 가 모두 `P` 에 있으면) 무인 실행이어도 다음 항목 「갱신」 대로 만듭니다.
+- 갱신: 위 예외가 아니면 8.6 이 끝날 때 `S' = (유효한 S, 없으면 빈 집합) ∪ T` 를 manifest(메모리)의 `extensions.verify.seen_verifiers` 에 둡니다. `T` 에서 빠진 이름도 `S` 에서 지우지 않습니다. 파일 저장은 8.8 의 manifest 저장 1회에 함께 합니다.
+- 복원: 사용자가 지운 verifier 를 다시 받으려면 `extensions.json` 의 `seen_verifiers` 에서 그 이름을 빼고 `/tpl update` 를 실행합니다. 다음 update 가 「새 verifier」 로 판정해 추가합니다.
 
 **구조적 머지 (양쪽 모두 있는 verifier):**
 - `run`: template 값 사용 (CLI 플래그, 버그 수정 반영)
@@ -730,6 +777,19 @@ manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
   - project에 있고 template에도 있는 name → project 값 유지 (커스텀 weight/description 보존)
   - template에만 있는 name → 추가
   - project에만 있는 name → template에서 삭제된 것으로 판단, 제거
+- `requires_env`: 아래 표를 따릅니다.
+
+| template verifier | project verifier | 결과 |
+|-------------------|------------------|------|
+| `requires_env` 있음 | 키 없음 | template 값을 추가 |
+| `requires_env` 있음 | 키 있음 (빈 배열·배열이 아닌 값 포함) | project 값 유지 |
+| `requires_env` 없음 | 무엇이든 | project 값 유지 (키가 없으면 그대로 없음) |
+
+`run` 이 늘 template 값으로 바뀌므로, `run` 이 참조하는 필수 변수 선언도 template 을 따라야 판정이 맞습니다. 사용자가 키를 적었으면 그 선언이 사용자의 결정이므로 덮어쓰지 않습니다. 배열이 아닌 값도 머지가 고치지 않고 유지하며, `verify.sh --check` 가 「확인 필요 (문자열 배열이 아님)」 로 알립니다.
+
+머지는 키 부재와 「사용자가 지운 키」 를 구별하지 못합니다. 필수 변수를 원하지 않는 사용자는 `"requires_env": []` 로 적습니다. 머지가 이 값을 유지합니다.
+
+프로젝트에서 이름을 바꾼 verifier 는 이름이 template 에 없으므로 「프로젝트 고유 항목 — 유지」 이며 `requires_env` 를 더하지 않습니다. 이름을 바꾸거나 지운 template verifier 는 원래 이름이 `seen_verifiers` 에 있으므로 다시 들어오지 않습니다.
 
 머지 결과를 `rd-workflow/config/verification.json`에 저장합니다.
 
@@ -737,7 +797,10 @@ manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
 - 추가된 verifier
 - 보존된 프로젝트 고유 verifier
 - 구조 업데이트된 verifier (run/adapter 변경)
+- `requires_env` 를 더한 verifier
 - 추가/제거된 criteria
+- 사용자가 지워 추가하지 않은 verifier (`seen_verifiers` 에 있음)
+- 기록이 없어 물어본 verifier 와 그 결과 (추가 / 건너뜀 / 무인 실행이라 확인 필요)
 
 #### 8.7 새 Extension 질문
 
@@ -765,6 +828,7 @@ manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
 - **생략 분기**: manifest가 null이고 `fs_available`이 공집합이면(예: lite 산출물 — `rd-workflow/extensions/` 부재) 매니페스트 파일을 생성하지 않습니다. 기록할 extension이 없는 빈 매니페스트는 무의미하고 혼란 요인입니다.
 - manifest가 null이었고 사용자가 모든 extension을 건너뛰어도, `fs_available`이 비어 있지 않으면 `fs_installed` 기준으로 manifest를 생성합니다 (다음 sync에서 다시 묻지 않도록)
 - 이 시점에서 1회만 파일에 기록합니다 (중간 저장 없음)
+- manifest 의 모르는 키(예: `extensions.verify.seen_verifiers`)를 지우지 않고 그대로 씁니다. 8.6 이 갱신한 `seen_verifiers` 도 이 저장에 함께 들어갑니다.
 
 ### 9. 완료 보고
 
@@ -776,7 +840,61 @@ manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
 - `defect_report_upstream` 결과 — `설정됨: <값>` 또는 `미설정 — <사유>`(사유와 함께 수동 지정 방법을 적습니다: 결함 보고 발행 시 `--upstream <owner/repo>` 로 지정하거나 `rd-workflow/config/workflow.json` 에 직접 기입). 유도 실패로 보류했더라도 sync 자체는 끝까지 진행된 것이므로 실패가 아니라 이 항목으로 보고합니다
 - Skill 재설치 결과 (설치/건너뛴 수)
 - Extension 자동 재설치 결과 (자동 재설치/신규 설치/건너뛴 수)
-- Verify Preset 머지 결과 요약 (추가/보존/업데이트된 verifier, 변경된 criteria) — verify preset이 자동 재설치된 경우에만
+- Verify Preset 머지 결과 요약 (추가/보존/업데이트된 verifier, `requires_env` 를 더한 verifier, 변경된 criteria, 사용자가 지워 추가하지 않은 verifier, 기록이 없어 물어본 verifier 와 결과) — verify preset이 자동 재설치된 경우에만
+- 템플릿 변경 이력 — 보고의 마지막 항목입니다. 아래 「변경 이력 보이기」 명령의 출력을 줄이지 않고 그대로 옮깁니다.
+
+#### 변경 이력 보이기
+
+동기화된 `rd-workflow/CHANGELOG.md` 에서 이전 VERSION 보다 뒤의 절을 골라 보입니다. 사용자가 CHANGELOG 를 열지 않아도 규칙 변경을 알게 하려는 단계입니다. 6단계 버전 갱신 뒤 프로젝트 루트에서 그대로 실행합니다. 이전 VERSION 은 1단계가 남긴 파일에서, 받은 VERSION 은 `rd-workflow/VERSION` 에서 읽습니다.
+
+```bash
+bash -s <<'RD_CHANGELOG'
+pv="$(git rev-parse --git-path rd-tpl-prev-version)"
+prev=""; [[ -f "$pv" ]] && prev="$(cat "$pv")"
+cur="$(cat rd-workflow/VERSION 2>/dev/null)"
+f=rd-workflow/CHANGELOG.md
+re='^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$'
+p="${prev#lite-}"; c="${cur#lite-}"
+if [[ ! -f "$f" ]]; then
+  echo "템플릿 변경 이력: 받은 템플릿에 $f 가 없어 보여 줄 변화가 없습니다."
+elif [[ ! "$p" =~ $re ]]; then
+  echo "템플릿 변경 이력: 이전 VERSION 을 알 수 없어(값: '${prev:-없음}') 새 변화를 고르지 못했습니다. $f 를 직접 확인하십시오."
+elif [[ "$c" =~ $re && ! "$c" > "$p" ]]; then
+  echo "템플릿 변경 이력: 받은 VERSION($cur)이 이전 VERSION($prev)보다 뒤가 아니어서 새 변화가 없습니다."
+else
+  awk -v prev="$p" -v lite="${prev%%-*}" -v cap=40 -v path="$f" '
+    BEGIN { d = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]" }
+    /^## / {
+      h = substr($0, 4); cur = 0; inold = (h == "그 이전")
+      if (h == "다음 발행" || (h ~ ("^" d "$") && h > prev)) { cur = ++n; head[n] = $0; body[n] = $0 "\n"; cnt[n] = 0 }
+      next
+    }
+    inold && start == "" && match($0, d) { start = substr($0, RSTART, RLENGTH) }
+    cur { body[cur] = body[cur] $0 "\n"; if ($0 ~ /^- /) cnt[cur]++ }
+    END {
+      m = 0; total = 0
+      for (i = 1; i <= n; i++) if (cnt[i] > 0) { k[++m] = i; total += cnt[i] }
+      if (m == 0) { print "템플릿 변경 이력: 이전 VERSION(" prev ") 뒤로 기록된 변화가 없습니다."; exit }
+      print "템플릿 변경 이력 (이전 VERSION " prev " 뒤의 절):"
+      if (total <= cap) { for (j = 1; j <= m; j++) printf "%s", body[k[j]] }
+      else {
+        printf "%s", body[k[1]]
+        for (j = 2; j <= m; j++) print head[k[j]] " — 항목 " cnt[k[j]] "개"
+        print "항목이 " total "개라 가장 최근 절만 전문으로 보였습니다. 전체는 " path " 에 있습니다."
+      }
+      if (start != "" && prev < start) print "이전 VERSION 이 기록 시작(" start ")보다 오래되어 그 사이 변화 일부는 기록에 없습니다. 구조 전환은 rd-workflow/MIGRATIONS.md 를 봅니다."
+      if (lite == "lite") print "「(full)」 표시 항목은 lite 배포본에 없습니다."
+    }' "$f"
+fi
+RD_CHANGELOG
+```
+
+- **고르는 절**: 제목이 이전 VERSION 보다 뒤인 VERSION 절과 `## 다음 발행` 절입니다. lite 의 `lite-` 접두는 떼고 비교합니다. CHANGELOG 절 제목은 full 발행 VERSION 이고, lite VERSION 은 같은 값에 `lite-` 를 붙인 것이기 때문입니다. `## 다음 발행` 은 발행 스크립트가 제목을 바꾸지 못했을 때만 배포본에 남으며, 그때도 이번에 받은 변화입니다.
+- **빼는 절**: 이전 VERSION 과 같거나 앞선 절, `## 그 이전` 절, 항목(`- ` 줄)이 0개인 절입니다.
+- **한 줄 안내**: CHANGELOG 가 없을 때, 이전 VERSION 을 모르거나 형식이 다를 때, 받은 VERSION 이 이전 VERSION 보다 뒤가 아닐 때(같은 VERSION 재동기화·다운그레이드), 고른 절에 항목이 없을 때 각각 한 줄을 냅니다. 받은 VERSION 을 먼저 비교하므로 `## 다음 발행` 절도 버전이 앞으로 갔을 때만 나옵니다.
+- **길이 상한**: 고른 절의 항목이 모두 40개 이하면 전문을 보입니다. 넘으면 가장 최근 절만 전문으로 보이고, 나머지 절은 제목과 항목 수만 보인 뒤 파일 경로를 안내합니다. 여러 발행을 건너뛴 프로젝트에서 변경 이력이 보고의 다른 항목(실패·보류)을 묻지 않게 하려는 상한입니다.
+- **기록 시작보다 오래된 프로젝트**: 이전 VERSION 이 `## 그 이전` 절이 밝힌 기록 시작 VERSION 보다 앞서면 기록에 없는 구간이 있다고 한 줄 덧붙입니다.
+- 이 단계는 CHANGELOG 를 읽기만 합니다.
 
 ## 기존 설치본 1회성 백필
 

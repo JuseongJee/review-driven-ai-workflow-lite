@@ -6,7 +6,7 @@
 
 1. `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` 읽기.
 2. 인덱스에서 status가 `idea` / `validated` / `ready-for-request` 인 항목만 추립니다 (`blocked` 은 set-aside 상태로 기본 목록 행에서 제외).
-3. `bash rd-workflow/scripts/fr_relations.sh readiness --root .` 를 실행합니다. 출력은 활성 FR 1건당 `<stem><TAB><판정>` 이고 판정 값은 `ready` / `waiting:<stem>,<stem>` / `check:<stem>,<stem>` / `error:<사유>` 다. `rc=2` 면 판정 없이 기존 목록만 출력하고 `관계 판정 불가 — 의존 상태를 표시하지 않습니다` 경고를 한 줄 남깁니다. 2단계에서 걸러낸 항목의 판정 행은 무시합니다.
+3. `bash rd-workflow/scripts/fr_relations.sh readiness --root .` 를 실행합니다. 출력은 활성 FR 1건당 `<stem><TAB><판정>` 이고 판정 값은 `ready` / `waiting:<stem>,<stem>` / `check:<stem>,<stem>` / `error:<사유>` 다. `rc=2` 면 판정 없이 기존 목록만 출력하고 `관계 판정 불가 — 의존 상태를 표시하지 않습니다` 경고를 한 줄 남깁니다. 2단계에서 걸러낸 항목의 판정 행은 무시합니다. 단 `error:parse:status` 행은 무시하지 않고 6단계에서 보입니다 — 상세 파일의 status 를 읽지 못한 FR 은 인덱스 status 도 허용값 밖이거나 인덱스에 행이 없어 2단계에서 빠지기 때문입니다.
 4. 판정에 따라 **두 구역**으로 출력합니다. 각 행에는 `착수` 칸을 둡니다.
 
    - **착수 가능**: 판정이 `ready` 인 항목만. 정렬은 인덱스 우선순위(P1 → P2 → P3 → `-`), 동순위는 날짜 오름차순. 시리즈 구성원이면 제목 뒤에 `[<name> N/M]` 을 붙입니다.
@@ -36,3 +36,4 @@
 GitHub 컬럼은 항상 표시합니다 (활성 항목에 연결이 하나도 없어도 생략하지 않음).
 
 5. 표 아래에 set-aside 요약 한 줄을 덧붙입니다: 인덱스에 `blocked` 항목이 있으면 `set-aside(blocked): N건 — 복원은 /fr status <slug> validated` 를 출력하고, 없으면 생략합니다.
+6. 3단계 출력에 `error:parse:status` 행이 있고 그 항목이 표에 나오지 않았으면, 표 아래에 `status 를 읽지 못한 FR N건: <short-title>, … — 상세 파일의 "- status:" 를 허용값(idea validated ready-for-request blocked done dropped parked) 하나로 고치십시오. 확인: bash rd-workflow/scripts/fr_relations.sh validate --root .` 를 덧붙입니다. short-title 은 stem 의 앞 11자(`YYYY-MM-DD-`)를 뗀 값입니다. 활성 항목이 0개여서 `활성 항목이 없습니다` 를 출력할 때도 이 줄은 출력합니다.

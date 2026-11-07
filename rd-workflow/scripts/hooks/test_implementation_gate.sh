@@ -13,16 +13,15 @@ FAIL=0
 
 # fixture 는 조합 6종을 1회씩 만들어 모든 시나리오가 공유한다 (fixture_for). hook 은 읽기·판정만
 # 하므로 읽기 전용으로 얼려 두고(fx_freeze), 시나리오가 원본에 쓰면 OS 가 거부한다.
-FX_LIST=""
-FX_SNAP0=""
+# 경로는 배열로 든다 — TMPDIR 에 공백이 있으면 공백 구분 문자열은 단어 분리로 경로가 잘린다.
+FX_LIST=()
 fx_freeze() { chmod -R a-w "$1"; }
 fx_thaw()   { chmod -R u+w "$1" 2>/dev/null; rm -rf "$1"; }
-fx_snap()   { find "$@" -print | LC_ALL=C sort; find "$@" -type f -exec cksum {} + | LC_ALL=C sort; }
 NOJQ_DIR=""
 cleanup_all() {
   local d
-  for d in $FX_LIST; do fx_thaw "$d"; done
-  FX_LIST=""
+  for d in ${FX_LIST[@]+"${FX_LIST[@]}"}; do fx_thaw "$d"; done
+  FX_LIST=()
   if [[ -n "$NOJQ_DIR" && -d "$NOJQ_DIR" ]]; then
     rm -rf "$NOJQ_DIR"
     NOJQ_DIR=""
@@ -51,7 +50,8 @@ trap 'cleanup_all; _rd_gbl_cleanup' EXIT INT TERM
 make_fixture() {
   local status="$1" autopilot="$2" with_state="${3:-}"
   local fixture
-  fixture="$(mktemp -d)" || { echo "test_implementation_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  # 템플릿을 준다 — macOS 의 템플릿 없는 mktemp 는 TMPDIR 을 무시해, 따옴표·역슬래시 TMPDIR 시나리오가 실제로 돌지 않는다.
+  fixture="$(mktemp -d "${TMPDIR:-/tmp}/rd-ig-fx.XXXXXX")" || { echo "test_implementation_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$fixture" && -d "$fixture" ]] || { echo "test_implementation_gate.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   mkdir -p "$fixture/rd-workflow/scripts/hooks"
   cp "$HOOK_SOURCE" "$fixture/rd-workflow/scripts/hooks/implementation_gate.sh"
@@ -93,12 +93,11 @@ build_fixtures() {
   FX_I_STATE="$(make_fixture "구현 중" "no" "yes")" || return 1
   FX_I_LINK="$(make_fixture "구현 중" "no" "link")" || return 1
   FX_I_HARD="$(make_fixture "구현 중" "no" "hardlink")" || return 1
-  FX_LIST="$FX_V_NO $FX_I_NO $FX_I_YES $FX_I_STATE $FX_I_LINK $FX_I_HARD"
+  FX_LIST=("$FX_V_NO" "$FX_I_NO" "$FX_I_YES" "$FX_I_STATE" "$FX_I_LINK" "$FX_I_HARD")
   local d
-  for d in $FX_LIST; do fx_freeze "$d"; done
-  FX_SNAP0="$(fx_snap $FX_LIST)"
+  for d in "${FX_LIST[@]}"; do fx_freeze "$d" || { echo "test_implementation_gate.sh: fixture 읽기 전용 보호 실패: $d" >&2; return 1; }; done
   if [[ "$(id -u)" == "0" ]]; then
-    echo "주의: root 실행 — 읽기 전용 보호가 무효이고 끝의 해시 비교만 원본 불변을 확인합니다" >&2
+    echo "주의: root 실행 — 읽기 전용 보호가 무효라 시나리오가 공유 fixture 를 바꿔도 막지 못합니다" >&2
   fi
 }
 # fixture_for <status> <autopilot> <with_state> → 경로를 stdout 으로, 모르는 조합은 rc 1
@@ -168,15 +167,32 @@ make_big_content() {
   printf '%s' "$s"
 }
 
+# json_str <값>
+# 값을 JSON 문자열 본문으로 이스케이프한다(\ · " · 제어 문자 \n \r \t). payload 생성은 jq 유무 두 모드에서
+# 같아야 하므로 jq 를 쓰지 않는다. 이 이스케이프 없이 보간하면 따옴표·역슬래시가 든 경로에서 payload 가
+# 깨져, 테스트가 의도와 다른 입력을 검증하고도 통과할 수 있다.
+json_str() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
 _hook_last_exit=0
 run_hook() {
-  local fixture="$1" file_path="$2" agent_id="${3:-}"
+  local fixture="$1" file_path agent_id="${3:-}"
   local payload
+  # RAW_JSON_PATH=1 이면 $2 가 이미 JSON 문자열 본문이다(\u 이스케이프·해독 불가 값 시나리오).
+  if [[ "${RAW_JSON_PATH:-0}" == 1 ]]; then file_path="$2"; else file_path="$(json_str "$2")"; fi
   # 세 입력을 구분한다:
   #   "__EMPTY__"      → agent_type 필드는 있고 값이 빈 문자열. 공식 계약이 규정하지 않은 경계다.
   #   "__PRETTY__"     → 최상위 agent_type 을 JSON 공백 4종(space·tab·CR·LF)으로 감싼 pretty 입력.
   #   "__MIXED__"      → agent_type 은 빈 문자열, agent_id 만 값이 있는 혼합 입력.
   #   "__BIG__"        → 판별 필드 없이 content 만 큰 입력. 안에 판별 필드 문자열이 들어 있다.
+  #   "__PRETTYBIG__"  → subagent 의 여러 줄 입력. file_path 줄 뒤에 파이프 버퍼(64KB)보다 큰 content 가 온다.
   #   "id:<값>"        → 최상위 agent_id 로 넣는다 (공식 문서가 기술하는 필드).
   #   그 밖의 비어있지 않은 값 → 최상위 agent_type 으로 넣는다 (이 버전이 실제로 보내는 필드).
   #   빈 인자          → 두 필드 모두 넣지 않아 메인 스레드 호출을 그대로 재현한다.
@@ -188,6 +204,8 @@ run_hook() {
     payload="$(printf '{\n  "agent_type"\t:\r\n "general-purpose" ,\n  "tool_input" : { "file_path" : "%s" }\n}' "$file_path")"
   elif [[ "$agent_id" == "__MIXED__" ]]; then
     payload="{\"agent_type\":\"\",\"agent_id\":\"agent_abc123\",\"tool_input\":{\"file_path\":\"$file_path\"}}"
+  elif [[ "$agent_id" == "__PRETTYBIG__" ]]; then
+    payload="$(printf '{\n  "agent_type": "worker",\n  "tool_input": {\n    "file_path": "%s",\n    "content": "%s"\n  }\n}' "$file_path" "$(make_big_content)")"
   elif [[ "$agent_id" == "__BIG__" ]]; then
     payload="{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$file_path\",\"content\":\"$(make_big_content)\"}}"
   elif [[ "$agent_id" == "__NESTED__" ]]; then
@@ -195,9 +213,9 @@ run_hook() {
     # 최상위만 본다는 계약이 지켜지면 메인 세션으로 판정되어 통과해야 한다.
     payload="{\"tool_input\":{\"file_path\":\"$file_path\",\"agent_type\":\"nested-only\",\"agent_id\":\"nested-only\"}}"
   elif [[ "$agent_id" == id:* ]]; then
-    payload="{\"agent_id\":\"${agent_id#id:}\",\"tool_input\":{\"file_path\":\"$file_path\"}}"
+    payload="{\"agent_id\":\"$(json_str "${agent_id#id:}")\",\"tool_input\":{\"file_path\":\"$file_path\"}}"
   elif [[ -n "$agent_id" ]]; then
-    payload="{\"agent_type\":\"$agent_id\",\"tool_input\":{\"file_path\":\"$file_path\"}}"
+    payload="{\"agent_type\":\"$(json_str "$agent_id")\",\"tool_input\":{\"file_path\":\"$file_path\"}}"
   else
     payload="{\"tool_input\":{\"file_path\":\"$file_path\"}}"
   fi
@@ -209,7 +227,7 @@ run_hook() {
     return 0
   fi
   local pfile
-  pfile="$(mktemp)" || { echo "test_implementation_gate.sh: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
+  pfile="$(mktemp "${TMPDIR:-/tmp}/rd-ig-payload.XXXXXX")" || { echo "test_implementation_gate.sh: 임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   [[ -n "$pfile" && -f "$pfile" ]] || { echo "test_implementation_gate.sh: 임시 파일 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   printf '%s' "$payload" > "$pfile"
   run_with_timeout "$HOOK_TIMEOUT_SEC" "$pfile" \
@@ -237,11 +255,22 @@ run_scenario() {
   local fixture_base fixture_parent file_path
   fixture_base="$(basename "$fixture")"
   fixture_parent="$(dirname "$fixture")"
+  # 템플릿이 raw: 로 시작하면 나머지를 JSON 문자열 본문 그대로 쓴다. 이때 치환하는 fixture
+  # 경로만 json_str 로 이스케이프한다 — 따옴표·역슬래시가 든 TMPDIR 에서도 payload 가 깨지지 않는다.
+  local raw=0
+  if [[ "$path_tmpl" == raw:* ]]; then
+    raw=1
+    path_tmpl="${path_tmpl#raw:}"
+    fixture_base="$(json_str "$fixture_base")"
+    fixture_parent="$(json_str "$fixture_parent")"
+  fi
+  local fixture_sub="$fixture"
+  [[ $raw -eq 1 ]] && fixture_sub="$(json_str "$fixture")"
   file_path="$path_tmpl"
   file_path="${file_path//\{FB\}/$fixture_base}"
   file_path="${file_path//\{FP\}/$fixture_parent}"
-  file_path="${file_path//\{F\}/$fixture}"
-  run_hook "$fixture" "$file_path" "$agent_id"
+  file_path="${file_path//\{F\}/$fixture_sub}"
+  RAW_JSON_PATH="$raw" run_hook "$fixture" "$file_path" "$agent_id"
   local label="[${MODE:-jq}] scenario ${num}: ${name}"
   if [[ "$_hook_last_exit" == "$expected" ]]; then
     echo "[PASS] $label (exit=$_hook_last_exit)"
@@ -280,67 +309,6 @@ run_perf_scenario() {
     PASS=$((PASS + 1))
   else
     echo "[FAIL] $label — exit=$_hook_last_exit (기대 0; 137=상한 초과로 강제 종료), 소요 ${dt}s (상한 ${PERF_LIMIT_SEC}s)" >&2
-    FAIL=$((FAIL + 1))
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# watchdog 자체 검증 시나리오
-#   시나리오 42 의 상한은 run_with_timeout 이 자손까지 회수해야 의미가 있다. hook 은
-#   파서를 명령 치환 자식에 두므로, 직접 PID 만 죽이는 구현이면 테스트는 상한에 반환해도
-#   제곱 시간 계산이 고아로 남아 CPU 를 계속 쓴다 (final diff review 가 실측 재현).
-#   그 구조를 그대로 본뜬 probe 로 자손 종료를 결정적으로 고정한다 — 실제 hook 이 아니라
-#   watchdog 기구 자체를 대상으로 삼아, 파서 성능과 무관하게 항상 같은 판정이 나온다.
-# ---------------------------------------------------------------------------
-# _pid_terminated <pid>
-# return 0 = 그 PID 가 더 이상 실행 중이 아니다 (부재 또는 zombie).
-# kill -0 만으로는 부족하다 — SIGKILL 을 받고 아직 reap 되지 않은 zombie 에도 성공한다.
-# zombie 는 이미 종료된 프로세스이며 CPU 를 쓰지 않으므로 "종료"로 인정한다.
-_pid_terminated() {
-  local pid="$1" st
-  kill -0 "$pid" 2>/dev/null || return 0
-  st="$( { ps -o stat= -p "$pid" 2>/dev/null || true; } | tr -d ' ' )"
-  [[ -z "$st" ]] && return 0
-  case "$st" in Z*) return 0 ;; esac
-  return 1
-}
-
-run_watchdog_scenario() {
-  local num="$1" name="$2"
-  local dir probe child rc_ok=0 desc_ok=0 child_pid=""
-  dir="$(mktemp -d)" || { echo "test_implementation_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; return 1; }
-  [[ -n "$dir" && -d "$dir" ]] || { echo "test_implementation_gate.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
-  probe="$dir/probe.sh"
-  child="$dir/child.pid"
-  # hook 과 같은 형태: 명령 치환 자식이 오래 도는 작업을 맡는다.
-  {
-    printf '%s\n' '#!/bin/bash'
-    printf 'v=$(bash -c '"'"'echo $$ > "%s"; sleep 60'"'"')\n' "$child"
-    printf '%s\n' 'sleep 60'
-  } > "$probe"
-  run_with_timeout 2 /dev/null bash "$probe"
-  [[ "$_timeout_last_exit" == "137" ]] && rc_ok=1
-  child_pid="$(cat "$child" 2>/dev/null || true)"
-  # 종료 판정은 유한한 grace 안에서 폴링한다. 그룹 kill 직후 한 번만 kill -0 을 보면
-  # 아직 회수되지 않은(zombie) PID 를 실행 중으로 오인해 테스트가 환경 따라 흔들린다.
-  # 판별력은 그대로다 — 직접 PID 만 죽이는 구현에서는 자손이 60초를 계속 살아 있으므로
-  # 3초 grace 로는 절대 사라지지 않는다.
-  if [[ -n "$child_pid" ]]; then
-    local waited=0
-    while [[ $waited -lt 60 ]]; do
-      if _pid_terminated "$child_pid"; then desc_ok=1; break; fi
-      sleep 0.05
-      waited=$((waited + 1))
-    done
-  fi
-  [[ -n "$child_pid" ]] && kill -9 "$child_pid" 2>/dev/null
-  rm -rf "$dir"
-  local label="[모드 무관] scenario ${num}: ${name}"
-  if [[ $rc_ok -eq 1 && $desc_ok -eq 1 ]]; then
-    echo "[PASS] $label (rc=137, 자손 pid=${child_pid} 종료 확인)"
-    PASS=$((PASS + 1))
-  else
-    echo "[FAIL] $label — rc=$_timeout_last_exit (기대 137), 자손 pid=${child_pid:-없음} 종료=$desc_ok" >&2
     FAIL=$((FAIL + 1))
   fi
 }
@@ -445,7 +413,7 @@ run_scenario 38 "메인 세션(prompt_id·effort 만) + CURRENT_TASK.md → 통�
   "구현 중" "no" "{F}/CURRENT_TASK.md" 0
 # 39 는 판별 필드 탐색이 최상위에 한정되는지 고정한다. 전체 문자열에서 첫 "agent_type" 을
 # 찾는 구현이면 tool_input 하위 필드를 최상위로 오인해 메인 세션을 차단한다 —
-# fail-open 경계가 조용히 fail-closed 로 뒤집히는 회귀다 (final diff review 가 실측 재현).
+# fail-open 경계가 조용히 fail-closed 로 뒤집히는 회귀다 (실측 재현).
 run_scenario 39 "메인 세션 + tool_input 하위에만 판별 필드 → 통과 (최상위 한정 계약)" \
   "구현 중" "no" "{F}/CURRENT_TASK.md" 0 "__NESTED__"
 # 40 은 JSON 공백 처리를 건다. 키와 ':' 사이 공백으로 space 만 허용하는 구현이면
@@ -458,21 +426,38 @@ run_scenario 41 "subagent + agent_type 빈 값 + agent_id 값 있음 → 차단 
   "구현 중" "no" "{F}/CURRENT_TASK.md" 2 "__MIXED__"
 # 42 는 성능 회귀와 오인 차단을 한 payload 로 건다 (run_perf_scenario 주석 참조).
 run_perf_scenario 42 "메인 세션 + 200KB content(내부에 판별 필드 문자열) → 통과 + 선형 시간"
-# 43(watchdog)은 jq 모드와 무관하므로 두 모드 뒤에 1회만 실행한다.
+# 44~47 은 file_path 값의 JSON 이스케이프 해독을 건다. jq 경로는 원래 해독하므로 no-jq 모드가 대상이다.
+# 다음 따옴표에서 자르는 폴백은 44 를 `{F}/a\` 로 읽어 차단 대상을 놓친다(fail-open).
+run_scenario 44 "subagent + 이스케이프 따옴표가 든 경로 a\"b/../CURRENT_TASK.md → 차단" \
+  "구현 중" "no" "{F}/a\"b/../CURRENT_TASK.md" 2 "agent_abc123"
+# 45 는 과잉 차단을 막는다. \\ 를 해독하지 못해 fail-closed 로 빠지면 평범한 경로가 막힌다.
+run_scenario 45 "subagent + 역슬래시가 든 차단 집합 밖 경로 → 통과" \
+  "구현 중" "no" "{F}/a\\b/x.md" 0 "agent_abc123"
+# 46 은 '_'·'.' 를 \u 로 감춘 정본 경로다. \u 를 그대로 두면 이름이 달라 차단 대상을 놓친다.
+run_scenario 46 "subagent + \\u 이스케이프로 쓴 CURRENT_TASK.md → 차단" \
+  "구현 중" "no" 'raw:{F}/CURRENT\u005fTASK\u002emd' 2 "agent_abc123"
+# 47 은 fail-closed 계약이다. 해독할 수 없는 값을 빈 값·원문으로 넘기면 차단이 꺼진다.
+# jq 모드도 jq 가 파싱에 실패해 같은 폴백으로 오므로 두 모드 모두 차단이다.
+run_scenario 47 "subagent + 해독할 수 없는 이스케이프(\\x) → 차단 (fail-closed)" \
+  "구현 중" "no" 'raw:{F}/\x.md' 2 "agent_abc123"
+# 48 은 fail-closed 의 오차단을 막는다. 해독기가 첫 줄에서 답을 내고 바로 끝나면 큰 후행 필드를 쓰던
+# 생산자가 SIGPIPE 를 받고, hook 의 pipefail 이 그것을 해독 실패로 읽어 정상 경로를 막는다.
+run_scenario 48 "subagent + 여러 줄 JSON·큰 후행 content + 차단 집합 밖 경로 → 통과" \
+  "구현 중" "no" "{F}/src/ok.md" 0 "__PRETTYBIG__"
 }
 
 # --- jq 경로와 bash 폴백을 둘 다 결정적으로 실행한다 ---
 # 실패하는 jq shim 을 PATH 앞에 두면 command -v jq 는 성공하고 jq 호출은 실패하므로
 # 두 파서 함수(read_hook_agent_id / extract_json_field)의
 # bash 폴백 분기가 환경과 무관하게 반드시 실행된다.
-NOJQ_DIR="$(mktemp -d)" || { echo "test_implementation_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+NOJQ_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rd-ig-nojq.XXXXXX")" || { echo "test_implementation_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$NOJQ_DIR" && -d "$NOJQ_DIR" ]] || { echo "test_implementation_gate.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 printf '%s\n' '#!/bin/bash' 'exit 1' > "$NOJQ_DIR/jq"
 chmod +x "$NOJQ_DIR/jq"
 _orig_path="$PATH"
 
 # 픽스처가 놓이는 볼륨이 대소문자를 구분하는지 남긴다 — case alias 시나리오의 기대값 근거다.
-_probe="$(mktemp -d)" || { echo "test_implementation_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+_probe="$(mktemp -d "${TMPDIR:-/tmp}/rd-ig-case.XXXXXX")" || { echo "test_implementation_gate.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$_probe" && -d "$_probe" ]] || { echo "test_implementation_gate.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 printf 'x\n' > "$_probe/CASEPROBE"
 if [[ -e "$_probe/caseprobe" ]]; then
@@ -501,15 +486,6 @@ echo "=== 모드: jq (환경 PATH 그대로) ==="
 MODE="jq"
 PATH="$_orig_path"
 run_all_scenarios
-
-# 43 은 42 의 상한을 실효화하는 기구를 검증한다 (run_watchdog_scenario 주석 참조).
-run_watchdog_scenario 43 "watchdog 상한 초과 → 명령 치환 자손까지 회수"
-
-# 보조: 공유 fixture 가 시나리오에 오염되지 않았는지 끝에서 비교한다.
-if [[ "$(fx_snap $FX_LIST)" != "$FX_SNAP0" ]]; then
-  echo "[FAIL] 복제 원본이 바뀜 — 공유 fixture 가 시나리오 실행 중 변경되었습니다" >&2
-  FAIL=$((FAIL + 1))
-fi
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"

@@ -94,5 +94,28 @@ F=base mk "$rowA"; F=ours mk "$rowA" "$rowRaw2"; F=theirs mk "$rowA"
 [[ "$(run)" == 1 && ! -s "$T/out" ]] && grep -qF '구분자로 센 위치: >|< 2026-01-08 >|< t >|< ``code >|< span`` 안 >|<' "$T/err" \
   && pass "이중 백틱 스팬도 같은 진단(구분자 표시)을 받는다" || fail "이중 백틱 — rc=$(run) err=$(cat "$T/err")"
 
+# 18~21) 칸 단위 재판정 (fr-index-merge-cell-level: 2026-11-07 changelog 발행이 우선순위만·상태만 바꾼 한 행에서 멈췄다)
+rowC='| 2026-01-09 | c | `a `\|` b` 요약 | tooling | idea | P3 | [상세](items/2026-01-09-c.md) |'
+rowCo='| 2026-01-09 | c | `a `\|` b` 요약 | tooling | idea | P2 | [상세](items/2026-01-09-c.md) |'
+rowCt='| 2026-01-09 | c | `a `\|` b` 요약 | tooling | done | P3 | [상세](items/2026-01-09-c.md) |'
+rowCm='| 2026-01-09 | c | `a `\|` b` 요약 | tooling | done | P2 | [상세](items/2026-01-09-c.md) |'
+F=base mk "$rowA" "$rowC"; F=ours mk "$rowA" "$rowCo"; F=theirs mk "$rowA" "$rowCt"
+[[ "$(run)" == 0 ]] && [[ "$(cat "$T/out")" == "$(printf '%s\n' "$hdr" "$rowA" "$rowCm")" ]] \
+  && pass "다른 칸 수정은 칸 단위로 합쳐지고 \\| 요약은 보존된다" || fail "칸 단위 병합 — $(cat "$T/out" "$T/err")"
+# 두 칸(상태·우선순위)을 양쪽이 다르게 수정 → 충돌 칸 이름을 헤더 순서대로 모두 알린다
+rowCv='| 2026-01-09 | c | `a `\|` b` 요약 | tooling | validated | P2 | [상세](items/2026-01-09-c.md) |'
+rowCd='| 2026-01-09 | c | `a `\|` b` 요약 | tooling | dropped | P1 | [상세](items/2026-01-09-c.md) |'
+F=base mk "$rowA" "$rowC"; F=ours mk "$rowA" "$rowCv"; F=theirs mk "$rowA" "$rowCd"
+[[ "$(run)" == 1 && ! -s "$T/out" ]] && [[ "$(cat "$T/err")" == 'merge_fr_index: 행 충돌(같은 칸을 양쪽이 다르게 수정): c — 칸: 상태, 우선순위' ]] \
+  && pass "같은 칸 상이 수정 → rc 1, 충돌 칸 이름 모두 안내" || fail "같은 칸 충돌 — rc=$(run) err=$(cat "$T/err")"
+# 행 삭제 대 칸 수정 → 칸 단위로 풀지 않는다
+F=base mk "$rowA" "$rowC"; F=ours mk "$rowA" "$rowCo"; F=theirs mk "$rowA"
+[[ "$(run)" == 1 && ! -s "$T/out" ]] && grep -qF '행 충돌(양쪽 상이 수정): c' "$T/err" \
+  && pass "행 삭제 대 칸 수정 → rc 1" || fail "삭제 대 수정 — rc=$(run) $(cat "$T/out" "$T/err")"
+# 열 이름만 바꾼 헤더(칸 수 같음) + 서로 다른 칸 수정 → 칸 의미가 다를 수 있어 풀지 않는다
+hdrR="${hdr/| 상태 |/| 진행 |}"
+F=base mk "$rowA" "$rowC"; F=ours mk "$rowA" "$rowCo"; printf '%s\n' "$hdrR" "$rowA" "$rowCt" > "$T/theirs"
+[[ "$(run)" == 1 && ! -s "$T/out" ]] && pass "헤더가 다르면 칸 단위로 풀지 않음 → rc 1" || fail "헤더 상이 칸 병합 — $(cat "$T/out" "$T/err")"
+
 echo "merge_fr_index: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]

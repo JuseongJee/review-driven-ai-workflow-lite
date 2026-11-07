@@ -271,6 +271,7 @@ test_selftest_empty_backlog_succeeds_and_propagates_error() {
   cp "${SCRIPT_DIR}/self_test.sh" "${fx}/rd-workflow/scripts/self_test.sh"
   cp "$TARGET" "${fx}/rd-workflow/scripts/check_fr_related_files_existence.sh"
   cp "$PARSER" "${fx}/rd-workflow/scripts/check_skill_reference_existence.sh"
+  cp "${SCRIPT_DIR}/_fr_status.sh" "${fx}/rd-workflow/scripts/_fr_status.sh"
 
   # 대조군 1 — 빈 백로그는 성공해야 한다(D4 핵심 판정).
   RD_SELFTEST_CHECKER_ONLY=fr_related_files_existence_check \
@@ -338,6 +339,7 @@ test_wrapper_active_filter() {
   cp "${SCRIPT_DIR}/self_test.sh" "${fx}/rd-workflow/scripts/self_test.sh"
   cp "$TARGET" "${fx}/rd-workflow/scripts/check_fr_related_files_existence.sh"
   cp "$PARSER" "${fx}/rd-workflow/scripts/check_skill_reference_existence.sh"
+  cp "${SCRIPT_DIR}/_fr_status.sh" "${fx}/rd-workflow/scripts/_fr_status.sh"
   printf -- '# done item\n- status: done\n- related files: `rd-workflow/scripts/gone_done.sh`\n' \
     > "${fx}/rd-workflow-workspace/backlog/items/done-item.md"
   printf -- '# no status item\n- related files: `rd-workflow/scripts/gone_nostatus.sh`\n' \
@@ -357,6 +359,39 @@ test_wrapper_active_filter() {
   rm -rf "$fx"
 }
 
+# 활성 판정은 _fr_status.sh 공용 판정을 따른다: 한글 키·주석 붙은 값은 비활성, obsolete·비표준은 검사 대상.
+# 출력: "rc=<self_test 검사 종료 코드> warn=<0|1>". 경로 부재는 경고일 뿐 rc 0 이다. 실행 오류(rc≠0)를 비활성 제외로 오인하지 않도록 rc 를 함께 낸다.
+_wrapper_single_item_result() {
+  local content="$1" fx out rc
+  fx="$(mktemp -d)" || { echo "mktemp 실패" >&2; return 2; }
+  mkdir -p "${fx}/rd-workflow/scripts" "${fx}/rd-workflow-workspace/backlog/items"
+  cp "${SCRIPT_DIR}/self_test.sh" "${fx}/rd-workflow/scripts/self_test.sh"
+  cp "$TARGET" "${fx}/rd-workflow/scripts/check_fr_related_files_existence.sh"
+  cp "$PARSER" "${fx}/rd-workflow/scripts/check_skill_reference_existence.sh"
+  cp "${SCRIPT_DIR}/_fr_status.sh" "${fx}/rd-workflow/scripts/_fr_status.sh"
+  printf -- "$content" > "${fx}/rd-workflow-workspace/backlog/items/one.md"
+  out="$(RD_SELFTEST_CHECKER_ONLY=fr_related_files_existence_check \
+    bash "${fx}/rd-workflow/scripts/self_test.sh" 2>&1)"; rc=$?
+  rm -rf "$fx"
+  if printf '%s' "$out" | grep -q "gone_x.sh"; then echo "rc=${rc} warn=1"; else echo "rc=${rc} warn=0"; fi
+}
+
+test_wrapper_shared_status_judgement() {
+  local r
+  r="$(_wrapper_single_item_result '# t\n- 상태: done\n- related files: `rd-workflow/scripts/gone_x.sh`\n')"
+  if [ "$r" = "rc=0 warn=0" ]; then
+    pass "wrapper_shared(a): '- 상태: done' 은 검사 대상 아님 (rc=0)"
+  else fail "wrapper_shared(a): '- 상태: done' 기대 rc=0 warn=0, 실제 $r"; fi
+  r="$(_wrapper_single_item_result '# t\n- status: done (→ 설명)\n- related files: `rd-workflow/scripts/gone_x.sh`\n')"
+  if [ "$r" = "rc=0 warn=0" ]; then
+    pass "wrapper_shared(b): 'done (→ 설명)' 은 검사 대상 아님 (rc=0)"
+  else fail "wrapper_shared(b): 'done (→ 설명)' 기대 rc=0 warn=0, 실제 $r"; fi
+  r="$(_wrapper_single_item_result '# t\n- status: obsolete\n- related files: `rd-workflow/scripts/gone_x.sh`\n')"
+  if [ "$r" = "rc=0 warn=1" ]; then
+    pass "wrapper_shared(c): 'obsolete' 은 검사 대상 (rc=0, 부재 경고)"
+  else fail "wrapper_shared(c): 'obsolete' 기대 rc=0 warn=1, 실제 $r"; fi
+}
+
 test_all_present
 test_partial_missing_channel_separated
 test_all_missing
@@ -373,4 +408,5 @@ test_probe_handles_special_char_install_path
 test_selftest_empty_backlog_succeeds_and_propagates_error
 test_multi_file_middle_error
 test_wrapper_active_filter
+test_wrapper_shared_status_judgement
 exit $FAIL

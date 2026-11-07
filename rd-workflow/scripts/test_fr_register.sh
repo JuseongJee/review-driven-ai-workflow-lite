@@ -281,6 +281,9 @@ else
   echo "  (skip: git < 2.28 — reference-transaction 훅 없음)"
 fi
 
+# SIGINT 가 무시된 채 상속된 셸(비대화형 백그라운드 실행 등)은 INT trap 을 설치할 수 없어 INT 사례가 거짓 FAIL 한다. 한 번 감지한다.
+_int_ignored=0; [[ "$(bash -c 'kill -INT $$; echo survived' 2>/dev/null)" == survived ]] && _int_ignored=1
+env_skip() { printf 'env-skip: test_fr_register %s — SIGINT 가 무시된 채 상속된 셸(비대화형 백그라운드 실행 등)\n' "$1" >&2; }
 echo "== trap 보존: 실제 INT/TERM 전달 시 기존 핸들러·EXIT 체인·종료 코드 =="
 if [[ "$_gmaj" -gt 2 || ( "$_gmaj" -eq 2 && "$_gmin" -ge 28 ) ]]; then
   R="$T/r10"; mk_repo "$R"; W="$T/r10-wt"; ( cd "$R" && git worktree add -q -b fr/s "$W" main ); HK="$R/.git/hooks/reference-transaction"
@@ -291,14 +294,19 @@ if [[ "$_gmaj" -gt 2 || ( "$_gmaj" -eq 2 && "$_gmin" -ge 28 ) ]]; then
   [[ "$rc" == 77 && "$out" == *"result=skipped"*"reason=interrupted"*"SENTINEL-TERM"*"SENTINEL-EXIT quoted"* ]] && pass "TERM: 우리 보고 → 기존 TERM 핸들러(exit 77) → 기존 EXIT(인용 포함) 체인, rc 77" || fail "TERM 체인 — rc=$rc $out"
   [[ "$(cat "$R/$IDX")" == "$before_idx" && ! -e "$R/$ITEMS/$D-st1.md" && "$(cd "$R" && git rev-parse main)" == "$old" ]] && pass "TERM 체인 뒤 준비분 rollback·ref 불변" || fail "TERM rollback"
   # INT: 기존 INT 핸들러 없음 → 재송신으로 기본 동작(종료) 또는 우리 fallback 130; EXIT sentinel 은 실행
-  mk_hook prepared INT 1
-  add_fr "$W" st2; before_idx="$(cat "$R/$IDX")"
-  out="$(cd "$W" && TMPDIR="$TMPD" bash -c "echo \$\$ > $PIDF; trap 'echo SENTINEL-EXIT' EXIT; source rd-workflow/scripts/_fr_register_common.sh; fr_register_run st2" 2>&1)"; rc=$?
-  [[ "$rc" == 130 && "$out" == *"reason=interrupted"*"SENTINEL-EXIT"* && "$(cat "$R/$IDX")" == "$before_idx" && ! -e "$R/$ITEMS/$D-st2.md" ]] && pass "INT: 우리 보고 → 기존 EXIT 실행, rollback, rc 정확히 130" || fail "INT 체인 — rc=$rc $out"
-  # INT 에 기존 핸들러가 return 만 하는 경우 → 본문 실행 뒤 우리 코드 130
-  add_fr "$W" st3; before_idx="$(cat "$R/$IDX")"
-  out="$(cd "$W" && TMPDIR="$TMPD" bash -c "echo \$\$ > $PIDF; trap 'echo SENTINEL-INT-RETURN' INT; source rd-workflow/scripts/_fr_register_common.sh; fr_register_run st3" 2>&1)"; rc=$?
-  [[ "$rc" == 130 && "$out" == *"reason=interrupted"*"SENTINEL-INT-RETURN"* && ! -e "$R/$ITEMS/$D-st3.md" ]] && pass "INT: return 하는 기존 핸들러 → 본문 1회 실행 뒤 rc 130" || fail "INT return 체인 — rc=$rc $out"
+  if [[ "$_int_ignored" == 1 ]]; then
+    env_skip "INT: 우리 보고 → 기존 EXIT 실행, rollback, rc 정확히 130"
+    env_skip "INT: return 하는 기존 핸들러 → 본문 1회 실행 뒤 rc 130"
+  else
+    mk_hook prepared INT 1
+    add_fr "$W" st2; before_idx="$(cat "$R/$IDX")"
+    out="$(cd "$W" && TMPDIR="$TMPD" bash -c "echo \$\$ > $PIDF; trap 'echo SENTINEL-EXIT' EXIT; source rd-workflow/scripts/_fr_register_common.sh; fr_register_run st2" 2>&1)"; rc=$?
+    [[ "$rc" == 130 && "$out" == *"reason=interrupted"*"SENTINEL-EXIT"* && "$(cat "$R/$IDX")" == "$before_idx" && ! -e "$R/$ITEMS/$D-st2.md" ]] && pass "INT: 우리 보고 → 기존 EXIT 실행, rollback, rc 정확히 130" || fail "INT 체인 — rc=$rc $out"
+    # INT 에 기존 핸들러가 return 만 하는 경우 → 본문 실행 뒤 우리 코드 130
+    add_fr "$W" st3; before_idx="$(cat "$R/$IDX")"
+    out="$(cd "$W" && TMPDIR="$TMPD" bash -c "echo \$\$ > $PIDF; trap 'echo SENTINEL-INT-RETURN' INT; source rd-workflow/scripts/_fr_register_common.sh; fr_register_run st3" 2>&1)"; rc=$?
+    [[ "$rc" == 130 && "$out" == *"reason=interrupted"*"SENTINEL-INT-RETURN"* && ! -e "$R/$ITEMS/$D-st3.md" ]] && pass "INT: return 하는 기존 핸들러 → 본문 1회 실행 뒤 rc 130" || fail "INT return 체인 — rc=$rc $out"
+  fi
   tmp_clean "신호 체인"
   rm -f "$HK"
 else
@@ -325,7 +333,12 @@ out="$(cd "$R" && bash -c 'source rd-workflow/scripts/_fr_register_common.sh; _f
 echo "== trap 보존 / 비정상 종료 시 EXIT rollback =="
 R="$T/r8"; mk_repo "$R"; in_fr "$R" fr/e; add_fr "$R" e1
 out="$(cd "$R" && bash -c 'trap "echo SENTINEL-EXIT" EXIT; trap "echo SENTINEL-INT" INT; source rd-workflow/scripts/_fr_register_common.sh; fr_register_run e1 >/dev/null; trap -p EXIT; trap -p INT' 2>/dev/null)"
-[[ "$out" == *"trap -- 'echo SENTINEL-EXIT' EXIT"* && "$out" == *"'echo SENTINEL-INT'"* && "$out" == *"SENTINEL-EXIT" ]] && pass "정상 return 뒤 기존 EXIT/INT trap 원문 복원 + 기존 EXIT 본문 실행" || fail "trap 보존 — $out"
+if [[ "$_int_ignored" == 1 ]]; then
+  [[ "$out" == *"trap -- 'echo SENTINEL-EXIT' EXIT"* && "$out" == *"SENTINEL-EXIT" ]] && pass "정상 return 뒤 기존 EXIT trap 원문 복원 + 기존 EXIT 본문 실행" || fail "trap 보존(EXIT) — $out"
+  env_skip "정상 return 뒤 기존 INT trap 원문 복원"
+else
+  [[ "$out" == *"trap -- 'echo SENTINEL-EXIT' EXIT"* && "$out" == *"'echo SENTINEL-INT'"* && "$out" == *"SENTINEL-EXIT" ]] && pass "정상 return 뒤 기존 EXIT/INT trap 원문 복원 + 기존 EXIT 본문 실행" || fail "trap 보존 — $out"
+fi
 # prepared 상태에서 set -e 로 비정상 종료 → EXIT 핸들러가 rollback
 R="$T/r9"; mk_repo "$R"; W="$T/r9-wt"; ( cd "$R" && git worktree add -q -b fr/e "$W" main ); add_fr "$W" e2
 before_idx="$(cat "$R/$IDX")"; before_ls="$(cd "$R" && git ls-files -s)"; old="$(cd "$R" && git rev-parse main)"
@@ -413,6 +426,19 @@ add_fr "$R" ni1
 ! ( cd "$R" && git cat-file -e "main:$IDX" 2>/dev/null ) && pass "사전조건: main 에 인덱스 없음" || fail "사전조건 — main 에 인덱스 있음"
 out="$(reg "$R" ni1)"; rc=$?
 [[ "$rc" == 3 && "$out" == *"reason=git-error"* && "$out" != *"index-format"* ]] && pass "기본 브랜치 인덱스 없음: skipped git-error (index-format 아님)" || fail "기본 브랜치 인덱스 없음 — rc=$rc $out"
+
+# 기본 브랜치 머리행에 `관계` 칸이 없고 워킹트리는 6-a 로 이관된 상태 → 칸 수 검사(shape-mismatch) 전에 알기 쉬운 사유로 건너뛴다
+R="$T/r-hdr"; mk_repo "$R"; in_fr "$R" fr/hd
+( cd "$R" && blk="$(awk '/fr-index-migrate:begin/{f=1} f&&/^ *```bash/{g=1;next} g&&/^ *```/{exit} g{print}' "$SCRIPT_DIR/../claude_skills/fr/add.md" | sed 's/^   //')" && [[ -n "$blk" ]] && bash -c "$blk" )
+( cd "$R" && printf '| %s | hd1 | 요약 hd1 | tooling | idea | - | - | [상세](items/%s-hd1.md) |\n' "$D" "$D" >> "$IDX" && detail_of hd1 > "$ITEMS/$D-hd1.md" )
+[[ "$(cd "$R" && sed -n '/^| 날짜/p' "$IDX")" == *"우선순위 | 관계 | 상세"* ]] && pass "사전조건: 워킹트리 인덱스가 이관됨" || fail "사전조건 — 이관 안 됨"
+old_h="$(cd "$R" && git rev-parse main)"
+out="$(reg "$R" hd1)"; rc=$?
+[[ "$rc" == 3 && "$(line1 "$out")" == "result=skipped branch=main commit=- reason=index-header-mismatch" ]] && pass "머리행 불일치: 첫 줄 skipped index-header-mismatch" || fail "머리행 불일치 첫 줄 — rc=$rc $out"
+[[ "$(printf '%s\n' "$out" | grep -c '^result=')" == 1 ]] && pass "머리행 불일치: result= 줄 1개" || fail "result= 줄 수 — $out"
+[[ "$out" == *"6-a"* && "$out" == *"rd task fr-register --slug hd1"* ]] && pass "머리행 불일치: 6-a 와 재실행 명령 안내" || fail "안내 문장 — $out"
+[[ "$(cd "$R" && git rev-parse main)" == "$old_h" ]] && pass "머리행 불일치: main ref 불변 (회귀 확인)" || fail "main ref 가 움직임"
+tmp_clean "머리행 불일치"
 
 [[ "$(fx_snap "$TPL")" == "$SNAP0" ]] || fail "복제 원본이 시나리오 중 바뀜"
 echo "fr_register: PASS=$PASS FAIL=$FAIL"

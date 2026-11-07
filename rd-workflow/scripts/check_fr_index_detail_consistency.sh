@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # check_fr_index_detail_consistency.sh — FUTURE_REQUESTS.md 인덱스와 items/ 상세 파일의
-# 양방향 정합성을 검사한다. 진실 원천은 items/ 상세 파일이다(상세 파일의 status가
-# done/dropped/parked가 아니면 활성, 필드 자체가 없으면 fail-safe로 활성 취급).
+# 양방향 정합성을 검사한다. 진실 원천은 items/ 상세 파일이다.
+# status 판정 규칙(어느 키·어느 줄·첫 토큰·허용값)의 정본은 _fr_status.sh 다. 허용값이면 그
+# 분류(활성/비활성)를 따르고, 키 줄이 둘 다 없으면 fail-safe 로 활성 취급하며, 그 밖의 값은
+# 비표준으로 따로 보고하고 ①②④ 대조에서 뺀다.
 #
-# 검사 4종(전부 신호 전용, exit 0):
+# 검사 5종(전부 신호 전용, exit 0):
 #   ① 활성 상세 파일 중 인덱스에 대응 행이 없음
 #   ② 인덱스 행의 대응 상세 파일이 없거나, 있지만 비활성인데 인덱스에 남아 있음
 #   ③ 활성 상세 파일에 - status: / - kind: 필드 자체가 없음
 #   ④ 활성 + 인덱스 행 존재 양쪽 다 있는 경우, 인덱스 종류 컬럼과 상세 kind 값이 다름
+#   ⑤ 비표준 status(허용값 밖의 값, 키 줄은 있으나 값이 빔)
 #
 # 인덱스 파싱은 컬럼 "값"이 아니라 "위치"로 구조를 판단한다 — 종류·상태 컬럼 값이 enum
 # 밖(오타, status=done 잔존)이어도 그대로 추출해야 ②·④ 판정 대상에서 빠지지 않는다
@@ -32,6 +35,12 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=_fr_status.sh
+if ! source "${SCRIPT_DIR}/_fr_status.sh"; then
+  echo "check_fr_index_detail_consistency.sh: _fr_status.sh 를 읽지 못했습니다: '${SCRIPT_DIR}/_fr_status.sh'" >&2
+  exit 2
+fi
 
 ROOT=""
 while [[ $# -gt 0 ]]; do
@@ -71,6 +80,7 @@ EXEC_ERROR=0
 M=0
 P=0
 K=0
+S=0
 
 # 인덱스 행 → basename(items/<파일>.md) 매핑 (bash 3.2 호환, 연관배열 미사용)
 INDEX_BASENAMES=()
@@ -161,28 +171,15 @@ if [[ "$_find_rc" -ne 0 ]]; then
 fi
 
 ACTIVE_BASENAMES=()
+NONSTD_BASENAMES=()
+DET_BASES=()
+DET_STATUS=()
 N=0
 
-_read_field() {
-  # _read_field <file> <pattern> -> stdout: 값(트리밍) 또는 빈 문자열. 반환: 0=매치,
-  # 1=매치 없음(정상), 2=읽기 실행 실패
-  local file="$1" pattern="$2" line rc
-  line="$(grep -m1 "$pattern" "$file" 2>/dev/null)"
-  rc=$?
-  if [[ "$rc" -eq 0 ]]; then
-    line="${line#*:}"
-    line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    printf '%s' "$line"
-    return 0
-  elif [[ "$rc" -eq 1 ]]; then
-    return 1
-  else
-    return 2
-  fi
-}
-
-# items 필드 판독을 awk 1회로 한다. 파일마다 한 레코드(status 판독코드·값·kind 판독코드·값)를
-# 입력 순서대로 낸다. 판독코드는 _read_field 와 같다(0 매치·1 없음·2 읽기 실패).
+# items 필드 판독을 awk 1회로 한다. 파일마다 한 레코드(status 판독코드·값·분류·kind 판독코드·값)를
+# 입력 순서대로 낸다. status 판독코드: 0 값 있음·1 두 키 줄 없음·3 키 줄은 있으나 값 없음·2 읽기 실패.
+# 값은 키 뒤 문자열 전체(공용 규칙 frs_src_raw), 분류는 첫 토큰으로 판정한 active|inactive|nonstandard.
+# kind 판독코드: 0 매치·1 없음·2 읽기 실패.
 # getline < 파일 을 쓰는 이유: 빈 파일도 레코드를 내야 하고(FNR==1 이 오지 않음),
 # 읽기 실패가 awk 전체를 멈추지 않고 그 파일의 판독코드 2 로 남아야 한다.
 _ITEM_FILES=()
@@ -203,19 +200,23 @@ for f in "${_ITEM_FILES[@]+"${_ITEM_FILES[@]}"}"; do
 done
 _fields_out=""
 if [[ "${#_AWK_FILES[@]}" -gt 0 ]]; then
-  _fields_out="$(awk '
+  fr_status_awk_vars
+  _fields_out="$(awk "${FR_STATUS_AWK_ARGS[@]}" "$FR_STATUS_AWK"'
     function tv(s) { sub(/^[^:]*:/, "", s); sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
     BEGIN {
+      frs_init()
       for (i = 1; i < ARGC; i++) {
-        f = ARGV[i]; src = 1; krc = 1; sv = ""; kv = ""
+        f = ARGV[i]; krc = 1; kv = ""; ln = 0; frs_reset()
         while ((r = (getline line < f)) > 0) {
-          if (src == 1 && index(line, "- status:") == 1) { src = 0; sv = tv(line) }
-          if (krc == 1 && index(line, "- kind:") == 1)   { krc = 0; kv = tv(line) }
-          if (src == 0 && krc == 0) break
+          ln++
+          frs_feed(line, ln)
+          if (krc == 1 && index(line, "- kind:") == 1) { krc = 0; kv = tv(line) }
         }
-        if (r < 0) { src = 2; krc = 2; sv = ""; kv = "" }
         close(f)
-        printf "%d\034%s\034%d\034%s\n", src, sv, krc, kv
+        if (r < 0) { printf "2\034\034\0342\034\n"; continue }
+        raw = frs_src_raw()
+        src = (raw != "" ? 0 : (frs_has_key() ? 3 : 1))
+        printf "%d\034%s\034%s\034%d\034%s\n", src, raw, frs_class(frs_value()), krc, kv
       }
       printf "#N\034%d\n", ARGC - 1
       exit 0
@@ -236,9 +237,9 @@ while [[ "$_i" -lt "${#_ITEM_FILES[@]}" ]]; do
     f="${_ITEM_FILES[$_i]}"; _i=$((_i + 1))
     base="${f##*/}"
     if [[ "${_RD[$((_i - 1))]}" -eq 1 ]]; then
-      IFS=$'\034' read -r status_rc status_val kind_rc kind_val
+      IFS=$'\034' read -r status_rc status_val status_class kind_rc kind_val
     else
-      status_rc=2; status_val=""; kind_rc=2; kind_val=""
+      status_rc=2; status_val=""; status_class=""; kind_rc=2; kind_val=""
     fi
     if [[ "$status_rc" -eq 2 ]]; then
       echo "items/${base}: 필드 읽기 실패 (status, grep rc=2)" >&2
@@ -249,17 +250,28 @@ while [[ "$_i" -lt "${#_ITEM_FILES[@]}" ]]; do
       EXEC_ERROR=1
     fi
 
+    # 판독코드 1(두 키 줄 없음)·2(읽기 실패)는 활성(fail-safe), 값이 있거나 빈 값 줄만 있는 비표준은 ⑤ 로 보고하고 대조에서 뺀다.
     active=1
-    case "$status_val" in
-      done|dropped|parked) active=0 ;;
-    esac
+    status_tok="${status_val%%[ $'\t']*}"
+    DET_BASES+=("$base"); DET_STATUS+=("$status_tok")
+    if [[ "$status_rc" -eq 0 || "$status_rc" -eq 3 ]]; then
+      case "$status_class" in
+        inactive) active=0 ;;
+        nonstandard)
+          active=0
+          S=$((S + 1))
+          NONSTD_BASENAMES+=("$base")
+          echo "items/${base}: 비표준 status (값: ${status_val:-(비어 있음)}) — 허용값: ${FR_STATUS_ACTIVE} ${FR_STATUS_INACTIVE}" >&2
+          ;;
+      esac
+    fi
 
     if [[ "$active" -eq 1 ]]; then
       N=$((N + 1))
       ACTIVE_BASENAMES+=("$base")
 
       if [[ "$status_rc" -eq 1 ]]; then
-        echo "items/${base}: 활성인데 - status: 필드 없음" >&2
+        echo "items/${base}: 활성인데 - status:·- 상태: 필드 없음" >&2
         K=$((K + 1))
       fi
       if [[ "$kind_rc" -eq 1 ]]; then
@@ -304,9 +316,16 @@ for ib in "${INDEX_BASENAMES[@]+"${INDEX_BASENAMES[@]}"}"; do
     for ab in "${ACTIVE_BASENAMES[@]+"${ACTIVE_BASENAMES[@]}"}"; do
       [[ "$ab" == "$ib" ]] && { is_active=1; break; }
     done
+    for ab in "${NONSTD_BASENAMES[@]+"${NONSTD_BASENAMES[@]}"}"; do
+      [[ "$ab" == "$ib" ]] && { is_active=2; break; }
+    done
     if [[ "$is_active" -eq 0 ]]; then
-      det_status="$(_read_field "$detail_file" '^- status:' 2>/dev/null)"
-      [[ -z "$det_status" ]] && det_status="(필드 없음)"
+      det_status="(필드 없음)"
+      _di=0
+      for ab in "${DET_BASES[@]+"${DET_BASES[@]}"}"; do
+        [[ "$ab" == "$ib" ]] && { det_status="${DET_STATUS[$_di]:-(필드 없음)}"; break; }
+        _di=$((_di + 1))
+      done
       echo "items/${ib}: 인덱스(${INDEX_FILE##*/}:${idx_line})에 남아 있으나 상세 status=${det_status} (비활성)" >&2
       K=$((K + 1))
     fi
@@ -314,7 +333,7 @@ for ib in "${INDEX_BASENAMES[@]+"${INDEX_BASENAMES[@]}"}"; do
   idx=$((idx + 1))
 done
 
-echo "검사 완료 — 활성 상세 ${N}건, 인덱스 행 ${M}건(파싱 실패 ${P}건 제외), 불일치 ${K}건"
+echo "검사 완료 — 활성 상세 ${N}건, 인덱스 행 ${M}건(파싱 실패 ${P}건 제외), 불일치 ${K}건, 비표준 status ${S}건"
 
 if [[ "$EXEC_ERROR" -eq 1 ]]; then
   exit 2

@@ -19,6 +19,18 @@ i=$(cat "$RD_STUB_COUNTER" 2>/dev/null || echo 0)
 codes=($RD_STUB_CODES)
 code="${codes[$i]:-30}"
 echo $((i + 1)) > "$RD_STUB_COUNTER"
+# 비용 기록 — RD_STUB_COSTS(공백 구분, 호출 순서별 ok:<USD>|unk:<사유>|none|gone)를 같은 카운터로 읽어 덧붙인다.
+# gone 은 드레인 도중 기록 파일이 사라진 경우(다른 batch 정리 등)를 흉내 낸다.
+if [ -n "${RD_AUTOPILOT_COST_FILE:-}" ]; then
+  # shellcheck disable=SC2206
+  costs=($RD_STUB_COSTS)
+  cspec="${costs[$i]:-none}"
+  case "$cspec" in
+    ok:*)  printf 'cost\tok\t%s\n' "$(awk -v v="${cspec#ok:}" 'BEGIN{printf "%.6f", v}')" >> "$RD_AUTOPILOT_COST_FILE" ;;
+    unk:*) printf 'cost\tunknown\t%s\n' "${cspec#unk:}" >> "$RD_AUTOPILOT_COST_FILE" ;;
+    gone)  rm -f "$RD_AUTOPILOT_COST_FILE" ;;
+  esac
+fi
 if [ -n "${RD_STUB_ENVLOG:-}" ]; then
   echo "FR=${RD_AUTOPILOT_FR:-} MODE=${RD_AUTOPILOT_MODE:-} FINISH=${RD_FINISH_POLICY:-}" >> "$RD_STUB_ENVLOG"
 fi
@@ -51,7 +63,7 @@ run_case() {
   # 주의: BSD/macOS env 는 옵션을 환경 대입보다 **앞**에 두어야 한다 (test_review_wait.sh probe() 와 동일).
   #       -u 를 "$@" 앞에 두므로, 호출부가 이 변수를 의도적으로 넘기면 그 대입이 이긴다.
   out=$(env -u RD_AUTOPILOT_FR -u RD_AUTOPILOT_MODE -u RD_FINISH_POLICY \
-        -u RD_RALPH_MAX_ITER -u RD_RALPH_NONPROGRESS_LIMIT "$@" \
+        -u RD_RALPH_MAX_ITER -u RD_RALPH_NONPROGRESS_LIMIT -u RD_AUTOPILOT_COST_FILE "$@" \
         RD_STUB_CODES="$codes" RD_STUB_COUNTER="$counter" \
         RD_AUTOPILOT_OUTCOME_FILE="$outcome" \
         RD_RALPH_WRAPPER_CMD="bash $STUB" \
@@ -125,6 +137,21 @@ assert_contains "재개 판정 불가 (resume-undetermined)"
 assert_invocations 1
 assert_detail_in_summary "$RDETAIL"
 
+# 발행 실패 3종도 즉시 중단한다 — 다음 FR 로 넘어가면 실패한 발행 위에 작업이 쌓인다.
+PDETAIL=$'사유: s\n로그: l\n다음: n'
+run_case "publish-incomplete 즉시 중단" 1 "20 0 30" RD_STUB_REASON=publish-incomplete RD_STUB_DETAIL="$PDETAIL"
+assert_contains "발행 중간 상태 (publish-incomplete)"
+assert_contains "다음: n"
+assert_invocations 1
+run_case "publish-failed 즉시 중단" 1 "20 0 30" RD_STUB_REASON=publish-failed RD_STUB_DETAIL="$PDETAIL"
+assert_contains "발행 실패 (publish-failed)"
+assert_contains "다음: n"
+assert_invocations 1
+run_case "publish-unsafe 즉시 중단" 1 "20 0 30" RD_STUB_REASON=publish-unsafe RD_STUB_DETAIL="$PDETAIL"
+assert_contains "발행 후 안전 검사 실패 (publish-unsafe)"
+assert_contains "다음: n"
+assert_invocations 1
+
 # drain 의 최종 요약 구역에 대기 상세 2건이 "행 전체" 로 남는지 본다.
 DETAIL='alpha-task	대기(선행: lead-task)	선행 lead-task 완료 필요
 beta-task	오류(series)	fr_relations.sh validate 로 관계 데이터 수정'
@@ -165,6 +192,95 @@ if grep -q "FINISH=push" "$ENVLOG2"; then
 else
   echo "  FAIL [env] override 불일치: $(cat "$ENVLOG2")"; fail=1
 fi
+
+# --- 정리 잔여(cleanup-pending) 요약 표시 (T3) ---
+# 전용 stub·러너. 기존 STUB·run_case 는 건드리지 않는다.
+CP_HELPER="${SCRIPT_DIR}/lifecycle/cleanup_pending.sh"
+CP_STUB="${TMP}/cp_stub.sh"
+cat > "$CP_STUB" <<'CPSTUBEOF'
+#!/usr/bin/env bash
+i=$(cat "$RD_STUB_COUNTER" 2>/dev/null); i="${i:-0}"
+# shellcheck disable=SC2206
+codes=($RD_CP_CODES)
+code="${codes[$i]:-30}"
+echo $((i + 1)) > "$RD_STUB_COUNTER"
+if [ "$i" -eq 0 ] && [ -n "${RD_CP_WRITE:-}" ]; then
+  for spec in $RD_CP_WRITE; do
+    slug="${spec%%:*}"; n="${spec##*:}"; k=0
+    while [ "$k" -lt "$n" ]; do
+      k=$((k + 1)); printf 'worktree\tw%s\t사유\t복구\n' "$k"
+    done | bash "$RD_CP_HELPER" write "$slug"
+  done
+fi
+if [ "$code" -eq 0 ] && [ -n "${RD_AUTOPILOT_OUTCOME_FILE:-}" ]; then
+  echo completed > "$RD_AUTOPILOT_OUTCOME_FILE"
+  [ -n "${RD_CP_OUTCOME_EXTRA:-}" ] && printf '%s\n' "$RD_CP_OUTCOME_EXTRA" >> "$RD_AUTOPILOT_OUTCOME_FILE"
+fi
+exit "$code"
+CPSTUBEOF
+chmod +x "$CP_STUB"
+
+# run_cp_case <이름> <기대 exit> <codes> [env...] — CP_SETUP 이 있으면 임시 저장소 안에서 먼저 eval 한다.
+run_cp_case() {
+  local name="$1" expect="$2" codes="$3"; shift 3
+  local repo
+  repo="$(mktemp -d "${TMP}/cprepo.XXXXXX")" || { echo "  FAIL [$name] mktemp"; fail=1; return 1; }
+  local counter="${repo}.counter"; : > "$counter"
+  local outcome="${repo}.outcome"; : > "$outcome"
+  local out ec
+  out=$( cd "$repo" && git init -q . && { [ -z "${CP_SETUP:-}" ] || eval "$CP_SETUP"; } &&
+        env -u RD_AUTOPILOT_FR -u RD_AUTOPILOT_MODE -u RD_FINISH_POLICY \
+        -u RD_RALPH_MAX_ITER -u RD_RALPH_NONPROGRESS_LIMIT -u RD_AUTOPILOT_COST_FILE "$@" \
+        RD_CP_CODES="$codes" RD_STUB_COUNTER="$counter" RD_CP_HELPER="$CP_HELPER" \
+        RD_AUTOPILOT_OUTCOME_FILE="$outcome" \
+        RD_RALPH_WRAPPER_CMD="bash $CP_STUB" \
+        bash "$DRAIN" 2>&1 ); ec=$?
+  if [ "$ec" -ne "$expect" ]; then
+    echo "  FAIL [$name] exit 기대 $expect, 실제 $ec"; echo "$out" | sed 's/^/    /'; fail=1
+  else
+    echo "  ok [$name] exit $ec"
+  fi
+  LAST_OUT="$out"
+}
+
+assert_not_contains() {
+  case "$LAST_OUT" in
+    *"$1"*) echo "  FAIL [not-contains] '$1' 있음"; echo "$LAST_OUT" | sed 's/^/    /'; fail=1 ;;
+    *) echo "  ok [not-contains] $1" ;;
+  esac
+}
+
+CP_SETUP=""
+run_cp_case "T3-1 기록 없음" 0 "0 30";                       assert_not_contains "잔여(cleanup-pending)"
+run_cp_case "T3-2 slug 별 항목 합" 0 "0 30" RD_CP_WRITE="sa:2 sb:1"
+assert_contains "잔여(cleanup-pending): 3건 (sa 2건, sb 1건)"
+CP_SETUP='printf "worktree\tw\tr\tc\n" | bash "$RD_CP_HELPER_SETUP" write old && touch -t 200001010000 "$(git rev-parse --path-format=absolute --git-common-dir)/rd-workflow/archive-cleanup-pending/old"'
+CP_SETUP="export RD_CP_HELPER_SETUP='$CP_HELPER'; $CP_SETUP"
+run_cp_case "T3-3 드레인 전 기록 제외" 0 "0 30";             assert_not_contains "잔여(cleanup-pending)"
+CP_SETUP='mkdir -p "$(git rev-parse --path-format=absolute --git-common-dir)/rd-workflow" && : > "$(git rev-parse --path-format=absolute --git-common-dir)/rd-workflow/archive-cleanup-pending"'
+run_cp_case "T3-4 조회 실패" 0 "0 30";                       assert_contains "잔여(cleanup-pending): 조회 실패"
+CP_SETUP=""
+run_cp_case "T3-5 기록 실패 보고" 0 "0 30" RD_CP_OUTCOME_EXTRA="cleanup-record-failed sx /r/x.md"
+assert_contains "잔여(cleanup-pending): 기록 실패 1건 (sx — 기록 /r/x.md)"
+
+# --- 실행 비용 합계 (spec D6) ---
+run_case "비용 합계: 일부 누락·확인 불가" 0 "0 0 0 30" RD_STUB_COSTS="ok:0.5 ok:0.25 unk:x none"
+assert_contains '실행 비용 합계: $0.7500 (정가 환산, 리뷰 도구 비용 제외) · wrapper 호출 4회 · 확인 불가 1회'
+assert_contains '비용 기록 없는 호출 1회'
+assert_contains '실제 비용은 더 큼'
+run_case "비용 합계: 확인 불가만" 0 "30" RD_STUB_COSTS="unk:x"
+assert_contains '실행 비용 합계: 확인 불가 — wrapper 호출 1회'
+PRE="${TMP}/precost"; printf 'cost\tok\t9.000000\n' > "$PRE"
+run_case "비용 합계: 호출자 파일은 시작 이후 줄만" 0 "0 30" RD_AUTOPILOT_COST_FILE="$PRE" RD_STUB_COSTS="ok:0.5 none"
+assert_contains '$0.5000'
+assert_not_contains '9.5'
+if [ "$(wc -l < "$PRE" | tr -d ' ')" = "2" ]; then echo "  ok [cost] 호출자 파일 보존·덧붙임"; else echo "  FAIL [cost] 호출자 파일이 잘렸거나 변경됨"; fail=1; fi
+run_case "비용 합계: 읽을 수 없는 경로" 0 "30" RD_AUTOPILOT_COST_FILE="${TMP}/nodir/x/cost" RD_STUB_COSTS="ok:0.5"
+assert_contains '집계 불가'
+assert_not_contains '$0'
+run_case "비용 합계: 드레인 도중 기록 파일이 사라짐" 0 "0 30" RD_STUB_COSTS="ok:0.5 gone"
+assert_contains '집계 불가 — 비용 기록 파일을 읽을 수 없음'
+assert_not_contains '$0'
 
 if [ "$fail" -ne 0 ]; then echo "test_ralph_drain: FAIL"; exit 1; fi
 echo "test_ralph_drain: PASS"

@@ -83,11 +83,42 @@ claude_format_line() {
   esac
   # **빈 문자열을 돌려주지 않는다.** 엔진은 빈 값을 받으면 원본으로 떨어지므로 절단이
   # 무효가 된다. 생략 부호를 포함해 200자 이하로 맞춘다(199 + `…`).
-  if [ "${#out}" -gt 200 ]; then
-    printf '%s…' "${out:0:199}"
-  else
-    printf '%s' "$out"
+  local probe='…'
+  if [ "${#probe}" -eq 1 ]; then
+    # UTF-8 로캘: 길이와 절단이 글자 단위다.
+    if [ "${#out}" -gt 200 ]; then
+      printf '%s…' "${out:0:199}"
+    else
+      printf '%s' "$out"
+    fi
+    return 0
   fi
+  # 그 밖의 로캘(LANG 이 없는 C 등)은 길이와 절단이 바이트 단위라 한글을 글자 중간에서
+  # 자른다. 바이트로 고정해 생략 부호(3바이트)를 포함해 200바이트 이하로 맞추고,
+  # 끝에 남은 미완성 UTF-8 글자를 버린다.
+  local LC_ALL=C
+  if [ "${#out}" -le 200 ]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  local cut="${out:0:197}" n=0 need=1
+  while [ "$n" -lt 3 ]; do               # 끝의 이어지는 바이트(10xxxxxx)를 센다
+    case "${cut: -1}" in
+      [$'\x80'-$'\xbf']) cut="${cut%?}"; n=$((n+1)) ;;
+      *) break ;;
+    esac
+  done
+  case "${cut: -1}" in                   # 그 앞 선두 바이트가 요구하는 글자 길이
+    [$'\xc0'-$'\xdf']) need=2 ;;
+    [$'\xe0'-$'\xef']) need=3 ;;
+    [$'\xf0'-$'\xf7']) need=4 ;;
+  esac
+  if [ "$need" -gt $((n+1)) ]; then
+    cut="${cut%?}"                       # 미완성 글자는 선두 바이트까지 버린다
+  else
+    cut="${out:0:197}"                   # 마지막 글자가 완성돼 있으면 그대로 둔다
+  fi
+  printf '%s…' "$cut"
 }
 
 session_dir="${SESSION_PATH}"
@@ -157,7 +188,7 @@ cleanup() {
     watchdog_dir=""
   fi
 
-  # process group 종료 — 리더 생존과 독립. TERM → KILL_GRACE → KILL.
+  # process group 종료 — 리더 생존과 독립. TERM → (그룹이 사라질 때까지 최대 KILL_GRACE 폴링) → KILL.
   # 판정이 「없음」(1)이 아니면 신호를 보낸다 — ps 가 실패해 판정 불가(2)여도 보낸다.
   # 판정 불가의 대표 원인인 권한 거부는 kill 도 같은 EPERM 으로 실패하므로 남의 그룹에 닿지 않는다.
   local gs=0
@@ -165,14 +196,23 @@ cleanup() {
     gs=0; rw_group_alive "$claude_pgid" || gs=$?
     if [ "$gs" -ne 1 ]; then
       kill -- -"$claude_pgid" 2>/dev/null || true
-      sleep "${RW_KILL_GRACE:-3}" || true  # 그룹 단위 신호로 sleep 이 먼저 끝나도 set -e 가 cleanup 을 끊지 않게 한다
-      gs=0; rw_group_alive "$claude_pgid" || gs=$?
-      [ "$gs" -ne 1 ] && { kill -9 -- -"$claude_pgid" 2>/dev/null || true; }
+      # TERM 뒤 최대 grace 까지만 기다린다 — 그룹이 먼저 사라지면 바로 다음 단계로 간다.
+      gs=0; rw_group_wait_gone "$claude_pgid" "${RW_KILL_GRACE:-3}" || gs=$?
+      if [ "$gs" -ne 1 ]; then
+        kill -9 -- -"$claude_pgid" 2>/dev/null || true
+        # KILL 이 반영되기까지 몇 ms 걸린다 — 최대 2초 기다려 뒤의 발행 판정과 경쟁하지 않게 한다.
+        rw_group_wait_gone "$claude_pgid" 2 || true
+      fi
     fi
   elif [ -z "$claude_pgid" ] && [ -n "$claude_pid" ] && kill -0 "$claude_pid" 2>/dev/null; then
     kill "$claude_pid" 2>/dev/null || true
-    sleep "${RW_KILL_GRACE:-3}" || true
-    kill -0 "$claude_pid" 2>/dev/null && kill -9 "$claude_pid" 2>/dev/null || true
+    _w=0; _lim=$(( ${RW_KILL_GRACE:-3} * 10 ))
+    while kill -0 "$claude_pid" 2>/dev/null && [ "$_w" -lt "$_lim" ]; do sleep 0.1 || true; _w=$(( _w + 1 )); done
+    if kill -0 "$claude_pid" 2>/dev/null; then
+      kill -9 "$claude_pid" 2>/dev/null || true
+      _w=0
+      while kill -0 "$claude_pid" 2>/dev/null && [ "$_w" -lt 20 ]; do sleep 0.1 || true; _w=$(( _w + 1 )); done
+    fi
   fi
   if [ -n "$claude_pid" ]; then
     wait "$claude_pid" 2>/dev/null || true

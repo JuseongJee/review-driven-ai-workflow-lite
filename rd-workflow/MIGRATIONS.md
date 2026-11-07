@@ -80,6 +80,91 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 **실행 절차**:
 1. 선행 검증: 프로젝트에 `.claude/settings.json`이 있으면 먼저 `python3 -m json.tool .claude/settings.json > /dev/null`로 parse를 검증합니다. 실패(깨진 JSON)하면 병합을 시도하지 않고 사용자에게 보고한 뒤 선택을 받습니다 — (a) 수동 복구 후 재시도, (b) 기존 파일을 `.claude/settings.json.bak`으로 백업하고 clone된 파일로 대체. 파일이 없으면(`.claude/` 디렉토리 부재 포함) `mkdir -p .claude && cp "<임시 clone 경로>/.claude/settings.json" .claude/`로 복사하고 2번(hooks 대조)을 건너뜁니다.
 2. hooks 대조: clone된 템플릿 `.claude/settings.json`의 각 hook 항목(event → matcher → command 단위)을 프로젝트 `.claude/settings.json`과 대조하고, **부재 항목만** 같은 event/matcher 아래에 추가합니다.
+   아래 스니펫을 프로젝트 루트에서 실행합니다. 인자는 clone 된 템플릿의 `.claude/settings.json` 경로입니다. 출력의 `M003: added` 줄과 `+` 줄을 사용자에게 보고합니다.
+   ```bash
+   python3 - "<임시 clone 경로>/.claude/settings.json" <<'PY'
+   import json, os, sys, tempfile
+
+   proj_p = ".claude/settings.json"
+   try:
+       tpl = json.load(open(sys.argv[1], encoding="utf-8"))
+   except Exception as e:
+       print("M003 실패: 템플릿 settings 를 읽지 못했습니다 (%s)" % e)
+       sys.exit(1)
+   try:
+       proj = json.load(open(proj_p, encoding="utf-8"))
+   except Exception as e:
+       print("M003 실패: 프로젝트 settings 를 읽지 못했습니다 (%s)" % e)
+       sys.exit(1)
+   if not isinstance(proj, dict):
+       print("M003 실패: settings 최상위가 객체가 아닙니다")
+       sys.exit(1)
+   hooks = proj.get("hooks", {}) if "hooks" in proj else {}
+   if not isinstance(hooks, dict):
+       print("M003 실패: hooks 가 객체가 아닙니다")
+       sys.exit(1)
+
+   for event, gs in hooks.items():
+       if not isinstance(gs, list) or any(not isinstance(g, dict) or not isinstance(g.get("hooks", []), list) for g in gs):
+           print("M003 실패: hooks.%s 의 형식이 올바르지 않습니다" % event)
+           sys.exit(1)
+
+   def triples(cfg):
+       out = set()
+       for event, gs in (cfg.get("hooks") or {}).items():
+           for g in gs:
+               for h in g.get("hooks", []):
+                   if isinstance(h, dict) and isinstance(h.get("command"), str):
+                       out.add((event, g.get("matcher", ""), h["command"]))
+       return out
+
+   have = triples(proj)
+   added = []
+   for event, gs in (tpl.get("hooks") or {}).items():
+       for g in gs:
+           matcher = g.get("matcher", "")
+           for h in g.get("hooks", []):
+               if not (isinstance(h, dict) and isinstance(h.get("command"), str)):
+                   continue
+               key = (event, matcher, h["command"])
+               if key in have:
+                   continue
+               pgs = hooks.setdefault(event, [])
+               tgt = next((pg for pg in pgs if pg.get("matcher", "") == matcher), None)
+               if tgt is None:
+                   tgt = {k: v for k, v in g.items() if k != "hooks"}
+                   tgt["hooks"] = []
+                   pgs.append(tgt)
+               tgt.setdefault("hooks", []).append(dict(h))
+               have.add(key)
+               added.append(key)
+
+   if not added:
+       print("M003: 해당 없음")
+       sys.exit(0)
+   proj["hooks"] = hooks
+   rendered = (json.dumps(proj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+   # 같은 디렉터리 임시 파일에 다 쓴 뒤 원자 교체합니다 — 쓰는 도중 실패해도 원본이 남습니다.
+   tmp = None
+   try:
+       # 심링크면 링크가 가리키는 실제 파일 자리에서 교체합니다 — 링크 자리에 일반 파일을 두면 공유 설정이 끊깁니다.
+       target = os.path.realpath(proj_p)
+       fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".settings.json.m003.")
+       with os.fdopen(fd, "wb") as f:
+           f.write(rendered)
+       os.chmod(tmp, os.stat(target).st_mode & 0o7777)  # mkstemp 의 0600 대신 원본 권한을 잇습니다
+       os.replace(tmp, target)
+   except Exception as e:
+       if tmp is not None:
+           try: os.unlink(tmp)
+           except OSError: pass
+       print("M003 실패: 저장 중 오류 — 원본이 유지됩니다 (%s)" % e)
+       sys.exit(1)
+   print("M003: added %d" % len(added))
+   for event, matcher, cmd in added:
+       print("  + %s / %s / %s" % (event, matcher or "(matcher 없음)", cmd))
+   PY
+   ```
 3. `.gitignore` 대조: clone된 템플릿 `.gitignore`의 유효 라인별로 프로젝트 `.gitignore`에 정확 일치하는지 검사하고, **부재 라인만** 파일 끝에 추가합니다:
    ```bash
    while IFS= read -r line || [[ -n "$line" ]]; do
@@ -124,7 +209,7 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 2. 아래 스니펫으로 제거 대상 식별·제거를 수행합니다 (프로젝트 루트에서 실행, `<임시 clone 경로>`를 실제 경로로 치환):
    ```bash
    python3 - "<임시 clone 경로>" <<'PY'
-   import json, os, re, sys
+   import json, os, re, sys, tempfile
 
    clone = sys.argv[1]
    proj_path = ".claude/settings.json"
@@ -171,9 +256,23 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
            del hooks[event]
 
    if removed:
-       with open(proj_path, "w") as f:
-           json.dump(proj, f, indent=2, ensure_ascii=False)
-           f.write("\n")
+       rendered = (json.dumps(proj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+       # 같은 디렉터리 임시 파일에 다 쓴 뒤 원자 교체합니다 — 쓰는 도중 실패해도 원본이 남습니다.
+       tmp = None
+       try:
+           # 심링크면 링크가 가리키는 실제 파일 자리에서 교체합니다 — 링크 자리에 일반 파일을 두면 공유 설정이 끊깁니다.
+           target = os.path.realpath(proj_path)
+           fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".settings.json.m005.")
+           with os.fdopen(fd, "wb") as f:
+               f.write(rendered)
+           os.chmod(tmp, os.stat(target).st_mode & 0o7777)  # mkstemp 의 0600 대신 원본 권한을 잇습니다
+           os.replace(tmp, target)
+       except Exception as e:
+           if tmp is not None:
+               try: os.unlink(tmp)
+               except OSError: pass
+           print("M005 실패: 저장 중 오류 — 원본이 유지됩니다 (%s)" % e)
+           sys.exit(1)
        for event, matcher, cmd in removed:
            print(f"removed: {event} / {matcher or '(matcher 없음)'} / {cmd}")
    else:
@@ -336,13 +435,16 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
    rendered = (json.dumps(cfg, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
    # 임시 파일 생성까지 try 안에 둡니다 — 디렉터리 쓰기 권한이 없는 경우가 실제로 있고,
    # 밖에 두면 그 실패가 traceback 으로 터져 "원본은 유지된다" 는 보장이 사용자에게 보이지 않습니다.
-   d = os.path.dirname(os.path.abspath(path)) or "."
+   # 심링크면 링크가 가리키는 실제 파일 자리에서 교체합니다 — 링크 자리에 일반 파일을 두면 공유 설정이 끊깁니다.
+   target = os.path.realpath(path)
+   d = os.path.dirname(target) or "."
    tmp = None
    try:
        fd, tmp = tempfile.mkstemp(dir=d, prefix=".settings.json.m008.")
        with os.fdopen(fd, "wb") as f:
            f.write(rendered)
-       os.replace(tmp, path)          # 원자 교체
+       os.chmod(tmp, os.stat(target).st_mode & 0o7777)  # mkstemp 의 0600 대신 원본 권한을 잇습니다
+       os.replace(tmp, target)        # 원자 교체
    except Exception as e:
        if tmp is not None:
            try: os.unlink(tmp)
@@ -669,3 +771,101 @@ git commit -m "chore: 추적 중인 .turn_ready 마커 추적 해제"
 - **완료 확인**: `git ls-files | grep -c '\.turn_ready'` 가 `0` 이면 끝입니다.
 - 과거 커밋에 남은 마커는 이력 문제라 이 안내의 범위 밖입니다.
 
+
+## M015: 템플릿 permissions.allow 부재 규칙 추가 (`.claude/settings.json`)
+
+**조건**: 프로젝트 `.claude/settings.json` 이 있고, clone 된 템플릿 `.claude/settings.json` 의 `permissions.allow` 규칙 가운데 프로젝트 `permissions.allow` 에 없는 것이 하나 이상 있을 때. 프로젝트에 settings 가 없으면 M003 이 템플릿 파일을 통째로 복사하므로(permissions 포함) 이 항목은 해당 없음입니다.
+
+**실행 순서**: M005 → M008 → M003 다음(4단계 안)입니다. hooks 와 독립이므로 순서 의존은 없습니다.
+
+**왜 필요한가**: 템플릿이 리뷰 턴 실행과 검증 실행 스크립트의 권한 허용 목록을 배포하기 시작했습니다. 기존 소비 프로젝트는 지금까지 `permissions` 가 없는 settings 를 받았으므로, 이 항목이 없으면 새 목록이 전파되지 않습니다.
+
+**계약**:
+- 선행 검증: JSON parse 에 실패하면 파일을 바꾸지 않고 `M015 실패: …` 로 보고합니다.
+- `permissions` 키가 없으면 빈 dict 로, `allow` 키가 없으면 빈 list 로 만들어 진행합니다. 지금까지 배포된 settings 의 정상 상태가 키 부재입니다.
+- 키가 있는데 타입이 다르면(`null` 포함 — `permissions` 가 dict 가 아니거나 `allow` 가 list 가 아님) `M015 실패: …` 를 출력하고 파일을 바꾸지 않습니다.
+- 템플릿 allow 순서대로, 프로젝트 allow 에 정확히 일치하는 문자열이 없는 규칙만 끝에 추가합니다.
+- `deny`·`ask`·`defaultMode` 등 다른 키와 기존 규칙의 순서·값은 바꾸지 않습니다. 프로젝트 `deny`·`ask` 에 같은 문자열이 있는 규칙도 추가합니다. deny 가 우선하므로 프로젝트 정책은 유지됩니다.
+- 추가가 있을 때만 다시 씁니다(`indent=2`, `ensure_ascii=False`, 끝 개행). 출력은 `M015: added <N>` 과 추가한 규칙 목록, 또는 `M015: 해당 없음` 입니다.
+- 두 번째 실행은 `M015: 해당 없음` 이고 파일을 바꾸지 않습니다.
+
+**실행 절차**: 아래 스니펫을 프로젝트 루트에서 실행합니다. 인자는 clone 된 템플릿의 `.claude/settings.json` 경로입니다.
+
+```bash
+python3 - "<임시 clone 경로>/.claude/settings.json" <<'PY'
+import json, os, sys, tempfile
+
+proj_p = ".claude/settings.json"
+try:
+    tpl = json.load(open(sys.argv[1], encoding="utf-8"))
+    tpl_allow = tpl["permissions"]["allow"]
+    if not isinstance(tpl_allow, list):
+        raise TypeError("템플릿 permissions.allow 가 list 가 아닙니다")
+except Exception as e:
+    print("M015 실패: 템플릿 settings 를 읽지 못했습니다 (%s)" % e)
+    sys.exit(1)
+try:
+    proj = json.load(open(proj_p, encoding="utf-8"))
+except FileNotFoundError:
+    print("M015: 해당 없음 (.claude/settings.json 없음)")
+    sys.exit(0)
+except Exception as e:
+    print("M015 실패: 프로젝트 settings 를 읽지 못했습니다 (%s)" % e)
+    sys.exit(1)
+if not isinstance(proj, dict):
+    print("M015 실패: settings 최상위가 객체가 아닙니다")
+    sys.exit(1)
+perms = proj.get("permissions", {}) if "permissions" in proj else {}
+if not isinstance(perms, dict):
+    print("M015 실패: permissions 가 객체가 아닙니다")
+    sys.exit(1)
+allow = perms.get("allow", []) if "allow" in perms else []
+if not isinstance(allow, list):
+    print("M015 실패: permissions.allow 가 list 가 아닙니다")
+    sys.exit(1)
+added = [r for r in tpl_allow if r not in allow]
+if not added:
+    print("M015: 해당 없음")
+    sys.exit(0)
+perms["allow"] = allow + added
+proj["permissions"] = perms
+rendered = (json.dumps(proj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+# 같은 디렉터리 임시 파일에 다 쓴 뒤 원자 교체합니다 — 쓰는 도중 실패해도 원본이 남습니다.
+tmp = None
+try:
+    # 심링크면 링크가 가리키는 실제 파일 자리에서 교체합니다 — 링크 자리에 일반 파일을 두면 공유 설정이 끊깁니다.
+    target = os.path.realpath(proj_p)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".settings.json.m015.")
+    with os.fdopen(fd, "wb") as f:
+        f.write(rendered)
+    os.chmod(tmp, os.stat(target).st_mode & 0o7777)  # mkstemp 의 0600 대신 원본 권한을 잇습니다
+    os.replace(tmp, target)
+except Exception as e:
+    if tmp is not None:
+        try: os.unlink(tmp)
+        except OSError: pass
+    print("M015 실패: 저장 중 오류 — 원본이 유지됩니다 (%s)" % e)
+    sys.exit(1)
+print("M015: added %d" % len(added))
+for r in added:
+    print("  + " + r)
+PY
+```
+
+**주의**:
+- 프로젝트 `permissions.allow` 는 Claude Code 가 신뢰한 폴더에서만 적용됩니다. worktree 는 메인 저장소의 신뢰를 따릅니다.
+- 환경 변수 접두(`REVIEW_TURN_LIMIT=`·`WAIT_TIMEOUT=`·`RD_AUTOPILOT=`)는 하나만 붙인 호출에 맞습니다. 접두 변수를 둘 이상 붙인 호출은 맞지 않으며 권한 확인이 뜹니다.
+- 이 항목이 만든 변경은 자동 커밋하지 않고 다음 정규 커밋에 편승시킵니다 (M004 와 같은 계약).
+
+## M016: 세션 자기 worktree 삭제 차단 가드 추가 (`.claude/settings.json`)
+
+**조건**: 이 버전 이후로 동기화하는 모든 프로젝트.
+
+**동작 변화**: 새 Bash PreToolUse 가드(`self_worktree_delete_gate.sh`)가 세션이 쓰는 worktree 또는 그 상위 폴더를 `trash`·`rm`·`git worktree remove` 로 지우는 명령을 막습니다. 판정은 같은 명령 안의 변수·`cd`·`git -C` 를 풀어 대상 경로를 구합니다. 대상을 구할 수 없으면 통과합니다. 다음 경로는 정상으로 통과합니다.
+- 기본 체크아웃 세션에서 다른 worktree 를 정리하는 명령
+- worktree 안의 하위 경로를 삭제하는 명령
+- 시제품 worktree 정리
+
+**실행 절차**: 별도 스니펫이 없습니다. M005 가 옛 감시 항목 문자열을 지우고, M003 이 새 가드 등록과 새 감시 항목을 더합니다. 순서는 M005 → M008 → M003 입니다.
+
+**사용자가 할 일**: 세션 안에서 worktree 를 지우려다 막히면 세션을 끝낸 뒤 기본 체크아웃에서 `cd <기본 체크아웃> && bash rd-workflow/scripts/rd task list` 를 실행합니다.

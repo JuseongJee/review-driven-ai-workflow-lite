@@ -58,6 +58,10 @@ ${review_goal}
 ## Status
 awaiting-author
 
+## Closure Reason
+<!-- 비워 두면 seal 이 실행 기록으로 판정합니다. 사람이 리뷰어의 남은 이의를 덮고 종결할 때만 user-override 를 적고, 그 아래에 '근거: <날짜> <결정한 사람> — <그 사람이 한 말>' 줄을 더합니다. 허용 값: reviewer-no-objection | user-override -->
+-
+
 ## Current Owner
 Author
 

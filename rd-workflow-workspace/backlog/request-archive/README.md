@@ -112,12 +112,7 @@ archive 실행 주체는 Claude (`.claude/rules/rd-workflow/task-tracking.md` �
    초기 템플릿 상태로 reset (또는 새 REQUEST 로 덮어쓰기).
 
 5. **lifecycle 일괄 마무리 (큰 작업 — fr branch 사용 시):**
-   위 1–4단계가 fr branch 에서 완료(commit)된 후, main 으로 switch 하고 아래 명령을 실행한다:
-   ```bash
-   git checkout main
-   bash rd-workflow/scripts/lifecycle/archive.sh
-   ```
-   `archive.sh` 가 merge + tag + push + branch/worktree 정리를 일괄 처리한다.
+   위 1–4단계를 fr branch 에서 commit 한 뒤 작업 worktree 에서 발행한다. 실행 위치와 정리는 `rd-workflow/docs/flows/WORKFLOW.md` 「REQUEST 아카이브」 절을, `--no-worktree` 작업은 같은 문서 「`--no-worktree` 작업의 마감 경로」 절을 따른다.
 
    **`standard` (fr branch 사용, `--size small`):** 위 1–4단계와 `archive.sh` 를 그대로 따릅니다.
    **`light` (fr branch 없음):** REQUEST·아카이브가 없으므로 이 절차의 대상이 아닙니다. 기록은 `reports/tier-log.md` 행이며 커밋에 별도 환경변수를 붙이지 않습니다.

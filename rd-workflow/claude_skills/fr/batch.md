@@ -8,11 +8,13 @@
 
 - 인자 없음 — 사용법 출력 후 종료(파일 수정 없음).
 - 진행 중 manifest(`rd-workflow-workspace/.batch-manifest.json`, status ∈ preparing/running/paused)가 이미 있으면 — 재개 여부를 사용자에게 확인합니다(신규 인자보다 재개 우선). 재개 경로는 status에 따라 갈립니다:
-  - `running`/`paused` — 국면 1이 완료된 manifest입니다. 재개를 확정하면 국면 2 진입 **전에** `bash rd-workflow/scripts/batch/batch_manifest.sh validate <manifest>`를 재실행해 통과를 확인합니다(실패 시 재개하지 않고 사용자에게 실패 사유를 보고하고 멈춥니다). 통과하면 manifest `.status`를 `running`으로 전환(아래 tmp+mv 규율 적용)한 뒤, **국면 2 진입 전에 회수 스윕을 수행합니다.** `next`는 `blocked` 항목을 선택하지 않으므로, 스윕이 없으면 이미 발행이 끝난 blocked 작업이 회수되지 않고 `running` 완료 작업에는 무인 세션을 먼저 띄우게 됩니다.
+  - `running`/`paused` — 국면 1이 완료된 manifest입니다. 재개 여부를 물을 때 `running` 항목마다 `block_reason` 이 있으면 함께 보입니다(국면 2 표의 `unknown` 행이 남긴 멈춘 사유). 재개를 확정하면 국면 2 진입 **전에** `bash rd-workflow/scripts/batch/batch_manifest.sh validate <manifest>`를 재실행해 통과를 확인합니다(실패 시 재개하지 않고 사용자에게 실패 사유를 보고하고 멈춥니다). 통과하면 manifest `.status`를 `running`으로 전환(아래 tmp+mv 규율 적용)한 뒤, **국면 2 진입 전에 회수 스윕을 수행합니다.** `next`는 `blocked` 항목을 선택하지 않으므로, 스윕이 없으면 이미 발행이 끝난 blocked 작업이 회수되지 않고 `running` 완료 작업에는 무인 세션을 먼저 띄우게 됩니다.
 
     스윕은 **판정 패스**와 **복원 재조정 패스** 두 단계입니다.
 
-    - **판정 패스** — 대상은 manifest 의 `blocked`·`running` 항목이며 `order` 오름차순으로 판정합니다. 각 항목에 「archive 이어붙이기 계약」 절의 분기를 그대로 적용합니다.
+    - **판정 패스** — 대상은 manifest 의 `blocked`·`running` 항목이며 `order` 오름차순으로 판정합니다. 각 항목에 「archive 이어붙이기 계약」 절의 분기를 그대로 적용합니다. **단 outcome 파일(`rd-workflow-workspace/.batch-outcome-<slug>`) 첫 줄이 `blocked:publish-unsafe` 인 항목은 그 절로 보내지 않고 `archive.sh` 를 부르지 않습니다.** 안전 불변식 위반으로 ref 정리를 멈춘 상태라, 남은 ref 를 이어붙이기가 정리하면 사람이 확인해야 할 위반을 지웁니다. 대신 `archive-state` 판정만 실행합니다.
+      - `complete` 이고 `verify-done` 도 통과 → 사람이 ref 정리를 끝낸 것으로 보고 `set-state <manifest> "$slug" completed completed -` 로 회수합니다.
+      - 그 밖(`incomplete-archive`·`not-archived`·`unknown`, 또는 `verify-done` 실패) → 상태를 바꾸지 않고 manifest `.status` 를 `paused` 로 되돌린 뒤(tmp+mv 규율), outcome 둘째 줄 이후(`사유:`·`로그:`·`다음:`)와 `archive-state` 의 `missing` 을 보이고 멈춥니다. 예: 로컬 fr 브랜치가 남아 있으면 `missing=local-branch` 를 보이고, 로그를 확인해 그 브랜치를 직접 정리한 뒤 다시 재개하라고 안내합니다.
     - **복원 재조정 패스** — 판정 패스를 마친 뒤, **`completed` 인 모든 항목**에 대해 `bash rd-workflow/scripts/batch/batch_manifest.sh restore-dependents <manifest> "$slug"` 를 실행하고 산출된 항목을 `pending` 으로 되돌립니다. 그래프 규칙은 헬퍼가 단일 출처입니다.
 
       **이번 스윕에서 회수한 선행만 보면 안 됩니다.** 완료 기록(`set-state ... completed`)과 후속 복원(`set-state ... pending`)은 각각 별도 `set-state` 로 flush 되므로 그 사이에 세션이 끝날 수 있습니다. 그렇게 되면 다음 호출에서 그 선행은 이미 `completed` 라 판정 패스 대상이 아니고, 후속은 `skipped` 라 `next` 도 선택하지 않아 **영구 잔류**합니다. 후속을 일부만 복원하고 중단한 경우도 나머지에서 같은 일이 생깁니다.
@@ -74,7 +76,7 @@
    `external-unmet` 의 ③ 은 **정상 데이터에 대한 사람의 명시적 결정**이고 `rc=1` 의 `error` 는 **데이터 결함**입니다. 둘을 같은 경고로 묶지 않습니다.
 3. **의존/순서 확정**: 3-0 의 초안을 출발점으로 묶음의 인과관계를 분석해 실행 순서(order)와 의존 그래프(depends_on)를 사용자에게 제시·확정합니다. 자동 탐지가 아니라 사용자 확정입니다.
 4. **종료 정책 확정**: `push` / `merge` 중 1회 확인합니다. `none`은 지원하지 않습니다(archive를 하지 않아 완료 목표와 모순입니다). 확정값은 모든 FR에 일관 적용됩니다.
-5. **manifest 작성**: 위 결과를 `rd-workflow-workspace/.batch-manifest.json`에 기록하고 `bash rd-workflow/scripts/batch/batch_manifest.sh validate <manifest>`로 검증합니다(순환 의존·dangling·finish_policy 차단). **validate 통과 후에만** status를 `running`으로 전환합니다(tmp+mv 규율 — 호출 형식 참조). 이 전환이 국면 1 완료의 유일한 신호이며, `preparing`인 동안은 국면 2에 진입하지 않습니다.
+5. **manifest 작성**: 위 결과를 `rd-workflow-workspace/.batch-manifest.json`에 기록하고 `bash rd-workflow/scripts/batch/batch_manifest.sh validate <manifest>`로 검증합니다(순환 의존·dangling·finish_policy 차단). **validate 통과 후에만** status를 `running`으로 전환합니다(tmp+mv 규율 — 호출 형식 참조). 이 전환이 국면 1 완료의 유일한 신호이며, `preparing`인 동안은 국면 2에 진입하지 않습니다. 전환 직후 이 batch 의 비용 기록을 비웁니다: `cost_dir="$(git rev-parse --path-format=absolute --git-common-dir)/rd-workflow/batch-cost"; mkdir -p "$cost_dir"` 를 실행하고, manifest 의 각 slug 마다 `: > "$cost_dir/<slug>.tsv"` 를 실행합니다. 재개(`running`/`paused` 감지)에서는 비우지 않습니다 — 같은 FR 의 `resume` 재호출 비용이 이어서 합산됩니다.
 
 ### archive 이어붙이기 계약
 
@@ -104,6 +106,8 @@ stdout 첫 줄의 `state=` 로 분기합니다.
   | `push` | `bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch "fr/$task"` |
   | `merge` | `bash rd-workflow/scripts/lifecycle/archive.sh --fr-branch "fr/$task" --no-remote` |
 
+  재호출의 stdout·stderr 는 `rd-workflow-workspace/reports/batch-archive-<slug>.log` 에 남깁니다. 로그에 `archive: CLEANUP-RECORD-FAILED` 줄이 있으면 `.batch-outcome-<slug>` 에 `cleanup-record-failed <slug> <그 로그 경로>` 줄을 덧붙입니다. 이 줄은 정리 잔여 기록이 실패했다는 표시일 뿐이고, 발행 결과는 아래 `archive-state` 재판정이 정합니다. 재개 회수 스윕의 직접 재호출도 같은 규칙을 따릅니다.
+
   재호출 뒤 **같은 `archive-state` 를 다시 실행합니다.** `archive.sh` 의 성공 exit 만으로는 발행 완료가 보증되지 않습니다 — "fr branch 부재 + 동일 slug tag 존재" 만으로도 success exit 하기 때문입니다. **재판정에도 최초 판정과 같은 원칙을 적용합니다.**
 
   | 재판정 | 처리 |
@@ -124,6 +128,8 @@ stdout 첫 줄의 `state=` 로 분기합니다.
   | reason | 다음 행동 |
   |---|---|
   | `remote-unreachable` | 네트워크·인증 확인 후 **판정만** 재실행 (`archive-state`). `archive.sh` 재실행은 불필요합니다 |
+  | `remote-timeout` | 원격이 상한 시간(기본 30초) 안에 응답하지 않았습니다. 원격 서버·네트워크 상태를 확인한 뒤 **판정만** 재실행 (`archive-state`). 느린 원격이면 `RD_BATCH_REMOTE_TIMEOUT=<초>`(1~600)로 상한을 늘려 재실행합니다. `archive.sh` 재실행은 불필요합니다 |
+  | `tmpfile-failed` | 원격 조회 결과를 담을 임시 파일을 만들지 못했습니다. `TMPDIR` 의 쓰기 권한·여유 공간을 확인한 뒤 판정 재실행 |
   | `remote-object-missing` | `git fetch origin` 으로 필요한 object 를 확보한 뒤 판정 재실행 |
   | `default-ref-missing` | 기본 브랜치 ref 를 로컬에 확보한 뒤 판정 재실행 |
   | `no-default-branch` | `rd-workflow/config/workflow.json` 의 `default_branch` 확인 |
@@ -143,50 +149,82 @@ manifest status가 `running`인 동안 반복합니다:
    - `slug` 빈값 + `rc=0` → 진짜 terminal, 국면 3으로 갑니다.
    - `slug` 빈값 + `rc=3` → **dead-end**(validate가 정상 차단하나 방어적 감지). 완료로 보지 않고 남은 stranded 규모를 `bash rd-workflow/scripts/batch/batch_manifest.sh summary <manifest>` 의 `pending=`/`running=` 값으로 요약에 명시한 뒤(임의 jq 집계 금지) 중단·사용자 보고합니다.
    - `slug` 빈값 + **그 외 `rc`**(예: 손상 manifest·경로 오류의 `2`) → 완료·dead-end 로 간주하지 않고 즉시 중단·사용자 보고합니다.
-2. **상태전이 → running**: `bash rd-workflow/scripts/batch/batch_manifest.sh set-state <manifest> "$slug" running` 후 headless를 기동합니다:
+2. **상태전이 → running**: `bash rd-workflow/scripts/batch/batch_manifest.sh set-state <manifest> "$slug" running "" -` 후 headless를 기동합니다. 마지막 `-` 는 `unknown` 행이 남긴 멈춘 사유를 지웁니다 — 생략하면 그 사유가 이 실행의 결과와 섞여 남습니다:
    ```bash
+   cost_dir="$(git rev-parse --path-format=absolute --git-common-dir)/rd-workflow/batch-cost"
+   mkdir -p "$cost_dir"
    RD_AUTOPILOT_FR="$slug" RD_AUTOPILOT_MODE=A RD_FINISH_POLICY=<manifest.finish_policy> \
      RD_AUTOPILOT_OUTCOME_FILE=rd-workflow-workspace/.batch-outcome-"$slug" \
-     bash rd-workflow/scripts/autopilot_headless.sh
+     RD_AUTOPILOT_COST_FILE="$cost_dir/$slug.tsv" \
+     bash rd-workflow/scripts/autopilot_headless.sh; hrc=$?
    ```
+   발행(`archive.sh`)은 무인 세션이 아니라 wrapper 가 claude 종료 뒤에 실행합니다. 결과는 outcome 첫 줄 `completed` 또는 `blocked:publish-failed`·`blocked:publish-incomplete`·`blocked:publish-unsafe` 입니다. 비용 기록 파일은 git 공용 디렉터리 아래라 작업 트리의 clean 검사를 막지 않습니다.
 3. **완주 판정(ground truth 재확인)**: exit 0이어도 `bash rd-workflow/scripts/batch/batch_manifest.sh verify-done "$slug"`로 재확인합니다.
    - 재확인 통과 → `set-state <manifest> "$slug" completed completed`.
    - exit 0이나 재확인 실패(outcome 오기록) → `set-state <manifest> "$slug" blocked "" "ground truth 불일치"` 후 4의 전파 적용.
-4. **실패 처리(exit 10/20/30/40 또는 재확인 실패)**:
-   - **먼저 판정**: outcome 파일(`rd-workflow-workspace/.batch-outcome-<slug>`) 첫 줄이 `blocked:time-cap-unreaped` 이면 skip 전파·다음 FR 진행 없이 exit 10 과 같은 방식으로 처리합니다. manifest `.status` 를 `paused`로 저장(tmp+mv 규율)하고 item 은 `running` 유지한 채 "이전 FR 의 잔여 프로세스(outcome 둘째 줄 이후에 pid·명령)를 정리한 뒤 재개하십시오" 를 안내하고 멈춥니다.
-   - **먼저 판정**: outcome 파일 첫 줄이 `blocked:resume-undetermined` 이면 skip 전파·다음 FR 진행 없이 exit 10 과 같은 방식으로 처리합니다. 이 FR 의 문제가 아니라 재개 후보를 판정하지 못한 전역 실패라서 FR 을 `blocked` 로 기록하지 않습니다. manifest `.status` 를 `paused` 로 저장(tmp+mv 규율)하고 item 은 `running` 유지한 채, outcome 둘째 줄 이후(제외·불확실 작업과 사유·다음 조치)를 보이고 "`rd task resolve-launch <slug>` 로 확정하거나 재개 대상을 정리한 뒤 재개하십시오" 를 안내하고 멈춥니다.
-   - exit 20/30 또는 재확인 실패 → `set-state <manifest> "$slug" blocked ...`. 이어서 `skip=$(... skip-dependents <manifest> "$slug")`의 각 slug를 `set-state <manifest> <s> skipped "" "선행 $slug blocked"`로 기록합니다. 독립 FR은 계속합니다.
-     - 사유가 `time-cap` 이면 위 blocked 처리와 같습니다. outcome 둘째 줄 이후의 진단(경과·작업 상태·열린 리뷰 세션 경로)이 blocked 사유로 보존되고, 요약에 사유 `time-cap` 이 보입니다.
-   - exit 10(resume) → item은 `running` 유지(set-state로 바꾸지 않음), manifest `.status`를 `paused`로 저장(tmp+mv 규율 — 호출 형식 참조)하고 재개 안내 후 멈춥니다. 다음 `/fr batch` 실행이 이 paused manifest를 감지해 재개를 확인하고, `.status`를 `running`으로 되돌린 뒤(호출 형식 참조) 국면 2를 재진입하면 `next`가 이 `running` item을 최우선 산출해 같은 FR을 이어갑니다. 잔여 규모 보고가 필요하면 `batch_manifest.sh summary` 의 `pending=`/`running=` 값을 사용합니다(임의 jq 집계 금지).
-   - exit 40(harness-error) → **먼저 「archive 이어붙이기 계약」 절의 판정을 수행합니다.** `complete`·`incomplete-archive`·`unknown` 은 그 절의 처리를 따릅니다. `not-archived` 일 때만 아래 재시도 경로로 갑니다.
+4. **실패 처리(wrapper exit code 와 outcome 으로 분기)**: 처리 경로는 헬퍼가 판정합니다. 이 문서는 판정 순서를 복제하지 않습니다.
+   ```bash
+   route=$(bash rd-workflow/scripts/batch/headless_result.sh route "rd-workflow-workspace/.batch-outcome-$slug" "$hrc")
+   ```
+   `$hrc` 는 2번에서 기동한 `autopilot_headless.sh` 의 exit code 입니다. 1번의 `rc`(`next` 의 종료 코드)와 다른 변수입니다. wrapper 기동과 `route` 호출을 서로 다른 Bash 호출로 실행하면 셸 변수 `hrc` 가 남지 않으므로, 그때는 `$hrc` 자리에 wrapper 요약 줄 `[exit N]` 의 N 을 넣습니다. `route` 는 항상 토큰 한 줄을 내고 exit 0 입니다. 아래 표에서 토큰의 행대로 처리합니다. 표에 없는 토큰이 나오면 헬퍼와 이 문서가 어긋난 것이므로 `unknown` 과 같이 중단합니다.
 
-     `not-archived` 재시도 경로 — 1회 재시도 후 재발 시 `blocked` 처리(ralph와 동일 정책). **재시도 전에 재개 지점을 정리합니다**:
-     1. 열린 리뷰 세션의 최신 Reviewer 턴이 `이의 없음` 이면 그 세션을 `awaiting-user` 로 종결 처리합니다 — 네 가지를 모두 갱신합니다.
-        - `SESSION.md`: `Status=awaiting-user`, `Current Owner=User`
-        - `CHECKPOINT.md`: 현재 결론과 남은 쟁점. 미해결이 없으면 Open Issues 첫 줄에 `- 없음` 을 적고, 종결 경위는 그 아래에 빈 줄로 띄워 문단으로 적습니다 (미해결 항목은 리스트로 적으며, 마커 앞이나 마커에 붙인 글은 미해결로 판정됩니다)
-        - `USER_ACTION.md`: 사용자가 취할 다음 행동과 질문. **이 갱신을 빠뜨리면 Owner 는 User 인데 안내는 "확인이 필요한 단계가 아닙니다" 라고 말하는 모순 상태가 사용자에게 노출됩니다**
-        - 리뷰 요약 report: `rd-workflow-workspace/reports/reviews/` 에 작성
-        사람이 마무리를 승인하기 전에는 `closed` 로 전환하지 않습니다 (`rd-workflow/docs/flows/FILE_BASED_REVIEW_PIPELINE.md` 종료 규칙).
-     2. `CURRENT_TASK.md` Status 를 실제 진행 단계에 맞게 보정합니다.
-     3. 정리 결과를 `CURRENT_TASK.md` Notes 에 기록합니다.
+| 토큰 | manifest `.status` | item 상태 | skip 전파 | 원격 호출 | 사용자에게 보일 것 | 안내 문구 |
+|---|---|---|---|---|---|---|
+| `verify-done` | 변경 없음 | 재확인 통과 시 `completed`, 실패 시 `blocked` | 통과 시 없음, 실패 시 `blocked` 행과 같음 | 없음 | 실패 시 사유 `ground truth 불일치` | 위 3번 완주 판정을 따릅니다. 통과 → `set-state <manifest> "$slug" completed completed`, 실패 → `set-state <manifest> "$slug" blocked "" "ground truth 불일치"` 후 `blocked` 행의 전파 적용 |
+| `pause-unreaped` | `paused` (tmp+mv 규율) | `running` 유지 | 없음, 다음 FR 진행 없음 | 없음 | outcome 둘째 줄 이후의 pid·명령 | "이전 FR 의 잔여 프로세스를 정리한 뒤 재개하십시오" 를 안내하고 멈춥니다 |
+| `pause-resume-undetermined` | `paused` (tmp+mv 규율) | `running` 유지, `blocked` 로 기록하지 않음(이 FR 의 문제가 아닌 재개 후보 판정 실패) | 없음, 다음 FR 진행 없음 | 없음 | outcome 둘째 줄 이후(제외·불확실 작업과 사유·다음 조치) | "`rd task resolve-launch <slug>` 로 확정하거나 재개 대상을 정리한 뒤 재개하십시오" 를 안내하고 멈춥니다 |
+| `pause-publish-timeout` | `paused` (tmp+mv 규율) | `running` 유지 | 없음, 다음 FR 진행 없음 | 없음 (원격이 응답하지 않아 상한에 걸렸을 수 있어 무인으로 `archive-state`·이어붙이기를 실행하지 않음) | outcome 둘째 줄 이후(`사유:`·`로그:`·`다음:`) | "원격 연결을 확인한 뒤 재개하십시오" 를 안내하고 멈춥니다. 사람이 재개하면 회수 스윕 판정 패스가 이 항목에 「archive 이어붙이기 계약」 절을 적용합니다 |
+| `archive-continue` | 변경 없음 | `blocked` 로 보내지 않음 | 없음 | 있음 — 「archive 이어붙이기 계약」 절의 `archive-state` 판정, 다음 FR 시작 전에 이어붙이기 1회 | outcome 둘째 줄 이후 `사유:` 줄의 원인(예: 원격 인증 실패) | 기본 브랜치가 병합된 채 남아 있으므로 그 절의 판정 결과대로 처리합니다. 원인이 남아 있으면 이어붙이기도 같은 이유로 실패하므로 원인을 사용자에게 보입니다 |
+| `pause-publish-unsafe` | `paused` (tmp+mv 규율) | `running` 유지, 발행은 끝났으므로 `blocked` 로 기록하지 않음 | 없음, 다음 FR 진행 없음 | 없음 (이 행에서 `archive.sh` 를 다시 실행하지 않음) | outcome 둘째 줄 이후(`사유:`·`로그:`·`다음:`) | 멈춥니다. 사람이 로그를 보고 ref 를 정리한 뒤 재개하면 회수 스윕 판정 패스의 unsafe 처리가 `archive-state` `complete` 와 `verify-done` 통과를 확인한 경우에만 `completed` 로 회수합니다. 정리가 확인되지 않으면 다시 `paused` 로 멈춥니다 |
+| `pause-resume` | `paused` (tmp+mv 규율 — 호출 형식 참조) | `running` 유지 (`set-state` 로 바꾸지 않음) | 없음 | 없음 | 재개 안내 | 재개 안내 후 멈춥니다. 다음 `/fr batch` 실행이 이 paused manifest 를 감지해 재개를 확인하고 `.status` 를 `running` 으로 되돌린 뒤(호출 형식 참조) 국면 2 를 재진입하면 `next` 가 이 `running` item 을 최우선 산출해 같은 FR 을 이어갑니다. 잔여 규모 보고가 필요하면 `batch_manifest.sh summary` 의 `pending=`/`running=` 값을 사용합니다(임의 jq 집계 금지) |
+| `blocked` | 변경 없음 | `blocked` | 있음 — `skip=$(... skip-dependents <manifest> "$slug")` 의 각 slug 를 `set-state <manifest> <s> skipped "" "선행 $slug blocked"` 로 기록, 독립 FR 은 계속 | 없음 | blocked 사유에 outcome 둘째 줄 이후의 `사유:`·`로그:`·`다음:` 을 보존. outcome 첫 줄이 `blocked:time-cap`(사유 `time-cap`)이면 경과·작업 상태·열린 리뷰 세션 경로 진단이 blocked 사유로 보존되고 요약에 사유 `time-cap` 이 보임 | `set-state <manifest> "$slug" blocked ...`. outcome 첫 줄 `blocked:publish-failed` 도 이 행입니다(기본 브랜치는 바뀌지 않았습니다). exit 31 `queue-blocked`(batch 밖 의존 FR 미완료 등으로 착수 불가)도 이 행입니다 — 다시 띄워도 같은 결과라 멈추지 않고 후속만 건너뜁니다 |
+| `harness-error` | 하위 절 「exit 40 처리」 의 판정에 따름 | 하위 절에 따름 | 하위 절에 따름 | 있음 — `archive-state` 판정 | 하위 절에 따름 | 아래 「exit 40 처리」 절을 따릅니다 |
+| `unknown` | `paused` (tmp+mv 규율) | `running` 유지, 사유만 기록: `set-state <manifest> "$slug" running "" "결과 판정 불가 — exit <hrc>, outcome 첫 줄 <첫 줄 또는 없음>"` | 없음, 다음 FR 진행 없음 | 없음 | wrapper exit code 와 outcome 첫 줄, outcome 둘째 줄 이후 | 처리 경로가 정해지지 않은 값입니다. 예: 발행 중 신호로 병합 전에 멈춤(outcome `blocked:publish-failed` + exit 130·143·129), 숫자 아닌 exit code. 중단하고 사용자에게 보고합니다. `running` 으로만 남기면 다음 호출이 세션 크래시와 구분하지 못하므로 `paused` 와 사유를 남깁니다. 다시 돌리면 재개 확인에 이 사유가 보이고, 회수 스윕이 발행 여부를 판정한 뒤 미발행이면 같은 FR 을 이어 띄웁니다 |
 
-     매 시도가 서로 다른 지점까지 진도를 냈다면 작업 결함이 아니라 세션 수명 문제입니다. `blocked` 로 버리기 전에 autopilot SKILL.md 「무인 진입」의 「결과 대기 규율」 위반 여부를 확인합니다. 조치는 다음 순서입니다(위 재개 지점 정리 목록과 별개).
+상태전이는 모두 `set-state`로 수행되어 매번 flush됩니다(재개 지점 최신화).
 
-     - **조치 가.** 해당 항목 출력의 `autopilot_headless: BASH_DEFAULT_TIMEOUT_MS=` 줄에서 유효 값을 확인합니다. 재개 회수 스윕처럼 그 줄이 없으면 현재 셸의 `BASH_DEFAULT_TIMEOUT_MS` 값을 확인합니다.
-     - **조치 나.** 값이 검증 소요에 못 미치는 호출자 설정(예: 셸에 남은 `120000`·`600000`)이면 해제하거나 올려 재시도합니다.
-     - **조치 다.** 유효 값이 기본값 이상이어도 timeout 을 배제하지 않습니다. 이 줄은 DEFAULT 설정값일 뿐 개별 명령의 timeout 인자나 다른 watchdog 의 증거가 아닙니다. 실행 로그와 `CURRENT_TASK.md` Notes 의 `waiting:` 줄에서 마지막 명령의 경과 시간·지정 timeout·"moved to the background" 유무를 확인하고 원인별로 조치합니다.
-        - 개별 Bash 호출에 짧은 `timeout` 인자가 남아 있었습니다: 인자를 생략하거나 예상 소요에 맞게 고칩니다. DEFAULT 를 올려도 그 명령에는 효과가 없습니다.
-        - 리뷰 어댑터 watchdog 에 걸렸습니다(어댑터 출력의 원인과 `wait config` 의 idle·cap): idle 또는 `WAIT_TIMEOUT` 을 점검합니다. 안쪽 상한을 올리면 바깥 Bash 대기(DEFAULT)가 그보다 크게 유지되도록 DEFAULT 도 함께 올립니다.
-        - 명령이 유효 DEFAULT 에 실제로 도달했습니다(경과 시간이 유효 값 이상, timeout 인자 없음): 호출 env 를 올려 재기동합니다.
-        - 원인이 불명확합니다: DEFAULT 상향을 처방으로 제시하지 않고 종전대로 「결과 대기 규율」 위반 여부를 봅니다.
+#### exit 40 처리 (`harness-error`)
 
-     **적용 범위**: 신규 exit 40 과 재개 회수 스윕이 같은 분기를 씁니다. 이미 `completed` 로 집계된 항목의 판정은 소급하지 않습니다.
-   - 상태전이는 모두 `set-state`로 수행되어 매번 flush됩니다(재개 지점 최신화).
+exit 40(`harness-error`) → **먼저 「archive 이어붙이기 계약」 절의 판정을 수행합니다.** `complete`·`incomplete-archive`·`unknown` 은 그 절의 처리를 따릅니다. `not-archived` 일 때만 아래 재시도 경로로 갑니다.
+
+`not-archived` 재시도 경로 — 1회 재시도 후 재발 시 `blocked` 처리(ralph와 동일 정책). **재시도 전에 재개 지점을 정리합니다**:
+1. 열린 리뷰 세션의 최신 Reviewer 턴이 `이의 없음` 이면 그 세션을 `awaiting-user` 로 종결 처리합니다 — 네 가지를 모두 갱신합니다.
+   - `SESSION.md`: `Status=awaiting-user`, `Current Owner=User`
+   - `CHECKPOINT.md`: 현재 결론과 남은 쟁점. 미해결이 없으면 Open Issues 첫 줄에 `- 없음` 을 적고, 종결 경위는 그 아래에 빈 줄로 띄워 문단으로 적습니다 (미해결 항목은 리스트로 적으며, 마커 앞이나 마커에 붙인 글은 미해결로 판정됩니다)
+   - `USER_ACTION.md`: 사용자가 취할 다음 행동과 질문. **이 갱신을 빠뜨리면 Owner 는 User 인데 안내는 "확인이 필요한 단계가 아닙니다" 라고 말하는 모순 상태가 사용자에게 노출됩니다**
+   - 리뷰 요약 report: `rd-workflow-workspace/reports/reviews/` 에 작성
+   사람이 마무리를 승인하기 전에는 `closed` 로 전환하지 않습니다 (`rd-workflow/docs/flows/FILE_BASED_REVIEW_PIPELINE.md` 종료 규칙).
+2. `CURRENT_TASK.md` Status 를 실제 진행 단계에 맞게 보정합니다.
+3. 정리 결과를 `CURRENT_TASK.md` Notes 에 기록합니다.
+
+매 시도가 서로 다른 지점까지 진도를 냈다면 작업 결함이 아니라 세션 수명 문제입니다. `blocked` 로 버리기 전에 autopilot SKILL.md 「무인 진입」의 「결과 대기 규율」 위반 여부를 확인합니다. 조치는 다음 순서입니다(위 재개 지점 정리 목록과 별개).
+
+- **조치 가.** 해당 항목 출력의 `autopilot_headless: BASH_DEFAULT_TIMEOUT_MS=` 줄에서 유효 값을 확인합니다. 재개 회수 스윕처럼 그 줄이 없으면 현재 셸의 `BASH_DEFAULT_TIMEOUT_MS` 값을 확인합니다.
+- **조치 나.** 값이 검증 소요에 못 미치는 호출자 설정(예: 셸에 남은 `120000`·`600000`)이면 해제하거나 올려 재시도합니다.
+- **조치 다.** 유효 값이 기본값 이상이어도 timeout 을 배제하지 않습니다. 이 줄은 DEFAULT 설정값일 뿐 개별 명령의 timeout 인자나 다른 watchdog 의 증거가 아닙니다. 실행 로그와 `CURRENT_TASK.md` Notes 의 `waiting:` 줄에서 마지막 명령의 경과 시간·지정 timeout·"moved to the background" 유무를 확인하고 원인별로 조치합니다.
+   - 개별 Bash 호출에 짧은 `timeout` 인자가 남아 있었습니다: 인자를 생략하거나 예상 소요에 맞게 고칩니다. DEFAULT 를 올려도 그 명령에는 효과가 없습니다.
+   - 리뷰 어댑터 watchdog 에 걸렸습니다(어댑터 출력의 원인과 `wait config` 의 idle·cap): idle 또는 `WAIT_TIMEOUT` 을 점검합니다. 안쪽 상한을 올리면 바깥 Bash 대기(DEFAULT)가 그보다 크게 유지되도록 DEFAULT 도 함께 올립니다.
+   - 명령이 유효 DEFAULT 에 실제로 도달했습니다(경과 시간이 유효 값 이상, timeout 인자 없음): 호출 env 를 올려 재기동합니다.
+   - 원인이 불명확합니다: DEFAULT 상향을 처방으로 제시하지 않고 종전대로 「결과 대기 규율」 위반 여부를 봅니다.
+
+**적용 범위**: 신규 exit 40 과 재개 회수 스윕이 같은 분기를 씁니다. 이미 `completed` 로 집계된 항목의 판정은 소급하지 않습니다.
 
 ### 국면 3 — 최종 요약
 
 1. `bash rd-workflow/scripts/batch/batch_manifest.sh summary <manifest>`로 집계를 받습니다.
-2. 완료/skip(+선행 사유)/제외(+사유)/실패(+blocked 사유)/적용 종료정책을 정리해 `rd-workflow-workspace/reports/`에 저장하고 사용자에게 출력합니다.
+2. 완료/skip(+선행 사유)/제외(+사유)/실패(+blocked 사유)/적용 종료정책을 정리해 `rd-workflow-workspace/reports/`에 저장하고 사용자에게 출력합니다. `completed` 항목은 정리 잔여 상태를 다음 규칙으로 덧붙여 표기합니다. `verify-done` 판정은 바꾸지 않습니다.
+   - `.batch-outcome-<slug>` 에 `cleanup-record-failed` 줄이 있으면 `completed (정리 잔여 기록 실패 — 기록 <경로>)` 로 씁니다. 경로는 wrapper 발행이면 발행 로그, 이어붙이기면 `batch-archive-<slug>.log` 입니다.
+   - 없으면 `bash rd-workflow/scripts/lifecycle/cleanup_pending.sh summary <slug>` 로 항목 수 N 을 읽습니다. N>0 이면 `completed (정리 잔여 N건)`, rc 2 면 `completed (정리 잔여 조회 실패)`, 0건이면 `completed` 로 씁니다.
+   - 항목마다 비용을 덧붙입니다. 항목 꼬리는 다음 호출의 출력 한 줄입니다.
+     ```bash
+     bash rd-workflow/scripts/batch/headless_result.sh cost-item "$cost_dir/<slug>.tsv"
+     ```
+   - 요약 끝에 전체 합계 한 줄을 둡니다. 인자는 비용을 붙인 항목마다 하나씩입니다. 인자가 없으면 출력이 없으므로 합계 줄을 내지 않습니다.
+     ```bash
+     bash rd-workflow/scripts/batch/headless_result.sh cost-total "$cost_dir"/<slug>.tsv ...
+     ```
+   - 항목 꼬리는 사용자 출력과 `reports/` 저장 보고서의 해당 항목 줄에, 합계 줄은 두 곳의 요약 끝에 넣습니다.
+     이 구분은 `ralph_drain.sh` 의 `summarize_cost` 와 같습니다(호출 수 대신 항목 수로 셉니다).
 3. manifest status를 `done`으로 전환합니다(tmp+mv 규율 — 호출 형식 참조).
 
 ### 규칙

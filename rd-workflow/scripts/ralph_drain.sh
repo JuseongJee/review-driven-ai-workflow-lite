@@ -7,7 +7,8 @@
 #   RD_FINISH_POLICY           push|merge|none  미설정 시 merge 주입 (무인 드레인 안전 기본값)
 #   RD_RALPH_MAX_ITER          절대 iteration 상한 (기본 50)
 #   RD_RALPH_NONPROGRESS_LIMIT 연속 non-terminal(완료/blocked 미도달) 한도 (기본 5)
-#   RD_RALPH_WRAPPER_CMD       wrapper 호출 명령 오버라이드 (테스트 훅; 기본 "bash rd-workflow/scripts/autopilot_headless.sh")
+#   RD_AUTOPILOT_COST_FILE    비용 기록 파일 경로 (선택). 있으면 모든 wrapper 호출에 넘기고 드레인 시작 이후 덧붙은 줄만 합산한다(비우지 않음). 없으면 임시 파일을 만든다
+#   RD_RALPH_WRAPPER_CMD      wrapper 호출 명령 오버라이드 (테스트 훅; 기본 "bash rd-workflow/scripts/autopilot_headless.sh")
 #
 # exit code: 0 정상 종료(queue-empty·queue-blocked) / 1 중단(backstop·harness-error 재발·관계/재개 판정 불가·미지 코드)
 set -uo pipefail
@@ -33,9 +34,38 @@ blocked=0
 blocked_reasons=""
 blocked_detail=""
 stop_reason=""
+drain_start="$(date +%s)"
+cp_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lifecycle/cleanup_pending.sh"
+record_failed=""
+calls=0
+
+# 비용 기록 파일 — 모든 wrapper 호출(재시도 포함)이 같은 경로에 덧붙인다. 비용 문제는 드레인의 exit code 를 바꾸지 않는다.
+# 호출자가 준 파일은 지우거나 비우지 않고 시작 시 줄 수(cost_base)만 기억한다. 임시 파일만 EXIT 에서 지운다.
+cost_file=""; cost_base=0; cost_err=""; cost_tmp=""
+if [ -n "${RD_AUTOPILOT_COST_FILE:-}" ]; then
+  cost_file="$RD_AUTOPILOT_COST_FILE"
+  if [ ! -e "$cost_file" ]; then
+    : >> "$cost_file" 2>/dev/null || cost_err="비용 기록 파일을 만들 수 없음: ${cost_file}"
+  fi
+  if [ -z "$cost_err" ] && [ ! -r "$cost_file" ]; then cost_err="비용 기록 파일을 읽을 수 없음: ${cost_file}"; fi
+else
+  cost_tmp="$(mktemp 2>/dev/null)" || cost_tmp=""
+  if [ -n "$cost_tmp" ]; then
+    cost_file="$cost_tmp"
+    trap 'rm -f "$cost_tmp"' EXIT
+  else
+    cost_err="비용 기록용 임시 파일을 만들 수 없음"
+  fi
+fi
+if [ -z "$cost_err" ]; then
+  cost_base="$(wc -l < "$cost_file" 2>/dev/null | tr -d ' ')"
+  case "$cost_base" in ''|*[!0-9]*) cost_err="비용 기록 파일을 읽을 수 없음: ${cost_file}"; cost_base=0 ;; esac
+fi
 
 # wrapper 1회 호출 — auto-pick·모드 A·finish policy·outcome 파일 경로를 주입한다.
 invoke_once() {
+  calls=$((calls + 1))
+  RD_AUTOPILOT_COST_FILE="$([ -z "$cost_err" ] && printf '%s' "$cost_file")" \
   RD_AUTOPILOT_FR=auto \
   RD_AUTOPILOT_MODE=A \
   RD_FINISH_POLICY="$FINISH_POLICY" \
@@ -62,6 +92,64 @@ summarize() {
   echo "iteration: ${iter}"
   echo "종료 사유: ${stop_reason}"
   [ -n "${blocked_detail:-}" ] && { echo "---- 대기 상세 ----"; printf '%s\n' "$blocked_detail"; }
+  summarize_cost
+  summarize_cleanup_pending
+}
+
+# 비용 합계 한 줄 (spec D6). a=ok 기록 수, b=unknown 기록 수, m=기록 없는 호출 수.
+summarize_cost() {
+  [ "$calls" -ge 1 ] || return 0
+  local res a b sum m extra=""
+  if [ -n "$cost_err" ]; then
+    echo "실행 비용 합계: 집계 불가 — ${cost_err} (wrapper 호출 ${calls}회)"; return 0
+  fi
+  if ! res="$(awk -F'\t' -v base="$cost_base" 'NR>base && $1=="cost" { if ($2=="ok") { a++; s+=$3 } else if ($2=="unknown") b++ } END { printf "%d %d %.4f", a, b, s }' "$cost_file" 2>/dev/null)"; then
+    echo "실행 비용 합계: 집계 불가 — 비용 기록 파일을 읽을 수 없음: ${cost_file} (wrapper 호출 ${calls}회)"; return 0
+  fi
+  read -r a b sum <<< "$res"
+  m=$((calls - a - b)); [ "$m" -ge 0 ] || m=0
+  if [ "$a" -ge 1 ]; then
+    [ "$m" -gt 0 ] && extra=" · 비용 기록 없는 호출 ${m}회 — 일부 호출 누락, 실제 비용은 더 큼"
+    [ -n "$extra" ] || [ "$b" -eq 0 ] || extra=" — 실제 비용은 더 큼"
+    echo "실행 비용 합계: \$${sum} (정가 환산, 리뷰 도구 비용 제외) · wrapper 호출 ${calls}회 · 확인 불가 ${b}회${extra}"
+  else
+    echo "실행 비용 합계: 확인 불가 — wrapper 호출 ${calls}회 · 확인 불가 ${b}회 · 비용 기록 없는 호출 ${m}회"
+  fi
+  return 0
+}
+
+# 드레인 시작 이후 기록된 정리 잔여·조회 실패·기록 실패를 요약 끝에 덧붙인다.
+summarize_cleanup_pending() {
+  local out err rc total=0 parts="" slug n first
+  err="$(mktemp 2>/dev/null)" || err=""
+  if [ -n "$err" ]; then
+    out="$(bash "$cp_helper" summary --since "$drain_start" 2>"$err")"; rc=$?
+  else
+    out="$(bash "$cp_helper" summary --since "$drain_start" 2>/dev/null)"; rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
+    first="$(head -n1 "$err" 2>/dev/null)"; first="${first#cleanup_pending: }"
+    [ -n "$first" ] || first="종료 코드 ${rc}"
+    echo "잔여(cleanup-pending): 조회 실패 (${first})"
+  else
+    while IFS=$'\t' read -r slug n; do
+      [ -n "$slug" ] || continue
+      total=$((total + n))
+      parts="${parts:+${parts}, }${slug} ${n}건"
+    done <<< "$out"
+    [ "$total" -gt 0 ] && echo "잔여(cleanup-pending): ${total}건 (${parts})"
+  fi
+  [ -n "$err" ] && rm -f "$err"
+  if [ -n "$record_failed" ]; then
+    local k=0 list="" a b c
+    while read -r a b c; do
+      [ -n "$b" ] || continue
+      k=$((k + 1))
+      list="${list:+${list}, }${b} — 기록 ${c}"
+    done <<< "$record_failed"
+    echo "잔여(cleanup-pending): 기록 실패 ${k}건 (${list})"
+  fi
+  return 0
 }
 
 while : ; do
@@ -78,6 +166,9 @@ while : ; do
   case "$code" in
     0)
       completed=$((completed + 1)); nonprogress=0
+      rf="$(awk 'NR>1 && /^cleanup-record-failed /' "$OUTCOME_FILE" 2>/dev/null)"
+      [ -z "$rf" ] || record_failed="${record_failed:+${record_failed}
+}${rf}"
       echo "ralph_drain: iter ${iter} → completed (누적 ${completed})" ;;
     10)
       nonprogress=$((nonprogress + 1))
@@ -101,6 +192,18 @@ while : ; do
         blocked_detail="$(awk 'NR>1' "$OUTCOME_FILE" 2>/dev/null)"
         summarize; exit 1
       fi
+      # 발행 실패 3종(wrapper 가 outcome 을 바꿔 쓴다)도 중단한다. 다음 FR 로 넘어가면
+      # 실패·중간 상태의 발행 위에 작업이 쌓인다. 상세(사유·로그·다음)는 outcome 둘째 줄 이후다.
+      case "$reason" in
+        publish-failed|publish-incomplete|publish-unsafe)
+          case "$reason" in
+            publish-failed)     stop_reason="발행 실패 (publish-failed) — 사람 확인 필요" ;;
+            publish-incomplete) stop_reason="발행 중간 상태 (publish-incomplete) — 이어붙이기 필요" ;;
+            *)                  stop_reason="발행 후 안전 검사 실패 (publish-unsafe) — ref 수동 정리 필요" ;;
+          esac
+          blocked_detail="$(awk 'NR>1' "$OUTCOME_FILE" 2>/dev/null)"
+          summarize; exit 1 ;;
+      esac
       blocked=$((blocked + 1)); nonprogress=0
       blocked_reasons="${blocked_reasons}
   - ${reason}"

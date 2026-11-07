@@ -20,12 +20,10 @@ export project_root
 source "$_PQ_SELF_DIR/_lifecycle_common.sh"
 source "$_PQ_SELF_DIR/_tasks_index.sh"
 source "$_PQ_SELF_DIR/session_launch.sh"
+source "$_PQ_SELF_DIR/_merge_precheck.sh"
 
 # 큐 상태 값 (허용 목록). 이 밖의 값은 손상으로 본다.
 PQ_STATES="requested user-approval granted running partial done failed cancelled"
-
-# 병합 충돌 자동 해소 대상 — archive.sh 의 자동 해소 목록과 같은 값이다 (D12 의 pq_merge_check 가 쓴다).
-PQ_AUTO_RESOLVE_PATHS="CURRENT_TASK.md rd-workflow-workspace/.lifecycle/stage_metrics.tsv rd-workflow-workspace/backlog/FUTURE_REQUESTS.md rd-workflow-workspace/.lifecycle/review-seals/verify-evidence"
 
 # ---------------------------------------------------------------- 설정 (D1)
 
@@ -288,7 +286,7 @@ _pq_prune_done() {
 # ---------------------------------------------------------------- status (D4)
 
 _pq_status_line() {
-  local slug="$1" st rc=0 reason
+  local slug="$1" st rc=0 reason bp
   st="$(_pq_state_of "$slug")" || rc=$?
   if [[ "$rc" -eq 3 ]]; then
     printf '%s  판정 불가  요청 파일 손상(%s)  → 파일을 직접 고치거나 삭제하십시오 (rd publish cancel 로 정리할 수 없음)\n' "$slug" "$(_pq_req_path "$slug")"
@@ -304,7 +302,8 @@ _pq_status_line() {
     reason="${reason:+$reason · }${wait%%$'\t'*}"
     action="${wait#*$'\t'}"
   fi
-  printf '%s  %s  %s  → %s\n' "$slug" "$(pq_label "$st")" "${reason:--}" "$action"
+  bp="$(_pq_bypass_text "$slug")"
+  printf '%s  %s  %s%s  → %s\n' "$slug" "$(pq_label "$st")" "${reason:--}" "${bp:+  $bp}" "$action"
 }
 
 # 요청됨 상태가 지금 허가될 수 없는 이유 (next 의 거부 조건과 같은 순서). stdout `사유<TAB>다음 행동`.
@@ -406,23 +405,84 @@ _pq_main_checkout() { local c; c="$(_pq_common_dir)" || return 1; [[ -n "$c" ]] 
 
 _pq_default_branch() { (cd "${project_root:-$PWD}" && get_default_branch 2>/dev/null); }
 
-# 병합 충돌 사전 확인 (D12). 자동 해소 경로를 뺀 충돌 파일이 남으면 stdout 에 한 줄씩 내고 rc 1.
-#   rc 0 통과 / 1 충돌 / 3 판정 불가
+# 병합 충돌 사전 확인 (D12). 판정은 공용 rd_merge_conflicts(_merge_precheck.sh)가 한다.
+#   자동 해소 경로를 뺀 충돌 파일이 남으면 stdout 에 한 줄씩 내고 rc 1. rc 0 통과 / 1 충돌 / 3 판정 불가
 pq_merge_check() {  # <default-branch> <head>
-  local def="$1" head="$2" out rc p a auto keep=""
-  [[ -n "$def" && -n "$head" ]] || return 3
-  out="$(git -C "${project_root:-$PWD}" merge-tree --write-tree --name-only --no-messages "$def" "$head" 2>/dev/null)"
-  rc=$?
-  case "$rc" in 0) return 0 ;; 1) ;; *) return 3 ;; esac
-  while IFS= read -r p; do
-    [[ -n "$p" ]] || continue
-    auto=0
-    for a in $PQ_AUTO_RESOLVE_PATHS; do [[ "$p" == "$a" ]] && auto=1; done
-    [[ "$auto" -eq 1 ]] || keep="${keep}${p}"$'\n'
-  done < <(printf '%s\n' "$out" | sed 1d | sort -u)
-  [[ -z "$keep" ]] && return 0
-  printf '%s' "$keep"
-  return 1
+  rd_merge_conflicts "${project_root:-$PWD}" "${1:-}" "${2:-}"
+}
+
+# archive 우회 옵션 파싱 (rd publish request). 결과는 전역 PQ_BP_GITLINK·PQ_BP_REVIEW·PQ_BP_BASIS.
+#   오류면 stderr 한 줄과 rc 2. 우회 옵션이 있으면 --basis 필수, 없으면 --basis 거부.
+PQ_BP_GITLINK=""; PQ_BP_REVIEW=""; PQ_BP_BASIS=""
+_pq_bp_value() {  # <옵션> <값...> — 사유·근거 값 규칙 검사. 통과하면 값을 stdout 으로 낸다.
+  local opt="$1" v="${2-}"   # 값 토큰이 없으면 빈 값으로 보고 아래 빈 값 검사가 거부한다
+  case "$v" in -*) printf '%s 의 값이 -로 시작합니다: %s\n' "$opt" "$v" >&2; return 2 ;; esac
+  if [[ -z "$v" || "$v" =~ ^[[:space:]]+$ ]]; then printf '%s 의 값이 없거나 공백뿐입니다\n' "$opt" >&2; return 2; fi
+  case "$v" in *$'\n'*|*$'\r'*) printf '%s 의 값에 줄바꿈이 있습니다\n' "$opt" >&2; return 2 ;; esac
+  printf '%s' "$v"
+}
+_pq_parse_bypass() {
+  local g=0 r=0 b=0 v
+  PQ_BP_GITLINK=""; PQ_BP_REVIEW=""; PQ_BP_BASIS=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --allow-gitlink-drop)
+        if [[ "$g" -eq 1 ]]; then printf '%s 를 두 번 줄 수 없습니다\n' "$1" >&2; return 2; fi
+        v="$(_pq_bp_value "$@")" || return 2
+        PQ_BP_GITLINK="$v"; g=1 ;;
+      --force-skip-review-check)
+        if [[ "$r" -eq 1 ]]; then printf '%s 를 두 번 줄 수 없습니다\n' "$1" >&2; return 2; fi
+        v="$(_pq_bp_value "$@")" || return 2
+        PQ_BP_REVIEW="$v"; r=1 ;;
+      --basis)
+        if [[ "$b" -eq 1 ]]; then printf '%s 를 두 번 줄 수 없습니다\n' "$1" >&2; return 2; fi
+        v="$(_pq_bp_value "$@")" || return 2
+        PQ_BP_BASIS="$v"; b=1 ;;
+      --allow-status-mismatch)
+        printf '큐는 Status 아카이브 보류에서만 발행하므로 이 우회를 받지 않습니다 — 사용자 승인 뒤 archive.sh --allow-status-mismatch "<사유>" 를 직접 실행하십시오\n' >&2
+        return 2 ;;
+      *)
+        printf '알 수 없는 인자: %s — 사용법: rd publish request [--allow-gitlink-drop <사유>] [--force-skip-review-check <사유>] --basis <근거>\n' "$1" >&2
+        return 2 ;;
+    esac
+    shift
+    [[ $# -gt 0 ]] && shift
+  done
+  if [[ $((g + r)) -gt 0 && "$b" -eq 0 ]]; then
+    printf '우회 옵션에는 --basis "<날짜> <결정한 사람> — <한 말>" 이 필요합니다\n' >&2; return 2
+  fi
+  if [[ $((g + r)) -eq 0 && "$b" -eq 1 ]]; then
+    printf -- '--basis 는 우회 옵션(--allow-gitlink-drop·--force-skip-review-check)과 함께만 줄 수 있습니다\n' >&2; return 2
+  fi
+  return 0
+}
+
+# 요청 파일의 우회 기록을 한 줄 조각으로 낸다. 우회가 없으면 빈 출력.
+_pq_bypass_text() {  # <slug>
+  local slug="$1" gl rv ba out=""
+  gl="$(pq_get "$slug" bypass-gitlink 2>/dev/null)"; rv="$(pq_get "$slug" bypass-review 2>/dev/null)"
+  ba="$(pq_get "$slug" bypass-basis 2>/dev/null)"
+  [[ -n "$gl" ]] && out="--allow-gitlink-drop (사유: $gl)"
+  [[ -n "$rv" ]] && out="${out:+$out, }--force-skip-review-check (사유: $rv)"
+  [[ -n "$out" ]] || return 0
+  printf '우회: %s · 근거: %s\n' "$out" "$ba"
+}
+
+# 인자를 작은따옴표로 감싼다(내부의 ' 는 '\'' 로). UTF-8 을 그대로 두고 복사해 실행해도 원문으로 복원된다.
+_pq_shq() {
+  local q="'\\''"
+  printf "'%s'" "${1//\'/$q}"
+}
+
+# archive.sh 에 넘길 인자 배열 PQ_BP_ARGS. 사유는 "<사유> (근거: <근거>)" 로 합친다.
+_pq_bypass_args() {  # <slug>
+  local slug="$1" gl rv ba
+  PQ_BP_ARGS=()
+  gl="$(pq_get "$slug" bypass-gitlink 2>/dev/null)"; rv="$(pq_get "$slug" bypass-review 2>/dev/null)"
+  ba="$(pq_get "$slug" bypass-basis 2>/dev/null)"
+  [[ -n "$gl" ]] && PQ_BP_ARGS+=(--allow-gitlink-drop "$gl (근거: $ba)")
+  [[ -n "$rv" ]] && PQ_BP_ARGS+=(--force-skip-review-check "$rv (근거: $ba)")
+  return 0
 }
 
 # 요청 파일을 새로 쓴다. 같은 slug 의 이전 실행 흔적(run-*·result-*)은 비운다. 큐 락 안에서 부른다.
@@ -440,13 +500,15 @@ _pq_write_request() {  # <slug> <state> <reason> <backend> <caller-id> <fr-branc
   pq_set "$slug" "state=$state" "notified=" "seq=$seq" "requested-at=$now" \
     "worktree=${project_root:-$PWD}" "fr-branch=$6" "head=$7" \
     "caller-backend=$4" "caller-id=$5" "reason=$reason" \
+    "bypass-gitlink=$PQ_BP_GITLINK" "bypass-review=$PQ_BP_REVIEW" "bypass-basis=$PQ_BP_BASIS" \
     "run-pid=" "run-token=" "archive-pgid=" "result-main=" "result-tag="
 }
 
 # ---------------------------------------------------------------- request (D5)
 
 pq_cmd_request() {
-  local slug mode backend cid launch st dirty def head frb conflicts rc lost=0 cur
+  local slug mode backend cid launch st dirty def head frb conflicts rc lost=0 cur p bp
+  _pq_parse_bypass "$@" || return 2
   slug="$(_pq_current_slug)" || { printf 'slug 를 정할 수 없습니다 — 작업 worktree 에서 실행하십시오\n' >&2; return 2; }
   _pq_slug_ok "$slug" || { printf '올바르지 않은 slug: %s\n' "$slug" >&2; return 2; }
   mode="$(pq_approval_mode)"
@@ -454,6 +516,12 @@ pq_cmd_request() {
   launch="$(tasks_index_get "$slug" launch 2>/dev/null || true)"
   if [[ "$mode" == user || -z "$cid" || "$launch" != ok ]]; then
     printf '사용자 승인 대상 — 발행 전에 사용자에게 승인을 받은 뒤 archive.sh 를 실행하십시오\n'
+    if [[ -n "$PQ_BP_GITLINK$PQ_BP_REVIEW" ]]; then
+      local a=""
+      [[ -n "$PQ_BP_GITLINK" ]] && a="$a --allow-gitlink-drop $(_pq_shq "$PQ_BP_GITLINK (근거: $PQ_BP_BASIS)")"
+      [[ -n "$PQ_BP_REVIEW" ]] && a="$a --force-skip-review-check $(_pq_shq "$PQ_BP_REVIEW (근거: $PQ_BP_BASIS)")"
+      printf '승인 뒤 실행할 명령: bash rd-workflow/scripts/lifecycle/archive.sh%s\n' "$a"
+    fi
     return 10
   fi
   backend="$(tasks_index_get "$slug" caller-backend 2>/dev/null || true)"
@@ -474,7 +542,11 @@ pq_cmd_request() {
   frb="$(git -C "${project_root:-$PWD}" rev-parse --abbrev-ref HEAD 2>/dev/null)"
   conflicts="$(pq_merge_check "$def" "$head")"; rc=$?
   if [[ "$rc" -eq 1 ]]; then
-    printf '요청할 수 없습니다 — 기본 브랜치(%s)와 병합 충돌하는 파일이 있습니다. 먼저 해소하십시오:\n%s\n' "$def" "$conflicts"
+    printf '요청할 수 없습니다 — 기본 브랜치(%s)와 병합 충돌하는 파일이 있습니다:\n' "$def"
+    while IFS= read -r p; do [[ -n "$p" ]] && printf '  - %s\n' "$p"; done <<EOF2
+$conflicts
+EOF2
+    rd_merge_conflict_guide '' "$frb" "$def" "${project_root:-$PWD}"
     return 1
   elif [[ "$rc" -ne 0 ]]; then
     printf '병합 충돌 사전 확인을 판정할 수 없습니다\n' >&2
@@ -506,18 +578,23 @@ pq_cmd_request() {
     _pq_write_request "$slug" user-approval "호출 세션 소실" "$backend" "$cid" "$frb" "$head"
     pq_unlock
     printf '호출 세션이 사라졌습니다 — 사용자에게 승인을 물으십시오. 승인되면 rd publish approve %s 뒤 rd publish run 을 실행합니다\n' "$slug"
+    bp="$(_pq_bypass_text "$slug")"
+    [[ -n "$bp" ]] && printf '%s\n' "$bp"
     return 11
   fi
   _pq_write_request "$slug" requested "" "$backend" "$cid" "$frb" "$head"
   pq_unlock
-  printf '요청했습니다: %s\n다음 행동: rd publish wait 를 백그라운드로 실행해 허가를 기다리십시오\n' "$slug"
+  printf '요청했습니다: %s\n' "$slug"
+  bp="$(_pq_bypass_text "$slug")"
+  [[ -n "$bp" ]] && printf '%s\n' "$bp"
+  printf '다음 행동: rd publish wait 를 백그라운드로 실행해 허가를 기다리십시오\n'
   return 0
 }
 
 # ---------------------------------------------------------------- next (D6)
 
 pq_cmd_next() {
-  local main common slot best="" bestseq="" f s seq st rc corrupt=0 d
+  local main common slot best="" bestseq="" f s seq st rc corrupt=0 d bp
   main="$(_pq_main_checkout)" || { printf '기본 체크아웃을 찾을 수 없습니다 — 판정 불가\n' >&2; return 3; }
   common="$(_pq_common_dir)"
   if [[ -f "$common/MERGE_HEAD" ]]; then
@@ -566,14 +643,15 @@ pq_cmd_next() {
   pq_set "$best" state=granted reason=
   pq_slot_set "$best"
   pq_unlock
-  printf '허가했습니다: %s\n' "$best"
+  bp="$(_pq_bypass_text "$best")"
+  printf '허가했습니다: %s%s\n' "$best" "${bp:+ — $bp}"
   return 0
 }
 
 # ---------------------------------------------------------------- approve (D4·D13)
 
 pq_cmd_approve() {
-  local slug="${1:-}" st rc=0 d slot
+  local slug="${1:-}" st rc=0 d slot bp
   if [[ -z "$slug" ]]; then
     slug="$(_pq_current_slug)" || { printf 'slug 를 정할 수 없습니다 — rd publish approve <slug>\n' >&2; return 2; }
   fi
@@ -598,6 +676,8 @@ pq_cmd_approve() {
   pq_slot_set "$slug"
   pq_unlock
   printf '승인했습니다: %s — rd publish run 을 실행하십시오\n' "$slug"
+  bp="$(_pq_bypass_text "$slug")"
+  [[ -n "$bp" ]] && printf '%s\n' "$bp"
   return 0
 }
 
@@ -605,7 +685,7 @@ pq_cmd_approve() {
 
 # 재검증 (AC14). <mode> granted 면 a~e, partial 이면 a·b·d. 실패 사유 한 줄을 stdout 에 내고 rc 1.
 _pq_reverify() {  # <slug> <mode> <head>
-  local slug="$1" mode="$2" head="$3" st dirty def now_head main common conflicts rc
+  local slug="$1" mode="$2" head="$3" st dirty def now_head main common conflicts rc wtp
   st="$(cd "${project_root:-$PWD}" && bash rd-workflow/scripts/rd task status 2>/dev/null | head -1)"
   if [[ "$st" != "아카이브 보류" ]]; then printf 'Status 가 %s 입니다 (아카이브 보류 필요)\n' "${st:-읽을 수 없음}"; return 1; fi
   dirty="$(git -C "${project_root:-$PWD}" status --porcelain 2>/dev/null)" || { printf '작업 worktree 상태를 읽을 수 없습니다\n'; return 1; }
@@ -621,7 +701,11 @@ _pq_reverify() {  # <slug> <mode> <head>
   if [[ "$mode" == granted ]]; then
     def="$(_pq_default_branch)" || { printf '기본 브랜치를 정할 수 없습니다\n'; return 1; }
     conflicts="$(pq_merge_check "$def" "$head")"; rc=$?
-    if [[ "$rc" -eq 1 ]]; then printf '기본 브랜치(%s)와 병합 충돌: %s\n' "$def" "$(printf '%s' "$conflicts" | tr '\n' ' ')"; return 1
+    if [[ "$rc" -eq 1 ]]; then
+      printf '기본 브랜치(%s)와 병합 충돌: %s\n' "$def" "$(printf '%s' "$conflicts" | tr '\n' ' ')"
+      wtp="$(pq_get "$slug" worktree || true)"
+      rd_merge_conflict_guide '' "$(pq_get "$slug" fr-branch || true)" "$def" "${wtp:-${project_root:-$PWD}}"
+      return 1
     elif [[ "$rc" -ne 0 ]]; then printf '병합 충돌 사전 확인을 판정할 수 없습니다\n'; return 1; fi
   fi
   return 0
@@ -640,7 +724,7 @@ _pq_evidence() {  # <slug>
 }
 
 pq_cmd_run() {
-  local slug st rc=0 from token mypid wt why ev arc_rc lastline
+  local slug st rc=0 from token mypid wt why ev arc_rc lastline hint
   slug="$(_pq_current_slug)" || { printf 'slug 를 정할 수 없습니다 — 작업 worktree 에서 실행하십시오\n' >&2; return 2; }
   _pq_slug_ok "$slug" || { printf '올바르지 않은 slug: %s\n' "$slug" >&2; return 2; }
   pq_lock || { printf '큐 락 획득 실패 — 잠시 뒤 다시 시도하십시오\n' >&2; return 1; }
@@ -683,11 +767,23 @@ pq_cmd_run() {
   local epid=$!
   set +m
   wait "$epid"; arc_rc=$?
-  # 출력 로그를 나르는 tee 가 마저 비울 때까지 잠시 기다린다 (archive 프로세스 그룹이 비면 끝).
-  local pgw pgn=0
+  # 출력 로그를 나르는 tee 가 마저 비울 때까지 기다린다. archive 가 끝나면 그 프로세스 그룹에는 tee 만
+  # 남으므로 그룹이 비는 시점이 곧 tee 종료다. 부하가 높으면 tee 가 2초 가까이 걸려(실측) 상한은
+  # 넉넉히 30초로 두고, 상한은 출력을 쥔 채 남은 프로세스 때문에 발행이 끝없이 멈추지 않게 하는 용도다.
+  local pgw pgn=0 drained=1 logf
+  logf="$(pq_dir)/$slug.log"
   pgw="$(pq_get "$slug" archive-pgid)"
-  case "$pgw" in ''|*[!0-9]*) ;; *) while kill -0 -- "-$pgw" 2>/dev/null && (( pgn < 20 )); do sleep 0.1; pgn=$((pgn+1)); done ;; esac
-  lastline="$(grep -v '^[[:space:]]*$' "$(pq_dir)/$slug.log" 2>/dev/null | tail -1)"
+  case "$pgw" in ''|*[!0-9]*) ;; *)
+    while kill -0 -- "-$pgw" 2>/dev/null; do
+      (( pgn < 300 )) || { drained=0; break; }
+      # 2초를 넘기면 멈춘 것으로 보이지 않게 한 번 알린다 (stderr — archive 출력 로그에는 섞이지 않는다).
+      (( pgn == 20 )) && printf 'archive 출력 기록이 끝나기를 기다립니다 (최대 30초) — 전체 출력: %s\n' "$logf" >&2
+      sleep 0.1; pgn=$((pgn+1))
+    done ;;
+  esac
+  lastline="$(grep -v '^[[:space:]]*$' "$logf" 2>/dev/null | tail -1)"
+  # 상한에 닿으면 마지막 줄이 실제 마지막이 아닐 수 있다 — 전체 출력 위치를 함께 알린다.
+  [[ "$drained" -eq 1 ]] || lastline="${lastline:+$lastline }(출력 기록이 끝나지 않았습니다 — 전체 출력: $logf)"
 
   ev="$(_pq_evidence "$slug")" || ev=""
   pq_lock || { printf '큐 락 획득 실패 — 상태가 running 으로 남았습니다. rd publish recover %s\n' "$slug" >&2; return 1; }
@@ -703,13 +799,19 @@ pq_cmd_run() {
     *)
       pq_set "$slug" state=failed "run-token=" "reason=archive.sh 종료 코드 ${arc_rc}${lastline:+ — $lastline}"
       [[ "$(pq_slot_get)" == "$slug" ]] && pq_slot_clear
-      pq_unlock; printf '발행 실패: archive.sh 종료 코드 %s%s\n' "$arc_rc" "${lastline:+ — $lastline}"; return 1 ;;
+      pq_unlock; printf '발행 실패: archive.sh 종료 코드 %s%s\n' "$arc_rc" "${lastline:+ — $lastline}"
+      hint=""
+      grep -q -e '--allow-gitlink-drop' "$(pq_dir)/$slug.log" 2>/dev/null && hint="$hint --allow-gitlink-drop \"<사유>\""
+      grep -q -e '--force-skip-review-check' "$(pq_dir)/$slug.log" 2>/dev/null && hint="$hint --force-skip-review-check \"<사유>\""
+      [[ -n "$hint" ]] && printf '큐 경로에서는 사람의 결정을 받은 뒤 rd publish request%s --basis "<날짜> <결정한 사람> — <한 말>" 로 다시 요청하십시오\n' "$hint"
+      return 1 ;;
   esac
 }
 
 # 중간 실행기 (D8-3). 큐 락 안에서 running·토큰 확인 → archive-pgid 기록 → 락 해제 → archive 로 exec.
 pq_cmd_exec() {  # <slug> <token>
   local slug="${1:-}" token="${2:-}" st pg cmd
+  PQ_BP_ARGS=()
   [[ -n "$slug" && -n "$token" ]] || return 1
   _pq_slug_ok "$slug" || return 1
   pq_lock || return 1
@@ -728,14 +830,15 @@ pq_cmd_exec() {  # <slug> <token>
       return 1 ;;
   esac
   pq_set "$slug" "archive-pgid=$pg"
+  _pq_bypass_args "$slug"
   pq_unlock
   cd "${project_root:-$PWD}" || return 1
   # 출력은 터미널과 로그 파일 둘 다로 보낸다 (run 이 실패 사유에 마지막 줄을 남긴다).
   exec > >(tee -a "$(pq_dir)/$slug.log") 2>&1
   if [[ -n "${RD_PQ_ARCHIVE:-}" ]]; then
-    exec env -u project_root -u TASK_STATE_PATH "$RD_PQ_ARCHIVE"
+    exec env -u project_root -u TASK_STATE_PATH "$RD_PQ_ARCHIVE" ${PQ_BP_ARGS[@]+"${PQ_BP_ARGS[@]}"}
   fi
-  exec env -u project_root -u TASK_STATE_PATH bash rd-workflow/scripts/lifecycle/archive.sh
+  exec env -u project_root -u TASK_STATE_PATH bash rd-workflow/scripts/lifecycle/archive.sh ${PQ_BP_ARGS[@]+"${PQ_BP_ARGS[@]}"}
 }
 
 # ---------------------------------------------------------------- recover (D11)
@@ -875,6 +978,7 @@ pq_cmd_wait() {
           [[ "$(pq_slot_get)" == "$slug" ]] && pq_slot_clear
           pq_unlock
           printf '호출 세션이 사라졌습니다 — 사용자에게 승인을 받은 뒤 rd publish approve %s → rd publish run\n' "$slug"
+          _pq_bypass_text "$slug"
           return 11
         fi
         pq_unlock
@@ -886,7 +990,7 @@ pq_cmd_wait() {
 # 호출 세션용 사건 수집. stdout 에 사건 줄, 결과 사건은 큐 락 안에서 notified 기록.
 # rc 0 사건 있음 / 1 없음.
 _pq_watch_scan() {
-  local d f s st n got=0 slot nreq=0 first="" rc reason
+  local d f s st n got=0 slot nreq=0 first="" rc reason bp
   d="$(pq_dir)" || return 1
   for f in "$d"/*.req; do
     [[ -f "$f" ]] || continue
@@ -904,6 +1008,10 @@ _pq_watch_scan() {
             pq_unlock
           fi
           printf '발행 결과 %s: %s%s → %s\n' "$s" "$(pq_label "$st")" "${reason:+ ($reason)}" "$(_pq_next_action "$s" "$st")"
+          if [[ "$st" == user-approval ]]; then
+            bp="$(_pq_bypass_text "$s")"
+            [[ -n "$bp" ]] && printf '  %s\n' "$bp"
+          fi
           got=1
         fi ;;
       requested) nreq=$((nreq+1)); [[ -n "$first" ]] || first="$s" ;;
@@ -914,7 +1022,7 @@ _pq_watch_scan() {
     for f in "$d"/*.req; do
       [[ -f "$f" ]] || continue
       s="$(basename "$f" .req)"
-      [[ "$(_pq_state_of "$s" 2>/dev/null)" == requested ]] && printf '발행 요청 %s — rd publish next 로 허가\n' "$s"
+      [[ "$(_pq_state_of "$s" 2>/dev/null)" == requested ]] && { bp="$(_pq_bypass_text "$s")"; printf '발행 요청 %s%s — rd publish next 로 허가\n' "$s" "${bp:+ — $bp}"; }
     done
     got=1
   fi
@@ -942,7 +1050,7 @@ pq_cmd_watch() {
 # ---------------------------------------------------------------- 디스패치
 
 _pq_usage() {
-  printf '사용법: rd publish <request|wait|next|approve|run|watch|status|cancel|recover> [인자]\n' >&2
+  printf '사용법: rd publish <request|wait|next|approve|run|watch|status|cancel|recover> [인자]\n  request [--allow-gitlink-drop <사유>] [--force-skip-review-check <사유>] --basis <근거>\n' >&2
 }
 
 main() {

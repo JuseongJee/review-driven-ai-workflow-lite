@@ -296,6 +296,25 @@ rw_group_alive() {  # $1=pgid → 0=있음 / 1=없음 / 2=판정 불가
   esac
 }
 
+# process group 이 사라질 때까지 최대 max_secs 초 기다린다 — rw_group_alive 와 같은 rc.
+#   1 = 없음(바로 반환) / 2 = 판정 불가(기다려도 나아지지 않으므로 바로 반환) / 0 = 상한까지 있음.
+# 0.1초 간격으로 판정하고, 반복 횟수(max_secs×10)와 SECONDS 경과(> max_secs) 중 먼저 닿는 쪽에서
+# 끝낸다 — 부하로 sleep 기동 비용이 쌓여도 상한+1초 남짓에 반환한다. max_secs 가 0 이면 1회만 판정한다.
+rw_group_wait_gone() {  # $1=pgid $2=최대 초 → 0=있음 / 1=없음 / 2=판정 불가
+  local pgid="${1:-}" max="${2:-0}" i=0 n start rc=0
+  case "$max" in ''|*[!0-9]*) max=0 ;; esac
+  n=$(( max * 10 ))
+  start=$SECONDS
+  while :; do
+    rc=0; rw_group_alive "$pgid" || rc=$?
+    [ "$rc" -ne 0 ] && return "$rc"
+    i=$(( i + 1 ))
+    [ "$i" -gt "$n" ] && return 0
+    [ $(( SECONDS - start )) -gt "$max" ] && return 0
+    sleep 0.1 || true
+  done
+}
+
 # process group 종료 증거 판정. stdout 한 단어, 항상 rc 0.
 #   alive      — ps 가 성공했고 pgid 가 같은 구성원이 있다.
 #   verified   — pgid 가 있고 ps 가 성공(rc 0 + 비어 있지 않은 출력)했고 구성원이 없다.

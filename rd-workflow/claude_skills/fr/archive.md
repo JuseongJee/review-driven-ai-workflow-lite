@@ -38,6 +38,8 @@
    ```
    인자 없이 부르면 task-state 의 `source-fr` 집합 전부가 대상입니다. **`fr-done` 은 묶은 FR 전부의 `items/` status 와 인덱스 행 status 를 함께 `done` 으로 바꿉니다** — 인덱스 행의 **삭제**는 여전히 `/fr archive` 몫이며, `/fr archive` 는 그 status 를 보고 삭제 대상을 고릅니다. 즉 `fr-done` 이 status 를 두 자리 모두 바꾸지 않으면(예: items 만 바꾸면) `/fr archive` 는 인덱스가 여전히 활성이라 0건으로 끝나고 FR 이 활성으로 남습니다 — 이 연결이 끊기지 않게 항상 `fr-done` 을 먼저 호출합니다.
 
+   **폐기로 닫는 FR**: 실측 결과 등으로 FR 을 폐기하면 `fr-done` 전에 `/fr status <slug> dropped` 로 닫고 상세에 세 가지(`fr/status.md` 규칙)를 남깁니다. `fr-done` 은 이미 `dropped` 인 상세와 인덱스 행을 덮지 않으므로 그 FR 은 「건너뜀」 또는 인덱스 「행 부재」 로 보고됩니다.
+
    **실패해도 발행을 계속합니다.** `fr-done` 이 exit 1(실패 1건 이상)이어도 이 기록 커밋과 이어지는 4번 발행을 중단하지 않습니다. 대신:
    - `fr-done` 의 표준출력(FR 별 items/인덱스 결과 + `처리 N / 건너뜀 M / 실패 K` 요약 + 실패 목록)을 completion report 의 **「FR 정리 결과」 절**에 그대로 옮깁니다.
    - `PROJECT_CONTEXT.md` 의 `auto_completion_report` 가 꺼진 프로젝트는 같은 내용을 **아카이브된 REQUEST 사본**(`request-archive/YYYY-MM-DD-HHMM-*.md`) 말미에 적습니다.
@@ -47,13 +49,13 @@
    ```bash
    bash rd-workflow/scripts/rd task fr-done <path>...
    ```
-4. main 으로 switch 후 `bash rd-workflow/scripts/lifecycle/archive.sh` 호출 → merge + tag + push + branch/worktree 정리 일괄 처리. (`archive.sh` 자체는 FR 정리에 관여하지 않습니다 — 위 3번에서 이미 끝나 있어야 합니다.)
+4. 작업 worktree 에서 발행합니다 — 승인 경로에 따라 `rd publish run` 또는 `bash rd-workflow/scripts/lifecycle/archive.sh` 를 씁니다(`AUTONOMY.md` 「종결 마커(seal)와 발행 승인」). 발행은 merge + tag + push + branch/worktree 정리를 일괄 처리합니다. 실행 위치와 정리는 `WORKFLOW.md` 「REQUEST 아카이브」 절을 따릅니다. (`archive.sh` 자체는 FR 정리에 관여하지 않습니다 — 위 3번에서 이미 끝나 있어야 합니다.)
 
 즉, **사용자가 수동으로 REQUEST archive 를 진행할 때**:
 - 리뷰 종결 직후 seal → `아카이브 보류` 전이 순으로 준비합니다. 이 둘은 커밋 **앞**입니다 — 게이트가 워킹트리의 task-state 를 읽으므로 전이는 즉시 반영되고, 보류 상태에서만 archive 기록 커밋이 통과합니다.
 - archive content 는 seal 파일과 함께 fr branch 에서 commit 합니다. **마커는 커밋되어야 효력이 생깁니다** — `archive.sh` 는 워킹트리가 아니라 fr tip(no-fr 모드면 현재 `HEAD`)에서 마커를 읽습니다.
-- main 으로 switch 한 뒤 `bash rd-workflow/scripts/lifecycle/archive.sh` 를 실행합니다.
-- `archive.sh` 가 merge/tag/push/cleanup 을 자동 처리하므로 사용자는 seal·상태 전이·archive content commit 과 main switch 만 수동 수행하면 됩니다. `archive.sh` 의 호출 형태·인자·내부 순서는 종전과 같아, 위 준비를 마친 뒤 곧바로 부르면 종전의 one-shot 실행과 동일합니다.
+- 작업 worktree 에서 `bash rd-workflow/scripts/lifecycle/archive.sh` 를 실행합니다.
+- `archive.sh` 가 merge/tag/push/cleanup 을 자동 처리하므로 사용자는 seal·상태 전이·archive content commit 만 수동 수행하면 됩니다. `archive.sh` 의 호출 형태·인자·내부 순서는 종전과 같아, 위 준비를 마친 뒤 곧바로 부르면 종전의 one-shot 실행과 동일합니다.
 - 다음에 할 일이 헷갈리면 `bash rd-workflow/scripts/rd task status` 를 실행합니다 — `발행` / `seal 과 archive 기록을 커밋하세요` / 실패 사유별 복구 안내 중 하나를 냅니다.
 
 ### fr 브랜치 없이 작업한 경우 (no-fr 모드)

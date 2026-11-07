@@ -270,10 +270,12 @@ cat > "$STUB/herdr" <<'STUBEOF'
 exec sleep 30
 STUBEOF
 chmod +x "$STUB/herdr"
+# 판정 기준은 「대역의 30초를 다 기다리지 않았다」 이다. 상한 2초에 10초 기준을 두면 부하에서 간헐 FAIL 했다.
+# 대역 대기보다 넉넉히 짧은 25초로 본다(정상 경로는 약 2초라 시간 비용은 늘지 않는다).
 start=$SECONDS
 out="$(PATH="$STUB:$PATH" HERDR_ENV=1 RD_LAUNCH_TIMEOUT=2 session_probe alpha 2>/dev/null)"
 elapsed=$((SECONDS-start))
-[[ "$out" == "unknown" && "$elapsed" -lt 10 ]] \
+[[ "$out" == "unknown" && "$elapsed" -lt 25 ]] \
   && pass "무응답이 유한 시간 안에 unknown 으로 끝난다" || fail "타임아웃: $out/${elapsed}s"
 
 # 8) 살아 있는 세션이 다른 작업을 맡고 있으면 대상 불일치로 본다
@@ -652,6 +654,110 @@ out="$(cat "$TMP/launch.out")"
 [[ "$out" == "failed" ]] && pass "start: S2 다른 오류 코드(rc=1)는 failed" || fail "start: S2 판정: $out"
 [[ "$err" == *"agent start 응답(rc=1)"*"agent_pane_not_found"* ]] \
   && pass "start: S3 실패 응답 본문을 stderr 로 남긴다" || fail "start: S3 진단 출력 없음: $err"
+[[ "$(grep -c '^agent start' "$STUB/calls.log")" -eq 1 ]] \
+  && pass "start: S2 busy 가 아닌 오류는 다시 부르지 않는다" || fail "start: S2 agent start 호출 수: $(grep -c '^agent start' "$STUB/calls.log")"
+
+# 8-3) `agent_pane_busy` 재시도 (promote-launch-race). 새 tab 셸이 시작 스크립트의 자식 프로세스를
+#      포그라운드로 돌리는 순간 herdr 가 이 코드로 거부한다(2026-11-06 실측). 같은 pane 으로 다시 부른다.
+#   mk_seq_stub <spec>... — agent start 를 부를 때마다 다음 spec 을 쓴다(마지막 spec 은 반복).
+#   busy=stderr busy+rc1, busyout=stdout busy+rc1, ok=rc0, notready=stderr agent_not_ready+rc1,
+#   timeout=rc124, busy124=stderr busy+rc124, slowok=4초 뒤 rc0
+mk_seq_stub() {
+  : > "$STUB/calls.log"; printf '0' > "$STUB/seq.n"; printf '%s\n' "$@" > "$STUB/seq.list"
+  cat > "$STUB/herdr" <<STUBEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$STUB/calls.log"
+busy='{"error":{"code":"agent_pane_busy","message":"agent target pane wX:p9 is not an available shell"}}'
+case "\$1 \$2" in
+  "tab create") echo '{"result":{"root_pane":{"pane_id":"wX:p9","tab_id":"wX:t9"},"tab":{"tab_id":"wX:t9"}}}' ;;
+  "agent start")
+    n=\$(cat "$STUB/seq.n"); printf '%s' "\$((n + 1))" > "$STUB/seq.n"
+    total=\$(wc -l < "$STUB/seq.list"); idx=\$((n + 1)); (( idx > total )) && idx=\$total
+    case "\$(sed -n "\${idx}p" "$STUB/seq.list")" in
+      busy) printf '%s' "\$busy" >&2; exit 1 ;;
+      busyout) printf '%s' "\$busy"; exit 1 ;;
+      ok) exit 0 ;;
+      notready) echo '{"error":{"code":"agent_not_ready","message":"blocked"}}' >&2; exit 1 ;;
+      timeout) exit 124 ;;
+      busy124) printf '%s' "\$busy" >&2; exit 124 ;;
+      slowok) sleep 4; exit 0 ;;
+    esac ;;
+  "agent prompt") exit 0 ;;
+  "tab close") exit 0 ;;
+esac
+STUBEOF
+  chmod +x "$STUB/herdr"
+}
+_bl() { PATH="$STUB:$PATH" HERDR_ENV=1 RD_CHILD_SESSION= session_launch /tmp/wt alpha REQUEST.md 2>"$TMP/b.err"; }
+_nstart() { grep -c '^agent start' "$STUB/calls.log" || true; }
+unset RD_LAUNCH_BUSY_RETRY_SECS
+
+mk_seq_stub busy busy ok
+out="$(_bl)"; err="$(cat "$TMP/b.err")"
+[[ "$out" == "ok" ]] && pass "busy: B1 busy 2회 뒤 성공이면 ok" || fail "busy: B1 판정: $out"
+[[ "$(_nstart)" -eq 3 && "$(grep '^agent start' "$STUB/calls.log" | sort -u | wc -l | tr -d ' ')" -eq 1 ]] \
+  && pass "busy: B1 같은 인자로 3회 부른다" || fail "busy: B1 호출: $(grep '^agent start' "$STUB/calls.log")"
+[[ "$(_nclose)" -eq 0 ]] && pass "busy: B1 tab 을 닫지 않는다" || fail "busy: B1 tab close $(_nclose)회"
+[[ "$err" == *"최대 30초 동안 다시 시도합니다"* ]] && pass "busy: B1 재시도 시작 줄" || fail "busy: B1 시작 줄 없음: $err"
+[[ "$err" == *"2회 다시 시도했습니다"* ]] && pass "busy: B1 재시도 요약 줄" || fail "busy: B1 요약 줄 없음: $err"
+
+# B2 상한 도달 — 무한 재시도는 테스트 안의 10초 제한으로 FAIL 시킨다.
+mk_seq_stub busy
+# 백그라운드 서브셸은 이 파일의 set -e 를 이어받아 첫 rc≠0 에서 끝나므로 끈다(명령 치환은 이어받지 않는다).
+( set +e; RD_LAUNCH_BUSY_RETRY_SECS=1 _bl > "$TMP/b2.out" ) &
+_b2pid=$!; _b2i=0
+while kill -0 "$_b2pid" 2>/dev/null && (( _b2i < 50 )); do sleep 0.2; _b2i=$((_b2i + 1)); done
+if kill -0 "$_b2pid" 2>/dev/null; then
+  kill -9 "$_b2pid" 2>/dev/null || true; wait "$_b2pid" 2>/dev/null || true
+  fail "busy: B2 상한 안에 끝나지 않음(10초)"
+else
+  wait "$_b2pid" 2>/dev/null || true
+  pass "busy: B2 상한(1초) 뒤 끝난다"
+fi
+out="$(cat "$TMP/b2.out")"; err="$(cat "$TMP/b.err")"
+[[ "$out" == "failed" && "$(_nclose)" -eq 1 && "$err" == *"agent_pane_busy"* ]] \
+  && pass "busy: B2 상한 도달은 failed·tab 닫기·마지막 응답 기록" || fail "busy: B2 out=$out close=$(_nclose) err=$err"
+
+mk_seq_stub busy notready
+out="$(_bl)"; err="$(cat "$TMP/b.err")"
+[[ "$out" == "unknown" && "$(_nstart)" -eq 2 && "$(_nclose)" -eq 0 && "$err" == *"1회 다시 시도했습니다"* ]] \
+  && pass "busy: B3 busy 뒤 agent_not_ready 는 unknown·tab 보존" || fail "busy: B3 out=$out start=$(_nstart) close=$(_nclose) err=$err"
+
+mk_seq_stub busy ok
+out="$(RD_LAUNCH_BUSY_RETRY_SECS=0 _bl)"; err="$(cat "$TMP/b.err")"
+[[ "$out" == "failed" && "$(_nstart)" -eq 1 && "$err" != *"다시 시도합니다"* ]] \
+  && pass "busy: B4 RD_LAUNCH_BUSY_RETRY_SECS=0 이면 재시도하지 않는다" || fail "busy: B4 out=$out start=$(_nstart) err=$err"
+
+mk_seq_stub busy timeout
+out="$(_bl)"; err="$(cat "$TMP/b.err")"
+[[ "$out" == "unknown" && "$(_nstart)" -eq 2 && "$(_nclose)" -eq 0 && "$err" == *"1회 다시 시도했습니다"* ]] \
+  && pass "busy: B5 busy 뒤 타임아웃은 unknown·tab 보존" || fail "busy: B5 out=$out start=$(_nstart) close=$(_nclose) err=$err"
+
+mk_seq_stub busyout ok
+out="$(_bl)"
+[[ "$out" == "ok" && "$(_nstart)" -eq 2 ]] \
+  && pass "busy: B6 stdout 으로 온 busy 도 재시도한다" || fail "busy: B6 out=$out start=$(_nstart)"
+
+_b7() { _session_launch_timeout_secs RD_LAUNCH_BUSY_RETRY_SECS 30 0 120; }
+_v="$(RD_LAUNCH_BUSY_RETRY_SECS=abc _b7 2>"$TMP/b7.err")"
+[[ "$_v" == 30 && "$(cat "$TMP/b7.err")" == *"허용 범위(0~120초)"* ]] \
+  && pass "busy: B7 정수 아닌 값은 경고 후 30" || fail "busy: B7 abc → $_v / $(cat "$TMP/b7.err")"
+_v="$(RD_LAUNCH_BUSY_RETRY_SECS=121 _b7 2>"$TMP/b7.err")"
+[[ "$_v" == 30 && "$(cat "$TMP/b7.err")" == *"허용 범위(0~120초)"* ]] \
+  && pass "busy: B7 121 은 경고 후 30" || fail "busy: B7 121 → $_v / $(cat "$TMP/b7.err")"
+_v="$(RD_LAUNCH_BUSY_RETRY_SECS=0 _b7 2>"$TMP/b7.err")"
+[[ "$_v" == 0 && ! -s "$TMP/b7.err" ]] \
+  && pass "busy: B7 0 은 경고 없이 0" || fail "busy: B7 0 → $_v / $(cat "$TMP/b7.err")"
+
+mk_seq_stub busy slowok
+out="$(RD_LAUNCH_BUSY_RETRY_SECS=3 _bl)"
+[[ "$out" == "ok" && "$(_nstart)" -eq 2 && "$(_nclose)" -eq 0 ]] \
+  && pass "busy: B8 창이 지난 뒤 끝난 시도의 결과(ok)를 따른다" || fail "busy: B8 out=$out start=$(_nstart) close=$(_nclose)"
+
+mk_seq_stub busy124
+out="$(_bl)"
+[[ "$out" == "unknown" && "$(_nstart)" -eq 1 && "$(_nclose)" -eq 0 ]] \
+  && pass "busy: B9 busy 본문이 있어도 rc=124 는 재시도 없이 unknown" || fail "busy: B9 out=$out start=$(_nstart) close=$(_nclose)"
 
 # 9) 종료 판정용 이름·경로 경계 (resume-name Task 1)
 _sl_long="abcdefghij-abcdefghij-abcdefghij-abcdefg"
@@ -837,29 +943,34 @@ make_hc_launch_stub wait; got="$(hc_launch alpha RD_LAUNCH_START_TIMEOUT=6)"; er
 [[ "$(grep -n 'tab.rename' "$STUB/order.log" | head -1 | cut -d: -f1)" -lt "$(grep -n '^hc get alpha' "$STUB/order.log" | head -1 | cut -d: -f1)" ]] \
   && pass "T4: rename 이 대기보다 앞선다" || fail "rename 순서: $(cat "$STUB/order.log")"
 
-# T4b) 조회가 느려도(4초) 안내한 상한(6초)을 넘겨 기다리지 않는다. 고치기 전에는 조회마다 상한
-#      전체(RD_LAUNCH_TIMEOUT)를 써서 대기 구간이 약 9초였다. 실제로 기다리지 않도록 처리 조회와
-#      1초 sleep 을 가짜 시계(SECONDS 증가)로 바꾼다 — 조회는 min(4초, 그 조회의 상한)만큼 흐르고,
+# T4b) 조회가 느려도(40초) 안내한 상한(60초)을 넘겨 기다리지 않는다. 고치기 전에는 조회마다 상한
+#      전체(RD_LAUNCH_TIMEOUT)를 써서 대기 구간이 상한을 넘었다. 실제로 기다리지 않도록 처리 조회와
+#      1초 sleep 을 가짜 시계(SECONDS 증가)로 바꾼다 — 조회는 min(40초, 그 조회의 상한)만큼 흐르고,
 #      상한보다 짧으면 시간 초과(124)다. 실행 약 5초(대부분 JSON 해석) — 안내와 실제 대기가 어긋나는
 #      회귀를 잡는 유일한 케이스.
+#      대기 길이는 가짜 시계가 더한 초(F)만 센다. SECONDS 차이로 재면 실제 경과(부하에서 JSON 해석이
+#      몇 초씩 늘어남)가 섞여 간헐 FAIL 했다(FR selftest-load-sensitive-asserts-residual). 실제 경과는
+#      제품의 마감 계산에도 들어가 대기를 줄이기만 하므로 F 를 늘리지 않는다. 가짜 시계 폭을 수십 초로
+#      잡는 것은 실제 경과 몇 초가 회귀(두 번째 조회가 상한 전체를 씀)를 가리지 않게 하려는 것이다.
 make_hc_launch_stub wait
-got="$(env HERDR_ENV= HC_TERMINAL_ID=t6 RD_CHILD_SESSION= PATH="$STUB:$PATH" RD_LAUNCH_START_TIMEOUT=6 RD_LAUNCH_TIMEOUT=5 \
+got="$(env HERDR_ENV= HC_TERMINAL_ID=t6 RD_CHILD_SESSION= PATH="$STUB:$PATH" RD_LAUNCH_START_TIMEOUT=60 RD_LAUNCH_TIMEOUT=50 \
   bash -c 'source "$1"
     eval "_t4b_orig$(declare -f _session_launch_hc_call)"
-    sleep() { if [[ "$1" == 1 ]]; then SECONDS=$(( SECONDS + 1 )); else command sleep "$@"; fi; }
+    F=0
+    sleep() { if [[ "$1" == 1 ]]; then SECONDS=$(( SECONDS + 1 )); [[ -n "${W0:-}" ]] && F=$(( F + 1 )); else command sleep "$@"; fi; }
     _session_launch_hc_call() {
       if [[ "$3" == get && "$4" == alpha ]]; then
         [[ -n "${W0:-}" ]] || W0=$SECONDS
-        local d=4; (( $1 < d )) && d=$1; SECONDS=$(( SECONDS + d ))
-        if (( $1 < 4 )); then : > "$2"; return 124; fi
+        local d=40; (( $1 < d )) && d=$1; SECONDS=$(( SECONDS + d )); F=$(( F + d ))
+        if (( $1 < 40 )); then : > "$2"; return 124; fi
         printf "{\"state\":\"live\",\"cwd\":\"/tmp/wt\",\"turn\":0,\"status\":null}" > "$2"; return 0
       fi
       _t4b_orig_session_launch_hc_call "$@"
     }
     session_launch /tmp/wt alpha /tmp/wt/REQUEST.md claude-test >"$2/t4b.out" 2>/dev/null
-    printf "%s %s\n" "$(cat "$2/t4b.out")" "$(( SECONDS - ${W0:-$SECONDS} ))"' _ "$SCRIPT_DIR/session_launch.sh" "$STUB")"
-[[ "${got% *}" == unknown && "${got#* }" -le 7 ]] \
-  && pass "T4b: 느린 조회에서도 대기 상한(6초)을 지킨다" || fail "느린 조회 대기: $got"
+    printf "%s %s\n" "$(cat "$2/t4b.out")" "$F"' _ "$SCRIPT_DIR/session_launch.sh" "$STUB")"
+[[ "${got% *}" == unknown && "${got#* }" -le 61 ]] \
+  && pass "T4b: 느린 조회에서도 대기 상한(60초)을 지킨다" || fail "느린 조회 대기: $got"
 
 make_hc_launch_stub exit; got="$(hc_launch alpha)"
 [[ "$got" == failed ]] && pass "T5: 즉시 종료는 failed" || fail "exit: $got"

@@ -123,9 +123,9 @@ check "https .git 및 /"   "$(PU 'https://github.com/JuseongJee/review-driven-ai
 check "ssh scp .git"      "$(PU 'git@github.com:JuseongJee/review-driven-ai-workflow.git')"      "JuseongJee/review-driven-ai-workflow"
 check "ssh scp bare"      "$(PU 'git@github.com:JuseongJee/review-driven-ai-workflow')"          "JuseongJee/review-driven-ai-workflow"
 check "lite https"        "$(PU 'https://github.com/JuseongJee/review-driven-ai-workflow-lite.git')" "JuseongJee/review-driven-ai-workflow-lite"
-check "GHE https"         "$(PU 'https://ghes.navercorp.com/jay-jee/review-driven-ai-workflow.git')"  "ghes.navercorp.com/jay-jee/review-driven-ai-workflow"
-check "GHE ssh"           "$(PU 'git@ghes.navercorp.com:jay-jee/review-driven-ai-workflow.git')"      "ghes.navercorp.com/jay-jee/review-driven-ai-workflow"
-check "GHE lite ssh"      "$(PU 'git@ghes.navercorp.com:jay-jee/review-driven-ai-workflow-lite.git')" "ghes.navercorp.com/jay-jee/review-driven-ai-workflow-lite"
+check "GHE https"         "$(PU 'https://ghe.example.com/example-org/review-driven-ai-workflow.git')"  "ghe.example.com/example-org/review-driven-ai-workflow"
+check "GHE ssh"           "$(PU 'git@ghe.example.com:example-org/review-driven-ai-workflow.git')"      "ghe.example.com/example-org/review-driven-ai-workflow"
+check "GHE lite ssh"      "$(PU 'git@ghe.example.com:example-org/review-driven-ai-workflow-lite.git')" "ghe.example.com/example-org/review-driven-ai-workflow-lite"
 
 echo "== --print-upstream: credential 제거 =="
 out="$(PU 'https://someuser:ghp_secrettoken@github.com/O/R.git')"
@@ -154,7 +154,7 @@ echo "== --print-upstream: 부작용 없음 (격리 디렉토리 내용 fingerpr
 ISO="$(mktemp -d)" || { echo "test_sync_template.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$ISO" && -d "$ISO" ]] || { echo "test_sync_template.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 ( cd "$ISO" && mkdir -p sub && echo seed > sub/seed.txt )
-# 크기만 비교하면 같은 길이로 내용이 바뀌는 부작용을 놓친다 (Turn 006 Finding 3).
+# 크기만 비교하면 같은 길이로 내용이 바뀌는 부작용을 놓친다.
 # cksum 은 macOS/Linux 공통이며 파일명 없이 "체크섬 크기" 를 낸다.
 snap() { (cd "$1" && find . -type f | LC_ALL=C sort | while read -r f; do
            printf '%s %s\n' "$f" "$(cksum < "$f")"; done); }
@@ -270,7 +270,7 @@ J
 
   # F5b — **`command` 가 없는 프로젝트 고유 item 이 보존돼야 합니다.**
   # 이 item 들은 모두 key=null 로 접혀 같은 group 의 두 번째부터 조용히 삭제됐습니다
-  # (final diff review Turn 002 Finding 1 — 사용자 hook 이 사라지는 데이터 손실).
+  # (사용자 hook 이 사라지는 데이터 손실).
   m8_mk F5b <<'J'
 {"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"},{"type":"prompt","prompt":"A"},{"type":"agent","prompt":"B"}]}]}}
 J
@@ -349,64 +349,100 @@ J
   if [[ ! -f "$M8_TPL" ]]; then
     ok "템플릿 settings.json 없음 — 종단 검증 건너뜀 (설치본)"
   else
-    cat > "$M8_DIR/m003_sim_zzfx.py" <<'M3SIM'
-import json, sys
-proj_p, tpl_p = ".claude/settings.json", sys.argv[1]
-proj = json.load(open(proj_p)); tpl = json.load(open(tpl_p))
-def triples(cfg):
-    out = set()
-    for ev, gs in (cfg.get("hooks") or {}).items():
-        for g in gs:
-            for it in g.get("hooks", []):
-                out.add((ev, json.dumps(g.get("matcher")), it.get("command")))
-    return out
-have = triples(proj); added = 0
-for ev, gs in (tpl.get("hooks") or {}).items():
-    for g in gs:
-        for it in g.get("hooks", []):
-            key = (ev, json.dumps(g.get("matcher")), it.get("command"))
-            if key in have: continue
-            ph = proj.setdefault("hooks", {}).setdefault(ev, [])
-            tgt = None
-            for pg in ph:
-                if json.dumps(pg.get("matcher")) == json.dumps(g.get("matcher")): tgt = pg; break
-            if tgt is None:
-                tgt = {k: v for k, v in g.items() if k != "hooks"}; tgt["hooks"] = []; ph.append(tgt)
-            tgt.setdefault("hooks", []).append(dict(it)); added += 1
-json.dump(proj, open(proj_p, "w"), ensure_ascii=False, indent=2)
-print("added=%d" % added)
-M3SIM
-    m8_end() { # m8_end <케이스> — stdout: "<M003 추가건수> <템플릿hook수> <triple유일> <고유hook수>"
-      local c="$1" added
-      added="$( ( cd "$M8_DIR/$c" && python3 "$M8_DIR/m003_sim_zzfx.py" "$M8_TPL" ) | sed -n 's/^added=//p' )"
+    M8_MD="${SCRIPT_DIR}/../MIGRATIONS.md"
+    python3 - "$M8_MD" "$M8_DIR/m003_snippet_zzfx.py" <<'M3EXTRACT' || nok "M003 스니펫 추출 실패"
+import sys, textwrap
+md, out = sys.argv[1], sys.argv[2]
+lines = open(md, encoding="utf-8").read().split("\n")
+start = None
+for i, l in enumerate(lines):
+    if l.startswith("## M003"):
+        start = i
+        break
+if start is None:
+    sys.exit("M003 절을 찾지 못했습니다")
+body, grab = [], False
+for l in lines[start + 1:]:
+    s = l.strip()
+    if not grab and l.startswith("## "):
+        break
+    if s.startswith("python3 - ") and s.endswith("<<'PY'"):
+        grab = True
+        continue
+    if grab and s == "PY":
+        break
+    if grab:
+        body.append(l)
+if not body:
+    sys.exit("M003 의 python3 heredoc 본문이 비어 있습니다")
+open(out, "w", encoding="utf-8").write(textwrap.dedent("\n".join(body)) + "\n")
+M3EXTRACT
+    # 기대값은 템플릿 settings 에서 계산합니다. 템플릿에 hook 을 더할 때마다 숫자를 손으로 고치지 않게
+    # 하려는 것입니다(FR sync-test-gate-count-derived). 분류는 m8_end 와 같습니다.
+    # M8_NG = 템플릿 gate hook triple 수, M8_NS = 템플릿 감시 항목 수. fixture 의 gate triple 은 5건 고정입니다.
+    read -r M8_NG M8_NS < <(M8F="$M8_TPL" python3 -c "
+import json,os
+h=json.load(open(os.environ['M8F']))['hooks']
+cmds=[it.get('command','') for gs in h.values() for g in gs for it in g.get('hooks',[])]
+sen=[c for c in cmds if c.startswith(': rd-hook-sentinel')]
+print(sum(1 for c in cmds if not c.startswith(': rd-hook-sentinel') and 'rd-workflow/scripts/hooks/' in c), len(sen))") \
+      || nok "템플릿 settings 의 hook 개수 계산 실패"
+    m8_end() { # m8_end <케이스> — stdout: "<gate 추가> <감시 추가> <gate hook 수> <triple 유일> <고유 hook 수>"
+      # 감시 항목 = command 가 ": rd-hook-sentinel" 로 시작. gate 집계에서 뺍니다.
+      local c="$1" added before after
+      before="$(M8F="$M8_DIR/$c/.claude/settings.json" python3 -c "
+import json,os
+h=json.load(open(os.environ['M8F']))['hooks']
+print(sum(1 for gs in h.values() for g in gs for it in g.get('hooks',[]) if it.get('command','').startswith(': rd-hook-sentinel')))")"
+      added="$( ( cd "$M8_DIR/$c" && python3 "$M8_DIR/m003_snippet_zzfx.py" "$M8_TPL" ) | sed -n 's/^M003: added //p' )"
+      added="${added:-0}"
       python3 -c "
 import json,collections,sys
 h=json.load(open('$M8_DIR/$c/.claude/settings.json'))['hooks']
 tri=[(ev,json.dumps(g.get('matcher')),it['command']) for ev,gs in h.items() for g in gs for it in g.get('hooks',[])]
-tpl=[t for t in tri if 'rd-workflow/scripts/hooks/' in t[2]]
-own=[t for t in tri if 'rd-workflow/scripts/hooks/' not in t[2]]
+sen=[t for t in tri if t[2].startswith(': rd-hook-sentinel')]
+rest=[t for t in tri if not t[2].startswith(': rd-hook-sentinel')]
+tpl=[t for t in rest if 'rd-workflow/scripts/hooks/' in t[2]]
+own=[t for t in rest if 'rd-workflow/scripts/hooks/' not in t[2]]
 old=[t for t in tpl if t[2].startswith('bash rd-workflow/')]
 uniq=all(v==1 for v in collections.Counter(tpl).values()) and not old
-print('$added', len(tpl), 'yes' if uniq else 'no', len(own))"
+sadd=len(sen)-$before
+print($added-sadd, sadd, len(tpl), 'yes' if uniq else 'no', len(own))"
     }
     m8_mk E1 <<'J'
 {"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/session_start.sh"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"},{"type":"command","command":"bash rd-workflow/scripts/hooks/headless_background_gate.sh"}]},{"matcher":"Edit","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]},{"matcher":"Write","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]}]}}
 J
     m8_run E1 >/dev/null 2>&1
-    check "종단 E1 (구 표기 5건): M003 추가 0 / hook 5 / triple 유일 / 고유 0" "$(m8_end E1)" "0 5 yes 0"
+    check "종단 E1 (구 표기 5건, 템플릿 gate ${M8_NG}건·감시 ${M8_NS}건): gate 추가 $((M8_NG - 5)) / 감시 추가 ${M8_NS} / gate hook ${M8_NG} / triple 유일 / 고유 0" "$(m8_end E1)" "$((M8_NG - 5)) ${M8_NS} ${M8_NG} yes 0"
+
+    # 재실행 무변경(AC4): 같은 JSON 의미를 indent=4 로 다시 써서 무조건 재쓰기를 해시로 드러냅니다.
+    M8F="$M8_DIR/E1/.claude/settings.json" python3 -c 'import json,os;p=os.environ["M8F"];d=json.load(open(p));json.dump(d,open(p,"w"),indent=4,ensure_ascii=False)'
+    m8_h1="$(shasum -a 256 < "$M8_DIR/E1/.claude/settings.json")"
+    check "종단 E1 2회차 → M003 해당 없음" "$( ( cd "$M8_DIR/E1" && python3 "$M8_DIR/m003_snippet_zzfx.py" "$M8_TPL" ) | head -1)" "M003: 해당 없음"
+    check "종단 E1 2회차 파일 불변" "$(shasum -a 256 < "$M8_DIR/E1/.claude/settings.json")" "$m8_h1"
+
+    # 실패 시 무변경: 앞 event 는 추가 대상이 있고 뒤 event 가 잘못된 형식이라 부분 쓰기를 잡습니다.
+    m8_mk EF <<'J'
+{"hooks":{"SessionStart":[{"hooks":[]}],"Stop":[{"hooks":"oops"}]}}
+J
+    m8_before="$(shasum -a 256 < "$M8_DIR/EF/.claude/settings.json")"
+    m8_out="$( ( cd "$M8_DIR/EF" && python3 "$M8_DIR/m003_snippet_zzfx.py" "$M8_TPL" ) 2>&1 )" && m8_rc=0 || m8_rc=1
+    check "M003 형식 오류 → 실패" "$m8_rc" "1"
+    check "M003 형식 오류 → 실패 안내" "$(printf '%s\n' "$m8_out" | grep -c '^M003 실패')" "1"
+    check "M003 형식 오류 → 원본 byte 불변" "$(shasum -a 256 < "$M8_DIR/EF/.claude/settings.json")" "$m8_before"
 
     m8_mk E2 <<'J'
 {"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/session_start.sh"},{"type":"command","command":"bash \"${CLAUDE_PROJECT_DIR:-.}\"/rd-workflow/scripts/hooks/session_start.sh"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash scripts/my_own_zzfx.sh"},{"type":"command","command":"bash rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"},{"type":"command","command":"bash \"${CLAUDE_PROJECT_DIR:-.}\"/rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"},{"type":"command","command":"bash rd-workflow/scripts/hooks/headless_background_gate.sh"}]},{"matcher":"Edit","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]},{"matcher":"Write","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]}]}}
 J
     m8_run E2 >/dev/null 2>&1
-    check "종단 E2 (이미 중복 8건 + 고유 hook): M003 추가 0 / hook 5 / triple 유일 / 고유 1" "$(m8_end E2)" "0 5 yes 1"
+    check "종단 E2 (이미 중복 8건 + 고유 hook, 템플릿 gate ${M8_NG}건·감시 ${M8_NS}건): gate 추가 $((M8_NG - 5)) / 감시 추가 ${M8_NS} / gate hook ${M8_NG} / triple 유일 / 고유 1" "$(m8_end E2)" "$((M8_NG - 5)) ${M8_NS} ${M8_NG} yes 1"
 
     # **대조군 — 정규화를 건너뛰면 M003 이 실제로 중복을 만듭니다.** 이 케이스가 없으면
     # 위 두 단언이 "M003 은 원래 아무것도 안 한다" 와 구분되지 않습니다.
     m8_mk E3 <<'J'
 {"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/session_start.sh"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/pre_commit_archive_gate.sh"},{"type":"command","command":"bash rd-workflow/scripts/hooks/headless_background_gate.sh"}]},{"matcher":"Edit","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]},{"matcher":"Write","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/implementation_gate.sh"}]}]}}
 J
-    check "대조군 E3 (정규화 없이 M003): 추가 5 / hook 10 / triple 유일 아님" "$(m8_end E3)" "5 10 no 0"
+    check "대조군 E3 (정규화 없이 M003, 템플릿 gate ${M8_NG}건·감시 ${M8_NS}건): gate 추가 ${M8_NG} / 감시 추가 ${M8_NS} / gate hook $((M8_NG + 5)) / triple 유일 아님" "$(m8_end E3)" "${M8_NG} ${M8_NS} $((M8_NG + 5)) no 0"
   fi
 fi
 
@@ -494,7 +530,7 @@ check "N1 임시 파일 잔여 없음" \
   "$(find "$M9_DIR/N1/rd-workflow-workspace/backlog" -name '.FUTURE_REQUESTS.md.m009.*' | wc -l | tr -d ' ')" "0"
 
 # 섹션에 "blocked" 를 언급하는 **메모만** 있고 정식 항목이 없는 경우 — 삽입해야 한다.
-# substring 판정이면 여기서 건너뛰어 거짓 성공이 된다 (final diff review Turn 002 Finding 1).
+# substring 판정이면 여기서 건너뛰어 거짓 성공이 된다.
 m9_fixture N2
 python3 - "$(m9_fr N2)" <<'M9N2'
 import sys
@@ -555,6 +591,198 @@ check "F3 대상 파일 부재 → 종료코드 0" "$?" "0"
 check "F3 해당 없음 출력" "$(grep -c '해당 없음' "$M9_DIR/f3.out")" "1"
 
 rm -rf "$M9_DIR"
+
+# --- M015: 템플릿 permissions.allow 부재 규칙 추가 -------------------------
+# 스니펫을 MIGRATIONS.md 에서 꺼내 fixture 에 실제로 실행한다 (M009 와 같은 방식).
+M15_DIR="$(mktemp -d)" || { echo "test_sync_template.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$M15_DIR" && -d "$M15_DIR" ]] || { echo "test_sync_template.sh: 임시 디렉터리 경로 검증 실패" >&2; exit 1; }
+M15_MD="$SCRIPT_DIR/../MIGRATIONS.md"
+M15_TPL="$SCRIPT_DIR/../../.claude/settings.json"
+[[ -f "$SCRIPT_DIR/../../_ROOT_FILES/.claude/settings.json" ]] && M15_TPL="$SCRIPT_DIR/../../_ROOT_FILES/.claude/settings.json"
+M15_SNIP="$M15_DIR/m15_snippet_zzfx.py"
+if [[ ! -f "$M15_MD" || ! -f "$M15_TPL" ]]; then
+  ok "MIGRATIONS.md 또는 템플릿 settings 없음 — M015 검증 건너뜀"
+else
+python3 - "$M15_MD" "$M15_SNIP" <<'M15EXTRACT'
+import sys
+md, out = sys.argv[1], sys.argv[2]
+lines = open(md, encoding="utf-8").read().split("\n")
+start = None
+for i, l in enumerate(lines):
+    if l.startswith("## M015"):
+        start = i
+        break
+if start is None:
+    sys.exit("M015 절을 찾지 못했습니다")
+body, grab = [], False
+for l in lines[start:]:
+    s = l.strip()
+    if s.startswith("python3 - ") and s.endswith("<<'PY'"):
+        grab = True
+        continue
+    if grab and s == "PY":
+        break
+    if grab:
+        body.append(l)
+if not body:
+    sys.exit("M015 의 python3 heredoc 본문이 비어 있습니다")
+open(out, "w", encoding="utf-8").write("\n".join(body) + "\n")
+M15EXTRACT
+
+echo "== M015: permissions.allow 부재 규칙 추가 =="
+m15_mk() { mkdir -p "$M15_DIR/$1/.claude"; cat > "$M15_DIR/$1/.claude/settings.json"; }
+m15_run() { ( cd "$M15_DIR/$1" && python3 "$M15_SNIP" "$M15_TPL" ) 2>&1; }
+m15_f() { echo "$M15_DIR/$1/.claude/settings.json"; }
+m15_get() { python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+for k in sys.argv[3:]: d=d.get(k) if isinstance(d,dict) else None
+print(json.dumps(d,sort_keys=True))" "$(m15_f "$1")" x "${@:2}"; }
+m15_tpl_allow="$(python3 -c "
+import json,sys
+print(json.dumps(json.load(open(sys.argv[1]))['permissions']['allow']))" "$M15_TPL")"
+
+m15_mk K1 <<'J'
+{"hooks":{}}
+J
+check "K1 키 부재 → added 10" "$(m15_run K1 | head -1)" "M015: added 10"
+check "K1 allow = 템플릿 10건(순서 동일)" "$(m15_get K1 permissions allow)" "$m15_tpl_allow"
+check "K1 hooks 불변" "$(m15_get K1 hooks)" "{}"
+
+m15_mk K2 <<'J'
+{"permissions":{"deny":["Bash(rm:*)"],"ask":["Bash(git push:*)"]},"hooks":{}}
+J
+check "K2 allow 만 없음 → added 10" "$(m15_run K2 | head -1)" "M015: added 10"
+check "K2 deny 불변" "$(m15_get K2 permissions deny)" '["Bash(rm:*)"]'
+check "K2 ask 불변" "$(m15_get K2 permissions ask)" '["Bash(git push:*)"]'
+
+m15_mk P1 <<'J'
+{"permissions":{"allow":["Bash(npm test)","Bash(bash rd-workflow/scripts/self_test.sh:*)"],"deny":["Bash(bash rd-workflow/scripts/build.sh:*)"],"ask":["Bash(git push:*)"],"defaultMode":"default"},"hooks":{}}
+J
+check "P1 기존 2건 중 1건 겹침 → added 9" "$(m15_run P1 | head -1)" "M015: added 9"
+check "P1 allow = 기존 2건 + 나머지 9건(템플릿 순서)" "$(m15_get P1 permissions allow)" \
+  "$(python3 -c "
+import json,sys
+t=json.loads(sys.argv[1]); ex=['Bash(npm test)','Bash(bash rd-workflow/scripts/self_test.sh:*)']
+print(json.dumps(ex+[r for r in t if r not in ex]))" "$m15_tpl_allow")"
+check "P1 deny 불변" "$(m15_get P1 permissions deny)" '["Bash(bash rd-workflow/scripts/build.sh:*)"]'
+check "P1 ask 불변" "$(m15_get P1 permissions ask)" '["Bash(git push:*)"]'
+check "P1 defaultMode 불변" "$(m15_get P1 permissions defaultMode)" '"default"'
+
+for c in K1 K2 P1; do
+  cp "$(m15_f $c)" "$M15_DIR/$c.after1"
+  check "$c 2회차 → 해당 없음" "$(m15_run $c | head -1)" "M015: 해당 없음"
+  check "$c 2회차 바이트 동일" "$(cmp -s "$M15_DIR/$c.after1" "$(m15_f $c)" && echo same || echo diff)" "same"
+done
+
+m15_mk T1 <<'J'
+{"permissions":null,"hooks":{}}
+J
+m15_mk T2 <<'J'
+{"permissions":{"allow":{}},"hooks":{}}
+J
+for c in T1 T2; do
+  cp "$(m15_f $c)" "$M15_DIR/$c.before"
+  check "$c 타입 이상 → M015 실패 출력" "$(m15_run $c | grep -c 'M015 실패')" "1"
+  check "$c 바이트 불변" "$(cmp -s "$M15_DIR/$c.before" "$(m15_f $c)" && echo same || echo diff)" "same"
+done
+if [[ "$(id -u)" == "0" ]]; then
+  ok "root 실행 — 저장 실패 케이스 건너뜀"
+else
+  m15_mk W15 <<'J'
+{"hooks":{}}
+J
+  m15_sha_before="$(shasum -a 256 "$(m15_f W15)" | cut -d' ' -f1)"
+  chmod 555 "$M15_DIR/W15/.claude"
+  m15_w_out="$(m15_run W15)"; m15_w_rc=$?
+  chmod 755 "$M15_DIR/W15/.claude"
+  check "W15 저장 실패 → exit 1" "$m15_w_rc" "1"
+  check "W15 저장 실패 → M015 실패 출력" "$(printf '%s\n' "$m15_w_out" | grep -c '^M015 실패:')" "1"
+  check "W15 저장 실패 → settings byte 불변" "$(shasum -a 256 "$(m15_f W15)" | cut -d' ' -f1)" "$m15_sha_before"
+fi
+# 심링크된 settings.json — 링크를 지키고 링크 대상을 고쳐야 공유 설정이 끊기지 않습니다.
+mkdir -p "$M15_DIR/L15/.claude"
+printf '%s\n' '{"hooks":{}}' > "$M15_DIR/L15/shared.json"
+chmod 644 "$M15_DIR/L15/shared.json"
+ln -s ../shared.json "$M15_DIR/L15/.claude/settings.json"
+check "L15 심링크 → added 10" "$(m15_run L15 | head -1)" "M015: added 10"
+check "L15 settings.json 은 여전히 심링크" "$([[ -L "$(m15_f L15)" ]] && echo link || echo file)" "link"
+check "L15 링크 대상에 allow 10건" "$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))['permissions']['allow']))" "$M15_DIR/L15/shared.json")" "10"
+check "L15 링크 대상 권한 유지(644)" "$(python3 -c "import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))" "$M15_DIR/L15/shared.json")" "0o644"
+fi
+trash "$M15_DIR" 2>/dev/null || true
+
+# --- M005: 템플릿 유래 stale hook 제거 + 저장 실패 -----------------------
+snip_extract() {
+python3 - "$1" "$2" "$3" <<'SNIPEXTRACT'
+import sys, textwrap
+md, head, out = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(md, encoding="utf-8").read().split("\n")
+start = next((i for i, l in enumerate(lines) if l.startswith(head)), None)
+if start is None:
+    sys.exit("%s 절을 찾지 못했습니다" % head)
+body, grab = [], False
+for l in lines[start:]:
+    s = l.strip()
+    if s.startswith("python3 - ") and s.endswith("<<'PY'"):
+        grab = True
+        continue
+    if grab and s == "PY":
+        break
+    if grab:
+        body.append(l)
+if not body:
+    sys.exit("%s 의 python3 heredoc 본문이 비어 있습니다" % head)
+open(out, "w", encoding="utf-8").write(textwrap.dedent("\n".join(body)) + "\n")
+SNIPEXTRACT
+}
+
+M5_DIR="$(mktemp -d)" || { echo "test_sync_template.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+[[ -n "$M5_DIR" && -d "$M5_DIR" ]] || { echo "test_sync_template.sh: 임시 디렉터리 경로 검증 실패" >&2; exit 1; }
+M5_MD="$SCRIPT_DIR/../MIGRATIONS.md"
+M5_GUIDE="$SCRIPT_DIR/../docs/guides/sync_template.md"
+if [[ ! -f "$M5_MD" || ! -f "$M5_GUIDE" ]]; then
+  ok "MIGRATIONS.md 또는 sync_template.md 없음 — M005 검증 건너뜀"
+else
+echo "== M005: stale hook 제거 =="
+snip_extract "$M5_MD" "## M005" "$M5_DIR/m5_a.py"
+snip_extract "$M5_GUIDE" "#### M005" "$M5_DIR/m5_b.py"
+check "M005 가이드 사본 = MIGRATIONS 본문" "$(cmp -s "$M5_DIR/m5_a.py" "$M5_DIR/m5_b.py" && echo same || echo diff)" "same"
+
+mkdir -p "$M5_DIR/clone/.claude" "$M5_DIR/clone/rd-workflow/scripts/hooks"
+echo '{"hooks":{}}' > "$M5_DIR/clone/.claude/settings.json"
+m5_mk() { mkdir -p "$M5_DIR/$1/.claude"; cat > "$M5_DIR/$1/.claude/settings.json"; }
+m5_run() { ( cd "$M5_DIR/$1" && python3 "$M5_DIR/m5_a.py" "$M5_DIR/clone" ) 2>&1; }
+m5_json='{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/zzfx_gone.sh"},{"type":"command","command":"bash scripts/own_hook.sh"}]}]}}'
+printf '%s\n' "$m5_json" | m5_mk R1
+check "M005 R1 → removed 1줄" "$(m5_run R1 | grep -c '^removed: PreToolUse')" "1"
+check "M005 R1 프로젝트 고유 hook 유지" "$(python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(json.dumps([h['command'] for g in d['hooks']['PreToolUse'] for h in g['hooks']]))" "$M5_DIR/R1/.claude/settings.json")" '["bash scripts/own_hook.sh"]'
+
+if [[ "$(id -u)" == "0" ]]; then
+  ok "root 실행 — 저장 실패 케이스 건너뜀"
+else
+  printf '%s\n' "$m5_json" | m5_mk W5
+  m5_sha_before="$(shasum -a 256 "$M5_DIR/W5/.claude/settings.json" | cut -d' ' -f1)"
+  chmod 555 "$M5_DIR/W5/.claude"
+  m5_w_out="$(m5_run W5)"; m5_w_rc=$?
+  chmod 755 "$M5_DIR/W5/.claude"
+  check "W5 저장 실패 → exit 1" "$m5_w_rc" "1"
+  check "W5 저장 실패 → M005 실패 출력" "$(printf '%s\n' "$m5_w_out" | grep -c '^M005 실패:')" "1"
+  check "W5 저장 실패 → settings byte 불변" "$(shasum -a 256 "$M5_DIR/W5/.claude/settings.json" | cut -d' ' -f1)" "$m5_sha_before"
+fi
+# 심링크된 settings.json — 링크를 지키고 링크 대상을 고쳐야 공유 설정이 끊기지 않습니다.
+mkdir -p "$M5_DIR/L5/.claude"
+printf '%s\n' "$m5_json" > "$M5_DIR/L5/shared.json"
+ln -s ../shared.json "$M5_DIR/L5/.claude/settings.json"
+check "L5 심링크 → removed 1줄" "$(m5_run L5 | grep -c '^removed: PreToolUse')" "1"
+check "L5 settings.json 은 여전히 심링크" "$([[ -L "$M5_DIR/L5/.claude/settings.json" ]] && echo link || echo file)" "link"
+check "L5 링크 대상에서 stale hook 제거" "$(grep -c zzfx_gone "$M5_DIR/L5/shared.json")" "0"
+fi
+trash "$M5_DIR" 2>/dev/null || true
+
 
 echo "--- acceptance_sync_once.sh: 임시 clone 폐기 가능 판정 (재귀 삭제 방어) ---"
 # 그 스크립트는 `set -e` 없이 진단을 모아 내는 방식이라, `mktemp` 가 실패해 경로가 비거나

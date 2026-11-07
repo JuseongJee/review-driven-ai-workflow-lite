@@ -30,7 +30,7 @@ Typical user requests can be short:
 
 ```bash
 bash -s <<'RD_SKILL_COMPAT'
-RD_SKILL_BASE=2026-11-01-202303 RD_SKILL_NAME=request-to-reviewed-plan
+RD_SKILL_BASE=2026-11-04-203832 RD_SKILL_NAME=request-to-reviewed-plan
 vf="rd-workflow/VERSION"
 if [ ! -f "$vf" ] && [ -f "_ROOT_FILES/rd-workflow/VERSION" ]; then exit 0; fi
 v=""; [ -f "$vf" ] && v="$(cat "$vf")"; v="${v#lite-}"
@@ -153,12 +153,15 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
 
 - Keep the original scope. Do not widen the request.
 - Ask only when a missing fact is required to create `REQUEST.md` or to choose the execution path safely.
-- 이 skill 은 `full` 등급 경로다. 진행 중 `standard` 로 보이면 하향을 **제안**만 하고 사용자가 지시할 때만 `/small-task-implement` 로 넘긴다 (하향은 사용자만 — WORKFLOW.md 위험 등급 절). 지시가 있으면 `REQUEST.md ## Risk Tier` 이력에 기록한다.
+- 이 skill 은 `full` 등급 경로다. 진행 중(`구현 대기` 전까지) `standard` 로 보이면 WORKFLOW.md 위험 등급 절의 하향 조건을 확인해 하향하고, 주체·근거를 `REQUEST.md ## Risk Tier` 이력에 적는다. Status 는 바꾸지 않고 넘긴다 — `/small-task-implement` 의 「이어받기」 가 리뷰 단계 Status 에서 `구현 중` 으로 바로 전이한다. 진행 중이던 리뷰 세션은 고치지 않고 두며 그 경로를 이력에 「하향으로 중단」 과 함께 적는다. 그 뒤 `/small-task-implement` 의 「이어받기」 로 넘긴다. 되돌리기 어려운 효과가 있으면 `full` 을 유지한다.
 - If `Execution Path` is `existing-code-change` or `new-feature-or-large-task`, continue through request review, spec or change spec, plan, and spec / plan review.
 - REQUEST review 세션을 만들기 전에 `REQUEST.md ## Risk Tier` 6항목을 즉시 채운다 — `- 최종 등급: full`(이 skill 의 경로는 `full`), 최초 등급, baseline HEAD(`git rev-parse HEAD`), 근거 신호, override·상향 이력, 변경 파일 요약. `-` 로 두면 `prepare_review_pipeline.sh` 가 malformed 경고를 낸다.
 - Use `bash rd-workflow/scripts/prepare_review_pipeline.sh request` and `bash rd-workflow/scripts/run_review_turn.sh ...` for `REQUEST` review.
 - Use `bash rd-workflow/scripts/prepare_review_pipeline.sh spec-plan` or the explicit spec / plan paths plus `bash rd-workflow/scripts/run_review_turn.sh ...` for spec / plan review.
+- Do not edit the SESSION.md Status or Current Owner by hand after writing an Author turn. `run_review_turn.sh` hands them over, and tells you the next action when it cannot.
+- Author 턴은 Reviewer 지적에 응답하기 전에 `receiving-code-review` 로 지적마다 사실을 확인하고 「수용 / 반박 / 보류」 와 근거를 적는다 (`FILE_BASED_REVIEW_PIPELINE.md` 턴 규칙).
 - **Superpowers가 사용 가능하면 반드시 `brainstorming`과 `writing-plans`를 사용한다.** 사용 불가능할 때만 같은 산출물을 직접 작성한다.
+- brainstorming·spec 작성 중 정적 목업으로 답이 안 나오는 동작 질문을 만나면 `rd-workflow/docs/flows/WORKFLOW.md` 「설계 중 동작 질문 — 일회용 시제품」 절을 따른다.
 - Update `CURRENT_TASK.md` at the major checkpoints.
 - Status 는 위 `## Status 전이` 절을 따라 기록한다.
 - Stop before implementation.
