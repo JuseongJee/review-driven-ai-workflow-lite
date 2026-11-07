@@ -10,6 +10,10 @@ REQUEST → 리뷰 → spec/plan → 실행 → 검증 → 최종 리뷰까지, 
 
 최근 세 발행에서 달라진 것입니다. 내 프로젝트의 `rd-workflow/VERSION` 보다 뒤의 절이 `/tpl update` 로 받을 변화입니다. 전체 이력은 [`rd-workflow/CHANGELOG.md`](rd-workflow/CHANGELOG.md) 에 있습니다.
 
+### 2026-11-08-074131
+
+- **거절한 extension 을 다시 묻지 않음**: `/tpl update` 가 설치하지 않은 extension(design-review·verify)을 update 마다 다시 묻지 않습니다. 안내한 extension 을 `rd-workflow/config/extensions.json` 의 `seen_extensions` 에 기록하고, 템플릿에 새로 추가된 extension 만 묻습니다. 새 extension 이 없으면 질문이 나오지 않습니다. 이미 설치해 쓰던 프로젝트는 첫 update 에서 묻지 않고 지금 있는 extension 으로 기록을 채웁니다. 거절한 extension 을 설치하려면 「<이름> extension 설치해줘」 로 요청하고, update 에서 다시 질문을 받으려면 `seen_extensions` 에서 그 이름을 빼고 `/tpl update` 를 실행합니다.
+
 ### 2026-11-08-065139
 
 - **`/fr do` 추가**: 여러 FR 을 한 번에 처리하는 진입점입니다. `/fr do [<slug들>]` 는 대화형으로 FR 마다 줄기(세션)를 띄워 동시에 진행하고, `/fr do --headless [--finish push|merge|none] [<slug들>]` 는 무인으로 순서대로 완주합니다. 대화형의 동시 줄기 수 상한은 `workflow.json` 의 새 키 `fr_do_max_streams`(기본 `4`)로 정합니다.
@@ -26,40 +30,6 @@ REQUEST → 리뷰 → spec/plan → 실행 → 검증 → 최종 리뷰까지, 
 ### 2026-11-07-210251
 
 - **팀 overlay 가이드**: rd-workflow 가 없는 기존 팀 저장소 클론을 새로 clone 하지 않고 overlay 아래로 옮겨 submodule 로 등록하는 짧은 경로를 이관 가이드에 더했습니다(브랜치·stash·미커밋 작업 유지). 예시 이름을 overlay `rd-myproject` 아래 submodule `myproject` 로 맞추고, 기존 클론 안의 세션에서 진행하지 말고 끝나면 overlay 루트에서 새 세션을 띄우라는 실행 위치 안내를 넣었습니다.
-
-### 2026-11-07-201215
-
-- 이 변경 이력(`rd-workflow/CHANGELOG.md`)을 새로 두었습니다. 배포 README 첫 화면에 최근 세 발행의 변화가 나옵니다.
-- **리뷰 턴 넘기기**: Author 턴 파일을 쓴 뒤 `run_review_turn.sh <세션>` 한 줄이면 Reviewer 턴이 돕니다. SESSION 의 Status·Owner 를 손으로 바꾸지 않습니다. 넘길 수 없는 상태면 다음 행동을 안내합니다.
-- **리뷰 종결 근거**: 사람이 남은 이의를 덮고 종결하면 `## Closure Reason` 의 `user-override` 아래에 `근거: <날짜> <결정한 사람> — <한 말>` 줄을 적어야 `rd review seal` 이 통과합니다. 자율 모드는 `user-override` 를 스스로 정하지 않고 `awaiting-user` 로 멈춥니다.
-- **리뷰 실행 기록**: `rd review seal` 이 리뷰어 턴 실행 기록(`reviewer_runs.tsv`)을 대조합니다. 리뷰어 턴을 돌리지 않은 세션과 이의를 손으로 지운 세션을 거부합니다.
-- **리뷰 발견 형식**: 리뷰어는 발견마다 `[confidence N/10]` 과 `경로:줄` 인용을 붙입니다. 프로젝트 리뷰 표준 파일 `rd-workflow-workspace/review-standards.md` 를 새로 둡니다. 내용이 있으면 diff review 리뷰어와 standard 구현이 읽습니다.
-- **완료 보고 양식**: completion report 와 autopilot 보고가 「사용자에게 달라진 것」 절로 시작하고 「정리 후보」 절로 끝납니다.
-- **자기 worktree 삭제 차단**: 세션 안에서 자기 작업 worktree 를 지우는 명령을 막고 정리 명령(`rd task list`)을 안내합니다.
-- **archive 안전**: 살아 있는 세션의 worktree 를 지우지 않고 정리 잔여로 남깁니다. submodule 커밋을 빠뜨린 병합은 기본 브랜치를 바꾸기 전에 멈춥니다.
-- **FR status 읽기**: `- status: done (설명)` 과 옛 키 `- 상태:` 를 모든 FR 도구가 같은 규칙으로 읽습니다. 아카이브 커밋 게이트가 막을 때 FR 마다 판정 값과 원문을 보입니다.
-- **무인 실행 발행**(full): `ralph_drain.sh`·`/fr batch` 의 발행을 wrapper 가 맡고 로그를 남깁니다. 실패는 `publish-failed`·`publish-incomplete`·`publish-unsafe` 로 나뉩니다. 발행 단계는 기본 30분 상한이 있습니다(`RD_PUBLISH_WALL_MINUTES`, `loop-guard.json` 의 `publish_wall_minutes`).
-- **무인 실행 비용**(full): 무인 실행 출력에 실행 비용·토큰·소요 시간 줄이 나옵니다. `/fr batch`·`ralph_drain.sh` 요약에 합계가 나옵니다.
-- **verify 설정 점검**(full): `verify.sh --check` 가 덜 채운 설정(TODO, 필수 환경 변수 미설정, 실행 대상 0개)을 나열합니다. `/tpl status` 에 `verify:` 줄이 나옵니다. verifier 에 `requires_env` 필드가 생겼습니다.
-- **`/tpl update` 와 verify 프리셋**(full): 기존 verifier 에 없는 `requires_env` 를 템플릿 값으로 채웁니다. 사용자가 지운 프리셋 verifier 를 다시 넣지 않습니다(`extensions.verify.seen_verifiers`).
-- **마이그레이션**: settings.json 의 권한 허용 10건(M015), gate hook 감시 항목(M003)이 sync 때 더해집니다. M003·M005·M015 는 저장에 실패하면 원본을 두고 실패를 알립니다.
-- **권한 허용 배포**: 템플릿 settings 가 리뷰·검증 스크립트 실행을 권한 확인 없이 허용합니다. 발행·archive·`rd` 는 지금처럼 확인을 받습니다.
-- **hook 실패 알림**: gate hook 파일이 없거나 읽을 수 없으면 화면과 모델 문맥에 경고합니다.
-- **설계 중 시제품**: 실행해 봐야 답이 나오는 동작 질문을 일회용 시제품 worktree 로 확인하는 절차가 `WORKFLOW.md` 에 생겼습니다. `PROJECT_CONTEXT.md` 에 `## Run`·`## Feature Entry Paths` 절이 생겼고 `/tpl status` 가 작성 여부를 보입니다(full).
-- **`/tpl update` 변경 이력**: update 완료 보고 끝에 이전 VERSION 뒤의 CHANGELOG 절이 나옵니다. 항목이 40개를 넘으면 가장 최근 절만 전문으로 보입니다. 이전 VERSION 을 모르거나 같은 버전을 다시 받으면 한 줄로 알립니다.
-- **판단 원칙 규칙**: `.claude/rules/rd-workflow/judgment.md` 가 새로 로드됩니다. root cause 우선, 테스트 편의를 위한 production 변경 금지, 사용자 편의 우선을 따릅니다.
-- **AI 등급 하향**: AI 가 근거를 `## Risk Tier` 이력에 적고 등급을 내릴 수 있습니다. 되돌리기 어려운 효과가 있으면 `full` 로 고정됩니다. `rd task set-status "구현 중"` 이 리뷰 단계(`REQUEST review 대기`·`spec/plan 작성 중`·`spec/plan review 대기`)에서 바로 통과합니다. 템플릿 규칙 합계가 약 1,000자 줄었습니다.
-- **standard 절차 안내**: `/small-task-implement`·`/final-diff-review` 가 `구현 중 → 검증 중 → diff review 대기` 순서와, 증거 기록·리뷰 세션 전에 작업물을 커밋하라고 안내합니다.
-- **FR 인덱스 병합**: 한 FR 행의 서로 다른 칸을 양쪽이 바꿔도 발행이 멈추지 않습니다. 같은 칸을 다르게 바꾸면 멈추고 풀어야 할 칸을 알립니다.
-- **FR 폐기 마감**: FR 을 폐기로 닫을 때는 `/fr status <slug> dropped` 뒤 `fr-done` 을 부릅니다. `/fr status` 로 종료하면 그 FR 의 raw capture 를 `raw-captures/archive/` 로 옮깁니다.
-- **발행 큐 우회 옵션**: `rd publish request --allow-gitlink-drop '<사유>' --basis '<근거>'`(또는 `--force-skip-review-check`)로 archive 우회를 요청합니다. 잘못된 인자는 종료 코드 2 로 거부합니다. 호출 세션의 `status`·`watch`·`next` 가 우회 사유와 근거를 보입니다.
-- **발행 실패 사유**: `rd publish run` 이 실패하면 부하와 상관없이 실패 사유에 archive 의 마지막 출력 줄이 남습니다. 출력 기록이 늦으면 대기 안내와 전체 로그 경로가 나옵니다.
-- **hook 입력 해석**: jq 가 없어도 hook 이 이스케이프된 경로·명령 값을 jq 와 같게 읽습니다. 해석할 수 없는 값은 막습니다.
-- **리뷰 기준**: diff review 리뷰어가 새·변경 셸 테스트를 macOS 기본 PATH 로 한 번 실행합니다.
-- **리뷰 진행 줄**: C 로캘에서 Claude 리뷰어 진행 줄을 글자 경계에서 자릅니다.
-- **lite 보완**: lite 의 세션 시작 화면에 진행 중 작업 표와 `rd task list` 안내가 나옵니다. lite autopilot 리뷰 턴의 `command not found: build_attempt_history` 를 고쳤습니다. lite 설치 직후 `self_test.sh consumer` 가 통과합니다. `subagent-git-safety.md` 가 lite 에 들어갑니다.
-- **`/fr batch` 재개**(full): 신호로 멈춘 batch 를 다시 돌리면 재개 확인에 판정 불가 사유가 보입니다. batch 밖 의존 FR 때문에 착수할 수 없는 FR 은 `blocked` 로 기록하고 독립 FR 은 계속합니다.
-- **`/fr batch` 원격 시간 상한**(full): 원격 조회가 30초 안에 응답하지 않으면 batch 를 `paused` 로 멈추고 `remote-timeout` 을 남깁니다. `RD_BATCH_REMOTE_TIMEOUT`(1~600초)으로 바꿉니다.
 
 ## 전제 조건
 

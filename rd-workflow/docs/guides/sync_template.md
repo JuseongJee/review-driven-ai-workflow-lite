@@ -670,6 +670,10 @@ bash rd-workflow/scripts/install_claude_skills.sh project
 - 파일 없음 → `manifest = null`
 - JSON 파싱 실패 → `manifest = null` (손상된 매니페스트는 부재와 동일하게 처리)
 
+manifest 최상위의 `seen_extensions` 는 문자열 배열입니다. 「이 프로젝트에 설치 여부를 안내한 적 있는 extension 이름」 의 누적 집합이며, 설치한 것과 거절한 것을 모두 담습니다. 순서는 의미가 없고, 저장할 때 이름순으로 정렬합니다. 배열이 아니거나 문자열이 아닌 원소가 있으면 형식 오류이며, 기록 없음과 같이 처리합니다.
+
+기호: `E` = 유효한 `seen_extensions`. manifest 가 null 이거나 키가 없거나 형식 오류면 `E` 는 「없음」 입니다.
+
 #### 8.1.1 Legacy presets 마이그레이션
 
 manifest에 `extensions.presets`가 있으면 1회 이전을 수행합니다:
@@ -719,8 +723,18 @@ manifest에 `extensions.presets`가 있으면 1회 이전을 수행합니다:
 
 #### 8.4 분류
 
-- `manifest != null`: `auto_reinstall` = manifest에 있는 extension, `new_extensions` = `fs_available` 중 manifest에도 `fs_installed`에도 없는 것
-- `manifest == null`: `fs_installed`에 있는 extension은 `auto_reinstall`로, 나머지는 `new_extensions`로 분류합니다. 매니페스트가 없어도 이미 설치된 extension에 대해서는 불필요한 질문을 하지 않습니다.
+`not_installed` = `fs_available` 중 manifest에도 `fs_installed`에도 없는 extension 입니다.
+
+| manifest | `E` | `auto_reinstall` | `new_extensions` (8.7 에서 물음) | `declined_extensions` (묻지 않음, 9단계 보고) |
+|---|---|---|---|---|
+| 있음 | 있음 | manifest에 있는 extension | `not_installed` 중 `E` 에 없는 것 | `not_installed` 중 `E` 에 있는 것 |
+| 있음 | 없음 | manifest에 있는 extension | 없음 | `not_installed` 전체 |
+| null | 없음 | `fs_installed` | `fs_available` 중 `fs_installed` 에 없는 것 | 없음 |
+
+- `E` 에 있는 extension 은 이미 안내했고 사용자가 설치하지 않기로 했으므로 다시 묻지 않습니다. 템플릿에 새로 추가된 extension 만 `E` 에 없으므로, 새 extension 이 없으면 8.7 질문이 나오지 않습니다.
+- manifest 는 있고 `E` 가 없으면(이 규칙 이전에 설치한 프로젝트의 첫 update) 묻지 않습니다. 이전 8.7 은 미설치 extension 을 update 마다 물었으므로, manifest 가 있는 프로젝트는 지금 있는 extension 을 이미 안내받았습니다. 이번 update 의 8.8 이 `seen_extensions` 를 만듭니다.
+- manifest 가 null 이면 안내 이력을 알 수 없으므로 미설치 extension 을 묻습니다. 이미 설치된 extension 은 묻지 않습니다.
+- 강제 질문: 8.1.1 Case B 와 8.5 자동 재설치 실패가 `new_extensions` 로 내린 extension 은 `E` 와 무관하게 `new_extensions` 에 남겨 묻습니다.
 
 #### 8.5 자동 재설치
 
@@ -813,20 +827,27 @@ manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
 1. {name} — {설명}
 ...
 
-설치할 확장을 선택하세요 (예: 1,2 또는 건너뛰기):
+설치할 확장을 선택하세요 (예: 1,2 또는 건너뛰기). 건너뛴 확장은 다음 update 부터 묻지 않습니다:
 ```
 
 사용자가 선택하면 해당 extension의 `rd-workflow/extensions/{name}/install.md`를 읽고 안내에 따라 설치합니다.
 `depends`가 있으면 먼저 설치할지 물어봅니다.
 
-설치 성공한 extension을 manifest에 추가합니다 (메모리). 거절한 extension은 추가하지 않습니다 (다음 sync에서 다시 질문).
+설치 성공한 extension을 manifest에 추가합니다 (메모리). 거절한 extension은 manifest에 추가하지 않습니다. 대신 8.8 이 `seen_extensions` 에 기록하므로 다음 update 부터 묻지 않습니다.
+
+사용자가 설치를 골랐지만 설치가 실패하거나 중단되면 그 extension 을 `failed_extensions` 로 둡니다. 거절과 달리 사용자는 설치를 원했으므로, 8.8 이 `seen_extensions` 에서 빼서 다음 update 가 다시 묻게 합니다. 8.5 자동 재설치 실패로 8.7 에 내려온 extension 도 같습니다(사용자가 이번에 명시적으로 건너뛰면 거절로 기록합니다). 완료 보고에 「설치 실패 — <이름>: <원인 한 줄>. 다음 `/tpl update` 에서 다시 묻습니다. 바로 다시 하려면 『<이름> extension 설치해줘』」 로 적습니다.
+
+무인 실행(autopilot 등)이라 물을 수 없으면 `new_extensions` 를 설치하지 않고 `unasked_extensions` 로 둡니다. 이 extension 은 `seen_extensions` 에 넣지 않습니다. 완료 보고에 「확인 필요 — 묻지 못한 extension: <이름>. 다음 대화형 `/tpl update` 에서 다시 묻습니다」 로 적습니다. 응답 없음이 거절로 굳지 않게 하려는 규칙입니다.
+
+복원: 설치하지 않은 extension 을 나중에 설치하려면 「<이름> extension 설치해줘」 로 요청합니다(그 extension 의 `install.md` 절차). 다음 update 에서 다시 질문을 받으려면 `extensions.json` 의 `seen_extensions` 에서 그 이름을 빼고 `/tpl update` 를 실행합니다.
 
 #### 8.8 매니페스트 저장
 
 최종 manifest를 `rd-workflow/config/extensions.json`에 저장합니다.
 
 - **생략 분기**: manifest가 null이고 `fs_available`이 공집합이면(예: lite 산출물 — `rd-workflow/extensions/` 부재) 매니페스트 파일을 생성하지 않습니다. 기록할 extension이 없는 빈 매니페스트는 무의미하고 혼란 요인입니다.
-- manifest가 null이었고 사용자가 모든 extension을 건너뛰어도, `fs_available`이 비어 있지 않으면 `fs_installed` 기준으로 manifest를 생성합니다 (다음 sync에서 다시 묻지 않도록)
+- manifest가 null이었고 사용자가 모든 extension을 건너뛰어도, `fs_available`이 비어 있지 않으면 `fs_installed` 기준으로 manifest를 생성합니다 (아래 `seen_extensions` 를 담아 다음 sync에서 다시 묻지 않도록)
+- `seen_extensions` 갱신: `fs_available` 이 비어 있지 않으면 `E' = ((E, 없으면 빈 집합) ∪ fs_available) − unasked_extensions − failed_extensions` 를 이름순으로 manifest 최상위 `seen_extensions` 에 둡니다. `E` 에 이미 있던 이름도 이번에 묻지 못했거나 설치가 실패했으면 빠집니다. 템플릿에서 빠진 extension 이름은 `E` 에서 지우지 않습니다.
 - 이 시점에서 1회만 파일에 기록합니다 (중간 저장 없음)
 - manifest 의 모르는 키(예: `extensions.verify.seen_verifiers`)를 지우지 않고 그대로 씁니다. 8.6 이 갱신한 `seen_verifiers` 도 이 저장에 함께 들어갑니다.
 
@@ -840,6 +861,7 @@ manifest의 `verify.preset` 값이 기록되어 있을 때 실행합니다.
 - `defect_report_upstream` 결과 — `설정됨: <값>` 또는 `미설정 — <사유>`(사유와 함께 수동 지정 방법을 적습니다: 결함 보고 발행 시 `--upstream <owner/repo>` 로 지정하거나 `rd-workflow/config/workflow.json` 에 직접 기입). 유도 실패로 보류했더라도 sync 자체는 끝까지 진행된 것이므로 실패가 아니라 이 항목으로 보고합니다
 - Skill 재설치 결과 (설치/건너뛴 수)
 - Extension 자동 재설치 결과 (자동 재설치/신규 설치/건너뛴 수)
+- 묻지 않은 미설치 extension — `declined_extensions` 가 있을 때만 적습니다. 이름마다 「이전에 안내함 — 설치하려면 『<이름> extension 설치해줘』」 를 적습니다. 이번 update 가 `seen_extensions` 를 새로 만들었으면(기록 없음·형식 오류) 「`seen_extensions` 를 새로 기록함」 을 함께 적습니다. 무인 실행으로 묻지 못한 extension 은 8.7 의 「확인 필요」 문구로, 설치가 실패한 extension 은 8.7 의 「설치 실패」 문구로 적습니다
 - Verify Preset 머지 결과 요약 (추가/보존/업데이트된 verifier, `requires_env` 를 더한 verifier, 변경된 criteria, 사용자가 지워 추가하지 않은 verifier, 기록이 없어 물어본 verifier 와 결과) — verify preset이 자동 재설치된 경우에만
 - 템플릿 변경 이력 — 보고의 마지막 항목입니다. 아래 「변경 이력 보이기」 명령의 출력을 줄이지 않고 그대로 옮깁니다.
 

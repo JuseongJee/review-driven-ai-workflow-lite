@@ -35,6 +35,7 @@
 
 - 시점 확인 → 이전 VERSION 기록·버전 확인 → 파일 분류 → 사용자 확인 → 마이그레이션 감지 → 동기화 → 검증 → 버전 갱신 → skill 재설치 → extension 자동 재설치/신규 안내 → 완료 보고(변경 이력 포함)
 - 각 단계의 세부 규칙(보존 대상, 분류 기준 등)은 sync_template.md가 권위 문서다.
+- extension 신규 안내는 `extensions.json` 의 `seen_extensions` 에 없는 extension 만 묻는다. 한 번 안내해 거절한 extension 은 다시 묻지 않는다 (sync_template.md 8.4·8.7).
 
 ### 4. 완료 요약
 
