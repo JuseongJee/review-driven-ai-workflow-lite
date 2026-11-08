@@ -10,6 +10,11 @@
 
 <!-- 관리 규칙(템플릿 개발 저장소): 발행 전에 마지막 VERSION 이후 완료 보고의 「사용자에게 달라진 것」 절에서 골라 `## 다음 발행` 절에 적습니다. 발행 스크립트가 이 제목을 새 VERSION 으로 바꿉니다. -->
 
+## 2026-11-08-092219
+
+- **`/fr groom` 추가**: `/fr groom <제목>` 으로 idea 상태 FR 한 건을, `/fr groom` 으로 idea FR 전부를 차례로 문답 검증합니다. AI 가 한 번에 한 질문과 권장 답을 내고, 마지막에 validated·parked·dropped 중 하나를 제안합니다. 결정하면 상세 파일에 `## groom 기록` 이 남고 상태가 바뀝니다. 일괄 모드에서는 「건너뛰기」·「중단」 을 말할 수 있고, 끝에 결과 요약표가 나옵니다. 사용자가 직접 요청할 때만 실행합니다.
+- **`/fr do` 의 idea FR 확인**: 대화형 `/fr do` 는 띄울 줄기에 idea FR 이 있을 때만 「groom 먼저 / 그대로 띄우기」 를 묻습니다. groom 을 고르면 결과를 기본 브랜치에 커밋한 뒤 후보를 다시 골라 띄우고, groom 을 중단하면 그 `/fr do` 는 새 줄기를 띄우지 않습니다. 무인 `/fr do --headless` 는 동작이 같고, 뺀 FR 표에 「groom 대상」 표시만 더합니다.
+
 ## 2026-11-08-074131
 
 - **거절한 extension 을 다시 묻지 않음**: `/tpl update` 가 설치하지 않은 extension(design-review·verify)을 update 마다 다시 묻지 않습니다. 안내한 extension 을 `rd-workflow/config/extensions.json` 의 `seen_extensions` 에 기록하고, 템플릿에 새로 추가된 extension 만 묻습니다. 새 extension 이 없으면 질문이 나오지 않습니다. 이미 설치해 쓰던 프로젝트는 첫 update 에서 묻지 않고 지금 있는 extension 으로 기록을 채웁니다. 거절한 extension 을 설치하려면 「<이름> extension 설치해줘」 로 요청하고, update 에서 다시 질문을 받으려면 `seen_extensions` 에서 그 이름을 빼고 `/tpl update` 를 실행합니다.

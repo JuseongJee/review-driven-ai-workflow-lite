@@ -2,10 +2,10 @@
 name: fr
 description: >
   Manage future requests — add, list, prioritize, lifecycle, sync with GitHub Issues.
-  Subcommands: /fr add, /fr list, /fr pri, /fr inspect, /fr archive, /fr park, /fr status, /fr pull, /fr push, /fr sync, /fr do (/fr batch is an alias of /fr do --headless until the next release).
+  Subcommands: /fr add, /fr list, /fr pri, /fr inspect, /fr groom, /fr archive, /fr park, /fr status, /fr pull, /fr push, /fr sync, /fr do (/fr batch is an alias of /fr do --headless until the next release).
   Use when the user wants to manage backlog items.
   Model self-invocation is limited to list / pri / inspect / pull and local-only add; publishing to GitHub (add while fr_github is enabled, push, sync)
-  and do (batch alias), archive, park, status all require an explicit user request.
+  and do (batch alias), groom, archive, park, status all require an explicit user request.
 user-invocable: true
 ---
 
@@ -18,6 +18,7 @@ Typical user requests:
 - "/fr archive"
 - "/fr park workflow-branch-clarification"
 - "/fr status some-title validated"
+- "/fr groom" / "/fr groom some-title"
 - "이거 FR에 넣어줘" → `/fr add`로 라우팅
 - "future request에 기록해줘" → `/fr add`로 라우팅
 - "FR 목록 보여줘" → `/fr list`로 라우팅
@@ -26,6 +27,7 @@ Typical user requests:
 - "N번 검토해줘" / "N번 autopilot 가능한지 봐줘" → 직전 `/fr list` 출력에서 N번 행의 short-title을 찾아 `/fr inspect <short-title>`로 라우팅 (번호는 inspect의 공식 인자가 아니라 라우팅 단계 변환용)
 - "done 항목 정리해줘" → `/fr archive`로 라우팅
 - "이거 parked로 옮겨줘" → `/fr park`로 라우팅
+- "idea FR 검증해줘" / "이 FR 문답으로 정리해줘" → `/fr groom [<short-title>]`로 라우팅
 - "착수 가능한 것들 띄워" / "더 띄울 FR 없나" → `/fr do`로 라우팅
 - "/fr do --headless" / "준비된 FR 무인으로 돌려줘" → `/fr do --headless`로 라우팅
 
@@ -62,6 +64,7 @@ RD_SKILL_COMPAT
 - `list` → Read `rd-workflow/claude_skills/fr/list.md` and follow it.
 - `pri` → Read `rd-workflow/claude_skills/fr/pri.md` and follow it.
 - `inspect` → Read `rd-workflow/claude_skills/fr/inspect.md` and follow it.
+- `groom` → Read `rd-workflow/claude_skills/fr/groom.md` and follow it.
 - `archive` → Read `rd-workflow/claude_skills/fr/archive.md` and follow it.
 - `park` → Read `rd-workflow/claude_skills/fr/park.md` and follow it.
 - `status` → Read `rd-workflow/claude_skills/fr/status.md` and follow it.
@@ -72,7 +75,7 @@ RD_SKILL_COMPAT
 - `batch` → 별칭입니다. Read `rd-workflow/claude_skills/fr/do.md` 의 「`/fr batch` 별칭」 절 and follow it.
 - 그 외 / 인자 없음 → 아래 사용법 출력 후 종료 (파일 수정 없음 보장)
 
-**Legacy call 처리**: 첫 번째 단어가 `add`, `list`, `pri`, `inspect`, `archive`, `park`, `status`, `pull`, `push`, `sync`, `do`, `batch` 중 어느 것도 아니면 사용법 help를 출력합니다. 파일을 절대 수정하지 않습니다.
+**Legacy call 처리**: 첫 번째 단어가 `add`, `list`, `pri`, `inspect`, `groom`, `archive`, `park`, `status`, `pull`, `push`, `sync`, `do`, `batch` 중 어느 것도 아니면 사용법 help를 출력합니다. 파일을 절대 수정하지 않습니다.
 
 ### 사용법 출력
 
@@ -82,6 +85,7 @@ RD_SKILL_COMPAT
 - `/fr list` — 활성 항목 목록 출력
 - `/fr pri` — 우선순위 검토
 - `/fr inspect <제목>` — 단일 FR 심층 검토 + autopilot 가능 여부 보고
+- `/fr groom [<제목들>]` — idea FR 을 문답으로 검증해 validated·parked·dropped 로 정리 (제목 없으면 idea 전부)
 - `/fr archive` — done 항목 인덱스에서 일괄 삭제
 - `/fr park <제목>` — 항목을 parked로 이동
 - `/fr status <제목> <상태>` — 항목 상태 변경
@@ -159,5 +163,5 @@ RD_SKILL_COMPAT
 - 결함 보고 전달은 FR 경로와 분리됩니다 — 라벨은 `defect-report`, 도구는 `defect_reports.sh`, 실패는 종료가 아니라 미전달 표시입니다.
 - **모델 자기호출 경계**: 모델이 사용자의 명시 요청 없이 이 skill 을 스스로 호출한 경우 `list`·`pri`·`inspect`·`pull` 과 **로컬 전용 `add`** 만 수행합니다.
   - `add` 는 자기호출일 때 **유효 backend 와 무관하게 로컬로만 등록**합니다. GitHub 연동이 활성이어도 `gh issue create` 로 넘어가지 않고, 로컬 등록을 마친 뒤 "GitHub Issue 발행은 사용자 요청이 필요합니다 — 발행하려면 `/fr push <제목>` 를 요청해 주십시오" 를 알립니다. `add` 의 `GitHub 연동` 절차는 사용자가 직접 호출한 경우에만 실행합니다.
-  - `push`(외부 저장소 Issue 발행)·`sync`(원격 label 변경·Issue close)·`do`(여러 FR 처리. 별칭 `batch` 포함)·`archive`·`park`·`status` 는 사용자의 명시 요청을 요구하며, 요청이 없으면 수행하지 않고 어떤 요청이 필요한지 알립니다.
+  - `push`(외부 저장소 Issue 발행)·`sync`(원격 label 변경·Issue close)·`do`(여러 FR 처리. 별칭 `batch` 포함)·`groom`(문답 검증 뒤 상태 변경)·`archive`·`park`·`status` 는 사용자의 명시 요청을 요구하며, 요청이 없으면 수행하지 않고 어떤 요청이 필요한지 알립니다.
   - 플래그가 skill 단위여서 부분 개방이 불가하므로 이 경계는 문서 계약이며 harness 강제가 아닙니다 (`AUTONOMY.md` 「실행 모드와 skill 호출 권한」).

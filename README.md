@@ -10,6 +10,11 @@ REQUEST → 리뷰 → spec/plan → 실행 → 검증 → 최종 리뷰까지, 
 
 최근 세 발행에서 달라진 것입니다. 내 프로젝트의 `rd-workflow/VERSION` 보다 뒤의 절이 `/tpl update` 로 받을 변화입니다. 전체 이력은 [`rd-workflow/CHANGELOG.md`](rd-workflow/CHANGELOG.md) 에 있습니다.
 
+### 2026-11-08-092219
+
+- **`/fr groom` 추가**: `/fr groom <제목>` 으로 idea 상태 FR 한 건을, `/fr groom` 으로 idea FR 전부를 차례로 문답 검증합니다. AI 가 한 번에 한 질문과 권장 답을 내고, 마지막에 validated·parked·dropped 중 하나를 제안합니다. 결정하면 상세 파일에 `## groom 기록` 이 남고 상태가 바뀝니다. 일괄 모드에서는 「건너뛰기」·「중단」 을 말할 수 있고, 끝에 결과 요약표가 나옵니다. 사용자가 직접 요청할 때만 실행합니다.
+- **`/fr do` 의 idea FR 확인**: 대화형 `/fr do` 는 띄울 줄기에 idea FR 이 있을 때만 「groom 먼저 / 그대로 띄우기」 를 묻습니다. groom 을 고르면 결과를 기본 브랜치에 커밋한 뒤 후보를 다시 골라 띄우고, groom 을 중단하면 그 `/fr do` 는 새 줄기를 띄우지 않습니다. 무인 `/fr do --headless` 는 동작이 같고, 뺀 FR 표에 「groom 대상」 표시만 더합니다.
+
 ### 2026-11-08-074131
 
 - **거절한 extension 을 다시 묻지 않음**: `/tpl update` 가 설치하지 않은 extension(design-review·verify)을 update 마다 다시 묻지 않습니다. 안내한 extension 을 `rd-workflow/config/extensions.json` 의 `seen_extensions` 에 기록하고, 템플릿에 새로 추가된 extension 만 묻습니다. 새 extension 이 없으면 질문이 나오지 않습니다. 이미 설치해 쓰던 프로젝트는 첫 update 에서 묻지 않고 지금 있는 extension 으로 기록을 채웁니다. 거절한 extension 을 설치하려면 「<이름> extension 설치해줘」 로 요청하고, update 에서 다시 질문을 받으려면 `seen_extensions` 에서 그 이름을 빼고 `/tpl update` 를 실행합니다.
@@ -26,10 +31,6 @@ REQUEST → 리뷰 → spec/plan → 실행 → 검증 → 최종 리뷰까지, 
 - **작업 색인이 막을 때 안내**: 작업 색인이 있는 저장소의 기본 브랜치에서 `rd task` 쓰기가 거부되면, 색인 경로·원인·복구 방법을 함께 보입니다.
 - **손으로 띄운 세션 기록**: 자동 기동이 실패한(`launch=failed`) 작업도 `rd task resolve-launch <slug>` 로 손 기동 세션을 확정할 수 있습니다. 자동 기동 실패 안내가 이 방법을 알립니다. 확인 중 색인이 바뀌었거나 저장이 실패하면 확정했다고 보고하지 않고 다시 실행할 명령을 안내합니다. 세션이 살아 있으면 `promote_rollback.sh` 가 worktree 를 지우지 않습니다(`--force` 는 경고 후 계속).
 - **리뷰 인용 경고 정확도**: 리뷰어 턴 뒤의 `cite-mismatch` 경고가 맞는 인용에는 나오지 않습니다. 리뷰어는 재현 명령과 출력을 `## Reproduction` 절에 적습니다.
-
-### 2026-11-07-210251
-
-- **팀 overlay 가이드**: rd-workflow 가 없는 기존 팀 저장소 클론을 새로 clone 하지 않고 overlay 아래로 옮겨 submodule 로 등록하는 짧은 경로를 이관 가이드에 더했습니다(브랜치·stash·미커밋 작업 유지). 예시 이름을 overlay `rd-myproject` 아래 submodule `myproject` 로 맞추고, 기존 클론 안의 세션에서 진행하지 말고 끝나면 overlay 루트에서 새 세션을 띄우라는 실행 위치 안내를 넣었습니다.
 
 ## 전제 조건
 
