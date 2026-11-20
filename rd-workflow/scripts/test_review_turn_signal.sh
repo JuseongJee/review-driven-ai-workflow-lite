@@ -126,14 +126,32 @@ start_case() {
   d="$TMP/$name"; bin="$d/bin"
   mkdir -p "$bin"
   CASE_D="$d"
-  cp "$SUBJECT" "${script_dir}/review_common.sh" "$bin/"
+  cp "$SUBJECT" "${script_dir}/review_common.sh" "${script_dir}/model_select.sh" "$bin/"
   { printf '#!/usr/bin/env bash\n'; adapter_body "$d" "$mode" "$delay"; } > "$bin/adapter_codex.sh"
   chmod +x "$bin/adapter_codex.sh"
-  printf '{"default_priority":["codex"],"tools":{"codex":{"effort_default":"high"}},"_comment":"signal test"}' > "$bin/tools.json"
+  printf '{"default_priority":["codex"],"tools":{"codex":{"bin":"bash","effort_default":"high"}},"_comment":"signal test"}' > "$bin/tools.json"
   mk_session "$d/session"
+  # TICK_LOG=1 이면 부모의 PATH 앞에 호출 인자를 남기는 sleep 을 둔다(유예를 벽시계 대신 요청한 sleep 시간으로 재기 위함).
+  local pathpfx=""
+  if [ "${TICK_LOG:-}" = 1 ]; then
+    mkdir -p "$d/tick"
+    # 각 호출에 그 순간 어댑터 상태를 붙인다(run=살아 있음, gone=없음·좀비, unknown=ps 로 볼 수 없음). KILL 뒤 대기를 유예와 구분하기 위함.
+    cat > "$d/tick/sleep" <<TICK
+#!/bin/sh
+s=unknown
+if [ -n "\$(ps -o stat= -p \$\$ 2>/dev/null)" ]; then
+  st="\$(ps -o stat= -p "\$(cat "$d/adapter.pid" 2>/dev/null)" 2>/dev/null)"
+  case "\$st" in ""|Z*) s=gone ;; *) s=run ;; esac
+fi
+echo "\$* \$s" >> "$d/sleep.log"
+exec /bin/sleep "\$@"
+TICK
+    chmod +x "$d/tick/sleep"
+    pathpfx="PATH=\"$d/tick:\$PATH\" "
+  fi
   cat > "$d/launch.sh" <<EOF
 set -m
-RD_REVIEW_TERM_GRACE=$grace REVIEW_TOOLS_CONFIG="$bin/tools.json" bash "$bin/run_review_turn.sh" "$d/session" >"$d/out" 2>"$d/err" &
+${pathpfx}RD_REVIEW_TERM_GRACE=$grace REVIEW_TOOLS_CONFIG="$bin/tools.json" bash "$bin/run_review_turn.sh" "$d/session" >"$d/out" 2>"$d/err" &
 echo \$! > "$d/parent.pid"
 wait \$!
 echo \$? > "$d/parent.rc"
@@ -146,7 +164,8 @@ EOF
   else
     ( set -m; bash "$d/launch.sh" >/dev/null 2>&1 & )
   fi
-  wait_file "$d/ready" 10
+  # 준비 대기 상한은 멈춤 방지용입니다. 부하에서 어댑터 기동이 10초를 넘겨, 준비 전에 신호를 보내 T1·T2 가 흔들렸습니다.
+  wait_file "$d/ready" 60
 }
 
 start_bystander() { # $1=PID 파일
@@ -154,16 +173,17 @@ start_bystander() { # $1=PID 파일
   echo $! > "$1"
 }
 
-echo "=== T1: HUP·INT·TERM 전달 (GRACE=4) ==="
+# 유예(GRACE)는 어댑터가 신호에 끝나지 않을 때만 다 씁니다. 그래서 경과를 유예와 비교하고, 유예를 부하 지연보다 넉넉한 30초로 둡니다.
+echo "=== T1: HUP·INT·TERM 전달 (GRACE=30) ==="
 for sig in HUP INT TERM; do
   case "$sig" in HUP) want=129;; INT) want=130;; TERM) want=143;; esac
-  start_case "t1_$sig" trap 0 4
+  start_case "t1_$sig" trap 0 30
   d="$CASE_D"
   start_bystander "$d/bystander.pid"
   [ -e "$d/ready" ] || ck "t1.ready[$sig]" 1 "(어댑터 ready 없음)"
   t0="$(now)"
   kill -"$sig" "$(pidof_file "$d/parent.pid")" 2>/dev/null
-  wait_file "$d/parent.rc" 10; t1="$(now)"
+  wait_file "$d/parent.rc" 40; t1="$(now)"
   elapsed="$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')"
   apid="$(pidof_file "$d/adapter.pid")"; cpid="$(pidof_file "$d/child.pid")"
   wait_dead "$apid" 2; ad=$?; wait_dead "$cpid" 2; cd_=$?
@@ -171,7 +191,7 @@ for sig in HUP INT TERM; do
   rc="$(pidof_file "$d/parent.rc")"
   if [ "$rc" = "$want" ]; then ck "t1.rc[$sig]" 0; else ck "t1.rc[$sig]" 1 "(기대=$want 실제=${rc:-없음})"; fi
   if alive "$(pidof_file "$d/bystander.pid")"; then ck "t1.bystander[$sig]" 0; else ck "t1.bystander[$sig]" 1; fi
-  if fcmp "$elapsed" '<' 3; then ck "t1.fast[$sig]" 0; else ck "t1.fast[$sig]" 1 "(경과 ${elapsed}s)"; fi
+  if fcmp "$elapsed" '<' 30; then ck "t1.fast[$sig]" 0; else ck "t1.fast[$sig]" 1 "(경과 ${elapsed}s)"; fi
   if grep -qF "중단 신호 $sig 수신" "$d/err" 2>/dev/null; then ck "t1.name[$sig]" 0; else ck "t1.name[$sig]" 1; fi
   if grep -qF "정상 종료" "$d/err" 2>/dev/null; then ck "t1.result[$sig]" 0; else ck "t1.result[$sig]" 1; fi
 done
@@ -189,16 +209,28 @@ fi
 wait_file "$d/parent.rc" 10
 
 echo "=== T2: TERM 무시 어댑터 (GRACE=2) ==="
-start_case t2 ignore 0 2
+TICK_LOG=1 start_case t2 ignore 0 2
 d="$CASE_D"
+: > "$d/sleep.log"   # 준비 중 호출은 세지 않는다 — TERM 뒤 부모의 sleep 만 센다
 t0="$(now)"
 kill -TERM "$(pidof_file "$d/parent.pid")" 2>/dev/null
-wait_file "$d/parent.rc" 10; t1="$(now)"
+# TERM 을 무시하는 어댑터는 KILL 이 없으면 끝나지 않으므로, 부모가 끝났는지는 t2.rc 가 봅니다. 상한은 멈춤 방지용입니다.
+wait_file "$d/parent.rc" 60; t1="$(now)"
 elapsed="$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')"
 apid="$(pidof_file "$d/adapter.pid")"
 if wait_dead "$apid" 2; then ck "t2.killed" 0; else ck "t2.killed" 1 "(어댑터 생존)"; fi
 if fcmp "$elapsed" '>=' 2; then ck "t2.lower" 0; else ck "t2.lower" 1 "(경과 ${elapsed}s)"; fi
-if fcmp "$elapsed" '<=' 5; then ck "t2.upper" 0; else ck "t2.upper" 1 "(경과 ${elapsed}s)"; fi
+# 벽시계 상한은 부하에서 흔들리므로, TERM 뒤 어댑터가 살아 있는 동안 부모가 요청한 sleep 시간의 합을 본다(GRACE=2 → 2초).
+# 폴링 간격이 바뀌어도 합은 같다. 유예를 무시하거나, KILL 앞에 대기를 더하거나, 일찍 KILL 하고 그 뒤에 기다리면 합이 달라진다.
+# 스케줄 지연은 합에 들어가지 않는다. 어댑터 자식의 sleep 30417 은 ready 뒤에 기록될 수 있어(백그라운드 기동 경쟁) 고유 길이로 거른다.
+if grep -q ' unknown$' "$d/sleep.log" 2>/dev/null; then
+  echo "SKIP t2.slept (ps 로 어댑터 상태를 볼 수 없음)"
+  # self_test 가 환경 제약 건너뜀으로 집계하도록 env-skip 표식을 stderr 에 낸다.
+  printf 'env-skip: test_review_turn_signal t2.slept — ps 로 어댑터 상태를 볼 수 없음\n' >&2
+else
+  slept="$(awk '$1 != 30417 && $2 == "run" { t += $1 } END { printf "%g", t + 0 }' "$d/sleep.log" 2>/dev/null)"
+  if [ "$slept" = 2 ]; then ck "t2.slept" 0; else ck "t2.slept" 1 "(TERM 뒤 어댑터 생존 중 요청한 sleep 합 ${slept:-없음}초, 기대 2초)"; fi
+fi
 rc="$(pidof_file "$d/parent.rc")"
 if [ -n "$rc" ] && [ "$rc" != 0 ]; then ck "t2.rc" 0; else ck "t2.rc" 1 "(rc=${rc:-없음})"; fi
 if grep -qF "잔존 프로세스 경고" "$d/err" 2>/dev/null; then ck "t2.warn" 0; else ck "t2.warn" 1; fi
@@ -210,9 +242,9 @@ if grep -qF "확인하기 전에 재실행하지 마십시오" "$d/err" 2>/dev/n
 
 echo "=== T2n: SIGINT 무시로 시작한 부모는 한계를 한 번 알린다 ==="
 d="$TMP/t2n"; mkdir -p "$d/bin"
-cp "$SUBJECT" "${script_dir}/review_common.sh" "$d/bin/"
+cp "$SUBJECT" "${script_dir}/review_common.sh" "${script_dir}/model_select.sh" "$d/bin/"
 { printf '#!/usr/bin/env bash\nexit 0\n'; } > "$d/bin/adapter_codex.sh"; chmod +x "$d/bin/adapter_codex.sh"
-printf '{"default_priority":["codex"],"tools":{"codex":{"effort_default":"high"}}}' > "$d/bin/tools.json"
+printf '{"default_priority":["codex"],"tools":{"codex":{"bin":"bash","effort_default":"high"}}}' > "$d/bin/tools.json"
 mk_session "$d/session"
 ( trap '' INT; REVIEW_TOOLS_CONFIG="$d/bin/tools.json" bash "$d/bin/run_review_turn.sh" "$d/session" >"$d/out" 2>"$d/err" )
 n="$(count_lines "$d/err" "SIGINT 가 무시된 채 시작되었습니다")"
@@ -362,10 +394,10 @@ run_fail_case() {
   d="$TMP/$name"; bin="$d/bin"
   mkdir -p "$bin"
   CASE_D="$d"
-  cp "$SUBJECT" "${script_dir}/review_common.sh" "$bin/"
+  cp "$SUBJECT" "${script_dir}/review_common.sh" "${script_dir}/model_select.sh" "$bin/"
   { printf '#!/usr/bin/env bash\n'; printf 'sd="%s/session"\n' "$d"; printf '%s\n' "$body"; printf 'exit 1\n'; } > "$bin/adapter_codex.sh"
   chmod +x "$bin/adapter_codex.sh"
-  printf '{"default_priority":["codex"],"tools":{"codex":{"effort_default":"high"}},"_comment":"signal test"}' > "$bin/tools.json"
+  printf '{"default_priority":["codex"],"tools":{"codex":{"bin":"bash","effort_default":"high"}},"_comment":"signal test"}' > "$bin/tools.json"
   mk_session "$d/session"
   REVIEW_TOOLS_CONFIG="$bin/tools.json" bash "$bin/run_review_turn.sh" "$d/session" >"$d/out" 2>"$d/err"
   echo $? > "$d/rc"

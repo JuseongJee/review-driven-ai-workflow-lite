@@ -134,11 +134,15 @@ PRUNED_NOTE=""
 # 파괴적 정리(worktree·브랜치 삭제)는 기본 체크아웃에서 부른 `rd task list` 에서만 한다 — 다른 작업
 # worktree 에서 목록만 보려던 호출이 발행 끝난 다른 작업의 worktree 를 지우지 않게 한다. 기본 체크아웃은
 # 공유 .git 의 부모 디렉터리다(`archive.sh` Step -1 과 같은 기준). 판정 실패는 기본 체크아웃이 아닌 것으로 본다.
-_tl_is_default_checkout() {
-  local common main here
+_tl_default_checkout_dir() {
+  local common
   common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
   [[ "$common" == /* ]] || return 1
-  main="$(cd "$(dirname "$common")" 2>/dev/null && pwd -P)" || return 1
+  (cd "$(dirname "$common")" 2>/dev/null && pwd -P)
+}
+_tl_is_default_checkout() {
+  local main here
+  main="$(_tl_default_checkout_dir)" || return 1
   here="$(pwd -P)" || return 1
   [[ "$main" == "$here" ]]
 }
@@ -411,6 +415,61 @@ _tl_publish_evidence() {
 }
 
 # ---------------------------------------------------------------------------
+# 직접 설치 PR 표시 (spec D5) — 색인에 pr-head·pr-url 이 있는 작업만 본다.
+#   stdout 첫 줄: none | waiting | linked. 둘째 줄부터: 사람에게 보일 행동 줄 한 줄.
+#   waiting: dpr_pr_waiting(색인 pr-head == fr tip, state≠cleanup-pending) 이 참이고, gh 로 PR 상태를 조회한다.
+#   linked : PR 대기는 아니지만 pr-url 이 있다 — 실제 단계를 그대로 두고 연결된 PR 만 알린다(gh 조회 없음).
+# 판정은 `rd task status` 와 같은 dpr_pr_waiting 한 함수다. gh·함수 로드는 하위 셸에서만 한다
+# (이 스크립트의 셸 옵션·함수를 건드리지 않기 위함). gh 시간 상한은 tp_gh(RD_PR_CHECK_TIMEOUT) 가 건다.
+# ---------------------------------------------------------------------------
+_tl_pr_info() {  # <slug> <fr_ref>
+  local slug="$1" fr_ref="$2" url head
+  url="$(tasks_index_get "$slug" pr-url 2>/dev/null)" || url=""
+  head="$(tasks_index_get "$slug" pr-head 2>/dev/null)" || head=""
+  if [[ -z "$url" && -z "$head" ]]; then printf 'none\n'; return 0; fi
+  (
+    set +e +u
+    source "$SCRIPT_DIR/_team_publish_common.sh" >/dev/null 2>&1 \
+      && source "$SCRIPT_DIR/_direct_pr_common.sh" >/dev/null 2>&1 \
+      || { printf 'none\n'; exit 0; }
+    if ! dpr_pr_waiting "$slug" "$fr_ref"; then
+      if [[ -n "$url" ]]; then printf 'linked\n→ 연결된 PR: %s\n' "$url"; else printf 'none\n'; fi
+      exit 0
+    fi
+    check="bash rd-workflow/scripts/rd pr check --task ${slug}"
+    if [[ -z "$url" ]]; then
+      printf 'waiting\n→ PR 주소가 기록되지 않았습니다 — bash rd-workflow/scripts/rd pr open --task %s\n' "$slug"
+      exit 0
+    fi
+    lim="${RD_PR_CHECK_TIMEOUT:-15}"
+    out="$(tp_gh "$lim" pr view "$url" --json state,mergeable,reviewDecision 2>/dev/null)" || out=""
+    cls="$(printf '%s' "$out" | python3 -I -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    assert isinstance(d, dict)
+except Exception:
+    print("ERROR"); sys.exit(0)
+st = str(d.get("state") or ""); mg = str(d.get("mergeable") or ""); rv = str(d.get("reviewDecision") or "")
+if st == "MERGED": print("MERGED")
+elif st == "CLOSED": print("CLOSED")
+elif rv == "CHANGES_REQUESTED": print("CHANGES_REQUESTED")
+elif mg == "CONFLICTING": print("CONFLICTING")
+else: print("OPEN")
+' 2>/dev/null)" || cls="ERROR"
+    case "$cls" in
+      MERGED)            act="→ merge 됨: ${check} --apply" ;;
+      CLOSED)            act="→ 닫힘: ${check} 로 선택지 확인" ;;
+      CHANGES_REQUESTED) act="→ 수정 요청: bash rd-workflow/scripts/rd pr reopen --task ${slug}" ;;
+      CONFLICTING)       act="→ 충돌: ${check} 로 복구 순서 확인" ;;
+      OPEN)              act="→ PR 검토 중: ${url}" ;;
+      *)                 act="→ PR 상태 조회 실패 — ${check}" ;;
+    esac
+    printf 'waiting\n%s\n' "$act"
+  ) || printf 'none\n'
+}
+
+# ---------------------------------------------------------------------------
 # 단계(status) 읽기 — 체크아웃된 작업은 worktree 의 task-state, 비체크아웃(spec D13)은
 # fr tip 의 blob 을 읽는다. 지금 checkout 된 baseline task-state 파일을 그대로 읽으면
 # 엉뚱한 상태를 보여준다.
@@ -479,6 +538,207 @@ _tl_queue_summary() {
   ) || true
 }
 
+# PR 검토 중 표 (change spec D7·AC4b) — Status 가 `PR 검토 중` 인 작업의 submodule 마다 한 줄.
+# 대상은 두 곳이다: 색인의 fr worktree 작업, 그리고 기본 체크아웃에서 fr 브랜치 없이 한 작업(task-state fr-branch=null).
+# no-fr 작업은 색인에 없고 task-state·PR 기록이 기본 체크아웃에 있다. tip 은 그 HEAD 이고, 기준점은 rd pr open 과 같이
+# fr-branch 값 null 로 판정한다(tp_target_base 의 base-commit 기준).
+# 기존 본문 루프와 별개로 색인을 다시 읽는다(진행 중 판정·출력 형식을 건드리지 않기 위함).
+# 하위 셸에서만 T3 공용 함수를 source 한다. source 에 실패하면 표를 생략하고 경고 한 줄만 낸다.
+# gh 는 기록 state=open 줄에서만 부른다(조회만, --apply 없음). 시간 상한은 tp_pr_state 안(RD_PR_CHECK_TIMEOUT)에 있다.
+_tl_pr_review_rows() {
+  (
+    set +e +u
+    rows=""
+    tp_loaded=0
+    cfgd=""
+    trap '[[ -n "$cfgd" ]] && rm -rf "$cfgd"' EXIT
+    # 행동 줄의 값 인용 — 복사해 붙인 명령에서 경로·작업 이름·PR 주소가 인자 하나로 그대로 읽히게 작은따옴표로 감싼다.
+    # 큰따옴표 안에서는 대화형 bash·zsh 가 ! 를 이력 확장하므로 쓰지 않는다. 값 안의 ' 는 '\'' 로 끊어 잇는다.
+    _tl_q() {
+      local v="$1" sq="'"
+      v="${v//$sq/$sq\\$sq$sq}"
+      printf "'%s'" "$v"
+    }
+    # fr 작업 줄의 set-status 는 --task <slug> 로 대상을 고정한다 — 현재 위치만으로 고르면, 목록 뒤에 색인 행이 사라졌을 때
+    # 남은 다른 작업이 골라진다. --task 는 그 작업이 색인에 없으면 아무것도 바꾸지 않고 멈춘다.
+    # 기본 체크아웃 작업(no-fr)에는 Status 를 바꾸는 명령(rd task set-status·rd pr check --apply)과 rd pr check(조회)를
+    # 안내하지 않는다. 대상 선택(task_resolve_target)은 기본 체크아웃 작업을 고를 방법이 없다 — 색인에 진행 중 작업이 있으면
+    # 그 작업을 고르고, 색인 파일만 남았으면 막는다. 조회도 merge·수정 요청·닫힘 뒤에는 대상 미지정 상태 변경 명령을 다음
+    # 행동으로 내므로 같은 이유로 뺀다. 그래서 남은 일과 대상 제약, Status 와 무관한 PR 단위 행동(gh pr reopen)만 보인다.
+    _TL_NOFR_NOTE="Status 를 바꾸는 rd 명령(rd task set-status·rd pr check --apply)이 지금은 이 작업을 대상으로 고르지 못할 수 있습니다(후속 FR nofr-task-target-resolution)"
+    # 작업 하나의 표 줄을 rows 에 더한다. <slug> <작업 경로> <fr-branch 값(fr/<slug> 또는 null)> <tip 커밋(빈 값 허용)>
+    _tl_pr_task_rows() {
+      local slug="$1" wt="$2" fr_ref="$3" tip_c="$4" cdq
+      cdq="cd $(_tl_q "$wt") &&"
+      if [[ "$tp_loaded" == 0 ]]; then
+        source "$SCRIPT_DIR/_team_publish_common.sh" >/dev/null 2>&1 \
+          && command -v tp_pr_state >/dev/null 2>&1 \
+          || { printf '\n경고: PR 검토 중 표를 만들 수 없습니다(_team_publish_common.sh 를 읽지 못했습니다).\n'; exit 0; }
+        tp_loaded=1
+        # fr tip 설정을 풀 임시 root. 만들지 못하면 PR 검토 중 표만 생략합니다(목록 본문은 그대로 — 하위 셸 실패는 || true 가 받음).
+        cfgd="$(mktemp -d "${TMPDIR:-/tmp}/rd-tlcfg.XXXXXX")" || { printf '\n경고: PR 검토 중 표를 만들 수 없습니다(임시 디렉터리를 만들지 못했습니다).\n'; exit 1; }
+      fi
+      rec="${wt}/${RD_TEAM_PR_RECORD}"
+      seen=" "; srows=""; trows=""; t_failed=""
+      # 기록 경로를 먼저 모은다 — 대상 판정(아래)이 기록 행보다 먼저 돌아 merge 된 PR 행의 안내를 정한다.
+      if [[ -f "$rec" ]]; then
+        while IFS=$'\t' read -r r_path _r_rest || [[ -n "$r_path" ]]; do
+          [[ -z "$r_path" || "$r_path" == "path" ]] || seen="${seen}${r_path} "
+        done < "$rec"
+      fi
+      # 기록에 없는데 gitlink 가 바뀐 submodule 중 mode=manual 인 것은 반영하지 않는 대상이다.
+      # 기준은 rd pr open·check 와 같다: 반영 대상 기준점(tp_target_base, spec D2-1), fr tip 에 커밋된 workflow.json.
+      # 대상 경로는 리뷰한 범위로 한정한다(tp_reviewed_head, rd pr open·check 와 같은 계산).
+      # 기준점·리뷰한 끝을 정하지 못하면 --apply 가 rc 2 로 멈추므로 대상 판정 실패로 원인·복구를 보인다.
+      base_c=""; rhead_c=""
+      if [[ -n "$tip_c" ]]; then
+        if ! base_c="$(tp_target_base "$wt" "$tip_c" "$fr_ref" 2>"$cfgd/base.err")" || [[ -z "$base_c" ]]; then
+          base_c=""; t_failed=1
+          trows="${trows}${slug}	-	-	대상 판정 실패	→ $(tp_base_fail_line "$cfgd/base.err")"$'\n'
+        elif ! rhead_c="$(tp_reviewed_head "$wt" "$tip_c" 2>/dev/null)"; then
+          base_c=""; t_failed=1
+          trows="${trows}${slug}	-	-	대상 판정 실패	→ seal 마커의 리뷰한 끝 커밋을 읽을 수 없습니다 / 복구: ${_TP_NEW_SESSION_HINT}"$'\n'
+        fi
+      fi
+      if [[ -n "$base_c" ]] && tp_tip_config_root "$wt" "$tip_c" "$cfgd"; then
+        # 대상 판정 실패는 빈 대상처럼 숨기지 않고 원인과 함께 한 줄로 보인다(PR 기록 행은 위에 그대로).
+        if t_out="$(tp_targets "$wt" "$base_c" "$tip_c" "$rhead_c" 2>"$cfgd/targets.err")"; then
+          while IFS=$'\t' read -r t_path _o _n; do
+            [[ -z "$t_path" ]] && continue
+            case "$seen" in *" ${t_path} "*) continue ;; esac
+            [[ "$(tp_config "$cfgd" "$t_path" mode 2>/dev/null)" == "manual" ]] || continue
+            trows="${trows}${slug}	${t_path}	-	반영하지 않음	→ team_publish.mode 가 manual 입니다"$'\n'
+          done <<< "$t_out"
+        else
+          t_cause="$(sed -n 1p "$cfgd/targets.err" 2>/dev/null)"; t_cause="${t_cause#tp_targets: }"
+          t_failed=1
+          trows="${trows}${slug}	-	-	대상 판정 실패	→ ${t_cause:-gitlink 비교에 실패했습니다}"$'\n'
+        fi
+      fi
+      if [[ -f "$rec" ]]; then
+        while IFS=$'\037' read -r r_path r_repo r_branch r_base r_url r_head r_state r_merged r_commits || [[ -n "$r_path" ]]; do
+          [[ -z "$r_path" || "$r_path" == "path" ]] && continue
+          case "$r_state" in
+            pushed)
+              srows="${srows}${slug}	${r_path}	-	push 완료	→ 반영 끝: 팀 브랜치 ${r_branch} 에 push 했습니다"$'\n' ;;
+            merged)
+              if [[ "$fr_ref" == null ]]; then
+                srows="${srows}${slug}	${r_path}	${r_url}	merge 반영됨	→ 포인터 반영 완료 / 남은 PR 이 모두 반영되면 Status 를 아카이브 보류로 옮겨야 합니다 / ${_TL_NOFR_NOTE}"$'\n'
+              else
+                srows="${srows}${slug}	${r_path}	${r_url}	merge 반영됨	→ 모든 PR 이 반영되면 rd pr check --apply 가 Status 를 옮깁니다"$'\n'
+              fi ;;
+            closed)
+              if [[ "$fr_ref" == null ]]; then
+                srows="${srows}${slug}	${r_path}	${r_url}	기록상 닫힘	→ 이 줄은 원격을 조회하지 않습니다 / 지금 상태는 PR 링크에서 확인하고, 링크에서도 닫혀 있으면 다시 올리려면 gh pr reopen $(_tl_q "$r_url") / ${_TL_NOFR_NOTE}"$'\n'
+              else
+                srows="${srows}${slug}	${r_path}	${r_url}	닫힘	→ 닫힌 PR 입니다: ${cdq} bash rd-workflow/scripts/rd pr check"$'\n'
+              fi ;;
+            open)
+              res="$(tp_pr_state "$r_url" 2>/dev/null)" || res=""
+              # 빈 칸이 이어지므로 read 가 아니라 cut 으로 자른다(탭은 IFS 공백이라 빈 칸이 합쳐진다).
+              verdict="$(printf '%s' "$res" | cut -f1)"; summary="$(printf '%s' "$res" | cut -f5-)"
+              case "$verdict" in
+                MERGED)
+                  # 대상 판정에 실패한 작업은 --apply 가 rc 2 로 멈추므로 실행할 수 없는 명령을 안내하지 않는다.
+                  if [[ -n "$t_failed" && "$fr_ref" == null ]]; then
+                    srows="${srows}${slug}	${r_path}	${r_url}	merge 됨	→ merge 됨: 아래 대상 판정 실패를 먼저 해결해야 합니다 / ${_TL_NOFR_NOTE}"$'\n'
+                  elif [[ -n "$t_failed" ]]; then
+                    srows="${srows}${slug}	${r_path}	${r_url}	merge 됨	→ merge 됨: 아래 대상 판정 실패를 먼저 해결해야 rd pr check --apply 가 진행됩니다"$'\n'
+                  elif [[ "$fr_ref" == null ]]; then
+                    srows="${srows}${slug}	${r_path}	${r_url}	merge 됨	→ merge 됨: submodule 포인터 반영과 Status 전이가 남았습니다 / ${_TL_NOFR_NOTE}"$'\n'
+                  else
+                    srows="${srows}${slug}	${r_path}	${r_url}	merge 됨	→ merge 됨: ${cdq} bash rd-workflow/scripts/rd pr check --apply"$'\n'
+                  fi ;;
+                CHANGES_REQUESTED)
+                  if [[ "$fr_ref" == null ]]; then
+                    srows="${srows}${slug}	${r_path}	${r_url}	수정 요청	→ 수정 요청: ${summary:-(의견 없음)} / 반영하려면 기본 체크아웃의 Status 를 구현 중으로 되돌립니다 / ${_TL_NOFR_NOTE}"$'\n'
+                  else
+                    srows="${srows}${slug}	${r_path}	${r_url}	수정 요청	→ 수정 요청: ${summary:-(의견 없음)} / 반영하려면 ${cdq} bash rd-workflow/scripts/rd task set-status \"구현 중\" --task $(_tl_q "$slug")"$'\n'
+                  fi ;;
+                CLOSED)
+                  if [[ "$fr_ref" == null ]]; then
+                    srows="${srows}${slug}	${r_path}	${r_url}	닫힘	→ PR 이 merge 없이 닫혔습니다 / 다시 올리려면 PR 링크에서 재개할 수 있는지 확인한 뒤 gh pr reopen $(_tl_q "$r_url") / ${_TL_NOFR_NOTE}"$'\n'
+                  else
+                    srows="${srows}${slug}	${r_path}	${r_url}	닫힘	→ PR 이 merge 없이 닫혔습니다: ${cdq} bash rd-workflow/scripts/rd pr check"$'\n'
+                  fi ;;
+                OPEN)
+                  srows="${srows}${slug}	${r_path}	${r_url}	검토 대기	→ 팀의 검토·merge 를 기다립니다"$'\n' ;;
+                *)
+                  srows="${srows}${slug}	${r_path}	${r_url}	조회 실패	→ ${summary:-gh 조회에 실패했습니다} / 나중에 rd task list 를 다시 실행하십시오"$'\n' ;;
+              esac ;;
+          esac
+        done < <(tr '\t' '\037' < "$rec")   # 탭은 IFS 공백이라 빈 칸이 합쳐지므로 비공백 구분자로 바꾼다
+      fi
+      # 기본 체크아웃 작업의 대상 판정 실패 복구(rd task set-base 등)는 실행한 위치의 task-state 를 고치므로, 다른 worktree 에서
+      # 목록을 본 사용자가 실행 위치를 알 수 있게 기본 체크아웃 경로를 붙인다.
+      if [[ "$fr_ref" == null && -n "$trows" ]]; then
+        trows="$(printf '%s' "$trows" | TL_LOC="복구 명령은 기본 체크아웃에서 실행합니다: ${cdq} <복구 명령>" \
+          awk -F'\t' -v OFS='\t' '$4 == "대상 판정 실패" { $5 = $5 " / " ENVIRON["TL_LOC"] } { print }')"$'\n'
+      fi
+      rows="${rows}${srows}${trows}"
+    }
+    while IFS= read -r slug; do
+      [[ -z "$slug" ]] && continue
+      _tl_load_row "$slug" || continue
+      [[ "$TL_CHECKOUT" == "yes" && -n "$TL_WORKTREE" && -d "$TL_WORKTREE" ]] || continue
+      fr_ref="${TL_FR_BRANCH:-fr/${slug}}"
+      [[ "$(_tl_read_status yes "$TL_WORKTREE" "$fr_ref")" == "PR 검토 중" ]] || continue
+      _tl_pr_task_rows "$slug" "$TL_WORKTREE" "$fr_ref" \
+        "$(git -C "$TL_WORKTREE" rev-parse -q --verify "refs/heads/${fr_ref}^{commit}" 2>/dev/null)"
+    done <<< "${SLUGS:-}"
+    # no-fr 작업 — 기본 체크아웃의 task-state 를 읽는다(어느 worktree 에서 불러도 같은 곳).
+    if main_wt="$(_tl_default_checkout_dir)"; then
+      ts="${main_wt}/rd-workflow-workspace/.lifecycle/task-state"
+      nf_br="$(awk -F'=' '$1=="fr-branch"{sub(/^[^=]+=/,""); print; exit}' "$ts" 2>/dev/null)"
+      nf_st="$(awk -F'=' '$1=="status"{sub(/^[^=]+=/,""); print; exit}' "$ts" 2>/dev/null)"
+      nf_slug="$(awk -F'=' '$1=="short-title"{sub(/^[^=]+=/,""); print; exit}' "$ts" 2>/dev/null)"
+      if [[ "$nf_br" == "null" && "$nf_st" == "PR 검토 중" ]]; then
+        [[ -n "$nf_slug" && "$nf_slug" != "-" ]] || nf_slug="(기본 체크아웃)"
+        _tl_pr_task_rows "$nf_slug" "$main_wt" null \
+          "$(git -C "$main_wt" rev-parse -q --verify "HEAD^{commit}" 2>/dev/null)"
+      fi
+    fi
+    [[ -n "$rows" ]] || exit 0
+    printf '\nPR 검토 중\n'
+    printf '작업\t경로\tPR\t상태\t남은 행동\n'
+    # %b 를 쓰지 않는다 — gh 요약·브랜치 이름의 역슬래시(\c·\033)가 해석돼 출력이 끊기거나 터미널을 바꾼다.
+    { printf '%s' "$rows" | column -t -s $'\t' 2>/dev/null; } || printf '%s' "$rows"
+  ) || true
+}
+
+# 끊긴 선점 점검 (issue-queue-take, change spec 3.7) — 팀 Issue 선점 장부가 없거나 비면 아무것도
+# 내지 않고 issue_queue.sh 도 실행하지 않는다. stale 이 실패해도 종료 코드를 바꾸지 않고 경고 한 줄만 낸다.
+_tl_issue_claims_report() {
+  local ledger out line url reason cmd n=0 body=""
+  if [[ -n "${RD_ISSUE_LEDGER:-}" ]]; then
+    ledger="$RD_ISSUE_LEDGER"
+  else
+    ledger="$(git -C "$project_root" rev-parse --git-common-dir 2>/dev/null)" || return 0
+    [[ "$ledger" == /* ]] || ledger="$project_root/$ledger"
+    ledger="$ledger/rd-issue-claims.tsv"
+  fi
+  [[ -s "$ledger" ]] || return 0
+  if ! out="$(bash "${RD_ISSUE_QUEUE:-$SCRIPT_DIR/../issue_queue.sh}" stale 2>/dev/null)"; then
+    echo "tasks_list: 경고 — 끊긴 선점 점검 실패 (issue_queue.sh stale)" >&2
+    return 0
+  fi
+  while IFS=$'\t' read -r url reason cmd; do
+    [[ -n "$url" ]] || continue
+    if [[ -n "$cmd" && "$cmd" != "-" ]]; then
+      n=$((n + 1))
+      body="${body}  ${url} — ${reason} · ${cmd}"$'\n'
+    else
+      body="${body}  ${url} — ${reason} · 기본 브랜치를 확인한 뒤 다시 보십시오"$'\n'
+    fi
+  done <<< "$out"
+  [[ -n "$body" ]] || return 0
+  if (( n > 0 )); then
+    printf '\n끊긴 선점 %d건 — 풀지 사용자에게 한 줄로 물은 뒤 아래 명령으로 풉니다:\n%s' "$n" "$body"
+  else
+    printf '\n끊긴 선점 확인 필요 — 판정하지 못한 선점이 있습니다:\n%s' "$body"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # 본문 출력
 # ---------------------------------------------------------------------------
@@ -519,7 +779,12 @@ while IFS= read -r slug; do
   evidence="$(_tl_publish_evidence "$slug" "$fr_tip")"
 
   if [[ "$evidence" == "needs-verify" ]]; then
-    PUBLISH_ROWS="${PUBLISH_ROWS}${slug}	⚠ 발행 확인 필요	확인: bash rd-workflow/scripts/lifecycle/archive.sh --dry-run	-\n"
+    verify_cmd="bash rd-workflow/scripts/lifecycle/archive.sh --dry-run"
+    # 직접 설치 PR 작업은 archive.sh 가 아니라 rd pr check --apply 로 마감을 이어 간다 (spec D10).
+    if [[ "$(tasks_index_get "$slug" pr-mode 2>/dev/null)" == "direct" ]]; then
+      verify_cmd="bash rd-workflow/scripts/rd pr check --task ${slug} --apply"
+    fi
+    PUBLISH_ROWS="${PUBLISH_ROWS}${slug}	⚠ 발행 확인 필요	확인: ${verify_cmd}	-\n"
     continue
   elif [[ "$evidence" == "cleanup-pending" ]]; then
     PUBLISH_ROWS="${PUBLISH_ROWS}${slug}	정리 대기	git worktree remove ${wt:-<worktree>}	-\n"
@@ -528,6 +793,14 @@ while IFS= read -r slug; do
 
   # in-progress — 메인 표
   stage="$(_tl_read_status "$checked_out" "$wt" "$fr_ref")"
+
+  # 직접 설치 PR: PR 대기이면 단계 칸을 바꾸고, 아니어도 연결된 PR 이 있으면 줄을 더한다 (spec D5).
+  pr_note=""
+  pr_info="$(_tl_pr_info "$slug" "$fr_ref")"
+  case "${pr_info%%$'\n'*}" in
+    waiting) stage="PR 검토 중"; pr_note="${pr_info#*$'\n'}" ;;
+    linked)  pr_note="${pr_info#*$'\n'}" ;;
+  esac
 
   if [[ "$checked_out" == "yes" ]]; then
     wt_col="$wt"
@@ -574,6 +847,9 @@ while IFS= read -r slug; do
   fi
 
   MAIN_ROWS="${MAIN_ROWS}${slug}	${stage}	${wt_col}	${launch_label}	${behind}\n"
+  if [[ -n "$pr_note" ]]; then
+    MAIN_ROWS="${MAIN_ROWS}	 	 	${pr_note}	\n"
+  fi
   if [[ -n "$action" ]]; then
     MAIN_ROWS="${MAIN_ROWS}	 	 	${action}	\n"
   fi
@@ -586,10 +862,13 @@ while IFS= read -r slug; do
 done <<< "$SLUGS"
 
 if [[ "$ANY" -eq 0 ]]; then
-  printf '진행 중인 작업이 없습니다.\n'
+  # 색인이 비어도 기본 체크아웃의 no-fr 작업이 PR 검토 중일 수 있다. 그 표가 있으면 진행 중 작업이 있는 것이다.
+  PR_TABLE="$(_tl_pr_review_rows)"
+  if [[ -n "$PR_TABLE" ]]; then printf '%s\n' "${PR_TABLE#$'\n'}"; else printf '진행 중인 작업이 없습니다.\n'; fi
   [[ -n "$PRUNED_NOTE" ]] && printf '%s\n' "$PRUNED_NOTE"
   [[ -n "$SWEEP_NOTES" ]] && printf '%s' "$SWEEP_NOTES"
   _tl_queue_summary
+  _tl_issue_claims_report
   exit 0
 fi
 
@@ -612,4 +891,6 @@ if [[ -n "$SWEEP_NOTES" ]]; then
   printf '\n%s' "$SWEEP_NOTES"
 fi
 
+_tl_pr_review_rows
 _tl_queue_summary
+_tl_issue_claims_report

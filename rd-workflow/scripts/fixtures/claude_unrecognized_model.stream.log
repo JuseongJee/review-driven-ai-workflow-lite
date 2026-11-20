@@ -1,0 +1,5 @@
+{"type":"system","subtype":"hook_started","hook_id":"00000000-0000-4000-8000-000000000002","hook_name":"SessionStart:startup","hook_event":"SessionStart","uuid":"00000000-0000-4000-8000-000000000003","session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"system","subtype":"init","model":"claude-nonexistent-zz9","effort":null,"session_id":"00000000-0000-4000-8000-000000000001","claude_code_version":"2.1.328"}
+[claude-code:unrecognized_model] {"model":"claude-nonexistent-zz9","query_source":"sdk"}
+{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"There's an issue with the selected model (claude-nonexistent-zz9). It may not exist or you may not have access to it. Run --model to pick a different model."}]}}
+{"type":"result","subtype":"success","is_error":true,"result":"There's an issue with the selected model (claude-nonexistent-zz9). It may not exist or you may not have access to it. Run --model to pick a different model.","total_cost_usd":0,"terminal_reason":"api_error"}

@@ -30,7 +30,7 @@ Typical user requests can be short:
 
 ```bash
 bash -s <<'RD_SKILL_COMPAT'
-RD_SKILL_BASE=2026-11-04-203832 RD_SKILL_NAME=request-to-reviewed-plan
+RD_SKILL_BASE=2026-11-08-092219 RD_SKILL_NAME=request-to-reviewed-plan
 vf="rd-workflow/VERSION"
 if [ ! -f "$vf" ] && [ -f "_ROOT_FILES/rd-workflow/VERSION" ]; then exit 0; fi
 v=""; [ -f "$vf" ] && v="$(cat "$vf")"; v="${v#lite-}"
@@ -159,6 +159,8 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
 - Use `bash rd-workflow/scripts/prepare_review_pipeline.sh request` and `bash rd-workflow/scripts/run_review_turn.sh ...` for `REQUEST` review.
 - Use `bash rd-workflow/scripts/prepare_review_pipeline.sh spec-plan` or the explicit spec / plan paths plus `bash rd-workflow/scripts/run_review_turn.sh ...` for spec / plan review.
 - Do not edit the SESSION.md Status or Current Owner by hand after writing an Author turn. `run_review_turn.sh` hands them over, and tells you the next action when it cannot.
+- REQUEST review 의 `분할:` 발견(`request_review.md` 「분할 신호」)은 일반 이의처럼 Author 턴에서 반영하고 사용자에게 묻지 않는다. 나눈 Source FR 의 범위만 좁히고, 함께 묶인 다른 Source FR 의 범위·AC 는 그대로 둔다(Source FR 이 없으면 REQUEST 전체가 대상이다). 뗀 기능마다 `## Constraints` 에 `- 후속 FR: <slug> — <한 줄 범위>` 줄을 쓰고, 그 아래 들여 쓴 줄로 빠진 AC·제약과 선행 FR(이 작업 밖의 기존 FR 포함)을 옮긴다. 등록은 기존 `후속 FR:` 처리(아카이브의 미등록 안내, `/fr do` 줄기는 `후속 FR:` 줄과 들여 쓴 항목 전체를 마감 보고의 「REQUEST review 분할 후속」 절에 옮김)를 따른다. 충족되지 않은 선행 FR 발견은 Author 가 풀 수 없으므로 사람 결정으로 `awaiting-user` 에 멈춘다. `/fr do` 줄기는 미완료 선행과 선택지를 인계 파일의 「호출 세션이 정해야 할 질문」 경로로 보낸다. 어느 FR 을 먼저 진행할지는 FR 을 고른 호출 세션이 정한다. 분할했으면 REQUEST review 가 끝날 때 사용자에게 남긴 범위와 뗀 기능 목록을 알린다.
+- **범위 밖 항목**: `run_review_turn.sh` 가 Reviewer 턴 뒤에 출력하는 「범위 밖으로 돌린 항목」 목록(6턴 뒤 범위 축소 — `FILE_BASED_REVIEW_PIPELINE.md` 턴 규칙)을 세션이 끝날 때 리뷰 보고서(`rd-workflow-workspace/reports/reviews/`)와 사용자 응답에 옮긴다. 다음 리뷰 단계의 리뷰어 지시는 스크립트가 같은 작업의 세션에서 이 줄을 직접 모으므로 REQUEST 에 옮겨 적지 않는다. 사람이 남은 이의를 범위 밖으로 정하면 `--decision` 실행 전에 `REQUEST.md ## Constraints` 에 `- 범위 밖: <항목> — <사유> (결정: 사람, <리뷰 종류> 턴 NNN)` 줄을 쓴다.
 - Author 턴은 Reviewer 지적에 응답하기 전에 `receiving-code-review` 로 지적마다 사실을 확인하고 「수용 / 반박 / 보류」 와 근거를 적는다 (`FILE_BASED_REVIEW_PIPELINE.md` 턴 규칙).
 - **Superpowers가 사용 가능하면 반드시 `brainstorming`과 `writing-plans`를 사용한다.** 사용 불가능할 때만 같은 산출물을 직접 작성한다.
 - brainstorming·spec 작성 중 정적 목업으로 답이 안 나오는 동작 질문을 만나면 `rd-workflow/docs/flows/WORKFLOW.md` 「설계 중 동작 질문 — 일회용 시제품」 절을 따른다.
@@ -172,6 +174,7 @@ skill 진입 직후, Step 0 이전에 `REQUEST.md` 상태를 확인한다:
 Final output:
 - `Execution Path`
 - `REQUEST.md` status
+- REQUEST review 에서 분할했으면 남긴 범위와 `후속 FR:` 목록
 - spec path
 - plan path
 - request review session path

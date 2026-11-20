@@ -18,6 +18,7 @@ source "$SCRIPT_DIR/_lifecycle_common.sh"
 source "$SCRIPT_DIR/_tasks_index.sh"
 source "$SCRIPT_DIR/session_launch.sh"
 source "$SCRIPT_DIR/../_task_common.sh"
+source "$SCRIPT_DIR/../_submodule_common.sh"
 
 # ===========================================================================
 # promote.sh — 재설계 (task-4-brief). 이제 이 스크립트는 **기본 브랜치에 어떤 커밋도
@@ -70,7 +71,7 @@ if [[ -n "$SIZE_VAL" ]]; then
   esac
 elif [[ -n "$STATUS_VAL" ]]; then
   if ! _state_status_canonical "$STATUS_VAL"; then
-    echo "promote: --status 값이 canonical 10종이 아닙니다: '$STATUS_VAL'" >&2
+    echo "promote: --status 값이 canonical 11종이 아닙니다: '$STATUS_VAL'" >&2
     echo "  허용: ${STATE_CANONICAL_STATUSES//|/, }" >&2
     exit 1
   fi
@@ -945,17 +946,25 @@ if [[ "$NEED_ATTACH" -eq 1 ]]; then
   else
     git worktree add "$TARGET_DIR" "$TARGET_BRANCH"
     echo "promote: worktree $TARGET_DIR 생성 ($TARGET_BRANCH)"
-    # 새 worktree 의 submodule 은 비어 있으므로 초기화한다. 실패해도 착수는 계속한다 —
-    # submodule 없이 작업하는 사용자도 있고, 원격 접근 실패가 작업 착수를 막을 이유는 아니다.
+    # 새 worktree 의 submodule 은 메인 체크아웃에서 초기화된 것만 메인을 원천으로 받는다. 나머지는 비워 둔다.
+    # 실패해도 착수는 계속한다 — submodule 없이 작업하는 사용자도 있고, 받기 실패가 작업 착수를 막을 이유는 아니다.
     if [[ -f "${TARGET_DIR}/.gitmodules" ]]; then
-      echo "promote: submodule 을 초기화합니다 (git submodule update --init --recursive) — 원격에서 받으므로 시간이 걸릴 수 있습니다" >&2
-      if _sub_out="$(git -C "$TARGET_DIR" submodule update --init --recursive 2>&1)"; then
-        echo "promote: submodule 초기화 완료"
+      echo "promote: submodule 을 메인 체크아웃에서 받습니다" >&2
+      _sub_rc=0
+      _sub_empty="$(RD_SUBMODULE_REMOTE_BUDGET="${RD_SUBMODULE_REMOTE_TIMEOUT:-120}" rd_submodule_fill "$TARGET_DIR" "$MAIN_WT_PATH" main-only)" || _sub_rc=$?
+      if [[ "$_sub_rc" == 0 ]]; then
+        echo "promote: submodule 준비 완료"
       else
         {
-          echo "promote: submodule 초기화 실패 — 착수는 계속합니다. submodule 디렉터리가 비어 있을 수 있습니다."
-          printf '%s\n' "$_sub_out" | tail -3 | sed 's/^/  /'
-          echo "  복구: git -C $(printf '%q' "$TARGET_DIR") submodule update --init --recursive"
+          echo "promote: submodule 준비 실패 — 착수는 계속합니다"
+          echo "  복구: cd $(printf '%q' "$TARGET_DIR") && bash rd-workflow/scripts/rd submodule init"
+        } >&2
+      fi
+      # 일부 경로가 실패해도 나머지 경로는 처리하므로, 비워 둔 경로는 성공 여부와 상관없이 알린다.
+      if [[ -n "$_sub_empty" ]]; then
+        {
+          echo "promote: 메인 체크아웃에서 초기화하지 않은 submodule 은 비워 두었습니다: $(printf '%s\n' "$_sub_empty" | awk 'NR>1{printf ", "}{printf "%s",$0}')"
+          echo "  필요하면 worktree 에서: bash rd-workflow/scripts/rd submodule init [<경로>...]"
         } >&2
       fi
     fi

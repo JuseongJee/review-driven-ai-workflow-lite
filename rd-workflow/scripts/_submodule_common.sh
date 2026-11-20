@@ -187,12 +187,226 @@ rd_review_input_check() {
         esac
         { grep "^${tag}	" "$bad" || true; } | head -20 | sed 's/^[A-Z]	/    - /'
       done
-      echo "  복구: git submodule update --init --recursive"
+      echo "  복구: submodule 이 비어 있으면: bash rd-workflow/scripts/rd submodule init"
       echo "        원격 객체가 없으면: git -C <submodule 경로> fetch"
       echo "        출력 누락이면: git -C <상위 저장소> config -f .gitmodules --get-regexp 'submodule\\..*\\.ignore' 로 원인 설정을 찾아 해제"
     } >&2
   fi
   rm -f "$exp" "$bad" "$out" "$missing" "$missing.raw"
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# submodule 받기 (change-spec promote-submodule-lazy-local-init D1~D11)
+# ---------------------------------------------------------------------------
+# promote 와 `rd submodule init` 이 함께 씁니다. 메인 체크아웃(원천)에서 초기화된 submodule 은 원천을 로컬 복제해
+# 원격 없이 받고, 그렇지 않은 submodule 은 모드에 따라 비워 두거나 원격에서 받습니다.
+# 전역: _RD_SUB_PREFIX(최상위 기준 접두 경로, 최상위는 빈 값) · _RD_SUB_BUDGET0(원래 원격 예산, 빈 값 = 상한 없음) ·
+#       _RD_SUB_LEFT(남은 원격 예산 초) · _RD_SUB_NOSRC_REASON(원천 없는 원격 받기의 안내 사유).
+
+# _rd_sub_list <super> — <super>/.gitmodules 의 `submodule.<name>.path` 를 `.gitmodules` 순서로 NUL 구분 레코드(`키\n값`)로 냅니다.
+_rd_sub_list() {
+  git -C "$1" config -f .gitmodules -z --get-regexp '^submodule\..*\.path$' 2>/dev/null || true
+}
+
+# _rd_sub_is_gitlink <super> <경로> — index 에 그 경로의 gitlink(160000)가 있으면 0. gitlink 없는 `.gitmodules` 항목은 git 도 무시합니다.
+_rd_sub_is_gitlink() {
+  local x
+  x="$(GIT_LITERAL_PATHSPECS=1 git -C "$1" ls-files -s -- "$2" 2>/dev/null | head -n 1)"
+  [[ "${x%% *}" == "160000" ]]
+}
+
+# _rd_sub_resolve <super> <경로> — 경로가 submodule 이거나, 앞부분이 초기화된 submodule 이고 나머지가 그 안의 submodule 이면 0.
+_rd_sub_resolve() {
+  local super="$1" a="$2" rec p
+  while IFS= read -r -d '' rec; do
+    p="${rec#*$'\n'}"
+    if [[ "$a" == "$p" ]]; then _rd_sub_is_gitlink "$super" "$p" && return 0; continue; fi
+    if [[ "$a" == "$p"/* ]] && _rd_is_repo_root "$super/$p"; then
+      _rd_sub_resolve "$super/$p" "${a#"$p"/}" && return 0
+    fi
+  done < <(_rd_sub_list "$super")
+  return 1
+}
+
+# _rd_sub_remote <stderr 파일> <명령…> — 원격에 닿는 명령 하나를 실행합니다. 명령의 stdout 은 stderr 로, stderr 는 파일로 보냅니다.
+# 예산(_RD_SUB_BUDGET0)이 있으면 `_rd_run_limited` 로 남은 초 안에서 실행하고 그 명령의 경과 초만 남은 예산에서 뺍니다.
+# 반환: 명령의 종료 코드 / 124 시간 초과 / 125 예산 소진으로 실행하지 않음. 124·125 는 stderr 파일에 원인 한 줄을 적습니다.
+_rd_sub_remote() {
+  local errf="$1" rc=0 t0 b="${_RD_SUB_BUDGET0:-}"
+  shift
+  if [[ -z "$b" ]]; then
+    "$@" >&2 2>"$errf" || rc=$?
+    return "$rc"
+  fi
+  if (( ${_RD_SUB_LEFT:-0} <= 0 )); then
+    printf '원격 대기 상한(%s초)을 다 써서 시도하지 않았습니다\n' "$b" > "$errf"
+    return 125
+  fi
+  t0=$SECONDS
+  _rd_run_limited "$_RD_SUB_LEFT" "$errf" env GIT_TERMINAL_PROMPT=0 "$@" >&2 || rc=$?
+  _RD_SUB_LEFT=$(( _RD_SUB_LEFT - (SECONDS - t0) ))
+  if [[ "$rc" == 124 ]]; then
+    printf '시간 초과(%s초) — 원격이 응답하지 않습니다\n' "$b" > "$errf"
+  fi
+  return "$rc"
+}
+
+# _rd_sub_fail <표시 경로> <stderr 파일> — 실패 안내(원인 3줄 이내와 재시도 명령)를 stderr 로 냅니다.
+_rd_sub_fail() {
+  local disp="$1" errf="$2"
+  {
+    printf 'submodule 받기 실패: %s\n' "$disp"
+    tail -n 3 "$errf" 2>/dev/null | sed 's/^/  /'
+    printf '  재시도: bash rd-workflow/scripts/rd submodule init %q\n' "$disp"
+  } >&2
+}
+
+# _rd_sub_not_ready <super> <경로> <name> <errf> — 받기 명령이 성공해도 그 경로가 체크아웃된 submodule 저장소가
+# 아니면(git 이 submodule.<name>.update=none 등으로 받기를 건너뜀) 원인을 errf 에 쓰고 0 을 돌려줍니다.
+# 저장소가 없는 경우와, 받기 실패로 남은 index 없는 저장소가 그대로인 경우를 모두 잡습니다.
+# 빈 디렉터리에서 git 명령을 부르면 상위 저장소에 적용되므로, origin 을 바꾸기 전에 이 확인을 거칩니다.
+_rd_sub_not_ready() {
+  local idx=""
+  if _rd_is_repo_root "$1/$2"; then
+    idx="$(git -C "$1/$2" rev-parse --path-format=absolute --git-path index 2>/dev/null)" || idx=""
+    [[ -n "$idx" && -e "$idx" ]] && return 1
+  fi
+  printf 'git 이 받기를 건너뛰어 submodule 이 체크아웃되지 않았습니다. submodule.%s.update=none 이면 그 설정을 지운 뒤 다시 받으십시오\n' "$3" > "$4"
+  return 0
+}
+
+# rd_submodule_fill <super> <src> <mode> [<경로>...] — mode: main-only | all.
+# stdout: 비워 둔 경로(최상위 기준) 줄 단위 / stderr: 안내 / 반환 0 또는 1(하나 이상 실패, 잘못된 경로 인자).
+# <src> 가 빈 값이면 원천 없음입니다. 환경 RD_SUBMODULE_REMOTE_BUDGET(초, 빈 값 = 상한 없음)이 원격 명령 시간의 합을 제한합니다.
+rd_submodule_fill() {
+  local super="$1" src="$2" mode="$3" top=0 rc=0 errf i p name disp a bad=0 direct target
+  local st c st_src src_init kind idx orig oid x reason rec key ok
+  local -a sm_paths=() sm_names=() args=() subs=() flags=()
+  shift 3
+  if [[ -z "${_RD_SUB_PREFIX:-}" ]]; then
+    top=1
+    _RD_SUB_BUDGET0="${RD_SUBMODULE_REMOTE_BUDGET:-}"
+    _RD_SUB_LEFT="$_RD_SUB_BUDGET0"
+    for a in "$@"; do
+      a="${a#./}"; a="${a%/}"
+      args+=("$a")
+      if ! _rd_sub_resolve "$super" "$a"; then
+        echo "submodule 이 아닙니다: $a" >&2
+        bad=1
+      fi
+    done
+    [[ "$bad" == 0 ]] || return 1
+  elif [[ $# -gt 0 ]]; then
+    args=("$@")
+  fi
+  errf="$(mktemp "${TMPDIR:-/tmp}/rd-sub-err.XXXXXX")" || { echo "submodule 받기 실패: 임시 파일을 만들 수 없습니다" >&2; return 1; }
+  while IFS= read -r -d '' rec; do
+    p="${rec#*$'\n'}"
+    # gitlink 가 없는 .gitmodules 항목은 후보에서 조용히 뺍니다.
+    _rd_sub_is_gitlink "$super" "$p" || continue
+    sm_paths+=("$p")
+    key="${rec%%$'\n'*}"; key="${key#submodule.}"
+    sm_names+=("${key%.path}")
+  done < <(_rd_sub_list "$super")
+
+  for ((i = 0; i < ${#sm_paths[@]}; i++)); do
+    p="${sm_paths[i]}"; name="${sm_names[i]}"; disp="${_RD_SUB_PREFIX:-}${p}"
+    direct=0; target=1; subs=()
+    if (( ${#args[@]} > 0 )); then
+      for a in "${args[@]}"; do
+        if [[ "$a" == "$p" ]]; then direct=1
+        elif [[ "$a" == "$p"/* ]]; then subs+=("${a#"$p"/}"); fi
+      done
+      # 경로를 직접 지정하면 그 아래는 전부 대상입니다.
+      (( direct == 1 )) && subs=()
+      (( direct == 0 && ${#subs[@]} == 0 )) && continue
+      (( direct == 1 )) || target=0
+    fi
+    st="$(git -C "$super" submodule status -- "$p" 2>/dev/null | head -n 1)" || true
+    if [[ -z "$st" ]]; then
+      echo "submodule 받기 실패: $disp" >&2
+      echo "  submodule 상태를 읽을 수 없습니다" >&2
+      rc=1; continue
+    fi
+    c="${st:0:1}"
+    # kind: empty(비어 있음) / noindex(복제만 되고 체크아웃한 적 없음) / ready(초기화됨)
+    kind=ready
+    if [[ "$c" == "-" ]]; then
+      kind=empty
+    elif _rd_is_repo_root "$super/$p"; then
+      idx="$(git -C "$super/$p" rev-parse --path-format=absolute --git-path index 2>/dev/null)" || idx=""
+      [[ -n "$idx" && ! -e "$idx" ]] && kind=noindex
+    fi
+    src_init=0
+    if [[ -n "$src" ]]; then
+      st_src="$(git -C "$src" submodule status -- "$p" 2>/dev/null | head -n 1)" || true
+      [[ -n "$st_src" && "${st_src:0:1}" != "-" ]] && _rd_is_repo_root "$src/$p" && src_init=1
+    fi
+    ok=0
+    if [[ "$kind" == ready ]]; then
+      (( direct == 1 )) && echo "이미 받았습니다: $disp" >&2
+      ok=1
+    elif (( target == 1 )); then
+      if (( src_init == 0 )) && [[ "$mode" == main-only ]]; then
+        printf '%s\n' "$disp"
+        continue
+      fi
+      x="$(GIT_LITERAL_PATHSPECS=1 git -C "$super" ls-files -s -- "$p" 2>/dev/null | head -n 1)"
+      x="${x#* }"; oid="${x%% *}"; oid="${oid:0:7}"
+      flags=()
+      if (( src_init == 0 )); then
+        reason="${_RD_SUB_NOSRC_REASON:-메인 체크아웃에서 초기화하지 않았습니다}"
+        if [[ "$kind" == empty ]]; then flags=(--init --recursive); fi
+      else
+        reason="커밋 ${oid} 이 메인 체크아웃에 없습니다"
+        git -C "$super" submodule init -- "$p" >&2 2>"$errf" || true
+      fi
+      orig="$(git -C "$super" config "submodule.${name}.url" 2>/dev/null)" || orig=""
+      if (( src_init == 1 )) && [[ "$kind" == empty ]]; then
+        # D2 3~4: 메인 체크아웃을 원천으로 로컬 복제. 이 명령에만 protocol.file.allow 를 줍니다.
+        echo "submodule ${disp}: 메인 체크아웃에서 받습니다" >&2
+        if git -C "$super" -c protocol.file.allow=always -c "submodule.${name}.url=${src}/${p}" \
+             submodule update -- "$p" >&2 2>"$errf"; then
+          if _rd_sub_not_ready "$super" "$p" "$name" "$errf"; then
+            _rd_sub_fail "$disp" "$errf"; rc=1; continue
+          fi
+          if [[ -n "$orig" ]]; then
+            git -C "$super/$p" remote set-url origin "$orig" >&2 2>"$errf" || {
+              _rd_sub_fail "$disp" "$errf"; rc=1; continue; }
+          fi
+          ok=1
+        elif ! _rd_is_repo_root "$super/$p"; then
+          reason="메인 체크아웃에서 받지 못했습니다"
+        fi
+      fi
+      if (( ok == 0 )); then
+        # D2 5~6, D1 표 3행: 원격에서 받습니다. 복제가 남아 있으면 origin 을 원래 URL 로 먼저 되돌립니다.
+        if _rd_is_repo_root "$super/$p" && [[ -n "$orig" ]]; then
+          git -C "$super/$p" remote set-url origin "$orig" >&2 2>/dev/null || true
+        fi
+        printf '원격 접근이 필요합니다: %s — %s\n' "$disp" "$reason" >&2
+        if _rd_sub_remote "$errf" git -C "$super" submodule update ${flags[@]+"${flags[@]}"} -- "$p"; then
+          cat "$errf" >&2
+          if _rd_sub_not_ready "$super" "$p" "$name" "$errf"; then
+            _rd_sub_fail "$disp" "$errf"; rc=1; continue
+          fi
+          ok=1
+        else
+          _rd_sub_fail "$disp" "$errf"; rc=1; continue
+        fi
+      fi
+    fi
+    # D4: 초기화된 경로 아래 중첩으로 한 단계 내려갑니다. 원천도 같은 경로로 내려갑니다.
+    if (( ok == 1 )) && _rd_is_repo_root "$super/$p"; then
+      local saved="${_RD_SUB_PREFIX:-}" nsrc=""
+      (( src_init == 1 )) && nsrc="$src/$p"
+      _RD_SUB_PREFIX="${saved}${p}/"
+      rd_submodule_fill "$super/$p" "$nsrc" "$mode" ${subs[@]+"${subs[@]}"} || rc=1
+      _RD_SUB_PREFIX="$saved"
+    fi
+  done
+  rm -f "$errf"
   return "$rc"
 }
 
@@ -205,23 +419,38 @@ rd_review_input_check() {
 # TERM 을 무시하는 실행(호출 셸의 `trap '' TERM` 상속)에서도 유한 시간에 돌아오게 하기 위해서입니다.
 # macOS 기본 환경에 timeout 명령이 없어 bash 로 감시합니다. 명령의 stdout 은 임시 파일로 받습니다 — 멈춘 명령의
 # 자식이 살아남아도 호출부 명령 치환의 파이프를 붙잡지 않게 합니다. 감시 프로세스의 출력도 /dev/null 입니다.
+# 명령은 자기 프로세스 그룹(set -m)으로 띄우고 신호를 그룹에 보냅니다. git 이 띄운 fetch·ssh·submodule helper 가
+# 살아남아 반환 뒤에 submodule 을 체크아웃하면, 사용자의 재시도·작업과 경쟁하기 때문입니다.
+# 시간 초과면 그룹이 모두 사라진 뒤(유예 2초, 그 뒤 KILL) 돌아옵니다.
 _rd_run_limited() {
-  local lim="$1" errf="$2" pid wd rc=0 flag outf
+  local lim="$1" errf="$2" pid wd rc=0 flag outf had_m=0 i=0
   shift 2
   flag="$(mktemp "${TMPDIR:-/tmp}/rd-lim.XXXXXX")" || return 1
   outf="$(mktemp "${TMPDIR:-/tmp}/rd-lim-out.XXXXXX")" || { rm -f "$flag"; return 1; }
-  "$@" >"$outf" 2>"$errf" &
+  [[ "$-" == *m* ]] && had_m=1
+  set -m
+  "$@" </dev/null >"$outf" 2>"$errf" &
   pid=$!
+  # 감시도 자기 프로세스 그룹으로 띄우고 끝낼 때 그룹째 끝냅니다. 서브셸만 끝내면 그 안의 sleep 이 시한까지 남고,
+  # 호출부 프로세스 그룹에 들어 있으면 그 그룹을 붙잡습니다(큐 발행은 archive 그룹이 빌 때까지 기다립니다).
   ( sleep "$lim"
     if kill -0 "$pid" 2>/dev/null; then
-      echo 1 > "$flag"; kill -TERM "$pid" 2>/dev/null
+      echo 1 > "$flag"; kill -TERM -- "-$pid" 2>/dev/null
       sleep 2
-      kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+      kill -KILL -- "-$pid" 2>/dev/null
     fi ) >/dev/null 2>&1 &
   wd=$!
+  [[ "$had_m" == 1 ]] || set +m
   wait "$pid" || rc=$?
-  kill "$wd" 2>/dev/null || true
-  [[ -s "$flag" ]] && rc=124
+  # 끝낸 감시를 여기서 거둡니다. 거두지 않으면 bash 가 나중에 「Terminated」 를 호출부 stderr 에 찍습니다.
+  # KILL 로 끝냅니다. 호출 셸이 TERM 을 무시하면 감시도 이를 상속해, TERM 으로는 아래 wait 가 시한까지 막힙니다.
+  kill -KILL -- "-$wd" 2>/dev/null || true
+  wait "$wd" 2>/dev/null || true
+  if [[ -s "$flag" ]]; then
+    rc=124
+    while kill -0 -- "-$pid" 2>/dev/null && [[ "$i" -lt 20 ]]; do sleep 0.1; i=$((i + 1)); done
+    kill -KILL -- "-$pid" 2>/dev/null || true
+  fi
   [[ "$rc" == 124 ]] || cat "$outf"
   rm -f "$flag" "$outf"
   return "$rc"

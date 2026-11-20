@@ -207,7 +207,8 @@ _strip_html_comments() {
 # 사용: build_ac_enforcement_notice [request_md_path]
 # 출력: 주입할 notice 문자열. 주입 불필요(AC 채워짐) 시 빈 문자열.
 build_ac_enforcement_notice() {
-  local req="${1:-${PROJECT_ROOT:-.}/REQUEST.md}"
+  # 기본값은 run_review_turn.sh 가 정한 이 작업의 REQUEST(기록 커밋 뒤에는 보관본)입니다.
+  local req="${1:-${PROJECT_ROOT:-.}/${REVIEW_REQUEST_FILE:-REQUEST.md}}"
   [[ -f "$req" ]] || return 0
 
   local ac_meaningful reason
@@ -255,6 +256,8 @@ build_ac_enforcement_notice() {
 # 줄어들 수 있다. 그래서 실제 인라인 누적 바이트를 `prompt inline:` 표시에 함께 노출해
 # 지연 회귀를 사용자가 관측할 수 있게 한다. 재보정이 필요하면 같은 절차로 재측정한다.
 : "${REVIEW_PROMPT_INLINE_MAX_BYTES:=24000}"
+# 이 턴 수를 넘긴 Reviewer 턴부터 리뷰어 지시에 범위 축소 블록을 넣는다(사용자 결정 2026-11-20: 6턴).
+: "${REVIEW_SCOPE_NARROW_AFTER:=6}"
 
 # 인라인 블록 직렬화. kind=rules|data
 # rules = 이번 턴에 적용할 규범, data = 읽을 자료(지시 아님)
@@ -303,6 +306,166 @@ get_review_response_language() {
   printf '%s\n' "$v"
 }
 
+# === 리뷰 비용·범위 밖 (review-loop-formal-closure) ===
+# 모두 표시용이며 fail-open 이다 — 값을 못 얻으면 `-` 를 내고 턴 진행·종료 코드를 바꾸지 않는다.
+
+# observe_turn_tokens <tool> <session_dir|-> — 이번 실행의 리뷰 도구 토큰 수(정수) 또는 `-`.
+# 로그 확인 조건은 observe_actual(model_select.sh)과 같다: 상태 파일의 log_preserved·writer_group 두 줄.
+# 사전 정리에 실패한 실행은 호출부가 `-` 를 넘긴다.
+observe_turn_tokens() {
+  local tool="${1:-}" sd="${2:--}" st log v=""
+  st="${sd}/.review_wait_status"
+  if [[ -z "$sd" || "$sd" == "-" || ! -f "$st" || -L "$st" ]] \
+     || ! grep -q '^log_preserved: yes$' "$st" 2>/dev/null \
+     || ! grep -q '^writer_group: verified$' "$st" 2>/dev/null; then
+    printf -- '-\n'; return 0
+  fi
+  case "$tool" in
+    codex)
+      log="${sd}/.codex_output.log"
+      [[ -f "$log" && ! -L "$log" ]] && v="$(awk '
+        p { s = $0; gsub(/[ ,]/, "", s); if (s ~ /^[0-9]+$/) last = s; p = 0; next }
+        /^[[:space:]]*tokens used[[:space:]]*$/ { p = 1 }
+        END { if (last != "") print last }' "$log" 2>/dev/null)" || v=""
+      ;;
+    claude)
+      log="${sd}/.claude_output.log"
+      if [[ -f "$log" && ! -L "$log" ]] && command -v jq >/dev/null 2>&1; then
+        # result 가 없으면 빈 출력이어야 한다 — jq 1.7(macOS 기본)의 last(empty) 는 null 을 내 0 이 되므로 배열로 모은다.
+        v="$(jq -nrR '[inputs | fromjson? | select(type=="object" and .type=="result" and (.usage|type)=="object")] | .[-1] // empty | .usage
+          | ((.input_tokens // 0) + (.output_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0))' "$log" 2>/dev/null)" || v=""
+      fi
+      ;;
+  esac
+  [[ "$v" =~ ^[0-9]+$ ]] || v="-"
+  printf '%s\n' "$v"
+}
+
+# _rc_fmt_dur <초> — 사람이 읽는 시간(예: 1h05m, 7m, 42s).
+_rc_fmt_dur() {
+  local s="$1"
+  if (( s >= 3600 )); then printf '%dh%02dm' $((s / 3600)) $(((s % 3600) / 60))
+  elif (( s >= 60 )); then printf '%dm' $((s / 60))
+  else printf '%ds' "$s"; fi
+}
+
+# _rc_session_start_epoch <session_dir> — 세션 폴더 이름의 YYYYMMDD_HHMMSS 를 epoch 로. 실패하면 빈 값.
+# BSD date(-j -f)를 먼저, GNU date(-d)를 다음으로 시도한다. 둘 다 안 되면 표시를 `-` 로 둔다.
+_rc_session_start_epoch() {
+  local n; n="$(basename "$1")"
+  [[ "$n" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2}) ]] || return 0
+  local stamp="${n:0:15}" e=""
+  e="$(date -j -f '%Y%m%d_%H%M%S' "$stamp" +%s 2>/dev/null)" \
+    || e="$(date -d "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}" +%s 2>/dev/null)" \
+    || e=""
+  [[ "$e" =~ ^[0-9]+$ ]] && printf '%s' "$e"
+  return 0
+}
+
+# review_cost_line <session_dir> <이번 턴 토큰|-> — `리뷰 비용:` 한 줄.
+# 누적 턴 수 = turns/ 의 턴 파일 수. 리뷰 도구 시간·토큰 = turn_metrics.tsv 실행 행의 합.
+# 토큰 열이 없거나 `-` 인 행이 있으면 누적 토큰 뒤에 「일부 미확인」 을 붙인다.
+review_cost_line() {
+  local sd="$1" this_tok="${2:--}" turns now start elapsed="-" tool_s=0 tok_sum=0 tok_unknown=0 rows=0
+  turns="$(find "${sd}/turns" -maxdepth 1 -name '[0-9][0-9][0-9]_*.md' 2>/dev/null | wc -l | tr -d ' ')"
+  now="$(date +%s 2>/dev/null)" || now=""
+  start="$(_rc_session_start_epoch "$sd")"
+  if [[ "$now" =~ ^[0-9]+$ && -n "$start" && "$now" -ge "$start" ]]; then
+    elapsed="$(_rc_fmt_dur $((now - start)))"
+  fi
+  local f="${sd}/turn_metrics.tsv" agg=""
+  if [[ -f "$f" ]]; then
+    agg="$(awk -F'\t' '
+      NR == 1 { tc = ($NF == "tokens") ? NF : 0; next }
+      /^#/ || NF < 9 { next }
+      { n++; if ($9 ~ /^[0-9]+$/) w += $9
+        if (tc && $tc ~ /^[0-9]+$/) t += $tc; else u = 1 }
+      END { printf "%d %d %d %d", n, w, t, u }' "$f" 2>/dev/null)" || agg=""
+  fi
+  if [[ "$agg" =~ ^([0-9]+)\ ([0-9]+)\ ([0-9]+)\ ([01])$ ]]; then
+    rows="${BASH_REMATCH[1]}"; tool_s="${BASH_REMATCH[2]}"; tok_sum="${BASH_REMATCH[3]}"; tok_unknown="${BASH_REMATCH[4]}"
+  fi
+  local tok_total="-"
+  if (( rows > 0 )); then
+    if (( tok_sum > 0 )); then tok_total="$tok_sum"; fi
+    (( tok_unknown == 1 )) && tok_total="${tok_total} (일부 미확인)"
+  fi
+  printf '리뷰 비용: 누적 %s턴 · 세션 경과 %s · 리뷰 도구 %s · 토큰 이번 턴 %s / 누적 %s (리뷰 도구만)\n' \
+    "$turns" "$elapsed" "$(_rc_fmt_dur "$tool_s")" "$this_tok" "$tok_total"
+}
+
+# _rc_short_title <SESSION.md> — `## Branch Context` 절의 short-title 값. 다음 `## ` 제목에서 멈춘다.
+_rc_short_title() {
+  awk '$0 == "## Branch Context" { f = 1; next } f && /^## / { exit }
+       f && /^- short-title:/ { sub(/^- short-title:[ \t]*/, ""); sub(/[ \t]+$/, ""); print; exit }' "$1" 2>/dev/null
+}
+
+# _rc_oos_lines <turn_file> — 턴 파일의 `범위 밖:` 줄(줄머리, 앞의 `- ` 허용)을 그대로 낸다.
+_rc_oos_lines() {
+  grep -E '^[[:space:]]*(- )?범위 밖:' "$1" 2>/dev/null | sed -E 's/^[[:space:]]*(- )?//'
+}
+
+# session_out_of_scope <session_dir> — 세션의 모든 Reviewer 턴에서 `범위 밖:` 줄을 `턴 NNN: <줄>` 로 낸다.
+session_out_of_scope() {
+  local f n line
+  for f in "$1"/turns/[0-9][0-9][0-9]_reviewer.md "$1"/turns/[0-9][0-9][0-9]_codex.md; do
+    [[ -f "$f" ]] || continue
+    n="$(basename "$f")"; n="${n:0:3}"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && printf '턴 %s: %s\n' "$n" "$line"
+    done < <(_rc_oos_lines "$f")
+  done | sort
+}
+
+# decided_out_of_scope <session_dir> <request_file> — 리뷰어 지시의 「이미 정한 범위 밖」 목록.
+# (1) REQUEST `## Constraints` 의 `- 범위 밖:` 줄 (사람이 정한 것)
+# (2) short-title 이 같고 task-state base-commit 에 없던(이번 작업에서 연) 리뷰 세션들의 Reviewer 턴 `범위 밖:` 줄
+decided_out_of_scope() {
+  local sd="$1" req="$2" root="${PROJECT_ROOT:-.}" st base="" d dst dn
+  # 기록 커밋 뒤 리뷰는 보관본을 읽지만, 그 뒤 사람이 정한 결정은 루트 REQUEST.md 에 적힌다 — 둘 다 읽는다.
+  local r
+  for r in "$req" "${root}/REQUEST.md"; do
+    [[ -f "$r" ]] || continue
+    awk '/^## Constraints[[:space:]]*$/ { f = 1; next } f && /^## / { exit }
+         f && /^- 범위 밖:/ { sub(/^- /, ""); print "REQUEST: " $0 }' "$r" 2>/dev/null
+  done | awk '!seen[$0]++'
+  st="$(_rc_short_title "${sd}/SESSION.md")"
+  [[ -n "$st" && "$st" != "unknown" && "$st" != "-" ]] || return 0
+  # 이번 작업의 세션 = promote 가 기록한 base-commit 에 없던 세션. 같은 이름의 옛 작업 세션은 이미 기본 브랜치에
+  # 있으므로 base-commit 에 있다. promote 전에 기본 체크아웃에서 연 리뷰 세션(full 흐름)도 base 에 없어 포함된다.
+  local ts="${root}/rd-workflow-workspace/.lifecycle/task-state"
+  [[ -f "$ts" ]] && base="$(sed -n 's/^base-commit=\([0-9a-f]\{7,\}\)$/\1/p' "$ts" | head -1)"
+  # base 를 모르면(promote 를 거치지 않은 작업) 옛 작업과 가를 수 없다 — 현재 세션의 줄만 쓴다.
+  if [[ -z "$base" ]] || ! git -C "$root" cat-file -e "${base}^{commit}" 2>/dev/null; then
+    session_out_of_scope "$sd" | sed "s|^|$(basename "$sd") |"
+    return 0
+  fi
+  # promote 는 이름에 slug 가 없는 REQUEST review 세션을 옮기지 않는다 — 그 세션은 기본 체크아웃에 남으므로
+  # 현재 작업 트리와 기본 체크아웃(main worktree)의 리뷰 세션 폴더를 함께 본다.
+  local rootp wt wtp rel common seen=" "
+  rootp="$(cd "$root" 2>/dev/null && pwd -P)" || return 0
+  common="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || common=""
+  for wt in "$rootp" ${common:+"$(dirname "$common")"}; do
+    wtp="$(cd "$wt" 2>/dev/null && pwd -P)" || continue
+    [[ "$seen" == *" ${wtp} "* ]] && continue
+    seen="${seen}${wtp} "
+    for d in "${wtp}/rd-workflow-workspace/handoffs/review_pipeline"/*/ "$(dirname "$sd")"/*/; do
+      d="${d%/}"; dn="$(basename "$d")"
+      [[ -f "${d}/SESSION.md" ]] || continue
+      rel="$(cd "$d" 2>/dev/null && pwd -P)" || continue
+      [[ "$rel" == "${wtp}/"* ]] || continue
+      [[ "$seen" == *" ${rel} "* ]] && continue
+      seen="${seen}${rel} "
+      dst="$(_rc_short_title "${d}/SESSION.md")"
+      [[ "$dst" == "$st" ]] || continue
+      rel="${rel#"${wtp}"/}"
+      git -C "$root" cat-file -e "${base}:${rel}/SESSION.md" 2>/dev/null && continue
+      session_out_of_scope "$d" | sed "s|^|${dn} |"
+    done
+  done
+  return 0
+}
+
 # 리뷰 프롬프트 생성
 # 문구를 고칠 때 두 함정이 있습니다.
 # - 본문 heredoc 은 따옴표 없는 `<<EOF` 라 변수와 명령 치환이 전개됩니다. 문구에 넣는 백틱은 `\`` 로
@@ -343,6 +506,25 @@ build_review_prompt() {
       fi
       ;;
   esac
+
+  # 범위 축소(6턴 초과)와 이미 정한 범위 밖 목록 (review-loop-formal-closure).
+  local _rp_narrow=0 _rp_decided="" _rp_tn
+  _rp_tn="$(printf '%s' "$next_turn_number" | sed 's/^0*//')"
+  if [[ "${_rp_tn:-0}" =~ ^[0-9]+$ && "${_rp_tn:-0}" -gt "${REVIEW_SCOPE_NARROW_AFTER}" ]]; then
+    _rp_narrow=1
+  fi
+  _rp_decided="$(decided_out_of_scope "${PROJECT_ROOT:-.}/${session_dir_rel}" \
+    "${PROJECT_ROOT:-.}/${REVIEW_REQUEST_FILE:-REQUEST.md}" 2>/dev/null | sed 's/^/- /')" || _rp_decided=""
+
+  # 기록 커밋 뒤에는 루트 REQUEST.md 가 빈 템플릿입니다. 리뷰어가 그 파일을 보고 완료 기준이 없다고
+  # 판단하지 않도록, 보관본을 쓸 때만 그 경로를 완료 기준 출처로 알립니다.
+  local _rp_request_line=""
+  if [[ -n "${REVIEW_REQUEST_FILE:-}" && "${REVIEW_REQUEST_FILE}" != "REQUEST.md" ]]; then
+    _rp_request_line="
+Task REQUEST (acceptance criteria and Risk Tier): ${REVIEW_REQUEST_FILE}
+- The root REQUEST.md was emptied by the archive record commit. Read this archived copy wherever the review criteria refer to REQUEST.md. Do not treat the empty root REQUEST.md as missing acceptance criteria.
+"
+  fi
 
   # --- B·C: 정적 컨텍스트 인라인 수집 ---
   # 성공/실패를 세 갈래로 분류한다.
@@ -470,6 +652,25 @@ ${_rp_fb_note}     Follow the review criteria referenced in \"Review goal\" abov
     if [[ -n "$_attempt_history" ]]; then
       printf '%s\n\n' "$_attempt_history"
     fi
+    if [[ -n "$_rp_decided" ]]; then
+      cat <<EOF
+ALREADY DECIDED OUT OF SCOPE (by a person or by an earlier reviewer turn of this task):
+${_rp_decided}
+- Do not raise these again, as an objection or as a 메모 line, when the fact and the impact are the same.
+- Exception: if new evidence shows data loss, a security problem, a deviation from the request/AC/spec, a verification gap, or a defect on the task's default usage path, raise it as an objection.
+
+EOF
+    fi
+    if [[ "$_rp_narrow" -eq 1 ]]; then
+      cat <<EOF
+SCOPE NARROWING (this session has passed ${REVIEW_SCOPE_NARROW_AFTER} turns):
+- From this turn, only these block closure: (1) a defect on the task's default usage path, (2) data loss or a security problem in any environment, (3) a deviation from the request/AC/spec, (4) a verification gap (the tests do not cover the defect).
+- Wrong results or inconvenience that occur only in uncommon environments, and requests to add defensive procedures, do not block. Write each one at the end of Summary as one line: "범위 밖: <location> — <content> — <reason>".
+- If an open objection from an earlier turn now falls out of scope by this rule, remove it from Open Issues and write it as a "범위 밖:" line. Do not ask the user.
+- If every remaining objection is out of scope, close the review with no objections. If any objection in (1)-(4) remains, keep it open.
+
+EOF
+    fi
     cat <<EOF
 You are continuing an existing file-based review session.
 
@@ -489,7 +690,7 @@ Session execution contract:
 
 Review target:
 ${review_target}
-
+${_rp_request_line}
 Review goal:
 ${review_goal}
 
@@ -544,19 +745,19 @@ Required turn file sections:
 Optional section "## Reproduction": put the commands you ran and their output here, after Findings. Do not put them inside Findings; the script reads every list item in Findings as a finding.
 
 Findings format (a script checks it after your turn; violations are shown to the Author):
-- Start each finding with a head line "- F<number> [confidence <1-10>/10] <one-line title>". Continue numbering from the highest number in CHECKPOINT_FILE; reuse the same number when you revisit an issue.
+- Start each finding with a head line "- F<number> <one-line title>". Continue numbering from the highest number in CHECKPOINT_FILE; reuse the same number when you revisit an issue.
 - Give every main finding at least one line "  - 근거: \`path:line\` — \`verbatim text\`". The path is relative to the project root. Copy the text exactly from within 3 lines of that line.
-- Move a finding you cannot cite to a "### 부록: 인용하지 못한 발견" subsection, and give it confidence 4 or lower.
+- Move a finding you cannot cite to a "### 부록: 인용하지 못한 발견" subsection.
 - If there are no findings, write the single line "- 없음". Put resolutions and agreements in Agreement, not in Findings.
 - Removal candidates use the same head line, with "제거:" at the start of the title.
 Example:
 ## Findings
-- F3 [confidence 8/10] <title>
+- F3 <title>
   - 근거: \`rd-workflow/scripts/review_common.sh:433\` — \`if [[ \$((_rp_acc + sz)) -gt \${REVIEW_PROMPT_INLINE_MAX_BYTES} ]]; then\`
   - <explanation and request>
 
 ### 부록: 인용하지 못한 발견
-- F4 [confidence 3/10] <title>
+- F4 <title>
   - 인용하지 못한 이유: <reason>
 
 If you cannot continue safely, record the blocker in CHECKPOINT_FILE and set Current Owner to User with Status awaiting-user.
@@ -603,7 +804,7 @@ _rf_resolve_cite_path() {
 }
 
 # ## Findings 절을 읽어 레코드로 낸다 (탭 구분).
-#   H section id conf   발견 머리 줄 (conf 가 없거나 1~10 이 아니면 -)
+#   H section id        발견 머리 줄
 #   C ref quote         직전 발견의 근거 줄 (ref 를 못 읽으면 ?)
 #   N text              발견도 "- 없음" 도 아닌 최상위 항목
 #   Z                   "- 없음"
@@ -616,12 +817,7 @@ _rf_parse_findings() {
     /^### 부록/ { sec = "appendix"; next }
     /^- F[0-9]+([ \t]|$)/ {
       id = $0; sub(/^- /, "", id); sub(/[ \t].*$/, "", id)
-      conf = "-"
-      if (match($0, /\[confidence [0-9]+\/10\]/)) {
-        c = substr($0, RSTART + 12, RLENGTH - 12); sub(/\/10\]$/, "", c); c += 0
-        if (c >= 1 && c <= 10) conf = c
-      }
-      printf "H\t%s\t%s\t%s\n", sec, id, conf
+      printf "H\t%s\t%s\n", sec, id
       next
     }
     /^- 없음[ \t]*$/ { print "Z"; next }
@@ -662,8 +858,8 @@ _rf_parse_findings() {
 _rf_check_impl() {
   local turn_file="$1" session_dir="$2" turn_no="$3" review_type="${4:--}"
   local kind a b c
-  local cur_id="" cur_sec="" cur_conf="-" cur_ncites=0
-  local findings=0 main=0 appendix=0 cite_ok=0 violations=0 confs=""
+  local cur_id="" cur_sec="" cur_ncites=0
+  local findings=0 main=0 appendix=0 cite_ok=0 violations=0
   local head_oid=""
   # 리뷰 대상 커밋. Branch Context 에 full OID 가 있고 저장소에서 commit 으로 풀릴 때만 쓴다.
   if [[ -f "${session_dir}/SESSION.md" ]]; then
@@ -686,22 +882,8 @@ _rf_check_impl() {
 
   _rf_flush() {
     [[ -n "$cur_id" ]] || return 0
-    if [[ "$cur_sec" == "appendix" ]]; then
-      if [[ "$cur_conf" == "-" ]]; then
-        _rf_warn "$cur_id" "confidence-missing" "머리 줄에 [confidence N/10] (N=1~10) 이 없습니다"
-      elif [[ "$cur_conf" -gt 4 ]]; then
-        _rf_warn "$cur_id" "appendix-confidence" "부록 발견의 confidence 는 4 이하여야 합니다 (현재 ${cur_conf})"
-      fi
-    else
-      if [[ "$cur_ncites" -eq 0 ]]; then
-        if [[ "$cur_conf" == "-" ]]; then
-          _rf_warn "$cur_id" "not-a-finding" "발견 머리 줄 형식이 아닙니다. 해소 확인·합의는 Agreement 에 적습니다"
-        else
-          _rf_warn "$cur_id" "cite-missing" "본문 발견에 근거 줄이 없습니다"
-        fi
-      elif [[ "$cur_conf" == "-" ]]; then
-        _rf_warn "$cur_id" "confidence-missing" "머리 줄에 [confidence N/10] (N=1~10) 이 없습니다"
-      fi
+    if [[ "$cur_sec" != "appendix" && "$cur_ncites" -eq 0 ]]; then
+      _rf_warn "$cur_id" "cite-missing" "본문 발견에 근거 줄이 없습니다. 해소 확인·합의라면 Agreement 에 적습니다"
     fi
     cur_id=""
     return 0
@@ -713,10 +895,9 @@ _rf_check_impl() {
     case "$kind" in
       H)
         _rf_flush
-        cur_sec="$a"; cur_id="$b"; cur_conf="$c"; cur_ncites=0
+        cur_sec="$a"; cur_id="$b"; cur_ncites=0
         findings=$((findings + 1))
         if [[ "$a" == "appendix" ]]; then appendix=$((appendix + 1)); else main=$((main + 1)); fi
-        confs="${confs:+${confs},}${c}"
         ;;
       N)
         _rf_flush
@@ -775,14 +956,13 @@ _rf_check_impl() {
   done < <(_rf_parse_findings "$turn_file")
   _rf_flush
 
-  [[ -n "$confs" ]] || confs="-"
   printf 'finding check (턴 %s): 발견 %s (본문 %s·부록 %s) · 인용 확인 %s · 위반 %s\n' \
     "$turn_no" "$findings" "$main" "$appendix" "$cite_ok" "$violations" >&2
 
   local tsv="${session_dir}/finding_metrics.tsv"
   if ! {
-    [[ -s "$tsv" ]] || printf '# turn\treview_type\tfindings\tmain\tappendix\tcite_ok\tviolations\tconfidences\n'
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$turn_no" "$review_type" "$findings" "$main" "$appendix" "$cite_ok" "$violations" "$confs"
+    [[ -s "$tsv" ]] || printf '# turn\treview_type\tfindings\tmain\tappendix\tcite_ok\tviolations\n'
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$turn_no" "$review_type" "$findings" "$main" "$appendix" "$cite_ok" "$violations"
   } >> "$tsv" 2>/dev/null; then
     echo "⚠️  finding metric 기록 실패: $tsv" >&2
   fi
@@ -1155,7 +1335,7 @@ classify_adapter_failure_cause() {
     printf '%s\n' "$line" | grep -qiE 'at capacity' && f_capacity=1
     printf '%s\n' "$line" | grep -qiE 'rate limit|rate_limit|too many requests|429' && f_rate=1
     printf '%s\n' "$line" | grep -qiE 'unauthorized|authentication|not logged in|invalid api key|401' && f_auth=1
-    if printf '%s\n' "$line" | grep -qiE 'model not found|model_not_found' \
+    if printf '%s\n' "$line" | grep -qiE 'model not found|model_not_found|issue with the selected model' \
        || { printf '%s\n' "$line" | grep -qi 'model' && printf '%s\n' "$line" | grep -qi 'does not exist'; }; then f_model=1; fi
     printf '%s\n' "$line" | grep -qiE 'spend cap|out of credits|credit balance (is )?too low|out of extra usage' && f_spend=1
     printf '%s\n' "$line" | grep -qiE 'hit your usage limit|hit your limit|usage limit reached' && f_usage=1

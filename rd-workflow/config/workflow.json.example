@@ -5,6 +5,13 @@
   "default_execution_mode": "semi-auto",
   "defect_report_upstream": "",
   "default_branch": "",
+  "archive_publish": "push",
   "review_input_warn_lines": 8000,
-  "review_response_language": "한국어"
+  "review_response_language": "한국어",
+  "team_publish": {
+    "mode": "pr",
+    "base": "",
+    "branch_prefix": "",
+    "light": "pr"
+  }
 }

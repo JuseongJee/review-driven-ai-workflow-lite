@@ -223,6 +223,21 @@ review_execution_path_from_request() {
   return 0
 }
 
+# review_request_file <base> <head> — diff review 가 완료 기준으로 읽을 REQUEST 경로(저장소 루트 기준) 출력
+#   기록 커밋은 루트 REQUEST.md 를 비우고 보관본(request-archive/*.md)을 추가합니다. base..head 구간에
+#   그 보관본이 추가돼 있으면 루트 REQUEST.md 는 이미 빈 템플릿이므로 보관본을 출력합니다. 여러 개면
+#   파일명(YYYY-MM-DD-HHMM- 접두)이 가장 늦은 것입니다. 구간에 없거나 판정할 수 없으면 REQUEST.md.
+#   항상 return 0 — 판정 실패가 리뷰를 막지 않고 종전 동작으로 돌아갑니다.
+review_request_file() {
+  local base="${1:-}" head="${2:-}" added=""
+  if [[ -n "$base" && -n "$head" ]]; then
+    added="$(git diff --name-only --diff-filter=A "${base}..${head}" -- 'rd-workflow-workspace/backlog/request-archive/' 2>/dev/null \
+      | grep -E '^rd-workflow-workspace/backlog/request-archive/[^/]+\.md$' | grep -v '/README\.md$' | sort | tail -n 1 || true)"
+  fi
+  printf '%s\n' "${added:-REQUEST.md}"
+  return 0
+}
+
 # source_fr_from_request [request_file] — REQUEST.md '## Source FR' 첫 유효행 출력
 #   백틱·양끝 공백 제거. HTML 주석 행(<!-- ... -->)은 건너뛴다 — 템플릿이 형식 예시를
 #   주석으로 담기 때문이다. 파일/섹션 부재·값 '-'·빈 값이면 빈 출력.
@@ -369,11 +384,10 @@ source_fr_split() {
   fi
   case "$v" in
     *"|"*)
-      local saved_IFS="$IFS" part
-      IFS='|'
-      set -- $v
-      IFS="$saved_IFS"
-      for part in "$@"; do
+      local part
+      local -a parts
+      IFS='|' read -r -a parts <<<"$v"
+      for part in "${parts[@]}"; do
         [[ -n "$part" ]] && printf '%s\n' "$part"
       done
       ;;
@@ -702,6 +716,7 @@ RD_RECORD_PATHS=(
   "rd-workflow-workspace/.lifecycle/review-seals/"
   "rd-workflow-workspace/.lifecycle/review-skip-audit.log"
   "rd-workflow-workspace/.lifecycle/stage_metrics.tsv"
+  "rd-workflow-workspace/.lifecycle/team-prs.tsv"
   "rd-workflow-workspace/backlog/"
   "rd-workflow-workspace/raw-captures/"
   "rd-workflow-workspace/reports/completions/"
@@ -841,7 +856,184 @@ rd_gitlink_content_id() {
   printf 'nested:%s\n' "$hash"
 }
 
-# rd_protected_tree_hash <commit-ish> — 기록 경로를 제외한 트리의 canonical 해시 (§2.2)
+# --- 팀 PR merge 뒤 gitlink 치환 (change-spec publish-via-pull-request 3.1·D4·D7 (나)(다)) ---
+# PR 기록 파일. 기록 경로(RD_RECORD_PATHS)에 들어 보호 트리 해시에서 빠집니다. `rd pr` 도 이 상수를 씁니다.
+# 줄 형식(탭 구분, 헤더 한 줄): path repo branch base url head-oid state merged-oid commits
+RD_TEAM_PR_RECORD="rd-workflow-workspace/.lifecycle/team-prs.tsv"
+
+# _rd_is_oid <s> — 40/64 자리 소문자 hex 인가 (git 인자로 넘기기 전 검사)
+_rd_is_oid() {
+  [[ "${1-}" =~ ^[0-9a-f]{40}$ || "${1-}" =~ ^[0-9a-f]{64}$ ]]
+}
+
+# 아래 _rd_tpp_* 는 호출자가 동적 범위 지역 변수 두 개를 정해 둔 뒤 부릅니다.
+#   _rd_tpp_args — git 앞 인자 배열 (`-C <repo>` 또는 `--git-dir=<common dir>`)
+#   _rd_tpp_alt  — 이 호출에만 붙일 대체 객체 디렉터리(`:` 구분, 없으면 빈 값)
+_rd_tpp_git() {
+  if [[ -n "${_rd_tpp_alt-}" ]]; then
+    GIT_ALTERNATE_OBJECT_DIRECTORIES="${GIT_ALTERNATE_OBJECT_DIRECTORIES:+$GIT_ALTERNATE_OBJECT_DIRECTORIES:}$_rd_tpp_alt" \
+      git "${_rd_tpp_args[@]}" "$@"
+  else
+    git "${_rd_tpp_args[@]}" "$@"
+  fi
+}
+
+# _rd_tpp_try <T> <H> <M 트리> — return 0: merge-tree 가 충돌 없이(rc 0) 끝나고 트리가 같음,
+# 1: 충돌(rc 1) 또는 트리 다름, 2: 판정 불가(객체 없음·git 오류), 3: H 가 이미 T 에 들어 있음.
+# 3 의 이유: merge 직전 대상 브랜치는 리뷰한 head 를 아직 담고 있지 않습니다. T 가 H 를 포함하면
+# merge-tree 는 T 의 트리를 그대로 돌려주므로, H 위에 손으로 고친 커밋을 T 로 삼은 M 이 통과합니다.
+# rc 와 트리는 따로 봅니다 — 충돌 마커 트리를 그대로 커밋한 merge 는 트리가 같아도 rc 1 입니다.
+# merge-tree --write-tree 는 객체를 씁니다. 검증이 저장소를 바꾸지 않도록 임시 객체 디렉터리에 쓰고,
+# 원래 객체 디렉터리는 대체 조회로만 읽습니다.
+_rd_tpp_try() {
+  local t="$1" h="$2" mtree="$3" own tmpo out rc tree
+  _rd_tpp_git merge-base --is-ancestor "$h" "$t" 2>/dev/null
+  case "$?" in
+    0) return 3 ;;
+    1) ;;
+    *) return 2 ;;
+  esac
+  own="$(_rd_tpp_git rev-parse --path-format=absolute --git-path objects 2>/dev/null)" || return 2
+  [[ -n "$own" && "$own" != *:* ]] || return 2
+  tmpo="$(mktemp -d "${TMPDIR:-/tmp}/rd-tpp-obj.XXXXXX")" || return 2
+  out="$(GIT_OBJECT_DIRECTORY="$tmpo" \
+         GIT_ALTERNATE_OBJECT_DIRECTORIES="${own}${_rd_tpp_alt:+:$_rd_tpp_alt}${GIT_ALTERNATE_OBJECT_DIRECTORIES:+:$GIT_ALTERNATE_OBJECT_DIRECTORIES}" \
+         git "${_rd_tpp_args[@]}" merge-tree --write-tree "$t" "$h" 2>/dev/null)"
+  rc=$?
+  rm -rf "$tmpo"
+  case "$rc" in
+    0) ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+  tree="${out%%$'\n'*}"
+  _rd_is_oid "$tree" || return 2
+  [[ "$tree" == "$mtree" ]] || return 1
+  return 0
+}
+
+# _rd_tpp_judge <M> <H> <commits> — rd_team_pr_preserved 의 본체 (rc·stdout 같음)
+_rd_tpp_judge() {
+  local m="$1" h="$2" k="${3-}" mtree line t r
+  local -a ps
+  if ! _rd_tpp_git cat-file -e "${m}^{commit}" 2>/dev/null \
+     || ! _rd_tpp_git cat-file -e "${h}^{commit}" 2>/dev/null; then
+    echo "objects-missing"; return 2
+  fi
+  mtree="$(_rd_tpp_git rev-parse --verify -q "${m}^{tree}" 2>/dev/null)" || { echo "objects-missing"; return 2; }
+  line="$(_rd_tpp_git rev-list --parents -n 1 "$m" 2>/dev/null)" || { echo "objects-missing"; return 2; }
+  # shellcheck disable=SC2206
+  ps=($line)
+  if [[ "${#ps[@]}" == "3" ]]; then
+    # merge 커밋: T=M^1, 둘째 부모가 리뷰한 head 여야 합니다.
+    [[ "${ps[2]}" == "$h" ]] || { echo "base-unknown"; return 1; }
+    _rd_tpp_try "${ps[1]}" "$h" "$mtree"; r=$?
+    case "$r" in
+      0) return 0 ;;
+      1|3) echo "content-differs"; return 1 ;;
+      *) echo "objects-missing"; return 2 ;;
+    esac
+  elif [[ "${#ps[@]}" == "2" ]]; then
+    # 부모 하나: squash 와 rebase 를 구분할 수 없어 M^ 를 먼저, 그다음 M~commits 를 시도합니다.
+    # 시도한 후보가 모두 「H 가 이미 T 에 들어 있음」(3) 으로 떨어지면 content-differs 입니다.
+    local all_anc=1
+    _rd_tpp_try "${ps[1]}" "$h" "$mtree"; r=$?
+    [[ "$r" == "0" ]] && return 0
+    [[ "$r" == "2" ]] && { echo "objects-missing"; return 2; }
+    [[ "$r" == "3" ]] || all_anc=0
+    if [[ "$k" =~ ^[1-9][0-9]*$ && "$k" != "1" ]]; then
+      t="$(_rd_tpp_git rev-parse --verify -q "${m}~${k}^{commit}" 2>/dev/null)" || { echo "objects-missing"; return 2; }
+      _rd_tpp_try "$t" "$h" "$mtree"; r=$?
+      [[ "$r" == "0" ]] && return 0
+      [[ "$r" == "2" ]] && { echo "objects-missing"; return 2; }
+      [[ "$r" == "3" ]] || all_anc=0
+    fi
+    if [[ "$all_anc" == "1" ]]; then echo "content-differs"; return 1; fi
+    echo "base-unknown"; return 1
+  fi
+  echo "base-unknown"; return 1
+}
+
+# rd_team_pr_preserved <repo-dir> <merged-oid> <head-oid> <commits|""> — merge 결과가 리뷰한 head 를
+# 충돌·손 편집 없이 담았는가 (spec D7 (나)(다)).
+#   return 0 보존 (stdout 없음)
+#   return 1 미보존 — stdout `base-unknown`(merge 직전 대상 브랜치 T 를 정하지 못함) | `content-differs`
+#   return 2 판정 불가 — stdout `objects-missing` (객체를 읽지 못함·git 오류)
+# T: 부모가 둘이면 M^1(M^2 == head 필수). 하나면 M^ 를 먼저 시도하고, 아니면 commits 가 숫자일 때 M~commits.
+# 판정: `git merge-tree --write-tree T head` 가 rc 0 이고 그 트리가 M^{tree} 와 같음.
+# head 가 이미 T 의 조상이거나 T 와 같으면 그 후보는 보존이 아닙니다(모든 후보가 그러면 content-differs).
+rd_team_pr_preserved() {
+  local repo="${1-}" m="${2-}" h="${3-}" k="${4-}"
+  local -a _rd_tpp_args
+  local _rd_tpp_alt=""
+  if [[ -z "$repo" ]] || ! _rd_is_oid "$m" || ! _rd_is_oid "$h" || ! _rd_is_repo_root "$repo"; then
+    echo "objects-missing"; return 2
+  fi
+  _rd_tpp_args=(-C "$repo")
+  _rd_tpp_judge "$m" "$h" "$k"
+}
+
+# rd_gitlink_seal_oid <root> <commit-oid> <path> <gitlink-oid> <cdir> — seal 해시가 이 gitlink 를 셀 커밋 OID
+#
+# 기본은 <gitlink-oid> 그대로입니다. 아래 셋을 **모두** 만족할 때만 기록의 head-oid 를 돌려줍니다 (spec 3.1).
+#   1. <commit-oid> 안의 기록 파일에 path 가 같고 state=merged 이며 merged-oid == <gitlink-oid> 인 줄이 있습니다.
+#   2. 보존 판정 (나)(다) 를 그 자리에서 다시 계산해 통과합니다 (rd_team_pr_preserved 와 같은 본체).
+#   3. 판정에 필요한 객체를 모두 읽을 수 있습니다 (rd_gitlink_content_id 와 같은 객체 풀).
+# 기록은 보호 트리 밖이라 손으로 고칠 수 있습니다. 그래서 기록은 비교 대상만 알려 주고, 통과 여부는 재계산이
+# 정합니다. 하나라도 아니면 치환하지 않아 merged-oid 의 실제 내용으로 셉니다(fail-closed). 항상 return 0.
+rd_gitlink_seal_oid() {
+  local root="${1-}" coid="${2-}" path="${3-}" gl="${4-}" cdir="${5-}"
+  local recs line rest f p st mo ho k found="" pool
+  local -a fs _rd_tpp_args
+  local _rd_tpp_alt=""
+  if [[ -z "$root" || -z "$coid" || -z "$path" ]] || ! _rd_is_oid "$gl"; then
+    printf '%s\n' "$gl"; return 0
+  fi
+  recs="$(git -C "$root" show "${coid}:${RD_TEAM_PR_RECORD}" 2>/dev/null)" || { printf '%s\n' "$gl"; return 0; }
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    # 빈 칸(base="" 등)이 있으므로 IFS 분리 대신 탭마다 직접 자릅니다.
+    fs=(); rest="$line"
+    while [[ "$rest" == *$'\t'* ]]; do
+      f="${rest%%$'\t'*}"; fs+=("$f"); rest="${rest#*$'\t'}"
+    done
+    fs+=("$rest")
+    [[ "${#fs[@]}" -ge 9 ]] || continue
+    p="${fs[0]}"; ho="${fs[5]}"; st="${fs[6]}"; mo="${fs[7]}"; k="${fs[8]}"
+    if [[ "$p" == "$path" && "$st" == "merged" && "$mo" == "$gl" ]]; then
+      found=1; break
+    fi
+  done <<EOF_TPR
+$recs
+EOF_TPR
+  if [[ -z "$found" ]] || ! _rd_is_oid "$ho"; then
+    printf '%s\n' "$gl"; return 0
+  fi
+  [[ "$k" =~ ^[0-9]+$ ]] || k=""
+  # merge 결과(gl)와 기록의 head(ho)가 함께 있는 곳을 고릅니다. submodule 저장소에 한쪽만 있으면 풀로 갑니다.
+  if _rd_is_repo_root "${root}/${path}" && git -C "${root}/${path}" cat-file -e "${gl}^{commit}" 2>/dev/null \
+     && git -C "${root}/${path}" cat-file -e "${ho}^{commit}" 2>/dev/null; then
+    _rd_tpp_args=(-C "${root}/${path}")
+  elif [[ -n "$cdir" ]] && pool="$(_rd_submodule_object_pool "$cdir")" \
+       && GIT_ALTERNATE_OBJECT_DIRECTORIES="${GIT_ALTERNATE_OBJECT_DIRECTORIES:+$GIT_ALTERNATE_OBJECT_DIRECTORIES:}$pool" \
+          git --git-dir="$cdir" cat-file -e "${gl}^{commit}" 2>/dev/null \
+       && GIT_ALTERNATE_OBJECT_DIRECTORIES="${GIT_ALTERNATE_OBJECT_DIRECTORIES:+$GIT_ALTERNATE_OBJECT_DIRECTORIES:}$pool" \
+          git --git-dir="$cdir" cat-file -e "${ho}^{commit}" 2>/dev/null; then
+    _rd_tpp_args=(--git-dir="$cdir"); _rd_tpp_alt="$pool"
+  else
+    printf '%s\n' "$gl"; return 0
+  fi
+  if _rd_tpp_judge "$gl" "$ho" "$k" >/dev/null; then
+    printf '%s\n' "$ho"
+  else
+    printf '%s\n' "$gl"
+  fi
+  return 0
+}
+
+# rd_protected_tree_hash <commit-ish> [기록 커밋] — 기록 경로를 제외한 트리의 canonical 해시 (§2.2)
+#   둘째 인자: gitlink 치환이 읽을 기록의 커밋 (no-fr rebind 에서 기록을 지운 커밋의 해시를 기록이 있던 커밋 기준으로 셉니다).
+#   없으면 <commit-ish> 자신의 기록을 읽습니다.
 #
 # **fail-closed 가 이 함수의 계약입니다.** repo root 탐색 / OID 확인 / `ls-tree` / 필터 /
 # `hash-object` 중 어느 단계가 실패해도 nonzero 로 끝냅니다. `ls-tree` 실패를 흘려보내면
@@ -862,7 +1054,7 @@ rd_gitlink_content_id() {
 # (`core.quotePath` 등 출력 설정에 무관), `-C <repo root>` 와 `--full-tree` 로 호출 위치가
 # 결과에 영향을 주지 않습니다.
 rd_protected_tree_hash() {
-  local ref="${1-}" root oid raw filtered hash rc rec path meta bad=0 cdir=""
+  local ref="${1-}" rec_ref="${2-}" root oid raw filtered hash rc rec path meta bad=0 cdir="" rec_oid=""
   if [[ -z "$ref" ]]; then
     echo "rd_protected_tree_hash: 대상 commit 이 지정되지 않았습니다 — 판정 불가." >&2
     return 1
@@ -877,6 +1069,13 @@ rd_protected_tree_hash() {
     echo "rd_protected_tree_hash: '${ref}' 를 commit 으로 해석할 수 없습니다 — 판정 불가." >&2
     return 1
   }
+  rec_oid="$oid"
+  if [[ -n "$rec_ref" ]]; then
+    rec_oid="$(rd_resolve_commit_oid "$rec_ref" "$root")" || {
+      echo "rd_protected_tree_hash: 기록 커밋 '${rec_ref}' 를 commit 으로 해석할 수 없습니다 — 판정 불가." >&2
+      return 1
+    }
+  fi
   raw="$(mktemp "${TMPDIR:-/tmp}/rd-tree-raw.XXXXXX")" || {
     echo "rd_protected_tree_hash: mktemp 실패 — 판정 불가." >&2
     return 1
@@ -902,7 +1101,9 @@ rd_protected_tree_hash() {
     if [[ "$rec" == "160000 "* ]]; then
       # gitlink 는 커밋 OID 가 아니라 내용 ID 로 셉니다 (spec 2.1 D1).
       meta="${rec%%$'\t'*}"
-      printf '160000 content %s\t%s\0' "$(rd_gitlink_content_id "${root}/${path}" "${meta##* }" "$cdir")" "$path"
+      # 팀 PR merge 뒤 포인터는 기록·재계산이 맞을 때만 리뷰한 head 로 셉니다 (rd_gitlink_seal_oid).
+      printf '160000 content %s\t%s\0' \
+        "$(rd_gitlink_content_id "${root}/${path}" "$(rd_gitlink_seal_oid "$root" "$rec_oid" "$path" "${meta##* }" "$cdir")" "$cdir")" "$path"
       continue
     fi
     printf '%s\0' "$rec"
@@ -1283,13 +1484,15 @@ _state_legacy_section() {
   ' "$file"
 }
 
-# canonical 10종 집합 (LC-19) — _state_common.sh 독자 정의 (guard_common.sh에 의존하지 않음)
+# canonical 11종 집합 (LC-19) — _state_common.sh 독자 정의 (guard_common.sh에 의존하지 않음)
 # 파이프(|) 구분 문자열. _state_status_canonical() 의 단일 진실 출처.
 # `아카이브 보류` 는 「리뷰 종결·발행 대기」입니다 (change-spec §4.1). 완료가 아니며,
 # 이 상태에서만 기록 커밋(제외 경로 한정)이 게이트를 통과합니다.
 # `구현 대기` 는 「spec/plan review 종결·구현 착수 대기」입니다 (change-spec
 # 2026-09-24-1836-task-status-no-implementation-pending).
-STATE_CANONICAL_STATUSES="대기 중|REQUEST review 대기|spec/plan 작성 중|spec/plan review 대기|구현 대기|구현 중|검증 중|diff review 대기|아카이브 보류|완료"
+# `PR 검토 중` 은 「seal 을 마치고 팀 저장소에 PR 을 올렸으며 merge 를 기다리는」 진행 중 상태입니다
+# (change-spec publish-via-pull-request D3). `_task_common.sh` 의 배열과 같은 순서입니다.
+STATE_CANONICAL_STATUSES="대기 중|REQUEST review 대기|spec/plan 작성 중|spec/plan review 대기|구현 대기|구현 중|검증 중|diff review 대기|아카이브 보류|PR 검토 중|완료"
 
 # _state_status_canonical <status> — return 0: canonical, 1: 비canonical
 # STATE_CANONICAL_STATUSES 변수를 단일 출처로 사용 (Bash 3.2 호환: IFS 분리 루프)
@@ -1336,7 +1539,7 @@ state_ensure() {
 
   # Status 비어있거나 비canonical → fail-closed (SEC-13)
   if [[ -z "$st" ]] || ! _state_status_canonical "$st"; then
-    echo "task-state 마이그레이션 실패: CURRENT_TASK.md ## Status ('${st:-<없음>}') 가 canonical 10종이 아닙니다." >&2
+    echo "task-state 마이그레이션 실패: CURRENT_TASK.md ## Status ('${st:-<없음>}') 가 canonical 11종이 아닙니다." >&2
     echo "CURRENT_TASK.md 의 Status 를 유효한 값으로 복구한 뒤 다시 실행하세요 (묵시적 초기화 금지 — SEC-13)." >&2
     return 3
   fi

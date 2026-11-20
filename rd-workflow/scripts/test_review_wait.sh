@@ -769,6 +769,8 @@ run_parse_harness() {
 set -uo pipefail
 CONFIG_FILE="$cfg"
 REVIEW_CFG_KV=""
+# load_review_config_once 가 쓰는 선택 함수(ms_jq_available·ms_load_legacy)
+source "$(dirname "$RUN_REVIEW_TURN")/model_select.sh"
 
 # ── load_review_config (구현 후 버전 또는 현행 버전 — 테스트는 실제 파일 실행) ──
 # 실제 run_review_turn.sh 에서 함수를 추출해 실행
@@ -990,6 +992,7 @@ RJSON
 set -uo pipefail
 CONFIG_FILE="$sandbox/review-tools.json"
 REVIEW_CFG_KV=""
+source "$(dirname "$RUN_REVIEW_TURN")/model_select.sh"  # load_review_config_once 가 쓰는 선택 함수
 
 $(sed -n '/^load_review_config()/,/^}/p' "$RUN_REVIEW_TURN")
 $(sed -n '/^get_tool_config()/,/^}/p' "$RUN_REVIEW_TURN")
@@ -1069,6 +1072,7 @@ FAKE_JQ
 set -uo pipefail
 CONFIG_FILE="$sandbox/review-tools.json"
 REVIEW_CFG_KV=""
+source "$(dirname "$RUN_REVIEW_TURN")/model_select.sh"  # load_review_config_once 가 쓰는 선택 함수
 
 $(sed -n '/^load_review_config()/,/^}/p' "$RUN_REVIEW_TURN")
 $(sed -n '/^get_tool_config()/,/^}/p' "$RUN_REVIEW_TURN")
@@ -1110,6 +1114,7 @@ HARNESS11A_BODY
 set -uo pipefail
 CONFIG_FILE="$bad_json"
 REVIEW_CFG_KV=""
+source "$(dirname "$RUN_REVIEW_TURN")/model_select.sh"  # load_review_config_once 가 쓰는 선택 함수
 
 $(sed -n '/^load_review_config()/,/^}/p' "$RUN_REVIEW_TURN")
 $(sed -n '/^get_tool_config()/,/^}/p' "$RUN_REVIEW_TURN")
@@ -2489,8 +2494,9 @@ run_case33() {
     fail "케이스 33: 기대 rc=124 + '유휴 임계' — 실제 rc=$rc (${elapsed}초)"
   fi
 
-  [ "$elapsed" -lt 15 ] \
-    && pass "케이스 33(보조1): 15초 이내 종료" \
+  # 유휴 판정이 듣지 않으면 상한(WAIT_TIMEOUT 60초)에서 끝납니다. 그래서 경과를 그 상한과 비교합니다(고정 15초는 부하에서 흔들림).
+  [ "$elapsed" -lt 60 ] \
+    && pass "케이스 33(보조1): 상한(60초) 전에 유휴로 종료 (${elapsed}초)" \
     || fail "케이스 33(보조1): ${elapsed}초 — 과도하게 오래 걸림"
 
   leftover="$(leftover_watchdog_in "$sandbox/tmp")"
@@ -2847,7 +2853,7 @@ run_case36d() {
 
 # ===========================================================================
 # 케이스 37 (V5): 관측기 고장 — 엔진 직접 하니스 (어댑터에 장애 주입 없음)
-#   RW_OBSERVER_OK=0 RW_ABS_CAP=300 RW_FALLBACK_CAP=3 → 마커 세 필드 'cap 3 failed',
+#   RW_OBSERVER_OK=0 RW_ABS_CAP=60 RW_FALLBACK_CAP=3 → 마커 세 필드 'cap 3 failed',
 #   약 3초에 발동
 # ===========================================================================
 run_case37() {
@@ -2868,7 +2874,7 @@ run_case37() {
     RW_TOOL_LABEL=claude
     RW_TARGET_PGID=""
     RW_TARGET_PID="$dummy_pid"
-    RW_ABS_CAP=300
+    RW_ABS_CAP=60
     RW_OBSERVER_OK=0
     RW_FALLBACK_CAP=3
     RW_IDLE=60
@@ -2895,10 +2901,12 @@ run_case37() {
     fail "케이스 37: 마커 기대 'cap 3 failed' — 실제 '[$marker]' (${elapsed}초)"
   fi
 
-  if [ "$elapsed" -ge 2 ] && [ "$elapsed" -le 6 ]; then
-    pass "케이스 37(보조): 약 3초에 발동 (${elapsed}초)"
+  # 하한은 부하로 깨지지 않습니다. 관측기 고장 경로는 유휴 판정을 끄므로, 대체 상한이 듣지 않으면 절대 상한(RW_ABS_CAP 60초)에서
+  # 끝납니다. 그래서 상한은 그 절대 상한과 비교합니다(고정 6초는 부하에서 흔들림).
+  if [ "$elapsed" -ge 2 ] && [ "$elapsed" -lt 60 ]; then
+    pass "케이스 37(보조): 절대 상한(60초) 전에 3초 대체 상한으로 발동 (${elapsed}초)"
   else
-    fail "케이스 37(보조): 발동 시각 이상 (${elapsed}초, 기대 2~6초)"
+    fail "케이스 37(보조): 발동 시각 이상 (${elapsed}초, 기대 2초 이상 60초 미만)"
   fi
 
   kill "$dummy_pid" 2>/dev/null || true

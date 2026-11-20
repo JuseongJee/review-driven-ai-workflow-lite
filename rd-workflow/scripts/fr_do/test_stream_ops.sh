@@ -127,23 +127,28 @@ watch_run() { # <출력 파일> — 백그라운드로 띄우고 WPID 에 PID
 }
 watch_stop() { kill "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null; }
 
-# wait_for <파일> <문자열> [횟수=1] [상한초=10] — 문자열이 횟수만큼 나올 때까지 0.2초마다 봅니다(부하가 큰 병렬 실행에서 고정 sleep 을 피함).
+# 대기 상한은 결함 판정 기준이 아니라 멈춤 방지 장치입니다. 기다리는 신호는 정상이면 반드시 오므로 상한은 결함일 때만 닿습니다.
+# 병렬 self_test 부하에서 watch 기동이 10초를 넘겨 대기가 먼저 끝나고 뒤 단언이 FAIL 했으므로 60초로 둡니다.
+# 상한에 닿으면 그 사실을 PASS 가 아닌 줄로 남기고 watch 를 멈춘 뒤 그 케이스를 끝냅니다(케이스는 서브셸에서 돕니다).
+# 뒤 대기를 이어 가면 대기마다 상한을 다 써서 실패 보고가 몇 분씩 늦어집니다.
+WAIT_CAP=60
+# wait_for <파일> <문자열> [횟수=1] — 문자열이 횟수만큼 나올 때까지 0.2초마다 봅니다(부하가 큰 병렬 실행에서 고정 sleep 을 피함).
 wait_for() {
-  local i=0 max=$(( ${4:-10} * 5 ))
+  local i=0 max=$(( WAIT_CAP * 5 ))
   while [ "$i" -lt "$max" ]; do
     [ "$(grep -cF -- "$2" "$1" 2>/dev/null)" -ge "${3:-1}" ] && return 0
     sleep 0.2; i=$((i + 1))
   done
-  return 1
+  echo "WAIT-TIMEOUT wait_for '$2' x${3:-1} (${WAIT_CAP}초)"; watch_stop; exit 1
 }
 # settle <N> — watch 가 감시 반복을 N번 더 돌 때까지 기다립니다(가짜 herdr 의 agent get 호출 수 기준. 부하와 무관한 「그 사이 반복이 있었다」 보장).
 settle() {
   local c0 i=0; c0="$(wc -l < "$WD/calls" 2>/dev/null | tr -d ' ')"; c0="${c0:-0}"
-  while [ "$i" -lt 100 ]; do
+  while [ "$i" -lt $(( WAIT_CAP * 5 )) ]; do
     [ "$(wc -l < "$WD/calls" | tr -d ' ')" -ge $(( c0 + $1 )) ] && return 0
     sleep 0.2; i=$((i + 1))
   done
-  return 1
+  echo "WAIT-TIMEOUT settle $1 (${WAIT_CAP}초)"; watch_stop; exit 1
 }
 watch_blocked_once() {
   local n=watch_blocked_once; local o="$T/$n.out"; watch_start $n
@@ -155,7 +160,7 @@ watch_blocked_once() {
 watch_two_streams_both_seen() {
   local n=watch_two_streams_both_seen; local o="$T/$n.out"; watch_start $n
   printf 's1\t\ns2\t\n' > "$WS/active.tsv"; echo idle > "$WD/status.s1"; echo idle > "$WD/status.s2"
-  watch_run "$o"; wait_for "$o" "STREAM s2" 1 6; watch_stop
+  watch_run "$o"; wait_for "$o" "STREAM s2"; watch_stop
   has "$n" "$o" "STREAM s1"; has "$n" "$o" "STREAM s2"
 }
 watch_report_once() {
@@ -205,6 +210,40 @@ watch_queue_change() {
   watch_run "$o"; wait_for "$o" "STREAM s1 idle"; settle 1
   printf 's1  요청됨\n' > "$T/$n.q"; wait_for "$o" "QUEUE"; settle 2; watch_stop
   count_is "$n" "$o" "QUEUE" 1; has "$n" "$o" "요청됨"
+}
+
+# 감시가 도는 동안 발행 큐에 생존 표시(who=fr-do)를 남깁니다(작업 세션의 감시 없음 경고 근거).
+watch_beats_queue() {
+  local n=watch_beats_queue; local o="$T/$n.out" w i=0; watch_start $n
+  w="$WR/.git/rd-workflow/publish-queue/WATCH"
+  watch_run "$o"
+  while [ "$i" -lt $(( WAIT_CAP * 5 )) ] && ! grep -q '^who=fr-do$' "$w" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
+  watch_stop
+  [ "$i" -lt $(( WAIT_CAP * 5 )) ] || { echo "WAIT-TIMEOUT 생존 표시 who=fr-do (${WAIT_CAP}초)"; return; }
+  grep -q '^who=fr-do$' "$w" 2>/dev/null && grep -q '^at=[0-9]*$' "$w" && P "$n (생존 표시 who=fr-do)" || F "$n" "생존 표시 없음 — $(cat "$w" 2>&1 | tr '\n' '|')"
+}
+
+# 큐를 읽지 못하면 조회 실패를 한 번 알리고 생존 표시를 남기지 않습니다(감시가 정상인 것처럼 보이지 않게).
+watch_queue_fail_no_beat() {
+  local n=watch_queue_fail_no_beat; local o="$T/$n.out"; watch_start $n
+  printf 's1\t\n' > "$WS/active.tsv"; echo idle > "$WD/status.s1"
+  export RD_FR_DO_QUEUE_CMD='echo "큐 깨짐" >&2; exit 3'
+  watch_run "$o"; wait_for "$o" "QUEUE 조회 실패"; settle 2; watch_stop
+  count_is "$n" "$o" "QUEUE 조회 실패 (rc=3): 큐 깨짐" 1
+  [ ! -e "$WR/.git/rd-workflow/publish-queue/WATCH" ] && P "$n (생존 표시 없음)" || F "$n" "조회 실패인데 생존 표시가 있음"
+}
+
+# 조회 실패 뒤 회복하면 실패 전과 같은 큐 줄이어도 다시 알립니다(호출 세션이 허가 점검을 이어 가는 신호).
+watch_queue_recover_reemits() {
+  local n=watch_queue_recover_reemits; local o="$T/$n.out"; watch_start $n
+  printf 's1\t\n' > "$WS/active.tsv"; echo idle > "$WD/status.s1"
+  printf 's1  요청됨\n' > "$T/$n.q"
+  printf '#!/bin/bash\n[ -e "%s" ] && { echo 깨짐 >&2; exit 3; }\ncat "%s"\n' "$T/$n.fail" "$T/$n.q" > "$T/$n.q.sh"
+  export RD_FR_DO_QUEUE_CMD="bash $T/$n.q.sh"
+  watch_run "$o"; wait_for "$o" "QUEUE s1"
+  touch "$T/$n.fail"; wait_for "$o" "QUEUE 조회 실패"
+  rm -f "$T/$n.fail"; wait_for "$o" "QUEUE s1" 2; settle 2; watch_stop
+  count_is "$n" "$o" "QUEUE s1  요청됨" 2; count_is "$n" "$o" "QUEUE 조회 실패" 1
 }
 
 # 33자 이상 slug: promote 는 herdr 에이전트 이름을 앞 32자로 자릅니다. 가짜 herdr 는 잘린 이름에만 응답합니다.
@@ -266,6 +305,24 @@ JSON
   has "$n" "$h" "## 발행 방법"; has "$n" "$h" "## 실행 규칙"
   has "$n" "$h" "$st/reports/<slug>-question.md"; has "$n" "$h" "$st/reports/<slug>-closing.md"
   grep -qF '{REPORTS}' "$h" && F "$n" "{REPORTS} 치환자가 남음" || P "$n 치환자 없음"
+}
+
+handoff_design_qa() {
+  # 설계 문답을 고른 회차만 인계 파일에 그 절이 붙어야 합니다. 빠지면 줄기가 설계 질문을 스스로 정합니다.
+  local n=handoff_design_qa; local r="$T/$n" o="$T/$n.out" st
+  mkrepo "$r"; : > "$r/rd-workflow-workspace/backlog/items/2026-11-08-s1-fr.md"
+  for q in on off; do
+    if [ "$q" = on ]; then dq=',"design_qa":true'; else dq=''; fi
+    printf '{"wave":"%s","why":"x","streams":[{"slug":"s1","title":"t","frs":["2026-11-08-s1-fr"],"owns":"a","notes":"- n"}]%s}\n' "w-$q" "$dq" > "$T/$n.$q.json"
+    python3 "$r/rd-workflow/scripts/fr_do/handoff.py" "$T/$n.$q.json" > "$o" 2>&1 || { F "$n" "handoff.py 실패($q): $(cat "$o")"; return; }
+  done
+  st="$(bash -c "source '$r/rd-workflow/scripts/fr_do/_state.sh'; fr_do_state_dir")"
+  has "$n" "$st/waves/w-on/handoff-s1.md" "## 설계 문답"
+  has "$n" "$st/waves/w-on/handoff-s1.md" "$st/reports/s1-question.md"
+  has "$n" "$st/waves/w-on/handoff-s1.md" "사용자 직접 답변 — 호출 세션은 답하지 않음"
+  has "$n" "$st/waves/w-on/handoff-s1.md" "「설계·스펙 승인 대기 생략」 보다 이 절이 우선합니다"
+  has "$n" "$st/waves/w-on/handoff-s1.md" "첫 줄을 「사용자 직접 답변 — 답변 완료」 으로 바꾸고"
+  grep -qF "## 설계 문답" "$st/waves/w-off/handoff-s1.md" && F "$n" "design_qa 없는 회차에 설계 문답 절이 붙음" || P "$n 미선택 회차에는 절 없음"
 }
 
 handoff_bad_slug_rejected() {
@@ -359,8 +416,8 @@ compact_recheck_line_gone() {
 }
 
 CASES="grant_not_archive_hold grant_dirty_main_hold grant_dirty_state_dir_hint grant_merging_main_hold grant_conflict_hold grant_mergetree_error_holds grant_no_branch_skips_merge grant_auto_only_ok
-watch_blocked_once watch_two_streams_both_seen watch_report_once watch_report_across_restart watch_idle_again_after_working watch_ctx_threshold watch_queue_change watch_long_slug_agent_name
-close_not_closed_keeps_row close_closed_removes_row close_long_slug_closes_tab handoff_generate_paths handoff_bad_slug_rejected handoff_launch_verdict handoff_active_row
+watch_blocked_once watch_two_streams_both_seen watch_report_once watch_report_across_restart watch_idle_again_after_working watch_ctx_threshold watch_queue_change watch_long_slug_agent_name watch_beats_queue watch_queue_fail_no_beat watch_queue_recover_reemits
+close_not_closed_keeps_row close_closed_removes_row close_long_slug_closes_tab handoff_generate_paths handoff_design_qa handoff_bad_slug_rejected handoff_launch_verdict handoff_active_row
 compact_sent compact_below_limit compact_typing_waits compact_working compact_unreadable compact_recheck_typing compact_missing_input_line compact_recheck_read_fail compact_recheck_line_gone"
 # 환경변수(FAKE_DIR 등)가 섞이지 않게 케이스마다 서브셸로 병렬 실행합니다.
 for c in $CASES; do ( "$c" ) > "$T/log.$c" 2>&1 & PIDS="$PIDS $!"; done

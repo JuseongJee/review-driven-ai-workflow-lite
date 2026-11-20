@@ -622,5 +622,41 @@ check "이미 이관된 인덱스 불변" "$sum1" "$(cksum < "$INDEX")"
 check "잠금 잔존 없음" "no" "$([ -e "$INDEX.lock" ] && echo yes || echo no)"
 check "임시 파일 잔존 없음" "0" "$(ls "$INDEX".?????? 2>/dev/null | wc -l | tr -d ' ')"
 
+echo "== 케이스 36: handed-off 상세는 status 오류가 아니고, handed-off 선행은 dropped 처럼 check =="
+reset_fx
+item 2026-03-10 lead handed-off
+item 2026-03-10 follow validated "- depends-on: 2026-03-10-lead"
+row 2026-03-10 follow validated P2 'dep:2026-03-10-lead' '**[선행: lead]** 요약'
+check "handed-off 상세는 validate 통과" "rc=0" "$(validate_out)"
+check "handed-off 선행은 check" "check:2026-03-10-lead" "$(readiness_of 2026-03-10-follow)"
+
+echo "== 케이스 37: in-progress — 체크아웃·비체크아웃 fr 브랜치·active.tsv 에서 진행 중 FR 과 단계 =="
+reset_fx
+ip_ts() { # ip_ts <파일> <status> <source-fr>
+  mkdir -p "$(dirname "$1")"
+  printf 'schema=1\nstatus=%s\nsource-fr=%s\n' "$2" "$3" > "$1"
+}
+ip_commit() { git -C "$fx" add -A >/dev/null && git -C "$fx" -c user.name=t -c user.email=t@t commit -qm "$1" >/dev/null; }
+TS=rd-workflow-workspace/.lifecycle/task-state
+I=rd-workflow-workspace/backlog/items
+git -C "$fx" init -q -b main >/dev/null
+ip_ts "$fx/$TS" "대기 중" "$I/2026-04-01-idle.md"
+ip_commit base
+# 비체크아웃 fr 브랜치 둘: PR 검토 중(진행 중) / 완료(제외)
+git -C "$fx" checkout -q -b fr/pr; ip_ts "$fx/$TS" "PR 검토 중" "$I/2026-04-01-pr.md"; ip_commit pr
+git -C "$fx" checkout -q main -b fr/done; ip_ts "$fx/$TS" "완료" "$I/2026-04-01-done.md"; ip_commit done
+git -C "$fx" checkout -q main
+# 체크아웃된 작업 worktree: 커밋된 값(대기 중)이 아니라 파일 값(구현 중)을 읽어야 한다. FR 2건(| 구분).
+git -C "$fx" worktree add -q -b fr/wt "$fx/wt" >/dev/null 2>&1
+ip_ts "$fx/wt/$TS" "구현 중" "$I/2026-04-01-wa.md|$I/2026-04-01-wb.md"
+# active.tsv: 2번째 칸이 빈 줄, 이미 나온 stem(wa) 은 task-state 단계를 유지
+mkdir -p "$fx/rd-workflow-workspace/.lifecycle/fr-do"
+printf 's9\t\t2026-04-01-solo\nwt\trd/x.sh\t2026-04-01-wa;2026-04-01-pr\n' > "$fx/rd-workflow-workspace/.lifecycle/fr-do/active.tsv"
+ip_out="$(bash "$TARGET" in-progress --root "$fx" 2>&1 | LC_ALL=C sort)"
+ip_exp="$(printf '2026-04-01-pr\tPR 검토 중\n2026-04-01-solo\t/fr do 줄기 s9\n2026-04-01-wa\t구현 중\n2026-04-01-wb\t구현 중\n' | LC_ALL=C sort)"
+check "in-progress 출력" "$ip_exp" "$ip_out"
+git -C "$fx" worktree remove --force "$fx/wt" >/dev/null 2>&1
+rm -rf "${fx:?}"/.git
+
 if [ "$FAIL" -eq 0 ]; then echo "test_fr_relations.sh: PASS"; else echo "test_fr_relations.sh: FAIL" >&2; fi
 exit "$FAIL"

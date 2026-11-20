@@ -2,12 +2,12 @@
 # adapter_codex.sh — Codex CLI 어댑터 (background 실행 + watchdog+wait)
 # 환경변수: SESSION_PATH, PROMPT_FILE, EXPECTED_TURN_FILE,
 #           TOOL_BIN, PROJECT_ROOT,
+#           TOOL_MODEL  (선택 — 해석된 모델 slug. 빈 값이면 -m 을 붙이지 않음)
 #           TOOL_EFFORT (선택 — reasoning effort. 빈 값이면 전역 설정을 따름)
 #
-# TOOL_MODEL 은 의도적으로 사용하지 않는다. 모델은 전역 ~/.codex/config.toml 을
-# 단일 진실 원천으로 두어 drift 를 없앤다는 결정이며, 부모가 TOOL_MODEL 을 export 하더라도
-# 이 어댑터는 무시한다. 조절 가능한 것은 reasoning effort 뿐이다.
-# 그래서 review-tools.json 의 codex stanza 에도 model 필드를 두지 않는다.
+# 모델은 models.json 또는 RD_REVIEW_CODEX_MODEL 로 고른 경우에만 -m 으로 넘기고,
+# 없으면 ~/.codex/config.toml 을 따른다. 부모(run_review_turn.sh)가 상속값을 지운 뒤
+# 해석값만 TOOL_MODEL·TOOL_EFFORT 로 넣는다.
 #
 # effort 값이 현재 모델에서 지원되지 않으면 codex 가 설정을 거부하고 이 어댑터는
 # **즉시 실패한다.** effort 없이 자동 재시도하지 않는다 — codex stderr 는 설정 오류 전용
@@ -548,10 +548,11 @@ marker_read_fd_open=1
 # 만들지 못해도 실행은 계속한다 — 진단이 「판정 불가」 로 표시할 뿐이다.
 write_ref="$(mktemp "${session_dir}/.wait_timeout.ref.XXXXXX" 2>/dev/null)" || write_ref=""
 
-# reasoning effort 전달 — 빈 값이면 -c 를 붙이지 않는다 (전역 설정을 따름 = 도입 전 동작).
+# 모델·reasoning effort 전달 — 빈 값이면 -m·-c 를 붙이지 않는다 (전역 설정을 따름 = 도입 전 동작).
 # -c 값은 TOML 로 파싱되므로 문자열을 따옴표로 감싼다.
 # bash 3.2 + set -u 에서 빈 배열 전개가 죽으므로 "${arr[@]+"${arr[@]}"}" 관용구가 필수다.
 extra_args=()
+[ -n "${TOOL_MODEL:-}" ] && extra_args+=(-m "$TOOL_MODEL")
 [ -n "${TOOL_EFFORT:-}" ] && extra_args+=(-c "model_reasoning_effort=\"${TOOL_EFFORT}\"")
 
 # workspace-write sandbox 는 physical 경로 기준으로 쓰기 범위를 판정한다. team-overlay

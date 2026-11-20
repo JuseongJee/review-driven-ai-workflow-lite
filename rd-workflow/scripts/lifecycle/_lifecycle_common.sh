@@ -116,6 +116,8 @@ metadata_write() {
 # **단일 출처입니다.** archive.sh Step 4 의 커밋 경로와 얹힌 커밋 검사의 허용 집합이
 # 모두 여기서 나옵니다. 두 벌로 두면 Step 4 가 경로를 늘렸을 때 검사가 그것을 침입으로
 # 오판하고, 그 어긋남이 조용히 발생합니다 (test_lifecycle.sh 가 배선을 고정합니다).
+# 예외 하나: PR 기록 파일(RD_TEAM_PR_RECORD)은 archive.sh Step 4 가 존재할 때만 지우므로 이 목록에 없고,
+# archive_extra_commits_check 가 허용 집합에 따로 더합니다.
 lifecycle_metadata_paths() {
   cat <<'PATHS'
 rd-workflow-workspace/.lifecycle/task-state
@@ -243,6 +245,9 @@ archive_extra_commits_check() {
   done <<EOF
 $paths_out
 EOF
+  # Step 4 가 PR 기록 파일(team-prs.tsv)을 지우는 커밋을 만들기 때문에 허용합니다. lifecycle_metadata_paths 에는 두지 않습니다(없는 작업이 대부분이고 archive.sh 가 존재할 때만 다룹니다).
+  # RD_TEAM_PR_RECORD 는 이 파일이 맨 위에서 source 하는 _state_common.sh 가 항상 정의합니다(비면 `||` 로 빈 경로가 허용되므로 비었을 때는 더하지 않습니다).
+  [[ -z "${RD_TEAM_PR_RECORD:-}" ]] || allowed_set="${allowed_set}|${RD_TEAM_PR_RECORD}"
   allowed_set="${allowed_set}|"
 
   commits="$(git -C "$root" rev-list --first-parent "${baseline}..${head_oid}" 2>/dev/null)" || return 2
@@ -532,7 +537,14 @@ archive_publish_content_check() {
         # 있다 — $root 를 인자로 넘기지 않는다. 이후 이 함수가 repo 상태를 읽도록 바뀌면
         # 기대값이 호출자의 cwd 를 따라가는 잠재 결함이 되므로, 그때는 $root 기준으로
         # 다시 설계해야 한다 (Minor M4).
+        #
+        # **이전 초기본도 통과시킨다.** 2026-11-13 에 초기본을 배포 템플릿과 같게 바꿨다.
+        # 그 전 초기본(`## Request` 링크·`## Branch / Worktree` 의 `main`·`## Output Files` 절)으로
+        # 쓰인 발행 후보를 막지 않도록, 현재 초기본과 다르면 `emit_current_task_baseline_legacy` 와
+        # 한 번 더 비교한다. 두 기대값 모두 정적 heredoc 이므로 위 「$root 를 넘기지 않는다」 전제가
+        # 그대로 성립한다.
         emit_current_task_baseline > "$td/want.raw" || { rm -rf "$td"; return 2; }
+        emit_current_task_baseline_legacy > "$td/legacy.raw" || { rm -rf "$td"; return 2; }
         p_oid="$(_archive_blob_oid "$root" "$publish" "$rel")"; rc=$?
         if [[ "$rc" -eq 2 ]]; then rm -rf "$td"; return 2; fi
         if [[ "$rc" -eq 1 ]]; then
@@ -556,7 +568,8 @@ archive_publish_content_check() {
             else
               _archive_strip_comment_lines < "$td/want.raw" > "$td/want" || { rm -rf "$td"; return 2; }
               _archive_strip_comment_lines < "$td/pub.raw" > "$td/pub" || { rm -rf "$td"; return 2; }
-              if ! cmp -s "$td/want" "$td/pub"; then
+              _archive_strip_comment_lines < "$td/legacy.raw" > "$td/legacy" || { rm -rf "$td"; return 2; }
+              if ! cmp -s "$td/want" "$td/pub" && ! cmp -s "$td/legacy" "$td/pub"; then
                 printf 'archive:   %s 가 baseline 상태가 아닙니다 (주석 줄 제외 비교)\n' "$rel" >&2
                 diff "$td/want" "$td/pub" 2>/dev/null | sed 's/^/archive:     /' >&2
                 blocked=1
@@ -900,7 +913,53 @@ metadata_exists() {
 }
 
 # CURRENT_TASK.md baseline form (runtime accessible inline heredoc)
+# emit_current_task_baseline — 빈 CURRENT_TASK.md. 배포 템플릿 `CURRENT_TASK.md` 와 byte 단위로
+# 같아야 합니다(scripts/test_build_template.sh 가 대조합니다). 다르면 archive 를 거친 프로젝트의
+# `/tpl update` A3 판정이 사용자가 쓰지 않은 줄 때문에 두 파일을 보존합니다.
 emit_current_task_baseline() {
+  cat <<'EOF'
+# Current Task
+
+## Task
+-
+
+## Short Title
+-
+
+## Status
+대기 중
+<!-- 허용 상태값은 .claude/rules/rd-workflow/task-tracking.md 참조. 변경은 rd task set-status 경유 -->
+
+## Request
+REQUEST.md
+
+## Source FR
+-
+<!-- 권위는 rd-workflow-workspace/.lifecycle/task-state. 변경은 rd task set-source-fr 경유 -->
+<!-- 복수(묶은 작업)이면 미러 쓰기가 자동으로 한 줄에 1건씩 나열합니다 — 여기 직접 목록을 적지 않습니다 -->
+
+## Spec
+-
+
+## Plan
+-
+
+## Branch / Worktree
+-
+
+## Next Step
+<!-- 요약만 담는다: 실행 모드 / 완료 단계 / 현재 위치(리뷰 단계·산출물 경로 등 Status 필드에 없는 정보만 — Status 문자열 반복 금지) / 다음 행동 / 인계 사항 / 핵심 산출물. 라운드별 Finding 상세·이력은 Notes로. -->
+-
+
+## Notes
+-
+EOF
+}
+
+# emit_current_task_baseline_legacy — 2026-11-13 까지 archive·promote 가 쓰던 이전 초기본.
+# 정적 heredoc 이며 고치지 않습니다. 이 초기본으로 쓰인 발행 후보를 archive_publish_content_check
+# 가 막지 않게 하는 데만 씁니다. `_tpl_classify.py` 의 `A3_LEGACY_BASELINE` 이 같은 내용입니다.
+emit_current_task_baseline_legacy() {
   cat <<'EOF'
 # Current Task
 

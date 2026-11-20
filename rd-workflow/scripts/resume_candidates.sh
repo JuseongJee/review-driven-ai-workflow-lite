@@ -21,7 +21,7 @@ frs_ok=1
 frs_file="$RC_DIR/_fr_status.sh"
 if [ -r "$frs_file" ]; then . "$frs_file" 2>/dev/null; fi
 [ -n "${FR_STATUS_AWK:-}" ] || frs_ok=0
-ACTIVE_STATUS="대기 중|REQUEST review 대기|spec/plan 작성 중|spec/plan review 대기|구현 대기|구현 중|검증 중|diff review 대기|아카이브 보류"
+ACTIVE_STATUS="대기 중|REQUEST review 대기|spec/plan 작성 중|spec/plan review 대기|구현 대기|구현 중|검증 중|diff review 대기|아카이브 보류|PR 검토 중"
 
 common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || common=""
 if [ -z "$common" ]; then

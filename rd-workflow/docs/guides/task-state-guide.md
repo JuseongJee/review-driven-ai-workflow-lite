@@ -39,7 +39,7 @@
 |----|--------|--------|------|
 | `schema` | `1` | lifecycle | 파일 형식 버전 |
 | `short-title` | kebab-case slug \| `-` (sentinel) | `rd task set-status` / promote | LC-18: 단 한 번 설정, 이후 immutable |
-| `status` | canonical 10종 (아래 목록) | `rd task set-status` / guard | LC-19: 집합 불변 |
+| `status` | canonical 11종 (아래 목록) | `rd task set-status` / guard | LC-19: 집합 불변 |
 | `fr-branch` | `fr/<slug>` \| `null` | promote / archive | 활성 여부는 `!= null` 이 아니라 **ref 실재**로 판정 — 아래 'fr-branch 활성 판정' 참조 |
 | `worktree-path` | 절대 경로 \| `null` | promote / archive | worktree 미사용 시 `null` |
 | `source-fr` | `-`(sentinel) 또는 `\|` 로 구분한 backlog item path 목록(복수 가능) | promote / `rd task set-source-fr` / `rd task fr-done` | FR 출처 경로(들) — 저장은 `\|` 구분 한 줄(저장 전용 직렬화), 그 외 자리는 줄 단위 목록 — 아래 'source-fr 계약' 참조 |
@@ -54,7 +54,7 @@
 
 병렬 작업을 연달아 발행해 `stage_metrics.tsv` 가 `main` 병합에서 충돌하면 `archive.sh` 가 줄 합집합(`git merge-file --union`)으로 해소합니다. 합친 결과의 첫 줄이 정확한 헤더가 아니거나, 헤더가 두 번 이상 나오거나, 탭 4필드가 아닌 행(빈 줄 포함)이 있으면 해소하지 않고 충돌 상태로 멈춥니다. `FUTURE_REQUESTS.md` 와 함께 충돌해도 둘을 모두 해소하며, 그 밖의 파일이 섞이면 멈춥니다.
 
-### canonical 10종 Status (LC-19)
+### canonical 11종 Status (LC-19)
 
 ```
 대기 중
@@ -66,23 +66,29 @@ spec/plan review 대기
 검증 중
 diff review 대기
 아카이브 보류
+PR 검토 중
 완료
 ```
 
 `아카이브 보류` 의 의미는 「**리뷰 종결·발행 대기**」이며 **완료가 아닙니다.** final diff review 가 종결되고 종결 마커(`rd review seal`)를 만든 뒤, `archive.sh` 로 발행하기 전까지의 구간입니다. 이 상태에서만 `pre_commit_archive_gate.sh` 가 archive 기록 커밋(REQUEST 아카이브·FR done·completion report 등 워크플로 기록 경로만 바꾸는 커밋)을 통과시킵니다.
 
-전이는 네 가지입니다 (`_task_common.sh` 의 전이표가 단일 출처입니다).
+전이는 다음과 같습니다 (`_task_common.sh` 의 전이표가 단일 출처입니다).
 
 ```
 diff review 대기 → 아카이브 보류      리뷰 종결 후 진입
 아카이브 보류   → 완료                 발행 완료
 아카이브 보류   → 구현 중              리뷰 후 변경이 필요해 되돌아감
 아카이브 보류   → 검증 중              외부 검증을 기다리며 작업물을 커밋하는 경로
+아카이브 보류   → PR 검토 중           rd pr open 이 팀 저장소에 PR 을 올림
+PR 검토 중      → 아카이브 보류        rd pr check --apply 가 merge 를 확인하고 포인터를 옮김
+PR 검토 중      → 구현 중              수정 요청을 반영하러 돌아감
 ```
 
 되돌아가면 보호 경로가 바뀌므로 기존 마커의 트리 해시가 어긋나고, 재리뷰·재seal 없이는 다시 발행할 수 없습니다.
 
-외부 검증 대기 절차는 `아카이브 보류` → `검증 중` → 작업물 커밋 → 검증 후 `검증 중` → `diff review 대기` → (보호 트리가 바뀌었으면 재seal) → `아카이브 보류` → 발행입니다. 이미 작성돼 워킹트리에 있던 파일을 그대로 커밋하면 seal 의 보호 트리 해시는 바뀌지 않고, 보호 트리 내용을 바꾸면 재seal 이 필요합니다. `archive.sh` 는 Status 를 읽지 않으므로 대기 중 `archive.sh` 를 돌리지 않는 것은 절차이고 기계적 차단은 없습니다.
+외부 검증 대기 절차는 `아카이브 보류` → `검증 중` → 작업물 커밋 → 검증 후 `검증 중` → `diff review 대기` → (보호 트리가 바뀌었으면 재seal) → `아카이브 보류` → 발행입니다. 이미 작성돼 워킹트리에 있던 파일을 그대로 커밋하면 seal 의 보호 트리 해시는 바뀌지 않고, 보호 트리 내용을 바꾸면 재seal 이 필요합니다. `archive.sh` 는 발행 대상 커밋의 Status 가 `아카이브 보류` 가 아니면 merge·push 전에 거부하므로 대기 상태에서는 발행되지 않습니다(건너뛰려면 `--allow-status-mismatch <사유>`).
+
+`PR 검토 중` 은 「seal 을 마치고 팀 저장소에 PR 을 올렸으며 merge 를 기다리는 상태」이며 **완료가 아닙니다.** 진행 중 작업이고 `rd task list` 가 submodule 별 PR 상태와 다음 행동을 보입니다. `pre_commit_archive_gate.sh` 는 이 상태에서 변경이 전부 워크플로 기록 경로(PR 기록 `rd-workflow-workspace/.lifecycle/team-prs.tsv` 포함)인 커밋만 통과시키고 코드를 바꾸는 커밋은 막습니다. 발행 요청(`rd publish request`)은 `아카이브 보류` 만 받으므로 이 상태에서는 거부됩니다. 흐름의 정본은 `rd-workflow/docs/flows/WORKFLOW.md` 「`PR 검토 중` — 팀 저장소 반영」 절입니다.
 
 **게이트가 보는 것은 index 만이 아닙니다.** hook 은 커밋 명령이 실행되기 **전**에 돌므로, `git commit -a`·`git commit <경로>` 처럼 커밋 집합을 명령 실행 중에 만드는 형태에서는 index 가 비어 있습니다. 그래서 판정 대상은 **index ∪ 워킹트리(추적 파일)** 이고, 보류 상태에서 기록 경로 밖의 파일이 **수정되어 있기만 해도** 커밋이 막힙니다. 코드 변경이 필요해진 것이므로 복구 경로는 상태를 되돌리는 것입니다: `bash rd-workflow/scripts/rd task set-status "구현 중"`.
 
@@ -149,21 +155,20 @@ created-at=2026-07-05-1030
 - **done 처리**: `rd task fr-done` 이 묶은 FR 전부의 `items/` status 와 `FUTURE_REQUESTS.md` 인덱스 행 status 를 함께 `done` 으로 바꾼다(각각 독립 판정 — 한쪽만 종료 상태여도 다른 쪽을 마저 갱신). **인덱스 행 삭제는 여전히 `/fr archive` 몫**이고 **발행(merge·tag·push)은 `archive.sh` 몫**이다(둘 다 변경 없음). 실패해도 발행은 막지 않는다 — 결과는 completion report 의 「FR 정리 결과」 절로 옮겨 발행 결과와 분리 보고하고, 재시도 대상은 아카이브된 REQUEST 사본의 `## Source FR` 과 그 보고서 절에서 회수한다.
 - **정정 CLI**: `bash rd-workflow/scripts/rd task source-fr` (조회, 줄 단위 목록 출력), `bash rd-workflow/scripts/rd task set-source-fr <값>...` (검증 후 설정 — 직접 파일 편집 금지), `bash rd-workflow/scripts/rd task fr-done [<값>...]` (done 처리).
 
-### guard 판정 (`task_guard_decide`, 7순위)
+### guard 판정 (`task_guard_decide`, 6순위)
 
-`rd task guard --candidate <slug> --mode <intake|promote|fr-add> [--source-fr <path> ...] [--dry-run]` 의 판정 순서다. `--dry-run` 은 같은 decision 을 내고 「상태 변경」 칸을 적용하지 않는다(`dry-run=yes` 출력). task-state 가 없는 저장소에서는 판정 없이 exit 3 으로 멈추고 `rd task status` 를 먼저 실행하라고 안내한다. `planning-design-intake`·`request-to-reviewed-plan` 은 이 함수 하나를 mode 만 다르게 호출하므로(`rd-workflow/docs/flows/WORKFLOW.md` 「Short Title 계약」 참조), 판정표는 **이 절 하나만 정본으로 둔다.**
+`rd task guard --candidate <slug> --mode <intake|promote> [--source-fr <path> ...] [--dry-run]` 의 판정 순서다. `--dry-run` 은 같은 decision 을 내고 「상태 변경」 칸을 적용하지 않는다(`dry-run=yes` 출력). task-state 가 없는 저장소에서는 판정 없이 exit 3 으로 멈추고 `rd task status` 를 먼저 실행하라고 안내한다. `planning-design-intake`·`request-to-reviewed-plan` 은 이 함수 하나를 mode 만 다르게 호출하므로(`rd-workflow/docs/flows/WORKFLOW.md` 「Short Title 계약」 참조), 판정표는 **이 절 하나만 정본으로 둔다.**
 
 | 순위 | 조건 | decision | 상태 변경 |
 |---|---|---|---|
 | 1 | 현재 Short Title 이 빈 값/`-` | `write` | `short-title`(+promote 는 `source-fr`) |
 | 2 | 현재 값 == candidate | `proceed-readonly` | 없음 |
-| 3 | `mode == fr-add` | `proceed-readonly` | 없음 |
-| 4 | candidate 가 현재 task-state 의 `source-fr` 집합 구성원과 slug 일치 (mode 무관) | `proceed-readonly` | 없음 |
-| 5 | `fr-branch` **활성** (아래 'fr-branch 활성 판정' 참조) | `block-active` | 없음 |
-| 6 | `## Status == 대기 중` | `rebind` | `short-title` 교체(+promote 는 `source-fr` 교체) |
-| 7 | 그 외 | `block-active` | 없음 |
+| 3 | candidate 가 현재 task-state 의 `source-fr` 집합 구성원과 slug 일치 (mode 무관) | `proceed-readonly` | 없음 |
+| 4 | `fr-branch` **활성** (아래 'fr-branch 활성 판정' 참조) | `block-active` | 없음 |
+| 5 | `## Status == 대기 중` | `rebind` | `short-title` 교체(+promote 는 `source-fr` 교체) |
+| 6 | 그 외 | `block-active` | 없음 |
 
-순위 4 는 「통합 slug 작업이 자기 source FR 로 재진입」하는 정상 흐름을 보호하고, 순위 5 는 「승격 완료 + 무관 후보」를 막는다(둘 다 신설 — 이전에는 순위 6/7 만 있었다). 자동 정합화는 하지 않는다 — rename(ref 실재 + slug 불일치)은 순위 5 로 차단되고, message 에 현재 Short Title 과 `fr-branch` slug 를 함께 보이며 사람이 ① 제목을 브랜치 slug 에 맞춰 그 작업을 계속하거나 ② 그 작업을 archive 하는 것 중 하나를 고른다.
+순위 3 은 「통합 slug 작업이 자기 source FR 로 재진입」하는 정상 흐름을 보호하고, 순위 4 는 「승격 완료 + 무관 후보」를 막는다(둘 다 신설 — 이전에는 순위 5/6 만 있었다). 자동 정합화는 하지 않는다 — rename(ref 실재 + slug 불일치)은 순위 4 로 차단되고, message 에 현재 Short Title 과 `fr-branch` slug 를 함께 보이며 사람이 ① 제목을 브랜치 slug 에 맞춰 그 작업을 계속하거나 ② 그 작업을 archive 하는 것 중 하나를 고른다.
 
 ### fr-branch 활성 판정
 
@@ -248,7 +253,7 @@ extensions.<ext-name>.<key>=<value>
 2. `task-state` 부재, `CURRENT_TASK.md` 존재:
    - CURRENT_TASK.md의 `## Status` 섹션에서 Status를 추출합니다.
    - legacy alias `실행 중` → `구현 중` 자동 변환합니다.
-   - Status가 canonical 10종이 아니면 **fail-closed**: task-state를 만들지 않고 exit 3 + 복구 안내 메시지 출력(SEC-13).
+   - Status가 canonical 11종이 아니면 **fail-closed**: task-state를 만들지 않고 exit 3 + 복구 안내 메시지 출력(SEC-13).
    - `active-fr`(있으면)에서 fr-branch / worktree-path / short-title을 추출합니다.
    - 백업 저장: `.lifecycle/migration-backup/<YYYYMMDD-HHMMSS>/CURRENT_TASK.md` 및 `active-fr`
    - task-state 생성 후 active-fr 삭제(단일 트랜잭션 — 임시 파일 + mv).
@@ -264,7 +269,7 @@ rd-workflow-workspace/.lifecycle/migration-backup/<YYYYMMDD-HHMMSS>/
 
 ### 실패 시 복구
 
-1. `CURRENT_TASK.md`의 `## Status` 값을 canonical 10종 중 하나로 수정합니다.
+1. `CURRENT_TASK.md`의 `## Status` 값을 canonical 11종 중 하나로 수정합니다.
 2. task-state 파일이 잔존하면 삭제합니다(`rm rd-workflow-workspace/.lifecycle/task-state`).
 3. `bash rd-workflow/scripts/rd task status` 재실행 → 마이그레이션 재시도.
 

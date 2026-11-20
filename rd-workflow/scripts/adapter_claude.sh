@@ -2,6 +2,8 @@
 # adapter_claude.sh — Claude Code CLI 어댑터 (self-review, background 실행 + watchdog+wait)
 # 환경변수: SESSION_PATH, PROMPT_FILE, EXPECTED_TURN_FILE,
 #           TOOL_BIN, PROJECT_ROOT,
+#           TOOL_MODEL  (선택 — 빈 값이면 --model 을 붙이지 않음 = CLI 기본값)
+#           TOOL_EFFORT (선택 — 빈 값이면 --effort 를 붙이지 않음 = CLI 기본값)
 #           SELF_REVIEW_WARNING (default: true)
 #
 # codex 와 같은 대기 계약(review_wait.sh 공유)을 쓴다. codex 와 다른 것은 호출 형태
@@ -447,6 +449,7 @@ RW_LOG_FD=5
 # --- spawn — background + 독립 pgid + 내부 fd 닫아 전달 ---
 model_args=()
 [[ -n "${TOOL_MODEL:-}" ]] && model_args=(--model "$TOOL_MODEL")
+[[ -n "${TOOL_EFFORT:-}" ]] && model_args+=(--effort "$TOOL_EFFORT")
 
 # stream-json 으로 바꾸는 이유는 활동 신호다 — 현행 `-p` 는 종료 직전까지 아무 출력도
 # 내지 않아(실측: 29.83초 전 구간 무출력) 유휴 판별이 불가능하다.

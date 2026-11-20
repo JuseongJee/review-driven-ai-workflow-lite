@@ -199,6 +199,72 @@ sec "$PS6" 'NOT inlined' | grep -qF "$STD_REL (size)"
 chk $? "standards-large 예산을 넘는 큰 표준은 디스크 읽기 목록에 남음"
 rm -f "$STD"
 
+echo "=== 6턴 뒤 범위 축소 · 이미 정한 범위 밖 (review-loop-formal-closure) ==="
+gen_turn() { # gen_turn <out> <다음 턴 번호>
+  build_review_prompt "$1" \
+    "$SD" "$SD/SESSION.md" "$SD/CHECKPOINT.md" "$SD/USER_ACTION.md" \
+    "$SD/turns/001_claude.md" "$SD/turns/$2_reviewer.md" \
+    request-review "TARGET.md" "goal" "20" "$2" 2>/dev/null
+}
+gen_turn "$TMP/n6.txt" 006
+! grep -q 'SCOPE NARROWING' "$TMP/n6.txt"; chk $? "축소: 턴 006 지시에는 축소 블록 없음"
+! grep -q 'ALREADY DECIDED OUT OF SCOPE' "$TMP/n6.txt"; chk $? "범위 밖: 출처가 없으면 블록 없음"
+gen_turn "$TMP/n8.txt" 008
+grep -q 'SCOPE NARROWING (this session has passed 6 turns)' "$TMP/n8.txt"; chk $? "축소: 턴 008 지시에 축소 블록"
+grep -q 'data loss or a security problem in any environment' "$TMP/n8.txt"; chk $? "축소: 데이터 손실·보안은 환경과 상관없이 보호"
+grep -qF '"범위 밖: <location> — <content> — <reason>"' "$TMP/n8.txt"; chk $? "축소: 범위 밖 줄 형식"
+grep -q 'remove it from Open Issues' "$TMP/n8.txt"; chk $? "축소: 범위 밖이 된 열린 이의를 Open Issues 에서 뺌"
+
+# 출처 두 곳: REQUEST Constraints 줄, short-title 이 같고 promote 의 base-commit 에 없던 세션의 Reviewer 턴 줄
+printf '\n## Branch Context\n- short-title: oos-task\n' >> "$TMP/$SD/SESSION.md"
+mkdir -p "$TMP/rd-workflow-workspace/.lifecycle"
+mk_prev() { # mk_prev <세션 이름> <short-title> <범위 밖 줄>
+  mkdir -p "$TMP/$1/turns"
+  printf '# Review Session\n\n## Branch Context\n- short-title: %s\n' "$2" > "$TMP/$1/SESSION.md"
+  printf '# 008 Reviewer\n\n## Summary\n\n%s\n' "$3" > "$TMP/$1/turns/008_reviewer.md"
+}
+mk_prev 20261120_130000_request-review oos-task '범위 밖: a.sh:3 — Host * 순서 — 드문 환경'
+mk_prev 20261120_110000_request-review oos-task '범위 밖: old.sh:1 — 옛 작업 결정 — 같은 slug'
+RP=rd-workflow-workspace/handoffs/review_pipeline
+mk_prev "$RP/20261120_110500_request-review" oos-task '범위 밖: old2.sh:1 — 기본 체크아웃 옛 작업 결정 — 같은 slug'
+# 같은 이름의 옛 작업 세션은 기본 브랜치에 이미 있다 = base-commit 에 있다
+git -C "$TMP" init -q && git -C "$TMP" add 20261120_110000_request-review "$RP/20261120_110500_request-review" \
+  && git -C "$TMP" -c user.name=t -c user.email=t@t commit -q -m base
+printf 'base-commit=%s\n' "$(git -C "$TMP" rev-parse HEAD)" > "$TMP/rd-workflow-workspace/.lifecycle/task-state"
+mk_prev 20261120_140000_request-review other-task '범위 밖: b.sh:1 — 다른 작업 결정 — 무관'
+printf '# Change Request\n\n## Constraints\n- 범위 밖: colima 비기본 경로 — 사람 결정\n\n## Acceptance Criteria\n- 범위 밖: 여기는 AC 절\n' > "$TMP/REQUEST.md"
+gen_turn "$TMP/d2.txt" 002
+grep -qF -- '- REQUEST: 범위 밖: colima 비기본 경로 — 사람 결정' "$TMP/d2.txt"; chk $? "범위 밖: REQUEST Constraints 줄 전달"
+grep -qF -- '- 20261120_130000_request-review 턴 008: 범위 밖: a.sh:3 — Host * 순서 — 드문 환경' "$TMP/d2.txt"; chk $? "범위 밖: 같은 작업의 앞 세션 Reviewer 턴 줄 전달"
+! grep -q '옛 작업 결정' "$TMP/d2.txt"; chk $? "범위 밖: base-commit 에 있던 같은 이름 옛 작업의 줄은 제외"
+! grep -q '다른 작업 결정' "$TMP/d2.txt"; chk $? "범위 밖: short-title 이 다른 세션의 줄은 제외"
+! grep -q '여기는 AC 절' "$TMP/d2.txt"; chk $? "범위 밖: Constraints 밖의 줄은 제외"
+grep -q 'Exception: if new evidence shows data loss' "$TMP/d2.txt"; chk $? "범위 밖: 새 근거의 보호 범주 결함은 이의 허용"
+# 기록 커밋 뒤 리뷰는 보관본을 읽지만, 그 뒤 사람 결정은 루트 REQUEST.md 에 적힌다
+printf '# Change Request\n\n## Constraints\n-\n' > "$TMP/archived.md"
+REVIEW_REQUEST_FILE=archived.md gen_turn "$TMP/d3.txt" 002
+grep -qF -- '- REQUEST: 범위 밖: colima 비기본 경로 — 사람 결정' "$TMP/d3.txt"; chk $? "범위 밖: 보관본을 읽는 리뷰에도 루트 REQUEST 의 사람 결정 전달"
+# promote 전에 기본 체크아웃에서 연 REQUEST review(이름에 slug 가 없어 promote 가 옮기지 않음)의 줄이
+# worktree 에서 연 다음 리뷰에 넘어간다
+mkdir -p "$TMP/$RP/20261120_120500_request-review/turns"
+printf '# Review Session\n\n## Branch Context\n- short-title: oos-task\n' > "$TMP/$RP/20261120_120500_request-review/SESSION.md"
+printf '# 008 Reviewer\n\n## Summary\n\n범위 밖: c.sh:1 — 기본 체크아웃 REQUEST 리뷰 결정 — 드문 환경\n' > "$TMP/$RP/20261120_120500_request-review/turns/008_reviewer.md"
+git -C "$TMP" worktree add -q "$TMP/wt" 2>/dev/null
+WS="$RP/20261120_130500_spec-plan-review"
+mkdir -p "$TMP/wt/$WS/turns" "$TMP/wt/rd-workflow-workspace/.lifecycle"
+printf '# Review Session\n\n## Branch Context\n- short-title: oos-task\n' > "$TMP/wt/$WS/SESSION.md"
+cp "$TMP/rd-workflow-workspace/.lifecycle/task-state" "$TMP/wt/rd-workflow-workspace/.lifecycle/task-state"
+PROJECT_ROOT="$TMP/wt" build_review_prompt "$TMP/d5.txt" "$WS" "$WS/SESSION.md" "$WS/CHECKPOINT.md" "$WS/USER_ACTION.md" \
+  "$WS/turns/001_author.md" "$WS/turns/002_reviewer.md" spec-plan-review "TARGET.md" "goal" "20" "002" 2>/dev/null
+grep -qF -- '- 20261120_120500_request-review 턴 008: 범위 밖: c.sh:1 — 기본 체크아웃 REQUEST 리뷰 결정 — 드문 환경' "$TMP/d5.txt"; chk $? "범위 밖: 기본 체크아웃에 남은 같은 작업 REQUEST 리뷰 결정이 worktree 리뷰에 전달"
+! grep -q '기본 체크아웃 옛 작업 결정' "$TMP/d5.txt"; chk $? "범위 밖: worktree 리뷰에도 기본 체크아웃의 base-commit 에 있던 옛 작업 줄은 제외"
+git -C "$TMP" worktree remove --force "$TMP/wt" 2>/dev/null
+# base-commit 이 없으면(promote 를 거치지 않은 작업) 다른 세션의 줄을 물려받지 않는다
+printf 'short-title=oos-task\n' > "$TMP/rd-workflow-workspace/.lifecycle/task-state"
+gen_turn "$TMP/d4.txt" 002
+! grep -q 'Host \* 순서' "$TMP/d4.txt"; chk $? "범위 밖: base-commit 이 없으면 다른 세션의 줄은 제외"
+rm -rf "$TMP/REQUEST.md" "$TMP/rd-workflow-workspace" "$TMP"/20261120_* "$TMP/.git"
+
 echo "=== 기준 문서 크기 상한 (4096 B) ==="
 # 기준 문서가 커지면 최신 Author 턴이 조용히 디스크 읽기로 밀려나는데 다른 곳에는 이를 잡는 장치가 없다.
 CRIT_DIR="${script_dir}/../docs/prompts/review"

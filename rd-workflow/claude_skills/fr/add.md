@@ -20,12 +20,12 @@
    {사용자 원문}
    CAPTURE_EOF
    ```
-   `--title` 은 반드시 넘깁니다 — Step 2 에서 확정한 short-title 을 그대로 씁니다. 생략하면 진행 중 작업의 Short Title(5단계에서 건드리지 않기로 한 값)이 아니라 `untitled` 로 저장되어 사후 정정이 필요합니다.
+   `--title` 은 반드시 넘깁니다 — Step 2 에서 확정한 short-title 을 그대로 씁니다. 생략하면 진행 중 작업의 Short Title 이 아니라 `untitled` 로 저장되어 사후 정정이 필요합니다.
    (`--source`: 직접 호출이면 `--source direct`, 자연어 라우팅이면 `--source routed`. CLI 기본값은 `routed`)
    충돌 시 `-2`, `-3` suffix.
    캡처 실패 시 경고만 — FR 등록 차단 안 함 — CLI 가 fail-open (exit 0) 으로 처리.
 
-3.5. **인덱스 머리행 사전 검사** — 4단계(상세 파일)·5단계(Short Title 기록)·6단계(인덱스)를 하기 전에, 아래 6-b 명령을 `FR_MODE=check` 로 한 번 실행합니다. 이 실행은 아무것도 쓰지 않습니다. rc 가 0 이 아니면 stderr 문장을 그대로 사용자에게 보이고 등록을 멈춥니다(4·5·6단계를 하지 않습니다). 상세 파일과 Short Title 이 바뀌지 않았으므로, 머리행을 고친 뒤 같은 short-title 로 다시 등록할 수 있습니다.
+3.5. **인덱스 머리행 사전 검사** — 4단계(상세 파일)·6단계(인덱스)를 하기 전에, 아래 6-b 명령을 `FR_MODE=check` 로 한 번 실행합니다. 이 실행은 아무것도 쓰지 않습니다. rc 가 0 이 아니면 stderr 문장을 그대로 사용자에게 보이고 등록을 멈춥니다(4·6단계를 하지 않습니다). 상세 파일과 인덱스가 바뀌지 않았으므로, 머리행을 고친 뒤 같은 short-title 로 다시 등록할 수 있습니다.
 
 4. 상세 파일 생성: `rd-workflow-workspace/backlog/items/YYYY-MM-DD-{short-title}.md`
 
@@ -46,19 +46,11 @@
 - request seed: {REQUEST로 만들 때 쓸 초안, 없으면 summary 반복}
 ```
 
-5. `CURRENT_TASK.md ## Short Title` 갱신 분기:
-
-   `bash rd-workflow/scripts/rd task guard --candidate "<short-title>" --mode fr-add` 를 실행하고 출력의 `decision` 에 따라 진행합니다:
-   - `write`: `message` 를 사용자에게 알리고 진행 (task-state `short-title` 이 sentinel `-` 인 경우 — LC-18 write 진입점)
-   - `proceed-readonly`: 변경 없이 진행 (진행 중 작업이 있어 Short Title 을 건드리지 않고 FR 등록만 계속)
-
-   이 명령은 판정만 하지 않습니다 — `write` 이면 부른 순간 Short Title 을 기록합니다. 그래서 중복 확인 등 앞 단계를 마친 뒤 이 5단계에서 한 번만 부릅니다. 상태만 미리 보려면 `--dry-run` 을 붙입니다(같은 `decision` 을 내고 아무것도 쓰지 않습니다). 예외: task-state 가 아직 없는 저장소에서는 판정 없이 exit 3 으로 멈추므로 `rd task status` 를 먼저 한 번 실행합니다.
-
-   fr-add 모드는 차단이 없습니다 (`block-*` decision 발생 안 함). task-state의 `short-title` 키가 부재이거나 값이 비어있으면 CLI 가 `proceed-readonly` 를 반환하고, FR 등록 절차(인덱스 + items/ + FR 캡처)는 정상 계속합니다.
+5. Short Title 은 건드리지 않습니다. 등록은 작업 상태(`CURRENT_TASK.md`·task-state)를 바꾸지 않으며, 이름은 착수할 때 promote 가 정합니다.
 
 6. `FUTURE_REQUESTS.md`의 `## 인덱스` 테이블 끝에 행 추가:
 
-   **이 6단계가 인덱스 행 추가의 정본 절차입니다.** 활성 인덱스에 행을 새로 넣는 경로는 `/fr add`·`/fr pull`(새 FR 생성)·`/fr status`(비활성 → 활성 복원) 셋이며, 셋 모두 아래 6-a → 6-b → 6-c 를 순서대로 그대로 수행합니다. 어느 한 단계도 건너뛰지 않습니다.
+   **이 6단계가 인덱스 행 추가의 정본 절차입니다.** 활성 인덱스에 행을 새로 넣는 경로는 `/fr add`·`/fr take`(Issue 로 새 FR 생성)·`/fr status`(비활성 → 활성 복원) 셋이며, 셋 모두 아래 6-a → 6-b → 6-c 를 순서대로 그대로 수행합니다. 어느 한 단계도 건너뛰지 않습니다.
 
    **6-a. 헤더 이관 (행을 붙이기 전)** — `## 인덱스` 아래 첫 `|` 행에 `관계` 칸이 없으면 `관계` 이전 형식을 쓰던 기존 설치입니다. 이때는 헤더·구분선·기존 행을 먼저 한 번에 이관하고 그 뒤에 새 행을 붙입니다. 아래 명령을 그대로 실행합니다 — 헤더에 `관계` 가 이미 있으면 아무것도 바꾸지 않으므로 매번 실행해도 안전합니다:
 
@@ -129,7 +121,7 @@
    | 상태 | `FR_STATUS` (`/fr add` 는 `idea`) |
    | 우선순위 | `FR_PRIORITY` (`/fr add` 는 `-`) |
    | 관계 | `FR_RELATION` |
-   | GitHub | `FR_GITHUB` |
+   | GitHub | `FR_GITHUB` (`/fr add` 는 `-`) |
    | 상세 | `[상세](items/{FR_DATE}-{FR_TITLE}.md)` (명령이 만듭니다) |
 
    <!-- fr-index-row:begin -->
@@ -197,7 +189,7 @@
    ```
    <!-- fr-index-row:end -->
 
-   명령은 쓰기 전에 머리행을 검사하고, 검사에 실패하면 rc=3 과 한 줄 안내를 stderr 로 내며 파일을 바꾸지 않습니다. 검사 항목은 네 가지입니다: 머리행과 구분선이 있음 / 모든 칸 이름이 위 표의 9개 중 하나임 / `상세` 칸이 있음 / `관계` 칸이 없으면 `우선순위` 칸이 있음(6-a 이관 조건). rc≠0 이면 안내 문장을 그대로 사용자에게 보이고 멈춥니다. 머리행에 없는 칸의 값은 넣지 않습니다(`종류` 칸이 없는 옛 설치에서는 `FR_KIND` 를 쓰지 않습니다). 값의 `|` 는 명령이 `\|` 로 이스케이프하고 이미 `\|` 인 것은 그대로 둡니다 — 이스케이프하지 않으면 GFM 이 그 자리에서 칸을 쪼개 표가 깨지고, `archive.sh` 의 인덱스 충돌 자동 병합(`merge_fr_index.sh`)이 그 행을 거부해 발행이 중단됩니다. 그래서 값은 `awk -v` 가 아니라 `ENVIRON` 으로 받습니다(`-v` 는 `\` 를 해석해 `\|` 를 망가뜨립니다). `sed -i` 는 쓰지 않습니다. 쓰기 모드는 `"$INDEX.lock"` 폴더를 `mkdir` 로 잡아 이 명령의 동시 실행을 한 번에 하나로 줄이고, 실행마다 고유한 임시 파일(`mktemp "$INDEX.XXXXXX"`)에 쓴 뒤 `mv` 로 교체하고 잠금을 풉니다. 같은 임시 파일을 여러 실행이 함께 쓰거나 읽기와 교체 사이에 다른 실행이 끼면 기존 행이나 다른 등록의 행을 잃기 때문입니다. 잠금을 10초 안에 잡지 못하면 rc=4 와 안내를 내고 아무것도 쓰지 않습니다. 강제 종료로 잠금 폴더가 남았으면 안내대로 그 폴더를 지운 뒤 다시 실행합니다. 이 잠금은 이 명령끼리만 직렬화합니다. GitHub 연동이 활성이면 아래 `GitHub 연동` 섹션의 절차로 GitHub 정보를 추가합니다 (인덱스에 GitHub 컬럼이 별도로 있는 변형 형식을 쓰는 경우에만 해당).
+   명령은 쓰기 전에 머리행을 검사하고, 검사에 실패하면 rc=3 과 한 줄 안내를 stderr 로 내며 파일을 바꾸지 않습니다. 검사 항목은 네 가지입니다: 머리행과 구분선이 있음 / 모든 칸 이름이 위 표의 9개 중 하나임 / `상세` 칸이 있음 / `관계` 칸이 없으면 `우선순위` 칸이 있음(6-a 이관 조건). rc≠0 이면 안내 문장을 그대로 사용자에게 보이고 멈춥니다. 머리행에 없는 칸의 값은 넣지 않습니다(`종류` 칸이 없는 옛 설치에서는 `FR_KIND` 를 쓰지 않습니다). 값의 `|` 는 명령이 `\|` 로 이스케이프하고 이미 `\|` 인 것은 그대로 둡니다 — 이스케이프하지 않으면 GFM 이 그 자리에서 칸을 쪼개 표가 깨지고, `archive.sh` 의 인덱스 충돌 자동 병합(`merge_fr_index.sh`)이 그 행을 거부해 발행이 중단됩니다. 그래서 값은 `awk -v` 가 아니라 `ENVIRON` 으로 받습니다(`-v` 는 `\` 를 해석해 `\|` 를 망가뜨립니다). `sed -i` 는 쓰지 않습니다. 쓰기 모드는 `"$INDEX.lock"` 폴더를 `mkdir` 로 잡아 이 명령의 동시 실행을 한 번에 하나로 줄이고, 실행마다 고유한 임시 파일(`mktemp "$INDEX.XXXXXX"`)에 쓴 뒤 `mv` 로 교체하고 잠금을 풉니다. 같은 임시 파일을 여러 실행이 함께 쓰거나 읽기와 교체 사이에 다른 실행이 끼면 기존 행이나 다른 등록의 행을 잃기 때문입니다. 잠금을 10초 안에 잡지 못하면 rc=4 와 안내를 내고 아무것도 쓰지 않습니다. 강제 종료로 잠금 폴더가 남았으면 안내대로 그 폴더를 지운 뒤 다시 실행합니다. 이 잠금은 이 명령끼리만 직렬화합니다.
 
    `관계` 값 형식은 `series:<name>#N/M; dep:<stem>,<stem>` 이고 관계가 없으면 `-` 입니다. 상세 파일의 `depends-on`·`series` 와 정확히 일치해야 합니다.
 
@@ -209,7 +201,7 @@
 
    이미 앞머리가 있는 요약을 옮겨 적을 때는 새로 만들지 않고 그대로 보존합니다. 관계 칸·앞머리·상세 필드 셋 중 하나라도 어긋나면 `fr_relations.sh validate` 가 `self_test.sh skills` 에서 비-0 으로 막습니다.
 
-6.5. **기본 브랜치 등록 커밋** — 등록 결과가 fr 브랜치와 함께 유실되지 않도록, 호출 브랜치와 무관하게 기본 브랜치에 커밋합니다. **GitHub 연동이 활성이면 아래 `GitHub 연동` 절차(상세·인덱스 행에 issue 정보 반영)를 먼저 마친 뒤 한 번만 호출합니다** — 등록 커밋 뒤에 행·상세를 고치면 기본 브랜치의 원본과 fr 브랜치의 수정본이 같은 경로에서 갈라져 archive 가 인덱스 단독 충돌로 처리하지 못합니다(상세 add/add 충돌):
+6.5. **기본 브랜치 등록 커밋** — 등록 결과가 fr 브랜치와 함께 유실되지 않도록, 호출 브랜치와 무관하게 기본 브랜치에 커밋합니다. 등록 커밋 뒤에 행·상세를 고치면 기본 브랜치의 원본과 fr 브랜치의 수정본이 같은 경로에서 갈라져 archive 가 인덱스 단독 충돌로 처리하지 못하므로(상세 add/add 충돌), 행·상세를 다 쓴 뒤 한 번만 호출합니다:
 
    ```bash
    bash rd-workflow/scripts/rd task fr-register --slug {short-title}
@@ -226,32 +218,21 @@
 
 > FR 등록: **{short-title}** — {summary}
 > FR 등록 커밋: {기본 브랜치} {해시}   ← 6.5 의 둘째 줄 (skipped 면 경고 줄)
+> 팀에 넘기려면 `/fr push {short-title}` 을 요청하십시오.   ← 팀 대기열이 있는 저장소에서만
+
+   셋째 줄은 팀 대기열이 있는 저장소에서만 출력합니다. `rd-workflow/config/workflow.json` 의 `issue_queue_repos` 에 빈 문자열이 아닌 값이 있거나, `.gitmodules` 에 저장소로 해석되는 submodule URL 이 있으면 대기열이 있습니다(`issue_queue.sh repos` 의 대상 결정 순서). 둘 다 없어 origin 으로 폴백하는 저장소는 혼자 쓰는 저장소로 보고 이 줄을 생략합니다. `/fr push` 자체는 그런 저장소에서도 그대로 동작합니다. 프로젝트 루트에서 아래 명령이 0 으로 끝나면 출력하고, 1 이면 생략합니다:
+
+   ```bash
+   bash rd-workflow/scripts/issue_queue.sh has-team-queue
+   ```
 
 ### 규칙
 
-- **한 세션에서 여러 건을 등록해도 `CURRENT_TASK.md ## Short Title` 은 첫 등록으로 고정됩니다** (5단계 guard 의 `write`/`proceed-readonly` 분기).
-- **reset**: 위 5단계에서 잘못 고정된 Short Title 을 되돌려야 하면 `bash rd-workflow/scripts/rd task set-title -` 를 씁니다. 허용 조건은 `Status == 대기 중` **그리고** `fr-branch` 가 활성이 아님(값이 비었거나 그 브랜치 ref 가 없음) 이며, 둘 다 성립해야 `short-title`·`source-fr` 을 함께 sentinel(`-`)로 되돌립니다. **`--force` 로는 reset 되지 않습니다** — 이 경로는 진행 중 작업 보호의 우회 통로를 열지 않기 위해 의도적으로 `--force` 를 받지 않으며, 조건 미충족·force 동반 모두 상태를 바꾸지 않고 사유만 알립니다. 정말 막혔다면 그 작업을 archive 하는 것이 정본 경로입니다.
+- **reset**: 이전 버전의 `/fr add` 가 기본 체크아웃에 Short Title 을 남겼으면 `bash rd-workflow/scripts/rd task set-title -` 를 씁니다. 허용 조건은 `Status == 대기 중` **그리고** `fr-branch` 가 활성이 아님(값이 비었거나 그 브랜치 ref 가 없음) 이며, 둘 다 성립해야 `short-title`·`source-fr` 을 함께 sentinel(`-`)로 되돌립니다. **`--force` 로는 reset 되지 않습니다** — 이 경로는 진행 중 작업 보호의 우회 통로를 열지 않기 위해 의도적으로 `--force` 를 받지 않으며, 조건 미충족·force 동반 모두 상태를 바꾸지 않고 사유만 알립니다. 정말 막혔다면 그 작업을 archive 하는 것이 정본 경로입니다.
 - 같은 short-title이 인덱스에 이미 있거나 `items/` 에 같은 파일명이 존재하면 등록하지 않고 사용자에게 알립니다. (done/dropped로 인덱스에서 삭제된 항목도 상세 파일이 남아있으므로 파일 존재 여부를 반드시 확인합니다.) 기본 브랜치의 `items/` 에 같은 파일이 있는지도 확인합니다 (`git cat-file -e <기본 브랜치>:rd-workflow-workspace/backlog/items/<파일>`) — fr 브랜치 세션에서는 현재 트리에 없어도 기본 브랜치에 이미 등록된 FR 이 있을 수 있습니다.
 - 입력이 너무 짧아서 summary를 만들 수 없으면 한 줄 질문으로 보충을 요청합니다.
 - FUTURE_REQUESTS.md의 기존 형식(테이블 구조, 상태 값)을 변경하지 않습니다.
 - 이 subcommand는 FR 등록만 합니다. REQUEST.md 작성이나 구현은 하지 않습니다.
 - 등록 대상이 rd-workflow 인프라 자체의 결함이면(소비 프로젝트 한정) FR로 등록하지 않고 `rd-workflow/docs/guides/workflow-defect-reporting.md` 규약(보고 파일 생성)을 따릅니다.
-- GitHub 연동 시 Issue 생성 실패가 로컬 FR 등록을 막지 않습니다.
-
-### GitHub 연동
-
-**모델 자기호출이면 이 절을 실행하지 않습니다.** 사용자의 명시 요청 없이 모델이 스스로 `/fr add` 를 호출한 경우, `fr_github` 가 활성이어도 로컬 등록에서 멈추고 "GitHub Issue 발행은 사용자 요청이 필요합니다 — 발행하려면 `/fr push <제목>` 를 요청해 주십시오" 를 알립니다. `gh issue create` 는 외부 저장소에 공개 기록을 남기는 비가역 행위이므로 backend 설정이 사용자 승인을 대신하지 않습니다 (`AUTONOMY.md` 「실행 모드와 skill 호출 권한」).
-
-GitHub 연동이 활성화되어 있고 **사용자가 직접 호출**했을 때만 실행합니다. 6단계(행·상세 작성)까지 마친 뒤, **6.5(기본 브랜치 등록 커밋) 앞에** 실행합니다 — 등록 커밋에는 issue 정보가 반영된 최종 행·상세가 실려야 합니다.
-
-1. `gh issue create` 실행:
-   - title: short-title
-   - body: 마크다운 포맷의 FR 상세 (summary, why, related context, related files, not now because)
-   - labels: `fr:idea`, `fr:{kind}`
-2. label이 repo에 없으면 `gh label create`로 생성을 시도합니다.
-   - **status label 생성 실패 → Issue 생성 중단, 에러 출력**
-   - kind label 생성 실패 → 경고 출력, label 없이 진행
-3. 성공 시 로컬 상세 파일의 `github-issue: -` 값을 `github-issue: owner/repo#N`으로 변경하고, 인덱스의 GitHub 컬럼도 `owner/repo#N`으로 갱신합니다.
-4. 완료 메시지에 issue URL을 포함합니다.
-
-Issue 생성 실패 시: 로컬 FR은 유지하고 "GitHub Issue 생성 실패, 로컬 FR만 등록됨" 경고를 출력합니다.
+- `/fr add` 는 `fr_github` 값과 상관없이 GitHub Issue 를 만들지 않습니다. `fr_github` 와 기존 `github-issue` 값은 `/fr list` 의 GitHub 칸 표시에만 남습니다. 팀 대기열로 넘기는 것은 `/fr push` 입니다.
+- 상태 허용값은 `idea`·`validated`·`ready-for-request`·`blocked`·`done`·`dropped`·`parked`·`handed-off` 입니다. 등록은 `idea` 로 시작합니다. `handed-off` 는 `/fr push` 로만 만들어집니다.

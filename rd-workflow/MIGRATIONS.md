@@ -1,32 +1,41 @@
 # Migrations
 
 템플릿 구조 변경 시 기존 프로젝트에 적용할 마이그레이션 목록.
-`sync_template.md` Step 4에서 이 파일(**clone된 템플릿의 사본**)을 읽고 해당하는 항목을 실행합니다.
+`sync_template.sh migrate pre|post` 가 **clone 된 템플릿의 스크립트**로 이 항목들을 처리합니다. 각 항목의 `**처리**:` 줄이 처리 방식(자동·판단·안내·혼합)을 밝힙니다. 판단 항목과 안내는 Claude 가 **clone 된 템플릿의 이 문서**를 읽고 사용자와 함께 처리합니다.
 
 ## 항목 추가 규칙
 
 **보존 파일의 정의 문구를 바꾸는 배포는 그 문구를 갱신하는 마이그레이션 항목을 동반합니다.**
 
-`sync_template.md` 2단계의 보존 목록에 있는 파일은 동기화가 덮지 않습니다. 그래서 배포가
+`sync_template.sh policy` 가 보존 파일로 내는 파일은 동기화가 덮지 않습니다. 그래서 배포가
 그 파일의 **정의 문구**(상태 값·종류 값 목록, 규약 서술 등)를 바꾸면 기존 프로젝트의 문구는
 구버전에 묶입니다. 그 문구를 검사하는 self_test 스텝이 있으면 **sync 직후 반드시 실패**하며,
 신규 부트스트랩 프로젝트만 통과합니다.
 
 새 어휘·새 규약을 도입할 때는 다음을 함께 확인하십시오.
 
-1. 바뀐 문구가 보존 파일에 있는가 (`sync_template.md` 2단계 목록 대조)
+1. 바뀐 문구가 보존 파일에 있는가 (`sync_template.sh policy` 의 `미전파`·`부재 시 생성`·`조건부 보존` 행 대조)
 2. 그 문구를 검사하는 스텝이 있는가 (`scripts/test_*.sh` 에서 해당 파일을 grep 하는지 확인)
 3. 둘 다 참이면 이 문서에 마이그레이션 항목을 추가한다 — 조건·실행·**보존 범위**(사용자
-   데이터를 건드리지 않는 경계)를 명시하고, 실행은 재실행이 안전한 형태로 쓴다
+   데이터를 건드리지 않는 경계)를 명시하고, 스크립트 동작은 재실행이 안전해야 합니다
 
 이 규칙이 없어 실제로 발생한 사례: FR status 어휘 `blocked` 도입 시 정의처
 `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` 가 보존 대상인데 갱신 항목이 없어,
 FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_status.sh` 로 실패했습니다
 (M009 가 그 뒤처리입니다).
 
+**새 항목은 스크립트에 등록합니다.** `rd-workflow/scripts/_tpl_migrate.py` 의 `REGISTRY` 에 `_entry(<분류>, <단계>, <안내 기준 날짜>, detect=…, notice=…)` 로 한 줄을 더하고, 단계 순서 목록(`PRE_ORDER`·`POST_DETECT`·`POST_NOTICE`)에 넣습니다.
+
+- 분류는 `auto`(상태 판정만으로 적용)·`ask`(판단 필요 — 감지만 하고 `ASK`)·`notice`(안내)·`mixed`(혼합)·`procedure`(절차 지시) 입니다. 「판단 필요」 항목을 `auto` 로 등록하지 않습니다.
+- 안내의 기준 날짜는 그 항목을 이 문서에 더한 커밋 날짜입니다. 이전 VERSION 의 날짜가 기준 날짜 이하면 `NOTICE` 를 냅니다.
+- 이 문서의 항목 제목은 `## M<숫자>: <제목>` 형식을 지킵니다. 등록하지 않은 항목은 `migrate post` 가 `<Mxxx><TAB>ASK<TAB>스크립트에 없는 항목 — MIGRATIONS.md 를 읽고 처리하십시오` 로 냅니다. 조용히 건너뛰지 않습니다.
+- 항목마다 `**처리**:` 줄에 처리 방식(자동·판단·안내·혼합)과 하위 명령을 적습니다. 실행 스니펫은 이 문서에 두지 않습니다. 동작의 정본은 스크립트입니다.
+
 ---
 
 ## M000: sync 절차 문서 권위 전환
+
+**처리**: 절차 지시 (`migrate pre` 는 `NOOP`). 하위 명령이 clone 의 스크립트로 실행되고, `sync_template.md` 1단계가 clone 문서의 권위를 정하므로 충족됩니다.
 
 **조건**: 프로젝트의 sync 절차 문서(`rd-workflow/docs/guides/sync_template.md`, 구버전 구조면 `ai/docs/guides/sync_template.md`)가 clone된 템플릿의 `rd-workflow/docs/guides/sync_template.md`와 내용이 다르거나 프로젝트에 없을 때. 판별은 `cmp -s <로컬 경로> "<임시 clone 경로>/rd-workflow/docs/guides/sync_template.md"` (exit 0이 아니면 해당).
 
@@ -36,13 +45,15 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 1. `<임시 clone 경로>/rd-workflow/docs/guides/sync_template.md`를 읽습니다.
 2. 이 시점 이후의 **모든 동기화 절차(0단계 시점 확인부터 완료 보고까지)를 clone된 sync_template.md를 권위 문서로** 실행합니다. 프로젝트 로컬 절차 문서와 로컬 skill의 절차 요약은 이번 동기화에서 따르지 않습니다.
 3. 로컬 절차 문서 기준으로 이미 수행한 단계(예: 파일 분류, 사용자 확인)가 있으면 clone 문서 기준으로 다시 수행합니다.
-4. 나머지 마이그레이션 항목의 실행 순서·적용 시점 규칙(**M005 → M008 → M003** 순, M004는 동기화 후 등)은 이 항목 이후에도 clone된 `MIGRATIONS.md` 기준으로 유지됩니다.
+4. 나머지 마이그레이션 항목의 실행 순서·적용 시점 규칙(실행 순서는 `_tpl_migrate.py` 의 `PRE_ORDER`·`POST_DETECT`·`POST_NOTICE` 가 정하며, M004는 동기화 후 등)은 이 항목 이후에도 clone된 스크립트와 `MIGRATIONS.md` 기준으로 유지됩니다.
 
 **주의**:
 - 이 항목은 파일을 변경하지 않는 **절차 지시**입니다. 프로젝트의 sync_template.md 파일 자체는 이후 동기화 단계에서 clone 내용으로 갱신됩니다.
 - 대표 사례 (v1 → v2, VERSION 2026-06-09 배포본): v1 절차 문서는 스크립트 동기화 범위를 "review pipeline 관련"으로 한정하고, 보존 목록에 `README.md`가 없으며, 0단계(업그레이드 시점 확인)가 없습니다. v1 문서로 sync하면 v2에서 변경된 hooks/lifecycle 스크립트가 갱신되지 않아 task-state 마이그레이션(M004) 이후 active-fr을 읽는 구버전 스크립트가 오동작할 수 있고, 프로젝트 README가 배포 repo의 GitHub용 README로 덮일 수 있습니다.
 
 ## M001: `ai/` → `rd-workflow/` 디렉토리 rename
+
+**처리**: 판단 (`migrate pre` 가 감지만 하고 `ASK` 를 냅니다. 나머지 항목은 실행하지 않고 exit 3, `classify` 도 exit 3). 아래 절차는 Claude 가 사용자와 함께 수행한 뒤 `classify` 부터 다시 합니다.
 
 **조건**: 프로젝트 루트에 `ai/` 디렉토리가 존재하고 `rd-workflow/`가 없을 때
 
@@ -60,6 +71,8 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 
 ## M002: `rd-workflow/workspace/` → `rd-workflow-workspace/` 분리
 
+**처리**: 판단 (`migrate pre` 가 감지만 하고 `ASK` 를 냅니다. 나머지 항목은 실행하지 않고 exit 3, `classify` 도 exit 3). 아래 절차는 Claude 가 사용자와 함께 수행한 뒤 `classify` 부터 다시 합니다.
+
 **조건**: `rd-workflow/workspace/` 디렉토리가 존재하고 루트에 `rd-workflow-workspace/`가 없을 때
 
 **실행 절차**:
@@ -73,106 +86,19 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 
 ## M003: v2 설정 파일 reconciliation (`.claude/settings.json` hooks + `.gitignore`)
 
+**처리**: 자동 (`migrate pre`, M005·M008 다음).
+
 **조건** (둘 중 하나라도 해당):
 - 프로젝트 `.claude/settings.json`의 hooks에 clone된 템플릿 `.claude/settings.json`의 hook 항목이 하나 이상 없을 때
 - 프로젝트 `.gitignore`에 clone된 템플릿 `.gitignore`의 유효 라인(빈 줄·주석 제외)이 하나 이상 없을 때
 
-**실행 절차**:
-1. 선행 검증: 프로젝트에 `.claude/settings.json`이 있으면 먼저 `python3 -m json.tool .claude/settings.json > /dev/null`로 parse를 검증합니다. 실패(깨진 JSON)하면 병합을 시도하지 않고 사용자에게 보고한 뒤 선택을 받습니다 — (a) 수동 복구 후 재시도, (b) 기존 파일을 `.claude/settings.json.bak`으로 백업하고 clone된 파일로 대체. 파일이 없으면(`.claude/` 디렉토리 부재 포함) `mkdir -p .claude && cp "<임시 clone 경로>/.claude/settings.json" .claude/`로 복사하고 2번(hooks 대조)을 건너뜁니다.
-2. hooks 대조: clone된 템플릿 `.claude/settings.json`의 각 hook 항목(event → matcher → command 단위)을 프로젝트 `.claude/settings.json`과 대조하고, **부재 항목만** 같은 event/matcher 아래에 추가합니다.
-   아래 스니펫을 프로젝트 루트에서 실행합니다. 인자는 clone 된 템플릿의 `.claude/settings.json` 경로입니다. 출력의 `M003: added` 줄과 `+` 줄을 사용자에게 보고합니다.
-   ```bash
-   python3 - "<임시 clone 경로>/.claude/settings.json" <<'PY'
-   import json, os, sys, tempfile
+**동작**:
+1. 프로젝트에 `.claude/settings.json` 이 없으면(`.claude/` 디렉토리 부재 포함) clone 판을 복사하고 hooks 대조를 건너뜁니다. 세부 줄은 `M003: settings.json 없음 — 템플릿 판을 복사했습니다` 입니다.
+2. hooks 대조: clone 된 템플릿 `.claude/settings.json` 의 각 hook 항목(event → matcher → command 단위)을 프로젝트와 대조하고, **부재 항목만** 같은 event/matcher 아래에 추가합니다. 세부 줄은 `M003: added <N>` 과 두 칸 들여쓴 `+ <event> / <matcher> / <command>` 입니다.
+3. `.gitignore` 대조: clone 된 템플릿 `.gitignore` 의 유효 라인(빈 줄·주석 제외) 가운데 프로젝트 `.gitignore` 에 정확히 일치하는 줄이 없는 것만 파일 끝에 추가합니다. 세부 줄은 `.gitignore: added <N>` 과 `+ <라인>` 입니다.
+4. 둘 다 없으면 `M003: 해당 없음` 입니다.
 
-   proj_p = ".claude/settings.json"
-   try:
-       tpl = json.load(open(sys.argv[1], encoding="utf-8"))
-   except Exception as e:
-       print("M003 실패: 템플릿 settings 를 읽지 못했습니다 (%s)" % e)
-       sys.exit(1)
-   try:
-       proj = json.load(open(proj_p, encoding="utf-8"))
-   except Exception as e:
-       print("M003 실패: 프로젝트 settings 를 읽지 못했습니다 (%s)" % e)
-       sys.exit(1)
-   if not isinstance(proj, dict):
-       print("M003 실패: settings 최상위가 객체가 아닙니다")
-       sys.exit(1)
-   hooks = proj.get("hooks", {}) if "hooks" in proj else {}
-   if not isinstance(hooks, dict):
-       print("M003 실패: hooks 가 객체가 아닙니다")
-       sys.exit(1)
-
-   for event, gs in hooks.items():
-       if not isinstance(gs, list) or any(not isinstance(g, dict) or not isinstance(g.get("hooks", []), list) for g in gs):
-           print("M003 실패: hooks.%s 의 형식이 올바르지 않습니다" % event)
-           sys.exit(1)
-
-   def triples(cfg):
-       out = set()
-       for event, gs in (cfg.get("hooks") or {}).items():
-           for g in gs:
-               for h in g.get("hooks", []):
-                   if isinstance(h, dict) and isinstance(h.get("command"), str):
-                       out.add((event, g.get("matcher", ""), h["command"]))
-       return out
-
-   have = triples(proj)
-   added = []
-   for event, gs in (tpl.get("hooks") or {}).items():
-       for g in gs:
-           matcher = g.get("matcher", "")
-           for h in g.get("hooks", []):
-               if not (isinstance(h, dict) and isinstance(h.get("command"), str)):
-                   continue
-               key = (event, matcher, h["command"])
-               if key in have:
-                   continue
-               pgs = hooks.setdefault(event, [])
-               tgt = next((pg for pg in pgs if pg.get("matcher", "") == matcher), None)
-               if tgt is None:
-                   tgt = {k: v for k, v in g.items() if k != "hooks"}
-                   tgt["hooks"] = []
-                   pgs.append(tgt)
-               tgt.setdefault("hooks", []).append(dict(h))
-               have.add(key)
-               added.append(key)
-
-   if not added:
-       print("M003: 해당 없음")
-       sys.exit(0)
-   proj["hooks"] = hooks
-   rendered = (json.dumps(proj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-   # 같은 디렉터리 임시 파일에 다 쓴 뒤 원자 교체합니다 — 쓰는 도중 실패해도 원본이 남습니다.
-   tmp = None
-   try:
-       # 심링크면 링크가 가리키는 실제 파일 자리에서 교체합니다 — 링크 자리에 일반 파일을 두면 공유 설정이 끊깁니다.
-       target = os.path.realpath(proj_p)
-       fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".settings.json.m003.")
-       with os.fdopen(fd, "wb") as f:
-           f.write(rendered)
-       os.chmod(tmp, os.stat(target).st_mode & 0o7777)  # mkstemp 의 0600 대신 원본 권한을 잇습니다
-       os.replace(tmp, target)
-   except Exception as e:
-       if tmp is not None:
-           try: os.unlink(tmp)
-           except OSError: pass
-       print("M003 실패: 저장 중 오류 — 원본이 유지됩니다 (%s)" % e)
-       sys.exit(1)
-   print("M003: added %d" % len(added))
-   for event, matcher, cmd in added:
-       print("  + %s / %s / %s" % (event, matcher or "(matcher 없음)", cmd))
-   PY
-   ```
-3. `.gitignore` 대조: clone된 템플릿 `.gitignore`의 유효 라인별로 프로젝트 `.gitignore`에 정확 일치하는지 검사하고, **부재 라인만** 파일 끝에 추가합니다:
-   ```bash
-   while IFS= read -r line || [[ -n "$line" ]]; do
-     [[ -z "$line" || "$line" == \#* ]] && continue
-     grep -Fxq -- "$line" .gitignore || printf '%s\n' "$line" >> .gitignore
-   done < "<임시 clone 경로>/.gitignore"
-   ```
-4. 사후 JSON 유효성 검증: `python3 -m json.tool .claude/settings.json > /dev/null`
+**판단 때 할 일**: 프로젝트 settings 의 parse·형식 오류는 `FAIL` 이고 병합을 시도하지 않습니다. 사용자에게 보고한 뒤 선택을 받습니다 — (a) 수동 복구 후 재시도, (b) 기존 파일을 `.claude/settings.json.bak` 으로 백업하고 clone 된 파일로 대체.
 
 **주의**:
 - 프로젝트 고유 hook·permissions 등 **기존 항목은 수정·삭제하지 않습니다.** 대조는 추가 방향으로만 동작합니다.
@@ -180,6 +106,8 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 - **이 "추가 방향으로만" 규약은 "표기 차이는 앞선 항목이 먼저 정규화한다" 는 전제 위에 있습니다.** 동일성 판정이 command 문자열 **정확 일치**이므로, 같은 스크립트를 가리키는 표기가 프로젝트와 템플릿에서 다르면 이 항목은 그것을 "부재" 로 읽어 **같은 hook 을 이중 등록**합니다. 그래서 표기 정규화는 **M008 이 M003 보다 먼저** 처리합니다. 앞으로 hook command 표기를 바꿀 때는 M003 을 고치는 대신 **정규화 항목을 하나 추가**하십시오 — 그러지 않으면 같은 사고가 반복됩니다 (실제 발생: 2026-08-21, 구 상대경로 표기 프로젝트에서 hook 4건이 8건으로).
 
 ## M004: task-state 마이그레이션 트리거
+
+**처리**: 자동 (`migrate post`, 동기화 후). `rd task status` 가 exit 3 이면 `ASK` 입니다 — 아래 3번의 수동 복구는 사용자가 합니다.
 
 **조건**: `rd-workflow-workspace/.lifecycle/task-state`가 없고 `rd-workflow/scripts/rd`가 존재할 때 (sync 직후의 pre-migration 상태)
 
@@ -194,6 +122,8 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 
 ## M005: 템플릿 유래 stale hook 제거 (`.claude/settings.json`)
 
+**처리**: 자동 (`migrate pre`, M003 보다 먼저).
+
 **조건**: 프로젝트 `.claude/settings.json`에 아래 3가지를 모두 만족하는 hook 항목이 하나 이상 있을 때:
 
 1. hook command 문자열이 `rd-workflow/scripts/hooks/` 하위 스크립트를 가리킨다 (템플릿 유래 항목 한정 — 그 외 경로의 프로젝트 고유 hook은 검사 대상이 아님)
@@ -204,83 +134,9 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 
 **실행 순서**: M005는 **M003보다 먼저** 실행합니다 (제거 후 추가). 제거를 먼저 수행하면 M003이 대조할 프로젝트 상태가 깨끗해지고, M003이 방금 추가한 유효 항목을 재검사하지 않습니다.
 
-**실행 절차**:
-1. 선행 검증: 프로젝트에 `.claude/settings.json`이 없으면 M005는 해당 없음입니다. 있으면 `python3 -m json.tool .claude/settings.json > /dev/null`로 parse를 검증합니다. 실패(깨진 JSON)하면 제거를 시도하지 않고 사용자에게 보고합니다.
-2. 아래 스니펫으로 제거 대상 식별·제거를 수행합니다 (프로젝트 루트에서 실행, `<임시 clone 경로>`를 실제 경로로 치환):
-   ```bash
-   python3 - "<임시 clone 경로>" <<'PY'
-   import json, os, re, sys, tempfile
+**동작**: `.claude/settings.json` 이 없으면 해당 없음입니다. 3중 조건에 걸린 hook 항목을 지우고, 비게 된 group 과 event 를 함께 지웁니다. 원본은 같은 디렉터리 임시 파일 + `os.replace` 로 교체하고, symlink 면 실경로에서 교체하고 권한을 잇습니다.
 
-   clone = sys.argv[1]
-   proj_path = ".claude/settings.json"
-   tpl_path = os.path.join(clone, ".claude/settings.json")
-
-   with open(proj_path) as f:
-       proj = json.load(f)
-
-   tpl = {}
-   if os.path.exists(tpl_path):
-       with open(tpl_path) as f:
-           tpl = json.load(f)
-
-   def entry_set(cfg):
-       out = set()
-       for event, groups in (cfg.get("hooks") or {}).items():
-           for g in groups:
-               for h in g.get("hooks", []):
-                   out.add((event, g.get("matcher", ""), h.get("command", "")))
-       return out
-
-   tpl_entries = entry_set(tpl)
-   removed = []
-   hooks = proj.get("hooks") or {}
-
-   for event in list(hooks.keys()):
-       for g in hooks[event]:
-           kept = []
-           for h in g.get("hooks", []):
-               cmd = h.get("command", "")
-               m = re.search(r'rd-workflow/scripts/hooks/[^\s"\']+', cmd)
-               is_stale = (
-                   m is not None
-                   and not os.path.exists(os.path.join(clone, m.group(0)))
-                   and (event, g.get("matcher", ""), cmd) not in tpl_entries
-               )
-               if is_stale:
-                   removed.append((event, g.get("matcher", ""), cmd))
-               else:
-                   kept.append(h)
-           g["hooks"] = kept
-       hooks[event] = [g for g in hooks[event] if g.get("hooks")]
-       if not hooks[event]:
-           del hooks[event]
-
-   if removed:
-       rendered = (json.dumps(proj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-       # 같은 디렉터리 임시 파일에 다 쓴 뒤 원자 교체합니다 — 쓰는 도중 실패해도 원본이 남습니다.
-       tmp = None
-       try:
-           # 심링크면 링크가 가리키는 실제 파일 자리에서 교체합니다 — 링크 자리에 일반 파일을 두면 공유 설정이 끊깁니다.
-           target = os.path.realpath(proj_path)
-           fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".settings.json.m005.")
-           with os.fdopen(fd, "wb") as f:
-               f.write(rendered)
-           os.chmod(tmp, os.stat(target).st_mode & 0o7777)  # mkstemp 의 0600 대신 원본 권한을 잇습니다
-           os.replace(tmp, target)
-       except Exception as e:
-           if tmp is not None:
-               try: os.unlink(tmp)
-               except OSError: pass
-           print("M005 실패: 저장 중 오류 — 원본이 유지됩니다 (%s)" % e)
-           sys.exit(1)
-       for event, matcher, cmd in removed:
-           print(f"removed: {event} / {matcher or '(matcher 없음)'} / {cmd}")
-   else:
-       print("removed: 없음")
-   PY
-   ```
-3. 사후 JSON 유효성 검증: `python3 -m json.tool .claude/settings.json > /dev/null`
-4. 스니펫이 출력한 제거 내역(event / matcher / command)을 사용자에게 보고합니다. `removed: 없음`이면 파일은 변경되지 않은 것입니다.
+**출력**: 지운 항목마다 `removed: <event> / <matcher 또는 (matcher 없음)> / <command>` 줄을 냅니다. 지울 것이 없으면 `removed: 없음` 이고 파일은 바뀌지 않습니다. 이 줄을 9단계 보고에 옮깁니다. parse 실패는 `FAIL` 이고 제거를 시도하지 않습니다.
 
 **예시 (대표 사례)**: 2026-08-20 게이트 정리 이전 템플릿으로 부트스트랩한 프로젝트에는 PreToolUse/Bash에 `bash rd-workflow/scripts/hooks/pre_commit_verify.sh` 등록이 남아 있으나, 그 스크립트는 지금 산출물에 존재하지 않고 템플릿 `.claude/settings.json`에도 등록이 없습니다. 3중 조건에 걸려 이 항목만 제거되고, 스크립트가 존재하는 나머지 hook 등록은 보존됩니다.
 
@@ -292,6 +148,8 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 
 ## M006: source-fr 계약 구현 — archive gate enforcement 활성화
 
+**처리**: 안내 (`migrate post`, 이전 VERSION 이 2026-08-03 이하일 때 `NOTICE`).
+
 **조건**: VERSION 2026-08-03 이후 템플릿으로 동기화하는 모든 프로젝트.
 
 **동작 변화**:
@@ -301,6 +159,8 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 **대응**: 차단 메시지가 나오면 REQUEST 아카이브(FR status done 처리)를 먼저 실행한 뒤 커밋합니다. stale `source-fr` 정정은 `bash rd-workflow/scripts/rd task set-source-fr <path|->`를 사용합니다.
 
 ## M007: 게이트 정리 — 값어치를 증명하지 못한 hook 제거
+
+**처리**: 안내 (`migrate post`, 이전 VERSION 이 2026-08-20 이하일 때 `NOTICE`). hook 등록 제거는 M005 가 자동으로 처리합니다.
 
 **조건**: VERSION 2026-08-20 이후 템플릿으로 동기화하는 모든 프로젝트.
 
@@ -324,8 +184,8 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 **아카이브 검증 게이트에 관하여**: 이 마이그레이션의 초기 버전은 `lifecycle/archive.sh` 에 `archive_selftest_gate` 를 신설해 아카이브마다 `self_test.sh consumer` 통과를 강제했습니다. 2026-09-03 에 그 게이트와 smoke 감축 엔진을 걷어냈습니다 — 구현 직후 돌린 검증을 아카이브가 다시 돌려 얻는 것이 없었고, 아카이브마다 15~20분을 썼습니다. 지금 템플릿에는 그 게이트가 없으며, 검증은 구현 직후 `bash rd-workflow/scripts/self_test.sh [그룹...]` 로 사람이 돌리고 final diff review 가 결과를 확인합니다.
 
 **실행 절차**:
-1. `.claude/settings.json` 의 stale hook 등록 제거는 **M005 가 그대로 처리합니다.** 제거된 5개 스크립트는 clone 에 존재하지 않고 템플릿 `.claude/settings.json` 에도 등록이 없으므로 M005 의 3중 조건에 걸립니다. M007 을 위해 따로 스니펫을 돌릴 필요가 없습니다.
-2. M005 실행 후 `.claude/settings.json` 의 `Stop` · `PostToolUse` 이벤트가 비어 남을 수 있습니다. M005 스니펫이 빈 event 를 지우므로 추가 조치는 불필요합니다.
+1. `.claude/settings.json` 의 stale hook 등록 제거는 **M005 가 그대로 처리합니다.** 제거된 5개 스크립트는 clone 에 존재하지 않고 템플릿 `.claude/settings.json` 에도 등록이 없으므로 M005 의 3중 조건에 걸립니다. M007 을 위해 따로 할 일이 없습니다.
+2. M005 실행 후 `.claude/settings.json` 의 `Stop` · `PostToolUse` 이벤트가 비어 남을 수 있습니다. M005 가 빈 event 를 지우므로 추가 조치는 불필요합니다.
 3. 런타임 잔여물 정리 (선택, 판정에 영향 없음):
    - `rd-workflow-workspace/.lifecycle/verify-cache`
    - `rd-workflow-workspace/.lifecycle/edit-provenance.d/`
@@ -336,6 +196,8 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 - 단계 게이트가 사라졌으므로 "리뷰 대기 중에는 구현 파일을 못 고친다" 는 **더 이상 기계가 강제하지 않습니다.** `CLAUDE.md` 의 Review 규칙을 사람과 AI 가 지킵니다.
 
 ## M008: hook command 경로 표기 정규화 (`.claude/settings.json`)
+
+**처리**: 자동 (`migrate pre`, M005 다음·M003 앞).
 
 **조건**: 프로젝트 `.claude/settings.json` 의 `hooks` 아래 어느 `command` 든 접두가 정확히 `bash rd-workflow/scripts/hooks/` 인 항목이 하나 이상 있을 때.
 
@@ -352,114 +214,13 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 - **멱등**: 신 표기만 있는 입력에 다시 실행하면 무변경이며 **파일을 재작성하지 않습니다**(mtime 도 그대로).
 - **안전**: parse 또는 schema 오류는 **원본 byte 를 바꾸지 않고 실패**합니다. 변경이 있을 때만 같은 디렉터리 임시 파일에 쓴 뒤 `os.replace` 로 **원자 교체**합니다.
 
-**실행 절차**:
-1. 선행 검증: 프로젝트에 `.claude/settings.json` 이 없으면 M008 은 해당 없음입니다.
-2. 아래 스니펫을 프로젝트 루트에서 실행합니다.
-   ```bash
-   python3 - <<'PY'
-   import json, os, sys, tempfile
-
-   OLD = "bash rd-workflow/scripts/hooks/"
-   NEW = 'bash "${CLAUDE_PROJECT_DIR:-.}"/rd-workflow/scripts/hooks/'
-   path = ".claude/settings.json"
-
-   if not os.path.exists(path):
-       print("M008: .claude/settings.json 없음 — 해당 없음"); sys.exit(0)
-
-   with open(path, "rb") as f:
-       original = f.read()
-   try:
-       cfg = json.loads(original.decode("utf-8"))
-   except Exception as e:
-       print("M008 실패: JSON parse 오류 — 원본을 바꾸지 않았습니다: %s" % e, file=sys.stderr)
-       sys.exit(1)
-
-   # schema 검증을 먼저 통과시킨 뒤에만 손댑니다 (write-before-validate 방지).
-   if not isinstance(cfg, dict):
-       print("M008 실패: 최상위가 객체가 아닙니다 — 원본을 바꾸지 않았습니다", file=sys.stderr); sys.exit(1)
-   hooks = cfg.get("hooks")
-   if hooks is None:
-       print("M008: hooks 키 없음 — 무변경"); sys.exit(0)
-   if not isinstance(hooks, dict):
-       print("M008 실패: hooks 가 객체가 아닙니다 — 원본을 바꾸지 않았습니다", file=sys.stderr); sys.exit(1)
-   for ev, groups in hooks.items():
-       if not isinstance(groups, list):
-           print("M008 실패: hooks[%s] 가 배열이 아닙니다 — 원본을 바꾸지 않았습니다" % ev, file=sys.stderr); sys.exit(1)
-       for g in groups:
-           if not isinstance(g, dict) or not isinstance(g.get("hooks", []), list):
-               print("M008 실패: hooks[%s] 의 group 구조가 예상과 다릅니다 — 원본을 바꾸지 않았습니다" % ev, file=sys.stderr); sys.exit(1)
-           for it in g.get("hooks", []):
-               if not isinstance(it, dict):
-                   print("M008 실패: hooks[%s] 의 item 이 객체가 아닙니다 — 원본을 바꾸지 않았습니다" % ev, file=sys.stderr); sys.exit(1)
-
-   normalized = folded = 0
-   seen_across = {}
-   for ev, groups in hooks.items():
-       for g in groups:
-           items = g.get("hooks", [])
-           kept, seen = [], set()
-           for it in items:
-               cmd = it.get("command")
-               if isinstance(cmd, str) and cmd.startswith(OLD):
-                   it["command"] = NEW + cmd[len(OLD):]
-                   normalized += 1
-                   cmd = it["command"]
-               # **command 가 문자열이 아닌 item 은 중복 판정 대상이 아닙니다.**
-               # `command` 키가 없는 프로젝트 고유 item(예: prompt·agent 형태)은 모두
-               # key=null 로 접혀 같은 group 의 두 번째부터 조용히 삭제됩니다 — 사용자
-               # hook 이 사라지는 데이터 손실입니다. 내용·순서를 그대로 보존합니다.
-               if not isinstance(cmd, str):
-                   kept.append(it)
-                   continue
-               key = json.dumps(cmd, ensure_ascii=False)
-               if key in seen:      # first-wins: 처음 항목 전체를 남기고 나머지를 버립니다
-                   folded += 1
-                   continue
-               seen.add(key)
-               # **알림 키에 matcher 를 포함합니다.** matcher 가 다른 group 에 같은 command 가
-               # 있는 것은 정상 구성입니다(예: Edit·Write 둘 다 implementation_gate.sh).
-               # matcher 를 빼면 그 정상 구성마다 경고가 나와 진짜 신호를 덮습니다.
-               mk = (ev, json.dumps(g.get("matcher"), ensure_ascii=False), key)
-               seen_across[mk] = seen_across.get(mk, 0) + 1
-               kept.append(it)
-           if "hooks" in g:
-               g["hooks"] = kept
-
-   for (ev, matcher, key), n in seen_across.items():
-       if n > 1:
-           print("M008 알림: event %s / matcher %s 에서 같은 command 가 %d 개 group 에 걸쳐 있습니다 (group 경계는 합치지 않습니다): %s" % (ev, matcher, n, key))
-
-   if normalized == 0 and folded == 0:
-       print("M008: 변경 없음 (이미 정규화됨) — 파일을 재작성하지 않았습니다"); sys.exit(0)
-
-   rendered = (json.dumps(cfg, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-   # 임시 파일 생성까지 try 안에 둡니다 — 디렉터리 쓰기 권한이 없는 경우가 실제로 있고,
-   # 밖에 두면 그 실패가 traceback 으로 터져 "원본은 유지된다" 는 보장이 사용자에게 보이지 않습니다.
-   # 심링크면 링크가 가리키는 실제 파일 자리에서 교체합니다 — 링크 자리에 일반 파일을 두면 공유 설정이 끊깁니다.
-   target = os.path.realpath(path)
-   d = os.path.dirname(target) or "."
-   tmp = None
-   try:
-       fd, tmp = tempfile.mkstemp(dir=d, prefix=".settings.json.m008.")
-       with os.fdopen(fd, "wb") as f:
-           f.write(rendered)
-       os.chmod(tmp, os.stat(target).st_mode & 0o7777)  # mkstemp 의 0600 대신 원본 권한을 잇습니다
-       os.replace(tmp, target)        # 원자 교체
-   except Exception as e:
-       if tmp is not None:
-           try: os.unlink(tmp)
-           except OSError: pass
-       print("M008 실패: 교체 중 오류 — 원본이 유지됩니다: %s" % e, file=sys.stderr)
-       sys.exit(1)
-   print("M008: 표기 정규화 %d건, 중복 접기 %d건" % (normalized, folded))
-   PY
-   ```
-3. 사후 JSON 유효성 검증: `python3 -m json.tool .claude/settings.json > /dev/null`
-4. M008 이 끝난 뒤 M003 을 실행합니다. 이 순서를 지키면 M003 의 정확 일치 대조가 정상 동작합니다.
+**출력**: `M008: 표기 정규화 <N>건, 중복 접기 <N>건`, 또는 `M008: 변경 없음 (이미 정규화됨) — 파일을 재작성하지 않았습니다` 입니다. settings 가 없으면 `M008: .claude/settings.json 없음 — 해당 없음`, `hooks` 키가 없으면 `M008: hooks 키 없음 — 무변경` 입니다. 여러 group 에 같은 command 가 걸쳐 있으면 `M008 알림: …` 줄을 냅니다. parse·schema 오류는 `FAIL` 이고 원본을 바꾸지 않습니다.
 
 **주의**: 이 항목이 만든 변경은 자동 커밋하지 않고 다음 정규 커밋에 편승시킵니다 (M004 와 같은 계약).
 
 ## M009: 보존 파일 정의 문구 — FR status `blocked` (`FUTURE_REQUESTS.md`)
+
+**처리**: 자동 (`migrate pre`).
 
 **조건**: 프로젝트 `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` 의 「상태 값」 또는
 「파일 분리」 섹션에 `blocked` 서술이 없을 때. 파일 자체가 없으면 해당 없음입니다.
@@ -484,10 +245,10 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 
 ```
 ## 상태 값
-- `blocked`: 무인 드레인(ralph)이 …
+- `blocked`: 무인 드레인(ralph)이 중단조건에 걸려 set-aside 한 항목. 활성 인덱스에 잔류하되 auto-pick·`/fr pri`·`/fr push` 대상에서 제외되고 `/fr list` 에는 set-aside 요약(건수)으로만 표기. 원인 해소 후 `validated` 로 복원해 재시도
 
 ## 파일 분리
-- **`blocked` 항목**: 활성 인덱스에 **잔류**합니다 …
+- **`blocked` 항목**: 활성 인덱스에 **잔류**합니다 (parked 처럼 별도 파일로 옮기지 않습니다). auto-pick·`/fr pri`·`/fr push` 대상에서 제외되고 `/fr list` 에는 set-aside 요약으로만 표기됩니다.
 ```
 
 **신규 부트스트랩 프로젝트와 형태가 다릅니다.** 배포본 「파일 분리」는 `- **이 파일**:` 항목
@@ -497,125 +258,16 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 의 M009 회귀가 그 정확한 행을 oracle 로 고정합니다. 형태를 통일하려면 「이 파일」 행 교체가
 필요하고 그것은 사용자 데이터 보존과 충돌합니다.
 
-**실행 절차**: 프로젝트 루트에서 아래 스니펫을 실행합니다.
+**출력**: `M009: <N>개 섹션에 blocked 서술을 삽입했습니다.` 또는 `M009: 두 섹션에 이미 blocked 서술이 있습니다 — 해당 없음`, 파일이 없으면 `M009: rd-workflow-workspace/backlog/FUTURE_REQUESTS.md 없음 — 해당 없음` 입니다. 실패는 `FAIL` 이고 원본을 바꾸지 않습니다.
 
-   ```bash
-   python3 - <<'PY'
-   import os, stat, sys, tempfile
-
-   PATH = "rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
-
-   STATUS_ITEM = (
-       "- `blocked`: 무인 드레인(ralph)이 중단조건에 걸려 set-aside 한 항목. 활성 인덱스에 "
-       "잔류하되 auto-pick·`/fr pri`·`/fr push` 대상에서 제외되고 `/fr list` 에는 set-aside "
-       "요약(건수)으로만 표기. 원인 해소 후 `validated` 로 복원해 재시도"
-   )
-   SPLIT_ITEM = (
-       "- **`blocked` 항목**: 활성 인덱스에 **잔류**합니다 (parked 처럼 별도 파일로 옮기지 "
-       "않습니다). auto-pick·`/fr pri`·`/fr push` 대상에서 제외되고 `/fr list` 에는 "
-       "set-aside 요약으로만 표기됩니다."
-   )
-
-   if not os.path.exists(PATH):
-       print("M009: %s 없음 — 해당 없음" % PATH)
-       sys.exit(0)
-
-   with open(PATH, encoding="utf-8") as f:
-       lines = f.read().split("\n")
-
-   # --- 판정 단계: 쓰기 전에 전부 끝낸다 ---
-   targets = {}
-   for name in ("상태 값", "파일 분리"):
-       hits = [i for i, l in enumerate(lines) if l.strip() == "## " + name]
-       if len(hits) != 1:
-           print(
-               "M009 실패: '## %s' 헤딩이 %d개입니다 (정확히 1개여야 합니다) — "
-               "원본을 바꾸지 않았습니다." % (name, len(hits)),
-               file=sys.stderr,
-           )
-           print(
-               "  조치: %s 에서 그 헤딩을 하나만 남기거나, 배포본의 해당 섹션 문구를 "
-               "직접 옮겨 적으십시오." % PATH,
-               file=sys.stderr,
-           )
-           sys.exit(1)
-       targets[name] = hits[0]
-
-   def section_end(start):
-       for i in range(start + 1, len(lines)):
-           if lines[i].startswith("## "):
-               return i
-       return len(lines)
-
-   # 완료 판정은 **정식 항목 형태**로 합니다. 단순히 "blocked" 라는 글자가 섹션 안에
-   # 있는지만 보면, 예컨대 "blocked 는 아직 미지원" 같은 메모만 있어도 정식 정의가 없는
-   # 상태에서 건너뛰어 거짓 성공이 됩니다.
-   MARKERS = {"상태 값": "- `blocked`:", "파일 분리": "- **`blocked` 항목**:"}
-
-   pending = []   # (삽입 인덱스, 본문)
-   for name, item in (("상태 값", STATUS_ITEM), ("파일 분리", SPLIT_ITEM)):
-       start = targets[name]
-       body = lines[start + 1:section_end(start)]
-       if any(l.startswith(MARKERS[name]) for l in body):
-           continue
-       offset = None
-       if name == "상태 값":
-           for j, l in enumerate(body):
-               if l.startswith("- `done`"):
-                   offset = j
-                   break
-       if offset is None:
-           for j, l in enumerate(body):
-               if l.startswith("- "):
-                   offset = j
-                   break
-       if offset is None:
-           print(
-               "M009 실패: '## %s' 섹션에 목록 항목이 없습니다 — 원본을 바꾸지 "
-               "않았습니다." % name,
-               file=sys.stderr,
-           )
-           print("  조치: 배포본의 해당 섹션 문구를 직접 옮겨 적으십시오.", file=sys.stderr)
-           sys.exit(1)
-       pending.append((start + 1 + offset, item))
-
-   if not pending:
-       print("M009: 두 섹션에 이미 blocked 서술이 있습니다 — 해당 없음")
-       sys.exit(0)
-
-   # --- 쓰기 단계: 임시 파일 + os.replace 원자 교체 ---
-   for idx, text in sorted(pending, reverse=True):
-       lines.insert(idx, text)
-   rendered = "\n".join(lines).encode("utf-8")
-
-   d = os.path.dirname(os.path.abspath(PATH))
-   mode = stat.S_IMODE(os.stat(PATH).st_mode)
-   tmp = None
-   try:
-       fd, tmp = tempfile.mkstemp(dir=d, prefix=".FUTURE_REQUESTS.md.m009.")
-       with os.fdopen(fd, "wb") as f:
-           f.write(rendered)
-           f.flush()
-           os.fsync(f.fileno())
-       os.chmod(tmp, mode)
-       os.replace(tmp, PATH)
-       tmp = None
-   except Exception as e:
-       if tmp is not None:
-           try:
-               os.unlink(tmp)
-           except OSError:
-               pass
-       print("M009 실패: 쓰기 오류 — 원본을 바꾸지 않았습니다: %s" % e, file=sys.stderr)
-       sys.exit(1)
-
-   print("M009: %d개 섹션에 blocked 서술을 삽입했습니다." % len(pending))
-   PY
-   ```
+- 「상태 값」·「파일 분리」 헤딩이 정확히 1개가 아니면 실패합니다. 조치: 그 헤딩을 하나만 남기거나, 배포본의 해당 섹션 문구를 직접 옮겨 적습니다.
+- 섹션에 목록 항목이 없으면 실패합니다. 조치: 배포본의 해당 섹션 문구를 직접 옮겨 적습니다.
 
 **검증**: `bash rd-workflow/scripts/test_fr_blocked_status.sh` 가 PASS 합니다.
 
 ## M010: 위험 등급(risk tier) 도입 — small-task 사용자 지정·final diff review 절대 규칙 대체
+
+**처리**: 안내 (`migrate post`, 이전 VERSION 이 2026-09-04 이하일 때 `NOTICE`). 아래 ① `CLAUDE.md` 정리는 M013 이 대신합니다.
 
 - 적용 대상: 2026-09-04 이전에 배포된 모든 소비 프로젝트.
 - 변경: `CLAUDE.md`(우선 원칙 4·5, Intake 규칙, 핵심 절차, 절대 규칙 1항, Review 규칙 1항), `WORKFLOW.md` 위험 등급 절, `REQUEST.md` 템플릿 `## Risk Tier`, `reports/tier-log.md` 신설, skill 6종, `prepare_review_pipeline.sh` 의 Risk Tier 판독.
@@ -624,6 +276,8 @@ FR 항목을 가진 모든 기존 프로젝트가 sync 직후 `test_fr_blocked_s
 - 검증: `bash rd-workflow/scripts/test_review_effort_override.sh` 의 `RT` 표 기반 케이스 통과, `grep -n "small로 판단\|스스로 small" CLAUDE.md` 0건.
 
 ## M011: 종결 마커(seal) 기반 archive precheck · `아카이브 보류` 상태 · no-fr 모드
+
+**처리**: 판단(감지) + 안내 (`migrate post`). `.gitignore` 가 `review-seals/` 를 가리면 `ASK` 와 고칠 규칙 안내를 냅니다. 이전 VERSION 이 2026-09-06 이하면 `NOTICE` 를 냅니다.
 
 **조건**: 종결 마커를 도입한 템플릿(`rd-workflow/scripts/rd` 에 `review seal` 서브커맨드가 있는 판)으로 동기화하는 모든 프로젝트.
 
@@ -666,6 +320,8 @@ bash rd-workflow/scripts/rd review seal --legacy-unverified "<사유>" <세션 �
 
 ## M012: 기본 실행 모드 `semi-auto` 전환 · `rd task mode` 출력 어휘 변경
 
+**처리**: 안내 (`migrate post`, 이전 VERSION 이 2026-09-06 이하일 때 `NOTICE`).
+
 **조건**: 이 변경 이후 템플릿으로 동기화하는 모든 프로젝트.
 
 **동작 변화**
@@ -704,7 +360,9 @@ cat rd-workflow/config/workflow.json            # 내용과 default_execution_mo
 
 ## M013: CLAUDE.md 프로젝트 소유 전환 · rules 분리
 
-**조건**: clone 에 `.claude/rules/rd-workflow/` 가 있고 프로젝트에 `CLAUDE.md` 가 있으면 항상 실행합니다. 분류기 결과가 할 일을 정합니다. `template`·`modified` 행이 있으면 절을 정리합니다. `abort`·`ambiguous` 행과 분류기 오류는 자동 편집 없이 5단계 보고에 넣습니다. 처리할 행이 없으면 편집 없이 보고만 합니다.
+**처리**: 혼합 (`migrate post` + `migrate M013 --decide`). 묻지 않는 처리(`template` 절 걷어내기·`index missing` 보충)와 사용자 결정의 반영은 스크립트가 합니다. `modified` 절의 선택만 사용자에게 묻습니다.
+
+**조건**: clone 에 `.claude/rules/rd-workflow/` 가 있고 프로젝트에 `CLAUDE.md` 가 있으면 항상 실행합니다. 분류기 결과가 할 일을 정합니다. `template`·`modified` 행이 있으면 절을 정리합니다. `abort`·`ambiguous` 행과 분류기 오류는 자동 편집 없이 9단계 완료 보고에 넣습니다. 처리할 행이 없으면 편집 없이 보고만 합니다.
 
 **동작 변화**
 
@@ -716,7 +374,7 @@ cat rd-workflow/config/workflow.json            # 내용과 default_execution_mo
 
 **지원 하한**: Claude Code 2.1.310 이상. 그 미만은 프로젝트 rules 하위 폴더 로드를 보장하지 않습니다. 버전 검사를 코드로 넣지 않았습니다. 실측이 한 버전뿐이라 하한을 단정할 근거가 없기 때문입니다.
 
-**git 추적 확인**: 프로젝트 `.gitignore` 가 `.claude/` 를 가리면 rules 가 커밋되지 않아 다른 clone 에서 규칙이 통째로 빠집니다. 동기화 후 `git check-ignore -v .claude/rules/rd-workflow/core.md` 가 아무것도 출력하지 않는지 확인합니다. 출력이 있으면 출력이 가리키는 `.gitignore` 줄을 사용자에게 보여 주고 고치는 방법을 안내합니다. 그 줄이 `.claude/` 또는 `.claude` 처럼 폴더 전체를 가리키면 Git 은 그 아래를 예외로 다시 포함하지 않습니다. 이때는 그 줄을 `.claude/*` 로 바꾸고 다음 줄에 `!.claude/rules/` 를 넣습니다. 그러면 `.claude/` 의 다른 파일은 계속 무시되고 rules 만 추적됩니다. 고친 뒤 같은 명령을 다시 실행해 출력이 없는지 확인합니다.
+**git 추적 확인**: 프로젝트 `.gitignore` 가 `.claude/` 를 가리면 rules 가 커밋되지 않아 다른 clone 에서 규칙이 통째로 빠집니다. `migrate post` 가 `git check-ignore -v .claude/rules/rd-workflow/core.md` 를 실행합니다. 출력이 있으면 `M013` 의 `ASK` 세부 줄 `gitignore<TAB><그 출력><TAB><고치는 방법>` 으로 냅니다. Claude 는 그 `.gitignore` 줄을 사용자에게 보여 주고 고치는 방법을 안내합니다. `.gitignore` 편집은 사용자 파일이라 스크립트가 하지 않습니다. 그 줄이 `.claude/` 또는 `.claude` 처럼 폴더 전체를 가리키면 Git 은 그 아래를 예외로 다시 포함하지 않습니다. 이때는 그 줄을 `.claude/*` 로 바꾸고 다음 줄에 `!.claude/rules/` 를 넣습니다. 그러면 `.claude/` 의 다른 파일은 계속 무시되고 rules 만 추적됩니다. 고친 뒤 같은 명령을 다시 실행해 출력이 없는지 확인합니다.
 
 **분류기** `rd-workflow/scripts/claudemd_rules_migrate.sh` (읽기 전용):
 
@@ -735,23 +393,41 @@ bash rd-workflow/scripts/claudemd_rules_migrate.sh classify <project CLAUDE.md> 
   - `project` — 어느 판의 템플릿에도 없는 제목. 손대지 않습니다.
   - `ambiguous` — 같은 제목이 반복된 절. 손대지 않고 사용자에게 보고합니다.
 
-**실행 절차** (Claude 가 수행):
+**스크립트가 하는 것** (`migrate post`, 결정 없이 실행):
 
-1. 분류기를 clone 의 사본으로 실행합니다(clone 이 권위 — M000 과 같은 원칙). 종료코드가 0 이 아니면 그 자리에서 절차를 멈추고, 아무것도 바꾸지 않은 채 오류를 보고합니다.
-2. `abort` 면 자동 편집을 하지 않습니다. 사유(fence 포함 파일)와 다음 행동(사용자가 절 목록과 diff 를 보고 직접 정리한 뒤 sync 재실행)을 보고하고 4·5단계로 갑니다.
-3. **결정을 먼저 모읍니다.** 시작할 때 `CLAUDE.md` 사본(결정 기준본)을 scratch 에 저장합니다. `modified` 절마다 프로젝트 판과 현재 rules 판의 diff 를 보여 주고 셋 중 하나를 고르게 합니다. 결정은 제목으로 기록합니다(`ambiguous` 를 뺀 제목은 파일 안에서 유일합니다). 이 단계에서는 파일을 바꾸지 않습니다.
-   - 템플릿 채택 → 절을 지웁니다.
-   - 프로젝트 판 유지 → 절을 남기고 제목 다음 줄에 `<!-- rd-workflow:project-override -->` 표식을 넣습니다. 다음 sync 의 분류기는 이 절을 `keep` 으로 봅니다. 이 절과 rules 판이 함께 로드되므로, 사용자가 절 첫 줄에 대체 대상을 적도록 안내합니다.
-   - 보류 → 원문 그대로 둡니다. 다음 sync 에 다시 묻습니다.
-   - 사용자 답을 받기 전에는 그 절을 바꾸지 않습니다.
-   - **편집 시작 직전에 결정 기준본과 현재 `CLAUDE.md` 를 `cmp -s` 로 비교합니다.** 다르면 사용자가 본 diff 와 지금 본문이 다를 수 있으므로 모은 결정을 모두 버립니다. "결정을 받는 동안 `CLAUDE.md` 가 바뀌어 다시 묻습니다" 라고 사유를 알리고 3단계를 처음부터 다시 합니다.
-   - **편집은 한 번에 하나씩, 매번 재분류한 범위로 합니다.** 분류기를 실행해 현재 출력의 첫 처리 대상(`template` 절, 또는 결정이 "템플릿 채택"·"프로젝트 판 유지" 인 `modified` 절)을 고르고 그 절의 현재 `start`·`end` 로 한 번 편집합니다. 그리고 다시 분류합니다. 처리 대상이 없을 때까지 반복합니다. 이전 출력의 줄 번호를 재사용하지 않으므로, 앞 절 삭제·표식 삽입·사용자 대기 중 파일 변경이 있어도 범위가 어긋나지 않습니다. 반복 중에도 분류기 종료코드가 0 이 아니면 즉시 멈추고 보고합니다.
-4. `index missing` 이면 clone 의 `CLAUDE.md` 에서 `## rd-workflow 규칙` 절을 복사해 파일 끝에 붙입니다.
-5. 분류기를 다시 실행해 결과를 9단계 완료 보고에 넣습니다. 보고에는 걷어낸 절, 유지(override)한 절, 보류한 절, `ambiguous` 절, `abort` 사유, 분류기 오류, 다음 행동을 적습니다. 보류 절이 있으면 "이 절과 rules 판이 두 벌로 로드되는 상태" 임을 적습니다.
+1. 분류기를 clone 의 사본으로 실행합니다(clone 이 권위 — M000 과 같은 원칙). 종료코드가 0 이 아니면 그 자리에서 멈추고 `FAIL`(세부 줄 `fail<TAB><원인>`)을 냅니다. 파일은 바뀌지 않습니다.
+2. `abort` 면 편집하지 않고 `ASK`(세부 줄 `abort<TAB>…`)를 냅니다. 다음 행동은 사용자가 절 목록과 diff 를 보고 직접 정리한 뒤 sync 를 다시 실행하는 것입니다.
+3. `template` 절을 하나씩 걷어냅니다. 매번 분류기를 다시 실행해 그 절의 현재 `start`·`end` 로 지우고, `template` 절이 없을 때까지 반복합니다. 이전 출력의 줄 번호를 재사용하지 않습니다. 걷어낸 절은 `removed<TAB><제목>` 세부 줄로 냅니다.
+4. `index missing` 이면 clone 의 `CLAUDE.md` 에서 `## rd-workflow 규칙` 절을 파일 끝에 붙이고 `index<TAB>목차 절을 보충했습니다` 를 냅니다.
+5. 이 시점의 `CLAUDE.md` 를 결정 기준본(git 디렉터리의 `rd-tpl-m013-base.md`)으로 저장합니다.
+6. `modified` 절마다 프로젝트 판 절과 현재 rules 판 절의 diff 파일(git 디렉터리의 `rd-tpl-m013/<번호>.diff`)을 만들고 `modified<TAB><제목><TAB><diff 파일>` 세부 줄과 함께 `ASK` 를 냅니다. `ambiguous` 절은 `ambiguous<TAB><제목>` 으로 보고만 합니다.
+7. 처리할 `modified` 가 없으면 `APPLIED`(걷어낸 절 또는 목차 보충이 있음) 또는 `NOOP` 입니다.
+
+**사용자에게 묻는 것**: `modified` 절마다 diff 를 보여 주고 셋 중 하나를 받습니다. 결정은 제목으로 기록합니다(`ambiguous` 를 뺀 제목은 파일 안에서 유일합니다). 사용자 답을 받기 전에는 그 절을 바꾸지 않습니다.
+
+- 템플릿 채택(`adopt`) → 절을 지웁니다.
+- 프로젝트 판 유지(`keep`) → 절을 남기고 제목 다음 줄에 `<!-- rd-workflow:project-override -->` 표식을 넣습니다. 다음 sync 의 분류기는 이 절을 `keep` 으로 봅니다. 이 절과 rules 판이 함께 로드되므로, 사용자가 절 첫 줄에 대체 대상을 적도록 안내합니다.
+- 보류(`defer`) → 원문 그대로 둡니다. 다음 sync 에 다시 묻습니다.
+
+**`--decide` 로 답 넘기기**:
+
+```bash
+bash "$C/rd-workflow/scripts/sync_template.sh" migrate M013 --decide '<제목>=adopt' --decide '<제목>=keep' --decide '<제목>=defer'
+```
+
+1. 기준본이 없으면 `결정 없이 먼저 실행하십시오` 와 함께 exit 2 입니다.
+2. 기준본과 현재 `CLAUDE.md` 가 다르면 사용자가 본 diff 와 지금 본문이 다를 수 있으므로 결정을 모두 버립니다. `changed<TAB>CLAUDE.md 가 결정을 받는 동안 바뀌어 다시 묻습니다` 를 내고 결정 없이 실행을 처음부터 합니다(새 기준본·새 `modified` 줄). Claude 는 사유를 알리고 다시 묻습니다.
+3. 편집은 한 번에 하나씩, 매번 재분류한 범위로 합니다. 첫 처리 대상(`template` 절, 또는 결정이 `adopt`·`keep` 인 `modified` 절)을 그 절의 현재 `start`·`end` 로 편집하고 다시 분류합니다. 처리 대상이 없을 때까지 반복합니다. 반복 중에도 분류기 종료코드가 0 이 아니면 멈추고 `FAIL` 입니다.
+4. 세부 줄은 `removed`·`override`·`deferred`(보류 절 — 이 절과 rules 판이 두 벌로 로드되는 상태)·`unknown-decision`(분류 결과에 `modified` 절로 없어 반영하지 않음)·`ambiguous`·`index`·`gitignore` 입니다. 상태는 `unknown-decision`·`gitignore` 가 있으면 `ASK`, 보류 절이 남으면 `NOTICE`, 아니면 `APPLIED`·`NOOP` 입니다.
+5. 끝나면 기준본을 지웁니다. 쓰기는 같은 디렉터리 임시 파일 + `os.replace` 이고, symlink 면 실경로에서 교체하고 권한을 잇습니다.
+
+세부 줄은 9단계 완료 보고에 들어갑니다: 걷어낸 절, 유지(override)한 절, 보류한 절, `ambiguous` 절, `abort` 사유, 분류기 오류, 다음 행동.
 
 **재실행 성질**: 걷어낸 절은 더 이상 분류되지 않습니다. override 절은 `keep` 입니다. 보류 절만 다시 `modified` 로 나옵니다. 모든 절을 정리한 프로젝트에서 다시 실행하면 `template`·`modified` 행이 0 이고 `CLAUDE.md` 는 바뀌지 않습니다.
 
 ## M014: `.turn_ready` 마커 추적 방지 · 이미 추적된 마커 안내
+
+**처리**: 판단(감지) (`migrate post`). 추적 중인 `.turn_ready` 가 있으면 `ASK` 와 아래 명령을 세부 줄로 냅니다. 추적 해제와 커밋은 사용자가 합니다.
 
 **조건**: 프로젝트에 추적 중인 `.turn_ready` 파일이 있을 때(`git ls-files | grep -c '\.turn_ready'` 가 0 보다 큼). 추적 중인 파일이 없으면 이 항목은 할 일이 없습니다.
 
@@ -774,6 +450,8 @@ git commit -m "chore: 추적 중인 .turn_ready 마커 추적 해제"
 
 ## M015: 템플릿 permissions.allow 부재 규칙 추가 (`.claude/settings.json`)
 
+**처리**: 자동 (`migrate pre`). JSON·타입 오류는 `FAIL` 이며 원본을 바꾸지 않습니다.
+
 **조건**: 프로젝트 `.claude/settings.json` 이 있고, clone 된 템플릿 `.claude/settings.json` 의 `permissions.allow` 규칙 가운데 프로젝트 `permissions.allow` 에 없는 것이 하나 이상 있을 때. 프로젝트에 settings 가 없으면 M003 이 템플릿 파일을 통째로 복사하므로(permissions 포함) 이 항목은 해당 없음입니다.
 
 **실행 순서**: M005 → M008 → M003 다음(4단계 안)입니다. hooks 와 독립이므로 순서 의존은 없습니다.
@@ -789,68 +467,7 @@ git commit -m "chore: 추적 중인 .turn_ready 마커 추적 해제"
 - 추가가 있을 때만 다시 씁니다(`indent=2`, `ensure_ascii=False`, 끝 개행). 출력은 `M015: added <N>` 과 추가한 규칙 목록, 또는 `M015: 해당 없음` 입니다.
 - 두 번째 실행은 `M015: 해당 없음` 이고 파일을 바꾸지 않습니다.
 
-**실행 절차**: 아래 스니펫을 프로젝트 루트에서 실행합니다. 인자는 clone 된 템플릿의 `.claude/settings.json` 경로입니다.
-
-```bash
-python3 - "<임시 clone 경로>/.claude/settings.json" <<'PY'
-import json, os, sys, tempfile
-
-proj_p = ".claude/settings.json"
-try:
-    tpl = json.load(open(sys.argv[1], encoding="utf-8"))
-    tpl_allow = tpl["permissions"]["allow"]
-    if not isinstance(tpl_allow, list):
-        raise TypeError("템플릿 permissions.allow 가 list 가 아닙니다")
-except Exception as e:
-    print("M015 실패: 템플릿 settings 를 읽지 못했습니다 (%s)" % e)
-    sys.exit(1)
-try:
-    proj = json.load(open(proj_p, encoding="utf-8"))
-except FileNotFoundError:
-    print("M015: 해당 없음 (.claude/settings.json 없음)")
-    sys.exit(0)
-except Exception as e:
-    print("M015 실패: 프로젝트 settings 를 읽지 못했습니다 (%s)" % e)
-    sys.exit(1)
-if not isinstance(proj, dict):
-    print("M015 실패: settings 최상위가 객체가 아닙니다")
-    sys.exit(1)
-perms = proj.get("permissions", {}) if "permissions" in proj else {}
-if not isinstance(perms, dict):
-    print("M015 실패: permissions 가 객체가 아닙니다")
-    sys.exit(1)
-allow = perms.get("allow", []) if "allow" in perms else []
-if not isinstance(allow, list):
-    print("M015 실패: permissions.allow 가 list 가 아닙니다")
-    sys.exit(1)
-added = [r for r in tpl_allow if r not in allow]
-if not added:
-    print("M015: 해당 없음")
-    sys.exit(0)
-perms["allow"] = allow + added
-proj["permissions"] = perms
-rendered = (json.dumps(proj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-# 같은 디렉터리 임시 파일에 다 쓴 뒤 원자 교체합니다 — 쓰는 도중 실패해도 원본이 남습니다.
-tmp = None
-try:
-    # 심링크면 링크가 가리키는 실제 파일 자리에서 교체합니다 — 링크 자리에 일반 파일을 두면 공유 설정이 끊깁니다.
-    target = os.path.realpath(proj_p)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".settings.json.m015.")
-    with os.fdopen(fd, "wb") as f:
-        f.write(rendered)
-    os.chmod(tmp, os.stat(target).st_mode & 0o7777)  # mkstemp 의 0600 대신 원본 권한을 잇습니다
-    os.replace(tmp, target)
-except Exception as e:
-    if tmp is not None:
-        try: os.unlink(tmp)
-        except OSError: pass
-    print("M015 실패: 저장 중 오류 — 원본이 유지됩니다 (%s)" % e)
-    sys.exit(1)
-print("M015: added %d" % len(added))
-for r in added:
-    print("  + " + r)
-PY
-```
+**출력**: `M015: added <N>` 과 두 칸 들여쓴 `+ <규칙>` 줄, 또는 `M015: 해당 없음` 입니다. 실패는 `M015 실패: <원인>` 이고 파일을 바꾸지 않습니다. 템플릿 settings 에 `permissions.allow` 가 없거나 list 가 아니면 실패합니다.
 
 **주의**:
 - 프로젝트 `permissions.allow` 는 Claude Code 가 신뢰한 폴더에서만 적용됩니다. worktree 는 메인 저장소의 신뢰를 따릅니다.
@@ -858,6 +475,8 @@ PY
 - 이 항목이 만든 변경은 자동 커밋하지 않고 다음 정규 커밋에 편승시킵니다 (M004 와 같은 계약).
 
 ## M016: 세션 자기 worktree 삭제 차단 가드 추가 (`.claude/settings.json`)
+
+**처리**: 안내 (`migrate post`, 이전 VERSION 이 2026-11-07 이하일 때 `NOTICE`). 등록 변경은 M005·M003 이 자동으로 처리합니다.
 
 **조건**: 이 버전 이후로 동기화하는 모든 프로젝트.
 
@@ -872,6 +491,8 @@ PY
 
 ## M017: `/fr batch` 별칭화 · batch manifest 폐지 · `scripts/batch/` 제거
 
+**처리**: 판단(감지) + 안내 (`migrate post`). `rd-workflow-workspace/.batch-manifest.json` 이 있으면 `ASK` 와 남은 항목 처리 안내를 냅니다. 이전 VERSION 이 2026-11-08 이하면 `NOTICE` 를 냅니다.
+
 **조건**: 이 버전 이후로 동기화하는 모든 프로젝트.
 
 **동작 변화**:
@@ -881,7 +502,7 @@ PY
 - `fr_relations.sh batch-draft` 서브커맨드가 없어졌습니다.
 - `workflow.json` 에 선택 키 `fr_do_max_streams`(기본 `4`)가 생겼습니다. 키가 없어도 `4` 로 동작합니다.
 
-**실행 절차**: 필수 스니펫은 없습니다. `.gitignore` 에 아래 줄을 더합니다. 기존 `.batch-manifest.json`·`.batch-outcome-*`·`.batch-logs/` 줄은 남은 파일이 미추적으로 잡히지 않도록 그대로 둡니다.
+**실행 절차**: 필수 스니펫은 없습니다. M003 이 `.gitignore` 에 아래 줄을 부재 라인으로 더합니다. 기존 `.batch-manifest.json`·`.batch-outcome-*`·`.batch-logs/` 줄은 남은 파일이 미추적으로 잡히지 않도록 그대로 둡니다.
 
 ```
 rd-workflow-workspace/.lifecycle/fr-do/
@@ -891,3 +512,24 @@ rd-workflow-workspace/.lifecycle/fr-do/
 - 진행 중이던 batch manifest 가 있으면 파일을 지우지 않고 남은 항목(`state` 가 `completed` 가 아니고 `feasibility` 가 `excluded` 가 아닌 항목)을 `/fr do <slug들>` 로 이어 처리합니다. `/fr batch` 별칭을 실행하면 남은 slug 를 안내합니다. 확인이 끝나면 manifest 파일을 직접 지웁니다.
 - `scripts/batch/resume_candidates.sh` 를 직접 부르던 스크립트는 `scripts/resume_candidates.sh` 로 바꿉니다.
 - `batch_manifest.sh`·`headless_result.sh` 를 직접 부르던 스크립트는 대체 경로가 없습니다. 무인 완주는 `/fr do --headless`(엔진 `ralph_drain.sh` 에 `RD_RALPH_SLUGS` 로 slug 목록 전달)로 바꿉니다.
+
+## M018: 마감 때 팀 저장소 PR 단계 추가 · 기본 반영 방식 `pr`
+
+**처리**: 안내 (`migrate post` 가 `NOTICE` 를 냅니다). 설정 파일을 자동으로 쓰지 않습니다. 반영 방식은 사용자가 고릅니다.
+
+**조건**: overlay(팀 저장소를 submodule 로 둔 구조)를 쓰고 소스에서 코드를 바꾸는 모든 프로젝트. submodule 이 없는 프로젝트는 영향이 없습니다.
+
+**동작 변화**:
+- 마감 흐름에 팀 저장소 반영 단계가 생겼습니다. `rd pr open` 이 팀 브랜치를 push 하고 PR 을 만들면 Status 가 `PR 검토 중` 이 되고, 팀이 merge 한 뒤 `rd pr check --apply` 가 submodule 포인터를 옮기고 `아카이브 보류` 로 되돌립니다. 그다음에 기존 발행 절차를 씁니다.
+- `rd-workflow/config/workflow.json` 에 선택 키 `team_publish` 가 생겼습니다(`mode`·`base`·`branch_prefix`·`light`·`submodules.<경로>`). 키가 없으면 기본값 `mode=pr` 로 동작합니다.
+- archive 가 반영 방식 `pr`·`push` 인 submodule 의 새 포인터가 팀 대상 브랜치에 들어 있는지 확인합니다. 들어 있지 않으면 발행을 거부합니다. **안내를 놓친 기존 사용자는 업데이트 직후 첫 발행에서 거부될 수 있습니다.** 거부 메시지가 어느 submodule 인지와 다음 행동을 알립니다.
+- `light` 작업이 반영 대상 submodule 을 바꾸면 `rd pr light-check` 가 `standard` 로 상향합니다(`team_publish.light` 가 `pr` 일 때).
+- `rd task list` 가 `PR 검토 중` 작업마다 submodule 별 PR 상태와 다음 행동을 보입니다.
+- 새 Status `PR 검토 중` 이 생겨 허용값이 11종이 됩니다.
+
+**실행 절차**: 필수 스니펫은 없습니다. 설정 파일도 자동으로 고치지 않습니다.
+
+**사용자가 할 일**:
+- 새 흐름을 쓰려면 `gh` 를 설치하고 팀 저장소 호스트에 로그인합니다(`gh auth status`). 순서는 `rd-workflow/docs/guides/team-overlay-fresh-install.md` 의 「마감 — 팀 저장소 반영」 절에 있습니다.
+- 이전 방식(팀 저장소 반영을 직접 하고 overlay 만 발행)으로 두려면 `rd-workflow/config/workflow.json` 에 `"team_publish": { "mode": "manual" }` 을 적고 커밋합니다. 일부 submodule 만 직접 반영하려면 `team_publish.submodules.<경로>.mode` 를 `manual` 로 적습니다.
+- seal 을 만든 뒤 반영 방식을 바꾸려면 설정을 커밋하고 diff review 를 다시 종결해 seal 을 새로 만들어야 합니다. `workflow.json` 이 seal 보호 트리에 들어 있기 때문입니다.

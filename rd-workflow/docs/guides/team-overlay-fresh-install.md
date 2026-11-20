@@ -243,6 +243,57 @@ overlay에 기록된 소스 리비전이 **원격에서 접근 가능해야** �
 
 구 `overlay-branch-sync`는 **브랜치 이름 1:1 동기화**였고, 새 구조에서 git이 하는 일은 **리비전 복원**이다. 소스와 overlay의 브랜치 이름이 달라도 무방하다.
 
+### 8. 마감 — 팀 저장소 반영
+
+소스(submodule)에서 코드를 바꾼 작업은 마감 때 팀 저장소에 PR 로 올립니다. overlay 작업은 PR 이 merge 된 뒤에 끝납니다. 흐름의 정본은 [WORKFLOW.md 「`PR 검토 중` — 팀 저장소 반영」](../flows/WORKFLOW.md)입니다.
+
+순서는 다음과 같습니다.
+
+```bash
+# final diff review 종결 → seal → 아카이브 보류 → 기록 커밋 뒤, overlay 루트에서
+bash rd-workflow/scripts/rd pr open --dry-run     # 대상·팀 브랜치·PR 제목을 먼저 확인합니다
+bash rd-workflow/scripts/rd pr open               # 팀 브랜치 push + PR 생성(Status: PR 검토 중)
+bash rd-workflow/scripts/rd pr check              # PR 상태와 다음 행동 확인(조회만)
+# 팀이 PR 을 merge 한 뒤 (포인터·Status 커밋은 이 명령이 직접 만듭니다. 중간에 실패하면 같은 명령을 다시 실행합니다)
+bash rd-workflow/scripts/rd pr check --apply      # 포인터를 merge 된 커밋으로 옮김(Status: 아카이브 보류)
+# 이어서 기존 발행(rd publish request 또는 archive.sh)
+```
+
+- `gh` 가 설치되고 소스 저장소의 호스트에 로그인돼 있어야 합니다(`gh auth status`). GitHub 저장소만 지원합니다.
+- `rd task list` 는 `PR 검토 중` 작업마다 submodule 별 PR 상태와 다음 행동을 보입니다.
+- 수정 요청이 오면 `rd task set-status "구현 중"` 으로 돌아가 고치고, 같은 리뷰 세션에서 재종결·재seal 한 뒤 `rd pr open` 을 다시 실행합니다. 새 PR 이 생기지 않고 열린 PR 의 본문이 갱신됩니다.
+- PR 이 merge 없이 닫히면 `rd pr check` 가 폐기·다시 열기·Issue 선점 풀기 선택지를 안내합니다(정본: WORKFLOW.md 「`PR 검토 중` — 팀 저장소 반영」의 닫힘 항목).
+- archive 는 반영 방식 `pr`·`push` 인 submodule 의 새 포인터가 팀 대상 브랜치에 들어 있어야 발행합니다. 팀 저장소 반영이 끝나지 않은 채 overlay 만 발행되는 일을 막습니다.
+
+반영 방식은 `rd-workflow/config/workflow.json` 의 `team_publish` 로 바꿉니다.
+
+```json
+{
+  "team_publish": {
+    "mode": "pr",
+    "base": "",
+    "branch_prefix": "",
+    "light": "pr",
+    "submodules": {
+      "myproject": { "mode": "manual" },
+      "libs/vendor": { "mode": "push", "base": "develop" }
+    }
+  }
+}
+```
+
+| 키 | 값 | 기본값 | 뜻 |
+|---|---|---|---|
+| `mode` | `pr` / `push` / `manual` | `pr` | 모든 submodule 의 반영 방식. `manual` 은 반영하지 않습니다 |
+| `base` | 브랜치 이름 | 빈 값(GitHub 기본 브랜치) | PR 대상 브랜치. `push` 이면 push 대상 브랜치 |
+| `branch_prefix` | 문자열 | 빈 값 | 팀 브랜치 이름은 `<branch_prefix><slug>` 입니다. 이 이름이 대상 브랜치와 같으면 `rd pr open` 이 원격을 바꾸지 않고 멈추므로, 작업 slug 가 대상 브랜치 이름(예: `main`)과 같을 수 있으면 `rd/` 처럼 접두어를 둡니다 |
+| `light` | `pr` / `merge` | `pr` | `pr` 이면 반영 대상 submodule 을 바꾼 `light` 작업을 `standard` 로 올립니다 |
+| `submodules.<경로>` | 위 키 일부 | - | `.gitmodules` 의 경로별 설정. 경로별 값이 전체 값을 덮어씁니다 |
+
+팀 저장소에 직접 반영하는 `push` 방식은 사용자가 승인한 뒤 `--approve-push` 를 붙여야 실행됩니다. 알 수 없는 `mode`·`light` 값은 오류로 멈춥니다.
+
+반영 방식은 작업 커밋(fr 작업은 fr 브랜치, fr 브랜치 없이 기본 브랜치에서 하는 작업은 HEAD)에 커밋된 `workflow.json` 으로 판정합니다. 작업 폴더의 설정이 커밋과 다르면 `rd pr open` 은 커밋한 뒤 다시 실행하라고 하고 멈춥니다. `workflow.json` 은 seal 이 보호하는 트리에 들어 있습니다. seal 뒤에 그 작업만 반영하지 않으려면 `archive.sh` 에 `--allow-unpublished-submodule "<사유>"` 를 붙입니다. 다음 작업부터 바꾸려면 기본 브랜치에 설정을 커밋합니다. 그 작업에서 바꾸려면 `rd task set-status "구현 중"` → 설정 커밋 → final diff review 재종결 → `rd review seal` 순서로 합니다. fr 브랜치 없이 기본 브랜치에서 하는 작업도 `rd pr open`·`rd pr check --apply` 로 반영합니다. 조건은 두 가지입니다. 첫째, 상위 저장소의 `archive_publish` 가 `push`(기본값)여야 합니다. `pr` 이면 두 명령이 「archive_publish=pr 는 fr 브랜치 작업만 지원합니다 — promote.sh 로 작업을 시작하십시오」 로 멈춥니다. 둘째, 기본 브랜치를 체크아웃한 곳에서 실행합니다. 반영 대상은 리뷰 기준점(seal 마커의 `review-base`)으로 정하고, 기준점이 없으면 `rd task set-base <리뷰한 diff 의 기준 커밋>` 뒤 task-state 를 커밋하라고 안내합니다.
+
 ## 주의사항과 한계
 
 - overlay repo의 커밋은 자동화되지 않는다. 작업 세션 끝에 수동으로 push한다.

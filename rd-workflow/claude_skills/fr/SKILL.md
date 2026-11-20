@@ -1,10 +1,10 @@
 ---
 name: fr
 description: >
-  Manage future requests — add, list, prioritize, lifecycle, sync with GitHub Issues.
-  Subcommands: /fr add, /fr list, /fr pri, /fr inspect, /fr groom, /fr archive, /fr park, /fr status, /fr pull, /fr push, /fr sync, /fr do (/fr batch is an alias of /fr do --headless until the next release).
+  Manage future requests — add, list, prioritize, lifecycle, take team GitHub Issues, hand FRs to the team.
+  Subcommands: /fr add, /fr list, /fr pri, /fr inspect, /fr groom, /fr archive, /fr park, /fr status, /fr take, /fr push, /fr do (/fr batch is an alias of /fr do --headless until the next release).
   Use when the user wants to manage backlog items.
-  Model self-invocation is limited to list / pri / inspect / pull and local-only add; publishing to GitHub (add while fr_github is enabled, push, sync)
+  Model self-invocation is limited to list / pri / inspect and local add; take (claims a team Issue), push (creates a GitHub Issue)
   and do (batch alias), groom, archive, park, status all require an explicit user request.
 user-invocable: true
 ---
@@ -25,6 +25,8 @@ Typical user requests:
 - "FR 우선순위 검토해줘" → `/fr pri`로 라우팅
 - "이 FR 검토해줘" → `/fr inspect <short-title>`로 라우팅
 - "N번 검토해줘" / "N번 autopilot 가능한지 봐줘" → 직전 `/fr list` 출력에서 N번 행의 short-title을 찾아 `/fr inspect <short-title>`로 라우팅 (번호는 inspect의 공식 인자가 아니라 라우팅 단계 변환용)
+- "팀 Issue 집어 가자" / "팀 대기열에서 하나 가져와" → `/fr take`로 라우팅
+- "이 FR 팀에 넘겨줘" → `/fr push <short-title>`로 라우팅
 - "done 항목 정리해줘" → `/fr archive`로 라우팅
 - "이거 parked로 옮겨줘" → `/fr park`로 라우팅
 - "idea FR 검증해줘" / "이 FR 문답으로 정리해줘" → `/fr groom [<short-title>]`로 라우팅
@@ -43,7 +45,7 @@ Typical user requests:
 
 ```bash
 bash -s <<'RD_SKILL_COMPAT'
-RD_SKILL_BASE=2026-11-07-210251 RD_SKILL_NAME=fr
+RD_SKILL_BASE=2026-11-08-092219 RD_SKILL_NAME=fr
 vf="rd-workflow/VERSION"
 if [ ! -f "$vf" ] && [ -f "_ROOT_FILES/rd-workflow/VERSION" ]; then exit 0; fi
 v=""; [ -f "$vf" ] && v="$(cat "$vf")"; v="${v#lite-}"
@@ -68,14 +70,15 @@ RD_SKILL_COMPAT
 - `archive` → Read `rd-workflow/claude_skills/fr/archive.md` and follow it.
 - `park` → Read `rd-workflow/claude_skills/fr/park.md` and follow it.
 - `status` → Read `rd-workflow/claude_skills/fr/status.md` and follow it.
-- `pull` → Read `rd-workflow/claude_skills/fr/pull.md` and follow it.
+- `take` → Read `rd-workflow/claude_skills/fr/take.md` and follow it.
+- `pull` → `rd-workflow/claude_skills/fr/pull.md` 파일이 있으면(rd 정본 저장소) Read 하고 그 절차(결함 보고 흡수)를 따릅니다. 파일이 없으면 "`/fr pull` 은 없어졌습니다 — 팀 Issue 는 `/fr take` 로 집습니다" 를 출력하고 파일을 바꾸지 않습니다.
 - `push` → Read `rd-workflow/claude_skills/fr/push.md` and follow it.
-- `sync` → Read `rd-workflow/claude_skills/fr/sync.md` and follow it.
+- `sync` → "`/fr sync` 는 없어졌습니다 — 팀 Issue 는 `/fr take` 로 집고, 내 FR 은 `/fr push` 로 넘깁니다" 를 출력하고 파일을 바꾸지 않습니다.
 - `do` → Read `rd-workflow/claude_skills/fr/do.md` and follow it.
 - `batch` → 별칭입니다. Read `rd-workflow/claude_skills/fr/do.md` 의 「`/fr batch` 별칭」 절 and follow it.
 - 그 외 / 인자 없음 → 아래 사용법 출력 후 종료 (파일 수정 없음 보장)
 
-**Legacy call 처리**: 첫 번째 단어가 `add`, `list`, `pri`, `inspect`, `groom`, `archive`, `park`, `status`, `pull`, `push`, `sync`, `do`, `batch` 중 어느 것도 아니면 사용법 help를 출력합니다. 파일을 절대 수정하지 않습니다.
+**Legacy call 처리**: 첫 번째 단어가 `add`, `list`, `pri`, `inspect`, `groom`, `archive`, `park`, `status`, `take`, `pull`, `push`, `sync`, `do`, `batch` 중 어느 것도 아니면 사용법 help를 출력합니다. 파일을 절대 수정하지 않습니다.
 
 ### 사용법 출력
 
@@ -89,9 +92,8 @@ RD_SKILL_COMPAT
 - `/fr archive` — done 항목 인덱스에서 일괄 삭제
 - `/fr park <제목>` — 항목을 parked로 이동
 - `/fr status <제목> <상태>` — 항목 상태 변경
-- `/fr pull` — GitHub Issues → 로컬 FR 가져오기
-- `/fr push [제목]` — 로컬 FR → GitHub Issue 내보내기
-- `/fr sync` — 연결된 항목 status 동기화
+- `/fr take` — 팀 GitHub Issue 하나를 골라 선점하고 FR 을 만들어 착수
+- `/fr push [제목]` — 내 FR 을 팀 GitHub Issue 로 넘김 (FR 은 handed-off 로 닫힘)
 - `/fr do [<slug들>]` — 여러 FR 을 줄기로 묶어 병렬로 띄우고 감시·발행 허가·마감까지 처리 (터미널 herdr)
 - `/fr do --headless [--finish push|merge|none] [<slug들>]` — 고른 FR 을 무인으로 순차 완주
 - `/fr batch <인자>` — `/fr do --headless` 의 별칭 (별칭, 다음 배포에서 제거)
@@ -103,22 +105,23 @@ RD_SKILL_COMPAT
 
 ## 백엔드 결정
 
-서브커맨드 실행 전에 GitHub 연동 여부를 결정합니다.
+`take`·`push`·정본 `pull`(결함 보고 흡수)은 GitHub 를 부릅니다. 아래 전제조건을 검증합니다. `add` 는 `fr_github` 값과 상관없이 GitHub 를 부르지 않습니다. `fr_github` 는 `/fr list` 의 GitHub 칸 표시에만 남습니다.
 
-1. 인자에서 `--github` 또는 `--local` 플래그를 탐색합니다. 발견하면 인자에서 제거합니다.
-   - `--github`: GitHub 연동 강제 활성화
-   - `--local`: GitHub 연동 강제 비활성화
-2. 플래그가 없으면 `rd-workflow/config/workflow.json`의 `fr_github` 값을 읽습니다.
-3. 파일이 없거나 `fr_github` 키가 없으면 기본값 `false` (연동 비활성).
-4. GitHub 연동 활성화 시 전제조건을 검증합니다:
+1. 인자의 `--github`·`--local` 플래그는 쓰지 않습니다. 발견하면 인자에서 제거하고 무시합니다.
+2. 대상 저장소는 `bash rd-workflow/scripts/issue_queue.sh repos` 가 정합니다. 설정 키는 `rd-workflow/config/workflow.json` 의 세 가지입니다.
+   - `issue_queue_repos`: Issue 를 가져올 저장소 배열 (`owner/repo`, `host/owner/repo`). 없으면 overlay 의 submodule URL 전부, submodule 이 없으면 `origin` 입니다.
+   - `issue_queue_labels`: 이 중 하나라도 붙은 Issue 만 고르기 화면에 보입니다. 없으면 라벨로 거르지 않습니다.
+   - `issue_claim_label`: 선점할 때 assignee 와 함께 붙이는 라벨입니다. 이 라벨이 붙은 Issue 는 고르기 화면에서 빠집니다.
+3. 선점 표시는 항상 GitHub assignee 입니다. 라벨은 팀 규약이 있을 때만 함께 붙습니다.
+4. 전제조건을 검증합니다:
    - `gh` CLI 설치 여부 — 미설치: "gh CLI가 설치되어 있지 않습니다" 출력 후 종료
    - `gh auth status` 통과 여부 — 미인증: "gh auth login으로 인증이 필요합니다" 출력 후 종료
-   - `gh repo view` 성공 여부 — 실패: "git remote가 설정되지 않았거나 Issues가 비활성화되어 있습니다" 출력 후 종료
+   - 대상 저장소 결정 — `/fr push` 에 `--repo` 가 있으면 그 값을 대상으로 쓰고 이 검사를 건너뜁니다. 그 밖에는 `issue_queue.sh repos` 가 rc 3 이면 "Issue 를 가져올 저장소를 정하지 못했습니다 — `issue_queue_repos` 를 설정하십시오" 출력 후 종료
 5. 검증 실패 시 로컬 fallback 없이 종료합니다.
-6. **예외 — 결함 보고 전달 경로**: `workflow-defect-reporting.md` 규약에 따른 결함 보고 발행은 전제조건 실패 시 **종료하지 않습니다.** 보고 파일을 그대로 두고 미전달로 표시한 뒤, 사유·미전달 목록·재시도 명령을 안내합니다. 여기서 종료하면 보고서가 다시 조용히 쌓여 규약이 해결하려는 문제로 되돌아갑니다. 이 예외는 결함 보고 경로에만 적용되며 `add`/`push`/`pull`/`sync` 의 FR 경로는 위 5번 그대로입니다.
-7. `pull`, `push`, `sync` 서브커맨드는 `fr_github` 설정과 무관하게 항상 전제조건 검증을 실행합니다.
+6. **예외 — 결함 보고 전달 경로**: `workflow-defect-reporting.md` 규약에 따른 결함 보고 발행은 전제조건 실패 시 **종료하지 않습니다.** 보고 파일을 그대로 두고 미전달로 표시한 뒤, 사유·미전달 목록·재시도 명령을 안내합니다. 여기서 종료하면 보고서가 다시 조용히 쌓여 규약이 해결하려는 문제로 되돌아갑니다. 이 예외는 결함 보고 경로에만 적용되며 `take`·`push` 는 위 5번 그대로입니다.
+7. `take`·`push`·정본 `pull` 은 설정과 무관하게 항상 전제조건 검증을 실행합니다.
 
-이후 각 서브커맨드는 결정된 연동 여부에 따라 동작합니다.
+
 
 ---
 
@@ -126,12 +129,12 @@ RD_SKILL_COMPAT
 
 ### Label 체계
 
-- **status**: `fr:idea`, `fr:validated`, `fr:ready-for-request`
-- **종료**: `fr:done`, `fr:dropped`
-- **kind**: `fr:feature`, `fr:bug`, `fr:refactor`, `fr:tech-debt`, `fr:tooling`, `fr:research`, `fr:test`
-- **priority**: 사용하지 않음 (pri는 로컬 전용)
+rd 가 만들거나 읽는 라벨은 생산자 라벨 둘뿐입니다. Issue 상태 라벨(`fr:*`)은 만들지도 읽지도 않습니다.
 
-`fr:` namespace를 FR 전용으로 사용합니다. 기존 repo에 `fr:*` label이 있으면 충돌 가능 — pull은 status label 필수 조건으로 완화됩니다.
+- `rd-handoff`: `/fr push` 가 넘긴 Issue (`issue_queue.sh produce --label rd-handoff`)
+- `defect-report`: 결함 보고 전달 (`defect_reports.sh`)
+- 선점 표시는 assignee 이고, `issue_claim_label` 은 팀 규약이 있을 때만 붙입니다.
+- priority 는 사용하지 않습니다 (pri 는 로컬 전용).
 
 ### 에러 처리
 
@@ -139,17 +142,14 @@ RD_SKILL_COMPAT
 |------|--------|------|
 | gh 미설치 | "gh CLI가 설치되어 있지 않습니다" | 종료 |
 | gh 미인증 | "gh auth login으로 인증이 필요합니다" | 종료 |
-| repo 미연결 | "git remote가 설정되지 않았습니다" | 종료 |
-| Issues 비활성 | "이 저장소에서 Issues가 비활성화되어 있습니다" | 종료 |
-| status label 생성 실패 | "fr:{status} label 생성 실패 — Issue 생성 중단" | **에러, 해당 항목 중단** |
-| kind label 생성 실패 | "fr:{kind} label 생성 실패" | 경고, label 없이 진행 |
-| Issue 생성 실패 | "GitHub Issue 생성 실패" | add: 로컬 유지+경고, push: 건너뜀+경고 |
+| 대상 저장소 미결정 | "Issue 를 가져올 저장소를 정하지 못했습니다" | 종료 |
+| Issue 생성·조회 실패 | `issue_queue.sh` 의 종료 코드와 stderr | push: 건너뜀+경고, take: 종료 코드별 안내 (`take.md`) |
 
 ### 데이터 분리
 
-- 로컬과 GitHub는 독립 저장소입니다. 연결은 인덱스의 GitHub 컬럼과 상세 파일의 `github-issue` 필드 양쪽에서 추적합니다.
-- 연동을 비활성화해도 기존 `github-issue` 필드는 유지합니다 (삭제 안 함).
-- 사용자 안내: "GitHub 연동을 비활성화하면 로컬 데이터만 표시됩니다. GitHub Issues는 별도로 관리해야 합니다."
+- 로컬과 GitHub 는 독립 저장소입니다. 연결은 인덱스의 GitHub 컬럼과 상세 파일의 `github-issue` 필드 양쪽에서 추적합니다.
+- 기존 `github-issue` 필드는 설정을 바꿔도 유지합니다 (삭제 안 함).
+- 선점 장부는 `$(git rev-parse --git-common-dir)/rd-issue-claims.tsv` 이고 저장소에 커밋되지 않습니다.
 
 ---
 
@@ -159,9 +159,10 @@ RD_SKILL_COMPAT
 - `/fr add`는 FR 등록만 합니다. REQUEST.md 작성, 구현 착수 금지.
 - 서브커맨드가 없거나 알 수 없으면 사용법만 출력하고 종료합니다. 파일 수정 없음.
 - `github-issue`는 인덱스(GitHub 컬럼)와 상세 파일 양쪽에서 관리합니다. 연결/해제 시 양쪽 모두 갱신합니다.
-- pull/push/sync는 `fr_github` 설정과 무관하게 `--github` 플래그 없이도 실행 가능합니다 (항상 전제조건 검증 실행).
+- `take`·`push`·정본 `pull` 은 `fr_github` 설정과 무관하게 실행하며 항상 전제조건 검증을 합니다.
+- 종료 상태는 `done`·`dropped`·`handed-off` 입니다. `handed-off` 는 `/fr push` 로만 만들어집니다.
 - 결함 보고 전달은 FR 경로와 분리됩니다 — 라벨은 `defect-report`, 도구는 `defect_reports.sh`, 실패는 종료가 아니라 미전달 표시입니다.
-- **모델 자기호출 경계**: 모델이 사용자의 명시 요청 없이 이 skill 을 스스로 호출한 경우 `list`·`pri`·`inspect`·`pull` 과 **로컬 전용 `add`** 만 수행합니다.
-  - `add` 는 자기호출일 때 **유효 backend 와 무관하게 로컬로만 등록**합니다. GitHub 연동이 활성이어도 `gh issue create` 로 넘어가지 않고, 로컬 등록을 마친 뒤 "GitHub Issue 발행은 사용자 요청이 필요합니다 — 발행하려면 `/fr push <제목>` 를 요청해 주십시오" 를 알립니다. `add` 의 `GitHub 연동` 절차는 사용자가 직접 호출한 경우에만 실행합니다.
-  - `push`(외부 저장소 Issue 발행)·`sync`(원격 label 변경·Issue close)·`do`(여러 FR 처리. 별칭 `batch` 포함)·`groom`(문답 검증 뒤 상태 변경)·`archive`·`park`·`status` 는 사용자의 명시 요청을 요구하며, 요청이 없으면 수행하지 않고 어떤 요청이 필요한지 알립니다.
+- **모델 자기호출 경계**: 모델이 사용자의 명시 요청 없이 이 skill 을 스스로 호출한 경우 `list`·`pri`·`inspect` 와 **`add`** 만 수행합니다.
+  - `add` 는 GitHub 를 부르지 않습니다. 팀 대기열이 있는 저장소(`issue_queue.sh has-team-queue` 가 0)이면 등록을 마친 뒤 "팀에 넘기려면 `/fr push <제목>` 을 요청해 주십시오" 를 알립니다. 판정 명령은 `add.md` 7단계에 있습니다.
+  - `take`(팀 Issue 선점, 원격 변경)·`push`(외부 저장소 Issue 발행)·`do`(여러 FR 처리. 별칭 `batch` 포함)·`groom`(문답 검증 뒤 상태 변경)·`archive`·`park`·`status` 는 사용자의 명시 요청을 요구하며, 요청이 없으면 수행하지 않고 어떤 요청이 필요한지 알립니다.
   - 플래그가 skill 단위여서 부분 개방이 불가하므로 이 경계는 문서 계약이며 harness 강제가 아닙니다 (`AUTONOMY.md` 「실행 모드와 skill 호출 권한」).

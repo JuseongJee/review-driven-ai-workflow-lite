@@ -117,5 +117,34 @@ hdrR="${hdr/| 상태 |/| 진행 |}"
 F=base mk "$rowA" "$rowC"; F=ours mk "$rowA" "$rowCo"; printf '%s\n' "$hdrR" "$rowA" "$rowCt" > "$T/theirs"
 [[ "$(run)" == 1 && ! -s "$T/out" ]] && pass "헤더가 다르면 칸 단위로 풀지 않음 → rc 1" || fail "헤더 상이 칸 병합 — $(cat "$T/out" "$T/err")"
 
+# 22~30) 표 본문의 한 줄 HTML 주석은 집합 원소로 보존된다 (archive-publish-fixes D2: done 처리가 남긴 주석 줄에서 병합이 멈췄다)
+cm='<!-- (2026-11-07) old → done, 인덱스에서 삭제 -->'
+cm2='<!-- (2026-11-17) b → done -->'
+# ok <이름> <기대 줄...> — rc 0 과 출력 전체를 본다
+ok() { local nm="$1"; shift; local rc; rc="$(run)"
+  [[ "$rc" == 0 ]] && [[ "$(cat "$T/out")" == "$(printf '%s\n' "$hdr" "$@")" ]] \
+    && pass "$nm" || fail "$nm — rc=$rc $(cat "$T/out" "$T/err")"; }
+F=base mk "$rowA" "$cm" "$rowB" "$rowX"; F=ours mk "$rowA" "$cm" "$rowX"; F=theirs mk "$rowA" "$cm" "$rowB"
+ok "a 주석 줄이 있는 표에서 양쪽 행 삭제가 합쳐지고 주석은 남는다" "$rowA" "$cm"
+F=base mk "$rowA" "$cm" "$rowB"; F=ours mk "$cm" "$rowB"; F=theirs mk "$rowA" "$cm" "$rowB"
+ok "a2 주석 앞 행이 지워져도 주석은 base 순서 자리에 남는다" "$cm" "$rowB"
+F=base mk "$rowA" "$rowB" "$rowX"; F=ours mk "$rowA" "$cm2" "$rowX"; F=theirs mk "$rowA" "$rowB" "$rowX" "$rowY"
+ok "b 새 주석은 그쪽 파일의 앞 원소 뒤에 들어가고 반대편 새 행은 끝에 붙는다" "$rowA" "$cm2" "$rowX" "$rowY"
+F=base mk "$rowA" "$rowB"; F=ours mk "$rowA" "$cm2"; F=theirs mk "$rowA" "$cm2"
+ok "c 양쪽이 같은 새 주석을 넣으면 한 번만 남는다" "$rowA" "$cm2"
+F=base mk "$rowA" "$cm" "$rowB"; F=ours mk "$rowA" "$rowB"; F=theirs mk "$rowA" "$cm" "$rowB"
+ok "d 한쪽이 지운 base 주석은 사라진다" "$rowA" "$rowB"
+F=base mk "$rowA" "$cm" "$rowB"; F=ours mk "$rowA" "$cm2" "$rowB"; F=theirs mk "$rowA" "$cm" "$rowB"
+ok "d2 한쪽이 주석 글을 바꾸면 바뀐 글만 남는다" "$rowA" "$cm2" "$rowB"
+F=base mk "$rowA" "$cm" "$rowB" "$cm"; F=ours mk "$rowA" "$cm" "$rowB" "$cm" "$rowX"; F=theirs mk "$rowA" "$cm" "$rowB" "$cm"
+ok "e 같은 글의 주석 두 줄이 모두 보존된다" "$rowA" "$cm" "$rowB" "$cm" "$rowX"
+F=base mk "$rowA" "$cm" "$rowB" "$cm"; F=ours mk "$rowA" "$cm" "$rowB"; F=theirs mk "$rowA" "$cm" "$rowB" "$cm" "$rowX"
+ok "e2 같은 글의 주석 두 줄 중 한쪽이 지운 줄만 사라진다" "$rowA" "$cm" "$rowB" "$rowX"
+F=base mk "$rowA"; F=ours mk "$cm2" "$rowA"; F=theirs mk "$rowA"
+ok "f 앞 원소가 없는 새 주석은 표 본문 맨 앞에 들어간다" "$cm2" "$rowA"
+F=base mk "$rowA"; F=ours mk "$rowA" '<!-- 시작' '끝 -->'; F=theirs mk "$rowA"
+[[ "$(run)" == 1 && ! -s "$T/out" ]] && grep -qF 'ours 10행 — 표 뒤에 빈 줄이 아닌 내용이 있습니다: <!-- 시작' "$T/err" \
+  && pass "g 표 안의 여러 줄 주석은 첫 줄에서 거부된다 → rc 1" || fail "g 여러 줄 주석 허용됨 — $(cat "$T/out" "$T/err")"
+
 echo "merge_fr_index: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]

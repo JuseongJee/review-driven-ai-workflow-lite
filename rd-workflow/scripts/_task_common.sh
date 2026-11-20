@@ -27,14 +27,16 @@ source "${_TC_DIR}/lifecycle/slug.sh"
 source "${_TC_DIR}/lifecycle/_tasks_index.sh"
 source "${_TC_DIR}/lifecycle/session_launch.sh"
 
-# canonical 10종 (LC-19) — `_state_common.sh` 의 STATE_CANONICAL_STATUSES 와 **같은 집합**이어야
+# canonical 11종 (LC-19) — `_state_common.sh` 의 STATE_CANONICAL_STATUSES 와 **같은 집합**이어야
 # 합니다. 한쪽만 고치면 CLI 는 받아들이는데 권위 파일 검증이 거부하는 어긋난 중간 상태가
 # 생깁니다 (self_test 의 LC-19 3자 일치 검증이 이 어긋남을 잡습니다).
 # `아카이브 보류` 는 「리뷰 종결·발행 대기」입니다 (change-spec §4.1) — 완료가 아닙니다.
+# `PR 검토 중` 은 「seal 을 마치고 팀 저장소에 PR 을 올렸으며 merge 를 기다리는」 진행 중
+# 상태입니다 (change-spec D3) — 완료가 아닙니다.
 # `구현 대기` 는 「spec/plan review 종결·구현 착수 대기」입니다 (change-spec
 # 2026-09-24-1836-task-status-no-implementation-pending) — spec/plan review 대기 도
 # 아니고 구현 중도 아닙니다.
-TASK_CANONICAL_STATUSES=("대기 중" "REQUEST review 대기" "spec/plan 작성 중" "spec/plan review 대기" "구현 대기" "구현 중" "검증 중" "diff review 대기" "아카이브 보류" "완료")
+TASK_CANONICAL_STATUSES=("대기 중" "REQUEST review 대기" "spec/plan 작성 중" "spec/plan review 대기" "구현 대기" "구현 중" "검증 중" "diff review 대기" "아카이브 보류" "PR 검토 중" "완료")
 
 task_status_canonical() {
   local s="$1" c
@@ -100,7 +102,8 @@ task_transition_allowed() {
     "구현 중→검증 중"|"검증 중→구현 중"|"검증 중→diff review 대기"|\
     "diff review 대기→구현 중"|"diff review 대기→완료"|\
     "diff review 대기→아카이브 보류"|"아카이브 보류→완료"|\
-    "아카이브 보류→구현 중"|"아카이브 보류→검증 중") return 0 ;;
+    "아카이브 보류→구현 중"|"아카이브 보류→검증 중"|\
+    "아카이브 보류→PR 검토 중"|"PR 검토 중→아카이브 보류"|"PR 검토 중→구현 중") return 0 ;;
   esac
   return 1
 }
@@ -108,7 +111,7 @@ task_transition_allowed() {
 task_set_status() {
   local to="$1" force="${2:-0}" from rc=0
   if ! task_status_canonical "$to"; then
-    echo "허용되지 않은 Status 값: ${to} (canonical 10종만 허용 — LC-19)" >&2
+    echo "허용되지 않은 Status 값: ${to} (canonical 11종만 허용 — LC-19)" >&2
     return 4
   fi
   from="$(task_read_status)" || {
@@ -672,7 +675,7 @@ _task_resolve_launch_failed() {
 # 뽑는다. 'rd-workflow-workspace/backlog/items/YYYY-MM-DD-slug.md' → 'slug'. 날짜 접두가
 # 없는(legacy) 파일명은 basename 전체(확장자 제외)를 slug 로 본다.
 #
-# guard 순위 4(change spec §2.1·§2.2)의 cand↔source-fr 비교 기준이다. cand 는 항상
+# guard 순위 3(change spec §2.1·§2.2)의 cand↔source-fr 비교 기준이다. cand 는 항상
 # normalize_slug 를 거친 short-title slug([a-z0-9-]) 이고, source-fr 집합의 원소는
 # canonical **경로**이므로 직접 비교할 수 없다 — 여기서 같은 "slug 자리" 로 투영한 뒤
 # 정확 일치로 비교한다(부분·접두 일치 불허).
@@ -746,31 +749,12 @@ task_guard_decide() {
   else
     # task-state 부재 시 CURRENT_TASK.md 산문 파싱 (마이그레이션 전 호환)
     if ! grep -q '^## Short Title' "$file" 2>/dev/null; then
-      if [[ "$mode" == "fr-add" ]]; then
-        echo "decision=proceed-readonly"
-        echo "message=CURRENT_TASK.md에 ## Short Title 섹션이 없습니다. 갱신 없이 진행합니다."
-        return 0
-      fi
       [[ "$dry" == "1" ]] || printf '## Short Title\n-\n\n' >> "$file"   # intake/promote: 부재 = write 대상 (`standard` 등급 현행 의미)
     fi
     cur="$(_extract_task_section "Short Title")"
   fi
 
-  # fr-add + ## Short Title 섹션 부재(task-state 없고 뷰 섹션도 없음) → proceed-readonly
-  if [[ -z "$cur" && "$mode" == "fr-add" && ! state_file_exists ]]; then
-    echo "decision=proceed-readonly"
-    echo "message=CURRENT_TASK.md에 ## Short Title 섹션이 없습니다. 갱신 없이 진행합니다."
-    return 0
-  fi
-
   if [[ -z "$cur" || "$cur" == "-" ]]; then
-    # fr-add + task-state 존재 + short-title 키 부재/빈 값(손상): write 금지 — proceed-readonly (GRD-02)
-    # "-"(sentinel)은 정상 상태 → write 허용. ""(키 부재·빈 값)만 손상으로 간주.
-    if [[ "$mode" == "fr-add" ]] && state_file_exists && [[ -z "$cur" ]]; then
-      echo "decision=proceed-readonly"
-      echo "message=task-state의 short-title이 비어있습니다(손상 가능). 갱신 없이 진행합니다."
-      return 0
-    fi
     if [[ "$dry" == "1" ]]; then
       echo "decision=write"
       echo "message=Short Title을 ${cand} 로 기록할 상황입니다 — --dry-run 이라 기록하지 않았습니다."
@@ -808,17 +792,12 @@ task_guard_decide() {
     echo "message=동일 Short Title(${cand}) — 변경 없이 진행합니다."
     return 0
   fi
-  if [[ "$mode" == "fr-add" ]]; then
-    echo "decision=proceed-readonly"
-    echo "message=진행 중 작업(${cur})이 있어 Short Title을 변경하지 않고 진행합니다."
-    return 0
-  fi
 
-  # 순위 4 (신설, change spec §2.1) — cand 가 현재 task-state 의 source-fr 집합
+  # 순위 3 (신설, change spec §2.1) — cand 가 현재 task-state 의 source-fr 집합
   # 구성원과 slug 기준으로 정확 일치하면 "같은 작업으로 재진입" 으로 보고 상태를
   # 바꾸지 않는다. mode 무관(intake·promote 둘 다) — "현재 작업이 그 FR 의 작업"
-  # 이라는 사실은 mode 와 무관하다. 순위 2·3 다음, 순위 5(fr-branch 활성 차단)보다
-  # 먼저 판정한다 — 통합 slug 로 자기 source FR 에 재진입하는 정상 흐름이 순위 5 의
+  # 이라는 사실은 mode 와 무관하다. 순위 2 다음, 순위 4(fr-branch 활성 차단)보다
+  # 먼저 판정한다 — 통합 slug 로 자기 source FR 에 재진입하는 정상 흐름이 순위 4 의
   # 보호 확대에 걸리지 않게 하기 위함이다.
   if state_file_exists; then
     local _sfr_raw _sfr_members _sfr_m _sfr_mslug
@@ -835,8 +814,8 @@ task_guard_decide() {
     done <<< "$_sfr_members"
   fi
 
-  # 순위 5 (신설, change spec §2.2) — fr-branch 가 활성(ref 실재, 또는 조회 실패로
-  # 판정 불가)이면 순위 2·4 에 해당하지 않는 한 무조건 block-active. 상태를 바꾸지
+  # 순위 4 (신설, change spec §2.2) — fr-branch 가 활성(ref 실재, 또는 조회 실패로
+  # 판정 불가)이면 순위 2·3 에 해당하지 않는 한 무조건 block-active. 상태를 바꾸지
   # 않는다 — 보호를 넓히는 방향이다(현행에서 rebind 로 통과했던 "승격 완료 + 무관
   # 후보" 를 막는다). 자동 정합화는 하지 않는다 — 사람이 둘 중 하나를 고른다.
   local _fbstate _fb_val
@@ -883,7 +862,7 @@ task_guard_decide() {
     # 달라 정상 상태를 divergence 로 차단한다 (final diff review F2).
     [[ "$mode" == "promote" ]] && _task_source_fr_mirror_write "$(source_fr_split "$src_val" "$project_root")"
     echo "decision=rebind"
-    # 순위 6 메시지 보강(AC A-6) — rebind 는 "이전 값이 기존 브랜치명과 어긋나게 되는
+    # 순위 5 메시지 보강(AC A-6) — rebind 는 "이전 값이 기존 브랜치명과 어긋나게 되는
     # 경우" 임을 병기한다. fr-branch 가 이미 비활성(null 또는 ref 부재)이라 여기 도달한
     # 것이므로, stale 값을 그대로 두면 이후 브랜치명·source-fr 과 어긋난 채 남는다.
     if [[ "$mode" == "promote" ]]; then
@@ -1389,7 +1368,7 @@ _fr_done_items_step() {
   line="$(sed -n "${tgt}p" "$abs")"
   prev_raw="$raw"; prev_line="$line"
   want="done"; rest=""
-  if [[ "$tok" == "done" || "$tok" == "dropped" ]]; then
+  if [[ "$tok" == "done" || "$tok" == "dropped" || "$tok" == "handed-off" ]]; then
     if [[ "$line" == "- status: ${tok}" ]]; then
       printf '  items: 건너뜀 (이미 %s)\n' "$tok"
       return 2
@@ -1497,7 +1476,7 @@ _fr_done_index_step() {
           found = 1
           if (n >= status_idx) {
             cur = fld[status_idx]
-            if (cur != "done" && cur != "dropped") { fld[status_idx] = newv; changed = 1 }
+            if (cur != "done" && cur != "dropped" && cur != "handed-off") { fld[status_idx] = newv; changed = 1 }
             # 재구성은 **실제 셀만**(2..n-1) 돈다. split 은 바깥쪽 구분자에 해당하는
             # 처음·마지막 빈 원소도 돌려주므로, 1..n 을 그대로 출력하면 7열 행이
             # 9열이 되어 상태 칸이 한 칸 밀린다 (final diff review F1 — 실측 손상).

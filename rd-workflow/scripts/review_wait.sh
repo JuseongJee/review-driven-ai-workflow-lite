@@ -192,9 +192,11 @@ rw_status_init_snapshot() {  # $1=스트림fd $2=cap $3=idle
 rw_render_final_block() {  # $1=yes|no $2=사유 토큰 $3=회수 가능한 임시 경로(선택) → stdout
   local base=""
   # 스트림 경로가 실행 중 symlink 로 대체됐다면 그 내용은 도구가 고른 파일이므로 읽지 않는다.
+  # 스트림은 세션 폴더에 있어 도구가 쓸 수 있다. writer 종료 증거(`writer_group`)는 이번 실행의 판정
+  # (RW_GROUP_STATE)만 남기고 스냅샷에서 물려받지 않는다 — 물려받으면 `verified` 와 이번 `unverified` 가 함께 남는다.
   if [ -n "$RW_STATUS_STREAM_PATH" ] && [ -f "$RW_STATUS_STREAM_PATH" ] && [ ! -L "$RW_STATUS_STREAM_PATH" ]; then
     base="$( { rw_status_last_snapshot "$RW_STATUS_STREAM_PATH" \
-      | grep -v -E '^(log_preserved|log_preserved_reason|log_path_final|log_path_recovery):' \
+      | grep -v -E '^(log_preserved|log_preserved_reason|log_path_final|log_path_recovery|writer_group):' \
       || true; } )"
   fi
   case "$base" in

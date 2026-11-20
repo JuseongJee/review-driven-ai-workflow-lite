@@ -1050,5 +1050,277 @@ _d_pqrc=0; ( cd "$TMP" && bash rd-workflow/scripts/lifecycle/publish_queue.sh no
 [[ "$_d_rc" == "$_d_pqrc" ]] && pass "rd publish 는 하위 명령의 종료 코드를 그대로 돌려준다" || fail "종료 코드 불일치: rd=$_d_rc pq=$_d_pqrc"
 rm -rf "$(git -C "$TMP" rev-parse --path-format=absolute --git-common-dir)/rd-workflow/publish-queue"
 
+# ---------------------------------------------------------------------------
+# PR 검토 중 표 (change spec D7·AC4b) — 가짜 gh 를 PATH 앞에 두고 mktemp fixture 안에서만 돈다.
+# ---------------------------------------------------------------------------
+GH_DIR="$(mktemp -d)" || { echo "test_tasks_list.sh: 가짜 gh 디렉터리 생성 실패" >&2; exit 1; }
+GH_DIR="$(cd "$GH_DIR" && pwd -P)"
+cat > "$GH_DIR/gh" <<'GH_EOF'
+#!/usr/bin/env bash
+# 가짜 gh — `gh pr view <url> --json ...` 에만 답한다. 호출마다 calls.log 에 한 줄을 남긴다.
+printf '%s\n' "$*" >> "$(dirname "$0")/calls.log"
+url="$3"
+case "$url" in
+  *slow*) sleep 120 ;;
+  */merged) printf '{"state":"MERGED","mergeCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"reviewDecision":"","headRefOid":"bbbb","commits":[{}],"latestReviews":[]}\n' ;;
+  */open)   printf '{"state":"OPEN","mergeCommit":null,"reviewDecision":"","headRefOid":"bbbb","commits":[{}],"latestReviews":[]}\n' ;;
+  */gone) printf '{"state":"CLOSED","mergeCommit":null,"reviewDecision":"","headRefOid":"bbbb","commits":[{}],"latestReviews":[]}\n' ;;
+  */changes) printf '{"state":"OPEN","mergeCommit":null,"reviewDecision":"CHANGES_REQUESTED","headRefOid":"bbbb","commits":[{}],"latestReviews":[]}\n' ;;
+esac
+GH_EOF
+chmod +x "$GH_DIR/gh"
+_PR_OLD_PATH="$PATH"
+_pr_mk() {  # <slug> — 팀 submodule gitlink 1개(sub/m)를 바꾼 fr 브랜치 + worktree, Status PR 검토 중
+  git -C "$TMP" branch "fr/$1" main
+  git -C "$TMP" worktree add -q "$TMP/.worktrees/$1" "fr/$1"
+  git -C "$TMP/.worktrees/$1" update-index --add --cacheinfo "160000,1111111111111111111111111111111111111111,sub/m"
+  git -C "$TMP/.worktrees/$1" commit -q -m "$1 gitlink"
+  tasks_index_upsert "$1" fr-branch="fr/$1" worktree-path="$TMP/.worktrees/$1" checkout=yes launch=ok
+  ( cd "$TMP/.worktrees/$1" && bash rd-workflow/scripts/rd task set-status "PR 검토 중" --force >/dev/null )
+}
+_pr_cleanup() { _sw_cleanup "$1"; }
+
+# t_list_pr_review_rows: MERGED·OPEN·pushed·manual 네 줄과 행동 줄
+# manual 판정은 rd pr open 과 같게 반영 대상 기준점(tp_target_base)과 fr tip 에 커밋된 workflow.json 으로 한다 —
+# 그래서 manual 설정을 커밋한 뒤 작업 worktree 의 파일만 기본값({})으로 바꿔 둔다(worktree 파일을 읽으면 manual 줄이 빠짐).
+# 기록 마지막 줄(sub/c)은 개행 없이 쓰고 브랜치 이름에 역슬래시(\c)를 넣는다 — 마지막 줄 유실과 %b 해석(\c 뒤 출력 끊김)을 잡는다.
+# 호출부 회귀(spec D2-2): 기본 브랜치가 sub/other(manual)를 바꾼 커밋을 fr/prr 가 병합한다. manual 줄 기준이 반영 대상
+# 기준점(merge-base)이면 sub/other 는 이 작업의 대상이 아니므로 표에 없다. base-commit 기준으로 남으면 sub/other 줄이 생긴다.
+# main 은 기본 체크아웃의 작업 트리를 건드리지 않게 plumbing 으로 옮기고, prr 를 치운 뒤 되돌린다.
+_pr_mk prr
+_prr="$TMP/.worktrees/prr"
+mkdir -p "$_prr/rd-workflow-workspace/.lifecycle" "$_prr/rd-workflow/config"
+printf '{"team_publish":{"submodules":{"sub/m":{"mode":"manual"},"sub/other":{"mode":"manual"}}}}\n' > "$_prr/rd-workflow/config/workflow.json"
+awk -F= -v b="$(git -C "$TMP" rev-parse main)" '$1=="base-commit"{print "base-commit=" b; f=1; next} {print} END{if(!f) print "base-commit=" b}' \
+  "$_prr/rd-workflow-workspace/.lifecycle/task-state" > "$_prr/ts.tmp" && mv "$_prr/ts.tmp" "$_prr/rd-workflow-workspace/.lifecycle/task-state"
+git -C "$_prr" add -f rd-workflow/config/workflow.json rd-workflow-workspace/.lifecycle/task-state
+git -C "$_prr" commit -q -m "prr 설정·base-commit"
+_pr_main_old="$(git -C "$TMP" rev-parse main)"
+_pr_idx="$TMP/.main-other.idx"
+GIT_INDEX_FILE="$_pr_idx" git -C "$TMP" read-tree main
+GIT_INDEX_FILE="$_pr_idx" git -C "$TMP" update-index --add --cacheinfo "160000,2222222222222222222222222222222222222222,sub/other"
+_pr_main_new="$(git -C "$TMP" commit-tree "$(GIT_INDEX_FILE="$_pr_idx" git -C "$TMP" write-tree)" -p main -m "main: sub/other 변경")"
+rm -f "$_pr_idx"
+git -C "$TMP" update-ref refs/heads/main "$_pr_main_new" "$_pr_main_old"
+git -C "$_prr" merge -q --no-edit main >/dev/null || fail "prr 준비: main 병합 실패"
+printf '{}\n' > "$_prr/rd-workflow/config/workflow.json"
+{ printf 'path\trepo\tbranch\tbase\turl\thead-oid\tstate\tmerged-oid\tcommits\nsub/a\tr\tbr\tmain\thttps://example.test/x/1/merged\tbbbb\topen\t\t\nsub/b\tr\tbr\tmain\thttps://example.test/x/2/open\tbbbb\topen\t\t\nsub/d\tr\tbr\tmain\thttps://example.test/x/5/closed\tbbbb\tclosed\t\t\nsub/e\tr\tbr\tmain\thttps://example.test/x/8/changes\tbbbb\topen\t\t\n'
+  printf '%s' 'sub/c	r	br\cX	main	-	bbbb	pushed	bbbb	'; } > "$_prr/rd-workflow-workspace/.lifecycle/team-prs.tsv"
+: > "$GH_DIR/calls.log"
+out="$(PATH="$GH_DIR:$_PR_OLD_PATH" bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+_pr_ok=1
+for needle in "sub/a" "merge 됨" "sub/b" "검토 대기" "sub/c" "push 완료" 'br\cX 에 push 했습니다' "sub/m" "반영하지 않음" \
+              "→ merge 됨: cd '$TMP/.worktrees/prr' && bash rd-workflow/scripts/rd pr check --apply" \
+              "→ 닫힌 PR 입니다: cd '$TMP/.worktrees/prr' && bash rd-workflow/scripts/rd pr check" \
+              "→ 수정 요청: (의견 없음) / 반영하려면 cd '$TMP/.worktrees/prr' && bash rd-workflow/scripts/rd task set-status \"구현 중\" --task 'prr'"; do
+  [[ "$out" == *"$needle"* ]] || { _pr_ok=0; fail "PR 검토 중 표에 '$needle' 없음: $out"; }
+done
+[[ "$_pr_ok" == 1 ]] && pass "PR 검토 중 표가 MERGED·OPEN·pushed·manual 줄과 행동 줄을 보인다"
+[[ "$out" != *"sub/other"* ]] && pass "main 에서 병합해 온 submodule(sub/other)은 manual 줄에 없다(반영 대상 기준점)" \
+  || fail "PR 검토 중 표에 main 에서 온 sub/other 줄이 있음: $out"
+[[ "$(wc -l < "$GH_DIR/calls.log" | tr -d ' ')" == 3 ]] \
+  && pass "gh 는 기록 state=open 줄에서만 부른다(3회)" || fail "gh 호출 수: $(cat "$GH_DIR/calls.log")"
+
+# t_list_gh_timeout: gh 가 멈춰도 상한 안에 끝나고 조회 실패로 보이며 목록은 끝까지 간다
+printf 'path\trepo\tbranch\tbase\turl\thead-oid\tstate\tmerged-oid\tcommits\nsub/a\tr\tbr\tmain\thttps://example.test/x/3/slow\tbbbb\topen\t\t\n' \
+  > "$TMP/.worktrees/prr/rd-workflow-workspace/.lifecycle/team-prs.tsv"
+_t0=$SECONDS
+out="$(PATH="$GH_DIR:$_PR_OLD_PATH" RD_PR_CHECK_TIMEOUT=1 bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+_el=$((SECONDS - _t0))
+# 상한(1초)이 듣지 않으면 가짜 gh 가 120초를 멈춥니다. 그래서 경과를 가짜 gh 수명과 비교합니다(U5 방식).
+# 고정 상한(종전 10초)은 쓰지 않습니다 — 병렬 self_test 부하에서 목록 시간이 10초를 넘어 FAIL 한 적이 있습니다(2026-11-19).
+if [[ "$_el" -lt 120 && "$out" == *"조회 실패"* && "$out" == *"시간 초과"* ]]; then
+  pass "gh 시간 초과: ${_el}초 만에 끝나고 조회 실패로 표시한다"
+else
+  fail "gh 시간 초과 처리: ${_el}초 / $out"
+fi
+# t_list_merged_target_fail: PR 은 merge 됐지만 반영 대상 판정에 실패하면(대상 범위에 탭 경로) --apply 를 안내하지 않는다.
+# 없으면 새는 실수: 조회가 「merge 됨 → rd pr check --apply」를 안내하고, 사용자가 실행하면 대상 판정에서 rc 2 로 멈춥니다.
+git -C "$_prr" update-index --add --cacheinfo "160000,3333333333333333333333333333333333333333,$(printf 'z\tother')"
+git -C "$_prr" commit -q -m "탭 경로 gitlink"
+printf 'path\trepo\tbranch\tbase\turl\thead-oid\tstate\tmerged-oid\tcommits\nsub/a\tr\tbr\tmain\thttps://example.test/x/1/merged\tbbbb\topen\t\t\n' \
+  > "$_prr/rd-workflow-workspace/.lifecycle/team-prs.tsv"
+out="$(PATH="$GH_DIR:$_PR_OLD_PATH" bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+if [[ "$out" == *"대상 판정 실패"* && "$out" == *"→ merge 됨: 아래 대상 판정 실패를 먼저 해결해야 rd pr check --apply 가 진행됩니다"* \
+      && "$out" != *"&& bash rd-workflow/scripts/rd pr check --apply"* ]]; then
+  pass "merge 된 PR 과 대상 판정 실패가 함께 있으면 --apply 실행을 안내하지 않는다"
+else
+  fail "merge 됨 + 대상 판정 실패 행동 줄: $out"
+fi
+# 같은 작업에서 rd pr check(조회)도 같은 안내를 냅니다(두 조회는 따로 구현돼 있습니다).
+out="$(cd "$_prr" && PATH="$GH_DIR:$_PR_OLD_PATH" bash rd-workflow/scripts/rd pr check 2>&1 || true)"
+if [[ "$out" == *"대상 판정 실패"* && "$out" == *"$(printf 'merge 됨\t아래 대상 판정 실패를 먼저 해결해야 rd pr check --apply 가 진행됩니다')"* \
+      && "$out" != *"$(printf 'merge 됨\tbash rd-workflow/scripts/rd pr check --apply')"* ]]; then
+  pass "rd pr check 도 merge 된 PR 과 대상 판정 실패가 함께 있으면 --apply 실행을 안내하지 않는다"
+else
+  fail "rd pr check 의 merge 됨 + 대상 판정 실패 행동 줄: $out"
+fi
+# t_list_merged_base_fail: 반영 대상 기준점(seal 마커 review-base)을 쓸 수 없으면 두 조회가 원인·복구를 보이고 --apply 를 안내하지 않는다.
+# 없으면 새는 실수: 기준점 오류를 버리고 대상 판정을 건너뛰어 merge 된 PR 행이 --apply 를 안내하고, 실행하면 rc 2 로 멈춥니다.
+mkdir -p "$_prr/rd-workflow-workspace/.lifecycle/review-seals"
+printf 'schema=1\nsession-id=probe\nreview-base=4444444444444444444444444444444444444444\nreview-head=%s\nhead=%s\n' \
+  "$(git -C "$_prr" rev-parse HEAD)" "$(git -C "$_prr" rev-parse HEAD)" > "$_prr/rd-workflow-workspace/.lifecycle/review-seals/probe.seal"
+awk -F= '$1=="review-session"{print "review-session=probe"; f=1; next} {print} END{if(!f) print "review-session=probe"}' \
+  "$_prr/rd-workflow-workspace/.lifecycle/task-state" > "$_prr/ts.tmp" && mv "$_prr/ts.tmp" "$_prr/rd-workflow-workspace/.lifecycle/task-state"
+git -C "$_prr" add -f rd-workflow-workspace/.lifecycle/review-seals/probe.seal rd-workflow-workspace/.lifecycle/task-state
+git -C "$_prr" commit -q -m "기준점이 커밋이 아닌 seal 마커"
+out="$(PATH="$GH_DIR:$_PR_OLD_PATH" bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+if [[ "$out" == *"대상 판정 실패"*"리뷰 기준점 4444444 를 쓸 수 없습니다"*"복구: tip 의 조상 중"* \
+      && "$out" == *"→ merge 됨: 아래 대상 판정 실패를 먼저 해결해야 rd pr check --apply 가 진행됩니다"* \
+      && "$out" != *"&& bash rd-workflow/scripts/rd pr check --apply"* ]]; then
+  pass "기준점을 쓸 수 없으면 rd task list 가 원인·복구를 보이고 --apply 실행을 안내하지 않는다"
+else
+  fail "기준점 실패의 rd task list 행동 줄: $out"
+fi
+out="$(cd "$_prr" && PATH="$GH_DIR:$_PR_OLD_PATH" bash rd-workflow/scripts/rd pr check 2>&1 || true)"
+if [[ "$out" == *"대상 판정 실패"*"리뷰 기준점 4444444 를 쓸 수 없습니다"*"복구: tip 의 조상 중"* \
+      && "$out" == *"$(printf 'merge 됨\t아래 대상 판정 실패를 먼저 해결해야 rd pr check --apply 가 진행됩니다')"* \
+      && "$out" != *"$(printf 'merge 됨\tbash rd-workflow/scripts/rd pr check --apply')"* ]]; then
+  pass "기준점을 쓸 수 없으면 rd pr check 가 원인·복구를 보이고 --apply 실행을 안내하지 않는다"
+else
+  fail "기준점 실패의 rd pr check 행동 줄: $out"
+fi
+_pr_cleanup prr
+git -C "$TMP" update-ref refs/heads/main "$_pr_main_old"
+
+# t_list_no_pr_review: PR 검토 중 작업이 없으면 표도 gh 호출도 없다
+# (구현 중인 prn 에 open 기록이 남아 있어도 Status 가 다르면 조회하지 않는다)
+_pr_mk prn
+( cd "$TMP/.worktrees/prn" && bash rd-workflow/scripts/rd task set-status "구현 중" --force >/dev/null 2>&1 )
+mkdir -p "$TMP/.worktrees/prn/rd-workflow-workspace/.lifecycle"
+printf 'path\trepo\tbranch\tbase\turl\thead-oid\tstate\tmerged-oid\tcommits\nsub/a\tr\tbr\tmain\thttps://example.test/x/4/open\tbbbb\topen\t\t\n' \
+  > "$TMP/.worktrees/prn/rd-workflow-workspace/.lifecycle/team-prs.tsv"
+: > "$GH_DIR/calls.log"
+out="$(PATH="$GH_DIR:$_PR_OLD_PATH" bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+if [[ "$out" != *"조회 실패"* && "$out" != *"검토 대기"* && ! -s "$GH_DIR/calls.log" ]]; then
+  pass "PR 검토 중 작업이 없으면 표도 gh 호출도 없다"
+else
+  fail "PR 검토 중 없는데 표·호출: $out / $(cat "$GH_DIR/calls.log")"
+fi
+_pr_cleanup prn
+
+# t_list_nofr_pr_review: fr 브랜치 없이 기본 체크아웃에서 한 작업(fr-branch=null)이 PR 검토 중이면 색인이 비어도 표에 나온다.
+# 없으면 새는 실수: no-fr 작업은 색인에 없어 표가 비고, 빈 색인이면 「진행 중인 작업이 없습니다」 로 끝나 열린 PR 을 놓칩니다.
+# 기준점은 rd pr open 과 같이 tip(기본 체크아웃 HEAD)의 task-state base-commit 으로 정하므로 그 커밋을 만들고 끝나면 되돌린다.
+_tasks_shared_dir_fill || :
+_nf_idx="$_TASKS_SD_VAL/tasks.local"
+[[ -f "$_nf_idx" ]] && mv "$_nf_idx" "$_nf_idx.nofr-bak"
+_nf_old="$(git -C "$TMP" rev-parse HEAD)"
+_nf_ts="$TMP/rd-workflow-workspace/.lifecycle/task-state"
+_nf_ts_had=0; [[ -f "$_nf_ts" ]] && { _nf_ts_had=1; cp "$_nf_ts" "$TMP/.nf-ts.bak"; }
+git -C "$TMP" update-index --add --cacheinfo "160000,1111111111111111111111111111111111111111,sub/m"
+git -C "$TMP" commit -q -m "nofr gitlink"
+printf 'schema=1\nshort-title=nfx\nstatus=PR 검토 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\nreview-session=null\nbase-commit=%s\n' "$_nf_old" > "$_nf_ts"
+git -C "$TMP" add -f "$_nf_ts"
+git -C "$TMP" commit -q -m "nofr task-state"
+printf 'path\trepo\tbranch\tbase\turl\thead-oid\tstate\tmerged-oid\tcommits\nsub/m\tr\tbr\tmain\thttps://example.test/x/6/open\tbbbb\topen\t\t\nsub/n\tr\tbr\tmain\thttps://example.test/x/7/changes\tbbbb\topen\t\t\nsub/o\tr\tbr\tmain\thttps://example.test/x/9/merged\tbbbb\topen\t\t\nsub/p\tr\tbr\tmain\thttps://example.test/x/10/merged\tbbbb\tmerged\tbbbb\t\nsub/q\tr\tbr\tmain\thttps://example.test/x/11/closed\tbbbb\tclosed\t\t\nsub/r\tr\tbr\tmain\thttps://example.test/x/12/gone\tbbbb\topen\t\t\n' \
+  > "$TMP/rd-workflow-workspace/.lifecycle/team-prs.tsv"
+: > "$GH_DIR/calls.log"
+out="$(PATH="$GH_DIR:$_PR_OLD_PATH" bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+if [[ "$out" == *"PR 검토 중"* && "$out" == *"nfx"*"sub/m"*"https://example.test/x/6/open"*"검토 대기"* \
+      && "$out" != *"진행 중인 작업이 없습니다"* && "$out" != *"대상 판정 실패"* ]]; then
+  pass "no-fr 작업의 열린 PR 이 색인이 비어도 PR 검토 중 표에 나오고 빈 목록 문구가 없다"
+else
+  fail "no-fr PR 검토 중 표: $out"
+fi
+# t_list_nofr_no_state_cmd: 기본 체크아웃 작업 줄에는 Status 를 바꾸는 명령(set-status·--apply)과 그것을 다음 행동으로 내는 조회(rd pr check)를
+# 안내하지 않고, 남은 일과 대상 제약(후속 FR)만 보인다. 기록이 merge 반영됨(state=merged)인 줄도 같다.
+# 없으면 새는 실수: 그 명령들의 대상 선택은 색인에 진행 중 작업이 있으면 그 작업을 고르므로, 안내대로 따라가면 다른 작업의 Status 가 바뀝니다.
+_nf_note="이 작업을 대상으로 고르지 못할 수 있습니다(후속 FR nofr-task-target-resolution)"
+_nf_line="$(grep -F 'nfx' <<<"$out" || true)"
+_nf_n="$(grep -F 'sub/n' <<<"$out" || true)"; _nf_o="$(grep -F 'sub/o' <<<"$out" || true)"; _nf_p="$(grep -F 'sub/p' <<<"$out" || true)"
+_nf_q="$(grep -F 'sub/q' <<<"$out" || true)"; _nf_r="$(grep -F 'sub/r' <<<"$out" || true)"
+if [[ "$_nf_n" == *"수정 요청"*"$_nf_note"* \
+      && "$_nf_o" == *"merge 됨: submodule 포인터 반영과 Status 전이가 남았습니다 / "*"$_nf_note"* \
+      && "$_nf_p" == *"merge 반영됨"*"포인터 반영 완료"*"$_nf_note"* \
+      && "$_nf_q" == *"https://example.test/x/11/closed  기록상 닫힘 "*"→ 이 줄은 원격을 조회하지 않습니다 / 지금 상태는 PR 링크에서 확인하고, 링크에서도 닫혀 있으면 다시 올리려면 gh pr reopen 'https://example.test/x/11/closed' / Status 를 바꾸는 rd 명령"*"$_nf_note"* \
+      && "$_nf_r" != *"기록상"* \
+      && "$_nf_r" == *"https://example.test/x/12/gone"*" 닫힘 "*"→ PR 이 merge 없이 닫혔습니다 / 다시 올리려면 PR 링크에서 재개할 수 있는지 확인한 뒤 gh pr reopen 'https://example.test/x/12/gone' / Status 를 바꾸는 rd 명령"*"$_nf_note"* \
+      && "$_nf_line" != *'set-status "구현 중"'* && "$_nf_line" != *"&& bash rd-workflow/scripts/rd pr check"* ]]; then
+  pass "기본 체크아웃 작업 줄은 Status 를 바꾸는 명령·조회 대신 남은 일과 대상 제약을 보인다"
+else
+  fail "no-fr 행동 줄: $_nf_line"
+fi
+# t_list_nofr_target_fail: 기본 체크아웃 작업의 반영 대상 기준점을 정할 수 없으면(base-commit=null, seal 마커 없음) merge 줄은
+# --apply 대신 대상 제약을 보이고, 대상 판정 실패 줄은 복구를 기본 체크아웃에서 하라고 경로를 보인다.
+# 없으면 새는 실수: 공통 실패 분기가 --apply 를 다음 행동으로 지목하고, 다른 worktree 에서 본 사용자가 set-base 를 엉뚱한 task-state 에 씁니다.
+awk -F= '$1=="base-commit"{print "base-commit=null"; next} {print}' "$_nf_ts" > "$TMP/.nf-ts.tmp" && mv "$TMP/.nf-ts.tmp" "$_nf_ts"
+git -C "$TMP" add -f "$_nf_ts"; git -C "$TMP" commit -q -m "nofr base-commit null"
+out="$(PATH="$GH_DIR:$_PR_OLD_PATH" bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+_nf_o="$(grep -F 'sub/o' <<<"$out" || true)"; _nf_f="$(grep -F '대상 판정 실패' <<<"$out" | grep -F 'nfx' || true)"
+if [[ "$_nf_o" == *"아래 대상 판정 실패를 먼저 해결해야 합니다 / "*"$_nf_note"* && "$_nf_o" != *"--apply 가 진행됩니다"* \
+      && "$_nf_f" == *"복구 명령은 기본 체크아웃에서 실행합니다: cd '$TMP' &&"* ]]; then
+  pass "기본 체크아웃 작업의 대상 판정 실패는 merge 줄에 대상 제약을, 실패 줄에 복구 위치를 보인다"
+else
+  fail "no-fr 대상 판정 실패: $_nf_o / $_nf_f"
+fi
+# t_list_nofr_not_pr_review: 기본 체크아웃 작업이 PR 검토 중이 아니면(열린 기록이 남아 있어도) 그 작업 줄도 gh 호출도 없다(AC3).
+# 없으면 새는 실수: Status 조건이 빠지면 수정하러 구현 중으로 돌아간 작업의 PR 을 목록이 계속 조회·표시합니다.
+awk -F= '$1=="status"{print "status=구현 중"; next} {print}' "$_nf_ts" > "$TMP/.nf-ts.tmp" && mv "$TMP/.nf-ts.tmp" "$_nf_ts"
+: > "$GH_DIR/calls.log"
+out="$(PATH="$GH_DIR:$_PR_OLD_PATH" bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+if [[ "$out" != *"nfx"* && ! -s "$GH_DIR/calls.log" ]]; then
+  pass "기본 체크아웃 작업이 PR 검토 중이 아니면 그 줄도 gh 호출도 없다"
+else
+  fail "no-fr 구현 중인데 줄·호출: $out / $(cat "$GH_DIR/calls.log")"
+fi
+rm -f "$TMP/rd-workflow-workspace/.lifecycle/team-prs.tsv"
+git -C "$TMP" reset -q --hard "$_nf_old"
+if [[ "$_nf_ts_had" == 1 ]]; then mv "$TMP/.nf-ts.bak" "$_nf_ts"; else rm -f "$_nf_ts"; fi
+[[ -f "$_nf_idx.nofr-bak" ]] && mv "$_nf_idx.nofr-bak" "$_nf_idx"
+trash "$GH_DIR" 2>/dev/null || rm -rf "$GH_DIR"
+
+# test_issue_claims_report: 끊긴 선점 점검 블록 (issue-queue-take, 변경 spec 3.7)
+#   issue_queue.sh 는 RD_ISSUE_QUEUE 로 주입한 가짜다. 장부는 RD_ISSUE_LEDGER 로 지정한다.
+_IQ="$(mktemp -d)" || { echo "test_tasks_list.sh: 대역 issue_queue 디렉터리 생성 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+printf '#!/usr/bin/env bash\necho "$*" >> "%s/calls.log"\ncat "%s/out.txt" 2>/dev/null\nexit "$(cat "%s/rc.txt" 2>/dev/null || echo 0)"\n' "$_IQ" "$_IQ" "$_IQ" > "$_IQ/fake_iq.sh"
+export RD_ISSUE_QUEUE="$_IQ/fake_iq.sh" RD_ISSUE_LEDGER="$_IQ/ledger.tsv"
+
+# no_ledger_no_call: 장부가 없으면 아무것도 내지 않고 issue_queue.sh 를 실행하지 않는다
+rm -f "$RD_ISSUE_LEDGER" "$_IQ/calls.log"
+out="$(bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+if [[ "$out" != *"끊긴 선점"* && ! -e "$_IQ/calls.log" ]]; then
+  pass "장부가 없으면 끊긴 선점을 내지 않고 issue_queue.sh 를 부르지 않는다"
+else
+  fail "no_ledger_no_call: 호출 $(cat "$_IQ/calls.log" 2>/dev/null | wc -l)회 / $out"
+fi
+
+# stale_lines_shown: 풀기 명령이 있는 줄만 머리줄 건수에 센다. 판정 불가 줄은 명령 없이 나온다
+printf 'o/r\t1\thttps://h/o/r/issues/1\t-\t2026-01-01T00:00:00Z\n' > "$RD_ISSUE_LEDGER"
+printf 'https://h/o/r/issues/1\t연결 FR 없음\tbash rd-workflow/scripts/issue_queue.sh release o/r 1\nhttps://h/o/r/issues/2\t판정 불가\t-\nhttps://h/o/r/issues/3\tFR dropped\tbash rd-workflow/scripts/issue_queue.sh release o/r 3\n' > "$_IQ/out.txt"
+: > "$_IQ/calls.log"
+out="$(bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+if grep -qxF '끊긴 선점 2건 — 풀지 사용자에게 한 줄로 물은 뒤 아래 명령으로 풉니다:' <<<"$out" \
+   && grep -qxF '  https://h/o/r/issues/1 — 연결 FR 없음 · bash rd-workflow/scripts/issue_queue.sh release o/r 1' <<<"$out" \
+   && grep -qxF '  https://h/o/r/issues/3 — FR dropped · bash rd-workflow/scripts/issue_queue.sh release o/r 3' <<<"$out" \
+   && grep -qxF '  https://h/o/r/issues/2 — 판정 불가 · 기본 브랜치를 확인한 뒤 다시 보십시오' <<<"$out" \
+   && [[ "$(grep -c '^stale$' "$_IQ/calls.log")" == 1 ]]; then
+  pass "끊긴 선점 줄을 형식대로 내고 판정 불가 줄은 명령 없이 머리줄 건수에서 뺀다"
+else
+  fail "stale_lines_shown: $out"
+fi
+
+# undecided_only_header: 판정 불가 줄만 있으면 "0건 … 명령으로 풉니다" 대신 확인 필요 머리줄을 낸다
+printf 'https://h/o/r/issues/2\t판정 불가\t-\n' > "$_IQ/out.txt"
+out="$(bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+if grep -qxF '끊긴 선점 확인 필요 — 판정하지 못한 선점이 있습니다:' <<<"$out" && [[ "$out" != *"명령으로 풉니다"* ]]; then
+  pass "판정 불가 줄만 있으면 풀기 안내 대신 확인 필요 머리줄을 낸다"
+else
+  fail "undecided_only_header: $out"
+fi
+
+# stale_failure_warns: stale 이 실패하면 경고 한 줄만 내고 rd task list 종료 코드는 그대로다
+printf '1\n' > "$_IQ/rc.txt"; : > "$_IQ/out.txt"
+_f_rc=0; out="$(bash "$SCRIPT_DIR/tasks_list.sh" 2>&1)" || _f_rc=$?
+rm -f "$RD_ISSUE_LEDGER"
+_b_rc=0; bash "$SCRIPT_DIR/tasks_list.sh" >/dev/null 2>&1 || _b_rc=$?
+if [[ "$_f_rc" == "$_b_rc" && "$(grep -c '끊긴 선점 점검 실패' <<<"$out")" == 1 ]]; then
+  pass "stale 실패는 경고 한 줄만 내고 종료 코드를 바꾸지 않는다"
+else
+  fail "stale_failure_warns: rc=$_f_rc 기준 rc=$_b_rc / $out"
+fi
+unset RD_ISSUE_QUEUE RD_ISSUE_LEDGER
+rm -rf "$_IQ"
+
 printf 'tasks_list: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

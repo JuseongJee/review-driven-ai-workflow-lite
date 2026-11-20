@@ -19,6 +19,446 @@ TMP="$(mktemp -d)" || { echo "test_review_effort_override.sh: 임시 디렉터�
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
+# 검사 대상이 읽는 환경 변수를 호출 환경에서 물려받지 않는다. 값이 필요한 케이스는 그 호출에만 붙인다.
+# 물려받으면 effort 미전달 케이스가 상속값을 전달하고(TOOL_EFFORT), 격리 케이스가 kill switch·다른
+# 설정 파일·다른 턴 한도로 돈다(RD_REVIEW_EFFORT_OVERRIDE·REVIEW_TOOLS_CONFIG·REVIEW_TURN_LIMIT).
+unset TOOL_EFFORT RD_REVIEW_EFFORT_OVERRIDE REVIEW_TOOLS_CONFIG REVIEW_TURN_LIMIT
+unset CODEX_HOME RD_MODELS_CONFIG RD_REVIEW_CODEX_MODEL RD_REVIEW_CLAUDE_MODEL \
+      RD_REVIEW_CODEX_EFFORT RD_REVIEW_CLAUDE_EFFORT
+
+finish() {
+  echo
+  if [ "$FAIL" -eq 0 ]; then
+    echo "test_review_effort_override: ALL PASS"
+    exit 0
+  else
+    echo "test_review_effort_override: FAILED"
+    exit 1
+  fi
+}
+
+# ============================================================
+# 예시 복사 (spec D1·D12, REQUEST AC11) — 배포 트리의 models.json.example 을 그대로 복사해 쓰면
+# 리뷰 턴이 그 값을 쓰는지 본다. 트리의 스크립트로 임시 프로젝트를 만들고 가짜 codex 로 실행한다.
+#   기본: 이 파일이 든 트리.  RD_TEST_TREE=<트리 루트> RD_TEST_ONLY=example-copy: 그 트리에서 이 케이스만.
+# ============================================================
+example_copy_case() { # example_copy_case <트리 루트>
+  local tree="$1" ex="$TMP/excopy" f
+  rm -rf "$ex"
+  mkdir -p "$ex/rd-workflow/scripts" "$ex/rd-workflow/config" "$ex/rd-workflow/docs/flows" \
+           "$ex/rd-workflow/docs/prompts/review" "$ex/home/.codex" "$ex/bin" "$ex/args" "$ex/sess/turns"
+  for f in run_review_turn.sh review_common.sh review_wait.sh adapter_codex.sh adapter_claude.sh model_select.sh; do
+    if ! cp "$tree/rd-workflow/scripts/$f" "$ex/rd-workflow/scripts/$f" 2>/dev/null; then
+      fail "example-copy: 트리에 rd-workflow/scripts/$f 가 없음 ($tree)"; return
+    fi
+  done
+  if ! jq '.review.codex.effort = "high"' "$tree/rd-workflow/config/models.json.example" \
+         > "$ex/rd-workflow/config/models.json" 2>/dev/null; then
+    fail "example-copy: 트리의 rd-workflow/config/models.json.example 을 읽지 못함 ($tree)"; return
+  fi
+  printf '{"default_priority":["codex"]}\n' > "$ex/rd-workflow/config/review-tools.json"
+  printf '기준\n' > "$ex/rd-workflow/docs/prompts/review/diff_review.md"
+  printf '규칙\n' > "$ex/rd-workflow/docs/flows/FILE_BASED_REVIEW_PIPELINE.md"
+  printf 'target\n' > "$ex/TARGET.md"
+  cat > "$ex/sess/SESSION.md" <<'EOF'
+# Review Session
+
+## Status
+awaiting-reviewer
+
+## Current Owner
+Reviewer
+
+## Review Type
+diff-review
+
+## Review Target
+TARGET.md
+
+## Review Goal
+goal
+
+## Turn Limit
+20
+
+## Review Scope
+- execution-path: other
+EOF
+  printf '# C\n\n## Open Issues\n- 없음\n' > "$ex/sess/CHECKPOINT.md"
+  printf '# U\n\n## Question For User\n-\n' > "$ex/sess/USER_ACTION.md"
+  printf '# T1\n' > "$ex/sess/turns/001_claude.md"
+  cat > "$ex/bin/codex" <<'FKEOF'
+#!/usr/bin/env bash
+for a in "$@"; do printf '%s\n' "$a"; done > "$ARGDIR/args.codex"
+cat > /dev/null
+printf '# T\n' > "$EXPECTED_TURN_FILE"
+sed -e 's/^awaiting-reviewer$/awaiting-author/' -e 's/^Reviewer$/Author/' \
+  "$SESSION_PATH/SESSION.md" > "$SESSION_PATH/S.tmp"
+mv "$SESSION_PATH/S.tmp" "$SESSION_PATH/SESSION.md"
+FKEOF
+  chmod +x "$ex/bin/codex"
+  ( cd "$ex" && env -u RD_MODELS_CONFIG -u REVIEW_TOOLS_CONFIG -u CODEX_HOME -u TOOL_MODEL -u TOOL_EFFORT \
+      -u RD_REVIEW_EFFORT_OVERRIDE HOME="$ex/home" ARGDIR="$ex/args" WAIT_TIMEOUT=20 PATH="$ex/bin:$PATH" \
+      bash "$ex/rd-workflow/scripts/run_review_turn.sh" sess >"$ex/out" 2>"$ex/err" )
+  grep -qF "effort 시도: high (source: tool-default · file:" "$ex/err" \
+    && grep -qF "models.json#review.codex.effort)" "$ex/err"
+  chk $? "example-copy 예시 복사본의 review.codex.effort=high → 실행 줄 tool-default · models.json#review.codex.effort"
+  grep -qxF 'model_reasoning_effort="high"' "$ex/args/args.codex" 2>/dev/null
+  chk $? "example-copy 가짜 codex 가 effort high 를 받음"
+}
+
+case "${RD_TEST_ONLY:-}" in
+  "") ;;
+  example-copy)
+    echo "=== 예시 복사 (example-copy) ==="
+    example_copy_case "${RD_TEST_TREE:-$(cd "${script_dir}/../.." && pwd)}"
+    finish ;;
+  *) echo "test_review_effort_override.sh: 알 수 없는 RD_TEST_ONLY 값: ${RD_TEST_ONLY}" >&2; exit 2 ;;
+esac
+
+# ============================================================
+# 0) 선택 함수 (model_select.sh) — 계열 해석·값 판정·effort 변환·설정 읽기·조회·저장
+#    HOME·CODEX_HOME 을 임시 경로로 바꾸고 고정 캐시 표본을 쓴다. 실제 ~/.codex 는 읽지 않는다.
+# ============================================================
+echo "=== 선택 함수 ==="
+
+MS="${script_dir}/model_select.sh"
+MS_SAMPLE="${script_dir}/fixtures/models_cache.sample.json"
+MSH="$TMP/home"
+mkdir -p "$MSH/.codex"
+cp "$MS_SAMPLE" "$MSH/.codex/models_cache.json"
+TAB="$(printf '\t')"
+
+# ms <함수> <인자...> — HOME=$MSH 로 source 해 함수 하나를 부른다. stderr 는 $TMP/ms.err.
+# 다른 홈이 필요하면 MS_HOME 을, Codex 홈은 호출 앞에 CODEX_HOME 을 붙인다.
+ms() { ( export HOME="${MS_HOME:-$MSH}"; source "$MS"; "$@" ) 2>"$TMP/ms.err"; }
+has_err() { grep -qF -- "$1" "$TMP/ms.err"; }
+
+# --- U1·U2 계열 해석 (숨은 gpt-6.3-sol 이 표본에 있음) ---
+eq "$(ms ms_codex_resolve_family sol)"   "gpt-6.2-sol"   "U1/U2 sol → gpt-6.2-sol (숨은 gpt-6.3-sol 제외)"
+eq "$(ms ms_codex_resolve_family luna)"  "gpt-6-luna"    "U1 luna → gpt-6-luna (6 > 5.6)"
+eq "$(ms ms_codex_resolve_family astra)" "gpt-6.2-astra" "U1 astra → gpt-6.2-astra"
+
+# --- U3 버전은 정수 배열로 비교 (6.10 > 6.2) ---
+mkdir -p "$TMP/h3/.codex"
+jq '.models += [{"slug":"gpt-6.10-sol","visibility":"list","priority":50,
+                 "supported_reasoning_levels":[{"effort":"low"}],"default_reasoning_level":"low"}]' \
+  "$MS_SAMPLE" > "$TMP/h3/.codex/models_cache.json"
+eq "$(MS_HOME="$TMP/h3" ms ms_codex_resolve_family sol)" "gpt-6.10-sol" "U3 gpt-6.10-sol 이 gpt-6.2-sol 보다 새 버전"
+
+# --- U4 해석 실패 ---
+out="$(ms ms_codex_resolve_family nosuch)"; rc=$?
+eq "$out|$rc" "|1" "U4 없는 계열 → 빈 값·rc 1"
+has_err "계열 'nosuch'"; chk $? "U4 없는 계열 경고 문구"
+mkdir -p "$TMP/h4/.codex"
+out="$(MS_HOME="$TMP/h4" ms ms_codex_resolve_family sol)"; rc=$?
+eq "$out|$rc" "|1" "U4 캐시 없음 → 빈 값·rc 1"
+has_err "$TMP/h4/.codex/models_cache.json"; chk $? "U4 캐시 없음 경고에 캐시 경로"
+eq "$(ms ms_codex_resolve_family reserve)" "" "U4 버전 없는 gpt-reserve 는 계열 후보가 아님"
+
+# --- U5 CODEX_HOME 하나로 캐시·config.toml·경고 경로를 정함 ---
+mkdir -p "$TMP/h5home/.codex" "$TMP/h2"
+cp "$MS_SAMPLE" "$TMP/h5home/.codex/models_cache.json"
+printf 'model = "gpt-6.1-sol"\n' > "$TMP/h5home/.codex/config.toml"
+printf '{"models":[{"slug":"gpt-9-sol","visibility":"list","priority":1,"supported_reasoning_levels":[{"effort":"high"}]}]}\n' \
+  > "$TMP/h2/models_cache.json"
+printf 'model = "gpt-9-sol"\n' > "$TMP/h2/config.toml"
+eq "$(MS_HOME="$TMP/h5home" CODEX_HOME="$TMP/h2" ms ms_codex_resolve_family sol)" "gpt-9-sol" "U5 CODEX_HOME 의 캐시를 씀"
+eq "$(MS_HOME="$TMP/h5home" CODEX_HOME="$TMP/h2" ms ms_codex_config_model)"     "gpt-9-sol" "U5 CODEX_HOME 의 config.toml 을 씀"
+MS_HOME="$TMP/h5home" CODEX_HOME="$TMP/h2" ms ms_codex_resolve_family nosuch >/dev/null
+has_err "$TMP/h2/"; chk $? "U5 경고 문구의 경로가 CODEX_HOME"
+
+# --- U6 값 판정 ---
+while IFS='|' read -r t k v want; do
+  eq "$(ms ms_classify "$t" "$k" "$v")" "$want" "U6 classify $t $k [$v] → $want"
+done <<'U6_TABLE'
+codex|model|gpt-6.2-sol|pinned
+claude|model|claude-opus-5-5|pinned
+claude|model|opus|alias
+codex|model|Sol|invalid
+codex|effort|ultra|step
+codex|effort|highest|relative
+claude|effort|default|default
+codex|model||invalid
+U6_TABLE
+
+# --- U7 effort 변환 — 결과값과 경고 ---
+u7() { # u7 <tool> <값> <지원 단계> <기대값> <경고 기대: 낮춤|해석|없음> <이름>
+  local out; out="$(ms ms_convert_effort "$1" "$2" "$3")"
+  eq "$out" "$4" "$6"
+  case "$5" in
+    낮춤) has_err "'$2' 를 '$4' 로 바꿉니다"; chk $? "$6 — 낮춤 경고" ;;
+    해석) has_err "'$2' 를 해석하지 못했습니다"; chk $? "$6 — 해석 실패 경고" ;;
+    없음) ! has_err "⚠️"; chk $? "$6 — 경고 없음" ;;
+  esac
+}
+u7 codex  ultra   "low medium high xhigh max"       max    낮춤 "U7 codex ultra → 바로 아래 max"
+u7 codex  low     "medium high"                     medium 낮춤 "U7 codex low → 아래가 없으면 최저 지원 단계"
+u7 codex  highest "low medium high xhigh max ultra" ultra  없음 "U7 codex highest → 최고 단계"
+u7 codex  lowest  ""                                ""     해석 "U7 codex 상대어 + 모델 정보 없음 → 미전달"
+u7 codex  xhigh   ""                                xhigh  없음 "U7 codex 단계 + 모델 정보 없음 → 그대로"
+u7 claude ultra   ""                                max    낮춤 "U7 claude ultra → max"
+u7 claude lowest  ""                                low    없음 "U7 claude lowest → low"
+
+# --- U8 config.toml 최상위 model ---
+mkdir -p "$TMP/h8/.codex" "$TMP/h8b/.codex"
+printf 'model = "gpt-6.1-sol"\nmodel_reasoning_effort = "high"\n\n[features]\nmodel = "x"\n' > "$TMP/h8/.codex/config.toml"
+printf "model = 'gpt-6-luna'\n" > "$TMP/h8b/.codex/config.toml"
+eq "$(MS_HOME="$TMP/h8"  ms ms_codex_config_model)" "gpt-6.1-sol" "U8 첫 [ 절 앞의 model 만 읽음"
+eq "$(MS_HOME="$TMP/h8b" ms ms_codex_config_model)" "gpt-6-luna"  "U8 작은따옴표(리터럴 문자열) model"
+
+# --- U9~U13 models.json 읽기 ---
+mj() { printf '%s' "$2" > "$TMP/mj_$1.json"; printf '%s' "$TMP/mj_$1.json"; }
+f="$(mj u9 '{"session":{}}')"
+out="$(ms ms_load_models "$f" request-review)"; rc=$?
+eq "$out|$rc" "|0" "U9 review 절 없음 → 빈 출력·rc 0"
+[ ! -s "$TMP/ms.err" ]; chk $? "U9 경고 없음"
+for spec in 'empty|' 'brace|{' 'concat|{}{"review":{"claude":{"model":"opus"}}}'; do
+  name="${spec%%|*}"; body="${spec#*|}"
+  f="$(mj "u10_$name" "$body")"
+  out="$(ms ms_load_models "$f" request-review)"
+  eq "$out" "" "U10 손상($name) → 빈 출력"
+  has_err "models.json 을 읽지 못했습니다($f)"; chk $? "U10 손상($name) → D6 경고"
+done
+f="$(mj u11 '{"review":{"codex":true,"claude":{"model":"opus"}}}')"
+eq "$(ms ms_load_models "$f" request-review)" "review.claude.model${TAB}ok${TAB}opus" "U11 무효 절 밖의 칸은 남음"
+has_err "review.codex"; chk $? "U11 review.codex 절 무효 경고"
+f="$(mj u12 '{"review":{"claude":{"model":3,"effort":""}}}')"
+eq "$(ms ms_load_models "$f" request-review | cut -f1,2 | tr '\n' ' ')" \
+   "review.claude.model${TAB}invalid review.claude.effort${TAB}invalid " "U12 숫자·빈 문자열 → invalid"
+f="$(mj u13 '{"review":{"codex":{"review_types":{"request-review":{"effort":"high"}}}}}')"
+eq "$(ms ms_load_models "$f" request-review)" "review.codex.review_type_effort${TAB}ok${TAB}high" "U13 현재 리뷰 종류의 칸만 냄"
+eq "$(ms ms_load_models "$f" diff-review)" "" "U13 다른 리뷰 종류면 행 없음"
+
+# --- U21 Codex·Claude 가 아닌 도구는 선택하지 않음 (Claude 환경 변수를 빌려 쓰지 않고 Codex 계열 해석도 하지 않음) ---
+u21="$( ( export HOME="$MSH" RD_MODELS_CONFIG="$TMP/no_models.json" RD_REVIEW_CLAUDE_MODEL=nosuch RD_REVIEW_CLAUDE_EFFORT=high
+          source "$MS"; ms_resolve_review gemini other request-review
+          printf '%s|%s|%s|%s' "$MS_MODEL_VALUE" "$MS_MODEL_SOURCE" "$MS_EFFORT_VALUE" "$MS_EFFORT_SOURCE" ) 2>"$TMP/ms.err" )"
+eq "$u21" "|cli-default||global" "U21 gemini → 모델·effort 값 없음 (cli-default·global)"
+! has_err "계열";                 chk $? "U21 gemini → Codex 계열 경고 없음"
+printf '{"default_priority":["gemini","claude"],"tools":{"gemini":{"model":"gemini-2.5-pro"},"claude":{"model":"sonnet"}}}' > "$TMP/u21b.json"
+u21b="$( ( export HOME="$MSH" RD_MODELS_CONFIG="$TMP/no_models.json" RD_REVIEW_CLAUDE_MODEL=opus
+           source "$MS"; ms_load_legacy "$TMP/u21b.json" request-review; ms_resolve_review gemini other request-review
+           printf '%s|%s|%s' "$MS_MODEL_VALUE" "$MS_MODEL_SOURCE" "$MS_EFFORT_VALUE" ) 2>"$TMP/ms.err" )"
+eq "$u21b" "gemini-2.5-pro|review-tools.json|" "U21b gemini → tools.gemini.model 을 그대로 넘김 (Claude 칸·환경 변수 아님)"
+u21r="$( ( source "${script_dir}/run_review_turn.sh" 2>/dev/null; set +e
+           MODEL_VALUE=gemini-2.5-pro; MODEL_ORIGIN="file:$TMP/u21b.json#tools.gemini.model"; REVIEW_JQ_MISSING=0
+           print_selection_recovery gemini "confirmed model" ) 2>&1 )"
+printf '%s' "$u21r" | grep -qF "tools.gemini.model"; chk $? "U21b gemini 모델 거부 안내가 tools.gemini.model 을 가리킴"
+! printf '%s' "$u21r" | grep -q "RD_REVIEW_";      chk $? "U21b gemini 안내에 RD_REVIEW_* 없음"
+
+# --- CLI: 임시 프로젝트에 model_select.sh 를 복사해 기본 경로가 임시 폴더가 되게 한다 ---
+MSP="$TMP/msp"
+mkdir -p "$MSP/rd-workflow/scripts" "$MSP/rd-workflow/config"
+cp "$MS" "$MSP/rd-workflow/scripts/model_select.sh"
+MSC="$MSP/rd-workflow/config"
+MSCLI="$MSP/rd-workflow/scripts/model_select.sh"
+# U15 준비: (d) 가 이 예시를 쓰지 않는지 확인하는 데만 쓴다.
+printf '{"version":1,"review":{"codex":{"small_task_effort":"medium"}}}\n' > "$MSC/models.json.example"
+# cli <인자...> → rc 출력. stdout·stderr 는 $TMP/cli.out·$TMP/cli.err.
+cli() { ( cd "$MSP" && HOME="$MSH" bash "$MSCLI" "$@" ) >"$TMP/cli.out" 2>"$TMP/cli.err"; echo $?; }
+cli_out() { grep -qxF -- "$1" "$TMP/cli.out"; }
+cli_err() { grep -qF -- "$1" "$TMP/cli.err"; }
+clean_cfg() { rm -f "$MSC/models.json" "$MSC/review-tools.json"; }
+
+# --- U14 show review <종류> ---
+clean_cfg
+printf '{"version":1,"review":{"codex":{"effort":"high"},"claude":{"model":"Opus"}}}' > "$MSC/models.json"
+printf '{"default_priority":["codex","claude"],"tools":{"codex":{"small_task_reasoning_effort":"medium"},"claude":{"model":"sonnet"}}}' \
+  > "$MSC/review-tools.json"
+rc="$(RD_REVIEW_CODEX_EFFORT=max cli show review request-review)"
+eq "$rc" "0" "U14 show review rc 0"
+cli_out "Codex effort: high — models.json";                                chk $? "U14 models.json 칸 → — models.json"
+cli_out "Codex small-task effort: medium — review-tools.json (옛 키)";      chk $? "U14 옛 키만 있는 칸 → (옛 키)"
+cli_out "Codex 모델: - — 미설정";                                           chk $? "U14 없는 칸 → 미설정"
+cli_out "Claude 모델: sonnet — review-tools.json (옛 키)";                  chk $? "U14 무효 새 칸(Opus) → 옛 키 sonnet"
+! grep -q 'max' "$TMP/cli.out";                                            chk $? "U14 환경 변수 RD_REVIEW_CODEX_EFFORT 는 표에 반영되지 않음"
+clean_cfg
+printf '{"review":{"codex":{"effort":"medium","review_types":{"diff-review":{"effort":"xhigh"}}}}}' > "$MSC/models.json"
+cli show review >/dev/null
+cli_out "Codex effort: medium — models.json";              chk $? "U14 종류별 칸이 기본 Codex effort 칸을 가리지 않음"
+cli_out "Codex effort (diff-review): xhigh — models.json"; chk $? "U14 diff-review 종류별 칸"
+
+# --- U16 show review (종류 생략) — 옛 종류 열거·옛 설정 손상 ---
+clean_cfg
+printf '{"default_priority":["codex","claude"],"overrides":{"_comment":"x","diff-review":{"tools":{"codex":{"reasoning_effort":"high"}}}}}' \
+  > "$MSC/review-tools.json"
+cli show review >/dev/null
+cli_out "Codex effort (diff-review): high — review-tools.json (옛 키)"; chk $? "U16 옛 설정의 종류별 effort 를 열거"
+printf '{"default_priority":"codex","tools":{"claude":{"model":"sonnet"}}}' > "$MSC/review-tools.json"
+cli show review >/dev/null
+cli_err "설정 파일 파싱 실패";            chk $? "U16 옛 설정 파싱 실패 경고"
+cli_out "Claude 모델: - — 미설정";        chk $? "U16 옛 설정 파싱 실패 → 옛 칸 모두 미설정"
+
+# --- U18 kill switch 줄 ---
+clean_cfg
+cli show review >/dev/null
+cli_out "kill switch: RD_REVIEW_EFFORT_OVERRIDE=미설정 (적용 중)"; chk $? "U18 kill switch 미설정"
+RD_REVIEW_EFFORT_OVERRIDE=0 cli show review >/dev/null
+cli_out "kill switch: RD_REVIEW_EFFORT_OVERRIDE=0 (무력화됨)";   chk $? "U18 kill switch 0"
+RD_REVIEW_EFFORT_OVERRIDE=yes cli show review >/dev/null
+cli_out "kill switch: RD_REVIEW_EFFORT_OVERRIDE=yes (무력화됨 · 인식 불가 값)"; chk $? "U18 kill switch 인식 불가 값"
+
+# --- U15 set ---
+clean_cfg
+printf '{"version":1,"review":{"claude":{"model":"opus"}},"session":{"model":"sonnet"}}' > "$MSC/models.json"
+eq "$(cli set review.codex.effort high)" "0" "U15(a) set rc 0"
+eq "$(jq -r '[.review.codex.effort, .review.claude.model, .session.model] | join(",")' "$MSC/models.json")" \
+   "high,opus,sonnet" "U15(a) 지정 칸만 바꾸고 다른 칸·최상위 절 보존"
+printf '{}{"review":{}}' > "$MSC/models.json"; cp "$MSC/models.json" "$TMP/orig.json"
+eq "$(cli set review.codex.effort high)" "1" "U15(b) 이어 붙은 값 2개 → rc 1"
+cli_err "$MSC/models.json";                 chk $? "U15(b) 경고에 파일 경로"
+cmp -s "$MSC/models.json" "$TMP/orig.json"; chk $? "U15(b) 원본 그대로"
+printf '{"review":{"codex":true}}' > "$MSC/models.json"; cp "$MSC/models.json" "$TMP/orig.json"
+eq "$(cli set review.codex.effort high)" "1" "U15(c) 상위 칸이 객체가 아님 → rc 1"
+cli_err "$MSC/models.json" && cli_err "review.codex"; chk $? "U15(c) 경고에 파일 경로와 review.codex"
+cmp -s "$MSC/models.json" "$TMP/orig.json"; chk $? "U15(c) 원본 그대로"
+clean_cfg
+eq "$(cli set review.claude.model haiku)" "0" "U15(d) 파일 없음 → rc 0"
+eq "$(jq -c . "$MSC/models.json")" '{"version":1,"review":{"claude":{"model":"haiku"}}}' \
+   "U15(d) {\"version\":1} 에서 시작 (예시 파일을 쓰지 않음)"
+perm_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null; }
+eq "$(perm_of "$MSC/models.json")" "644" "U15(i) 새 파일 권한 0644 (임시 파일의 0600 을 옮기지 않음)"
+chmod 640 "$MSC/models.json"
+eq "$(cli set review.codex.effort medium)" "0" "U15(i) 0640 파일 set rc 0"
+eq "$(perm_of "$MSC/models.json")" "640" "U15(i) 기존 파일 권한 0640 유지"
+mkdir -p "$TMP/fakebin"; printf '#!/bin/sh\nexit 1\n' > "$TMP/fakebin/mv"; chmod +x "$TMP/fakebin/mv"
+clean_cfg
+eq "$(PATH="$TMP/fakebin:$PATH" cli set review.claude.model haiku)" "1" "U15(f) 옮기기 실패 → rc 1"
+[ ! -e "$MSC/models.json" ];      chk $? "U15(f) models.json 이 생기지 않음"
+[ ! -e "$MSC/models.json.lock" ]; chk $? "U15(f) 잠금 폴더가 남지 않음"
+cli_err "옮기지 못함";            chk $? "U15(f) 경고에 옮기지 못함"
+printf '{"version":1,"review":{"claude":{"model":"sonnet"}}}' > "$MSC/models.json"; cp "$MSC/models.json" "$TMP/orig.json"
+eq "$(PATH="$TMP/fakebin:$PATH" cli set review.claude.model haiku)" "1" "U15(e) 기존 원본 + 옮기기 실패 → rc 1"
+cli_err "옮기지 못함";                      chk $? "U15(e) 경고에 옮기지 못함"
+cmp -s "$MSC/models.json" "$TMP/orig.json"; chk $? "U15(e) 원본 그대로"
+[ ! -e "$MSC/models.json.lock" ];           chk $? "U15(e) 잠금 폴더가 남지 않음"
+eq "$(cli set review.claude.model Opus)" "1" "U15(g) 무효 값 → rc 1"
+cli_err "review.claude.model";              chk $? "U15(g) 경고에 칸 이름"
+cmp -s "$MSC/models.json" "$TMP/orig.json"; chk $? "U15(g) 원본 그대로"
+eq "$(cli set review.claude.model null)"    "0" "U15(g) null(칸 비우기) 허용"
+eq "$(cli set review.codex.effort default)" "0" "U15(g) default(의도적 미전달) 허용"
+eq "$(RD_MODELS_CONFIG="$TMP/nodir/sub/models.json" cli set review.codex.effort high)" "1" "U15(h) 상위 폴더 없음 → rc 1"
+cli_err "잠금을 만들지 못했습니다" && cli_err "$TMP/nodir/sub"; chk $? "U15(h) 잠금 생성 실패 안내와 상위 폴더 경로"
+! cli_err "다른 저장이 진행 중";  chk $? "U15(h) 점유 안내를 내지 않음"
+mkdir -p "$TMP/dircfg/models.json"
+eq "$(RD_MODELS_CONFIG="$TMP/dircfg/models.json" cli set review.claude.model opus)" "1" "U15(j) 설정 경로가 폴더 → rc 1"
+cli_err "일반 파일이 아님" && cli_err "$TMP/dircfg/models.json"; chk $? "U15(j) 일반 파일이 아님 안내와 경로"
+eq "$(find "$TMP/dircfg" -mindepth 1 | sort | tr '\n' ' ')" "$TMP/dircfg/models.json " "U15(j) 임시 파일·잠금이 남지 않음"
+mkdir -p "$TMP/lnk/real"; printf '{"version":1}' > "$TMP/lnk/real/actual.json"; ln -s real/actual.json "$TMP/lnk/models.json"
+eq "$(RD_MODELS_CONFIG="$TMP/lnk/models.json" cli set review.claude.model sonnet)" "0" "U15(k) 심볼릭 링크 경로 set → rc 0"
+[ -L "$TMP/lnk/models.json" ]; chk $? "U15(k) 링크가 링크로 남음"
+eq "$(jq -r '.review.claude.model' "$TMP/lnk/real/actual.json")" "sonnet" "U15(k) 실제 파일에 씀"
+eq "$(find "$TMP/lnk" -mindepth 1 | sort | tr '\n' ' ')" "$TMP/lnk/models.json $TMP/lnk/real $TMP/lnk/real/actual.json " "U15(k) 임시 파일·잠금이 남지 않음"
+
+# --- U17 잠금 점유 ---
+printf '{"version":1}' > "$MSC/models.json"; cp "$MSC/models.json" "$TMP/orig.json"
+mkdir "$MSC/models.json.lock"
+eq "$(cli set review.codex.effort high)" "1" "U17 잠금 점유 → rc 1"
+cli_err "$MSC/models.json.lock";            chk $? "U17 경고에 잠금 경로"
+cmp -s "$MSC/models.json" "$TMP/orig.json"; chk $? "U17 원본 그대로"
+[ -d "$MSC/models.json.lock" ];             chk $? "U17 남의 잠금을 지우지 않음"
+rmdir "$MSC/models.json.lock"
+eq "$(cli set review.codex.effort high)" "0" "U17 잠금 해제 뒤 set rc 0"
+[ ! -e "$MSC/models.json.lock" ];           chk $? "U17 정상 set 뒤 잠금 없음"
+
+# --- U19 set-legacy ---
+clean_cfg
+eq "$(cli set-legacy default_priority '["claude","codex"]')" "0" "U19(a) 파일 없음 → rc 0"
+eq "$(jq -c . "$MSC/review-tools.json")" '{"default_priority":["claude","codex"]}' "U19(a) 지정 칸으로 파일 생성"
+clean_cfg
+eq "$(cli set-legacy tools.gemini.model '"g"')" "0" "U19(e) 파일 없음 → rc 0"
+eq "$(jq -c .default_priority "$MSC/review-tools.json")" '["codex","claude"]' "U19(e) 기본 우선순위에서 시작"
+leg="$( ( source "$MS"; ms_load_legacy "$MSC/review-tools.json" request-review; printf '%s' "$MS_LEGACY_KV" ) 2>"$TMP/ms.err")"
+! has_err "파싱 실패";                                    chk $? "U19(e) 지금 로더가 파싱 실패 없이 읽음"
+printf '%s\n' "$leg" | grep -qxF "priority${TAB}codex claude"; chk $? "U19(e) priority 행"
+printf '%s\n' "$leg" | grep -qxF "tool.gemini.model${TAB}g";   chk $? "U19(e) tool.gemini.model 행"
+printf '{"default_priority":["codex"],"tools":{"claude":{"model":"sonnet"}}}' > "$MSC/review-tools.json"
+eq "$(cli set-legacy tools.gemini.model '"g"')" "0" "U19(b) 기존 파일 → rc 0"
+eq "$(jq -r '.tools.claude.model' "$MSC/review-tools.json")" "sonnet" "U19(b) 옛 tools.claude.model 보존"
+cp "$MSC/review-tools.json" "$TMP/orig.json"
+eq "$(cli set-legacy tools.codex.reasoning_effort '"high"')" "1" "U19(c) 허용 밖 경로 → rc 1"
+cmp -s "$MSC/review-tools.json" "$TMP/orig.json"; chk $? "U19(c) 원본 그대로"
+printf '{"default_priority":' > "$MSC/review-tools.json"; cp "$MSC/review-tools.json" "$TMP/orig.json"
+eq "$(cli set-legacy tools.gemini.model '"g"')" "1" "U19(d) 손상 파일 → rc 1"
+cmp -s "$MSC/review-tools.json" "$TMP/orig.json"; chk $? "U19(d) 원본 그대로"
+
+# --- U20 apply — 공백이 든 설정 경로, 둘째 줄 실패 ---
+clean_cfg
+SPC="$TMP/my cfg"; mkdir -p "$SPC"
+printf 'models review.claude.model haiku\nlegacy tools.claude.bin "x"\nmodels review.codex.effort high\n' > "$TMP/apply.list"
+mkdir "$SPC/review-tools.json.lock"
+rc="$(RD_MODELS_CONFIG="$SPC/models.json" REVIEW_TOOLS_CONFIG="$SPC/review-tools.json" cli apply "$TMP/apply.list")"
+eq "$rc" "1" "U20 중간 실패 → rc 1"
+eq "$(grep -c '^반영됨: ' "$TMP/cli.out")|$(grep -c '^실패: ' "$TMP/cli.out")|$(grep -c '^미적용: ' "$TMP/cli.out")" \
+   "1|1|1" "U20 반영됨·실패·미적용 각 1줄"
+eq "$(jq -r '.review.codex.effort // "없음"' "$SPC/models.json")" "없음" "U20 첫 실패에서 멈춤 (셋째 칸 미반영)"
+retry="$(sed -n 's/^다시 실행: //p' "$TMP/cli.out")"
+( cd "$TMP" && env -u RD_MODELS_CONFIG -u REVIEW_TOOLS_CONFIG HOME="$MSH" bash -c "$retry" ) >/dev/null 2>&1
+[ $? -ne 0 ]; chk $? "U20c 재시도 중 재실패 → rc≠0"
+eq "$(jq -r '.review.codex.effort // "없음"' "$SPC/models.json")" "없음" "U20c 재실패 뒤 셋째 칸 미반영"
+rmdir "$SPC/review-tools.json.lock"
+( cd "$TMP" && env -u RD_MODELS_CONFIG -u REVIEW_TOOLS_CONFIG HOME="$MSH" bash -c "$retry" ) >/dev/null 2>&1
+chk $? "U20b 다른 작업 폴더에서 다시 실행 → rc 0"
+eq "$(jq -r '.review.codex.effort // "없음"' "$SPC/models.json")" "high" "U20b 셋째 칸까지 반영"
+eq "$(jq -r '.tools.claude.bin | type + ":" + .' "$SPC/review-tools.json" 2>/dev/null)" "string:x" "U20b tools.claude.bin 이 문자열 x"
+[ ! -e "$MSC/models.json" ] && [ ! -e "$MSC/review-tools.json" ]; chk $? "U20b 기본 경로에는 파일이 생기지 않음"
+
+# --- U20d apply — 형식이 틀린 줄이 있으면 아무 칸도 쓰지 않음 ---
+rm -f "$SPC/models.json"
+printf 'models review.claude.model sonnet\ntypo review.claude.effort high\nmodels review.claude.effort high\n' > "$TMP/bad.list"
+rc="$(RD_MODELS_CONFIG="$SPC/models.json" REVIEW_TOOLS_CONFIG="$SPC/review-tools.json" cli apply "$TMP/bad.list")"
+eq "$rc" "1" "U20d 형식 오류 줄 → rc 1"
+[ ! -e "$SPC/models.json" ]; chk $? "U20d 앞의 정상 줄도 쓰지 않음"
+cli_err "2번째 줄" && cli_err "typo review.claude.effort high"; chk $? "U20d 안내에 줄 번호와 줄 내용"
+! grep -q '^반영됨: ' "$TMP/cli.out"; chk $? "U20d 반영됨 줄 없음"
+printf 'models review.claude.model opus\nmodels  review.claude.effort high\n' > "$TMP/bad2.list"
+rc="$(RD_MODELS_CONFIG="$SPC/models.json" REVIEW_TOOLS_CONFIG="$SPC/review-tools.json" cli apply "$TMP/bad2.list")"
+eq "$rc" "1" "U20e 구분 공백이 둘인 줄 → rc 1"
+[ ! -e "$SPC/models.json" ]; chk $? "U20e 앞의 정상 줄도 쓰지 않음"
+cli_err "2번째 줄"; chk $? "U20e 안내에 줄 번호"
+printf 'models review.claude.model opus\n' > "$TMP/noread.list"; chmod 000 "$TMP/noread.list"
+rc="$(RD_MODELS_CONFIG="$SPC/models.json" REVIEW_TOOLS_CONFIG="$SPC/review-tools.json" cli apply "$TMP/noread.list")"
+chmod 644 "$TMP/noread.list"
+eq "$rc" "1" "U20f 읽지 못하는 목록 → rc 1"
+cli_err "읽지 못했습니다" && cli_err "$TMP/noread.list"; chk $? "U20f 안내에 목록 경로"
+
+# --- D2 /review-config skill 의 저장 명령 — 본문 펜스 블록의 표지 주석 다음 줄을 그대로 실행한다 ---
+SKILL_MD="${script_dir}/../claude_skills/review-config/SKILL.md"
+skill_line() { awk -v m="# rd:$1" '{ t = $0; sub(/^[ \t]+/, "", t) } t == m { if ((getline n) > 0) { sub(/^[ \t]+/, "", n); print n }; exit }' "$SKILL_MD"; }
+clean_cfg
+printf '{"version":1,"review":{"claude":{"model":"opus"}},"session":{"model":"sonnet"}}' > "$MSC/models.json"
+line="$(skill_line review-config-write)"
+[ -n "$line" ]; chk $? "D2 skill 에 rd:review-config-write 표지 줄이 있음"
+( cd "$MSP" && HOME="$MSH" bash -c "$line" ) >/dev/null 2>&1
+eq "$(jq -r '[.review.codex.effort, .review.claude.model, .session.model] | join(",")' "$MSC/models.json")" \
+   "high,opus,sonnet" "D2 skill 쓰기 명령이 model_select.sh set 으로 U15(a) 와 같은 결과"
+
+# --- D2e skill 완료 메시지는 apply 가 성공할 때만 ---
+line="$(skill_line review-config-apply)"
+[ -n "$line" ]; chk $? "D2e skill 에 rd:review-config-apply 표지 줄이 있음"
+rm -f "$SPC/models.json" "$SPC/review-tools.json"; mkdir "$SPC/review-tools.json.lock"
+( cd "$MSP" && HOME="$MSH" RD_MODELS_CONFIG="$SPC/models.json" REVIEW_TOOLS_CONFIG="$SPC/review-tools.json" \
+    list="$TMP/apply.list" bash -c "$line" ) >"$TMP/d2e.out" 2>&1
+rmdir "$SPC/review-tools.json.lock"
+grep -q '^실패: ' "$TMP/d2e.out";  chk $? "D2e apply 가 실제로 돌아 실패 줄을 냄"
+! grep -q '저장 완료' "$TMP/d2e.out"; chk $? "D2e apply 실패 → 완료 메시지 없음"
+
+# --- D5 review-tools.json.example 에서 옮긴 키는 없고, 이 파일이 맡는 키는 남음 (REQUEST AC11) ---
+RTX="${script_dir}/../config/review-tools.json.example"
+rtx_paths() { jq "[paths | map(tostring) | select($1)] | length" "$RTX" 2>/dev/null; }
+eq "$(rtx_paths '. == ["tools","codex","reasoning_effort"]')"            "0" "D5 tools.codex.reasoning_effort 없음"
+eq "$(rtx_paths '. == ["tools","codex","small_task_reasoning_effort"]')" "0" "D5 tools.codex.small_task_reasoning_effort 없음"
+eq "$(rtx_paths '. == ["tools","claude","model"]')"                      "0" "D5 tools.claude.model 없음"
+eq "$(rtx_paths 'length == 5 and .[0] == "overrides" and .[2:] == ["tools","codex","reasoning_effort"]')" \
+   "0" "D5 overrides.*.tools.codex.reasoning_effort 없음"
+eq "$(jq 'has("default_priority")' "$RTX" 2>/dev/null)"               "true" "D5 default_priority 남음"
+eq "$(jq '.tools.codex | has("bin")' "$RTX" 2>/dev/null)"             "true" "D5 tools.codex.bin 남음"
+eq "$(jq '.tools.claude | has("bin")' "$RTX" 2>/dev/null)"            "true" "D5 tools.claude.bin 남음"
+eq "$(jq '.tools.gemini | has("bin")' "$RTX" 2>/dev/null)"            "true" "D5 tools.gemini.bin 남음"
+eq "$(jq '.tools.claude | has("self_review_policy")' "$RTX" 2>/dev/null)" "true" "D5 tools.claude.self_review_policy 남음"
+eq "$(jq '.tools.gemini | has("model")' "$RTX" 2>/dev/null)"          "true" "D5 tools.gemini.model 남음 (Gemini 는 범위 밖)"
+
 # ============================================================
 # 1) 해석 우선순위 (AC 1~8) — run_review_turn.sh 를 source 해 함수만 쓴다
 # ============================================================
@@ -50,19 +490,20 @@ S_OTHER="$(mk_session s_other other)"
 S_LEGACY="$(mk_session s_legacy '')"
 
 # 서브셸에서 판정만 수행하고 `값|source|rejected|경고유무` 를 출력한다.
-# 주의: resolve_effort_override 를 command substitution 으로 감싸면 서브셸이 되어
-# EFFORT_* 할당이 소실된다. 직접 호출하고 경고만 파일로 캡처한다.
+# 판정은 실행기와 같은 공용 선택 함수 ms_resolve_review 가 한다(옛 설정만 둔 표본 — models.json 없음).
+# 주의: ms_resolve_review 를 command substitution 으로 감싸면 서브셸이 되어
+# MS_* 할당이 소실된다. 직접 호출하고 경고만 파일로 캡처한다.
 resolve() { # resolve <config> <session-file> <kill: unset|값> <review_type>
   (
-    export REVIEW_TOOLS_CONFIG="$TMP/$1.json"
+    export REVIEW_TOOLS_CONFIG="$TMP/$1.json" RD_MODELS_CONFIG="$TMP/no_models.json" HOME="$MSH"
     if [ "$3" = "unset" ]; then unset RD_REVIEW_EFFORT_OVERRIDE; else export RD_REVIEW_EFFORT_OVERRIDE="$3"; fi
     source "${script_dir}/run_review_turn.sh" 2>/dev/null
     set +e   # source 대상이 set -e 를 켜므로 다시 해제한다
     review_type="$4"
     load_review_config_once 2>/dev/null
-    resolve_effort_override "$(read_execution_path "$2")" 2>"$TMP/warn.txt"
+    ms_resolve_review codex "$(read_execution_path "$2")" "$4" 2>"$TMP/warn.txt"
     w=none; [ -s "$TMP/warn.txt" ] && w=warn
-    printf '%s|%s|%s|%s' "$EFFORT_VALUE" "$EFFORT_SOURCE" "$EFFORT_REJECTED" "$w"
+    printf '%s|%s|%s|%s' "$MS_EFFORT_VALUE" "$MS_EFFORT_SOURCE" "$MS_EFFORT_REJECTED" "$w"
   )
 }
 
@@ -162,8 +603,6 @@ RT_TABLE
 
 # prepare_review_pipeline.sh 연결 정적 단언 — 함수 테스트는 호출 한 줄과 heredoc 기록의 회귀를 보지 못한다.
 PREP="${script_dir}/prepare_review_pipeline.sh"
-grep -qF 'CTX_EXEC_PATH="$(review_execution_path_from_request "${project_root}/REQUEST.md")"' "$PREP"
-chk $? "RT prepare 가 review_execution_path_from_request 결과를 CTX_EXEC_PATH 에 대입"
 grep -qF -- '- execution-path: $CTX_EXEC_PATH' "$PREP"
 chk $? "RT prepare 가 CTX_EXEC_PATH 를 execution-path 로 기록"
 
@@ -173,26 +612,23 @@ chk $? "RT prepare 가 CTX_EXEC_PATH 를 execution-path 로 기록"
 # 어댑터가 effort 거부 시 즉시 실패하므로(자동 재시도 없음) "턴 성공 + effort 전달" =
 # "codex 가 그 값을 수락" 이고, 부모가 아는 정보만으로 상태가 결정된다.
 echo "=== 가시성 상태 5종 ==="
-status() { # status <EFFORT_VALUE> <EFFORT_SOURCE> <EFFORT_REJECTED> <tool>
+status() { # status <EFFORT_VALUE> <EFFORT_SOURCE> <EFFORT_REJECTED>
   (
     source "${script_dir}/run_review_turn.sh" 2>/dev/null
     set +e
     EFFORT_VALUE="$1"; EFFORT_SOURCE="$2"; EFFORT_REJECTED="$3"
-    compute_effort_status "$4"
+    compute_effort_status
   )
 }
-eq "$(status xhigh review-type '' codex)" \
+eq "$(status xhigh review-type '')" \
    "applied:xhigh (source: review-type)"      "상태1 applied (source 동반)"
-eq "$(status medium small-task '' codex)" \
+eq "$(status medium small-task '')" \
    "applied:medium (source: small-task)"      "상태1 source 가 실제 판정 단계를 반영"
-eq "$(status '' global '' codex)"  "none/global"                 "상태2 none/global (설정 부재)"
-eq "$(status '' kill-switch '' codex)" "disabled-by-kill-switch" "상태3 disabled-by-kill-switch"
-eq "$(status '' below-floor low codex)" "rejected-below-floor:low" \
+eq "$(status '' global '')"  "none/global"                 "상태2 none/global (설정 부재)"
+eq "$(status '' kill-switch '')" "disabled-by-kill-switch" "상태3 disabled-by-kill-switch"
+eq "$(status '' below-floor low)" "rejected-below-floor:low" \
    "상태4 rejected-below-floor (설정 존재 — none/global 과 구분)"
-eq "$(status xhigh review-type '' claude)" \
-   "not-applicable (tool=claude)"             "상태5 claude fallback 시 codex 값을 보고하지 않음"
-eq "$(status '' kill-switch '' claude)" \
-   "not-applicable (tool=claude)"             "상태5 가 다른 상태보다 우선 (도구 판정이 먼저)"
+# Claude 도 effort 를 받으므로 상태는 도구와 상관없다 (spec D7, not-applicable 분기 삭제). 도구 인자도 없다.
 
 # ============================================================
 # 3) 어댑터 전달 계약 (AC 10) — stub codex
@@ -290,7 +726,7 @@ echo "=== 호출자 환경 격리 ==="
 ISO="$TMP/iso"
 mkdir -p "$ISO/rd-workflow/scripts" "$ISO/rd-workflow/config" \
          "$ISO/rd-workflow/docs/flows" "$ISO/rd-workflow/docs/prompts/review" "$ISO/cap"
-for f in run_review_turn.sh review_common.sh review_wait.sh adapter_codex.sh adapter_claude.sh; do
+for f in run_review_turn.sh review_common.sh review_wait.sh adapter_codex.sh adapter_claude.sh model_select.sh; do
   cp "${script_dir}/$f" "$ISO/rd-workflow/scripts/$f"
 done
 printf '기준\n' > "$ISO/rd-workflow/docs/prompts/review/request_review.md"
@@ -311,9 +747,10 @@ mv "$SESSION_PATH/S.tmp" "$SESSION_PATH/SESSION.md"
 ESEOF
 chmod +x "$ISO/envstub"
 
-iso_session() {
+iso_session() { # iso_session [<리뷰 종류>] [<execution-path>] — 기본 request-review·other
+  local rt="${1:-request-review}" ep="${2:-other}"
   rm -rf "$ISO/sess"; mkdir -p "$ISO/sess/turns"
-  cat > "$ISO/sess/SESSION.md" <<'EOF'
+  cat > "$ISO/sess/SESSION.md" <<EOF
 # Review Session
 
 ## Status
@@ -323,7 +760,7 @@ awaiting-reviewer
 Reviewer
 
 ## Review Type
-request-review
+${rt}
 
 ## Review Target
 TARGET.md
@@ -335,7 +772,7 @@ goal
 20
 
 ## Review Scope
-- execution-path: other
+- execution-path: ${ep}
 EOF
   printf '# C\n\n## Open Issues\n- 없음\n' > "$ISO/sess/CHECKPOINT.md"
   printf '# U\n\n## Question For User\n-\n' > "$ISO/sess/USER_ACTION.md"
@@ -370,8 +807,8 @@ iso_session; iso_cfg claude high
     bash "$ISO/rd-workflow/scripts/run_review_turn.sh" sess >"$ISO/out_b" 2>"$ISO/err_b" )
 eq "$(grep '^TOOL_EFFORT=' "$ISO/cap/b")"   "TOOL_EFFORT="   "AC32 claude 환경에 TOOL_EFFORT 부재"
 eq "$(grep '^EFFORT_SOURCE=' "$ISO/cap/b")" "EFFORT_SOURCE=" "AC32 claude 환경에 EFFORT_SOURCE 부재"
-grep -q 'effort override: not-applicable (tool=claude)' "$ISO/out_b"
-chk $? "AC23 claude 선택 시 codex 값을 보고하지 않음"
+grep -q 'effort override: none/global' "$ISO/out_b"
+chk $? "AC23 claude 선택 시 codex 값을 보고하지 않음 (claude effort 미설정 → none/global)"
 
 # 케이스 C: 설정 부재 + 호출자가 TOOL_EFFORT export (후퇴 없음 보증)
 iso_session; iso_cfg codex ""
@@ -406,7 +843,7 @@ cat > "$ISO/rd-workflow/config/review-tools.json" <<EOF
 EOF
 ( cd "$ISO" && WAIT_TIMEOUT=20 \
     bash "$ISO/rd-workflow/scripts/run_review_turn.sh" sess >"$ISO/out_e" 2>"$ISO/err_e" )
-grep -q "reasoning effort 'ultra'" "$ISO/err_e"
+grep -q "\[effort\] 이번 호출에 넘긴 값: ultra" "$ISO/err_e"
 chk $? "실패 시 전달한 effort 값을 알려줌"
 grep -q 'RD_REVIEW_EFFORT_OVERRIDE=0' "$ISO/err_e"
 chk $? "실패 시 kill switch 복구 경로를 안내함"
@@ -414,6 +851,422 @@ grep -q 'review-tools.json' "$ISO/err_e"
 chk $? "effort 값 확인 안내"
 ! grep -q '제거' "$ISO/err_e"
 chk $? "영구 변경(제거) 지시 부재"
+
+# ============================================================
+# 4b) 리뷰 턴의 모델·effort 적용 (spec D4~D7) — 판정은 fn_run(함수 단위), 인자 배선은 ab_run(실행기 전체)
+#     ab_run 은 가짜 codex·claude 가 받은 인자를 본다. 실행기 한 번이 수 초라 배선 확인에만 쓴다.
+#     HOME 은 표본 캐시를 둔 임시 홈이다. 실제 모델·실제 ~/.codex 는 쓰지 않는다.
+# ============================================================
+echo "=== 리뷰 턴 모델·effort 적용 ==="
+
+ISO_CFG="$ISO/rd-workflow/config"
+ABH="$TMP/abhome"; mkdir -p "$ABH/.codex"
+cp "$MS_SAMPLE" "$ABH/.codex/models_cache.json"
+AB_BIN="$TMP/abbin"; AB_BIN_CLAUDE="$TMP/abbin_claude"; mkdir -p "$AB_BIN" "$AB_BIN_CLAUDE"
+# 가짜 CLI: 받은 인자를 한 줄씩 $ARGDIR/args.<이름> 에 남기고 턴 파일을 만든다. FAKE_FAIL=1 이면 원인 불명 오류로 rc 1.
+# FAKE_LOG=<파일> 이면 그 내용을 출력하고 rc 1 — Claude 는 stdout(stream-json), Codex 는 stderr 다.
+cat > "$AB_BIN/fakecli" <<'FKEOF'
+#!/usr/bin/env bash
+me="$(basename "$0")"
+: > "$ARGDIR/args.$me"
+for a in "$@"; do printf '%s\n' "$a" >> "$ARGDIR/args.$me"; done
+cat > /dev/null
+if [ "${FAKE_FAIL:-0}" = 1 ]; then echo "something odd happened" >&2; exit 1; fi
+if [ -n "${FAKE_LOG:-}" ]; then
+  if [ "$me" = claude ]; then cat "$FAKE_LOG"; else cat "$FAKE_LOG" >&2; fi
+  exit 1
+fi
+printf '# T\n' > "$EXPECTED_TURN_FILE"
+sed -e 's/^awaiting-reviewer$/awaiting-author/' -e 's/^Reviewer$/Author/' \
+  "$SESSION_PATH/SESSION.md" > "$SESSION_PATH/S.tmp"
+mv "$SESSION_PATH/S.tmp" "$SESSION_PATH/SESSION.md"
+FKEOF
+chmod +x "$AB_BIN/fakecli"
+ln -s "$AB_BIN/fakecli" "$AB_BIN/codex"
+ln -s "$AB_BIN/fakecli" "$AB_BIN/claude"
+ln -s "$AB_BIN/fakecli" "$AB_BIN_CLAUDE/claude"
+# jq 없는 PATH: 기본 유틸 폴더를 심링크하고 jq 만 뺀다 (/usr/bin/jq 가 있는 머신도 있음).
+NOJQ="$TMP/nojq"; mkdir -p "$NOJQ"
+for d in /bin /usr/bin /usr/sbin /sbin; do [ -d "$d" ] && ln -s "$d"/* "$NOJQ/" 2>/dev/null; done
+rm -f "$NOJQ/jq"
+
+ab_models() { if [ -z "$1" ]; then rm -f "$ISO_CFG/models.json"; else printf '%s' "$1" > "$ISO_CFG/models.json"; fi; }
+ab_toml()   { if [ -z "$1" ]; then rm -f "$ABH/.codex/config.toml"; else printf '%s\n' "$1" > "$ABH/.codex/config.toml"; fi; }
+ab_legacy() { # ab_legacy <도구> [<병합할 JSON>] — 그 도구 하나만 실행한다. Claude self-review 는 off.
+  local x="${2:-}"; [ -n "$x" ] || x='{}'
+  jq -n --arg t "$1" --argjson x "$x" \
+    '{default_priority:[$t], tools:{claude:{self_review_policy:"off"}}} * $x' > "$ISO_CFG/review-tools.json"
+}
+ab_reset() { ab_models ""; ab_toml ""; rm -f "$ISO_CFG/review-tools.json"; }
+ab_run() { # ab_run <이름> <리뷰 종류> <execution-path> [VAR=값...]
+  local name="$1" rt="$2" ep="$3"; shift 3
+  iso_session "$rt" "$ep"
+  rm -rf "$TMP/ab/$name"; mkdir -p "$TMP/ab/$name"
+  ( cd "$ISO" && env -u RD_MODELS_CONFIG -u REVIEW_TOOLS_CONFIG -u CODEX_HOME -u TOOL_MODEL -u TOOL_EFFORT \
+      -u RD_REVIEW_EFFORT_OVERRIDE HOME="$ABH" ARGDIR="$TMP/ab/$name" WAIT_TIMEOUT=20 PATH="$AB_BIN:$PATH" "$@" \
+      bash "$ISO/rd-workflow/scripts/run_review_turn.sh" sess >"$TMP/ab/$name/out" 2>"$TMP/ab/$name/err" )
+}
+ab_args() { local f="$TMP/ab/$1/args.$2"; if [ -f "$f" ]; then printf ' %s ' "$(tr '\n' ' ' < "$f")"; else printf 'NOFILE'; fi; }
+ab_has()  { case "$(ab_args "$1" "$2")" in *" $3 "*) return 0 ;; esac; return 1; }  # ab_has <이름> <도구> <인자 조각>
+ab_ran()  { [ -f "$TMP/ab/$1/args.$2" ]; }
+ab_noarg() { ab_ran "$1" "$2" && ! ab_has "$1" "$2" "$3"; }                     # 실행됐고 그 조각이 없음
+ab_noeff() { ab_ran "$1" codex && ! grep -q 'model_reasoning_effort' "$TMP/ab/$1/args.codex"; }
+ab_err()  { grep -qF -- "$2" "$TMP/ab/$1/err"; }
+ab_errn() { grep -cF -- "$2" "$TMP/ab/$1/err"; }
+ab_out()  { grep -qF -- "$2" "$TMP/ab/$1/out"; }
+MJ="$ISO_CFG/models.json"
+EFF() { printf 'model_reasoning_effort="%s"' "$1"; }
+
+# 함수 단위 판정 — 실행기를 source 해 실행기와 같은 순서로 부른다:
+#   load_review_config → resolve_review_selection → format_selection_line
+#   (SEL_LOG=<실패 로그> 이면 이어서 classify_adapter_failure_cause → print_selection_recovery).
+# 어댑터·가짜 CLI 는 띄우지 않는다. 결과는 $TMP/ab/<이름>/out(MODEL=·EFFORT=)·err(경고·실행 줄·복구 안내).
+# MODEL·EFFORT 는 실행기가 어댑터에 넘기는 TOOL_MODEL·TOOL_EFFORT 값이다(빈 값 = 인자 없음).
+# 그 값이 실제 CLI 인자(-m·-c·--model·--effort)가 되는 배선은 ab_run 케이스(A1·A2·A12·A14·A15·R5·R6·R7)가 본다.
+cat > "$TMP/seldrv.sh" <<'SDEOF'
+source "$1" 2>/dev/null
+set +e
+load_review_config "$3"
+resolve_review_selection "$2" "$4" "$3"
+format_selection_line "$2" >&2; echo >&2
+printf 'MODEL=%s\nEFFORT=%s\n' "$MODEL_VALUE" "$EFFORT_VALUE"
+if [ -n "${SEL_LOG:-}" ]; then
+  print_selection_recovery "$2" "$(classify_adapter_failure_cause "$SEL_LOG" "$2")"
+fi
+SDEOF
+fn_run() { # fn_run <이름> <tool> <리뷰 종류> <execution-path> [VAR=값...] — ab_run 과 같은 환경으로 판정만 한다
+  local name="$1" tool="$2" rt="$3" ep="$4"; shift 4
+  rm -rf "$TMP/ab/$name"; mkdir -p "$TMP/ab/$name"
+  ( cd "$ISO" && env -u RD_MODELS_CONFIG -u REVIEW_TOOLS_CONFIG -u CODEX_HOME -u TOOL_MODEL -u TOOL_EFFORT \
+      -u RD_REVIEW_EFFORT_OVERRIDE HOME="$ABH" PATH="$AB_BIN:$PATH" "$@" \
+      bash "$TMP/seldrv.sh" "$ISO/rd-workflow/scripts/run_review_turn.sh" "$tool" "$rt" "$ep" ) \
+    >"$TMP/ab/$name/out" 2>"$TMP/ab/$name/err"
+}
+fv()    { sed -n "s/^$2=//p" "$TMP/ab/$1/out"; }      # fv <이름> MODEL|EFFORT → 넘길 값
+fnone() { grep -qx "$2=" "$TMP/ab/$1/out"; }          # fnone <이름> MODEL|EFFORT → 판정이 끝났고 값이 비어 있음
+
+# --- A1 옛 키만 — Codex 는 -m 없이 옛 effort 그대로, Claude 는 옛 모델만 (실행기 실행: 옛 설정 동등) ---
+ab_reset; ab_toml 'model = "gpt-6.1-sol"'
+ab_legacy codex '{"tools":{"codex":{"reasoning_effort":"high"},"claude":{"model":"sonnet"}}}'
+ab_run a1x request-review other
+ab_noarg a1x codex "-m";                        chk $? "A1 옛 키만 → Codex 인자에 -m 없음"
+ab_has a1x codex "-c $(EFF high)";              chk $? "A1 옛 키 effort high 를 그대로 전달"
+eq "$(ab_errn a1x 'ℹ️  옛 설정 ')" "1"               "A1 Codex 실행에 옛 키 안내 1줄 (effort 칸)"
+ab_legacy claude '{"tools":{"codex":{"reasoning_effort":"high"},"claude":{"model":"sonnet"}}}'
+ab_run a1c request-review other
+ab_has a1c claude "--model sonnet";             chk $? "A1 Claude 옛 tools.claude.model → --model sonnet"
+ab_noarg a1c claude "--effort";                 chk $? "A1 Claude 는 Codex 옛 effort 를 쓰지 않음 (--effort 없음)"
+eq "$(ab_errn a1c 'ℹ️  옛 설정 ')" "1"               "A1 Claude 실행에 옛 키 안내 1줄 (모델 칸)"
+
+# --- A2 계열 sol + ultra — 실행 줄의 표기 (실행기 실행: Codex -m·-c 배선) ---
+ab_reset; ab_legacy codex
+ab_models '{"review":{"codex":{"model":"sol","effort":"ultra"}}}'
+ab_run a2 request-review other
+ab_has a2 codex "-m gpt-6.2-sol";               chk $? "A2 계열 sol → -m gpt-6.2-sol"
+ab_has a2 codex "-c $(EFF ultra)";              chk $? "A2 지원 단계 ultra 그대로"
+ab_err a2 "모델 요청: sol→gpt-6.2-sol (source: models.json · file:${MJ}#review.codex.model)"; chk $? "A2 실행 줄 모델 표기"
+ab_err a2 "effort 시도: ultra (source: tool-default · file:${MJ}#review.codex.effort)";       chk $? "A2 실행 줄 effort 표기"
+
+# --- A3 luna + ultra → max 하향 ---
+ab_reset; ab_legacy codex
+ab_models '{"review":{"codex":{"model":"luna","effort":"ultra"}}}'
+fn_run a3 codex request-review other
+eq "$(fv a3 MODEL)"  "gpt-6-luna"               "A3 계열 luna → -m gpt-6-luna"
+eq "$(fv a3 EFFORT)" "max"                      "A3 luna 가 지원하지 않는 ultra → max"
+ab_err a3 "지원하지 않는 effort 'ultra' 를 'max'"; chk $? "A3 하향 경고"
+
+# --- A4 옛 키 값은 변환하지 않음 ---
+ab_reset
+ab_legacy codex '{"tools":{"codex":{"reasoning_effort":"ultra"}}}'
+ab_models '{"review":{"codex":{"model":"luna"}}}'
+fn_run a4 codex request-review other
+eq "$(fv a4 EFFORT)" "ultra"                    "A4 옛 키 ultra 는 luna 여도 그대로"
+
+# --- A5 계열 해석 실패 ---
+ab_reset; ab_legacy codex
+ab_models '{"review":{"codex":{"model":"nosuch"}}}'
+fn_run a5 codex request-review other
+fnone a5 MODEL;                                 chk $? "A5 해석 실패 → -m 없음"
+ab_err a5 "계열 'nosuch'";                      chk $? "A5 해석 실패 경고"
+ab_err a5 "모델 요청: none (source: unresolved · file:${MJ}#review.codex.model = nosuch) — CLI 기본값으로 실행"; chk $? "A5 실행 줄 (파일 위치)"
+ab_models ""
+fn_run a5e codex request-review other RD_REVIEW_CODEX_MODEL=nosuch
+fnone a5e MODEL;                                chk $? "A5 환경 변수 해석 실패 → -m 없음"
+ab_err a5e "모델 요청: none (source: unresolved · env:RD_REVIEW_CODEX_MODEL = nosuch) — CLI 기본값으로 실행"; chk $? "A5 실행 줄 (환경 변수 위치)"
+
+# --- A6 환경 변수가 models.json 을 이김 ---
+ab_reset; ab_legacy codex
+ab_models '{"review":{"codex":{"model":"sol","effort":"medium"}}}'
+fn_run a6 codex request-review other RD_REVIEW_CODEX_MODEL=astra RD_REVIEW_CODEX_EFFORT=xhigh
+eq "$(fv a6 MODEL)"  "gpt-6.2-astra"            "A6 RD_REVIEW_CODEX_MODEL=astra 가 이김"
+eq "$(fv a6 EFFORT)" "xhigh"                    "A6 RD_REVIEW_CODEX_EFFORT=xhigh 가 이김"
+
+# --- A7 kill switch 0·빈 문자열·yes ---
+ab_reset; ab_legacy codex '{"tools":{"codex":{"reasoning_effort":"high"}}}'
+fn_run a7z codex request-review other RD_REVIEW_EFFORT_OVERRIDE=0   RD_REVIEW_CODEX_EFFORT=high
+fn_run a7e codex request-review other RD_REVIEW_EFFORT_OVERRIDE=    RD_REVIEW_CODEX_EFFORT=high
+fn_run a7y codex request-review other RD_REVIEW_EFFORT_OVERRIDE=yes RD_REVIEW_CODEX_EFFORT=high
+fnone a7z EFFORT; chk $? "A7 kill switch 0 → effort 없음"
+fnone a7e EFFORT; chk $? "A7 kill switch 빈 문자열 → effort 없음"
+fnone a7y EFFORT; chk $? "A7 kill switch yes → effort 없음"
+! ab_err a7z "인식할 수 없습니다"; chk $? "A7 kill switch 0 → 인식 불가 경고 없음"
+ab_err a7e "인식할 수 없습니다";   chk $? "A7 kill switch 빈 문자열 → 인식 불가 경고"
+ab_err a7y "인식할 수 없습니다";   chk $? "A7 kill switch yes → 인식 불가 경고"
+
+# --- A8 small-task 단계와 하한 ---
+ab_reset; ab_legacy codex
+ab_models '{"review":{"codex":{"small_task_effort":"high"}}}'
+fn_run a8 codex diff-review small-task
+eq "$(fv a8 EFFORT)" "high"                     "A8 small-task high 전달"
+ab_err a8 "effort 시도: high (source: small-task · "; chk $? "A8 실행 줄 small-task 출처"
+ab_toml 'model = "gpt-6.2-sol"'
+ab_models '{"review":{"codex":{"small_task_effort":"lowest"}}}'
+fn_run a8f codex diff-review small-task
+fnone a8f EFFORT;                               chk $? "A8 small-task lowest(→low) 는 하한 미만 → effort 없음"
+ab_err a8f "effort 시도: none (source: below-floor · "; chk $? "A8 실행 줄 below-floor"
+ab_err a8f "허용 하한(medium) 미만";            chk $? "A8 하한 경고"
+
+# --- A8b 하한은 small-task 단계에만 ---
+ab_reset; ab_legacy codex; ab_toml 'model = "gpt-6.2-sol"'
+ab_models '{"review":{"codex":{"effort":"low"}}}'
+fn_run a8b codex diff-review other
+eq "$(fv a8b EFFORT)" "low"                     "A8b 일반 세션 effort low 는 그대로 전달"
+
+# --- A9 리뷰 종류별 칸이 도구 기본을 이김 ---
+ab_reset; ab_legacy codex
+ab_models '{"review":{"codex":{"effort":"medium","review_types":{"request-review":{"effort":"xhigh"}}}}}'
+fn_run a9 codex request-review other
+eq "$(fv a9 EFFORT)" "xhigh"                    "A9 review_types.request-review.effort=xhigh"
+ab_err a9 "effort 시도: xhigh (source: review-type · "; chk $? "A9 실행 줄 review-type 출처"
+
+# --- A10 default 는 미전달로 멈추고 옛 키로 내려가지 않음 ---
+ab_reset; ab_legacy codex '{"tools":{"codex":{"reasoning_effort":"high"}}}'
+ab_models '{"review":{"codex":{"effort":"default"}}}'
+fn_run a10 codex request-review other
+fnone a10 EFFORT;                               chk $? "A10 effort default → 인자 없음 (옛 키 high 로 내려가지 않음)"
+! ab_err a10 "옛 설정";                         chk $? "A10 쓰지 않은 옛 키는 안내하지 않음"
+ab_err a10 "effort 시도: none (source: tool-default · "; chk $? "A10 실행 줄 none·tool-default"
+ab_err a10 "#review.codex.effort = default)";    chk $? "A10 실행 줄에 = default 위치"
+
+# --- A10b 모델 default 도 옛 키로 내려가지 않음 ---
+ab_reset; ab_legacy claude '{"tools":{"claude":{"model":"sonnet"}}}'
+ab_models '{"review":{"claude":{"model":"default"}}}'
+fn_run a10b claude request-review other
+fnone a10b MODEL;                               chk $? "A10b Claude 모델 default → --model 없음"
+! ab_err a10b "옛 설정";                        chk $? "A10b 옛 키 안내 없음"
+
+# --- D2c skill setup 의 「옛 설정을 따름」 → models.json 칸을 null 로 비워 옛 키로 내려감 ---
+ab_reset; ab_legacy claude '{"tools":{"claude":{"model":"sonnet"}}}'
+ab_models '{"review":{"claude":{"model":"haiku"}}}'
+{ printf '%s\n' 'legacy tools.gemini.model "g"'; skill_line review-config-legacy-choice; } > "$TMP/d2c.list"
+( cd "$ISO" && HOME="$ABH" list="$TMP/d2c.list" bash -c "$(skill_line review-config-apply)" ) >"$TMP/d2c.out" 2>&1
+fn_run d2c claude request-review other
+eq "$(fv d2c MODEL)" "sonnet"                   "D2c 옛 설정을 따름 → --model sonnet (haiku 에서 바뀜)"
+eq "$(jq -r '.tools.claude.model' "$ISO_CFG/review-tools.json")" "sonnet" "D2c review-tools.json 의 tools.claude.model 보존"
+
+# --- D2b skill setup 의 「CLI 기본값」 → default 로 저장해 옛 키로 내려가지 않음 ---
+ab_reset; ab_legacy claude '{"tools":{"claude":{"model":"sonnet"}}}'
+skill_line review-config-default-choice > "$TMP/d2b.list"
+( cd "$ISO" && HOME="$ABH" list="$TMP/d2b.list" bash -c "$(skill_line review-config-apply)" ) >"$TMP/d2b.out" 2>&1
+fn_run d2b claude request-review other
+fnone d2b MODEL;                                chk $? "D2b CLI 기본값 선택 → --model 없음"
+
+# --- A11 null 은 비어 있음 → 옛 키, 손상 파일은 무시 ---
+ab_reset; ab_legacy codex '{"tools":{"codex":{"reasoning_effort":"high"}}}'
+ab_models '{"review":{"codex":{"effort":null}}}'
+fn_run a11 codex request-review other
+eq "$(fv a11 EFFORT)" "high"                    "A11 effort null → 옛 키 high"
+eq "$(ab_errn a11 'ℹ️  옛 설정 ')" "1"               "A11 옛 키 안내 1줄"
+ab_models '{'
+fn_run a11c codex request-review other
+ab_err a11c "models.json 을 읽지 못했습니다";    chk $? "A11 models.json 손상 경고"
+eq "$(fv a11c EFFORT)" "high"                   "A11 손상 시 옛 키 high"
+
+# --- A12 Claude 모델·effort (a12 는 실행기 실행: Claude --model·--effort 배선) ---
+ab_reset; ab_legacy claude
+ab_models '{"review":{"claude":{"model":"haiku","effort":"high"}}}'
+ab_run a12 request-review other
+ab_has a12 claude "--model haiku";              chk $? "A12 Claude --model haiku"
+ab_has a12 claude "--effort high";              chk $? "A12 Claude --effort high"
+fn_run a12p claude request-review other RD_REVIEW_CLAUDE_MODEL=claude-opus-5-5
+ab_err a12p "고정 이름입니다";                  chk $? "A12 Claude 고정 이름 경고"
+eq "$(fv a12p MODEL)" "claude-opus-5-5"         "A12 Claude 고정 이름 그대로 전달"
+fn_run a12u claude request-review other RD_REVIEW_CLAUDE_EFFORT=ultra
+eq "$(fv a12u EFFORT)" "max"                    "A12 Claude ultra → --effort max"
+ab_err a12u "지원하지 않는 effort 'ultra'";      chk $? "A12 Claude 하향 경고"
+
+# --- A12b Codex 고정 이름 ---
+ab_reset; ab_legacy codex
+fn_run a12b codex request-review other RD_REVIEW_CODEX_MODEL=gpt-6.2-sol
+ab_err a12b "고정 이름입니다";                  chk $? "A12b Codex 고정 이름 경고"
+eq "$(fv a12b MODEL)" "gpt-6.2-sol"             "A12b Codex 고정 이름 -m 전달"
+
+# --- A13 Claude 성공 요약 (a12·a1c 실행기 실행의 stdout) ---
+ab_out a12 "effort override: applied:high (source: tool-default)"; chk $? "A13 Claude effort 전달 → applied:high (source: tool-default)"
+ab_out a1c "effort override: none/global";      chk $? "A13 Claude effort 미전달 → none/global"
+! cat "$TMP"/ab/*/out | grep -q 'not-applicable'; chk $? "A13 not-applicable 표시 없음"
+
+# --- A14 호출 환경의 TOOL_MODEL·TOOL_EFFORT 는 어댑터에 닿지 않음 (실행기 실행: 상속 환경 차단) ---
+ab_reset; ab_models '{"version":1}'
+ab_legacy codex
+ab_run a14x request-review other TOOL_MODEL=x TOOL_EFFORT=y
+ab_legacy claude
+ab_run a14c request-review other TOOL_MODEL=x TOOL_EFFORT=y
+ab_ran a14x codex && ! grep -qxE 'x|.*"y"|y' "$TMP/ab/a14x/args.codex";  chk $? "A14 Codex 인자에 상속값 x·y 없음"
+ab_ran a14c claude && ! grep -qxE 'x|y' "$TMP/ab/a14c/args.claude";      chk $? "A14 Claude 인자에 상속값 x·y 없음"
+
+# --- A16 옛 설정 파싱 실패 → 옛 값 모두 빠짐 ---
+ab_reset
+printf '{"default_priority":"codex","tools":{"codex":{"reasoning_effort":"high"}}}' > "$ISO_CFG/review-tools.json"
+fn_run a16 codex request-review other
+ab_err a16 "설정 파일 파싱 실패";               chk $? "A16 파싱 실패 경고"
+fnone a16 EFFORT;                               chk $? "A16 파싱 실패 → effort 없음 (옛 키를 다시 읽지 않음)"
+
+# --- A17 무효 새 칸 → 옛 키 (조회와 실행 일치) ---
+ab_reset; ab_legacy claude '{"tools":{"claude":{"model":"sonnet"}}}'
+ab_models '{"review":{"claude":{"model":"Opus"}}}'
+fn_run a17 claude request-review other
+ab_err a17 "값이 올바르지 않습니다: Opus";        chk $? "A17 무효 값 경고"
+eq "$(fv a17 MODEL)" "sonnet"                   "A17 무효 새 칸 → 옛 키 sonnet"
+
+# --- A18 config.toml 작은따옴표 모델로 effort 변환 ---
+ab_reset; ab_legacy codex; ab_toml "model = 'gpt-6-luna'"
+fn_run a18 codex request-review other RD_REVIEW_CODEX_EFFORT=ultra
+eq "$(fv a18 EFFORT)" "max"                     "A18 config.toml 의 luna 기준으로 ultra → max"
+fnone a18 MODEL;                                chk $? "A18 모델 설정 없음 → -m 없음"
+ab_err a18 "지원하지 않는 effort 'ultra'";       chk $? "A18 하향 경고"
+
+# --- A19 첫 저장 뒤에도 옛 effort 칸이 살아 있음 ---
+ab_reset
+ab_legacy codex '{"tools":{"codex":{"small_task_reasoning_effort":"high"}},"overrides":{"request-review":{"tools":{"codex":{"reasoning_effort":"xhigh"}}}}}'
+# 예시 파일을 두어 「첫 저장은 예시가 아니라 {"version":1} 에서 시작」 을 이 경로에서도 확인한다(M66).
+printf '{"version":1,"review":{"codex":{"small_task_effort":"medium"}}}' > "$ISO_CFG/models.json.example"
+( cd "$ISO" && env -u RD_MODELS_CONFIG HOME="$ABH" bash "$ISO/rd-workflow/scripts/model_select.sh" set review.claude.model haiku ) >/dev/null 2>&1
+chk $? "A19 set review.claude.model haiku rc 0"
+rm -f "$ISO_CFG/models.json.example"
+fn_run a19s codex diff-review small-task
+eq "$(fv a19s EFFORT)" "high"                   "A19 저장 뒤 small-task 세션 → 옛 small-task high"
+fn_run a19r codex request-review other
+eq "$(fv a19r EFFORT)" "xhigh"                  "A19 저장 뒤 request-review 세션 → 옛 종류별 xhigh"
+
+# --- A15 jq 없음 → 모든 설정·환경 변수를 쓰지 않음 (실행기 실행: jq 판정은 실행기가 턴 시작 때 한다) ---
+# Codex 는 원인 불명 실패(FAKE_FAIL)로 함께 돌려 인자와 복구 안내 한 줄(A15b)을 한 실행에서 본다.
+ab_reset; ab_legacy codex '{"tools":{"codex":{"reasoning_effort":"high"}}}'
+ab_models '{"review":{"codex":{"model":"sol","effort":"high"},"claude":{"model":"haiku","effort":"high"}}}'
+ab_run a15x request-review other PATH="$AB_BIN:$NOJQ" FAKE_FAIL=1 RD_REVIEW_CODEX_EFFORT=high RD_REVIEW_CODEX_MODEL=sol
+ab_noeff a15x;                                  chk $? "A15 jq 없음 → Codex effort 없음 (환경 변수도 무시)"
+ab_noarg a15x codex "-m";                       chk $? "A15 jq 없음 → Codex -m 없음"
+eq "$(ab_errn a15x 'jq가 설치되지 않아')" "1"       "A15 jq 경고 1번"
+ab_err a15x "jq 가 없어";                       chk $? "A15b 복구 안내에 jq 가 없어"
+ab_err a15x "config.toml";                      chk $? "A15b 복구 안내에 config.toml"
+! ab_err a15x "RD_REVIEW_CODEX_EFFORT=";        chk $? "A15b 환경 변수 덮어쓰기를 권하지 않음"
+ab_run a15c request-review other PATH="$AB_BIN_CLAUDE:$NOJQ" RD_SELF_REVIEW_APPROVE=1 \
+  RD_REVIEW_CLAUDE_MODEL=haiku RD_REVIEW_CLAUDE_EFFORT=high
+ab_noarg a15c claude "--model";                 chk $? "A15 jq 없음 → Claude --model 없음"
+ab_noarg a15c claude "--effort";                chk $? "A15 jq 없음 → Claude --effort 없음"
+# jq 없음 + 원인이 용량 부족(모델·effort 아님) → jq 안내 줄을 내지 않음 (D10 「표 대신」, T2-m1)
+printf 'ERROR: model is at capacity\n' > "$TMP/a15n_capacity.log"
+ab_run a15n request-review other PATH="$AB_BIN:$NOJQ" FAKE_LOG="$TMP/a15n_capacity.log"
+ab_err a15n "용량 부족";                         chk $? "A15n 원인 용량 부족으로 분류"
+! ab_err a15n "jq 가 없어";                     chk $? "A15n 원인이 모델·effort 가 아니면 jq 안내 없음"
+
+# ============================================================
+# 4c) 거부 시 복구 안내 (spec D10) — 칸마다 넘긴 값이면 그 출처, 넘기지 않았으면 cli-default 안내
+#     안내 문구는 fn_run 에 SEL_LOG=<오류 로그> 를 주어 함수로 본다. 안내 줄은 `    [모델] `·`    [effort] ` 로 시작한다.
+#     실행기 실행은 R6(실패 분기의 원인 줄·안내 연결)과 R5·R7 의 「안내대로 다시 실행」 만 쓴다.
+# ============================================================
+echo "=== 거부 시 복구 안내 ==="
+RV="$TMP/rv"; mkdir -p "$RV"
+printf 'ERROR: reasoning_effort unknown variant\n' > "$RV/codex_effort.log"
+printf 'ERROR: model not found\n' > "$RV/codex_model.log"
+printf 'ERROR: model not found\nERROR: reasoning_effort unknown variant\n' > "$RV/codex_both.log"
+printf '{"type":"result","is_error":true,"result":"Request failed"}\n' > "$RV/claude_unknown.log"
+RV_CL_MODEL="${script_dir}/fixtures/claude_unrecognized_model.stream.log"
+rv_sec() { grep -F "    [$2] " "$TMP/ab/$1/err"; }                  # rv_sec <이름> <모델|effort>
+rv_has() { rv_sec "$1" "$2" | grep -qF -- "$3"; }                  # rv_has <이름> <모델|effort> <조각>
+
+# --- R1 models.json 칸 출처 Codex effort 거부 ---
+ab_reset; ab_legacy codex
+ab_models '{"review":{"codex":{"effort":"high"}}}'
+fn_run r1 codex request-review other SEL_LOG="$RV/codex_effort.log"
+rv_has r1 effort "$MJ";                         chk $? "R1 effort 안내에 models.json 절대 경로"
+rv_has r1 effort "review.codex.effort";         chk $? "R1 effort 안내에 review.codex.effort"
+rv_has r1 effort "RD_REVIEW_EFFORT_OVERRIDE=0"; chk $? "R1 일회성 무력화 RD_REVIEW_EFFORT_OVERRIDE=0"
+rv_has r1 effort "RD_REVIEW_CODEX_EFFORT=default"; chk $? "R1 이번만 인자 빼기 RD_REVIEW_CODEX_EFFORT=default"
+! rv_sec r1 모델 >/dev/null;                    chk $? "R1 effort 만 거부 → 모델 안내 없음"
+
+# --- R2 환경 변수 출처 Codex effort 거부 ---
+ab_reset; ab_legacy codex
+fn_run r2 codex request-review other RD_REVIEW_CODEX_EFFORT=high SEL_LOG="$RV/codex_effort.log"
+rv_has r2 effort "RD_REVIEW_CODEX_EFFORT 에";   chk $? "R2 effort 안내가 RD_REVIEW_CODEX_EFFORT 를 고치라고 함"
+! rv_has r2 effort "$MJ";                       chk $? "R2 models.json 경로 없음"
+
+# --- R3 REVIEW_TOOLS_CONFIG 의 옛 키 거부 ---
+ab_reset
+jq -n '{default_priority:["codex"], tools:{codex:{reasoning_effort:"high"}, claude:{self_review_policy:"off"}}}' > "$TMP/alt.json"
+fn_run r3 codex request-review other REVIEW_TOOLS_CONFIG="$TMP/alt.json" SEL_LOG="$RV/codex_effort.log"
+rv_has r3 effort "$TMP/alt.json";               chk $? "R3 effort 안내에 REVIEW_TOOLS_CONFIG 경로"
+rv_has r3 effort "tools.codex.reasoning_effort"; chk $? "R3 effort 안내에 옛 키 tools.codex.reasoning_effort"
+
+# --- R4 Codex 모델 미전달 + 모델 거부 ---
+ab_reset; ab_legacy codex
+fn_run r4 codex request-review other SEL_LOG="$RV/codex_model.log"
+rv_has r4 모델 "프로젝트는 모델을 넘기지 않았습니다"; chk $? "R4 프로젝트는 모델을 넘기지 않았습니다"
+rv_has r4 모델 "$ABH/.codex/config.toml";        chk $? "R4 Codex 홈의 config.toml 경로"
+rv_has r4 모델 "RD_REVIEW_CODEX_MODEL=";         chk $? "R4 RD_REVIEW_CODEX_MODEL= 덮어쓰기"
+! ab_err r4 "=default";                         chk $? "R4 =default 를 권하지 않음"
+
+# --- R5 kill switch 설정 + Codex effort 거부, 이어서 해제 후 재실행 (r5b 는 실행기 실행) ---
+ab_reset; ab_legacy codex
+fn_run r5 codex request-review other RD_REVIEW_EFFORT_OVERRIDE=0 SEL_LOG="$RV/codex_effort.log"
+rv_has r5 effort "model_reasoning_effort";      chk $? "R5 config.toml 의 model_reasoning_effort 확인"
+rv_has r5 effort "unset RD_REVIEW_EFFORT_OVERRIDE"; chk $? "R5 kill switch 해제 안내"
+rv_has r5 effort "RD_REVIEW_CODEX_EFFORT=";     chk $? "R5 RD_REVIEW_CODEX_EFFORT= 덮어쓰기"
+! ab_err r5 "=default";                         chk $? "R5 =default 를 권하지 않음"
+ab_run r5b request-review other RD_REVIEW_CODEX_EFFORT=high
+ab_has r5b codex "-c $(EFF high)";              chk $? "R5 안내대로 다시 실행 → model_reasoning_effort=high 전달"
+
+# --- R6 Claude 실측 모델 거부 + models.json 고정 이름 (실행기 실행: 실패 분기의 원인 줄과 안내 연결) ---
+ab_reset; ab_legacy claude
+ab_models '{"review":{"claude":{"model":"claude-nonexistent-zz9"}}}'
+ab_run r6 request-review other FAKE_LOG="$RV_CL_MODEL"
+ab_err r6 "원인(로그 끝 오류 줄 기준): 모델 없음"; chk $? "R6 원인 모델 없음"
+rv_has r6 모델 "$MJ";                           chk $? "R6 모델 안내에 models.json 경로"
+rv_has r6 모델 "review.claude.model";           chk $? "R6 모델 안내에 review.claude.model"
+rv_has r6 모델 "RD_REVIEW_CLAUDE_MODEL=default"; chk $? "R6 이번만 인자 빼기 RD_REVIEW_CLAUDE_MODEL=default"
+
+# --- R7 Claude 원인 불명 + effort 미전달, 이어서 안내대로 재실행 (r7b 는 실행기 실행) ---
+ab_reset; ab_legacy claude
+fn_run r7 claude request-review other SEL_LOG="$RV/claude_unknown.log"
+rv_has r7 effort "CLI 기본값";                  chk $? "R7 effort 안내에 CLI 기본값"
+rv_has r7 effort "RD_REVIEW_CLAUDE_EFFORT=";    chk $? "R7 RD_REVIEW_CLAUDE_EFFORT= 덮어쓰기"
+! rv_has r7 effort ".claude";                   chk $? "R7 위치를 추측하지 않음 (.claude 없음)"
+! rv_has r7 effort "settings.json";             chk $? "R7 위치를 추측하지 않음 (settings.json 없음)"
+! rv_has r7 effort "=default";                  chk $? "R7 effort 안내에 =default 없음"
+ab_run r7b request-review other RD_REVIEW_CLAUDE_EFFORT=high
+ab_has r7b claude "--effort high";              chk $? "R7 안내대로 다시 실행 → --effort high"
+
+# --- R8 Claude 원인 불명 + models.json effort 넘김 ---
+ab_models '{"review":{"claude":{"effort":"high"}}}'
+fn_run r8 claude request-review other SEL_LOG="$RV/claude_unknown.log"
+rv_has r8 effort "$MJ";                         chk $? "R8 effort 안내에 models.json 경로"
+rv_has r8 effort "review.claude.effort";        chk $? "R8 effort 안내에 review.claude.effort"
+rv_has r8 effort "RD_REVIEW_CLAUDE_EFFORT=default"; chk $? "R8 이번만 인자 빼기 RD_REVIEW_CLAUDE_EFFORT=default"
+
+# --- R9 Claude 원인 불명 + models.json effort=default (넘기지 않음) ---
+ab_models '{"review":{"claude":{"effort":"default"}}}'
+fn_run r9 claude request-review other SEL_LOG="$RV/claude_unknown.log"
+rv_has r9 effort "review.claude.effort 의 값 때문에 넘기지 않았습니다"; chk $? "R9 넘기지 않은 이유의 위치"
+rv_has r9 effort "CLI 기본값";                  chk $? "R9 CLI 기본값 안내"
+! rv_has r9 effort "=default";                  chk $? "R9 effort 안내에 =default 없음"
+
+# --- R10 Codex 복합 오류(effort·model 후보) → 두 칸 모두 안내 ---
+ab_reset; ab_legacy codex
+ab_models '{"review":{"codex":{"model":"sol","effort":"ultra"}}}'
+fn_run r10 codex request-review other SEL_LOG="$RV/codex_both.log"
+rv_has r10 모델 "review.codex.model";           chk $? "R10 모델 안내에 review.codex.model"
+rv_has r10 effort "review.codex.effort";        chk $? "R10 effort 안내에 review.codex.effort"
+ab_reset
 
 # ============================================================
 # 5) B·C 인라인 상태 표시 (AC 23) — 부모 표시와 프롬프트 식별자가 정확히 일치해야 한다
@@ -486,11 +1339,7 @@ sec_i5="$(awk 'index($0,"NOT inlined — read these from disk")>0{f=1;next} f&&/
 printf '%s' "$sec_i5" | grep -q 'review-type:bogus-review'; [ $? -ne 0 ]
 chk $? "표시5 unmapped 는 disk-read 목록에 나타나지 않음"
 
-echo
-if [ "$FAIL" -eq 0 ]; then
-  echo "test_review_effort_override: ALL PASS"
-  exit 0
-else
-  echo "test_review_effort_override: FAILED"
-  exit 1
-fi
+echo "=== 예시 복사 ==="
+example_copy_case "${RD_TEST_TREE:-$(cd "${script_dir}/../.." && pwd)}"
+
+finish

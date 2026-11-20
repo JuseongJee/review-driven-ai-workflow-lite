@@ -104,6 +104,29 @@ case "$(state_read_field "status")" in
     ;;
 esac
 
+# --- PR 검토 중 상태 (spec D11) ---
+# 팀 PR 검토를 기다리는 동안은 `아카이브 보류` 와 같은 모양으로 판정합니다: 커밋 변경이 전부
+# 기록 경로이면 허용, 그 밖(판정 불가 rc 2 포함)은 차단입니다. 경로 판정은 기록 경로 목록을
+# 소유한 rd_commit_scope_all_records 에 위임합니다. 이 분기도 `done|dropped` 조기 통과보다 앞입니다.
+if [[ "$(state_read_field "status")" == "PR 검토 중" ]]; then
+  if rd_commit_scope_all_records; then
+    pr_rc=0
+  else
+    pr_rc=$?
+  fi
+  if [[ "$pr_rc" == 0 ]]; then
+    exit 0
+  fi
+  if [[ "$pr_rc" == 1 ]]; then
+    echo "[guard] PR 검토 중이지만 커밋 대상 변경에 기록 경로 밖의 파일이 있습니다." >&2
+  else
+    echo "[guard] 커밋 대상 변경이 기록 경로 안인지 판정할 수 없어 차단합니다." >&2
+  fi
+  echo "[guard] PR 검토 중에는 코드를 바꾸지 않습니다. 고치려면 bash rd-workflow/scripts/rd task set-status \"구현 중\"" >&2
+  # reason: PR 검토 중 상태에서 기록 경로 밖 변경(또는 판정 불가)을 커밋하려 해 막은 분기.
+  guard_deny "pre_commit_archive_gate.pr-review-out-of-scope"
+fi
+
 # --- 아카이브 보류 상태의 기록 커밋 예외 (spec §4.3) ---
 # task-state status 가 `아카이브 보류` 이면, 커밋에 들어갈 수 있는 변경이 전부 제외 경로(§2.1)
 # 안일 때만 통과시킵니다. 그래야 §4.2 정상 경로(seal → 상태 전이 → 기록 커밋)가 성립합니다.

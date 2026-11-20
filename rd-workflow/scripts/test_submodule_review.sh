@@ -179,7 +179,7 @@ mk_rd_fixture() {
   mkdir -p "$d/rd-workflow/scripts/hooks" "$d/rd-workflow/scripts/lifecycle" "$d/rd-workflow-workspace/.lifecycle" "$d/$SESS_REL"
   if [[ -f "$RD_SRC/VERSION" ]]; then cp "$RD_SRC/VERSION" "$d/rd-workflow/VERSION"; else echo "0000-00-00-000000" > "$d/rd-workflow/VERSION"; fi
   cp "$RD_SRC/scripts/prepare_review_pipeline.sh" "$RD_SRC/scripts/init_review_pipeline.sh" \
-     "$RD_SRC/scripts/run_review_turn.sh" "$RD_SRC/scripts/review_common.sh" \
+     "$RD_SRC/scripts/run_review_turn.sh" "$RD_SRC/scripts/review_common.sh" "$RD_SRC/scripts/model_select.sh" \
      "$RD_SRC/scripts/_state_common.sh" "$RD_SRC/scripts/_submodule_common.sh" "$RD_SRC/scripts/_task_common.sh" \
      "$RD_SRC/scripts/rd" "$RD_SRC/scripts/verify_record.sh" "$d/rd-workflow/scripts/"
   cp "$RD_SRC/scripts/hooks/_guard_common.sh" "$RD_SRC/scripts/hooks/_open_issues.awk" "$d/rd-workflow/scripts/hooks/"
@@ -295,7 +295,8 @@ N3="$(nested_copy "$TMP/s3e")"
 A="$(head_of "$N3")"; bump "$N3" two; B="$(head_of "$N3")"
 erase_inner_head "$N3/my mid/inner"
 chk "$N3" "$A" "$B"
-[[ "$CK_RC" == 1 ]] && has "객체 부재" "$CK_ERR" && pass "S3e" || fail "S3e rc=$CK_RC err=$CK_ERR"
+[[ "$CK_RC" == 1 ]] && has "객체 부재" "$CK_ERR" && has "submodule 이 비어 있으면: bash rd-workflow/scripts/rd submodule init" "$CK_ERR" \
+  && has "fetch" "$CK_ERR" && pass "S3e" || fail "S3e rc=$CK_RC err=$CK_ERR"
 
 echo "[S3f] 새로 추가된 submodule 은 기대 목록에 들어간다"
 N3="$(nested_copy "$TMP/s3f")"

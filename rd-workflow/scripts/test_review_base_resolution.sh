@@ -84,6 +84,7 @@ mk_repo() {
      "${RD_SRC}/scripts/init_review_pipeline.sh" \
      "${RD_SRC}/scripts/run_review_turn.sh" \
      "${RD_SRC}/scripts/review_common.sh" \
+     "${RD_SRC}/scripts/model_select.sh" \
      "${RD_SRC}/scripts/_state_common.sh" \
      "${RD_SRC}/scripts/_submodule_common.sh" \
      "${RD_SRC}/scripts/_task_common.sh" \
@@ -1406,6 +1407,42 @@ rr_set_reason "foo"
 rr_seal
 ne "$RR_RC" "0" "R7: 허용 값 밖 — rc≠0"
 has "Closure Reason 값이 올바르지 않습니다: 'foo'" "$RR_ERR" "R7: reason-invalid 문구"
+
+echo "=== 15. 기록 커밋 뒤 diff review 의 REQUEST 보관본 ==="
+# 기록 커밋은 루트 REQUEST.md 를 비우고 보관본을 추가합니다. 그 뒤 연 세션이 빈 REQUEST.md 를 읽으면
+# 리뷰 effort 가 unknown 이 되고 리뷰어가 「완료 기준 누락」 경고를 받아 사람 확인으로 넘깁니다.
+mk_archived_repo() { # mk_archived_repo <archive 여부 1|0> — fr/demo 에 작업 커밋 + (기록 커밋) 을 쌓은 저장소
+  local r
+  r="$(mk_repo)" || return 1
+  git -C "$r" checkout -q -b fr/demo
+  printf '# Change Request\n\n## Acceptance Criteria\n1. 동작한다\n\n## Risk Tier\n- 최종 등급: standard\n\n## Source FR\n-\n' > "${r}/REQUEST.md"
+  commit_code "$r" work
+  if [ "$1" = "1" ]; then
+    mkdir -p "${r}/rd-workflow-workspace/backlog/request-archive"
+    cp "${r}/REQUEST.md" "${r}/rd-workflow-workspace/backlog/request-archive/2026-11-17-1200-demo.md"
+  fi
+  printf '# Change Request\n\n## Acceptance Criteria\n-\n\n## Risk Tier\n- 최종 등급: -\n\n## Source FR\n-\n' > "${r}/REQUEST.md"
+  git -C "$r" add -A && git -C "$r" commit -q -m "record"
+  state_set "$r" fr-branch "fr/demo"
+  printf '%s\n' "$r"
+}
+ARCH_REL="rd-workflow-workspace/backlog/request-archive/2026-11-17-1200-demo.md"
+
+RA="$(mk_archived_repo 1)" || { echo "  FAIL  15: fixture 생성 실패"; exit 1; }
+prep "$RA"; rc=$?
+eq "$rc" "0" "15a: 기록 커밋 뒤 세션 생성 성공"
+SA="$(session_dir "$RA")"
+eq "$(session_section "$SA" "Review Scope")" "- execution-path: small-task" "15a: 리뷰 effort 를 보관본 Risk Tier 로 판정"
+reviewer_turn "$RA" "$SA"
+eq "$?" "0" "15a: Reviewer 턴 성공"
+if grep -q "AC Enforcement" "${OUT}/last-prompt.txt"; then fail "15a: 보관본이 있으면 AC 누락 경고 없음"; else pass "15a: 보관본이 있으면 AC 누락 경고 없음"; fi
+has "Task REQUEST (acceptance criteria and Risk Tier): ${ARCH_REL}" "$(cat "${OUT}/last-prompt.txt")" "15a: 프롬프트가 보관본을 완료 기준 출처로 알림"
+
+RB="$(mk_archived_repo 0)" || { echo "  FAIL  15b: fixture 생성 실패"; exit 1; }
+prep "$RB"
+SB="$(session_dir "$RB")"
+reviewer_turn "$RB" "$SB"
+has "AC Enforcement" "$(cat "${OUT}/last-prompt.txt")" "15b: 보관본이 없으면 루트 REQUEST.md 로 판정(종전 경고 유지)"
 
 if [ "$FAIL" = 0 ]; then
   echo "test_review_base_resolution: ALL PASS"

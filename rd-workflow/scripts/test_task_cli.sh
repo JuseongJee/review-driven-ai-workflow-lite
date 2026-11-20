@@ -33,14 +33,14 @@ $2
 -
 EOF
   # v2 2b: task-state도 함께 갱신 (task-state가 권위 소스 — 결정 1/3)
-  # canonical 10종이 아닌 값(손상 테스트용)은 task-state를 생성하지 않음
+  # canonical 11종이 아닌 값(손상 테스트용)은 task-state를 생성하지 않음
   local _ts_dir="$1/rd-workflow-workspace/.lifecycle"
   mkdir -p "$_ts_dir"
   # canonical 여부 판정: 기존 STATE_CANONICAL_STATUSES 파이프 문자열 사용 가능하지만
   # 함수 환경이 없으므로 직접 case 로 처리
   case "$2" in
     "대기 중"|"REQUEST review 대기"|"spec/plan 작성 중"|"spec/plan review 대기"|\
-    "구현 대기"|"구현 중"|"검증 중"|"diff review 대기"|"아카이브 보류"|"완료"|"실행 중")
+    "구현 대기"|"구현 중"|"검증 중"|"diff review 대기"|"아카이브 보류"|"PR 검토 중"|"완료"|"실행 중")
       # canonical 또는 legacy alias → task-state 생성
       local _ts_status="$2"
       # legacy alias '실행 중' → canonical '구현 중' 으로 정규화 (마이그레이션 계약)
@@ -133,9 +133,9 @@ t "alias 실행 중→검증 중 허용 (task-state='구현 중'으로 정규화
 mk_task_file "$TMP" "실행 중" "x"
 t "alias 실행 중→완료 차단 (task-state='구현 중')" 4 "-" bash "$RD" task set-status "완료"
 
-# 전이표 전수 (10×10, 자기 전이 제외 90건): 허용 목록 외 전부 차단인지 기계 검증
-ALLOWED="대기 중→REQUEST review 대기|대기 중→구현 중|REQUEST review 대기→spec/plan 작성 중|REQUEST review 대기→구현 중|spec/plan 작성 중→spec/plan review 대기|spec/plan 작성 중→구현 중|spec/plan review 대기→spec/plan 작성 중|spec/plan review 대기→구현 대기|spec/plan review 대기→구현 중|구현 대기→구현 중|구현 대기→spec/plan 작성 중|구현 중→spec/plan 작성 중|구현 중→검증 중|검증 중→구현 중|검증 중→diff review 대기|diff review 대기→구현 중|diff review 대기→완료|diff review 대기→아카이브 보류|아카이브 보류→완료|아카이브 보류→구현 중|아카이브 보류→검증 중"
-STATUSES=("대기 중" "REQUEST review 대기" "spec/plan 작성 중" "spec/plan review 대기" "구현 대기" "구현 중" "검증 중" "diff review 대기" "아카이브 보류" "완료")
+# 전이표 전수 (11×11, 자기 전이 제외 110건): 허용 목록 외 전부 차단인지 기계 검증
+ALLOWED="대기 중→REQUEST review 대기|대기 중→구현 중|REQUEST review 대기→spec/plan 작성 중|REQUEST review 대기→구현 중|spec/plan 작성 중→spec/plan review 대기|spec/plan 작성 중→구현 중|spec/plan review 대기→spec/plan 작성 중|spec/plan review 대기→구현 대기|spec/plan review 대기→구현 중|구현 대기→구현 중|구현 대기→spec/plan 작성 중|구현 중→spec/plan 작성 중|구현 중→검증 중|검증 중→구현 중|검증 중→diff review 대기|diff review 대기→구현 중|diff review 대기→완료|diff review 대기→아카이브 보류|아카이브 보류→완료|아카이브 보류→구현 중|아카이브 보류→검증 중|아카이브 보류→PR 검토 중|PR 검토 중→아카이브 보류|PR 검토 중→구현 중"
+STATUSES=("대기 중" "REQUEST review 대기" "spec/plan 작성 중" "spec/plan review 대기" "구현 대기" "구현 중" "검증 중" "diff review 대기" "아카이브 보류" "PR 검토 중" "완료")
 for from in "${STATUSES[@]}"; do
   for to in "${STATUSES[@]}"; do
     [[ "$from" == "$to" ]] && continue
@@ -145,6 +145,24 @@ for from in "${STATUSES[@]}"; do
     [[ "$rc" == "$want" ]] && echo "ok: 전이 ${from}→${to} rc=$rc" || { echo "FAIL: 전이 ${from}→${to} rc=$rc want=$want"; FAIL=1; }
   done
 done
+
+# PR 검토 중 전이 (change-spec D3): 명시 단언 — 전수 루프와 별개로 거부 3건을 이름으로 고정
+mk_task_file "$TMP" "아카이브 보류" "x"
+t "PR-a 허용: 아카이브 보류→PR 검토 중" 0 "-" bash "$RD" task set-status "PR 검토 중"
+t "PR-b 허용: PR 검토 중→아카이브 보류" 0 "-" bash "$RD" task set-status "아카이브 보류"
+mk_task_file "$TMP" "PR 검토 중" "x"
+t "PR-c 허용: PR 검토 중→구현 중" 0 "-" bash "$RD" task set-status "구현 중"
+mk_task_file "$TMP" "PR 검토 중" "x"
+t "PR-d 거부: PR 검토 중→완료" 4 "-" bash "$RD" task set-status "완료"
+t "PR-e 거부: PR 검토 중→검증 중" 4 "-" bash "$RD" task set-status "검증 중"
+mk_task_file "$TMP" "구현 중" "x"
+t "PR-f 거부: 구현 중→PR 검토 중" 4 "-" bash "$RD" task set-status "PR 검토 중"
+
+# PR 검토 중 안내: stdout 은 Status 한 줄 그대로, 안내는 stderr
+mk_task_file "$TMP" "PR 검토 중" "x"
+pr_out="$(bash "$RD" task status 2>"$TMP/pr_err")"
+[[ "$pr_out" == "PR 검토 중" ]] && echo "ok: PR 검토 중 status stdout 한 줄" || { echo "FAIL: PR 검토 중 stdout '$pr_out'"; FAIL=1; }
+grep -qF "rd pr check" "$TMP/pr_err" && echo "ok: PR 검토 중 안내에 rd pr check" || { echo "FAIL: PR 검토 중 안내 누락"; FAIL=1; }
 
 # 리뷰 단계→구현 중(하향)은 Risk Tier 이력 기록을 안내한다. 같은 목적지라도 구현 대기에서 오면 안내하지 않는다.
 mk_task_file "$TMP" "spec/plan review 대기" "x"
@@ -218,54 +236,20 @@ g "intake alias 실행 중: block-active" 2 "block-active" bash "$RD" task guard
 # promote: intake와 동일 로직
 mk_task_file "$TMP" "대기 중" "stale"
 g "promote stale: rebind" 0 "rebind" bash "$RD" task guard --candidate fr-x --mode promote
-# fr-add: Status guard 없음 (GRD-02)
-mk_task_file "$TMP" "구현 중" "busy-task"
-g "fr-add active: readonly (차단 없음)" 0 "proceed-readonly" bash "$RD" task guard --candidate other --mode fr-add
+# fr-add 모드는 없다 — 알 수 없는 mode 는 usage + exit 1, 상태 불변
 mk_task_file "$TMP" "대기 중" "-"
-# fr-add + task-state 존재 + short-title=-(sentinel) → write (LC-18: sentinel은 Short Title 부여 진입점)
-out_fr_sentinel="$(bash "$RD" task guard --candidate new-fr --mode fr-add 2>/dev/null)"
-d_fr_sentinel="$(printf '%s\n' "$out_fr_sentinel" | awk -F= '$1=="decision"{print $2}')"
-[[ "$d_fr_sentinel" == "write" ]] && echo "ok: fr-add sentinel -: write (Short Title 부여)" \
-  || { echo "FAIL: fr-add sentinel -: '$d_fr_sentinel' (기대: write)"; FAIL=1; }
-# task-state short-title 갱신 확인
-ts_fr_title="$(awk -F'=' '$1=="short-title"{sub(/^[^=]+=/,"");print;exit}' "${TMP}/rd-workflow-workspace/.lifecycle/task-state")"
-[[ "$ts_fr_title" == "new-fr" ]] && echo "ok: fr-add sentinel write — task-state 갱신됨" \
-  || { echo "FAIL: fr-add sentinel write — task-state 미갱신 (got='${ts_fr_title}')"; FAIL=1; }
-# CURRENT_TASK.md 뷰 미러 확인
-ct_fr_title="$(awk '/^## Short Title/{s=1;next} s&&/^## /{exit} s&&NF{print;exit}' "${TMP}/CURRENT_TASK.md")"
-[[ "$ct_fr_title" == "new-fr" ]] && echo "ok: fr-add sentinel write — 뷰 미러됨" \
-  || { echo "FAIL: fr-add sentinel write — 뷰 미러 안됨 (got='${ct_fr_title}')"; FAIL=1; }
-# fr-add + task-state 존재 + short-title 키 부재(손상, 빈 값) → proceed-readonly (손상 방어)
-# mk_task_file을 사용하면 task-state가 short-title=- 로 덮어써지므로 직접 생성
-mkdir -p "${TMP}/rd-workflow-workspace/.lifecycle"
-cat > "${TMP}/rd-workflow-workspace/.lifecycle/task-state" <<'_TSFIX'
-schema=1
-status=구현 중
-fr-branch=null
-worktree-path=null
-source-fr=-
-_TSFIX
-printf '# Current Task\n\n## Short Title\nsome-task\n\n## Status\n구현 중\n' > "$TMP/CURRENT_TASK.md"
-out_fr_corrupt="$(bash "$RD" task guard --candidate new-fr2 --mode fr-add 2>/dev/null)"
-d_fr_corrupt="$(printf '%s\n' "$out_fr_corrupt" | awk -F= '$1=="decision"{print $2}')"
-[[ "$d_fr_corrupt" == "proceed-readonly" ]] && echo "ok: fr-add 손상(키 부재) → proceed-readonly" \
-  || { echo "FAIL: fr-add 손상(키 부재) → '$d_fr_corrupt' (기대: proceed-readonly)"; FAIL=1; }
-# task-state의 short-title 키가 추가되지 않았는지 확인 (write 금지)
-ts_corrupt_title="$(awk -F'=' '$1=="short-title"{sub(/^[^=]+=/,"");print;exit}' "${TMP}/rd-workflow-workspace/.lifecycle/task-state")"
-[[ -z "$ts_corrupt_title" ]] && echo "ok: fr-add 손상 — task-state short-title 갱신 없음" \
-  || { echo "FAIL: fr-add 손상 — short-title이 갱신됨 (got='${ts_corrupt_title}')"; FAIL=1; }
-# Short Title 섹션 부재 + task-state 없음 → 마이그레이션 후 sentinel → write (LC-18)
-# (마이그레이션이 short-title=-로 task-state를 생성 → sentinel이므로 write가 올바름)
-rm -f "$TMP/rd-workflow-workspace/.lifecycle/task-state"
-printf '# Current Task\n\n## Status\n구현 중\n' > "$TMP/CURRENT_TASK.md"
-g "fr-add 섹션 부재(마이그레이션 후 sentinel): write" 0 "write" bash "$RD" task guard --candidate x --mode fr-add
+_fa_ts_before="$(cat "$TMP/rd-workflow-workspace/.lifecycle/task-state")"; _fa_ct_before="$(cat "$TMP/CURRENT_TASK.md")"
+bash "$RD" task guard --candidate new-fr --mode fr-add >/dev/null 2>&1; _fa_rc=$?
+[[ "$_fa_rc" == "1" && "$(cat "$TMP/rd-workflow-workspace/.lifecycle/task-state")" == "$_fa_ts_before" && "$(cat "$TMP/CURRENT_TASK.md")" == "$_fa_ct_before" ]] \
+  && echo "ok: guard fr-add 모드 제거 — exit 1, 상태 불변" \
+  || { echo "FAIL: guard fr-add 모드 제거 — rc=${_fa_rc} 또는 상태 변경"; FAIL=1; }
 
 # --- guard --dry-run (FR task-guard-name-hides-write) — 같은 decision, 쓰기 없음 ---
 # write·rebind 는 기존 호출이 부른 순간 기록하는 경로다. --dry-run 이 그 경로에서
 # 파일을 건드리면 "상태만 보려던" 호출이 다시 Short Title 을 바꾼다.
 ts_file="$TMP/rd-workflow-workspace/.lifecycle/task-state"
-for _dr in "write|대기 중|-|dry-new|fr-add" "rebind|대기 중|stale-dry|fresh-dry|intake" \
-           "proceed-readonly|구현 중|busy-dry|other-dry|fr-add"; do
+for _dr in "write|대기 중|-|dry-new|intake" "rebind|대기 중|stale-dry|fresh-dry|intake" \
+           "proceed-readonly|구현 중|busy-dry|busy-dry|intake"; do
   IFS='|' read -r _want _st _title _cand _mode <<< "$_dr"
   mk_task_file "$TMP" "$_st" "$_title"
   _ts_before="$(cat "$ts_file")"; _ct_before="$(cat "$TMP/CURRENT_TASK.md")"
@@ -648,47 +632,8 @@ env project_root="$TMP4" bash "$RD" task status >/dev/null 2>&1; rc_bad=$?
 [[ ! -f "${TMP4}/rd-workflow-workspace/.lifecycle/task-state" ]] && echo "ok: T5-f 손상 legacy → task-state 미생성" || { echo "FAIL: T5-f 손상 legacy → task-state 생성됨"; FAIL=1; }
 
 # ===========================================================================
-# --- TC-FIX: 손상된 task-state 에서 fr-add 가드가 막히거나 set-status 쓰기 실패가 exit 0 으로 새는 실수를 잡는다 ---
+# --- TC-FIX: set-status 쓰기 실패가 exit 0 으로 새는 실수를 잡는다 ---
 # ===========================================================================
-
-echo "--- TC-FIX-1: fr-add guard + task-state 존재 + short-title 손상 → proceed-readonly ---"
-TMP_FIX="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-[[ -n "$TMP_FIX" && -d "$TMP_FIX" ]] || { echo "test_task_cli.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-# task-state 존재하지만 short-title 키 없는 손상 fixture (mk_task_file 대신 직접 생성)
-mkdir -p "${TMP_FIX}/rd-workflow-workspace/.lifecycle"
-cat > "${TMP_FIX}/rd-workflow-workspace/.lifecycle/task-state" <<'FIXEOF'
-schema=1
-status=구현 중
-fr-branch=null
-worktree-path=null
-source-fr=-
-FIXEOF
-# CURRENT_TASK.md도 직접 생성 (mk_task_file은 task-state를 덮어쓰므로 사용 불가)
-cat > "${TMP_FIX}/CURRENT_TASK.md" <<'CTFIX'
-# Current Task
-
-## Task
-test
-
-## Short Title
-some-task
-
-## Status
-구현 중
-
-## Request
-[REQUEST.md](REQUEST.md)
-
-## Notes
--
-CTFIX
-# fr-add 모드: task-state에 short-title 키 없음(빈 값 반환) → proceed-readonly (write 금지)
-out_fix1="$(env project_root="$TMP_FIX" bash "$RD" task guard --candidate new-fr --mode fr-add 2>/dev/null)"
-d_fix1="$(printf '%s\n' "$out_fix1" | awk -F= '$1=="decision"{print $2}')"
-[[ "$d_fix1" == "proceed-readonly" ]] && echo "ok: TC-FIX-1a fr-add 손상 task-state → proceed-readonly" || { echo "FAIL: TC-FIX-1a fr-add 손상 task-state → '$d_fix1' (기대: proceed-readonly)"; FAIL=1; }
-# task-state의 short-title 키가 추가되지 않았는지 확인 (write 금지 — 손상 키 방치)
-ts_title_fix="$(awk -F'=' '$1=="short-title"{sub(/^[^=]+=/,"");print;exit}' "${TMP_FIX}/rd-workflow-workspace/.lifecycle/task-state")"
-[[ -z "$ts_title_fix" ]] && echo "ok: TC-FIX-1b short-title 갱신 없음 (write 금지)" || { echo "FAIL: TC-FIX-1b short-title이 갱신됨 (got='${ts_title_fix}')"; FAIL=1; }
 
 echo "--- TC-FIX-2: set-status 쓰기 실패 → exit 3 ---"
 TMP_FIX2="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
@@ -805,13 +750,7 @@ t "guard --source-fr 무효값 exit 1" 1 - bash "$RD" task guard --candidate tas
 # --source-fr 는 promote 전용 — 비promote 모드에서 지정 시 오용 거부 (fail fast)
 mk_task_file "$TMP" "대기 중" "-"
 t "guard intake --source-fr 오용 exit 1" 1 - bash "$RD" task guard --candidate task-e --mode intake --source-fr "$SRC_OK"
-t "guard fr-add --source-fr 오용 exit 1" 1 - bash "$RD" task guard --candidate task-f --mode fr-add --source-fr "$SRC_OK"
 
-# fr-add 모드는 source-fr 를 건드리지 않는다 (proceed-readonly 계약 유지)
-mk_task_file "$TMP" "구현 중" "busy-task"
-bash "$RD" task set-source-fr "$SRC_OK" >/dev/null 2>&1
-t "guard fr-add 진행 중" 0 - bash "$RD" task guard --candidate other --mode fr-add
-t "fr-add 후 source-fr 불변" 0 "$SRC_OK" bash "$RD" task source-fr
 
 # --- set-source-fr 복수 (change spec §2.4b·§2.3b) ---
 SRC_OK3="rd-workflow-workspace/backlog/items/2026-03-03-third.md"
@@ -1138,6 +1077,23 @@ fdh_out="$(env project_root="$FDH" bash "$RD" task fr-done \
 [[ "$fdh_rc" == "1" && "$fdh_out" == *"머리행 해석 실패"* && "$fdh_out" == *"실패 1"* ]] \
   && echo "ok: fr-done: slug 셀이 있는데 제목 칸을 못 찾으면 실패" \
   || { echo "FAIL: fr-done: slug 셀이 있는데 제목 칸을 못 찾으면 실패 (rc=$fdh_rc out='$fdh_out')"; FAIL=1; }
+
+# handed-off: 상세 status 와 인덱스 상태 칸을 done 으로 덮지 않는다
+FDHO="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패" >&2; exit 1; }
+fdl_mk "$FDHO" "| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |" hoff
+FDHO_F="$FDHO/rd-workflow-workspace/backlog/items/2026-06-01-hoff.md"
+FDHO_IDX="$FDHO/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
+printf '%s\n' "# fr item" "- status: handed-off" > "$FDHO_F"
+sed 's/| idea |/| handed-off |/' "$FDHO_IDX" > "$FDHO_IDX.new" && cat "$FDHO_IDX.new" > "$FDHO_IDX" && rm -f "$FDHO_IDX.new"
+fdho_sum="$(cksum < "$FDHO_F")"
+fdho_out="$(env project_root="$FDHO" bash "$RD" task fr-done rd-workflow-workspace/backlog/items/2026-06-01-hoff.md 2>&1)"; fdho_rc=$?
+[[ "$fdho_rc" == "0" && "$fdho_out" == *"건너뜀 (이미 handed-off)"* && "$(cksum < "$FDHO_F")" == "$fdho_sum" ]] \
+  && echo "ok: fr-done: handed-off 상세 불변·건너뜀 보고" \
+  || { echo "FAIL: fr-done: handed-off 상세 불변·건너뜀 보고 (rc=$fdho_rc out='$fdho_out')"; FAIL=1; }
+fdho_row="$(grep '| hoff |' "$FDHO_IDX")"
+[[ "$fdho_row" == *"| feature | handed-off | - |"* ]] \
+  && echo "ok: fr-done: handed-off 인덱스 상태 칸 유지" \
+  || { echo "FAIL: fr-done: handed-off 인덱스 상태 칸 유지 (row='$fdho_row')"; FAIL=1; }
 
 # fr-done <path>... 인자 지정 — task-state 없이도 동작 (발행 후 재시도 경로, §2.5.4)
 FD_ROOT2="$(new_tmp)" || { echo "test_task_cli.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
@@ -1927,6 +1883,23 @@ g_has "rd review seal" "$G_ERR" "안내(마커 없음): seal 을 먼저 실행"
 g_seal "$GS1"
 g_status
 g_has "seal 과 archive 기록을 커밋하세요" "$G_ERR" "안내(워킹트리 seal): 커밋하세요"
+
+# AC3 마커 — 세션의 review-base-oid 가 마커 review-base= 로 기록됩니다.
+_g_mk="$(ls "$G"/rd-workflow-workspace/.lifecycle/review-seals/*.seal 2>/dev/null | head -1)"
+_g_base="$(sed -n 's/^- review-base-oid: //p' "$GS1/SESSION.md")"
+if [[ -n "$_g_mk" && -n "$_g_base" ]] && grep -qx "review-base=${_g_base}" "$_g_mk"; then
+  echo "ok: seal 마커에 review-base=<세션 review-base-oid> 가 있음"
+else
+  echo "FAIL: seal 마커에 review-base=${_g_base} 가 없음 (마커: ${_g_mk:-없음})"; FAIL=1
+fi
+# 리뷰한 끝 — 세션의 review-head-oid 가 마커 review-head= 로 기록됩니다. 세션을 만든 뒤 포인터 커밋으로 HEAD 가
+# 움직였으므로 head=(seal 시점 HEAD)와 값이 다릅니다. 반영 대상 경로는 이 값으로 한정합니다.
+_g_rhead="$(sed -n 's/^- review-head-oid: //p' "$GS1/SESSION.md")"
+if [[ -n "$_g_mk" && -n "$_g_rhead" ]] && grep -qx "review-head=${_g_rhead}" "$_g_mk"; then
+  echo "ok: seal 마커에 review-head=<세션 review-head-oid> 가 있음"
+else
+  echo "FAIL: seal 마커에 review-head=${_g_rhead} 가 없음 (마커: ${_g_mk:-없음})"; FAIL=1
+fi
 
 # 전이 ① — 기록 커밋 직후 → 발행 안내
 git -C "$G" add -A >/dev/null 2>&1; git -C "$G" commit -q -m "seal + 기록" >/dev/null 2>&1

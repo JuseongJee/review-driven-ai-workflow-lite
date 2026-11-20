@@ -11,7 +11,7 @@
 
 ## Intake 규칙
 
-새 작업 요청이 오면 등급을 판정한다. `light`·`standard` 는 FR 등록 없이 바로 진행하고, `full` 은 시작 보고 블록을 낸 뒤 FR 에 등록하고(`/fr add` 절차) "FR 등록: **{title}** — {summary}. 다음 단계를 지정해주세요."를 출력한 뒤 지시를 기다린다. Source FR은 그 FR을 현재 작업으로 승격해 REQUEST.md를 쓸 때 채운다. 이미 등록된 FR 을 착수할 때 `light`·`standard` 로 판정되면 그 등급 절차로 진행하고 마감에서 FR 을 done 처리한다.
+새 작업 요청이 오면 등급을 판정한다. `light`·`standard` 는 FR 등록 없이 바로 진행하고, `full` 은 시작 보고 블록을 낸 뒤 FR 에 등록하고(`/fr add` 절차) "FR 등록: **{title}** — {summary}. 다음 단계를 지정해주세요."를 출력한 뒤 지시를 기다린다. Source FR은 그 FR을 현재 작업으로 승격해 REQUEST.md를 쓸 때 채운다. 이미 등록된 FR 을 착수할 때 `light`·`standard` 로 판정되면 그 등급 절차로 진행하고 마감에서 FR 을 done 처리한다. `/fr take` 로 Issue 를 집어 만든 FR 은 고르기가 착수 결정이므로 `full` 이어도 지시 대기 없이 `rd-workflow/claude_skills/fr/take.md` 의 등급별 종착 단계(`light`·`standard` 는 구현 착수, `full` 은 REQUEST review 진행)까지 진행한다.
 
 진행 중(`CURRENT_TASK.md` Status ≠ `대기 중`)에 들어온 독립 요청은 **FR 로 등록**한다. **동시 착수 여부는 사용자가 정하며 AI 가 임의로 동시 착수하지 않는다.** 지시가 있으면 별도 worktree 로 착수하고, 없으면 "FR 등록: **{title}**. 현재 작업 완료 후 진행하거나, 지금 별도 worktree 로 동시에 진행할 수 있습니다." 를 알린 뒤 현재 작업으로 복귀한다.
 
@@ -63,6 +63,7 @@
 
 - `full` 은 `REQUEST review`, `spec/plan review`, `final diff review`를 건너뛰지 않는다. `standard` 는 `final diff review` 를 건너뛰지 않는다.
 - `prepare_review_pipeline.sh`로 세션을 만들고 `run_review_turn.sh`로 턴을 잇는다. 최신 Reviewer 턴이 `이의 없음`을 명시할 때까지 이어가고, 사람 결정이 필요하거나 총 20턴에 도달하면 `awaiting-user`로 바꾸고 멈춘다.
+- 6턴(`REVIEW_SCOPE_NARROW_AFTER`)을 넘긴 Reviewer 턴부터는 사람에게 묻지 않고 범위를 줄인다. 기본 사용 경로의 결함·데이터 손실·보안·REQUEST/AC/spec 이탈·검증 공백만 종결을 막고, 드문 환경의 문제와 방어 절차 추가 요청은 `범위 밖:` 줄로 돌린다(`run_review_turn.sh` 가 리뷰어 지시에 넣는다).
 - **autopilot·반자율 모드에서는** `rd-workflow/docs/flows/AUTONOMY.md`의 자율 실행 규칙(예: 턴 한도 50턴)이 이 섹션보다 우선한다.
 - **REQUEST review 축약**: spec이 사용자 승인 완료 + REQUEST.md가 그 spec을 참조(승인된 결정의 백필)이면 1턴 확인으로 축약한다. 1턴에서 이의가 나오면 일반 수렴 규칙으로 복귀한다.
 - 세션 종료 시 `rd-workflow-workspace/reports/reviews/`에 주요 쟁점과 결론을 요약한 report를 쓴다.

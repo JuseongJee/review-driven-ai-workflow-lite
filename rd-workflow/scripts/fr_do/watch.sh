@@ -3,9 +3,15 @@
 #   STREAM <slug> <idle|done|blocked|gone>   세션 상태 변화
 #   CTX <slug> <N>%                           턴이 끝난 세션의 컨텍스트가 문턱(기본 85) 이상
 #   QUEUE <발행 큐 줄;...>                    발행 큐에 처리할 요청이 생김
+#   QUEUE 조회 실패 (rc=N): <오류 첫 줄>       발행 큐를 읽지 못함(그동안 생존 표시를 남기지 않음). 회복하면 처리할 큐 줄을 QUEUE 로 다시 냄
 #   REPORT <절대 경로>                        줄기가 질문(-question.md)·마감 보고(-closing.md)를 새로 씀
 # 줄기 목록: <상태 폴더>/active.tsv 첫 열. 보고 폴더: <상태 폴더>/reports/
-# env: RD_FR_DO_WATCH_INTERVAL(30) RD_FR_DO_CTX_LIMIT(85) RD_FR_DO_QUEUE_CMD(bash rd-workflow/scripts/rd publish status)
+# 발행 큐를 읽은 반복마다 큐에 감시 생존 표시를 남깁니다(작업 세션의 rd publish request·wait 가 감시 없음을 경고하는 근거).
+# 큐를 읽지 못한 반복은 표시를 남기지 않으므로, 조회 실패가 5분 넘게 이어지면 작업 세션도 경고합니다.
+# 큐 명령은 rd 를 거치지 않습니다(rd 는 하위 명령 전에 기본 체크아웃의 작업 상태를 점검하며, 그 실패가 큐 조회를 막지 않게 함).
+# env: RD_FR_DO_WATCH_INTERVAL(30) RD_FR_DO_CTX_LIMIT(85)
+#      RD_FR_DO_QUEUE_CMD(bash rd-workflow/scripts/lifecycle/publish_queue.sh status)
+#      RD_FR_DO_BEAT_CMD(bash rd-workflow/scripts/lifecycle/publish_queue.sh _beat fr-do)
 # 실행: bash rd-workflow/scripts/fr_do/watch.sh
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/_state.sh"
@@ -15,7 +21,8 @@ STATE="$(fr_do_state_dir)" || exit 1
 LIST="$STATE/active.tsv"
 REPORTS="$STATE/reports"
 CTX_LIMIT="${RD_FR_DO_CTX_LIMIT:-85}"
-QUEUE_CMD="${RD_FR_DO_QUEUE_CMD:-bash rd-workflow/scripts/rd publish status}"
+QUEUE_CMD="${RD_FR_DO_QUEUE_CMD:-bash rd-workflow/scripts/lifecycle/publish_queue.sh status}"
+BEAT_CMD="${RD_FR_DO_BEAT_CMD:-bash rd-workflow/scripts/lifecycle/publish_queue.sh _beat fr-do}"
 mkdir -p "$REPORTS"
 # 키별 상태는 임시 디렉터리의 파일로 둡니다(bash 3.2 에는 연관 배열이 없음).
 ST="$(mktemp -d "${TMPDIR:-/tmp}/fr-do-watch.XXXXXX")" || exit 1
@@ -41,6 +48,7 @@ if [[ -f "$SEEN" ]]; then
   done < "$SEEN"
 fi
 prevq=""
+prevqe=""
 while true; do
   if [[ -f "$LIST" ]]; then
     while IFS=$'\t' read -r s _ <&3; do
@@ -77,10 +85,21 @@ while true; do
   done <<EOT
 $mt
 EOT
-  q="$(bash -c "$QUEUE_CMD" </dev/null 2>/dev/null | grep -v "성공  -  → 없음" | grep -E "요청됨|실패|충돌|승인|진행" || true)"
-  if [[ "$q" != "$prevq" && -n "$q" ]]; then
-    echo "QUEUE $(printf '%s' "$q" | tr '\n' ';')"
+  qraw="$(bash -c "$QUEUE_CMD" </dev/null 2>"$ST/qerr")"; qrc=$?
+  if [[ "$qrc" -ne 0 ]]; then
+    qe="QUEUE 조회 실패 (rc=$qrc): $(grep -m1 . "$ST/qerr" 2>/dev/null)"
+    [[ "$qe" != "$prevqe" ]] && echo "$qe"
+    prevqe="$qe"
+    # 회복하면 처리할 큐 줄을 다시 내도록 비웁니다(실패 전과 같은 내용이어도 회복 신호가 됩니다).
+    prevq=""
+  else
+    prevqe=""
+    bash -c "$BEAT_CMD" </dev/null >/dev/null 2>&1 || :
+    q="$(printf '%s\n' "$qraw" | grep -v "성공  -  → 없음" | grep -E "요청됨|실패|충돌|승인|진행" || true)"
+    if [[ "$q" != "$prevq" && -n "$q" ]]; then
+      echo "QUEUE $(printf '%s' "$q" | tr '\n' ';')"
+    fi
+    prevq="$q"
   fi
-  prevq="$q"
   sleep "${RD_FR_DO_WATCH_INTERVAL:-30}"
 done

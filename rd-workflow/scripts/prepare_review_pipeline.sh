@@ -685,7 +685,15 @@ fi
 # 6번째 필드를 넣으면 진행 중인 legacy 세션이 죽는다.
 # 판정 규칙(Risk Tier 1차 키, malformed → unknown + 경고, 헤더 부재 → Execution Path fallback)은
 # _state_common.sh 의 review_execution_path_from_request 에 있고 test_review_effort_override.sh 가 표로 검증한다.
-CTX_EXEC_PATH="$(review_execution_path_from_request "${project_root}/REQUEST.md")"
+# 기록 커밋 뒤에 여는 세션(main 병합 확인 등)은 루트 REQUEST.md 가 비어 있으므로 구간에 추가된 보관본을 씁니다.
+CTX_REQUEST_FILE="REQUEST.md"
+if [[ "$review_type" == "diff-review" ]]; then
+  CTX_REQUEST_FILE="$(review_request_file "${REVIEW_BASE_OID:-}" "${REVIEW_HEAD_OID:-}")"
+  if [[ "$CTX_REQUEST_FILE" != "REQUEST.md" ]]; then
+    echo "diff review: 구간에 REQUEST 보관본이 있어 완료 기준과 리뷰 effort 를 ${CTX_REQUEST_FILE} 에서 읽습니다." >&2
+  fi
+fi
+CTX_EXEC_PATH="$(review_execution_path_from_request "${project_root}/${CTX_REQUEST_FILE}")"
 
 cat >> "${session_path}/SESSION.md" <<EOF
 

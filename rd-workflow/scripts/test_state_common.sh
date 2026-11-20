@@ -809,6 +809,15 @@ t_out "'|' 포함 canonical 1건 → join 통과(값 그대로)" "$PIPED" \
 t_out "'|' 포함 canonical 1건 → split 원소 1개" "$PIPED" \
   source_fr_split "$PIPED" "$RES_ROOT"
 
+# 케이스 6b (AC7): 원소에 '*' 가 있고 그 패턴과 맞는 파일이 cwd 에 있어도 glob 으로 펼치지 않는다
+# 없으면: 단어 분리가 pathname expansion 을 일으켜 원소가 파일명으로 바뀐다.
+_g_dir="$(mktemp -d "$TMP/glob.XXXXXXXX")" || { echo "test_state_common.sh: 임시 디렉터리 생성 실패" >&2; exit 1; }
+: > "$_g_dir/bX"
+_g_out="$( cd "$_g_dir" && source_fr_split 'a|b*' "$RES_ROOT" )"
+[[ "$_g_out" == "$(printf 'a\nb*')" ]] \
+  && echo "ok: AC7 '*' 원소가 cwd 파일명으로 펼쳐지지 않음" \
+  || { echo "FAIL: AC7 '*' 원소 glob 확장 ('${_g_out}')"; FAIL=1; }
+
 # 케이스 7: '|' 포함 경로가 다른 1건과 함께 → join 거부 · 상태 보존
 # 없으면: 되읽을 수 없는 값이 저장되어 두 경로로 찢어진다.
 t "'|' 포함 경로 + 다른 1건 → join 거부" 1 \

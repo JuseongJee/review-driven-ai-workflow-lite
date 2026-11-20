@@ -91,6 +91,7 @@ command -v gemini &>/dev/null && echo "gemini: 설치됨" || echo "gemini: 없�
 ```
 
 `rd-workflow/config/review-tools.json.example`을 `rd-workflow/config/review-tools.json`으로 복사합니다.
+`rd-workflow/config/models.json.example`을 `rd-workflow/config/models.json`으로 복사합니다. 리뷰어의 모델·effort 는 이 파일에서 고치고, 칸 목록과 확인 방법은 `rd-workflow/docs/USER_MANUAL.md` 「rd-workflow/config/models.json」 절을 안내합니다.
 
 ### 6. PROJECT_CONTEXT 검토 (선택)
 

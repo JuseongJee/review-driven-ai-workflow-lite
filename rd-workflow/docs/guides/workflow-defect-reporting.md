@@ -134,7 +134,7 @@ exit 9(생성 호출 실패) 다음에 아무 조치 없이 그대로 재실행�
 
 ### 7. 정본 흡수
 
-rd-workflow 정본 repo의 운영자(maintainer)가 발행된 Issue를 검토한 뒤 `defect-report` 라벨을 붙이고, `/fr pull --repo <배포 repo>`로 정본 backlog에 흡수합니다. 라벨은 권한 있는 사람만 붙일 수 있으므로 무분별한 외부 Issue가 그대로 흡수되지 않는 선별 게이트 역할을 합니다.
+rd-workflow 정본 repo의 운영자(maintainer)가 발행된 Issue를 검토한 뒤 `defect-report` 라벨을 붙이고 정본 backlog에 흡수합니다. 소비 프로젝트에는 `/fr pull` 이 없으므로 흡수는 rd 정본 저장소 운영자가 합니다. 라벨은 권한 있는 사람만 붙일 수 있으므로 무분별한 외부 Issue가 그대로 흡수되지 않는 선별 게이트 역할을 합니다.
 
 **라벨 부착에 실패한 채로 발행된 Issue는 아직 흡수 대상이 아닙니다.** `publish` 스크립트가 라벨 부착 실패를 경고로 출력하므로, 이 경고가 나오면 정본 운영자가 수동으로 라벨을 붙여야 검토 대기열에 올라갑니다.
 
@@ -144,4 +144,26 @@ rd-workflow 정본 repo의 운영자(maintainer)가 발행된 Issue를 검토한
 
 ### 9. source Issue 수명주기
 
-pull로 흡수한 뒤에도 원본(source) Issue는 **열린 상태로 유지**합니다. 정본 쪽 작업이 완료되거나 취소됐을 때 그 Issue를 닫는 것은 사람이 판단해서 하며, **자동 종료는 이 규약의 범위 밖입니다.**
+pull로 흡수할 때 원본(source) Issue는 **닫지 않고 열린 상태로 유지**합니다. 흡수한 FR 상세의 `github-issue` 에 그 Issue를 적습니다(중복 보고는 쉼표로 더합니다).
+
+`github-issue` 값은 아래 네 형식의 Issue 참조를 쉼표로 이은 목록입니다. 설명·괄호는 이 줄에 붙이지 않고 상세 본문에 적습니다.
+
+| 형식 | 예 | 가리키는 호스트 |
+| --- | --- | --- |
+| `owner/repo#N` | `acme/demo#7` | 호스트를 적지 않습니다. 직접 push 발행은 그 셸의 gh 기본 호스트, PR 본문의 `Closes` 는 PR 저장소의 호스트로 읽힙니다 |
+| `host/owner/repo#N` | `ghe.example.com/acme/demo#7` | 적은 호스트. PR 본문에는 `Closes https://ghe.example.com/acme/demo/issues/7` 로 들어갑니다 |
+| Issue URL | `https://github.com/acme/demo/issues/7` | URL 의 호스트. 브라우저에서 복사한 값을 그대로 적어도 됩니다 |
+| GitHub Enterprise Issue URL | `https://ghe.example.com/acme/demo/issues/7` | URL 의 호스트 |
+
+source Issue 가 github.com 이 아닌 호스트(GitHub Enterprise)에 있으면 호스트가 붙은 형식(둘째 줄)이나 그 호스트의 Issue URL 로 적습니다. 호스트를 뺀 `owner/repo#N` 으로 줄이면 다른 호스트의 Issue 를 가리킬 수 있습니다.
+
+그 FR 을 Source FR 로 둔 작업이 발행될 때 Issue 가 닫히는 시점은 발행 방식에 따라 다릅니다.
+
+| 발행 방식 | 닫는 주체와 시점 | 확인 방법 |
+| --- | --- | --- |
+| 기본 브랜치에 직접 push (`archive.sh` 기본) | push 직후 `archive.sh` 가 `issue_queue.sh close-fr` 로 반영 커밋 댓글을 달고 닫습니다 | 발행 출력의 「Issue 를 닫았습니다」·「이미 닫혀 있어 건너뜁니다」 줄. 실패하면 경고와 재실행 명령이 나옵니다 |
+| PR 발행 (`archive_publish=pr`) | `archive.sh` 는 닫지 않습니다. PR 본문 끝의 `Closes <값>` 줄이 올바른 Issue 참조이면, PR 이 기본 브랜치로 merge 될 때 GitHub 가 그 Issue 를 닫습니다([GitHub 문서: PR 과 Issue 연결](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue)) | PR 본문의 `Closes` 줄, merge 뒤 Issue 상태 |
+| 로컬 전용 모드 | 닫지 않습니다 | — |
+
+- 두 발행 경로는 같은 형식 검사(`issue_queue.sh issue-refs`)를 씁니다. 값의 조각 하나라도 형식이 어긋나면 직접 push 경로는 어느 Issue 도 건드리지 않고, PR 발행 경로는 PR 본문에 `Closes` 줄을 하나도 넣지 않습니다. 직접 push 경로와 overlay 의 `rd pr open` 은 틀린 조각을 알립니다. 직접 설치 PR 발행(`archive_publish=pr`)은 아직 이 경고를 화면에 내지 않으므로, PR 을 올린 뒤 PR 본문에 `Closes` 줄이 있는지 확인합니다. 경고를 보거나 `Closes` 줄이 없으면 상세의 `github-issue` 를 고치고 PR 본문에 `Closes` 줄을 직접 더합니다.
+- 사람이 닫는 경우: 이미 `done`·`dropped` 인 FR 에 중복 보고를 연결했을 때입니다. 그 FR 로 발행할 작업이 다시 없으므로 자동으로 닫히지 않습니다. 연결한 사람이 Issue 를 직접 닫습니다.

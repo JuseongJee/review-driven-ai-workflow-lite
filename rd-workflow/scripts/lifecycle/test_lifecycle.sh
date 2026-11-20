@@ -820,8 +820,10 @@ assert_eq "$_rc" "2" "존재하지 않는 기준선은 rc 2 git 오류"
 # _pc_repo 의 CURRENT_TASK.md(발행 후보)만 바꿔 커밋하면 된다.
 # ============================================================================
 
-# T1 — 구 baseline(주석 없음) 호환: 수정 전 emit_current_task_baseline 의 실제 출력을
-# 독립 fixture 문자열로 고정한다(수정된 emitter를 되돌려 재생성하지 않는다).
+# T1 — 구 baseline(주석 없음) 호환: 2026-09-24 이전 emit_current_task_baseline 의 실제 출력을
+# 독립 fixture 문자열로 고정한다(수정된 emitter를 되돌려 재생성하지 않는다). 2026-11-13 에 초기본을
+# 배포 템플릿과 같게 바꾼 뒤로는(`## Request` 평문·Branch `-`·Output Files 없음) 이 fixture 가
+# emit_current_task_baseline_legacy 비교로 통과한다.
 _old_baseline_fixture='# Current Task
 
 ## Task
@@ -1291,7 +1293,8 @@ printf '%s\n' \
 ( cd "$FIX10" && git add -A && git commit -qm "stale mirror" )
 ( cd "$FIX10" && project_root="$FIX10" bash "$SCRIPT_DIR/promote.sh" --short-title fix-mirror-reset --size small --no-worktree >/dev/null 2>&1 )
 assert_eq "$(awk '$0=="## Task"{getline; print; exit}' "$FIX10/CURRENT_TASK.md")" "-" "promote 초기화: Task 가 baseline 으로 리셋"
-assert_eq "$(awk '$0=="## Next Step"{getline; print; exit}' "$FIX10/CURRENT_TASK.md")" "-" "promote 초기화: Next Step 이 baseline 으로 리셋"
+# baseline 의 Next Step 은 안내 주석 줄 다음에 값이 온다 — 주석 줄을 건너뛰고 첫 값 줄을 읽는다.
+assert_eq "$(awk '$0=="## Next Step"{f=1; next} f && !/^<!--/{print; exit}' "$FIX10/CURRENT_TASK.md")" "-" "promote 초기화: Next Step 이 baseline 으로 리셋"
 assert_eq "$(awk '$0=="## Spec"{getline; print; exit}' "$FIX10/CURRENT_TASK.md")" "-" "promote 초기화: Spec 이 baseline 으로 리셋"
 assert_eq "$(awk '$0=="## Short Title"{getline; print; exit}' "$FIX10/CURRENT_TASK.md")" "fix-mirror-reset" "promote 초기화: Short Title 은 승격 값"
 assert_eq "$(awk '$0=="## Status"{getline; print; exit}' "$FIX10/CURRENT_TASK.md")" "구현 중" "promote 초기화: Status 는 승격 값"

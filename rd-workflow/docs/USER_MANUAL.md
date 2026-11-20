@@ -225,16 +225,34 @@ bash rd-workflow/scripts/typecheck.sh
 - `fr_github`: GitHub Issues 연동 여부
 - `default_execution_mode`: 기본 실행 모드. **기본값은 `"semi-auto"`** 이며 파일이나 키가 없어도 `semi-auto` 로 판정합니다. 단계마다 확인받는 종전 동작으로 되돌리려면 이 키에 `"manual"` 을 적습니다. 값을 판정할 수 없으면 `manual` 로 떨어지며 경고가 표시되고, 세션 지시가 이 값보다 우선합니다.
 
-이 파일은 배포본에 실체로 포함되어 있으므로 **직접 편집합니다.** example 파일을 무조건 복사하면 배포한 기본값과 적어 둔 설정이 덮이므로, 복사는 **경로가 없을 때만** 합니다. `.example` 에서 최초 1회 만드는 것은 배포본에 실체가 없는 설정(예: `review-tools.json`)에 해당합니다.
+이 파일은 배포본에 실체로 포함되어 있으므로 **직접 편집합니다.** example 파일을 무조건 복사하면 배포한 기본값과 적어 둔 설정이 덮이므로, 복사는 **경로가 없을 때만** 합니다. `.example` 에서 최초 1회 만드는 것은 배포본에 실체가 없는 설정(예: `review-tools.json`·`models.json`)에 해당합니다.
 
 ### rd-workflow/config/review-tools.json
 
 리뷰 도구 우선순위와 설정. 교차 리뷰를 위해 여러 도구를 등록할 수 있습니다.
 
-codex 의 추론 깊이는 `tools.codex.reasoning_effort`(리뷰 타입별로는 `overrides.{타입}.tools.codex.reasoning_effort`)로
-조절합니다. 키가 없으면 아무것도 전달하지 않고 전역 `~/.codex/config.toml` 설정을 그대로 따릅니다.
-`RD_REVIEW_EFFORT_OVERRIDE=0` 이면 설정을 남긴 채 즉시 무력화하며, 적용 결과는 턴 완료 시
-`effort override: <상태>` 로 표시됩니다. 모델은 전역 설정이 단일 진실 원천이라 codex 에는 `model` 을 두지 않습니다.
+모델·effort 는 이 파일이 아니라 아래 `models.json` 에서 고칩니다.
+
+### rd-workflow/config/models.json
+
+리뷰어의 모델과 추론 깊이(effort)는 `rd-workflow/config/models.json` 에서 고칩니다.
+
+1. `rd-workflow/config/models.json.example` 을 `rd-workflow/config/models.json` 으로 복사합니다.
+2. 바꿀 칸만 고칩니다. 값이 `null` 인 칸은 비어 있고, 비어 있으면 도구 자체 설정을 씁니다.
+3. 다음 리뷰 턴의 실행 줄 `리뷰 도구: <도구> / 모델 요청: <값> (source: …) / effort 시도: <값> (source: …)` 에서 값과 출처를 확인합니다. 리뷰 턴 없이 확인하려면 `bash rd-workflow/scripts/model_select.sh show review` 를 실행합니다.
+
+칸 목록:
+
+- `review.codex.model`: Codex 모델. 계열 이름(`sol` 처럼 소문자만)을 쓰면 `~/.codex/models_cache.json` 에서 그 계열의 최신 모델을 고릅니다. 비어 있으면 `~/.codex/config.toml` 의 모델을 씁니다.
+- `review.codex.effort`: Codex effort 기본값.
+- `review.codex.small_task_effort`: `standard` 등급 리뷰(세션 `execution-path: small-task`)의 Codex effort. `medium` 이 하한입니다.
+- `review.codex.review_types.<리뷰 종류>.effort`: 리뷰 종류별 Codex effort.
+- `review.claude.model`: Claude 모델. 별칭(`opus`·`sonnet`·`haiku`·`fable`)을 씁니다.
+- `review.claude.effort`: Claude effort.
+
+effort 값은 `low`·`medium`·`high`·`xhigh`·`max`·`ultra`·`lowest`·`highest` 입니다. 모델이 지원하지 않는 단계는 바로 아래 지원 단계로 낮추고 경고합니다. `default` 는 「이 칸에서 넘기지 않음」 입니다.
+`RD_REVIEW_EFFORT_OVERRIDE=0` 이면 설정을 남긴 채 Codex effort 를 즉시 무력화합니다.
+`review-tools.json` 의 옛 키(`tools.claude.model`·`tools.codex.reasoning_effort`·`tools.codex.small_task_reasoning_effort`·`overrides.<종류>.tools.codex.reasoning_effort`)는 아직 읽지만 새로 쓰지 마십시오. 옛 키를 쓰면 리뷰 턴이 `models.json` 으로 옮기라고 안내합니다.
 
 ## 디렉토리 구조
 
@@ -250,7 +268,8 @@ codex 의 추론 깊이는 `tools.codex.reasoning_effort`(리뷰 타입별로는
 └── rd-workflow/
     ├── config/
     │   ├── workflow.json        # 워크플로 설정
-    │   └── review-tools.json    # 리뷰 도구 설정
+    │   ├── review-tools.json    # 리뷰 도구 설정
+    │   └── models.json          # 리뷰어 모델·effort 설정
     ├── docs/
     │   ├── AI_DOC_MAP.md        # 문서 인덱스
     │   ├── USER_MANUAL.md       # 이 파일
@@ -300,7 +319,7 @@ codex 의 추론 깊이는 `tools.codex.reasoning_effort`(리뷰 타입별로는
 | 등급이 과하게 잡힘 | "standard 로 내려서 진행해줘" 명시 (하향은 사용자만) |
 | 검증이 계속 FAIL | `test.sh`/`lint.sh`/`typecheck.sh` 설정과 PROJECT_CONTEXT.md 검증 명령 확인 |
 | 리뷰가 20턴 넘어도 끝나지 않음 | `awaiting-user`로 전환됨 — 직접 판단 후 진행 지시 |
-| 산출물 파일을 못 찾음 | CURRENT_TASK.md의 `Output Files` 섹션 확인 |
+| 산출물 파일을 못 찾음 | CURRENT_TASK.md의 `Spec`·`Plan` 섹션 확인 |
 | skill이 원하는 출력을 안 냄 | `rd-workflow/docs/prompts/recovery/` 참조 |
 | 검증 스크립트 실행 실패 | test.sh/lint.sh/typecheck.sh 및 의존 도구 설치 상태 확인 |
 | PROJECT_CONTEXT.md가 비어 있음 | `rd-workflow/docs/guides/setup.md` 참조하여 채우기 |

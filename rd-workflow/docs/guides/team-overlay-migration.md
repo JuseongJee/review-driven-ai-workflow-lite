@@ -787,6 +787,20 @@ fi
 - [ ] 0단계 A-2 에서 고른 `EXTRA_PATHS`·`OLD_ONLY_MAP` 항목이 overlay 에 **내용 그대로** 있고, 소스에는 (팀 파일이 아닌 한) 남아 있지 않다
 - [ ] 6단계 5 의 ignore 검증이 통과했다
 
+## 기존 overlay 사용자: 마감 때 팀 저장소 PR 이 기본입니다
+
+이 이관을 마친 overlay 에서 마감 흐름이 바뀌었습니다. 기본 반영 방식이 `pr` 이라서, 소스(submodule)에서 코드를 바꾼 작업은 final diff review 종결 뒤 `rd pr open` 으로 팀 저장소에 PR 을 올리고 merge 가 끝나야 발행됩니다. archive 도 반영 방식 `pr`·`push` 인 submodule 의 새 포인터가 팀 대상 브랜치에 없으면 발행을 거부합니다. 안내를 놓치면 업데이트 직후 첫 발행이 거부될 수 있습니다.
+
+- 이 흐름을 쓰려면 별도 설정이 필요 없습니다. 순서는 [신규 설치 가이드 「마감 — 팀 저장소 반영」](team-overlay-fresh-install.md#daily-ops)을 따릅니다.
+- 이전 방식(팀 저장소 반영을 사용자가 직접 하고 overlay 만 발행)으로 두려면 `rd-workflow/config/workflow.json` 에 다음을 적고 커밋합니다. 업데이트가 이 파일을 자동으로 고치지 않습니다.
+
+```json
+{ "team_publish": { "mode": "manual" } }
+```
+
+- 일부 submodule 만 직접 반영하려면 `team_publish.submodules.<경로>.mode` 를 `manual` 로 적습니다.
+- 설정은 기본 브랜치에 커밋해 두면 다음 작업부터 적용됩니다. 이미 seal 을 만든 작업은 `workflow.json` 이 seal 보호 트리에 들어 있어 그대로 고칠 수 없습니다. 그 작업만 반영하지 않으려면 `archive.sh` 에 `--allow-unpublished-submodule "<사유>"` 를 붙이고, 그 fr 브랜치에서 바꾸려면 `rd task set-status "구현 중"` → 설정 커밋 → final diff review 재종결 → `rd review seal` 순서로 합니다.
+
 ## 일상 운용
 
 새 구조에서 평소에 무엇이 보이고 어떻게 처리하는지는

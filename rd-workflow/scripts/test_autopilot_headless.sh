@@ -333,11 +333,11 @@ case "$RD_FAKE_MODE" in
   silent) exit 0 ;;
   already) echo 'archive: 이미 archive 완료 — nothing to do (tag=fr/2026/x)' ;;
   premerged) echo 'archive: fr/x 이미 merge 됨 — skip'; echo 'archive: push 실패' >&2; exit 1 ;;
-  hang) printf '%s\n' "$$" > "$RD_FAKE_PIDFILE"; exec sleep 30 ;;
-  hang-noterm) trap '' TERM; printf '%s\n' "$$" > "$RD_FAKE_PIDFILE"; exec sleep 30 ;;
+  hang) printf '%s\n' "$$" > "$RD_FAKE_PIDFILE"; exec sleep 60 ;;
+  hang-noterm) trap '' TERM; printf '%s\n' "$$" > "$RD_FAKE_PIDFILE"; exec sleep 60 ;;
   merge-hang)
     git -c user.name=t -c user.email=t@t commit --allow-empty -qm 'merge: x (hang)'
-    printf '%s\n' "$$" > "$RD_FAKE_PIDFILE"; exec sleep 30 ;;
+    printf '%s\n' "$$" > "$RD_FAKE_PIDFILE"; exec sleep 60 ;;
 esac
 FAKE
 P_CASE=0
@@ -439,7 +439,8 @@ p_check "발행 N 발행 하지 않음 줄" "$([[ "$P_ALL" == *"발행 하지 �
 p_check "발행 N archive 미호출" "$([[ ! -e "$RD_FAKE_ARGS" ]]; echo $?)"
 
 # ── 발행 단계 시간 상한 (FR unattended-publish-step-timeout) ──
-# 대역은 모두 sleep 30 으로 끝나므로 감시가 고장 나도 케이스는 30초 안에 끝나고 경과 시간 단언이 FAIL 한다.
+# 대역은 모두 sleep 60 으로 끝나므로 감시가 고장 나도 케이스는 60초 안에 끝나고 경과 시간 단언이 FAIL 한다.
+# 단언은 고정 상한이 아니라 이 대역 수명과 비교한다 — 정상 경과가 부하로 늘어도 수명보다는 짧다.
 reap_pidfile() {  # 케이스 끝 정리 — pid 파일의 프로세스를 KILL (남아 있을 때만)
   local pp; pp="$(cat "$1" 2>/dev/null)"
   [[ -n "$pp" ]] && kill -KILL "$pp" 2>/dev/null
@@ -458,7 +459,8 @@ p_check "T1 사유 첫 줄(원인·출처·중단)" "$([[ "$(sed -n 2p "$P_OF")"
 p_check "T1 다음 줄 git status·--task x" "$([[ "$(grep '^다음: ' "$P_OF")" == *"git status"* && "$(grep '^다음: ' "$P_OF")" == *"--task x"* ]]; echo $?)"
 p_check "T1 stderr 상한 줄" "$([[ "$P_ALL" == *"autopilot_headless: 발행 시간 상한=0.02분 (환경변수)"* ]]; echo $?)"
 p_check "T1 pid 부재" "$(pid_gone "$P_PIDFILE"; echo $?)"
-p_check "T1 경과 10초 미만 (${P_ELAPSED}초)" "$(( P_ELAPSED < 10 ? 0 : 1 ))"
+# 상한이 듣지 않으면 가짜 발행(hang-noterm)이 수명 60초를 다 씁니다. 그래서 경과를 그 수명과 비교합니다(고정 10초는 부하에서 흔들림).
+p_check "T1 경과가 가짜 발행 수명(60초) 미만 (${P_ELAPSED}초)" "$(( P_ELAPSED < 60 ? 0 : 1 ))"
 reap_pidfile "$P_PIDFILE"
 
 # T2 merge 뒤 멈춤 → incomplete, 이어붙이기 안내
@@ -480,19 +482,21 @@ T3_WP=$!
 for _i in $(seq 1 50); do [[ -s "$T3_PID" ]] && break; sleep 0.1; done
 T3_T0=$SECONDS
 kill -TERM "$T3_WP" 2>/dev/null
-for _i in $(seq 1 75); do kill -0 "$T3_WP" 2>/dev/null || break; sleep 0.2; done
+# 회수가 듣지 않으면 가짜 발행(hang)이 수명 60초를 다 쓴 뒤에야 wrapper 가 끝납니다. 가짜 발행은 T3_T0 보다 최대 5초 먼저
+# 시작하므로, 수명의 절반(30초)까지만 기다리고 그때도 살아 있으면 FAIL 입니다(고정 8초·15초는 부하에서 흔들림).
+T3_CAP=30
+while (( SECONDS - T3_T0 < T3_CAP )); do kill -0 "$T3_WP" 2>/dev/null || break; sleep 0.2; done
 T3_ALIVE=0
 if kill -0 "$T3_WP" 2>/dev/null; then T3_ALIVE=1; kill -KILL "$T3_WP" 2>/dev/null; fi
 wait "$T3_WP" 2>/dev/null; T3_CODE=$?
 T3_ELAPSED=$((SECONDS - T3_T0))
 P_CODE=$T3_CODE; P_OF="$T3_OF"; P_OUT="$(cat "${TMP}/out-T3" 2>/dev/null)"
-p_check "T3 wrapper 가 15초 안에 반환 (${T3_ELAPSED}초)" "$T3_ALIVE"
+p_check "T3 wrapper 가 TERM 뒤 폴링 상한(${T3_CAP}초, 가짜 발행 수명 60초의 절반) 안에 반환 (${T3_ELAPSED}초)" "$T3_ALIVE"
 p_check "T3 종료 코드 143" "$([[ $T3_CODE == 143 ]]; echo $?)"
 p_check "T3 outcome publish-failed" "$([[ "$(head -n1 "$T3_OF")" == blocked:publish-failed ]]; echo $?)"
 p_check "T3 사유 첫 줄 신호 TERM 수신" "$([[ "$(sed -n 2p "$T3_OF")" == "사유: 신호 TERM 수신 — archive 를 중단했습니다" ]]; echo $?)"
 p_check "T3 pid 부재" "$(pid_gone "$T3_PID"; echo $?)"
 p_check "T3 요약 줄이 실제 종료 코드 143 을 보임" "$(grep -q '^autopilot_headless: .*\[exit 143 — 신호 TERM 수신\]$' "${TMP}/out-T3"; echo $?)"
-p_check "T3 신호부터 반환까지 8초 미만 (${T3_ELAPSED}초)" "$(( T3_ELAPSED < 8 ? 0 : 1 ))"
 reap_pidfile "$T3_PID"
 
 # T5 상한 초과로 회수하는 중에 TERM 을 받음 → 원인은 상한 초과, 종료 코드는 143
@@ -506,7 +510,9 @@ T5_OF="${TMP}/outcome-T5"; printf 'publish-ready\ntask x\n' > "$T5_OF"; T5_PID="
 T5_WP=$!
 for _i in $(seq 1 50); do grep -q '도달' "${TMP}/err-T5" 2>/dev/null && break; sleep 0.1; done
 kill -TERM "$T5_WP" 2>/dev/null
-for _i in $(seq 1 75); do kill -0 "$T5_WP" 2>/dev/null || break; sleep 0.2; done
+# T3 와 같은 이유로 가짜 발행 수명의 절반(30초)까지 기다립니다(고정 15초면 부하에서 KILL 로 끊겨 종료 코드 단언이 흔들림).
+T5_T0=$SECONDS
+while (( SECONDS - T5_T0 < 30 )); do kill -0 "$T5_WP" 2>/dev/null || break; sleep 0.2; done
 if kill -0 "$T5_WP" 2>/dev/null; then kill -KILL "$T5_WP" 2>/dev/null; fi
 wait "$T5_WP" 2>/dev/null; T5_CODE=$?
 P_CODE=$T5_CODE; P_OF="$T5_OF"; P_OUT="$(cat "${TMP}/out-T5" 2>/dev/null)"

@@ -16,6 +16,27 @@ fi
 source "${SCRIPT_DIR}/_task_common.sh" || exit 3
 # 일반 seal 의 리뷰 입력 완전성 검사(rd_review_input_check). _state_common.sh 는 위 _task_common.sh 가 불러옵니다.
 source "${SCRIPT_DIR}/_submodule_common.sh" || exit 3
+# submodule 네임스페이스 — task-state 를 쓰지 않으므로 state_ensure 앞에서 분기합니다 (change-spec D6).
+# usage 는 아래에서 정의되므로 여기서는 한 줄 사용법만 냅니다.
+if [[ "${1:-}" == "submodule" ]]; then
+  shift
+  if [[ "${1:-}" != "init" ]]; then
+    echo "사용법: bash rd-workflow/scripts/rd submodule init [<경로>...]" >&2
+    exit 1
+  fi
+  shift
+  _top="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "rd submodule init: git 저장소 안에서 부르십시오" >&2; exit 1; }
+  _common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || { echo "rd submodule init: 공용 git 디렉터리를 찾을 수 없습니다" >&2; exit 1; }
+  _top="$(cd "$_top" && pwd -P)"
+  _main="$(cd "$(dirname "$_common")" && pwd -P)"
+  _rc=0
+  if [[ "$_top" == "$_main" ]]; then
+    _RD_SUB_NOSRC_REASON='메인 체크아웃이라 원천이 자기 자신입니다' RD_SUBMODULE_REMOTE_BUDGET= rd_submodule_fill "$_top" "" all ${1+"$@"} || _rc=$?
+  else
+    RD_SUBMODULE_REMOTE_BUDGET= rd_submodule_fill "$_top" "$_main" all ${1+"$@"} || _rc=$?
+  fi
+  exit "$_rc"
+fi
 # 진입 시 task-state 보장 — 부재 시 마이그레이션 수행 (결정 4). 손상 legacy → exit 3.
 # 마이그레이션 여부를 하위 명령이 알 수 있게 기록한다(set-status 의 커밋할 파일 안내).
 RD_STATE_MIGRATED=0; state_file_exists || RD_STATE_MIGRATED=1
@@ -524,7 +545,9 @@ schema=${RD_SEAL_SCHEMA}
 session-id=${session_id}
 review-type=diff-review
 tree-hash=${cur_hash}
-${fr_cur:+fr-changes-hash=${fr_cur}
+${resolved_base:+review-base=${resolved_base}
+}${reviewed_oid:+review-head=${reviewed_oid}
+}${fr_cur:+fr-changes-hash=${fr_cur}
 }head=${head_now}
 branch-mode=${mode}
 fr-branch=${fr_field}
@@ -627,6 +650,33 @@ _rd_status_pending_guidance() {
   return 0
 }
 
+# `PR 검토 중` 안내 (change-spec D3) — 팀 저장소 PR 의 merge 를 기다리는 상태입니다.
+_rd_status_pr_review_guidance() {
+  echo "PR 검토 중 — 팀 저장소 PR 의 merge 를 기다리는 중입니다." >&2
+  echo "  PR 상태 확인: bash rd-workflow/scripts/rd pr check" >&2
+  echo "  수정 요청 반영: bash rd-workflow/scripts/rd task set-status \"구현 중\"" >&2
+  return 0
+}
+
+# 직접 설치 PR 대기 안내 (change-spec D5) — 현재 브랜치가 fr/<slug> 이고 PR 대기(dpr_pr_waiting)이면 stderr 한 줄.
+# 판정은 rd task list 와 같은 dpr_pr_waiting 한 함수다(gh·원격 조회 없이 로컬 ref 와 색인만 본다).
+# 하위 셸에서만 공용 함수를 source 한다 — 실패하면 아무것도 내지 않는다(Status 출력은 영향받지 않는다).
+_rd_status_direct_pr_note() {
+  local br slug
+  br="$(git symbolic-ref -q --short HEAD 2>/dev/null)" || return 0
+  case "$br" in fr/?*) slug="${br#fr/}" ;; *) return 0 ;; esac
+  (
+    set +e +u
+    source "${SCRIPT_DIR}/lifecycle/_tasks_index.sh" >/dev/null 2>&1 \
+      && source "${SCRIPT_DIR}/lifecycle/_team_publish_common.sh" >/dev/null 2>&1 \
+      && source "${SCRIPT_DIR}/lifecycle/_direct_pr_common.sh" >/dev/null 2>&1 || exit 0
+    dpr_pr_waiting "$slug" "$br" || exit 0
+    url="$(dpr_index_get "$slug" pr-url 2>/dev/null)" || url=""
+    echo "PR 검토 중(직접 설치 PR) — ${url:-PR 주소 미기록}. 확인: bash rd-workflow/scripts/rd pr check" >&2
+  ) || true
+  return 0
+}
+
 usage() {
   cat <<'EOF'
 사용법: bash rd-workflow/scripts/rd task <subcommand>
@@ -648,7 +698,7 @@ usage() {
                                            --assume-ended: 기동한 백엔드로 조회할 수 없을 때, 세션이
                                            없거나 끝났음을 직접 확인했다고 밝혀 failed 로 확정
   guard --candidate <slug> --mode <m> [--source-fr <path|-> ...] [--dry-run]
-                                           m: intake|promote|fr-add. decision=... 출력 (차단 exit 2)
+                                           m: intake|promote. decision=... 출력 (차단 exit 2)
                                            decision=write·rebind 이면 Short Title 을 **기록한다**.
                                            --dry-run: 판정만 하고 아무것도 쓰지 않음(dry-run=yes 출력)
                                            task-state 가 없으면 판정 없이 exit 3 — 'rd task status' 를 먼저 실행
@@ -682,8 +732,18 @@ usage() {
   seal [--legacy-unverified <사유>] <session-path>
                                            final diff review 종결 마커 생성 (4검사 통과 시 verified=yes)
 
+사용법: bash rd-workflow/scripts/rd submodule init [<경로>...]
+  대상: 비어 있는 submodule 전부(경로를 주면 그 경로와 그 아래). 경로는 최상위 기준 상대 경로이며 중첩도 받습니다
+  원천: worktree 에서는 메인 체크아웃에서 초기화된 submodule 을 로컬 복제하고, 그 밖은 원격에서 받습니다
+  종료 코드: 0 성공 / 1 하나 이상 실패 또는 submodule 이 아닌 경로 인자
+
 사용법: bash rd-workflow/scripts/rd publish <subcommand> [args...]
   발행 큐 명령. lifecycle/publish_queue.sh 로 그대로 넘기며 종료 코드도 그대로입니다
+
+사용법: bash rd-workflow/scripts/rd pr <open|light-check|sync> [args...]
+  open [--dry-run] [--approved] [--approve-push]  submodule 커밋을 팀 저장소에 PR·push 로 반영 (승인 필요 시 종료 코드 10)
+  light-check [<base-ref>]                         light 작업의 팀 저장소 반영 대상 판정 (상향이면 종료 코드 3)
+  sync [--task <slug>]  기록 파일만 충돌한 PR 에 기본 브랜치를 병합합니다(직접 설치 PR, archive_publish=pr 작업 전용)
 EOF
 }
 
@@ -692,6 +752,10 @@ ns="${1:-}"; [[ $# -gt 0 ]] && shift
 if [[ "$ns" == "publish" ]]; then
   bash "${SCRIPT_DIR}/lifecycle/publish_queue.sh" ${1+"$@"}
   exit $?
+fi
+# pr 네임스페이스 — 팀 저장소 반영 (team_publish.sh 로 위임, 종료 코드 그대로)
+if [[ "$ns" == "pr" ]]; then
+  exec bash "${SCRIPT_DIR}/lifecycle/team_publish.sh" ${1+"$@"}
 fi
 case "$ns" in task|review) ;; *) usage; exit 1 ;; esac
 cmd="${1:-}"; [[ $# -gt 0 ]] && shift
@@ -711,6 +775,8 @@ case "$cmd" in
     _st="$(task_read_status)" || exit 3
     printf '%s\n' "$_st"
     if [[ "$_st" == "아카이브 보류" ]]; then _rd_status_pending_guidance; fi
+    if [[ "$_st" == "PR 검토 중" ]]; then _rd_status_pr_review_guidance; fi
+    _rd_status_direct_pr_note
     ;;
   title)
     # task-state 존재 시 task-state에서 읽기 (결정 3: 기계 소비는 task-state 단일 소스)
@@ -876,7 +942,7 @@ case "$cmd" in
         *) usage; exit 1 ;;
       esac
     done
-    case "$gmode" in intake|promote|fr-add) ;; *) usage; exit 1 ;; esac
+    case "$gmode" in intake|promote) ;; *) usage; exit 1 ;; esac
     [[ -z "$cand" ]] && { usage; exit 1; }
     if [[ "$gsrc_count" -gt 0 && "$gmode" != "promote" ]]; then
       echo "guard: --source-fr 는 promote 모드 전용입니다 (mode=${gmode})" >&2

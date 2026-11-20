@@ -3,14 +3,16 @@
 #   promote 가 띄운 작업 세션이 파일 큐로 발행 허가를 받아 한 번에 하나씩 발행한다.
 #   큐 위치: <git-common-dir>/rd-workflow/publish-queue/ (추적하지 않음)
 #     <slug>.req  요청 파일(key=value 줄)   ACTIVE  허가 슬롯(slug 한 줄)   .lock/  큐 락(mkdir)
+#     WATCH       호출 세션 감시의 생존 표시(who·at 줄. 감시가 도는 동안 갱신)
 #   이 스크립트는 herdr agent prompt · herdr pane send-text · hc send 를 부르지 않는다.
 #   Spec: rd-workflow-workspace/specs/changes/2026-11-04-0917-publish-queue-tab-close-change-spec.md
 #
 # 종료 코드: 0 성공, 1 거부, 2 사용 오류, 3 판정 불가, 4 대기 시간 초과,
-#           10 사용자 승인 대상, 11 호출 세션 소실
+#           5 호출 세션의 감시 없음(wait — 요청은 큐에 그대로), 10 사용자 승인 대상, 11 호출 세션 소실
 #
 # 환경 변수: RD_PQ_POLL(폴링 간격 초, 기본 2), RD_PQ_LOCK_TRIES(락 재시도 횟수, 기본 50),
-#           RD_PQ_CALLER_CHECK(wait 의 호출 세션 생존 확인 간격 초, 기본 60)
+#           RD_PQ_CALLER_CHECK(wait 의 호출 세션 생존 확인 간격 초, 기본 60),
+#           RD_PQ_WATCH_STALE(감시 생존 표시가 낡았다고 보는 초, 기본 300)
 #
 # bash 3.2 호환: 연관 배열·${var,,}·BASHPID 를 쓰지 않는다.
 
@@ -407,8 +409,25 @@ _pq_default_branch() { (cd "${project_root:-$PWD}" && get_default_branch 2>/dev/
 
 # 병합 충돌 사전 확인 (D12). 판정은 공용 rd_merge_conflicts(_merge_precheck.sh)가 한다.
 #   자동 해소 경로를 뺀 충돌 파일이 남으면 stdout 에 한 줄씩 내고 rc 1. rc 0 통과 / 1 충돌 / 3 판정 불가
+#   gitlink 충돌 자동 해소(--gitlink-auto)는 발행 대상 커밋의 archive_publish 가 push 일 때만 켠다 — pr(직접 설치 PR)
+#   발행은 로컬 병합·자동 해소를 거치지 않고 archive 의 P4 가 자동 해소 없이 판정하므로, 같은 판정을 쓴다.
+#   archive_publish 를 판정할 수 없으면(설정 오류) 원인 한 줄과 판정 불가(rc 3).
 pq_merge_check() {  # <default-branch> <head>
-  rd_merge_conflicts "${project_root:-$PWD}" "${1:-}" "${2:-}"
+  local mode
+  mode="$(pq_archive_mode "${2:-}")" || return 3
+  if [[ "$mode" == push ]]; then
+    rd_merge_conflicts "${project_root:-$PWD}" "${1:-}" "${2:-}" --gitlink-auto
+  else
+    rd_merge_conflicts "${project_root:-$PWD}" "${1:-}" "${2:-}"
+  fi
+}
+
+# pq_archive_mode <commit> — 그 커밋의 archive_publish(push|pr). dpr_archive_mode 를 하위 셸에서 부른다
+#   (큐의 셸 옵션·함수를 오염시키지 않음). 판정 오류는 stderr 원인 한 줄과 rc 2.
+pq_archive_mode() {
+  ( set +e +u
+    source "$_PQ_SELF_DIR/_direct_pr_common.sh" >/dev/null 2>&1 || { printf 'archive_publish 설정 오류: _direct_pr_common.sh 를 불러올 수 없습니다\n' >&2; exit 2; }
+    dpr_archive_mode "${project_root:-$PWD}" "$1" || exit 2 )
 }
 
 # archive 우회 옵션 파싱 (rd publish request). 결과는 전역 PQ_BP_GITLINK·PQ_BP_REVIEW·PQ_BP_BASIS.
@@ -501,13 +520,46 @@ _pq_write_request() {  # <slug> <state> <reason> <backend> <caller-id> <fr-branc
     "worktree=${project_root:-$PWD}" "fr-branch=$6" "head=$7" \
     "caller-backend=$4" "caller-id=$5" "reason=$reason" \
     "bypass-gitlink=$PQ_BP_GITLINK" "bypass-review=$PQ_BP_REVIEW" "bypass-basis=$PQ_BP_BASIS" \
-    "run-pid=" "run-token=" "archive-pgid=" "result-main=" "result-tag="
+    "run-pid=" "run-token=" "archive-pgid=" "result-main=" "result-tag=" "watch-warned="
 }
 
 # ---------------------------------------------------------------- request (D5)
 
+# ---------------------------------------------------------------- 감시 생존 표시
+
+# 큐 감시(rd publish watch, fr_do/watch.sh)가 도는 동안 부른다. 같은 폴더의 임시 파일을 mv 해 반쯤 쓴 파일을 읽지 않게 한다.
+pq_beat() {  # <감시 이름>
+  local d who="${1:-watch}"
+  case "$who" in ''|*[!a-z0-9-]*) printf '올바르지 않은 감시 이름: %s\n' "$who" >&2; return 2 ;; esac
+  d="$(pq_dir)" || return 1
+  printf 'who=%s\nat=%s\n' "$who" "$(date +%s)" >"$d/WATCH.$$" && mv -f "$d/WATCH.$$" "$d/WATCH"
+}
+
+# 감시 생존 판정. WATCH 를 한 번만 읽어 생존 여부·공백 식별값·경고 문구를 같은 스냅숏으로 정한다
+# (여러 번 읽으면 그 사이 감시가 갱신돼, 알린 공백과 기록한 공백이 달라진다).
+# 결과: _PQ_WS_AT(마지막 at, 표시 없으면 none) _PQ_WS_AGE(지난 초, 표시 없으면 빈 값). rc 0 살아 있음 / 1 표시 없음·낡음.
+pq_watch_snapshot() {
+  local d at lim
+  _PQ_WS_AT=none; _PQ_WS_AGE=""
+  lim="${RD_PQ_WATCH_STALE:-300}"
+  case "$lim" in ''|*[!0-9]*) lim=300 ;; esac
+  d="$(pq_dir)" || return 1
+  at="$(sed -n 's/^at=//p' "$d/WATCH" 2>/dev/null | head -1)"
+  case "$at" in ''|*[!0-9]*) return 1 ;; esac
+  _PQ_WS_AT="$at"
+  _PQ_WS_AGE=$(( $(date +%s) - at ))
+  (( _PQ_WS_AGE <= lim ))
+}
+
+# 마지막 pq_watch_snapshot 의 공백에 대한 경고 줄.
+_pq_watch_warning_text() {
+  local since
+  if [[ -n "$_PQ_WS_AGE" ]]; then since="마지막 생존 표시 $(( _PQ_WS_AGE / 60 ))분 전"; else since="생존 표시 없음"; fi
+  printf '경고: 호출 세션의 감시가 없습니다 (%s) — 호출 세션이 이 발행 요청을 모를 수 있습니다. 사용자에게 알리십시오: 호출 세션에서 rd publish watch 또는 /fr do 감시를 다시 띄워야 허가가 납니다\n' "$since"
+}
+
 pq_cmd_request() {
-  local slug mode backend cid launch st dirty def head frb conflicts rc lost=0 cur p bp
+  local slug mode backend cid launch st dirty def head frb conflicts rc lost=0 cur p bp wm=""
   _pq_parse_bypass "$@" || return 2
   slug="$(_pq_current_slug)" || { printf 'slug 를 정할 수 없습니다 — 작업 worktree 에서 실행하십시오\n' >&2; return 2; }
   _pq_slug_ok "$slug" || { printf '올바르지 않은 slug: %s\n' "$slug" >&2; return 2; }
@@ -583,10 +635,16 @@ EOF2
     return 11
   fi
   _pq_write_request "$slug" requested "" "$backend" "$cid" "$frb" "$head"
+  # 요청 때 알린 감시 공백은 기록해 두어, 같은 공백으로 wait 가 곧바로 다시 끝나지 않게 한다.
+  if ! pq_watch_snapshot; then
+    wm="$(_pq_watch_warning_text)"
+    pq_set "$slug" "watch-warned=$_PQ_WS_AT"
+  fi
   pq_unlock
   printf '요청했습니다: %s\n' "$slug"
   bp="$(_pq_bypass_text "$slug")"
   [[ -n "$bp" ]] && printf '%s\n' "$bp"
+  [[ -n "$wm" ]] && printf '%s\n' "$wm"
   printf '다음 행동: rd publish wait 를 백그라운드로 실행해 허가를 기다리십시오\n'
   return 0
 }
@@ -723,6 +781,25 @@ _pq_evidence() {  # <slug>
   (cd "${project_root:-$PWD}" && tasks_publish_evidence "$1" "$head" "$def" "$mode") || return 3
 }
 
+# PR 방식(archive_publish: pr) 발행이 PR 을 올린 직후인가 (spec D3a). 색인 pr-head 가 fr 끝과 같고, pr-url 이 있고,
+# pr-sent(P9 가 성공한 발행의 head)가 pr-head 와 같을 때만 참이다. pr-head 는 정리 커밋을 만든 P7 에서 push·P9 보다
+# 먼저 기록되므로 P8·P9 실패·중단 뒤에도 남고, 재발행이면 이전 발행의 pr-url 도 남는다 — 그래서 pr-sent 로 이번 발행의
+# P9 성공을 확인한다. 이 판정은 tasks_publish_evidence 가 in-progress 를 낸 경우에만 부른다.
+# 하위 셸에서 source 하므로 큐의 셸 옵션·함수를 오염시키지 않는다.
+_pq_pr_waiting() {  # <slug>
+  (
+    set +e +u
+    cd "${project_root:-$PWD}" || exit 1
+    project_root="$PWD"; export project_root
+    source "$_PQ_SELF_DIR/_team_publish_common.sh" >/dev/null 2>&1 \
+      && source "$_PQ_SELF_DIR/_direct_pr_common.sh" >/dev/null 2>&1 || exit 1
+    dpr_pr_waiting "$1" "fr/$1" || exit 1
+    # 이번 발행의 P9(PR 생성·갱신)가 성공했어야 합니다 — pr-head 는 P7 에서 push·P9 보다 먼저 바뀝니다.
+    [[ -n "$(dpr_index_get "$1" pr-url 2>/dev/null)" ]] || exit 1
+    [[ "$(dpr_index_get "$1" pr-sent 2>/dev/null)" == "$(dpr_index_get "$1" pr-head 2>/dev/null)" ]]
+  ) 2>/dev/null
+}
+
 pq_cmd_run() {
   local slug st rc=0 from token mypid wt why ev arc_rc lastline hint
   slug="$(_pq_current_slug)" || { printf 'slug 를 정할 수 없습니다 — 작업 worktree 에서 실행하십시오\n' >&2; return 2; }
@@ -786,8 +863,13 @@ pq_cmd_run() {
   [[ "$drained" -eq 1 ]] || lastline="${lastline:+$lastline }(출력 기록이 끝나지 않았습니다 — 전체 출력: $logf)"
 
   ev="$(_pq_evidence "$slug")" || ev=""
+  [[ "$ev" == in-progress ]] && _pq_pr_waiting "$slug" && ev=pr-waiting
   pq_lock || { printf '큐 락 획득 실패 — 상태가 running 으로 남았습니다. rd publish recover %s\n' "$slug" >&2; return 1; }
   case "$ev" in
+    pr-waiting)
+      pq_set "$slug" state=done "run-token=" reason=
+      [[ "$(pq_slot_get)" == "$slug" ]] && pq_slot_clear
+      pq_unlock; printf 'PR 발행 완료: %s — merge 뒤 bash rd-workflow/scripts/rd pr check --task %s --apply\n' "$slug" "$slug"; return 0 ;;
     cleanup-pending)
       pq_set "$slug" state=done "run-token=" "result-main=$(git -C "$wt" rev-parse "refs/heads/$(_pq_default_branch)" 2>/dev/null)" \
         "result-tag=$(git -C "$wt" tag --list "fr/*/${slug}" 2>/dev/null | sort | tail -1)" reason=
@@ -892,7 +974,12 @@ pq_cmd_recover() {
   rc=0
   ev="$(_pq_evidence "$slug")" || rc=$?
   if [[ "$rc" -ne 0 ]]; then pq_unlock; printf '판정 불가 — 발행 증거를 확인할 수 없습니다. 사용자 확인 필요\n' >&2; return 3; fi
+  [[ "$ev" == in-progress ]] && _pq_pr_waiting "$slug" && ev=pr-waiting
   case "$ev" in
+    pr-waiting)
+      pq_set "$slug" state=done "run-token=" reason=
+      [[ "$(pq_slot_get)" == "$slug" ]] && pq_slot_clear
+      printf '복구: PR 발행이 이미 끝났습니다 — merge 뒤 bash rd-workflow/scripts/rd pr check --task %s --apply\n' "$slug" ;;
     cleanup-pending)
       pq_set "$slug" state=done "run-token=" reason=
       [[ "$(pq_slot_get)" == "$slug" ]] && pq_slot_clear
@@ -917,9 +1004,9 @@ _pq_num() {  # <값> <기본>
   case "$1" in ''|*[!0-9.]*|*.*.*|.) printf '%s\n' "$2" ;; *) printf '%s\n' "$1" ;; esac
 }
 
-# --timeout 인자 파싱. stdout 초(정수).
-_pq_timeout_arg() {  # <args...>
-  local t=3600
+# --timeout 인자 파싱. stdout 초(정수). 기본값이 빈 값이면 --timeout 이 없을 때 빈 값(시한 없음)을 낸다.
+_pq_timeout_arg() {  # <기본값> <args...>
+  local t="$1"; shift
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --timeout) shift; t="${1:-}"; case "$t" in ''|*[!0-9]*) return 2 ;; esac ;;
@@ -943,7 +1030,7 @@ _pq_wait_report() {  # <slug> <state>
 
 pq_cmd_wait() {
   local slug timeout poll chk since=0 st rc backend cid start alive
-  timeout="$(_pq_timeout_arg "$@")" || { printf '사용법: rd publish wait [--timeout 초]\n' >&2; return 2; }
+  timeout="$(_pq_timeout_arg 3600 "$@")" || { printf '사용법: rd publish wait [--timeout 초]\n' >&2; return 2; }
   slug="$(_pq_current_slug)" || { printf 'slug 를 정할 수 없습니다 — 작업 worktree 에서 실행하십시오\n' >&2; return 2; }
   _pq_slug_ok "$slug" || { printf '올바르지 않은 slug: %s\n' "$slug" >&2; return 2; }
   poll="$(_pq_num "${RD_PQ_POLL:-}" 2)"
@@ -959,6 +1046,21 @@ pq_cmd_wait() {
     if [[ "$st" != requested ]]; then
       _pq_wait_report "$slug" "$st"
       return 0
+    fi
+    # 감시 생존은 처음과 호출 세션 확인 간격마다 본다. 감시가 없으면 그 공백을 아직 알리지 않았을 때만
+    # 종료 코드 5 로 끝난다(요청 상태는 그대로). 이미 알린 공백이면 다시 띄운 wait 는 그대로 기다린다.
+    if [[ "$since" == 0 ]] && ! pq_watch_snapshot; then
+      if [[ "$(pq_get "$slug" watch-warned)" != "$_PQ_WS_AT" ]] && pq_lock; then
+        if [[ "$(_pq_state_of "$slug" 2>/dev/null)" == requested ]]; then
+          pq_set "$slug" "watch-warned=$_PQ_WS_AT"
+          pq_unlock
+          _pq_watch_warning_text
+          printf '요청은 큐에 그대로 있습니다. 사용자에게 알린 뒤 rd publish wait 를 다시 백그라운드로 실행하십시오\n'
+          return 5
+        fi
+        pq_unlock
+        continue
+      fi
     fi
     if (( SECONDS - start >= timeout )); then
       printf '대기 시간 초과 (%s초) — 호출 세션에 큐 확인을 요청하거나 사용자에게 알리십시오\n' "$timeout"
@@ -1029,17 +1131,19 @@ _pq_watch_scan() {
   [[ "$got" -eq 1 ]]
 }
 
+# 시한은 --timeout 을 줄 때만 있다. 없으면 사건이 있을 때만 끝난다.
 pq_cmd_watch() {
   local timeout poll start
-  timeout="$(_pq_timeout_arg "$@")" || { printf '사용법: rd publish watch [--timeout 초]\n' >&2; return 2; }
+  timeout="$(_pq_timeout_arg '' "$@")" || { printf '사용법: rd publish watch [--timeout 초]\n' >&2; return 2; }
   poll="$(_pq_num "${RD_PQ_POLL:-}" 2)"
   start=$SECONDS
   while :; do
+    pq_beat watch || :
     if _pq_watch_scan; then
       printf '처리한 뒤 rd publish watch 를 다시 백그라운드로 실행하십시오\n'
       return 0
     fi
-    if (( SECONDS - start >= timeout )); then
+    if [[ -n "$timeout" ]] && (( SECONDS - start >= timeout )); then
       printf '변화 없음 — 다시 대기\n'
       return 4
     fi
@@ -1067,6 +1171,7 @@ main() {
     recover) pq_cmd_recover "$@" ;;
     wait) pq_cmd_wait "$@" ;;
     watch) pq_cmd_watch "$@" ;;
+    _beat) pq_beat "$@" ;;
     ''|-h|--help) _pq_usage; return 2 ;;
     *) printf '알 수 없는 하위 명령: %s\n' "$sub" >&2; _pq_usage; return 2 ;;
   esac

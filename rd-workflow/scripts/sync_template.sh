@@ -7,6 +7,7 @@ set -euo pipefail
 # 통과 시 임시 clone 경로를 stdout에 출력한다.
 #
 # 사용법: sync_template.sh <배포 repo URL> [--force] [--allow-type-mismatch]
+#         sync_template.sh <policy|classify|apply|migrate|reinstall|changelog> [인자...]  (clone 의 스크립트로 실행)
 
 REPO_URL=""
 FORCE=""
@@ -34,6 +35,17 @@ if [[ "${1:-}" == "--print-upstream" ]]; then
   else printf '%s/%s\n' "$host" "$path"; fi
   exit 0
 fi
+
+# 하위 명령 (policy|classify|apply|migrate|reinstall|changelog): clone 한 템플릿의 스크립트로 실행하며
+# python 모듈에 넘긴다. clone 루트는 이 스크립트 위치의 두 단계 위, 프로젝트 루트는 현재 디렉터리다.
+case "${1:-}" in
+  policy|classify|apply|migrate|reinstall|changelog)
+    command -v python3 >/dev/null 2>&1 || { echo "오류: python3 가 필요합니다" >&2; exit 2; }
+    TPL_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    TPL_SUB="$1"; shift
+    exec python3 "$TPL_SCRIPT_DIR/sync_template_lib.py" "$TPL_SUB" "$(cd "$TPL_SCRIPT_DIR/../.." && pwd)" "$@"
+    ;;
+esac
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -69,7 +81,7 @@ template_type_of() {
 # 임시 clone
 CLONE_DIR="$(mktemp -d)" || { echo "sync_template: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$CLONE_DIR" && -d "$CLONE_DIR" ]] || { echo "sync_template: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-# 성공 시 cleanup은 호출자(sync_template.md 6단계)가 담당
+# 성공 시 cleanup은 호출자(sync_template.md 9단계 끝)가 담당
 # 실패 시 스크립트가 self-cleanup
 cleanup_on_failure() { [[ -n "$CLONE_DIR" ]] && rm -rf "$CLONE_DIR"; }
 trap 'cleanup_on_failure' ERR

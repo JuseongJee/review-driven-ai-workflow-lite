@@ -40,15 +40,36 @@ echo "=== 단위: append_turn_metric / compute_target_bytes ==="
 
   # append_turn_metric: 헤더 + 레코드
   session_dir="$TMP/sess"; mkdir -p "$session_dir"
-  append_turn_metric 2 spec-plan-review codex high 1000 6 100 160 ok
+  append_turn_metric 2 spec-plan-review codex high 1000 6 100 160 ok gpt-6.2-sol
   eq "$(wc -l < "$session_dir/turn_metrics.tsv" | tr -d ' ')" "2" "첫 기록: 헤더 1 + 레코드 1"
-  eq "$(head -1 "$session_dir/turn_metrics.tsv")" "$(printf '# turn\treview_type\ttool\teffort\tprompt_bytes\ttarget_bytes\tstart_epoch\tend_epoch\twall_seconds\tstatus')" "헤더 형식"
-  eq "$(sed -n 2p "$session_dir/turn_metrics.tsv")" "$(printf '2\tspec-plan-review\tcodex\thigh\t1000\t6\t100\t160\t60\tok')" "레코드: wall=60 계산 포함 10필드"
+  eq "$(head -1 "$session_dir/turn_metrics.tsv")" "$(printf '# turn\treview_type\ttool\teffort\tprompt_bytes\ttarget_bytes\tstart_epoch\tend_epoch\twall_seconds\tstatus\tmodel\ttokens')" "헤더 형식(12열, 맨 뒤 model·tokens)"
+  eq "$(sed -n 2p "$session_dir/turn_metrics.tsv")" "$(printf '2\tspec-plan-review\tcodex\thigh\t1000\t6\t100\t160\t60\tok\tgpt-6.2-sol\t-')" "레코드: wall=60 계산 포함 12필드, 토큰 인자 없음 → -"
 
   append_turn_metric 4 spec-plan-review codex "" 1000 - 200 230 timeout
   eq "$(wc -l < "$session_dir/turn_metrics.tsv" | tr -d ' ')" "3" "append-only: 헤더 재기록 없음"
   eq "$(sed -n 3p "$session_dir/turn_metrics.tsv" | cut -f4)" "none" "effort 빈 값 → none"
   eq "$(sed -n 3p "$session_dir/turn_metrics.tsv" | cut -f10)" "timeout" "status=timeout"
+  eq "$(sed -n 3p "$session_dir/turn_metrics.tsv" | awk -F'\t' '{print NF}')" "12" "12열 파일에 이어 쓴 행도 12열"
+  eq "$(sed -n 3p "$session_dir/turn_metrics.tsv" | cut -f11)" "unknown" "model 인자 없음 → 11열 unknown"
+
+  # 11열(토큰 열 없는) 옛 헤더 파일에는 11열 행을 이어 쓴다
+  session_dir="$TMP/sess11"; mkdir -p "$session_dir"
+  printf '# turn\treview_type\ttool\teffort\tprompt_bytes\ttarget_bytes\tstart_epoch\tend_epoch\twall_seconds\tstatus\tmodel\n' > "$session_dir/turn_metrics.tsv"
+  append_turn_metric 2 spec-plan-review codex high 1 1 100 160 ok m 500
+  eq "$(sed -n 2p "$session_dir/turn_metrics.tsv" | awk -F'\t' '{print NF}')" "11" "11열 옛 헤더 파일의 새 행은 11열"
+
+  # review_cost_line: 세션 폴더 이름의 시각, 턴 파일 수, 실행 행 합, 미확인 표시
+  session_dir="$TMP/20261120_100000_cost"; mkdir -p "$session_dir/turns"
+  : > "$session_dir/turns/001_author.md"; : > "$session_dir/turns/002_reviewer.md"; : > "$session_dir/turns/003_author.md"
+  append_turn_metric 2 request-review codex high 1 1 100 160 fail m -
+  append_turn_metric 2 request-review codex high 1 1 200 320 ok m 1500
+  cl="$(review_cost_line "$session_dir" 1500)"
+  case "$cl" in "리뷰 비용: 누적 3턴 · 세션 경과 "*) pass "비용 줄: 누적 턴 수는 턴 파일 수(재시도 행 무관)";; *) fail "비용 줄 머리 (실제=[$cl])";; esac
+  case "$cl" in *"세션 경과 - "*) fail "비용 줄: 폴더 이름 시각으로 경과 시간 계산 (실제=[$cl])";; *) pass "비용 줄: 폴더 이름 시각으로 경과 시간 계산";; esac
+  case "$cl" in *"리뷰 도구 3m · 토큰 이번 턴 1500 / 누적 1500 (일부 미확인) (리뷰 도구만)") pass "비용 줄: 시간은 모든 실행 합, 토큰 - 행이 있으면 일부 미확인";; *) fail "비용 줄 합계 (실제=[$cl])";; esac
+  session_dir="$TMP/sess-notime"; mkdir -p "$session_dir/turns"
+  append_turn_metric 2 request-review codex high 1 1 100 130 ok m 700
+  eq "$(review_cost_line "$session_dir" 700)" "리뷰 비용: 누적 0턴 · 세션 경과 - · 리뷰 도구 30s · 토큰 이번 턴 700 / 누적 700 (리뷰 도구만)" "비용 줄: 시각 없는 폴더 이름 → 경과 -, 전부 확인된 토큰은 표시 없음"
 
   # fail-open: 쓰기 불가 디렉토리에서도 return 0
   session_dir="$TMP/ro"; mkdir -p "$session_dir"; chmod 555 "$session_dir"
@@ -61,6 +82,11 @@ echo "=== 단위: append_turn_metric / compute_target_bytes ==="
 ) || fail "단위 파트 실패 (서브셸 rc 전파)"
 
 echo "=== 통합: mock adapter 3경로 ==="
+# 선택 함수가 읽는 환경 변수를 호출 환경에서 물려받지 않는다. 값이 필요한 케이스는 그 실행에만 붙인다.
+unset RD_MODELS_CONFIG RD_REVIEW_CODEX_MODEL RD_REVIEW_CLAUDE_MODEL RD_REVIEW_CODEX_EFFORT RD_REVIEW_CLAUDE_EFFORT \
+      RD_REVIEW_EFFORT_OVERRIDE TOOL_MODEL TOOL_EFFORT EFFORT_SOURCE
+MOCK_HOME="$TMP/home"; mkdir -p "$MOCK_HOME/.codex"
+cp "${script_dir}/fixtures/models_cache.sample.json" "$MOCK_HOME/.codex/models_cache.json"
 # 최소 세션 픽스처 (test_review_wait.sh 의 write_session 패턴 축약)
 mk_full_session() { # $1=디렉토리
   mkdir -p "$1/turns"
@@ -117,14 +143,22 @@ run_with_mock_adapter() { # $1=session $2=mock-adapter-body — rc 를 echo 하�
   [[ -n "$fake_dir" && -d "$fake_dir" ]] || { echo "test_review_metrics.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; return 1; }
   # run_review_turn.sh 는 script_dir 기준으로 adapter_<tool>.sh 를 찾으므로
   # 스크립트 사본 + mock adapter 를 한 디렉토리에 구성한다.
-  cp "${script_dir}/run_review_turn.sh" "${script_dir}/review_common.sh" "$fake_dir/"
-  printf '#!/usr/bin/env bash\n%s\n' "$body" > "$fake_dir/adapter_codex.sh"
-  chmod +x "$fake_dir/adapter_codex.sh"
-  # effort_default 를 심어 EFFORT_VALUE 가 채워지게 한다 — 일반 실패 경로의 effort 복구
+  cp "${script_dir}/run_review_turn.sh" "${script_dir}/review_common.sh" "${script_dir}/model_select.sh" "$fake_dir/"
+  # MOCK_TOOL=claude 면 Claude 어댑터 분기로 돈다(기본 codex). self-review 게이트는 off 로 통과시킨다.
+  local mtool="${MOCK_TOOL:-codex}"
+  printf '#!/usr/bin/env bash\n%s\n' "$body" > "$fake_dir/adapter_${mtool}.sh"
+  chmod +x "$fake_dir/adapter_${mtool}.sh"
+  # 옛 키 tools.codex.reasoning_effort 를 심어 EFFORT_VALUE 가 채워지게 한다 — 일반 실패 경로의 effort 복구
   # 안내(RD_REVIEW_EFFORT_OVERRIDE=0 등)가 실제로 트리거되는지 검증하려면 필요하다.
   # mock adapter 는 TOOL_EFFORT 를 읽지 않으므로 기존 ok/fail/timeout 케이스에는 영향 없다.
-  printf '{"default_priority":["codex"],"tools":{"codex":{"effort_default":"high"}},"_comment":"metrics test"}' > "$fake_dir/tools.json"
+  if [[ "$mtool" == "claude" ]]; then
+    printf '{"default_priority":["claude"],"tools":{"claude":{"bin":"bash","self_review_policy":"off"}},"_comment":"metrics test"}' > "$fake_dir/tools.json"
+  else
+    printf '{"default_priority":["codex"],"tools":{"codex":{"bin":"bash","reasoning_effort":"high"}},"_comment":"metrics test"}' > "$fake_dir/tools.json"
+  fi
   # MOCK_PATH_PREPEND: 시간 원천 실패 주입 등 명령 shim 디렉토리 (미설정이면 무영향)
+  # HOME·CODEX_HOME 은 고정 캐시 표본을 둔 임시 홈이다 — 실제 ~/.codex 를 읽지 않는다.
+  HOME="$MOCK_HOME" CODEX_HOME="$MOCK_HOME/.codex" \
   REVIEW_TOOLS_CONFIG="$fake_dir/tools.json" PATH="${MOCK_PATH_PREPEND:+$MOCK_PATH_PREPEND:}$PATH" \
     bash "$fake_dir/run_review_turn.sh" "$sess" \
     >"$TMP/last_out.txt" 2>"$TMP/last_err.txt" || rc=$?
@@ -249,6 +283,101 @@ rc="$(run_with_mock_adapter "$S1" "$OK_BODY2")"
 eq "$rc" "0" "비소비: 계측 파일 존재 세션에서 다음 턴 정상"
 eq "$(wc -l < "$S1/turn_metrics.tsv" | tr -d ' ')" "3" "append-only: 세션 2턴 = 헤더+레코드 2"
 
+echo "=== 관측: 실제 모델·effort (spec D8·D9) ==="
+# 가짜 어댑터가 이번 실행의 안정 로그를 남기고, 부모가 그 로그에서 관측한 값을 종료 줄과 TSV 11열에 남기는지 본다.
+# obs_tail: stderr 종료 줄에서 `turn time: <초> ` 뒤 부분 — `(status: …) / 실제 모델: … / 실제 effort: …`
+obs_tail() { sed -n 's/^turn time: [^ ]* //p' "$TMP/last_err.txt" | head -n 1; }
+obs_line() { printf '(status: %s) / 실제 모델: %s / 실제 effort: %s' "$1" "$2" "$3"; }
+# 실제 어댑터처럼 도구 종료를 확인한 뒤 발행했다는 상태 파일을 함께 남긴다(관측은 이 표지가 있을 때만 로그를 읽는다).
+PUB_BODY='printf "log_preserved: yes\nwriter_group: verified\n" > "${SESSION_PATH}/.review_wait_status"'
+CODEX_HEAD_BODY='printf "OpenAI Codex v0.169.0\n--------\nmodel: gpt-6.2-sol\nreasoning effort: medium\n--------\nuser\n" > "${SESSION_PATH}/.codex_output.log"'"
+$PUB_BODY"
+TURN_OK_BODY='
+tf="${SESSION_PATH}/turns/002_reviewer.md"
+printf "# Turn 002 — Reviewer\n이의 없음\n" > "$tf"
+sed -i.bak -e "s/^awaiting-reviewer$/awaiting-author/" -e "s/^Reviewer$/Author/" "${SESSION_PATH}/SESSION.md" && rm -f "${SESSION_PATH}/SESSION.md.bak"
+exit 0'
+
+# Claude 표본 — 실측 거부 로그(fixtures/claude_unrecognized_model.stream.log)에서 만든다.
+CL_FIX="${script_dir}/fixtures/claude_unrecognized_model.stream.log"
+CL_HOOK="$(sed -n 1p "$CL_FIX")"
+CL_INIT_OK="$(sed -n 2p "$CL_FIX" | jq -c '.model = "claude-opus-5-5"')"
+CL_RESULT_OK="$(sed -n 5p "$CL_FIX" | jq -c '.is_error = false')"
+{ printf 'stderr before init\n%s\n%s\n%s\n{"type":"res\n' "$CL_HOOK" "$CL_INIT_OK" "$CL_RESULT_OK"; } > "$TMP/cl_ok.log"
+{ printf 'stderr before init\n%s\n%s\n' "$CL_HOOK" "$CL_INIT_OK"; } > "$TMP/cl_noresult.log"
+{ printf '%s\n%s\n' "$CL_HOOK" "$(sed -n 2p "$CL_FIX" | jq -c 'del(.model) | .effort = "high"')"; } > "$TMP/cl_nomodel.log"
+printf '%s\n' "$CL_HOOK" > "$TMP/cl_hookonly.log"
+cl_copy() { printf 'cat "%s" > "${SESSION_PATH}/.claude_output.log"\n%s' "$1" "$PUB_BODY"; }
+
+# Codex 표본 — 머리말만, 머리말 + 복합 오류(effort·model 후보)
+printf 'OpenAI Codex v0.169.0\n--------\nmodel: gpt-6.2-sol\nreasoning effort: medium\n--------\nuser\n' > "$TMP/cx_head.log"
+{ cat "$TMP/cx_head.log"; printf 'ERROR: model not found\nERROR: reasoning_effort unknown variant\n'; } > "$TMP/cx_both.log"
+# 로그 파싱 변형(O2·O2c·O2d·O2e·O2g·O3)은 아래 「원인·세션 판정 함수」 절에서 observe_actual 을 직접 부른다.
+# 여기서는 실행기가 관측값을 종료 줄·TSV 에 잇는 경로만 실행기 실행으로 본다.
+
+# O1: Codex 머리말 → 종료 줄·TSV 11열
+sess="$TMP/o1"; mk_full_session "$sess"
+rc="$(run_with_mock_adapter "$sess" "$CODEX_HEAD_BODY
+$TURN_OK_BODY")"
+eq "$(obs_tail)" "$(obs_line ok gpt-6.2-sol medium)" "O1: Codex 머리말의 실제 모델·effort"
+eq "$(sed -n 2p "$sess/turn_metrics.tsv" | cut -f11)" "gpt-6.2-sol" "O1: TSV 11열 model"
+eq "$(sed -n 2p "$sess/turn_metrics.tsv" | cut -f4)" "high" "O1: TSV 4열은 요청 effort"
+
+# O1t: 토큰·비용 줄·범위 밖 줄 — Codex 푸터의 토큰을 TSV 12열과 비용 줄에 잇고, 앞 턴의 범위 밖 줄도 모아 낸다
+sess="$TMP/o1t"; mk_full_session "$sess"
+printf '범위 밖: a.sh:3 — 앞 턴 항목 — 드문 환경\n' > "$sess/turns/000_reviewer.md"
+rc="$(run_with_mock_adapter "$sess" "$CODEX_HEAD_BODY
+printf 'tokens used\n12,345\n' >> \"\${SESSION_PATH}/.codex_output.log\"
+$TURN_OK_BODY")"
+eq "$(sed -n 2p "$sess/turn_metrics.tsv" | cut -f12)" "12345" "O1t: TSV 12열 토큰(쉼표 제거)"
+grep -q '^리뷰 비용: 누적 3턴 · .* · 토큰 이번 턴 12345 / 누적 12345 (리뷰 도구만)$' "$TMP/last_err.txt"; chk $? "O1t: 비용 줄"
+grep -q '^  턴 000: 범위 밖: a.sh:3 — 앞 턴 항목 — 드문 환경$' "$TMP/last_err.txt"; chk $? "O1t: 앞 턴의 범위 밖 줄을 모아 출력"
+# O1u: 로그 확인 표지(상태 파일)가 없으면 토큰을 읽지 않는다
+sess="$TMP/o1u"; mk_full_session "$sess"
+rc="$(run_with_mock_adapter "$sess" "printf 'tokens used\n999\n' > \"\${SESSION_PATH}/.codex_output.log\"
+$TURN_OK_BODY")"
+eq "$(sed -n 2p "$sess/turn_metrics.tsv" | cut -f12)" "-" "O1u: 확인 표지 없는 로그의 토큰은 -"
+
+# O2b: 모델 거부 Claude 로그(실측 표본 그대로) — init 의 거부 모델을 쓰지 않는다
+sess="$TMP/o2b"; mk_full_session "$sess"
+rc="$(MOCK_TOOL=claude run_with_mock_adapter "$sess" "$(cl_copy "$CL_FIX")
+exit 1")"
+eq "$(obs_tail)" "$(obs_line fail unknown 미확인)" "O2b: 모델 거부 → 실제 모델 unknown"
+eq "$(sed -n 2p "$sess/turn_metrics.tsv" | cut -f11)" "unknown" "O2b: TSV 11열 unknown"
+# O4b·O4c·O6: 10열 헤더+행이 있는 세션에서 머리말 + 모델 오류 줄을 쓴 뒤 시간 초과.
+# 시간 초과는 분류하지 않으므로 남은 머리말 값을 쓰고, 설정 복구 안내를 내지 않는다.
+sess="$TMP/o4c"; mk_full_session "$sess"
+OLD_HDR="$(printf '# turn\treview_type\ttool\teffort\tprompt_bytes\ttarget_bytes\tstart_epoch\tend_epoch\twall_seconds\tstatus')"
+printf '%s\n%s\n' "$OLD_HDR" "$(printf '0\tspec-plan-review\tcodex\thigh\t1\t1\t1\t2\t1\tok')" > "$sess/turn_metrics.tsv"
+rc="$(run_with_mock_adapter "$sess" "$CODEX_HEAD_BODY
+printf 'ERROR: model not found\n' >> \"\${SESSION_PATH}/.codex_output.log\"
+exit 124")"
+eq "$rc" "124" "O4c: 부모가 124 를 보존"
+eq "$(obs_tail)" "$(obs_line timeout gpt-6.2-sol medium)" "O4b/O4c: 시간 초과 — 머리말 값, 분류하지 않음"
+! grep -q 'RD_REVIEW_CODEX_MODEL=' "$TMP/last_err.txt"; chk $? "O4c: RD_REVIEW_CODEX_MODEL 복구 안내 없음"
+grep -q '리뷰 턴 대기가 종료되었습니다' "$TMP/last_err.txt"; chk $? "O4c: 기존 대기 종료 안내 유지"
+eq "$(head -n 1 "$sess/turn_metrics.tsv")" "$OLD_HDR" "O6: 10열 헤더는 그대로"
+eq "$(tail -n 1 "$sess/turn_metrics.tsv" | awk -F'\t' '{print NF}')" "10" "O6: 10열 헤더 세션의 새 행은 10열"
+eq "$(tail -n 1 "$sess/turn_metrics.tsv" | cut -f10)" "timeout" "O6: cut -f10 이 status"
+
+# O4d: 같은 로그 + 신호 종료(143) — 분류하지 않음
+sess="$TMP/o4d"; mk_full_session "$sess"
+rc="$(run_with_mock_adapter "$sess" "$CODEX_HEAD_BODY
+printf 'ERROR: model not found\n' >> \"\${SESSION_PATH}/.codex_output.log\"
+kill -TERM \$\$; sleep 5")"
+eq "$rc" "143" "O4d: 부모가 143 을 보존"
+eq "$(obs_tail)" "$(obs_line fail gpt-6.2-sol medium)" "O4d: 신호 종료 — 머리말 값, 분류하지 않음"
+! grep -q 'RD_REVIEW_CODEX_MODEL=' "$TMP/last_err.txt"; chk $? "O4d: 설정 복구 안내 없음"
+
+# O5: 사전 정리 실패(STALE_UNCLEARED=1) — 이번 실행이 머리말을 새로 써도 관측하지 않는다.
+# 요청값(RD_REVIEW_CODEX_MODEL=sol·EFFORT=high)이 있어도 관측 실패를 요청값으로 채우지 않는다(O3).
+sess="$TMP/o5"; mk_full_session "$sess"
+mkdir -p "$sess/.review_wait_status"
+rc="$(export RD_REVIEW_CODEX_MODEL=sol RD_REVIEW_CODEX_EFFORT=high; run_with_mock_adapter "$sess" "$CODEX_HEAD_BODY
+$TURN_OK_BODY")"
+grep -q '모델 요청: sol→gpt-6.2-sol' "$TMP/last_err.txt"; chk $? "O5: fixture 유효 — 요청 모델이 gpt-6.2-sol 로 해석됨"
+eq "$(obs_tail)" "$(obs_line ok unknown unknown)" "O5/O3: STALE_UNCLEARED=1 → 요청값 대신 unknown"
+
 echo "=== 회귀: 부모 종료 코드 분류 (review-turn-timeout-too-short Task 6) ==="
 # ---------------------------------------------------------------------------
 # 신호 종료: 부모는 종료 코드를 보존하고, metric 은 coarse tri-state 의 fail 로 남는다.
@@ -263,7 +392,7 @@ if [ "$rc" = "143" ]; then
 else
   fail "신호 종료: 기대 rc=143 — 실제 $rc"
 fi
-st="$(awk -F'\t' 'END{print $NF}' "$sess/turn_metrics.tsv" 2>/dev/null)"
+st="$(tail -n 1 "$sess/turn_metrics.tsv" 2>/dev/null | cut -f10)"
 if [ "$st" = "fail" ]; then
   pass "신호 종료: metric status=fail 유지 (스키마 불변)"
 else
@@ -346,7 +475,7 @@ rc="$(run_with_mock_adapter "$sess" "$(mk_log_body "$NOEFF_VARIANT_LINE" 1)")"
 eq "$rc" "1" "T3: 부모 종료 1"
 grep -q '원인 불명' "$TMP/last_err.txt"; chk $? "T3: 원인 불명 표시"
 ! grep -q 'effort 거부' "$TMP/last_err.txt"; chk $? "T3: effort 거부 확정 문구 부재"
-grep -q 'RD_REVIEW_EFFORT_OVERRIDE=0' "$TMP/last_err.txt" && grep -q 'review-tools.json' "$TMP/last_err.txt"; chk $? "T3: 포괄 안내(일회성 무력화 + 값 확인) 존재"
+grep -q 'RD_REVIEW_EFFORT_OVERRIDE=0' "$TMP/last_err.txt" && grep -q 'tools.codex.reasoning_effort 를 고치거나' "$TMP/last_err.txt"; chk $? "T3: 포괄 안내(일회성 무력화 + 값 출처) 존재"
 ! grep -q '제거' "$TMP/last_err.txt"; chk $? "T3: 영구 변경(제거) 지시 부재"
 
 # T4: 끝 블록 안의 구분 불가 인용 두 변형
@@ -431,7 +560,7 @@ t10_check() { # $1=이름 $2=오류 줄 $3=처방 문구 $4=(선택) 이미 얻�
 t10_check capacity "$CAP_LINE" '재시도' "$TMP/cap_err.txt"
 t10_check rate 'ERROR: rate limit exceeded, too many requests' '재시도'
 t10_check auth 'ERROR: unauthorized: not logged in' '로그인'
-t10_check model 'ERROR: model not found: gpt-x' '모델 지정'
+t10_check model 'ERROR: model not found: gpt-x' '프로젝트는 모델을 넘기지 않았습니다'
 t10_check spendcap "$SPEND_LINE_T10" '소유자'
 ! grep -q '잠시 뒤' "$TMP/last_err.txt"; chk $? "T10(spendcap): 잠시 뒤 재시도 권고 없음"
 t10_check usagelimit 'ERROR: You’ve hit your usage limit. Try again later.' '재설정'
@@ -550,6 +679,56 @@ echo "=== 원인·세션 판정 함수 ==="
   ln -sf "$D/cap.log" "$D/link.log"
   eq "$(cls "$D/link.log" codex)" "unknown " "F-symlink: symlink 로그 → unknown"
   eq "$(cls "" codex)" "unknown " "F-stale: STALE_UNCLEARED 빈 경로 → unknown"
+
+  # O2f: 관측 jq 가 부분 출력을 낸 뒤 실패 → 부분 출력을 버리고 unknown/unknown, rc 0
+  mkdir -p "$D/o2f" "$D/fakejq"
+  printf '{"type":"system","subtype":"init","model":"claude-opus-5-5"}\n' > "$D/o2f/.claude_output.log"
+  printf 'log_preserved: yes\nwriter_group: verified\n' > "$D/o2f/.review_wait_status"
+  printf '#!/usr/bin/env bash\nprintf "claude-opus-5-5\\t\\n"\nexit 5\n' > "$D/fakejq/jq"
+  chmod +x "$D/fakejq/jq"
+  o2f_out="$(PATH="$D/fakejq:$PATH" "$BASH" -c 'set -euo pipefail; source "$1"; observe_actual claude "$2" -' _ "${script_dir}/model_select.sh" "$D/o2f")"; o2f_rc=$?
+  eq "$o2f_out|$o2f_rc" "$(printf 'unknown\tunknown|0')" "O2f: 관측 jq 실패 → 부분 출력 버리고 unknown/unknown, rc 0"
+
+  # O2·O2c·O2d·O2e·O2g·O3: observe_actual 의 로그 파싱. 실행기와 같게 일반 실패(fail)일 때만 그 로그의
+  # classify_adapter_failure_cause 출력을 넘기고, 성공·시간 초과는 `-` 를 넘긴다.
+  source "${script_dir}/model_select.sh"
+  obs() { # obs <codex|claude> <로그 원본|""> <fail|-> [상태 파일 내용] → "<model>\t<effort>"
+    local d c="-"
+    d="$(mktemp -d "$D/obs.XXXXXX")" || { echo "test_review_metrics.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, D='$D')" >&2; return 1; }
+    if [ -n "$2" ]; then cp "$2" "$d/.$1_output.log"; fi
+    printf '%s\n' "${4-log_preserved: yes
+writer_group: verified}" > "$d/.review_wait_status"
+    if [ "$3" = fail ]; then c="$(cls "$d/.$1_output.log" "$1")"; fi
+    observe_actual "$1" "$d" "$c"
+  }
+  TABC="$(printf '\t')"
+  eq "$(obs claude "$TMP/cl_ok.log" -)"         "claude-opus-5-5${TABC}미확인" "O2: Claude init 의 모델(JSON 아닌 줄·hook 줄 뒤), effort 근거 없음 → 미확인"
+  eq "$(obs claude "$TMP/cl_noresult.log" -)"   "claude-opus-5-5${TABC}미확인" "O2c: 시간 초과도 남은 init 값을 씀"
+  eq "$(obs codex "$TMP/cx_both.log" fail)"     "unknown${TABC}medium"         "O2d: candidates effort,model → 실제 모델 unknown"
+  eq "$(obs claude "$TMP/cl_nomodel.log" -)"    "unknown${TABC}high"           "O2e: 빈 모델 → unknown, effort high"
+  eq "$(obs claude "$TMP/cl_hookonly.log" fail)" "unknown${TABC}unknown"       "O2g: init 없음 → unknown / unknown"
+  eq "$(obs codex "" fail)"                     "unknown${TABC}unknown"        "O3: 로그 없음 → unknown"
+  # O8: Claude 토큰 — 마지막 result 이벤트의 usage 네 값 합. result 가 없으면 -.
+  d8="$(mktemp -d "$D/tok.XXXXXX")" || { echo "test_review_metrics.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, D='$D')" >&2; exit 1; }
+  printf 'log_preserved: yes\nwriter_group: verified\n' > "$d8/.review_wait_status"
+  { cat "$TMP/cl_noresult.log"; printf '%s\n' '{"type":"result","usage":{"input_tokens":10,"cache_creation_input_tokens":200,"cache_read_input_tokens":3000,"output_tokens":45}}'; } > "$d8/.claude_output.log"
+  eq "$(observe_turn_tokens claude "$d8")" "3255" "O8: Claude result usage 합"
+  cp "$TMP/cl_noresult.log" "$d8/.claude_output.log"
+  eq "$(observe_turn_tokens claude "$d8")" "-" "O8: result 없음 → -"
+  # O7: 어댑터가 도구 종료를 확인하고 발행했다는 표지가 없으면 같은 이름의 로그가 있어도 읽지 않는다.
+  eq "$(obs codex "$TMP/cx_head.log" - "writer_group: verified")" "unknown${TABC}unknown" "O7: 상태 파일에 log_preserved: yes 없음 → 로그를 읽지 않음"
+  eq "$(obs claude "$TMP/cl_ok.log" - "log_preserved: yes
+writer_group: unverified")" "unknown${TABC}unknown" "O7: writer_group 이 verified 가 아님 → 로그를 읽지 않음"
+  # O7c: 최종 상태 블록은 스냅샷의 writer_group 을 물려받지 않는다. 스냅샷에 verified 가 있어도
+  # 이번 판정이 unverified 면 발행 파일에는 unverified 한 줄만 남고 관측하지 않는다.
+  o7c="$(mktemp -d "$D/o7c.XXXXXX")" || { echo "test_review_metrics.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, D='$D')" >&2; exit 1; }
+  cp "$TMP/cx_head.log" "$o7c/.codex_output.log"
+  o7c_out="$("$BASH" -c 'source "$1"; source "$2"; cd "$3"
+    RW_STATUS_STREAM_PATH=stream RW_LOG_STABLE=.codex_output.log
+    printf "%s\n" "$RW_SNAP_DELIM" "log_path: tmp.log" "writer_group: verified" > stream
+    RW_GROUP_STATE=unverified rw_render_final_block yes "" > .review_wait_status
+    grep -c "^writer_group:" .review_wait_status; observe_actual codex . -' _ "${script_dir}/review_wait.sh" "${script_dir}/model_select.sh" "$o7c" 2>/dev/null)"
+  eq "$o7c_out" "$(printf '1\nunknown\tunknown')" "O7c: 스냅샷의 writer_group: verified 를 물려받지 않음 → 한 줄, 관측하지 않음"
 
   # S-*: assess_session_safety
   mk_sess() { # $1=파일 $2=Owner $3=Status

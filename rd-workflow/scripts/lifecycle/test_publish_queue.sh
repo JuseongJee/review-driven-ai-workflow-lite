@@ -66,7 +66,8 @@ HEOF
 chmod +x "$BIN/herdr"
 printf '#!/usr/bin/env bash\nprintf "hc %%s\\n" "$*" >>"%s"\nexit 1\n' "$CALLS" >"$BIN/hc"
 chmod +x "$BIN/hc"
-export RD_PQ_POLL=0.1 RD_PQ_CALLER_CHECK=0.2
+# 감시 생존 표시가 낡았다고 보는 시한. 시험 전체가 이 안에 끝나므로 mk_work 의 생존 표시는 시험 내내 새롭다.
+export RD_PQ_POLL=0.1 RD_PQ_CALLER_CHECK=0.2 RD_PQ_WATCH_STALE=3600
 set_agents() {  # set_agents <pane_id>...
   local out="" p
   for p in "$@"; do out="${out:+$out,}{\"pane_id\":\"$p\",\"tab_id\":\"t\",\"name\":\"n\",\"agent_status\":\"working\"}"; done
@@ -90,7 +91,7 @@ mk_base() {
 mk_base
 
 # mk_work <name> <slug> [nocaller]: 기준 저장소 사본(기본 체크아웃) + 작업 worktree(fr/<slug>).
-# 작업 worktree 경로를 stdout 으로 낸다. Status 는 아카이브 보류, 호출 세션 wX:p1(herdr).
+# 작업 worktree 경로를 stdout 으로 낸다. Status 는 아카이브 보류, 호출 세션 wX:p1(herdr), 호출 세션 감시 생존 표시 있음.
 mk_work() {
   local name="$1" slug="$2" nocaller="${3:-}" main wt
   main="$TMP/$name"
@@ -108,7 +109,13 @@ mk_work() {
   else
     pqf "$wt" "tasks_index_upsert '$slug' launch=ok caller-backend=herdr caller-id=wX:p1" >/dev/null
   fi
+  pqf "$wt" "pq_beat watch"
   printf '%s\n' "$wt"
+}
+# set_beat_at <repo> <epoch|none>: 감시 생존 표시의 시각을 바꾼다(none 이면 표시를 지운다).
+set_beat_at() {
+  local d; d="$(pqf "$1" pq_dir)"
+  if [[ "$2" == none ]]; then rm -f "$d/WATCH"; else printf 'who=watch\nat=%s\n' "$2" >"$d/WATCH"; fi
 }
 # set_status <wt> <값>: task-state 의 status 를 바꿔 커밋한다.
 set_status() {
@@ -371,10 +378,15 @@ test_request_hangul_conflict() {
 }
 test_request_auto_files_ok() {
   local W R2 p; W="$(mk_work rq4 pq-d)"; R2="$TMP/rq4"
-  for p in CURRENT_TASK.md rd-workflow-workspace/.lifecycle/stage_metrics.tsv rd-workflow-workspace/backlog/FUTURE_REQUESTS.md rd-workflow-workspace/.lifecycle/review-seals/verify-evidence; do
+  # 인덱스는 사전 판정이 병합기를 미리 돌리므로(spec 2026-11-17-1710 D3) 기준점을 두고 양쪽이 다른 행을 더한다.
+  mkdir -p "$R2/$(dirname "$MC_IDX")"
+  printf '%s\n' "$MC_HDR" "$(mc_row a)" >"$R2/$MC_IDX"; git -C "$R2" add -A; git -C "$R2" commit -q -m "add index"
+  git -C "$W" merge -q --no-edit master >/dev/null 2>&1
+  for p in CURRENT_TASK.md rd-workflow-workspace/.lifecycle/stage_metrics.tsv rd-workflow-workspace/.lifecycle/review-seals/verify-evidence; do
     mkdir -p "$R2/$(dirname "$p")" "$W/$(dirname "$p")"
     printf 'm\n' >"$R2/$p"; printf 'w\n' >"$W/$p"
   done
+  printf '%s\n' "$(mc_row m)" >>"$R2/$MC_IDX"; printf '%s\n' "$(mc_row w)" >>"$W/$MC_IDX"
   git -C "$R2" add -A; git -C "$R2" commit -q -m "main auto"
   git -C "$W" add -A; git -C "$W" commit -q -m "work auto"
   pq "$W" request
@@ -395,6 +407,209 @@ test_request_newline_path() {
   printf 'w\n' >"$W/$n"; git -C "$W" add -A; git -C "$W" commit -q -m "work nl"
   pq "$W" request
   [[ "$RC" -eq 1 && "$OUT" == *'CURRENT_TASK.md\nCURRENT_TASK.md'* ]] && pass "줄바꿈 경로는 자동 해소에서 빠지지 않고 충돌로 나열 (T6)" || fail "T6: rc=$RC out=$OUT"
+}
+# rd_merge_conflicts 직접 호출 사례 (P1~P4). 임시 저장소에 기준점(master)·ours·theirs 브랜치를 만든다.
+MC_IDX=rd-workflow-workspace/backlog/FUTURE_REQUESTS.md
+MC_HDR='# FUTURE_REQUESTS
+
+## 인덱스
+
+| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |
+|------|------|------|------|------|----------|------|'
+mc_row() { printf '| 2026-01-01 | %s | 요약%s | tooling | idea | - | [상세](items/2026-01-01-%s.md) |' "$1" "$1" "$1"; }
+# mc_repo <name> <path> <base> <ours> <theirs>: 한 경로의 세 판을 커밋한 저장소를 만들고 경로를 낸다.
+mc_repo() {
+  local r="$TMP/$1" p="$2"
+  git init -q -b master "$r"
+  git -C "$r" config user.name rd-test; git -C "$r" config user.email rd-test@example.invalid
+  mkdir -p "$r/$(dirname "$p")"
+  printf '%s\n' "$3" >"$r/$p"; git -C "$r" add -A; git -C "$r" commit -q -m base
+  git -C "$r" checkout -q -b ours; printf '%s\n' "$4" >"$r/$p"; git -C "$r" commit -q -am ours
+  git -C "$r" checkout -q -b theirs master; printf '%s\n' "$5" >"$r/$p"; git -C "$r" commit -q -am theirs
+  printf '%s\n' "$r"
+}
+# mc_run <precheck 파일> <repo>: rd_merge_conflicts <repo> ours theirs 를 불러 $OUT·$ERR·$RC 에 담는다.
+ERR=""
+mc_run() {
+  OUT="$(bash -c 'source "$1"; rd_merge_conflicts "$2" ours theirs' _ "$1" "$2" 2>"$2.err")"; RC=$?
+  ERR="$(cat "$2.err")"
+}
+test_precheck_task_state_auto() {
+  local r; r="$(mc_repo mc1 rd-workflow-workspace/.lifecycle/task-state 'status=a' 'status=b' 'status=c')"
+  mc_run "$SCRIPT_DIR/_merge_precheck.sh" "$r"
+  [[ "$RC" -eq 0 && -z "$OUT" ]] && pass "task-state 만 충돌 → rc 0, 경로 없음 (P1)" || fail "P1: rc=$RC out=$OUT err=$ERR"
+}
+test_precheck_index_merge_fails() {
+  local r b; b="$MC_HDR"$'\n'"$(mc_row a)"$'\n<!-- 시작\n끝 -->\n'"$(mc_row b)"
+  r="$(mc_repo mc2 "$MC_IDX" "$b" "$b"$'\n'"$(mc_row x)" "$b"$'\n'"$(mc_row y)")"
+  mc_run "$SCRIPT_DIR/_merge_precheck.sh" "$r"
+  [[ "$RC" -eq 1 && "$OUT" == "$MC_IDX" ]] && pass "병합기 실패 인덱스 → rc 1, 인덱스 경로 출력 (P2)" || fail "P2: rc=$RC out=$OUT err=$ERR"
+  [[ "$ERR" == *"rd_merge_conflicts: FUTURE_REQUESTS.md 는 자동 병합할 수 없습니다 —"* ]] && pass "병합기 실패 사유를 stderr 에 냄 (P2)" || fail "P2 stderr: err=$ERR"
+}
+test_precheck_index_merge_ok() {
+  local r; r="$(mc_repo mc3 "$MC_IDX" "$MC_HDR"$'\n'"$(mc_row a)" "$MC_HDR"$'\n'"$(mc_row a)"$'\n'"$(mc_row x)" "$MC_HDR"$'\n'"$(mc_row a)"$'\n'"$(mc_row y)")"
+  mc_run "$SCRIPT_DIR/_merge_precheck.sh" "$r"
+  [[ "$RC" -eq 0 && -z "$OUT" ]] && pass "서로 다른 행 추가 충돌은 병합기가 풀어 rc 0 (P3)" || fail "P3: rc=$RC out=$OUT err=$ERR"
+}
+test_precheck_merger_missing() {
+  local r lib="$TMP/mc4-lib"
+  r="$(mc_repo mc4 "$MC_IDX" "$MC_HDR"$'\n'"$(mc_row a)" "$MC_HDR"$'\n'"$(mc_row a)"$'\n'"$(mc_row x)" "$MC_HDR"$'\n'"$(mc_row a)"$'\n'"$(mc_row y)")"
+  mkdir -p "$lib"; cp "$SCRIPT_DIR/_merge_precheck.sh" "$lib/"
+  mc_run "$lib/_merge_precheck.sh" "$r"
+  [[ "$RC" -eq 3 ]] && pass "병합기 파일이 없으면 인덱스 충돌은 판정 불가 rc 3 (P4)" || fail "P4: rc=$RC out=$OUT err=$ERR"
+}
+# gitlink 자동 해소 사례 (G1~G7, spec 2026-11-18-0900 D1-1~D1-3). 상위 저장소(master)와 submodule 의 팀 bare 저장소를 만든다.
+#   submodule 커밋은 linked worktree 의 submodule 에서 만들고 push 하지 않는다 — 기본 체크아웃 submodule 과 팀 원격에는 없다.
+mg() { git -c user.name=rd-test -c user.email=rd-test@example.invalid -c protocol.file.allow=always "$@"; }
+# mc_gl_repo <name> [<submodule 경로>]: 상위 저장소 $TMP/<name>(master 에 submodule 하나)을 만든다.
+mc_gl_repo() {
+  local r="$TMP/$1" team="$TMP/$1-team.git" seed="$TMP/$1-seed" sp="${2:-sub}"
+  git init -q --bare -b master "$team"
+  git init -q -b master "$seed"; mg -C "$seed" commit -q --allow-empty -m c0; git -C "$seed" push -q "$team" master 2>/dev/null
+  git init -q -b master "$r"
+  mg -C "$r" submodule add -q "$team" "$sp" 2>/dev/null
+  mg -C "$r" commit -q -m base
+}
+# mc_gl_wt <repo> <branch> [<start>]: linked worktree $TMP/<repo 이름>-<branch> 를 만들고 submodule 을 초기화한다.
+mc_gl_wt() {
+  local w="$1-$2"
+  git -C "$1" worktree add -q -b "$2" "$w" "${3:-master}" 2>/dev/null
+  mg -C "$w" submodule update -q --init 2>/dev/null
+}
+# mc_gl_ci <submodule dir> <msg>: 빈 커밋을 만들고 OID 를 낸다.
+mc_gl_ci() { mg -C "$1" commit -q --allow-empty -m "$2"; git -C "$1" rev-parse HEAD; }
+# mc_gl_take <dst submodule> <src submodule> <oid>: src 의 커밋을 받아 detach 로 체크아웃한다.
+mc_gl_take() { mg -C "$1" fetch -q "$2" "$3" 2>/dev/null; git -C "$1" checkout -q --detach "$3"; }
+# mc_gl_set <worktree> [<경로>]: submodule gitlink 를 커밋한다.
+mc_gl_set() { mg -C "$1" add "${2:-sub}"; mg -C "$1" commit -q -m "gitlink ${2:-sub}"; }
+# mc_gl_run <repo> [--gitlink-auto]: rd_merge_conflicts <repo> ours theirs 를 불러 $OUT·$ERR·$RC 에 담는다.
+#   _state_common.sh 를 먼저 source 한다(호출부가 _lifecycle_common.sh 를 먼저 source 하는 것과 같은 전제).
+mc_gl_run() {
+  OUT="$(bash -c 'source "$1/../_state_common.sh"; source "$1/_merge_precheck.sh"; rd_merge_conflicts "$2" ours theirs ${3:+"$3"}' _ "$SCRIPT_DIR" "$1" "${2:-}" 2>"$1.err")"; RC=$?
+  ERR="$(cat "$1.err")"
+}
+test_gitlink_desc_and_optin() {
+  local r a b; mc_gl_repo gl1; r="$TMP/gl1"
+  mc_gl_wt "$r" ours; mc_gl_wt "$r" theirs
+  a="$(mc_gl_ci "$r-ours/sub" A)"; mc_gl_set "$r-ours"
+  mc_gl_take "$r-theirs/sub" "$r-ours/sub" "$a"; b="$(mc_gl_ci "$r-theirs/sub" B)"; mc_gl_set "$r-theirs"
+  git -C "$r/sub" cat-file -e "$a^{commit}" 2>/dev/null && { fail "G1 준비: 기본 체크아웃 submodule 에 A 가 있음"; return; }
+  mc_gl_run "$r" --gitlink-auto
+  [[ "$RC" -eq 0 && -z "$OUT" ]] && pass "조상·자손 gitlink(작업 worktree 에만 있음) → --gitlink-auto 로 rc 0 (G1)" || fail "G1: rc=$RC out=$OUT err=$ERR"
+  mc_gl_run "$r"
+  [[ "$RC" -eq 1 && "$OUT" == sub ]] && pass "--gitlink-auto 없으면 조상·자손도 충돌 rc 1 (G3)" || fail "G3: rc=$RC out=$OUT err=$ERR"
+}
+# pq_merge_check 는 발행 대상 커밋의 archive_publish 가 push 일 때만 gitlink 자동 해소를 켭니다.
+# 없으면 새는 실수: 직접 설치 PR(pr) 작업의 큐 요청·허가 판정이 조상·자손 gitlink 충돌을 지워, archive 의 P4 에서야 막힙니다.
+test_gitlink_pr_mode_no_auto() {
+  local r a; mc_gl_repo gl8; r="$TMP/gl8"
+  mc_gl_wt "$r" ours; mc_gl_wt "$r" theirs
+  a="$(mc_gl_ci "$r-ours/sub" A)"; mc_gl_set "$r-ours"
+  mc_gl_take "$r-theirs/sub" "$r-ours/sub" "$a"; mc_gl_ci "$r-theirs/sub" B >/dev/null; mc_gl_set "$r-theirs"
+  pq_mc() { OUT="$(project_root="$1" bash -c 'source "$1"; pq_merge_check ours theirs' _ "$PQ" 2>"$1.err")"; RC=$?; ERR="$(cat "$1.err")"; }
+  pq_mc "$r"
+  [[ "$RC" -eq 0 && -z "$OUT" ]] && pass "archive_publish 없음(push) → pq_merge_check 가 조상·자손 gitlink 를 자동 해소 rc 0" || fail "push: rc=$RC out=$OUT err=$ERR"
+  mkdir -p "$r-theirs/rd-workflow/config"; printf '{"archive_publish":"pr"}\n' >"$r-theirs/rd-workflow/config/workflow.json"
+  mg -C "$r-theirs" add rd-workflow/config/workflow.json; mg -C "$r-theirs" commit -q -m pr
+  pq_mc "$r"
+  [[ "$RC" -eq 1 && "$OUT" == sub ]] && pass "archive_publish=pr → pq_merge_check 가 자동 해소 없이 충돌 rc 1, sub" || fail "pr: rc=$RC out=$OUT err=$ERR"
+}
+test_gitlink_diverged() {
+  local r; mc_gl_repo gl2; r="$TMP/gl2"
+  mc_gl_wt "$r" ours; mc_gl_wt "$r" theirs
+  mc_gl_ci "$r-ours/sub" A >/dev/null; mc_gl_set "$r-ours"
+  mc_gl_ci "$r-theirs/sub" D >/dev/null; mc_gl_set "$r-theirs"
+  mc_gl_run "$r" --gitlink-auto
+  [[ "$RC" -eq 1 && "$OUT" == sub ]] && pass "갈라진 gitlink → --gitlink-auto 로도 rc 1, sub (G2)" || fail "G2: rc=$RC out=$OUT err=$ERR"
+}
+test_gitlink_fetch_timeout() {
+  # AC0: 객체가 어디에도 없고 submodule 원격이 응답하지 않으면 상한 안에 rc 3, 하위 프로세스 종료, fetch 는 경로당 한 번.
+  local r h0 h1 res t0 el pk="$TMP/gl4.pid" ck="$TMP/gl4.cnt"
+  mc_gl_repo gl4; r="$TMP/gl4"
+  git -C "$r/sub" config remote.origin.uploadpack "echo \$\$ > '$pk'; echo x >> '$ck'; sleep 30; git-upload-pack"
+  mg -C "$r" branch ours; mg -C "$r" branch theirs
+  git -C "$r" checkout -q ours; mg -C "$r" update-index --cacheinfo "160000,1111111111111111111111111111111111111111,sub"; mg -C "$r" commit -q -m o
+  git -C "$r" checkout -q theirs; mg -C "$r" update-index --cacheinfo "160000,2222222222222222222222222222222222222222,sub"; mg -C "$r" commit -q -m t
+  git -C "$r" checkout -q master; mg -C "$r" submodule update -q 2>/dev/null
+  h0="$(git -C "$r" rev-parse master)"; t0=$SECONDS
+  res="$(RD_MERGE_FETCH_TIMEOUT=1 bash -c '
+    source "$1/../_state_common.sh"; source "$1/_merge_precheck.sh"
+    s=$SECONDS; rc1=0; rd_merge_gitlink_pick "$2" sub 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 || rc1=$?
+    el=$((SECONDS - s)); kids="$(pgrep -P $$ | tr "\n" " ")"
+    rc2=0; out="$(rd_merge_conflicts "$2" ours theirs --gitlink-auto)" || rc2=$?
+    printf "rc1=%s el=%s kids=[%s] rc2=%s out=%s\n" "$rc1" "$el" "$kids" "$rc2" "$out"' _ "$SCRIPT_DIR" "$r" 2>"$r.err")"
+  el=$((SECONDS - t0)); ERR="$(cat "$r.err")"
+  h1="$(git -C "$r" rev-parse master)"
+  [[ "$res" == "rc1=3 "* ]] && pass "fetch 시간 초과 → pick rc 3 (G4)" || fail "G4 rc: $res err=$ERR"
+  # 경과는 pick 호출 하나만 잰다(res 의 el). 보장은 fetch 상한 + 4초(5초)지만 pick 은 그 앞뒤로 객체 조회(git 여러 번)를
+  # 더 하고, 공유 머신의 병렬 부하에서 벽시계가 8초까지 늘었다(실측). 문턱 15초는 상한이 없어 30초 sleep 을 기다리는
+  # 퇴행을 잡기 위한 값이다. 정밀한 「상한 + 4초」 는 git 을 거치지 않는 G4b(2) 가 본다.
+  [[ "$res" =~ el=([0-9]|1[0-5])\  ]] && pass "상한 안에 반환 — 무한 대기 없음 (G4)" || fail "G4 경과: 전체 ${el}s res=$res"
+  [[ "$ERR" == *"rd_merge_conflicts: submodule sub fetch 가 1초 안에 끝나지 않아 중단했습니다"* ]] && pass "초과 안내 한 줄 (G4)" || fail "G4 안내: err=$ERR"
+  [[ -s "$pk" ]] && ! kill -0 "$(cat "$pk")" 2>/dev/null && pass "반환 뒤 전송 하위 프로세스가 살아 있지 않음 (G4)" || fail "G4 하위 프로세스: pid=$(cat "$pk" 2>/dev/null)"
+  [[ "$res" == *"kids=[]"* ]] && pass "반환 뒤 감시 프로세스가 남지 않음 (G4)" || fail "G4 감시: $res"
+  [[ "$res" == *"rc2=1 out=sub" && "$h0" == "$h1" ]] && pass "사전 판정은 그 경로를 충돌로 냄, 기본 브랜치 불변 (G4)" || fail "G4 사전 판정: $res"
+  [[ "$(grep -c . "$ck" 2>/dev/null)" == 1 ]] && pass "같은 셸에서 경로당 fetch 한 번 (G4)" || fail "G4 횟수: $(cat "$ck" 2>/dev/null)"
+}
+test_gitlink_rollback() {
+  # AC2c: 기준 X, ours = X 의 자손 B, theirs = X 의 조상 A(롤백) → 자손을 고르지 않는다.
+  local r a x; mc_gl_repo gl5; r="$TMP/gl5"
+  a="$(mc_gl_ci "$r/sub" A)"; x="$(mc_gl_ci "$r/sub" X)"; git -C "$r/sub" push -q origin HEAD:master 2>/dev/null; mc_gl_set "$r"
+  mc_gl_wt "$r" ours; mc_gl_wt "$r" theirs
+  mc_gl_ci "$r-ours/sub" B >/dev/null; mc_gl_set "$r-ours"
+  git -C "$r-theirs/sub" checkout -q --detach "$a"; mc_gl_set "$r-theirs"
+  mc_gl_run "$r" --gitlink-auto
+  [[ "$RC" -eq 1 && "$OUT" == sub ]] && pass "롤백 충돌 → --gitlink-auto 로도 rc 1, sub (G5)" || fail "G5: rc=$RC out=$OUT err=$ERR"
+}
+test_gitlink_crisscross() {
+  # AC2e: 병합 기준이 둘이면 조상·자손 gitlink 라도 자동 해소하지 않는다.
+  local r a n mt; mc_gl_repo gl6; r="$TMP/gl6"
+  git -C "$r" checkout -q -b p master; printf 'p\n' >"$r/p.txt"; mg -C "$r" add p.txt; mg -C "$r" commit -q -m P
+  git -C "$r" checkout -q -b q master; printf 'q\n' >"$r/q.txt"; mg -C "$r" add q.txt; mg -C "$r" commit -q -m Q
+  git -C "$r" checkout -q master
+  mc_gl_wt "$r" ours p; mc_gl_wt "$r" theirs q
+  mg -C "$r-ours" merge -q --no-edit q; mg -C "$r-theirs" merge -q --no-edit p
+  a="$(mc_gl_ci "$r-ours/sub" A)"; mc_gl_set "$r-ours"
+  mc_gl_take "$r-theirs/sub" "$r-ours/sub" "$a"; mc_gl_ci "$r-theirs/sub" B >/dev/null; mc_gl_set "$r-theirs"
+  n="$(git -C "$r" merge-base --all ours theirs | grep -c .)"
+  mt="$(git -C "$r" merge-tree --write-tree --name-only --no-messages ours theirs 2>/dev/null | sed -n '2,$p')"
+  [[ "$n" -eq 2 && "$mt" == sub ]] || { fail "G6 준비: merge-base ${n}개, merge-tree 충돌=[$mt]"; return; }
+  mc_gl_run "$r" --gitlink-auto
+  [[ "$RC" -eq 1 && "$OUT" == sub ]] && pass "교차 병합 → --gitlink-auto 로도 rc 1, sub (G6)" || fail "G6: rc=$RC out=$OUT err=$ERR"
+}
+test_gitlink_base_not_gitlink() {
+  # 기준의 일반 파일 sub 를 두 줄기가 gitlink 로 바꿈 → 기준 gitlink 없이 판정해 rc 0.
+  local r a b; mc_gl_repo gl7 lib; r="$TMP/gl7"
+  printf 'f\n' >"$r/sub"; mg -C "$r" add sub; mg -C "$r" commit -q -m "file sub"
+  mc_gl_wt "$r" ours; mc_gl_wt "$r" theirs
+  a="$(mc_gl_ci "$r-ours/lib" A)"
+  mg -C "$r-ours" rm -q sub; mg -C "$r-ours" update-index --add --cacheinfo "160000,$a,sub"; mg -C "$r-ours" commit -q -m "sub gl A"
+  mc_gl_take "$r-theirs/lib" "$r-ours/lib" "$a"; b="$(mc_gl_ci "$r-theirs/lib" B)"
+  mg -C "$r-theirs" rm -q sub; mg -C "$r-theirs" update-index --add --cacheinfo "160000,$b,sub"; mg -C "$r-theirs" commit -q -m "sub gl B"
+  mc_gl_run "$r" --gitlink-auto
+  [[ "$RC" -eq 0 && -z "$OUT" ]] && pass "기준이 일반 파일인 gitlink 조상·자손 → rc 0 (G7)" || fail "G7: rc=$RC out=$OUT err=$ERR"
+}
+test_run_limited() {
+  # AC0 실행기: (1) 정상 종료 뒤 감시 sleep 회수 (2) 부모는 TERM 으로 끝나고 자식만 TERM 무시 → 그룹 KILL.
+  local wf="$TMP/rl.wpid" pp="$TMP/rl.ppid" cp="$TMP/rl.cpid" res
+  # (1) 은 감시 sleep 을 pgrep 으로 찾는다. pgrep 이 프로세스 목록을 얻지 못하는 환경(macOS 기본 PATH 의 「Cannot get process
+  #   list」)에서는 찾을 수 없어 건너뛰고 표식을 낸다. 찾는 대기는 10초로 끊는다.
+  if pgrep -f . >/dev/null 2>&1; then
+    res="$(bash -c 'source "$1/_merge_precheck.sh"; s=$SECONDS; rc=0
+      rd_run_limited 4271 "$2.err" bash -c '"'"'t0=$SECONDS; until p="$(pgrep -f "^sleep 4271$")"; do [[ $((SECONDS - t0)) -lt 10 ]] || exit 1; sleep 0.05; done; echo "$p" > "$1"'"'"' _ "$2" >/dev/null || rc=$?
+      printf "rc=%s el=%s\n" "$rc" "$((SECONDS - s))"' _ "$SCRIPT_DIR" "$wf" 2>/dev/null)"
+    [[ "$res" == "rc=0 el="[0-2] ]] && pass "rd_run_limited 정상 종료 → rc 0, 2초 안 (G4b)" || fail "G4b(1): $res"
+    [[ -s "$wf" ]] && ! kill -0 "$(cat "$wf")" 2>/dev/null && pass "반환 뒤 감시 sleep 이 남지 않음 (G4b)" || fail "G4b(1) 감시 sleep 생존: pid=$(cat "$wf" 2>/dev/null)"
+  else
+    printf 'env-skip: test_publish_queue test_run_limited G4b(1) — pgrep 으로 프로세스 목록을 얻을 수 없는 환경(감시 sleep 관측 불가)\n' >&2
+    printf 'S\n' >>"$TMP/cnt"
+  fi
+  res="$(bash -c 'source "$1/_merge_precheck.sh"; s=$SECONDS; rc=0
+    rd_run_limited 1 "$2.err" bash -c '"'"'echo $$ > "$1"; (trap "" TERM; exec sleep 30) & echo $! > "$2"; wait'"'"' _ "$2" "$3" >/dev/null || rc=$?
+    printf "rc=%s el=%s\n" "$rc" "$((SECONDS - s))"' _ "$SCRIPT_DIR" "$pp" "$cp" 2>/dev/null)"
+  [[ "$res" == "rc=124 el="[0-5] ]] && pass "TERM 무시 자식 → rc 124, 5초 안 (G4b)" || fail "G4b(2): $res"
+  [[ -s "$pp" && -s "$cp" ]] && ! kill -0 "$(cat "$pp")" 2>/dev/null && ! kill -0 "$(cat "$cp")" 2>/dev/null \
+    && pass "반환 뒤 부모·자식 모두 종료 (G4b)" || fail "G4b(2) 생존: parent=$(cat "$pp" 2>/dev/null) child=$(cat "$cp" 2>/dev/null)"
 }
 test_request_undecidable() {
   local W; W="$(mk_work rq11 pq-j)"
@@ -765,6 +980,40 @@ test_wait_caller_lost() {
   bgend "$p"
 }
 getk_in() { pqf "$1" "pq_get '$2' $3"; }
+# 감시 생존 표시 (publish-wait-no-watch-liveness)
+test_request_watch_warning() {
+  local W W2 ww; W="$(mk_work rw1 pw-a)"
+  set_beat_at "$W" none
+  pq "$W" request; ww="$(getk_in "$W" pw-a watch-warned)"
+  [[ "$RC" -eq 0 && "$OUT" == *"호출 세션의 감시가 없습니다 (생존 표시 없음)"* && "$ww" == none ]] \
+    && pass "감시 없음 → request rc 0 + 경고, 알린 공백 기록" || fail "request 감시 없음: rc=$RC ww=$ww out=$OUT"
+  W2="$(mk_work rw2 pw-b)"
+  pq "$W2" request
+  [[ "$RC" -eq 0 && "$OUT" != *"감시가 없습니다"* ]] && pass "감시 있음 → request 경고 없음" || fail "request 감시 있음: rc=$RC out=$OUT"
+}
+test_wait_watch_gone() {
+  local W rc out; W="$(mk_work rw3 pw-c)"
+  mkreq "$W" pw-c state=requested seq=1
+  set_beat_at "$W" 1000
+  runlim 60 "$W" wait --timeout 60; rc=$RC; out="$OUT"
+  if [[ "$rc" -eq 5 && "$out" == *"호출 세션의 감시가 없습니다"* && "$(getk_in "$W" pw-c state)" == requested ]]; then
+    pass "wait 중 감시 낡음 → rc 5, 경고, 요청은 requested 그대로"
+  else
+    fail "wait 감시 낡음: rc=$rc state=$(getk_in "$W" pw-c state) out=$out"
+  fi
+  # 같은 공백으로 다시 띄운 wait 는 곧바로 끝나지 않고 기다린다
+  runlim 60 "$W" wait --timeout 1; rc=$RC
+  [[ "$rc" -eq 4 ]] && pass "같은 감시 공백은 다시 띄운 wait 가 기다림" || fail "같은 공백 재대기: rc=$rc out=$OUT"
+}
+test_watch_no_default_timeout() {
+  # 시한 유무는 실제로 기다리지 않고 가린다. sleep 대역이 부를 때마다 SECONDS 를 4000초 앞당기고, 5번째에 끝낸다.
+  # 기본 시한(옛 3600초)이 있으면 두 번째 반복에서 rc 4 로 끝나 대역 끝 표식이 나오지 않는다.
+  local M2 out who; M2="$(mk_repo rw4)"
+  out="$(pqf "$M2" 'n=0; sleep() { n=$((n+1)); [[ $n -ge 5 ]] && { echo STUB-END; exit 0; }; SECONDS=$((SECONDS+4000)); }; pq_cmd_watch' 2>&1)"
+  who="$(sed -n 's/^who=//p' "$(pqf "$M2" pq_dir)/WATCH" 2>/dev/null)"
+  [[ "$out" == *STUB-END* && "$out" != *"변화 없음"* && "$who" == watch ]] \
+    && pass "watch 인자 없음 → 시한 없이 계속 돌고 생존 표시를 남김" || fail "watch 기본 시한: who=$who out=$out"
+}
 test_watch_on_request() {
   local M2 rc; M2="$(mk_repo wt4)"
   bgrun "$M2" "$TMP/wt4.out" watch --timeout 60; local p=$BGPID
@@ -1017,7 +1266,7 @@ test_run_bypass_hint() {
 }
 
 SEQ_CASES="test_config_default_caller test_config_invalid_user test_config_file_without_key test_cancel_granted_releases_slot test_cancel_running_refused test_cancel_terminal_and_missing test_cancel_more_states test_status_line test_status_orders_by_seq test_corrupt_req_is_undecidable test_stale_lock_reclaimed test_stale_guard_cleared test_lock_reclaim_rechecks_pid test_lock_without_pid test_unlock_not_owner test_live_lock_blocks test_unimplemented_and_usage"
-PAR_CASES="test_slot_state_must_hold test_prune_done_path_with_space test_request_user_mode test_request_no_caller test_request_preconditions test_request_auto_files_ok test_request_hangul_conflict test_request_auto_plus_code test_request_newline_path test_request_undecidable test_request_caller_lost test_request_duplicate_updates test_next_blocked_by_merge_head test_next_oldest_first test_next_parallel_single_grant test_next_refuses_with_corrupt test_approve_user_approval test_run_without_grant test_run_twice test_run_head_changed test_run_success test_partial_retry test_partial_reverify_keeps_slot test_recover_alive_pid test_recover_not_merged test_status_points_recover test_recover_orphan_archive test_recover_lock_owner test_exec_refused_after_recover test_exec_records_pgid_then_recover_refused test_exec_stale_token_next_generation test_exec_refused_non_running_state test_run_failed_reason_last_line test_wait_wakes_on_grant test_wait_timeout test_wait_caller_lost test_watch_on_request test_watch_on_result test_watch_result_between_watches test_real_archive_partial_recovery test_status_wait_reason test_recover_ps_fail test_exec_ps_fail test_request_bypass_rejects test_request_bypass_passes test_request_bypass_cleared test_run_bypass_hint test_user_approval_bypass_shown"
+PAR_CASES="test_slot_state_must_hold test_prune_done_path_with_space test_request_user_mode test_request_no_caller test_request_preconditions test_request_auto_files_ok test_request_hangul_conflict test_request_auto_plus_code test_request_newline_path test_precheck_task_state_auto test_precheck_index_merge_fails test_precheck_index_merge_ok test_precheck_merger_missing test_gitlink_desc_and_optin test_gitlink_pr_mode_no_auto test_gitlink_diverged test_gitlink_fetch_timeout test_gitlink_rollback test_gitlink_crisscross test_gitlink_base_not_gitlink test_run_limited test_request_undecidable test_request_caller_lost test_request_duplicate_updates test_next_blocked_by_merge_head test_next_oldest_first test_next_parallel_single_grant test_next_refuses_with_corrupt test_approve_user_approval test_run_without_grant test_run_twice test_run_head_changed test_run_success test_partial_retry test_partial_reverify_keeps_slot test_recover_alive_pid test_recover_not_merged test_status_points_recover test_recover_orphan_archive test_recover_lock_owner test_exec_refused_after_recover test_exec_records_pgid_then_recover_refused test_exec_stale_token_next_generation test_exec_refused_non_running_state test_run_failed_reason_last_line test_wait_wakes_on_grant test_wait_timeout test_wait_caller_lost test_request_watch_warning test_wait_watch_gone test_watch_no_default_timeout test_watch_on_request test_watch_on_result test_watch_result_between_watches test_real_archive_partial_recovery test_status_wait_reason test_recover_ps_fail test_exec_ps_fail test_request_bypass_rejects test_request_bypass_passes test_request_bypass_cleared test_run_bypass_hint test_user_approval_bypass_shown"
 want() { [[ -z "${PQ_TEST_ONLY:-}" || "$PQ_TEST_ONLY" == "$1" ]]; }
 # 실제 ps 를 한 번 실행해 쓸 수 있는지 정한다(샌드박스 등에서는 실패).
 PQ_PS_OK=0

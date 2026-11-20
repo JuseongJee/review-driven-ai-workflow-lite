@@ -254,15 +254,16 @@ EOT
       if [[ -z "$st" ]]; then bad=1; break; fi
       if [[ "$om" == "160000" && "$nm" == "160000" ]]; then
         local ida idb
-        ida="$(rd_gitlink_content_id "${root}/${path}" "$oo" "$cdir")" || { bad=1; break; }
-        idb="$(rd_gitlink_content_id "${root}/${path}" "$no" "$cdir")" || { bad=1; break; }
+        # 셀 커밋은 그 커밋 기준으로 정합니다 — old 는 merge-base 의 기록, new 는 대상 커밋의 기록 (spec 3.1).
+        ida="$(rd_gitlink_content_id "${root}/${path}" "$(rd_gitlink_seal_oid "$root" "$mb" "$path" "$oo" "$cdir")" "$cdir")" || { bad=1; break; }
+        idb="$(rd_gitlink_content_id "${root}/${path}" "$(rd_gitlink_seal_oid "$root" "$oid" "$path" "$no" "$cdir")" "$cdir")" || { bad=1; break; }
         [[ "$ida" == "$idb" ]] && continue
       fi
       if [[ "$nm" == "000000" ]]; then
         printf '000000 deleted\t%s\0' "$path"
       elif [[ "$nm" == "160000" ]]; then
         local idn
-        idn="$(rd_gitlink_content_id "${root}/${path}" "$no" "$cdir")" || { bad=1; break; }
+        idn="$(rd_gitlink_content_id "${root}/${path}" "$(rd_gitlink_seal_oid "$root" "$oid" "$path" "$no" "$cdir")" "$cdir")" || { bad=1; break; }
         printf '160000 content %s\t%s\0' "$idn" "$path"
       else
         printf '%s %s\t%s\0' "$nm" "$no" "$path"
@@ -541,13 +542,20 @@ _rd_seal_legacy_warning() {
 # `rd_seal_verify` 를 다시 부르는 방식은 성립하지 않습니다 — 그래서 해시를 값으로 넘깁니다.
 # 우회(`--force-skip-review-check`) 로 통과한 경우에는 승인한 해시가 없으므로 빈 값입니다.
 #
+# **승인한 커밋 OID 도 함께 남깁니다 (`RD_ARCHIVE_REVIEWED_OID`, change spec 2026-11-18-0900 D3-3).**
+# `rd_seal_verify` 가 승인한 `target` 커밋입니다. no-fr 발행 직전 재대조(`archive_publish_rebind_check`)가
+# 이 커밋의 PR 기록으로 보호 트리 해시를 셉니다(정리 커밋은 PR 기록을 지우므로). 해시와 같은 규칙으로
+# 첫머리에서 비우고 승인에 성공한 경로에서만 채우므로, 우회·실패에서는 빈 값입니다.
+#
 # 사용: archive_review_precheck <force_skip 0|1> <reason> <slug> <audit_log> [fr_branch]
 #       return 0=진행, 1=차단. 인자 형태는 종전과 같습니다.
 RD_ARCHIVE_REVIEWED_TREE_HASH=""
+RD_ARCHIVE_REVIEWED_OID=""
 archive_review_precheck() {
   local force_skip="$1" reason="$2" slug="$3" audit_log="$4" fr_ref="${5:-}"
   local mode="" target="" audit_ref="" ok=1 fail_msg=""
   RD_ARCHIVE_REVIEWED_TREE_HASH=""
+  RD_ARCHIVE_REVIEWED_OID=""
 
   if [[ -z "$fr_ref" ]]; then
     fr_ref="$(state_read_field "fr-branch")"
@@ -595,6 +603,7 @@ archive_review_precheck() {
 
   if [[ "$ok" -eq 0 ]]; then
     RD_ARCHIVE_REVIEWED_TREE_HASH="$RD_SEAL_TREE_HASH"
+    RD_ARCHIVE_REVIEWED_OID="$target"
     [[ "$RD_SEAL_VERIFIED" == "legacy-unverified" ]] && _rd_seal_legacy_warning
     return 0
   fi
@@ -713,7 +722,7 @@ archive_status_precheck() {
   return 0
 }
 
-# archive_publish_rebind_check <승인된 보호 트리 해시> <발행 대상 commit>
+# archive_publish_rebind_check <승인된 보호 트리 해시> <발행 대상 commit> [기록 커밋]
 #
 # precheck 가 승인한 트리와 **실제로 발행할 commit** 의 트리를 다시 결속합니다 (§2.2·§3.3.1).
 #
@@ -723,16 +732,29 @@ archive_status_precheck() {
 # 되돌리므로 이 시점에 `rd_seal_verify` 를 다시 부를 수는 없습니다 — 그래서 승인 시점의
 # 해시를 값으로 받아 대조합니다.
 #
+# 기록 커밋(셋째 인자, change spec 2026-11-18-0900 D3-3): 해시를 셀 때 PR 기록을 읽을 커밋입니다
+# (`rd_protected_tree_hash <발행 대상> <기록 커밋>`). no-fr 은 리뷰 검사가 승인한 정리 전 커밋
+# (`RD_ARCHIVE_REVIEWED_OID`)을 넘깁니다 — 정리 커밋은 PR 기록을 지우므로, 발행 대상에서 다시 읽으면
+# PR merge 로 옮긴 포인터가 merged 커밋의 실제 내용으로 세어집니다. 인자가 둘이면 종전과 같습니다(발행
+# 대상의 기록). 인자를 셋 넘겼는데 빈 값이고 승인 해시가 있으면 승인한 커밋을 모르는 것이므로 판정 불가로 막습니다.
+#
 #   return 0 — 일치. 발행해도 됩니다.
-#   return 1 — 불일치. 미검토 코드가 섞였습니다.
+#   return 1 — 불일치. 미검토 코드가 섞였거나, 기록 커밋 인자가 빈 값입니다.
 #   return 2 — 판정 불가 (인자 누락 또는 해시 계산 실패). fail-closed 라 통과가 아닙니다.
 archive_publish_rebind_check() {
-  local reviewed="${1-}" publish_oid="${2-}" cur=""
+  local reviewed="${1-}" publish_oid="${2-}" rec="" cur=""
+  if [[ "$#" -ge 3 ]]; then
+    rec="${3-}"
+    if [[ -z "$rec" && -n "$reviewed" ]]; then
+      echo "archive: 승인한 커밋을 알 수 없어 발행 대상을 판정할 수 없습니다 — 리뷰 검사가 승인한 커밋(기록 커밋)이 비어 있습니다." >&2
+      return 1
+    fi
+  fi
   if [[ -z "$reviewed" || -z "$publish_oid" ]]; then
     echo "archive: 발행 재대조에 필요한 값이 없습니다 (승인 해시 또는 발행 대상) — 판정 불가로 차단합니다." >&2
     return 2
   fi
-  cur="$(rd_protected_tree_hash "$publish_oid" 2>/dev/null)" || {
+  cur="$(rd_protected_tree_hash "$publish_oid" "$rec" 2>/dev/null)" || {
     echo "archive: 발행 대상의 보호 트리 해시를 계산할 수 없습니다 — 판정 불가로 차단합니다." >&2
     return 2
   }

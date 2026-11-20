@@ -614,6 +614,18 @@ case "$_hook_last_err" in
 esac
 status_case "gate 2g: 빈 Status + 보호 파일 staged → 차단 (fail-closed)" "" 2
 status_case "gate 2h: 검증 중 뒤에 공백이 붙은 값 → 차단 (정확 일치)" "검증 중 " 2
+
+# --- gate 3: PR 검토 중 (D11) — 기록 경로만 허용, 코드는 차단 + 구현 중 안내 ---
+# 없으면 새는 실수: 팀 PR 검토를 기다리는 동안 코드 커밋이 통과해 PR 과 어긋나거나, 기록 커밋까지 막힙니다.
+# 기록 경로 단언은 이미 기록 경로인 CURRENT_TASK.md 로 합니다.
+git -C "$FX" reset --hard -q HEAD >/dev/null 2>&1
+set_fr_status idea
+set_state_status "$FX" "PR 검토 중"
+printf '%s\n' "# Current Task" "note" > "$FX/CURRENT_TASK.md"
+git -C "$FX" add -A >/dev/null 2>&1
+run_hook "$FX"
+assert_eq "gate 3a: t_pr_review_records_only_allowed — PR 검토 중 + 기록 경로만 staged → 통과" "0" "$_hook_last_exit"
+status_case "gate 3b: t_pr_review_code_blocked — PR 검토 중 + 보호 파일 staged → 차단 + 구현 중 안내" "PR 검토 중" 2 'rd task set-status "구현 중"'
 git -C "$FX" reset --hard -q HEAD >/dev/null 2>&1
 
 # 트리 해시: archive content commit 은 해시를 바꾸지 않습니다.
@@ -728,6 +740,7 @@ expected_record_paths="$(printf '%s\n' \
   "rd-workflow-workspace/.lifecycle/review-skip-audit.log" \
   "rd-workflow-workspace/.lifecycle/stage_metrics.tsv" \
   "rd-workflow-workspace/.lifecycle/task-state" \
+  "rd-workflow-workspace/.lifecycle/team-prs.tsv" \
   "rd-workflow-workspace/backlog/" \
   "rd-workflow-workspace/handoffs/review_pipeline/" \
   "rd-workflow-workspace/raw-captures/" \
@@ -739,7 +752,7 @@ actual_record_paths="$(sc_run "$FX" "$FX" "$FX" 'printf "%s\n" "${RD_RECORD_PATH
 # 목록에 항목을 더하려면 반드시 여기 기대값도 고쳐야 하므로, 제외 확대가 diff 에 두 번
 # 나타나 리뷰어 눈에 띕니다. 「구현 상수를 그대로 베낀 기대값」 금지 규칙의 예외이며,
 # 자동 생성으로 바꾸면 tripwire 로서의 목적이 사라집니다.
-assert_eq "record-paths 4b: RD_RECORD_PATHS 가 change-spec §3.1 의 12개 항목과 정확히 일치" \
+assert_eq "record-paths 4b: RD_RECORD_PATHS 가 change-spec §3.1 의 13개 항목과 정확히 일치(team-prs.tsv 는 publish-via-pull-request spec 3.1·D4)" \
   "$expected_record_paths" "$actual_record_paths"
 
 # 목록 밖 `.lifecycle/` 파일은 보호 대상이어야 합니다 — 바꾸면 해시가 바뀝니다.

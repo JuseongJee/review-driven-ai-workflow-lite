@@ -17,7 +17,7 @@ FUTURE_REQUESTS에서 작업을 선택하고 파이프라인을 자율 실행한
 
 ```bash
 bash -s <<'RD_SKILL_COMPAT'
-RD_SKILL_BASE=2026-11-07-210251 RD_SKILL_NAME=autopilot
+RD_SKILL_BASE=2026-11-08-092219 RD_SKILL_NAME=autopilot
 vf="rd-workflow/VERSION"
 if [ ! -f "$vf" ] && [ -f "_ROOT_FILES/rd-workflow/VERSION" ]; then exit 0; fi
 v=""; [ -f "$vf" ] && v="$(cat "$vf")"; v="${v#lite-}"
@@ -311,6 +311,7 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
 - 최신 Reviewer 턴이 "이의 없음"을 명시할 때까지 반복한다
 - 50턴 도달 시 `awaiting-user`로 전환하고 사용자에게 보고한다 (일반 review의 20턴 대신 50턴)
 - Reviewer 피드백으로 수정이 필요하면 자율적으로 반영한다
+- REQUEST review 의 `분할:` 발견은 `rd-workflow/claude_skills/request-to-reviewed-plan/SKILL.md` Execution rules 의 분할 반영 항목대로 반영하고, 최종 보고서에 남긴 범위와 `후속 FR:` 목록을 적는다
 
 ### 3. fr 브랜치 승격 (promote)
 
@@ -332,7 +333,7 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
   - **모드 B 는 promote 호출 전에 WORKFLOW.md 시작 계약 5항**(Status 대기 중 → 기본 브랜치 clean 선확인 → `start_preflight.sh` exit 10 이면 시작하지 않고 인계(등록 커밋만 ahead 면 자동 채택), 사용자 명시 채택 시 진행 → baseline HEAD) 을 확인하고 **그 직후 시작 보고 블록을 1회** 낸다. 모드 A 는 모드 결정 시점에 이미 냈으므로 여기서 다시 내지 않는다.
   - `large` 는 시작 상태 `대기 중`(다음 단계 `REQUEST review 대기` 로 `--force` 없이 전이), `small` 은 `구현 중` 이다.
   - **`--source-fr` 를 반드시 명시한다.** 이 호출은 REQUEST.md 작성보다 앞서므로 REQUEST 본문에서 Source FR 을 읽을 수 없다. 생략하면 baseline REQUEST 의 `-` 가 기록되어(또는 stale REQUEST 가 남아 있으면 이전 작업 경로가 기록되어) §6 archive 의 FR done 자동 처리가 무동작하거나 다른 FR 을 건드린다. 값은 §1 에서 기억한 그 경로다.
-  - `<slug>`는 `CURRENT_TASK.md ## Short Title` 값이다(생략 시 promote.sh가 자동 추출).
+  - `<slug>` 는 선택한 FR 의 short-title(상세 파일명의 `YYYY-MM-DD-` 뒤)이다.
   - promote.sh가 `fr/<slug>` 브랜치 + task-state fr 필드 기록(commit) + CURRENT_TASK 갱신을 생성한다. 이는 §6 step 7 archive.sh가 요구하는 형식과 일치한다. **브랜치는 별도 worktree 에 부착되며, 호출 세션의 체크아웃은 기본 브랜치에 그대로 남는다** — `git switch` 는 `--no-worktree` 분기에만 있다(`promote.sh` 8단계). 이어서 아래 `launch` 처리를 반드시 수행한다.
 - **promote 직후 `launch` 결과 처리 (건너뛰지 않는다)**: promote 는 마지막에 `promote: 세션 기동 결과 — <값>` 을 출력한다. 그 값에 따라 갈린다.
   - `ok` — 이 세션은 여기서 멈춘다. 이후 단계는 기동된 세션이 진행한다. promote 가 `--autopilot` 으로 실행 주체 표식을 기동 전에 이미 두었고, 자식 세션은 인계 문구의 autopilot 줄로 이 skill 의 절차와 `end` 호출 지시를 받는다. 이 세션이 표식을 대신 두지 않는다. 자식이 그 지시를 따를지는 강제하지 못한다 — 따르지 않으면 `end` 가 실행되지 않아 표식이 남을 수 있고, 그 한계는 조건 문구 안내로 허용한다.

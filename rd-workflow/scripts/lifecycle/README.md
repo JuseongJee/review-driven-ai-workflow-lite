@@ -31,7 +31,8 @@ FR 작업의 git 라이프사이클 — branch 생성 → 작업 → main merge 
 | `metadata_write` | `task-state` 파일 필드 쓰기 |
 | `metadata_clear` | `task-state` fr 필드 reset (`fr-branch=null` 등 sentinel 복원 — 파일 삭제 아님). 되돌리는 필드는 `fr-branch`·`worktree-path`·`source-fr`·`base-commit`·`review-session` 이고 `created-at` 은 제거한다 |
 | `metadata_exists` | `task-state` 파일 존재 여부 |
-| `emit_current_task_baseline` | 빈 CURRENT_TASK.md 형태 출력 (heredoc) |
+| `emit_current_task_baseline` | 빈 CURRENT_TASK.md 형태 출력 (heredoc). 배포 템플릿 `CURRENT_TASK.md` 와 byte 단위로 같음(`scripts/test_build_template.sh` 가 대조) |
+| `emit_current_task_baseline_legacy` | 2026-11-13 까지 쓰던 이전 초기본 (heredoc). `archive_publish_content_check` 가 이 초기본의 발행 후보를 막지 않는 데만 씀 |
 | `registration_commit_shape <commit>` | FR 등록 커밋 형태 검증 — 통과 시 slug 출력 (helper 자기 검증·시작 계약 공용) |
 | `index_row_ncol` | stdin 한 줄의 인덱스 표 컬럼 수 (이스케이프되지 않은 `|` 기준 — `merge_fr_index.sh` 의 `xsplit()` 과 같은 계약) |
 | `classify_ahead_commits <local> <upstream>` | 시작 계약 4항 분류 — `ahead= behind= registration= decision=` |
@@ -99,10 +100,13 @@ bash rd-workflow/scripts/lifecycle/archive.sh \
   [--force-dirty] \
   [--force-skip-review-check <사유>] \
   [--allow-status-mismatch <사유>] \
+  [--allow-unpublished-submodule <사유>] \
   [--dry-run]
 ```
 
 **Status 검사:** 발행 대상 커밋(fr 모드는 fr tip, no-fr 은 HEAD)의 task-state `status` 가 `아카이브 보류` 가 아니면 seal 검사보다 먼저 거부합니다(merge·push 전). `--allow-status-mismatch <사유>` 는 이 검사만 건너뛰며 사유가 필수이고 audit 로그에 `[status:<값>]` 로 남습니다. `--force-skip-review-check` 와 서로를 우회하지 않습니다.
+
+**팀 저장소 반영 게이트:** fr·no-fr 발행 모두에 적용합니다. 판정하는 커밋(tip)은 fr 모드는 fr 브랜치, no-fr 모드는 Step 4 정리 커밋 전의 HEAD 입니다. no-fr 의 push 실패 뒤 재실행처럼 HEAD 가 이번 발행의 정리 커밋(또는 그 위의 `rd task set-title` 복구 커밋)이면 정리 전 커밋을 판정하므로 첫 실행과 같은 대상을 봅니다. 반영 방식 `pr`·`push` 인 submodule 의 새 포인터(tip 의 gitlink)가 팀 대상 브랜치(`origin/<base>`, `base` 가 비면 `origin/HEAD`)의 조상이거나 같아야 발행합니다. 반영 방식은 tip 에 커밋된 `rd-workflow/config/workflow.json` 으로 정합니다. tip 의 gitlink 가 모두 `manual` 이면 기준점 없이 통과합니다. 반영 대상은 기준점과 tip 의 gitlink 를 비교해 정합니다. 대상 경로는 기준점부터 리뷰한 끝까지 gitlink 가 바뀐 경로이고, 포인터 값은 tip 의 값입니다. 리뷰한 끝은 seal 마커의 `review-head`(seal 이 검증한 세션의 `review-head-oid`)이고, 이 줄이 없는 옛 마커는 `head` 입니다. 끝 정보가 없는 옛 마커와 마커가 없는 경우는 기준점부터 tip 까지 바뀐 경로가 대상입니다. 리뷰한 끝이 커밋이 아니거나 tip 의 조상이 아니면 기준점과 같은 원인 안내로 거부합니다. 기준점은 tip 커밋만 읽어 다음 순서로 정합니다: (1) tip 의 `review-session` 과 seal 마커가 있으면 마커의 `review-base`, 없으면 그 세션 `SESSION.md` 의 `review-base-oid` (2) fr 모드는 기본 브랜치와 tip 의 merge-base (3) task-state 의 `base-commit`. 기준점을 정하지 못하면 원인과 함께 거부하고 `rd task set-base <리뷰한 diff 의 기준 커밋>` 뒤 task-state 커밋, 또는 새 리뷰 세션을 안내합니다. 판정 전에 submodule 에서 팀 원격을 조회합니다(`git fetch origin <대상>`, 대상을 모르면 `git remote set-head origin --auto`). 조회마다 먼저 시작 줄 `archive: 팀 저장소 반영 확인 — <경로> 의 … 를 조회합니다 (…, 최대 <N>초)` 를 냅니다. 조회는 `RD_MERGE_FETCH_TIMEOUT` 초(기본 60)를 넘기면 중단합니다. 입력을 묻지 않도록 `GIT_TERMINAL_PROMPT=0` 으로 실행하고, 사용자 ssh 설정(`GIT_SSH_COMMAND`·`GIT_SSH`·`core.sshCommand`)이 없으면 `ssh -o BatchMode=yes` 를 씁니다. 조회 실패·시간 초과·판정 불가도 원인 한 줄과 함께 거부합니다. 거부하면 어느 submodule 인지와 다음 행동(`rd pr open`·`rd pr check --apply`), `manual` 설정 방법을 알립니다. `--allow-unpublished-submodule <사유>` 로 이 검사만 건너뛸 수 있고 사유는 audit 로그에 `[team-publish]` 로 남습니다. 발행 큐는 이 옵션을 받지 않습니다. submodule 판정 위치는 fr 모드는 fr 브랜치를 체크아웃한 worktree, no-fr 모드는 기본 체크아웃입니다. 그 submodule 이 초기화돼 있어야 합니다(없으면 원인과 `git submodule update --init <경로>` 를 알립니다).
 
 **락 대기:** 점유자가 `tasks-list-prune`(`rd task list` 의 지연 정리)이면 `RD_ARCHIVE_LOCK_WAIT_MAX` 초(기본 60, `0` 이면 대기 안 함) 안에서 기다립니다. 다른 점유자는 즉시 중단합니다.
 
@@ -130,6 +134,8 @@ final diff review 종결과 발행 사이에 `아카이브 보류` 상태가 들
 | 3 | `bash rd-workflow/scripts/rd task set-status "아카이브 보류"` | task-state 파일 쓰기 (커밋 불필요 — 게이트가 워킹트리를 읽는다) |
 | 4 | seal 파일 + archive content commit | `pre_commit_archive_gate.sh` 가 「보류 상태 + 변경이 전부 기록 경로 안」이면 통과시킨다 |
 | 5 | `bash rd-workflow/scripts/lifecycle/archive.sh` | `archive_review_precheck` 가 마커를 strict 검증한 뒤 발행 |
+
+**팀 저장소 반영 단계(`team_publish.sh`):** 반영 방식 `pr` 인 submodule 이 있으면 4번 뒤 5번 앞에 `rd pr open` → Status `PR 검토 중` → `rd pr check --apply` → `아카이브 보류` 가 들어갑니다. `rd pr open [--dry-run] [--approved] [--approve-push]`, `rd pr check [--task <slug>] [--apply]`, `rd pr light-check [<base-ref>]` 입니다. 종료 코드는 성공 0, 실패 1, 사용법·판정 불가 2, `light-check` 상향 3, 사용자 승인 필요 10 입니다. PR 기록 `rd-workflow-workspace/.lifecycle/team-prs.tsv` 는 이 명령만 쓰고 archive 가 지웁니다. 정본은 `rd-workflow/docs/flows/WORKFLOW.md` 「`PR 검토 중` — 팀 저장소 반영」 절입니다.
 
 - **마커는 커밋되어야 효력이 생긴다.** precheck 는 워킹트리가 아니라 **판정 대상 commit**(fr 모드=fr tip, no-fr 모드=현재 `HEAD`)에서 마커·`review-session` 포인터·보호 트리 해시를 읽는다 (§3.3.1). 4번이 그래서 5번보다 앞에 있다.
 - 2·3번을 마친 직후 곧바로 5번을 부르는 **연속 실행은 종전과 동일하다.** `archive.sh` 의 호출 형태·인자·내부 순서는 이번 변경으로 바뀌지 않았다 (one-shot 보존).
@@ -244,7 +250,7 @@ lifecycle 스크립트 전체에 명문화된 git 최소 버전 정책은 없다
 
 ### `publish_queue.sh`
 
-발행 요청 큐 (`rd publish <하위 명령>`). 저장소는 `<git-common-dir>/rd-workflow/publish-queue/` 이고 추적하지 않는다. 작업 세션은 `request`·`wait`·`run`, 호출 세션은 `watch`·`next`, 누구나 `status`·`cancel`·`recover` 를 쓴다. 허가 슬롯(`ACTIVE`)은 하나뿐이라 동시에 한 작업만 발행한다. 결과는 `tasks_publish_evidence` 로 판정한다(성공·부분 완료·실패). 설계: `rd-workflow-workspace/specs/changes/2026-11-04-0917-publish-queue-tab-close-change-spec.md`.
+발행 요청 큐 (`rd publish <하위 명령>`). 저장소는 `<git-common-dir>/rd-workflow/publish-queue/` 이고 추적하지 않는다. 작업 세션은 `request`·`wait`·`run`, 호출 세션은 `watch`·`next`, 누구나 `status`·`cancel`·`recover` 를 쓴다. 허가 슬롯(`ACTIVE`)은 하나뿐이라 동시에 한 작업만 발행한다. 결과는 `tasks_publish_evidence` 로 판정한다(성공·부분 완료·실패). 호출 세션의 감시(`watch`, `fr_do/watch.sh`)는 도는 동안 생존 표시(`WATCH`)를 갱신하고, 표시가 5분 넘게 낡으면 `request` 는 경고 줄을, `wait` 는 경고와 종료 코드 5 를 낸다(같은 감시 공백은 한 번만). `watch` 는 `--timeout` 을 줄 때만 시한이 있다. 설계: `rd-workflow-workspace/specs/changes/2026-11-04-0917-publish-queue-tab-close-change-spec.md`.
 
 ### `merge_fr_index.sh`
 
@@ -345,9 +351,11 @@ bash rd-workflow/scripts/lifecycle/promote_rollback.sh \
 
 ## pre-commit·commit-msg hook 우회
 
-기본 브랜치를 대상으로 하는 lifecycle 커밋 3곳 — `promote` 의 metadata 기록,
-`promote_rollback` 의 완료 기록, `archive` 의 metadata 정리 — 은 **현재 브랜치명이
-`main` 또는 `master` 일 때만** `git commit --no-verify` 로 실행됩니다.
+기본 브랜치를 대상으로 할 수 있는 lifecycle 커밋 — `promote` 의 metadata 기록,
+`promote_rollback` 의 완료 기록, `archive` 의 metadata 정리, `rd pr open`·`rd pr check --apply`
+(`team_publish.sh`)의 기록·포인터·Status 커밋 — 은 **현재 브랜치명이 `main` 또는 `master` 일 때만**
+`git commit --no-verify` 로 실행됩니다. `team_publish.sh` 의 커밋은 fr 작업에서는 fr 브랜치에,
+fr 브랜치 없이 하는 작업(no-fr)에서는 기본 브랜치에 생깁니다.
 
 **이유:** Claude Code 가 설치하는 `.git/hooks/pre-commit` 은 `main`/`master` 직접 커밋을
 무조건 차단하며 `--no-verify` 로만 우회를 허용합니다. 이 hook 은 브랜치명만 검사하고
@@ -360,7 +368,7 @@ bash rd-workflow/scripts/lifecycle/promote_rollback.sh \
 차단 대상 브랜치에서만 붙입니다. 우회 안내 메시지도 실제로 우회한 실행에서만 출력됩니다.
 반면 `RD_LIFECYCLE_BYPASS_REASON=lifecycle` 은 별개 hook 계층(제거된 `fr_branch_gate.sh`,
 또는 아직 동기화하지 않은 소비 프로젝트에 남은 그 사본)을 상대하므로 브랜치와 무관하게
-세 지점 모두에서 항상 유지됩니다.
+위 모든 지점에서 항상 유지됩니다.
 
 **건너뛰는 범위:** `--no-verify` 는 `pre-commit` 과 `commit-msg` 두 hook 을 모두 건너뜁니다.
 즉 프로젝트 자체의 lint·포맷 검사뿐 아니라 **커밋 메시지 정책 검사도 실행되지 않습니다.**
@@ -368,7 +376,7 @@ lifecycle 커밋 메시지는 스크립트가 `chore(lifecycle): …` 고정 형
 가능성은 낮지만, 프로젝트 규약이 그 형식과 다르면 검출되지 않습니다. 각 실행 시 이 사실이
 안내 메시지로 출력됩니다.
 
-**적용 범위:** 위 3곳뿐입니다. `promote` 의 fr 브랜치 승격 커밋은 fr 브랜치에서 실행되어
+**적용 범위:** 위 지점뿐입니다. `promote` 의 fr 브랜치 승격 커밋은 fr 브랜치에서 실행되어
 차단 대상이 아니므로 `--no-verify` 를 붙이지 않습니다.
 
 **staged 보존:** lifecycle 이 만드는 커밋은 모두 경로를 한정해(`git commit … -- <paths>`)

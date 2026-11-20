@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "review": {
+    "codex": {
+      "model": null,
+      "effort": null,
+      "small_task_effort": "medium",
+      "review_types": {
+        "request-review": { "effort": "medium" }
+      }
+    },
+    "claude": {
+      "model": null,
+      "effort": null
+    }
+  }
+}

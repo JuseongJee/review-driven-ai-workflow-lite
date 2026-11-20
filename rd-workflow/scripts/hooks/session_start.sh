@@ -33,12 +33,19 @@ if [[ ! -f "${project_root}/PROJECT_CONTEXT.md" ]]; then
 fi
 task_file="${project_root}/CURRENT_TASK.md"
 
+# 줄 전체가 완결된 한 줄 주석(`<!-- ... -->`)이면 값이 아니므로 건너뜁니다. 템플릿·archive 초기본의
+# Status·Source FR·Next Step 안내 주석이 값으로 보이지 않게 합니다. 첫 `-->` 가 줄 끝에 있을 때만
+# 주석으로 봅니다 — `<!-- a --> 본문 <!-- b -->` 처럼 주석 사이에 본문이 있는 줄은 값으로 남깁니다.
 extract_section() {
   local file="$1"
   local section="$2"
   awk -v target="## ${section}" '
     $0 == target { in_section = 1; next }
     in_section && /^## / { exit }
+    in_section {
+      t = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", t)
+      if (substr(t, 1, 4) == "<!--" && length(t) >= 7 && index(t, "-->") == length(t) - 2) next
+    }
     in_section { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); if (NF) print }
   ' "$file"
 }

@@ -7,12 +7,15 @@
 1. `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` 읽기.
 2. 인덱스에서 status가 `idea` / `validated` / `ready-for-request` 인 항목만 추립니다 (`blocked` 은 set-aside 상태로 기본 목록 행에서 제외).
 3. `bash rd-workflow/scripts/fr_relations.sh readiness --root .` 를 실행합니다. 출력은 활성 FR 1건당 `<stem><TAB><판정>` 이고 판정 값은 `ready` / `waiting:<stem>,<stem>` / `check:<stem>,<stem>` / `error:<사유>` 다. `rc=2` 면 판정 없이 기존 목록만 출력하고 `관계 판정 불가 — 의존 상태를 표시하지 않습니다` 경고를 한 줄 남깁니다. 2단계에서 걸러낸 항목의 판정 행은 무시합니다. 단 `error:parse:status` 행은 무시하지 않고 6단계에서 보입니다 — 상세 파일의 status 를 읽지 못한 FR 은 인덱스 status 도 허용값 밖이거나 인덱스에 행이 없어 2단계에서 빠지기 때문입니다.
+3-1. `bash rd-workflow/scripts/fr_relations.sh in-progress --root .` 를 실행합니다. 출력은 진행 중 FR 1건당 `<stem><TAB><단계>` 입니다. 출처는 작업마다의 task-state(체크아웃된 worktree 는 그 파일, 체크아웃되지 않은 `fr/*` 브랜치는 tip)와 `/fr do` 의 `active.tsv` 입니다. 단계는 task-state 의 Status(예: `구현 중`, `PR 검토 중`)이고, `active.tsv` 에만 있는 FR 은 `/fr do 줄기 <slug>` 입니다. `rc=2` 면 진행 표시 없이 목록을 내고 `진행 중 판정 불가 — 진행 중 표시를 하지 않습니다` 경고를 한 줄 남깁니다. `rd task list` 는 지연 정리를 하므로 이 절차에서 부르지 않습니다.
 4. 판정에 따라 **두 구역**으로 출력합니다. 각 행에는 `착수` 칸을 둡니다.
 
    - **착수 가능**: 판정이 `ready` 인 항목만. 정렬은 인덱스 우선순위(P1 → P2 → P3 → `-`), 동순위는 날짜 오름차순. 시리즈 구성원이면 제목 뒤에 `[<name> N/M]` 을 붙입니다.
    - **대기·확인 필요·오류**: 나머지 전부. 시리즈는 같은 `name` 끼리 `N` 오름차순으로 붙여 한 블록으로 내고, 블록은 그 안 최소 `N` 구성원의 우선순위 자리에 놓습니다. 블록이 아닌 항목은 우선순위순.
 
    `착수` 칸 값은 판정을 그대로 옮깁니다: `ready` → `착수 가능`, `waiting:` → `대기(선행: <short-title>)`, `check:` → `확인 필요(선행 dropped: <short-title>)`, `error:` → `오류(<사유>)`. 판정 값의 선행은 stem 이므로 앞 10자(날짜)와 뒤따르는 `-` 를 떼어 short-title 로 적고, 선행이 여럿이면 쉼표로 잇습니다.
+
+   3-1단계 출력에 있는 FR 은 `착수` 칸 값을 판정 대신 `진행 중(<단계>)` 으로 적습니다(예: `진행 중(구현 중)`). 구역과 행 순서는 판정대로 두고 칸 값만 바꿉니다. 이 FR 을 다시 착수하지 말라는 표시입니다.
 
    표 형식은 다음과 같습니다.
 
@@ -27,7 +30,7 @@
 
 ### GitHub 링크 표시
 
-인덱스의 GitHub 컬럼을 그대로 출력합니다. 이 값은 상세 파일에서 읽지 않습니다.
+`fr_github` 설정과 기존 `github-issue` 값은 이 표시에만 남습니다. `handed-off` 는 종료 상태라 목록에 나오지 않습니다. 인덱스의 GitHub 컬럼을 그대로 출력합니다. 이 값은 상세 파일에서 읽지 않습니다.
 
 | # | 우선순위 | 날짜 | 제목 | 착수 | 요약 | 종류 | 상태 | GitHub |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -36,4 +39,4 @@
 GitHub 컬럼은 항상 표시합니다 (활성 항목에 연결이 하나도 없어도 생략하지 않음).
 
 5. 표 아래에 set-aside 요약 한 줄을 덧붙입니다: 인덱스에 `blocked` 항목이 있으면 `set-aside(blocked): N건 — 복원은 /fr status <slug> validated` 를 출력하고, 없으면 생략합니다.
-6. 3단계 출력에 `error:parse:status` 행이 있고 그 항목이 표에 나오지 않았으면, 표 아래에 `status 를 읽지 못한 FR N건: <short-title>, … — 상세 파일의 "- status:" 를 허용값(idea validated ready-for-request blocked done dropped parked) 하나로 고치십시오. 확인: bash rd-workflow/scripts/fr_relations.sh validate --root .` 를 덧붙입니다. short-title 은 stem 의 앞 11자(`YYYY-MM-DD-`)를 뗀 값입니다. 활성 항목이 0개여서 `활성 항목이 없습니다` 를 출력할 때도 이 줄은 출력합니다.
+6. 3단계 출력에 `error:parse:status` 행이 있고 그 항목이 표에 나오지 않았으면, 표 아래에 `status 를 읽지 못한 FR N건: <short-title>, … — 상세 파일의 "- status:" 를 허용값(idea validated ready-for-request blocked done dropped parked handed-off) 하나로 고치십시오. 확인: bash rd-workflow/scripts/fr_relations.sh validate --root .` 를 덧붙입니다. short-title 은 stem 의 앞 11자(`YYYY-MM-DD-`)를 뗀 값입니다. 활성 항목이 0개여서 `활성 항목이 없습니다` 를 출력할 때도 이 줄은 출력합니다.

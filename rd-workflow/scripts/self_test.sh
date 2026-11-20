@@ -3,10 +3,14 @@
 # 본 프로젝트와 generated project 공통으로 rd-workflow 인프라가 정상인지 검증한다.
 # 제품 코드 테스트(test.sh/lint.sh/typecheck.sh)와는 책임이 다르다.
 #
-# 사용법: bash rd-workflow/scripts/self_test.sh [그룹...|all|consumer]
+# 사용법: bash rd-workflow/scripts/self_test.sh [그룹...|<테스트 파일>...|all|consumer]
 #   인자 없음 / all — 모든 스텝 (약 12분. 통합 테스트가 가장 길다)
 #   <그룹>...       — 그 그룹의 스텝만. 그룹: hooks review lifecycle skills build
 #                     (예: 리뷰 어댑터를 고쳤으면 `self_test.sh review`, 두 영역이면 나열)
+#   <테스트 파일>... — 그 스텝만 (선택자). 테스트 파일 이름(`test_tasks_list.sh`)이나 검사 함수
+#                     이름(`fr_relations_validate_check`). `.sh`·경로 앞부분은 있어도 없어도 된다.
+#                     반복 검증(리뷰 턴 사이, FAIL 재확인)에 쓴다. 실행기(`bash`)·위치 인자와는 맞추지 않는다.
+#                     맞지 않거나 consumer 모드로 모두 빠진 선택자가 있으면 FAIL 로 끝낸다. 그룹과 함께 주면 합집합이다.
 #   consumer        — 소비 프로젝트에서 뜻이 있는 스텝만 (dev-only 정본 위생 검사 제외)
 #   RD_SELFTEST_DRYRUN=1 — 실행하지 않고 실행 예정 스텝만 출력
 #
@@ -53,9 +57,32 @@ SELFTEST_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SELFTEST_GROUPS_ALL="hooks review lifecycle skills build"
 SELFTEST_MODE="all"          # all | consumer
 SELFTEST_GROUPS=""           # 빈 값 = 모든 그룹
+# 선택자 — 정규화한 이름(경로 앞부분·`.sh` 제거)을 공백으로 잇는다. 맞은 선택자는 SELFTEST_SEL_MATCHED 에 모은다.
+SELFTEST_SELECTORS=""
+SELFTEST_SEL_MATCHED=""
+# 청중 필터를 지나 실제로 실행(또는 dry-run 예정)된 스텝에 맞은 선택자. MATCHED 에만 있고 여기 없으면
+# 고른 스텝이 모두 청중(consumer 모드)으로 빠진 것이다.
+SELFTEST_SEL_RAN=""
+_SEL_HIT=""
+# 실행 중인 스텝을 선택자가 골랐으면 1. 선택적 검사의 건너뜀(_selftest_skip_optional)이 이 값을 본다.
+_SELFTEST_STEP_PICKED=0
+
+# 선택적 검사(dev repo 전용·extensions 전용)가 대상 파일이 없을 때 부른다. 그룹 실행에서는 종전처럼
+# 건너뜀을 알리고 성공으로 끝낸다. 선택자로 명시한 스텝이면 사용자가 그 검사를 요청한 것이므로
+# 이름과 사유를 알리고 실패로 끝낸다 — 실행하지 않은 검사를 PASS 로 보이지 않게 한다.
+# 사용법: _selftest_skip_optional "<사유>"
+_selftest_skip_optional() {
+  echo "  (skip: $1)"
+  if [[ "${_SELFTEST_STEP_PICKED:-0}" == 1 ]]; then
+    echo "  선택한 스텝을 이 설치본에서 실행할 수 없습니다: $1" >&2
+    return 1
+  fi
+  return 0
+}
 selftest_usage_exit() {
-  echo "  사용법: bash rd-workflow/scripts/self_test.sh [그룹...|all|consumer]" >&2
+  echo "  사용법: bash rd-workflow/scripts/self_test.sh [그룹...|<테스트 파일>...|all|consumer]" >&2
   echo "    그룹: ${SELFTEST_GROUPS_ALL}" >&2
+  echo "    테스트 파일 — 그 스텝만 (예: test_tasks_list.sh, fr_relations_validate_check)" >&2
   echo "    consumer — 소비 프로젝트에서 뜻이 있는 스텝만 (dev-only 제외)" >&2
   echo "  dry-run: RD_SELFTEST_DRYRUN=1" >&2
   exit 1
@@ -65,9 +92,49 @@ for _arg in "$@"; do
     all|full) ;;
     consumer) SELFTEST_MODE="consumer" ;;
     hooks|review|lifecycle|skills|build) SELFTEST_GROUPS="${SELFTEST_GROUPS} ${_arg}" ;;
-    *) echo "[self_test] 알 수 없는 인자입니다: $_arg" >&2; selftest_usage_exit ;;
+    -*|'') echo "[self_test] 알 수 없는 인자입니다: $_arg" >&2; selftest_usage_exit ;;
+    *)
+      _sel="${_arg##*/}"; _sel="${_sel%.sh}"
+      case "$_sel" in
+        ''|*[!A-Za-z0-9_.-]*) echo "[self_test] 선택자로 쓸 수 없는 인자입니다: $_arg" >&2; selftest_usage_exit ;;
+      esac
+      SELFTEST_SELECTORS="${SELFTEST_SELECTORS} ${_sel}" ;;
   esac
 done
+
+# 스텝이 선택자에 맞는지 본다. 맞으면 0 을 돌려주고, 맞은 선택자를 SELFTEST_SEL_MATCHED 와 _SEL_HIT 에 더한다.
+# 판정은 정확한 이름 일치뿐이다 — 명령 인자 중 `.sh` 파일의 이름, 첫 명령 단어가 `bash` 가 아니면 그
+# 단어(검사 함수), 설명의 괄호 안 이름. 실행기(`bash`)·위치 인자(`_`) 같은 그 밖의 명령 토큰과는
+# 맞추지 않는다. 변경 파일로 스텝을 추론하지 않는다(2026-09-03 에 걷어낸 smoke 엔진과 다른 점).
+# 사용법: _selftest_step_selected "<설명>" <명령...>
+_selftest_step_selected() {
+  local desc="$1" sel a b hit=1
+  shift
+  _SEL_HIT=""
+  for sel in $SELFTEST_SELECTORS; do
+    case "$desc" in
+      *"(${sel}.sh)"*|*"(${sel}.sh "*|*"(${sel})"*) ;;
+      *)
+        b=""
+        if [[ "${1-}" != bash && "${1-}" == "$sel" ]]; then
+          b="$sel"
+        else
+          for a in "$@"; do
+            [[ "${a##*/}" == "${sel}.sh" ]] && { b="$sel"; break; }
+          done
+        fi
+        [[ -n "$b" ]] || continue
+        ;;
+    esac
+    hit=0
+    _SEL_HIT="${_SEL_HIT} ${sel}"
+    case " ${SELFTEST_SEL_MATCHED} " in
+      *" ${sel} "*) ;;
+      *) SELFTEST_SEL_MATCHED="${SELFTEST_SEL_MATCHED} ${sel}" ;;
+    esac
+  done
+  return "$hit"
+}
 
 FAIL=0
 STEP_INDEX=0
@@ -115,15 +182,25 @@ run_step() {
   esac
   desc="${1-}"; shift
   STEP_INDEX=$((STEP_INDEX + 1))
+  # 선택자 판정은 청중 필터보다 먼저 한다 — consumer 모드가 뺀 스텝을 고른 선택자를
+  # 「맞지 않음」 으로 오보하지 않게 한다(뺀 사실은 청중 제외 요약이 알린다).
+  local _picked=1
+  if [[ -n "$SELFTEST_SELECTORS" ]] && _selftest_step_selected "$desc" "$@"; then _picked=0; fi
   # 청중 필터 — `consumer` 모드는 정본 위생 검사(dev-only)를 실행하지 않는다.
   if [[ "$SELFTEST_MODE" == "consumer" && "$audience" == "dev-only" ]]; then
     AUDIENCE_EXCLUDED+=("${STEP_INDEX}. ${desc}")
     return 0
   fi
-  # 그룹 필터 — 지정된 그룹이 있으면 그 밖의 스텝은 건너뛰고 기록한다.
-  # `always` 는 예약 그룹이다 — 사용자 인자로 받지 않고(인자 파서에 없음), 어느 그룹을 골라도
-  # 통과한다. 청중 필터는 위에서 이미 적용했으므로 `consumer` 모드의 dev-only 는 그대로 빠진다.
-  if [[ -n "$SELFTEST_GROUPS" && "$group" != always ]]; then
+  if [[ "$_picked" -eq 0 ]]; then
+    local _s
+    for _s in $_SEL_HIT; do
+      case " ${SELFTEST_SEL_RAN} " in *" ${_s} "*) ;; *) SELFTEST_SEL_RAN="${SELFTEST_SEL_RAN} ${_s}" ;; esac
+    done
+  fi
+  # 그룹·선택자 필터 — 지정된 그룹이나 선택자가 있으면 어느 쪽에도 들지 않는 스텝은 건너뛰고 기록한다.
+  # `always` 는 예약 그룹이다 — 사용자 인자로 받지 않고(인자 파서에 없음), 어느 그룹·선택자를
+  # 골라도 통과한다. 청중 필터는 위에서 이미 적용했으므로 `consumer` 모드의 dev-only 는 그대로 빠진다.
+  if [[ ( -n "$SELFTEST_GROUPS" || -n "$SELFTEST_SELECTORS" ) && "$group" != always && "$_picked" -ne 0 ]]; then
     case " ${SELFTEST_GROUPS} " in
       *" ${group} "*) ;;
       *) GROUP_EXCLUDED+=("${STEP_INDEX}. [${group}] ${desc}"); return 0 ;;
@@ -190,7 +267,9 @@ run_step() {
   exec 9>&-
   # 5. 실행 — 스텝 동안만 PIPE 처리기를 건다(tee 가 죽은 뒤 함수 스텝의 쓰기가 self_test 를 끝내지 않게).
   trap ':' PIPE
+  [[ "$_picked" -eq 0 ]] && _SELFTEST_STEP_PICKED=1 || _SELFTEST_STEP_PICKED=0
   if "$@" 2>&8 8>&-; then rc=0; else rc=$?; fi
+  _SELFTEST_STEP_PICKED=0
   trap - PIPE
   exec 8>&-
   # 6. 완료 확인 — 최대 5초.
@@ -537,7 +616,7 @@ _mktemp_scan_snippet() {
   if [[ ! -d "$dir" ]]; then
     _mktemp_scan_marker "$step" "$on_missing_dir" missing-dir 0 0 0 0 0
     if [[ "$on_missing_dir" == "skip" ]]; then
-      echo "  미배포 트리 — 건너뜁니다 (${dir} 부재)"; return 0
+      _selftest_skip_optional "미배포 트리 — ${dir} 부재"; return $?
     fi
     echo "  snippet 디렉터리가 없습니다: $dir" >&2; return 1
   fi
@@ -920,7 +999,7 @@ skill_invocation_authority_check() {
 # (autopilot_skill_lifecycle_check 의 "정본은 설치본에 없는 것이 정상" 처리와 같다).
 skill_invocation_canon_check() {
   local canon="${SCRIPT_DIR}/../../_ROOT_FILES/rd-workflow/claude_skills"
-  [[ -d "$canon" ]] || { echo "  정본 트리 없음 — 설치본이므로 건너뜁니다"; return 0; }
+  [[ -d "$canon" ]] || { _selftest_skip_optional "정본 트리 없음 — 설치본"; return $?; }
   _skill_authority_tree "$canon"
 }
 
@@ -1606,8 +1685,12 @@ if [[ "$SELFTEST_MODE" == "consumer" ]]; then
 else
   echo "  모드: all — 전체 ${SELFTEST_AUD_TOTAL}스텝"
 fi
-if [[ -n "$SELFTEST_GROUPS" ]]; then
+if [[ -n "$SELFTEST_GROUPS" && -n "$SELFTEST_SELECTORS" ]]; then
+  echo "  그룹:${SELFTEST_GROUPS} + 선택자:${SELFTEST_SELECTORS} (둘 중 하나에 드는 스텝과 mktemp 가드 대조만 돕니다)"
+elif [[ -n "$SELFTEST_GROUPS" ]]; then
   echo "  그룹:${SELFTEST_GROUPS} (그 밖의 스텝은 건너뜁니다)"
+elif [[ -n "$SELFTEST_SELECTORS" ]]; then
+  echo "  선택자:${SELFTEST_SELECTORS} (그 스텝과 mktemp 가드 대조만 돕니다)"
 fi
 if (( SELFTEST_AUD_UNDECLARED > 0 )); then
   echo "  경고: 청중을 선언하지 않은 스텝이 ${SELFTEST_AUD_UNDECLARED}건 있습니다 — 해당 스텝은 FAIL 로 보고됩니다" >&2
@@ -1645,6 +1728,7 @@ run_step skills consumer "FR 인덱스/상세 정합성 검사기 단위 테스�
 run_step skills consumer "FR 관계 무결성 (fr_relations_validate_check)" fr_relations_validate_check
 run_step skills consumer "FR 관계 헬퍼 테스트 (test_fr_relations.sh)" bash "${SCRIPT_DIR}/test_fr_relations.sh"
 run_step skills consumer "FR related files 변경 이력 테스트 (test_fr_related_history.sh)" bash "${SCRIPT_DIR}/test_fr_related_history.sh"
+run_step skills consumer "팀 Issue 집어 가기·넘기기 테스트 (test_issue_queue.sh)" bash "${SCRIPT_DIR}/test_issue_queue.sh"
 run_step skills consumer "skill 참조 경로 검사 단위 테스트" bash "${SCRIPT_DIR}/test_skill_reference_existence.sh"
 run_step skills consumer "FR related files 검사 단위 테스트" bash "${SCRIPT_DIR}/test_fr_related_files_existence.sh"
 run_step lifecycle consumer "lifecycle 단위 테스트 (test_lifecycle.sh)" bash "${SCRIPT_DIR}/lifecycle/test_lifecycle.sh"
@@ -1654,6 +1738,10 @@ run_step lifecycle consumer "promote autopilot 표식 테스트 (test_promote_au
 run_step lifecycle consumer "작업 목록 단위 테스트 (test_tasks_list.sh)" bash "${SCRIPT_DIR}/lifecycle/test_tasks_list.sh"
 run_step lifecycle consumer "발행 큐 단위 테스트 (test_publish_queue.sh)" bash "${SCRIPT_DIR}/lifecycle/test_publish_queue.sh"
 run_step lifecycle consumer "worktree archive 테스트 (test_archive_worktree.sh)" bash "${SCRIPT_DIR}/lifecycle/test_archive_worktree.sh"
+run_step lifecycle consumer "팀 저장소 PR 반영 공용 함수 테스트 (test_team_publish_common.sh)" bash "${SCRIPT_DIR}/lifecycle/test_team_publish_common.sh"
+run_step lifecycle consumer "팀 저장소 PR 반영 open·check·발행 테스트 (test_team_publish.sh)" bash "${SCRIPT_DIR}/lifecycle/test_team_publish.sh"
+run_step lifecycle consumer "직접 설치 PR 발행 테스트 (test_direct_pr.sh)" bash "${SCRIPT_DIR}/lifecycle/test_direct_pr.sh"
+run_step lifecycle consumer "seal 해시의 PR merge 치환 테스트 (test_seal_team_pr_subst.sh)" bash "${SCRIPT_DIR}/test_seal_team_pr_subst.sh"
 run_step lifecycle consumer "seal 뒤 main 병합 위치 archive 테스트 (test_archive_merge_position.sh)" bash "${SCRIPT_DIR}/lifecycle/test_archive_merge_position.sh"
 run_step lifecycle consumer "fr 한정 해시 단위 테스트 (test_fr_changes_hash.sh)" bash "${SCRIPT_DIR}/test_fr_changes_hash.sh"
 run_step lifecycle consumer "submodule 발행·정리 (test_archive_submodule.sh)" bash "${SCRIPT_DIR}/lifecycle/test_archive_submodule.sh"
@@ -1672,7 +1760,11 @@ run_step skills consumer "/fr batch 별칭 이관 안내 테스트 (fr_do/test_b
 run_step skills consumer "blocked status 어휘 일관성 (test_fr_blocked_status.sh)" bash "${SCRIPT_DIR}/test_fr_blocked_status.sh"
 run_step skills consumer "autopilot blocked 계약 회귀 (test_autopilot_blocked_contract.sh)" bash "${SCRIPT_DIR}/test_autopilot_blocked_contract.sh"
 run_step skills consumer "sync_template 타입 가드 테스트 (test_sync_template.sh)" bash "${SCRIPT_DIR}/test_sync_template.sh"
-run_step skills consumer "verify 설정 점검 (test_verify_check.sh)" bash -c 'if [[ -f "$1" ]]; then bash "$1"; else echo "  (skip: extensions/verify 없음 — 설치본)"; fi' _ "${SCRIPT_DIR}/../extensions/verify/test_verify_check.sh"
+verify_check_test_check() {
+  local t="${SCRIPT_DIR}/../extensions/verify/test_verify_check.sh"
+  if [[ -f "$t" ]]; then bash "$t"; else _selftest_skip_optional "extensions/verify 없음 — 설치본"; fi
+}
+run_step skills consumer "verify 설정 점검 (test_verify_check.sh)" verify_check_test_check
 # 결함 보고 로컬 조작부. 다른 배포 테스트와 같은 관례로 **배포 사본**을 실행한다 —
 # 테스트가 형제 `defect_reports.sh` 를 대상으로 잡으므로 이 한 줄이 곧 설치본 구현 검증이다.
 # 정본/배포본 drift 는 dev repo 전용 `build_verify_check`(build_template.sh verify)가 이미
@@ -1722,34 +1814,34 @@ run_step lifecycle dev-only "promote 활성 호출처가 시작 상태 인자를
 # self_test.sh 위치는 <root>/rd-workflow/scripts/ 이므로 dev 빌더는 두 단계 위 scripts/
 build_verify_check() {
   local builder="${SCRIPT_DIR}/../../scripts/build_template.sh"
-  if [[ -f "$builder" ]]; then bash "$builder" verify; else echo "  (skip: build_template.sh 없음 — 설치본)"; fi
+  if [[ -f "$builder" ]]; then bash "$builder" verify; else _selftest_skip_optional "build_template.sh 없음 — 설치본"; fi
 }
 test_build_template_check() {
   local t="${SCRIPT_DIR}/../../scripts/test_build_template.sh"
-  if [[ -f "$t" ]]; then bash "$t"; else echo "  (skip: dev repo 아님)"; fi
+  if [[ -f "$t" ]]; then bash "$t"; else _selftest_skip_optional "dev repo 아님"; fi
 }
 test_root_mirror_drift_gate_check() {
   local t="${SCRIPT_DIR}/hooks/test_root_mirror_drift_gate.sh"
-  if [[ -f "$t" ]]; then bash "$t"; else echo "  (skip: dev repo 아님)"; fi
+  if [[ -f "$t" ]]; then bash "$t"; else _selftest_skip_optional "dev repo 아님"; fi
 }
 # 배포 미러 계약(체크섬 미러 + VERSION 검증). publish.sh 도 dev repo 전용이라 설치본에서는 skip.
 test_publish_mirror_check() {
   local t="${SCRIPT_DIR}/../../scripts/test_publish_mirror.sh"
-  if [[ -f "$t" ]]; then bash "$t"; else echo "  (skip: dev repo 아님)"; fi
+  if [[ -f "$t" ]]; then bash "$t"; else _selftest_skip_optional "dev repo 아님"; fi
 }
 # publish.sh 원격 상태 판정 회귀(빈 원격 오판 → 새 root commit). 같은 이유로 dev repo 전용이다.
 test_publish_remote_state_check() {
   local t="${SCRIPT_DIR}/../../scripts/test_publish_remote_state.sh"
-  if [[ -f "$t" ]]; then bash "$t"; else echo "  (skip: dev repo 아님)"; fi
+  if [[ -f "$t" ]]; then bash "$t"; else _selftest_skip_optional "dev repo 아님"; fi
 }
 # skill 버전 대조 기준값 강제 지점. 정본(_ROOT_FILES/)과 git 이력이 필요해 dev repo 전용이다.
 skill_compat_baseline_check() {
   local t="${SCRIPT_DIR}/../../scripts/check_skill_compat_baseline.sh"
-  if [[ -f "$t" ]]; then bash "$t"; else echo "  (skip: dev repo 아님)"; fi
+  if [[ -f "$t" ]]; then bash "$t"; else _selftest_skip_optional "dev repo 아님"; fi
 }
 test_skill_compat_baseline_check() {
   local t="${SCRIPT_DIR}/../../scripts/test_skill_compat_baseline.sh"
-  if [[ -f "$t" ]]; then bash "$t"; else echo "  (skip: dev repo 아님)"; fi
+  if [[ -f "$t" ]]; then bash "$t"; else _selftest_skip_optional "dev repo 아님"; fi
 }
 
 
@@ -1768,7 +1860,7 @@ run_step build dev-only "skill 버전 기준값 (check_skill_compat_baseline.sh)
 run_step build dev-only "skill 버전 대조 단위 테스트 (test_skill_compat_baseline.sh)" test_skill_compat_baseline_check
 claudemd_size_check() {
   local checker="${SCRIPT_DIR}/check_claudemd_size.sh"
-  if [[ -f "$checker" ]]; then bash "$checker"; else echo "  (skip: check_claudemd_size.sh 없음 — lite 산출물)"; fi
+  if [[ -f "$checker" ]]; then bash "$checker"; else _selftest_skip_optional "check_claudemd_size.sh 없음 — lite 산출물"; fi
 }
 run_step build consumer "CLAUDE.md 크기 제한 (check_claudemd_size.sh)" claudemd_size_check
 run_step review consumer "검증 증거 래퍼 (test_verify_record.sh)" bash "${SCRIPT_DIR}/test_verify_record.sh"
@@ -1794,19 +1886,46 @@ print_audience_summary() {
 print_group_summary() {
   if (( ${#GROUP_EXCLUDED[@]} > 0 )); then
     echo ""
-    echo "== 그룹 밖 스텝 (${#GROUP_EXCLUDED[@]}개, 실행하지 않음 — 지정 그룹:${SELFTEST_GROUPS}) =="
+    echo "== 선택 밖 스텝 (${#GROUP_EXCLUDED[@]}개, 실행하지 않음 — 지정 그룹:${SELFTEST_GROUPS:- 없음}, 선택자:${SELFTEST_SELECTORS:- 없음}) =="
     printf '  - %s\n' "${GROUP_EXCLUDED[@]}"
     echo "전체 실행: bash rd-workflow/scripts/self_test.sh"
   fi
 }
 
+# 실행하지 못한 선택자를 알리고 FAIL 로 표시한다 — 오타로 0개 스텝을 돌리거나, 고른 스텝이 모두
+# 청중(consumer 모드)으로 빠졌는데 PASS 하는 일을 막는다. dry-run 에서도 같다.
+check_unmatched_selectors() {
+  local sel unmatched="" excluded=""
+  for sel in $SELFTEST_SELECTORS; do
+    case " ${SELFTEST_SEL_MATCHED} " in
+      *" ${sel} "*)
+        case " ${SELFTEST_SEL_RAN} " in *" ${sel} "*) ;; *) excluded="${excluded} ${sel}" ;; esac ;;
+      *) unmatched="${unmatched} ${sel}" ;;
+    esac
+  done
+  if [[ -n "$unmatched" ]]; then
+    echo "" >&2
+    echo "== FAIL: 어느 스텝에도 맞지 않는 선택자:${unmatched} ==" >&2
+    echo "   테스트 파일 이름·검사 함수 이름을 확인하십시오. 스텝 목록: RD_SELFTEST_DRYRUN=1 bash rd-workflow/scripts/self_test.sh" >&2
+    FAIL=1
+  fi
+  if [[ -n "$excluded" ]]; then
+    echo "" >&2
+    echo "== FAIL: 고른 스텝이 모두 청중 필터로 빠진 선택자:${excluded} — consumer 모드는 dev-only 스텝을 돌리지 않습니다 ==" >&2
+    FAIL=1
+  fi
+  return 0
+}
+
 # dry-run: 스텝을 실행하지 않고 실행 예정만 보고한다.
+check_unmatched_selectors
 if [[ -n "${RD_SELFTEST_DRYRUN:-}" ]]; then
   print_group_summary
   if [[ "$SELFTEST_MODE" == "consumer" ]]; then print_audience_summary; fi
   echo ""
   echo "== 실행 예정 스텝 (${#STEP_NAMES[@]}개) =="
   if (( ${#STEP_NAMES[@]} > 0 )); then printf '  - %s\n' "${STEP_NAMES[@]}"; fi
+  [[ "$FAIL" -eq 0 ]] || exit 1
   exit 0
 fi
 

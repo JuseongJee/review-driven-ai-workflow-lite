@@ -76,11 +76,22 @@ Author는 턴을 쓴 뒤 `SESSION.md`의 Status·Current Owner를 손으로 바�
 | `awaiting-reviewer` | `Reviewer` | (기존 검사) | 기존과 같음 |
 | `awaiting-author` | `Author`·`Claude` | 형식을 갖춘 Author 턴 | `awaiting-reviewer`·`Reviewer`로 전환한 뒤 Reviewer 턴 실행 |
 | `awaiting-author` | `Author`·`Claude` | Reviewer 턴 / 턴 없음 / 형식 미달 Author 턴 | 거부 — 써야 할 Author 턴 경로 안내 |
-| `awaiting-user` | 무관 | 무관 | 거부 — `USER_ACTION.md`의 사람 결정 안내 |
+| `awaiting-user` | 무관 | 무관 (옵션 없음) | 거부 — `USER_ACTION.md`의 사람 결정 안내와 `--decision`·`--override`·`--reopen` 사용법 |
+| `awaiting-user` + Open Issues 종결(`- 없음`) | 무관 | 형식을 갖춘 Author 턴 (`--reopen "<사유>"`) | 사유를 `## Reopen History`에 남기고 `awaiting-reviewer`·`Reviewer`로 전환한 뒤 Reviewer 턴 실행 |
+| `awaiting-user` + Open Issues 미해결 | 무관 | 무관 (`--reopen`) | 거부 — 사람 질문 대기 세션은 `--reopen` 으로 열지 않음 |
+| `awaiting-user` + Open Issues 미해결 | 무관 | 형식을 갖춘 Author 턴 (`--decision "<사용자 결정>"`) | 결정을 `## Reopen History` 와 `USER_ACTION.md` 의 `## User Decision` 에 남기고 `awaiting-reviewer`·`Reviewer`로 전환한 뒤 Reviewer 턴 실행 |
+| `awaiting-user` + Open Issues 미해결 | 무관 | 무관 (`--override "<결정한 사람> — <말>"`) | `## Closure Reason` 을 `user-override` 와 날짜가 붙은 `근거:` 줄로 쓰고 `closed` 로 바꿈. CHECKPOINT Open Issues 는 `- 없음` 과 남은 이의 원문을 담은 「사용자 종결」 문단이 됨. Reviewer 턴 없음. diff-review 세션에 실제 리뷰어 실행 기록이 없거나 마지막 리뷰 뒤 보호 경로가 바뀌었으면 seal 이 거부하므로 종결하지 않고 `--decision` 을 안내 |
+| `awaiting-user` + Open Issues 종결 또는 판정 불가 | 무관 | 무관 (`--decision`·`--override`) | 거부 — 종결이면 `--reopen`·seal 안내, 판정 불가(절 없음·빈 절·형식 오류)면 CHECKPOINT 복구 안내 |
 | `closed` | 무관 | 무관 | 거부 — 새 리뷰는 `prepare_review_pipeline.sh`로 새 세션 |
 | 위 밖의 조합 | | | 거부 — Status·Owner 값을 보이고 SESSION 확인 안내 |
 
-전환 뒤 실패(어댑터 오류 등)는 `awaiting-reviewer`·`Reviewer`로 남고 같은 명령으로 이어집니다.
+전환 뒤 실패(어댑터 오류 등)는 `awaiting-reviewer`·`Reviewer`로 남습니다. 옵션 없이 `run_review_turn.sh <세션>` 으로 다시 실행해 이어 갑니다. `--decision`·`--reopen`·`--extend-turns` 는 첫 실행에서 이미 반영됐으므로 다시 붙이면 거부되고 옵션 없이 실행하라고 안내합니다.
+
+턴 한도에 도달한 세션은 다음 턴을 만들지 않고 거부합니다. 사람이 더 이어 가기로 정했으면 `--decision`·`--reopen` 또는 Author 턴 전환 실행에 늘릴 턴 수 `--extend-turns <N>` 을 붙입니다. `## Turn Limit` 이 늘어난 값으로 바뀌고 `## Reopen History` 에 결정·사유 줄과 따로 `<턴 파일> 뒤 턴 한도 연장: A → B` 줄이 남습니다. 한도에 도달하지 않은 세션에는 거부합니다.
+
+`--reopen`은 이의 없음으로 수렴한 세션에 재확인 턴을 잇는 경로입니다. seal 직전 전체 검증이 실패했거나 기록 커밋·main 병합 뒤 바뀐 부분을 확인받을 때 씁니다. 새 세션과 달리 diff 전체를 처음부터 다시 리뷰하지 않습니다. 수렴 여부는 seal 과 같은 Open Issues 판정(`hooks/_open_issues.awk`)으로 가립니다. awaiting-user 는 「이의 없음 수렴」 과 「사람 질문 대기」 가 같은 상태값이기 때문입니다. `awaiting-user` 가 아닌 세션에 `--reopen`을 붙이면 거부합니다.
+
+기록 커밋 뒤의 diff review 는 루트 `REQUEST.md` 가 빈 템플릿입니다. 세션 준비와 Reviewer 턴은 리뷰 구간(base..head)에 추가된 `rd-workflow-workspace/backlog/request-archive/*.md` 를 이 작업의 REQUEST 로 씁니다. 리뷰 effort 판정, AC 누락 경고, 리뷰어 프롬프트의 완료 기준 출처가 모두 이 파일을 봅니다. 구간에 보관본이 없으면 루트 `REQUEST.md` 를 씁니다.
 
 ## 턴 규칙
 
@@ -93,8 +104,18 @@ Author는 턴을 쓴 뒤 `SESSION.md`의 Status·Current Owner를 손으로 바�
 - CHECKPOINT.md의 Open Issues 항목은 `- F2 (턴 004·006) — <쟁점> | 해소 조건: <조건> | 상태: <미해결 사유>` 형식으로 적는다. 발견 번호가 없는 쟁점은 `U<번호>`를 쓴다. `awaiting-user`로 끝날 때 항목에 근거 턴(`턴 NNN`)이나 `해소 조건:`이 없으면 `validate_turn_output`이 경고한다(종결 판정은 그대로). Agreed Points에는 합의 내용과 근거 턴 번호를 포함한다
 - Open Issues의 **미해결 항목은 리스트 항목**으로 적는다 (`-` `*` `+` `1.` `1)` 중 무엇이든). 미해결이 없으면 `- 없음` 또는 `- None` 한 줄을 절의 **첫 줄**에 둔다 (후행 마침표 1개 허용, 기호 뒤 공백 1개 필수)
 - 종결 경위는 그 마커 **아래**에 빈 줄로 한 번 띄운 뒤 문단으로 적는다. 문단의 내용은 판정에 쓰이지 않는다. 마커와 같은 줄, 마커 바로 다음 줄, 마커 앞에 적으면 `is_review_session_resolved`가 미해결로 판정한다 (fail-closed)
+- final diff review 의 검증 증거 시점: 리뷰 중 코드를 고친 중간 Author 턴은 고친 영역의 테스트 결과와 바뀐 변이 결과표 행만 싣는다. Reviewer 는 중간 턴에 전체 검증이나 결과표 전체 재생성을 요구하지 않는다. 고친 영역의 테스트가 수정 내용을 덮지 못하면 그 점을 이의로 낸다. 전체 검증의 시점(세션을 열기 전 1회, 리뷰 중 트리가 바뀌었으면 seal 직전 1회 더)은 `final-diff-review` skill 을 따르고, `rd review seal` 이 그 증거의 트리를 승인 트리와 대조한다
 - Reviewer 는 재현 작업(임시 git 저장소, 스크립트 실행)을 프로젝트 밖 임시 디렉터리(`mktemp -d`)에서 합니다. 세션 폴더에는 명령과 출력만 텍스트로 남기고, `.git` 을 만들지 않습니다. 중첩 저장소는 기록 커밋의 `git add` 를 실패시키거나 gitlink 한 줄로 들어가 증거 내용을 잃게 합니다.
-- Reviewer 발견은 `- F<번호> [confidence N/10] 제목` + `근거:` 줄 형식으로 쓴다.
+- Reviewer 발견은 `- F<번호> 제목` + `근거:` 줄 형식으로 쓴다. 인용하지 못한 발견은 `### 부록: 인용하지 못한 발견` 아래에 쓴다.
+- 이의 문턱: 모든 리뷰 종류에서 종결을 막는 이의(Findings 발견·Open Issues 항목)는 아래 셋뿐이다. 기준 파일의 점검 항목은 찾을 곳이고, 이의로 낼지는 이 문턱으로 정한다.
+  - (가) 사용자가 실제 사용에서 겪는 잘못된 결과·데이터 손실·보안 문제·회귀. 기준 파일의 치명 결함 범주(데이터 안전·경쟁 조건·신뢰 경계·열거형 완전성)가 여기에 든다
+  - (나) 요청·AC·spec 이탈, 또는 다음 단계를 잘못 이끄는 요청·설계의 누락·모호함
+  - (다) 검증이 실제로 결함을 덮지 못함(고친 동작을 덮는 테스트가 없음, 테스트가 거짓으로 통과함 — 변이 `생존` 포함)
+  - 기준 파일이 이름 붙인 `분할:`·`제거:` 발견은 종전대로 이의다
+- 이의마다 `경로:` 줄에 그 결함이 현실에서 일어나는 경로(누가 어떤 정상 사용에서 겪는가)를 한 줄 적는다. 경로를 적지 못하면 이의가 아니다.
+- 문턱 밖 지적은 Findings 에 넣지 않고 Summary 끝에 `메모: <위치> — <내용>` 줄로 적는다. 문구·서식·주석·유지보수성, 증거·기록 형식(검증 증거가 최신 트리와 어긋남 — `rd review seal` 이 검증 증거의 종료 코드와 트리를 대조한다. 변이 결과표 누락·행 갱신 누락 — 기계 검사가 없으며 작성·갱신은 Author 몫이다(`final-diff-review` skill). 측정 결과를 문서로 옮기지 않음), 실패 주입으로만 재현되는 경로, rd 가 만들지 않는 입력의 경계 사례, 사람이 이미 결정한 사항이 여기에 든다. 메모는 종결을 막지 않고 Author 는 응답하지 않아도 된다. 다음 턴에 같은 메모를 이의로 올리지 않는다.
+- 범위 축소: 다음 Reviewer 턴 번호가 6 을 넘으면(`REVIEW_SCOPE_NARROW_AFTER`, 기본 6) `run_review_turn.sh` 가 리뷰어 지시에 좁힌 문턱을 넣는다. 그 턴부터 종결을 막는 이의는 작업의 기본 사용 경로 결함, 환경과 상관없는 데이터 손실·보안 문제, 요청·AC·spec 이탈, 검증 공백뿐이다. 드문 환경에서만 생기는 잘못된 결과·불편과 방어 절차 추가 요구는 Summary 끝에 `범위 밖: <위치> — <내용> — <사유>` 줄로 적고 종결을 막지 않는다. 앞 턴의 열린 이의가 이 기준으로 범위 밖이 되면 Reviewer 가 Open Issues 에서 빼고 같은 줄로 옮긴다. 사람에게 묻지 않는다.
+- 이미 정한 범위 밖: 리뷰어 지시에는 REQUEST(diff review 는 보관본) `## Constraints` 의 `- 범위 밖:` 줄(사람이 정한 것)과, short-title 이 같고 task-state `base-commit` 에 없던(이번 작업에서 연) 리뷰 세션들의 Reviewer 턴 `범위 밖:` 줄이 함께 들어간다. Reviewer 는 같은 사실·같은 영향의 지적을 이의로도 메모로도 다시 내지 않는다. 새 근거로 드러난 보호 범주(위 범위 축소의 넷) 결함은 이의로 낸다. `run_review_turn.sh` 는 Reviewer 턴 뒤에 그 세션의 `범위 밖:` 줄을 턴 번호와 함께 출력한다.
 - Author 는 Reviewer 지적에 응답하기 전에 superpowers `receiving-code-review` 를 쓴다. 쓸 수 없으면 같은 원칙을 따른다 — 지적마다 코드·실행으로 사실을 확인하고, 확인 전에 동의하지 않는다.
 - Author 턴 `Findings` 에 지적마다 `- F2 — 수용|반박|보류. 근거: …` 한 줄을 쓴다. 수용은 고친 위치, 반박은 반대 근거 인용(`경로:줄` — `원문`, 또는 명령과 그 결과), 보류는 사람 판단이 필요한 이유를 적는다.
 - `run_review_turn.sh` 가 턴 뒤 인용을 파일과 대조해 경고를 보여 준다(턴은 막지 않는다).
@@ -105,7 +126,7 @@ Author는 턴을 쓴 뒤 `SESSION.md`의 Status·Current Owner를 손으로 바�
 `SESSION.md` 의 `## Closure Reason` 절이 리뷰를 어떻게 종결했는지 정합니다. 값은 `-`(비어 있음), `reviewer-no-objection`, `user-override` 중 하나입니다.
 
 - 비어 있으면 `rd review seal` 이 실행 기록으로 판정합니다. 마지막 턴이 리뷰어 턴이고, 그 턴의 실행 기록이 `open-issues=ok` 이며, 기록한 `head` 가 `review-head-oid` 와 같아야 합니다.
-- 사람이 리뷰어의 남은 이의를 덮고 종결하기로 정했을 때만 `user-override` 를 적습니다. 세션을 `closed` 로 바꾸는 쪽이 적습니다.
+- 사람이 리뷰어의 남은 이의를 덮고 종결하기로 정했을 때만 `user-override` 를 적습니다. 손으로 고치지 않고 `run_review_turn.sh <세션> --override "<결정한 사람> — <그 사람이 한 말>"` 로 적습니다(값·근거 줄·`closed` 를 함께 씁니다).
 - `user-override` 는 `## Closure Reason` 절의 주석 줄은 그대로 두고, 그 아래 `-` 줄을 `user-override` 로 바꿔 적습니다.
 - 턴 한도(20턴)에 도달한 뒤 사람이 종결하기로 정한 경우도 `user-override` 입니다.
 - `user-override` 에는 근거 줄이 필요합니다. 값 줄 아래, 같은 절 안에 `근거:` 로 시작하는 줄을 한 줄 적습니다. 앞의 `- ` 는 허용합니다.
@@ -410,20 +431,38 @@ cp rd-workflow/config/review-tools.json.example rd-workflow/config/review-tools.
 | `tools.claude.self_review_warning` | 셀프 리뷰 경고 표시 | `true` |
 | `tools.claude.self_review_policy` | self-review 정책 `block`(기본,차단) / `warn`(경고 후 통과) / `off`(무음 통과) | `block` |
 | `overrides.<type>.priority` | 리뷰 타입별 우선순위 오버라이드 | - |
-| `overrides.<type>.tools.codex.reasoning_effort` | 리뷰 타입별 codex reasoning effort | - |
 
 `REVIEW_TOOLS_CONFIG` 환경변수로 설정 파일 경로를 override할 수 있다.
+
+모델·effort 는 `rd-workflow/config/models.json` 에서 고치고 `bash rd-workflow/scripts/model_select.sh show review` 로 확인합니다.
+`models.json` 은 `rd-workflow/config/models.json.example` 을 복사해 만들고, 경로는 `RD_MODELS_CONFIG` 환경변수로 바꿀 수 있습니다.
+칸과 우선순위는 `rd-workflow/docs/guides/config_reference.md` 「models.json」 절을 따릅니다.
+리뷰 턴은 도구마다 어댑터 실행 직전에 stderr 로 실행 줄을 냅니다.
+
+```
+리뷰 도구: <도구> / 모델 요청: <값|none> (source: <단계> · <위치>) / effort 시도: <값|none> (source: <단계> · <위치>)
+```
+
+`<위치>` 는 값을 고른 곳(`env:<변수>`·`file:<경로>#<칸>`·`cli-default`)입니다.
 
 ### 턴 계측 (turn_metrics.tsv)
 
 `run_review_turn.sh` 는 리뷰어 턴마다 세션 디렉토리의 `turn_metrics.tsv` 에
-`turn / review_type / tool / effort / prompt_bytes / target_bytes / start_epoch / end_epoch / wall_seconds / status(ok|timeout|fail)` 를 append 한다.
+`turn / review_type / tool / effort / prompt_bytes / target_bytes / start_epoch / end_epoch / wall_seconds / status(ok|timeout|fail) / model / tokens` 을 append 한다.
+`effort` 는 이번 호출에 요청한 effort 이고(Claude 포함, 넘기지 않았으면 `none`), `model` 은 어댑터 로그에서 관측한 실제 모델이다(관측하지 못하면 `unknown`).
+`tokens` 는 리뷰 도구 토큰이다(Codex 는 로그의 `tokens used` 값, Claude 는 마지막 `result` 이벤트 `usage` 네 값의 합). 실제 모델과 같은 로그 확인 조건일 때만 읽고, 못 읽으면 `-` 이다.
+새 파일은 12열 헤더로 시작한다. 이미 있는 파일은 헤더를 바꾸지 않는다. 첫 줄이 `\ttokens` 로 끝나면 12열, `\tmodel` 로 끝나면 11열, 그 밖(10열 헤더, 계측 확장 이전 세션)이면 10열 행을 이어 쓴다. 그래서 `status` 는 마지막 열이 아니라 10번째 열로 읽는다.
 `status` 는 어댑터 프로세스 종료 상태(0→ok, 124→timeout, 그 외→fail)이며 턴 최종 유효성과는 별개다.
 기록 실패는 턴 실행을 막지 않는다(fail-open — 시간 원천 실패 포함). 단, 기록 실패는 stderr 에 `⚠️ turn metric ...` 경고로 표시되므로, 파일 부재는 계측 도입 이전 세션이거나 **기록 실패**(실행 stderr 의 경고로 구분)일 수 있다.
-턴 완료 시 stdout `turn time: <N>s` 와 stderr `turn time: <N>s (status: <s>)` 로도 표시된다.
+턴 완료 시 stdout `turn time: <N>s` 와 stderr `turn time: <N>s (status: <s>) / 실제 모델: <관측값> / 실제 effort: <관측값>` 로도 표시된다.
+Reviewer 턴이 끝나면 stderr 에 `리뷰 비용: 누적 <N>턴 · 세션 경과 <시간> · 리뷰 도구 <시간> · 토큰 이번 턴 <T> / 누적 <U> (리뷰 도구만)` 한 줄이 나온다. 누적 턴 수는 `turns/` 의 턴 파일 수, 세션 경과는 세션 폴더 이름의 시각부터 지금까지(Author 시간 포함, 못 읽으면 `-`), 리뷰 도구 시간과 누적 토큰은 이 파일의 실행 행 합(실패·재시도 포함)이다. 토큰을 못 읽은 행이나 토큰 열 없는 파일이면 누적 토큰 뒤에 `(일부 미확인)` 이 붙는다. Author(메인 세션) 토큰은 들어가지 않는다.
+실제 값은 Codex 는 `.codex_output.log` 머리말의 `model:`·`reasoning effort:` 줄, Claude 는 `.claude_output.log` 의 첫 `system`/`init` 이벤트의 `model`·`effort` 에서 읽는다. 읽지 못하면 `unknown` 이다. 요청값으로 채우지 않는다.
+Claude 실제 effort 가 `미확인` 이면 init 이벤트가 effort 를 담지 않은 것이다. 로컬 `claude -p` 실행의 init 은 `effort` 를 `null` 로 내므로(2026-11-19 실측) 보통 `미확인` 으로 보인다. effort 를 넘기지 못했다는 뜻이 아니다. 넘긴 값은 실행 줄의 `effort 시도:` 로 확인한다.
+어댑터가 모델 거부로 실패하면 로그의 모델은 실제 사용 근거가 아니므로 실제 모델을 `unknown` 으로 둔다.
+관측은 어댑터가 리뷰 도구의 종료를 확인하고 로그를 발행했을 때만 한다. 상태 파일 `.review_wait_status` 에 `log_preserved: yes` 와 `writer_group: verified` 가 없으면(도구가 살아 있거나 종료를 확인하지 못해 발행하지 않음) 실제 모델·effort 는 `unknown` 이다.
 
 `validate_turn_output` 은 리뷰어 턴 뒤 `check_reviewer_findings` 로 `## Findings` 의 형식과 인용을 검사하고 세션 디렉토리의 `finding_metrics.tsv` 에 턴마다 한 줄을 append 한다.
-칸은 `turn / review_type / findings / main / appendix / cite_ok / violations / confidences` 이고 `confidences` 는 쉼표로 이은 값(없으면 `-`)이다.
+칸은 `turn / review_type / findings / main / appendix / cite_ok / violations` 이다.
 검사는 경고만 한다(fail-open) — 위반도 파싱 오류도 턴 결과와 세션 상태를 바꾸지 않고, 기록 실패는 stderr 에 `⚠️  finding metric 기록 실패` 로 표시된다.
 `turn_metrics.tsv` 와는 별개 파일이다.
 

@@ -51,6 +51,47 @@ PS_STUB_EOF
   echo "  NOTE: 실제 ps 를 쓸 수 없는 환경 — lsof 기반 대역 ps 로 정상 정리 흐름을 검증합니다"
 fi
 
+# **실제 gh 호출 차단 (파일 전체 적용).** archive.sh 는 원격 발행 뒤 Source FR 에 연결된 Issue 를 issue_queue.sh 로
+# 닫는다. issue_queue.sh 는 gh 를 RD_GH 로 정하므로, 첫 사례보다 앞에서 가짜 gh 를 export 한다(실제 GitHub 에 쓰지 않는다).
+# 가짜 gh 는 호출마다 인자 전체를 gh.log 에 한 줄로 남긴다. 키: `api repos/o/r/issues/N` → api_repos_o_r_issues_N,
+# `issue <sub> N` → issue_<sub>_N. fail/<키> 가 있으면 실패(rc 1), resp/<키> 가 있으면 그 내용을 낸다.
+GHF="$(mktemp -d)" || { echo "test_archive_worktree.sh: 가짜 gh 디렉터리 생성 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+_ast_cleanup+=("$GHF")
+mkdir -p "$GHF/resp" "$GHF/fail"
+: > "$GHF/gh.log"
+cat > "$GHF/gh" <<'FAKE_GH_EOF'
+#!/usr/bin/env bash
+D="${FAKE_GH_DIR:?}"
+printf '%s\n' "$*" >> "$D/gh.log"
+cmd="${1:-}"
+case "$cmd" in
+  api)
+    shift; p=""
+    while [ $# -gt 0 ]; do
+      case "$1" in --hostname|--jq) shift 2 ;; -*) shift ;; *) [ -z "$p" ] && p="$1"; shift ;; esac
+    done
+    k="api_${p//[^A-Za-z0-9.]/_}" ;;
+  issue) k="issue_${2:-}_${3:-}" ;;
+  *) k="other" ;;
+esac
+[ -f "$D/fail/$k" ] && { echo "fake gh: $k 실패" >&2; exit 1; }
+if [ -f "$D/resp/$k" ]; then cat "$D/resp/$k"
+elif [ "$cmd" = api ]; then echo "fake gh: 응답 없음 $k" >&2; exit 1
+fi
+exit 0
+FAKE_GH_EOF
+chmod +x "$GHF/gh"
+export RD_GH="$GHF/gh" FAKE_GH_DIR="$GHF" RD_ISSUE_LEDGER="$GHF/ledger.tsv"
+gh_reset() {  # 호출 로그·실패 표식을 비운다
+  local f
+  : > "$GHF/gh.log"
+  for f in "$GHF"/fail/*; do [[ -e "$f" ]] && rm -f "$f"; done
+  return 0
+}
+gh_issue() { printf '{"state":"%s","assignees":[]}\n' "$2" > "$GHF/resp/api_repos_o_r_issues_$1"; }  # gh_issue <N> <open|closed>
+gh_fail() { : > "$GHF/fail/$1"; }
+gh_count() { grep -cF -e "$1" "$GHF/gh.log" || true; }  # gh_count <고정 문자열> — 그 문자열이 든 호출 줄 수
+
 PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1" >&2; }
@@ -1040,6 +1081,392 @@ nf_archive --force-skip-review-check "테스트" --allow-status-mismatch "테스
 [[ "$nf_rc" -eq 0 ]] && pass "T8: 두 플래그(hook 제거) → 재실행이 완료된다" || fail "T8: 두 플래그인데 실패 rc=$nf_rc — $nf_out"
 [[ "$(git -C "$NFO" rev-parse main)" == "$(git -C "$NFR" rev-parse main)" ]] \
   && pass "T8: 원격 main 이 로컬 main 을 따라왔다" || fail "T8: push 되지 않았다"
+
+# ---------------------------------------------------------------------------
+# 병렬 발행의 task-state 충돌 해소와 발행 뒤 Issue 닫기 (change spec 2026-11-17-1710 D1·D3·D4)
+# ---------------------------------------------------------------------------
+# ap_repo <dir> <기준 short-title> — T8 과 같은 모양의 기준 저장소를 만든다(커밋 1개, 원격 없음).
+ap_repo() {
+  local d="$1" st="$2"
+  mkdir -p "$d/rd-workflow"
+  cp -R "$SCRIPT_DIR/.." "$d/rd-workflow/scripts"
+  git -C "$d" init -q -b main
+  git -C "$d" config user.email t@t && git -C "$d" config user.name t
+  mkdir -p "$d/rd-workflow-workspace/.lifecycle" "$d/rd-workflow-workspace/backlog/items"
+  cp "$SCRIPT_DIR/../../../.gitignore" "$d/.gitignore"
+  bash -c "source '$SCRIPT_DIR/_lifecycle_common.sh'; emit_current_task_baseline" > "$d/CURRENT_TASK.md"
+  printf 'schema=1\nshort-title=%s\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\nbase-commit=null\nreview-session=null\n' "$st" \
+    > "$d/rd-workflow-workspace/.lifecycle/task-state"
+  printf '# Change Request\n\n## Source FR\n-\n' > "$d/REQUEST.md"
+  git -C "$d" add -A && git -C "$d" commit -q -m seed
+}
+ap_item() {  # ap_item <저장소> <이름> <github-issue 값> — FR 상세 파일을 만든다(커밋은 호출부)
+  printf '# %s\n\n- status: idea\n- github-issue: %s\n' "$2" "$3" > "$1/rd-workflow-workspace/backlog/items/$2.md"
+}
+ap_promote() {  # ap_promote <저장소> <slug> — worktree 작업을 만들고 작업 커밋을 하나 얹는다
+  ( cd "$1" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title "$2" --size large --source-fr - ) >/dev/null 2>&1
+  printf 'work-%s\n' "$2" > "$1/.worktrees/$2/src-$2.txt"
+  git -C "$1/.worktrees/$2" add -A
+  git -C "$1/.worktrees/$2" commit -q -m "구현: $2"
+}
+ap_set_field() {  # ap_set_field <worktree> <key> <value> — 작업 worktree 의 task-state 한 칸을 바꿔 커밋한다
+  local f="$1/rd-workflow-workspace/.lifecycle/task-state"
+  awk -F'=' -v k="$2" -v v="$3" 'BEGIN{OFS="="} $1==k{print k "=" v; next} {print}' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  git -C "$1" add -A
+  git -C "$1" commit -q -m "progress: $2"
+}
+ap_archive() {  # ap_archive <cwd> [추가 인자...] — 출력은 ap_out, 종료코드는 ap_rc
+  local d="$1"; shift
+  ap_rc=0
+  ap_out="$( cd "$d" && bash rd-workflow/scripts/lifecycle/archive.sh "$@" --force-skip-review-check "테스트" --allow-status-mismatch "테스트" 2>&1 )" || ap_rc=$?
+}
+
+echo "== archive.sh — 병렬 발행의 task-state 충돌 해소 (A1) =="
+AT="$(mktemp -d)" || { echo "mktemp 실패" >&2; exit 1; }
+AT="$(cd "$AT" && pwd -P)"
+_ast_cleanup+=("$AT")
+ATR="$AT/w"
+ap_repo "$ATR" prev
+ap_promote "$ATR" ts1
+ap_promote "$ATR" ts2
+ap_set_field "$ATR/.worktrees/ts2" status "아카이브 보류"
+ap_archive "$ATR/.worktrees/ts1"
+[[ "$ap_rc" -eq 0 ]] && pass "A1: 먼저 나간 줄기(ts1) 발행이 rc=0 이다" || fail "A1: ts1 발행 실패 rc=$ap_rc — $ap_out"
+ap_archive "$ATR/.worktrees/ts2"
+[[ "$ap_rc" -eq 0 ]] && pass "A1: task-state 가 충돌하는 늦은 줄기(ts2) 발행이 rc=0 이다" || fail "A1: ts2 rc=$ap_rc — $ap_out"
+[[ "$ap_out" == *"archive: task-state 충돌을 발행 줄기 쪽으로 해결했습니다 (정리 단계가 기준 상태로 되돌립니다)"* ]] \
+  && pass "A1: task-state 해소 안내가 있다" || fail "A1: 해소 안내 누락 — $ap_out"
+a1_ts="$(git -C "$ATR" show main:rd-workflow-workspace/.lifecycle/task-state)"
+[[ "$a1_ts" == *$'\nstatus=대기 중\n'* && "$a1_ts" == *$'\nfr-branch=null\n'* ]] \
+  && pass "A1: 발행 뒤 main 의 task-state 가 기준 상태(대기 중·fr-branch=null)다" || fail "A1: task-state 가 기준 상태가 아니다 — $a1_ts"
+[[ "$(git -C "$ATR" show main:CURRENT_TASK.md)" == "$(bash -c "source '$SCRIPT_DIR/_lifecycle_common.sh'; emit_current_task_baseline")" ]] \
+  && pass "A1: 발행 뒤 main 의 CURRENT_TASK.md 가 baseline 이다" || fail "A1: CURRENT_TASK.md 가 baseline 이 아니다"
+git -C "$ATR" show main:rd-workflow-workspace/.lifecycle/stage_metrics.tsv | grep -q $'^ts2\t아카이브 보류\t대기 중\t' \
+  && pass "A1: stage_metrics 에 늦은 줄기의 「아카이브 보류→대기 중」 전이 행이 있다" || fail "A1: ts2 전이 행 누락 — $(git -C "$ATR" show main:rd-workflow-workspace/.lifecycle/stage_metrics.tsv 2>&1)"
+[[ "$(git -C "$ATR" log -1 --format=%s main)" == "chore(lifecycle): archive ts2 metadata 정리" ]] \
+  && pass "A1: 늦은 줄기의 정리 커밋이 main 끝에 있다" || fail "A1: 정리 커밋 누락 — $(git -C "$ATR" log -3 --format=%s main)"
+
+echo "== archive.sh — 인덱스 병합기가 거부하는 충돌은 병합 전에 멈춘다 (A2) =="
+a2_idx="rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
+printf '# FR\n\n## 인덱스\n\n| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 상세 |\n|---|---|---|---|---|---|---|\n| 2026-01-01 | base | s | tooling | idea | - | [상세](items/base.md) |\n<!-- 여러 줄\n주석 -->\n' > "$ATR/$a2_idx"
+git -C "$ATR" add -A
+RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$ATR" commit -q -m "main: 여러 줄 주석 인덱스"
+ap_promote "$ATR" ix1
+ap_promote "$ATR" ix2
+for _a2 in ix1 ix2; do
+  printf '| 2026-02-02 | fr-%s | s | tooling | idea | - | [상세](items/fr-%s.md) |\n' "$_a2" "$_a2" >> "$ATR/.worktrees/$_a2/$a2_idx"
+  git -C "$ATR/.worktrees/$_a2" add -A
+  git -C "$ATR/.worktrees/$_a2" commit -q -m "등록: $_a2"
+done
+ap_archive "$ATR/.worktrees/ix1"
+[[ "$ap_rc" -eq 0 ]] && pass "A2: 먼저 나간 줄기(ix1) 발행이 rc=0 이다" || fail "A2: ix1 rc=$ap_rc — $ap_out"
+a2_head="$(git -C "$ATR" rev-parse HEAD)"
+ap_archive "$ATR/.worktrees/ix2"
+[[ "$ap_rc" -ne 0 ]] && pass "A2: 병합기가 거부하는 인덱스 충돌은 rc≠0 이다" || fail "A2: rc=0 — $ap_out"
+# --git-path 는 저장소 기준 상대 경로를 내므로 절대 경로로 받는다(상대 경로면 이 셸의 cwd 기준으로 읽혀 늘 「없음」이 된다).
+a2_mh="$(git -C "$ATR" rev-parse --path-format=absolute --git-path MERGE_HEAD)"
+[[ -n "$a2_mh" && ! -e "$a2_mh" && -z "$(git -C "$ATR" ls-files -u)" ]] \
+  && pass "A2: 기본 체크아웃에 MERGE_HEAD·충돌 항목이 없다(병합을 시작하지 않았다)" || fail "A2: 병합이 시작됐다(MERGE_HEAD='$a2_mh') — $ap_out"
+[[ "$(git -C "$ATR" rev-parse HEAD)" == "$a2_head" ]] \
+  && pass "A2: 기본 체크아웃 HEAD 가 바뀌지 않았다" || fail "A2: HEAD 가 바뀌었다"
+git -C "$ATR" merge --abort >/dev/null 2>&1 || true
+
+echo "== archive.sh — 원격 발행 뒤 Source FR 의 Issue 닫기 (A3·A4·A5·A6) =="
+# 원격: origin URL 은 https://github.com/o/r.git 이고 url.<bare>.insteadOf 로 로컬 bare 에 잇는다.
+#   `git remote get-url` 은 insteadOf 를 적용한 값을 내므로, bare 디렉터리 이름을 `gh@github.com:o/r.git` 로 두어
+#   issue_queue.sh commit-url 이 그 값을 `o/r` 로 읽게 한다(git 은 콜론 앞에 / 가 있어 로컬 경로로 다룬다).
+AP="$(mktemp -d)" || { echo "mktemp 실패" >&2; exit 1; }
+AP="$(cd "$AP" && pwd -P)"
+_ast_cleanup+=("$AP")
+APR="$AP/w"; APO="$AP/gh@github.com:o/r.git"
+ap_repo "$APR" -
+ap_item "$APR" i1 'o/r#1'; ap_item "$APR" i2 'o/r#2'; ap_item "$APR" i3 '-'
+ap_item "$APR" i5 'o/r#5'; ap_item "$APR" i6 'o/r#6'; ap_item "$APR" i7 'o/r#7'
+ap_item "$APR" i15 'https://github.com/o/r/issues/15'
+ap_item "$APR" i16 'https://github.com/o/r/issues/16, o/r#17'; ap_item "$APR" i18 'o/r#18'
+# 특수 문자 경로: glob 문자 `a[1]` 와 그 패턴에 맞는 다른 FR `a1`, 공백, 셸 메타문자 `;`.
+ap_item "$APR" 'a[1]' 'o/r#10'; ap_item "$APR" a1 'o/r#11'
+ap_item "$APR" 'space name' 'o/r#13'; ap_item "$APR" 'semi;printf INJECTED;' 'o/r#14'
+git -C "$APR" add -A && git -C "$APR" commit -q -m "FR 상세"
+git init -q --bare "$APO"
+git -C "$APR" remote add origin https://github.com/o/r.git
+git -C "$APR" config "url.$APO.insteadOf" https://github.com/o/r.git
+git -C "$APR" push -q origin main
+ap_it="rd-workflow-workspace/backlog/items"
+
+# A3 — 한 실행에 FR 일곱 개: 열림·닫힘·연결 없음·상세 없음·댓글 실패·조회 실패·닫기 실패(조회 실패 #7 을 #6 앞에 둔다).
+#   여기에 특수 문자 경로 셋을 얹는다: `a[1]`(#10 — glob 으로 `a1`(#11) 을 고르면 안 됨), 공백(#13)·`;`(#14) 경로는 닫기 실패로
+#   재실행 줄을 내게 한다.
+ap_promote "$APR" ia
+ap_set_field "$APR/.worktrees/ia" source-fr "$ap_it/i15.md|$ap_it/i16.md|$ap_it/i18.md|$ap_it/i1.md|$ap_it/i2.md|$ap_it/i3.md|$ap_it/gone.md|$ap_it/i5.md|$ap_it/i7.md|$ap_it/i6.md|$ap_it/a[1].md|$ap_it/space name.md|$ap_it/semi;printf INJECTED;.md"
+gh_reset
+gh_issue 1 open; gh_issue 2 closed; gh_issue 5 open; gh_issue 6 open
+gh_issue 10 open; gh_issue 11 open; gh_issue 13 open; gh_issue 14 open
+# #15 는 URL 값이고 장부에는 호스트 없이 선점한 행이 있다 — 지우지 않고 남은 사실과 forget 명령을 보여야 한다.
+printf '{"state":"open","assignees":[]}\n' > "$GHF/resp/api_repos_o_r_issues_15"
+printf 'o/r\t15\thttps://github.com/o/r/issues/15\t-\t2026-11-16T00:00:00Z\n' > "$RD_ISSUE_LEDGER"
+# #16·#17 은 한 FR 이다 — #17 조회가 실패해도 닫은 #16 의 남은 행 안내가 나와야 한다.
+gh_issue 16 open; gh_fail api_repos_o_r_issues_17
+printf 'o/r\t16\thttps://github.com/o/r/issues/16\t-\t2026-11-16T00:00:00Z\n' >> "$RD_ISSUE_LEDGER"
+# #18 은 닫은 뒤 장부 잠금이 잡혀 정리만 실패한다 — forget 줄을 내고 close-fr 재실행은 안내하지 않아야 한다.
+gh_issue 18 open
+printf 'o/r\t18\thttps://github.com/o/r/issues/18\t-\t2026-11-16T00:00:00Z\n' >> "$RD_ISSUE_LEDGER"
+mkdir "$RD_ISSUE_LEDGER.lock"; export RD_ISSUE_LOCK_WAIT=0.2
+gh_fail issue_comment_5; gh_fail issue_close_6; gh_fail api_repos_o_r_issues_7
+gh_fail issue_close_13; gh_fail issue_close_14
+ap_archive "$APR/.worktrees/ia"
+a3_out="$ap_out"
+rmdir "$RD_ISSUE_LEDGER.lock"; unset RD_ISSUE_LOCK_WAIT
+a3_pub="$(git -C "$APO" rev-parse main)"
+[[ "$ap_rc" -eq 0 ]] && pass "A3: Issue 닫기 실패가 섞여도 발행은 rc=0 이다" || fail "A3: rc=$ap_rc — $a3_out"
+[[ "$a3_pub" == "$(git -C "$APR" rev-parse main)" ]] && pass "A3: 원격 main 이 발행 커밋이다" || fail "A3: 원격 main 이 로컬과 다르다"
+[[ "$a3_out" == *"archive: Issue 를 닫았습니다: https://github.com/o/r/issues/1"* ]] \
+  && pass "A3: 열린 #1 을 닫았다고 알린다" || fail "A3: #1 닫음 줄 누락 — $a3_out"
+[[ "$a3_out" == *"archive: Issue 가 이미 닫혀 있어 건너뜁니다: https://github.com/o/r/issues/2"* ]] \
+  && pass "A3: 닫힌 #2 는 건너뛴다고 알린다" || fail "A3: #2 건너뜀 줄 누락 — $a3_out"
+[[ "$a3_out" == *"archive: Issue 를 닫았습니다: https://github.com/o/r/issues/15"* && "$a3_out" == *"archive: 장부에 호스트 없는 선점 행 o/r#15 이 남았습니다 — 같은 Issue 면 bash rd-workflow/scripts/issue_queue.sh forget o/r 15 로 장부 행만 지우십시오"* ]] \
+  && pass "A3: URL 값 #15 를 닫고 남은 호스트 없는 선점 행과 forget 명령을 알린다" || fail "A3: #15 닫음·장부 안내 누락 — $a3_out"
+[[ "$a3_out" == *"archive: Issue 를 닫았습니다: https://github.com/o/r/issues/16"* && "$a3_out" == *"선점 행 o/r#16 이 남았습니다 — 같은 Issue 면 bash rd-workflow/scripts/issue_queue.sh forget o/r 16 로"* && "$a3_out" == *"archive: WARNING — Issue 닫기 실패 ($ap_it/i16.md)"* ]] \
+  && pass "A3: 같은 FR 의 #17 이 실패해도 닫은 #16 과 남은 선점 행 안내를 보인다" || fail "A3: #16 부분 실패 안내 누락 — $a3_out"
+[[ "$a3_out" == *"archive: WARNING — Issue 닫기 실패 ($ap_it/i18.md)"* && "$a3_out" == *"archive:   장부 정리: bash rd-workflow/scripts/issue_queue.sh forget o/r 18"* && "$a3_out" != *"close-fr $ap_it/i18.md"* ]] \
+  && pass "A3: 장부 정리만 실패한 #18 은 forget 줄을 내고 close-fr 재실행 줄은 내지 않는다" || fail "A3: #18 안내 — $a3_out"
+[[ "$(gh_count 'issue close 1 --repo o/r')" == 1 ]] && pass "A3: #1 닫기 호출 1회" || fail "A3: #1 닫기 호출 수 $(gh_count 'issue close 1 --repo o/r') — $(<"$GHF/gh.log")"
+[[ "$(gh_count 'issue comment 2 ')" == 0 && "$(gh_count 'issue close 2 ')" == 0 ]] \
+  && pass "A3: 닫힌 #2 에 댓글·닫기 호출이 없다" || fail "A3: #2 호출 — $(<"$GHF/gh.log")"
+[[ "$(gh_count 'issue close 5 ')" == 0 ]] && pass "A3: 댓글이 실패한 #5 는 닫지 않는다" || fail "A3: #5 닫기 호출 — $(<"$GHF/gh.log")"
+[[ "$(gh_count 'issue comment 6 ')" == 1 ]] && pass "A3: 앞 FR 의 실패 뒤에도 #6 을 처리한다(댓글 1회)" || fail "A3: #6 댓글 호출 수 $(gh_count 'issue comment 6 ') — $(<"$GHF/gh.log")"
+[[ "$(gh_count 'issue comment 7 ')" == 0 && "$(gh_count 'issue close 7 ')" == 0 ]] \
+  && pass "A3: 조회 실패한 #7 에 댓글·닫기 호출이 없다" || fail "A3: #7 호출 — $(<"$GHF/gh.log")"
+a3_rerun() { printf 'archive:   재실행: bash rd-workflow/scripts/issue_queue.sh close-fr %s/%s.md --skip-closed --commit-url https://github.com/o/r/commit/%s' "$ap_it" "$1" "$a3_pub"; }
+[[ "$a3_out" == *"archive: WARNING — Issue 닫기 실패 ($ap_it/i7.md): Issue 를 조회하지 못했습니다"* && "$a3_out" == *"$(a3_rerun i7)"* ]] \
+  && pass "A3: #7 조회 실패 경고와 재실행 줄이 있다" || fail "A3: #7 경고·재실행 누락 — $a3_out"
+[[ "$a3_out" == *"archive: WARNING — Issue 닫기 실패 ($ap_it/gone.md)"* && "$a3_out" == *"archive:   수동 조치: 발행 커밋에 이 FR 상세가 없어 연결된 Issue 를 알 수 없습니다. 상세 파일의 github-issue 를 확인해 Issue 를 직접 닫으십시오."* ]] \
+  && pass "A3: 상세 없는 FR 은 경고와 수동 조치 줄을 낸다" || fail "A3: 상세 없음 경고·수동 조치 누락 — $a3_out"
+[[ "$a3_out" != *"close-fr $ap_it/gone.md"* ]] \
+  && pass "A3: 상세 없는 FR 에는 재실행 줄이 없다" || fail "A3: 상세 없는 FR 에 재실행 줄이 있다 — $a3_out"
+[[ "$a3_out" == *"archive: WARNING — Issue 닫기 실패 ($ap_it/i5.md):"* && "$a3_out" == *"$(a3_rerun i5)"* ]] \
+  && pass "A3: #5 댓글 실패 경고와 재실행 줄이 있다" || fail "A3: #5 경고·재실행 누락 — $a3_out"
+a3_w6="$(printf '%s\n' "$a3_out" | grep -F "archive: WARNING — Issue 닫기 실패 ($ap_it/i6.md):" || true)"
+[[ "$a3_w6" == *"(댓글은 달렸습니다)" && "$a3_out" == *"$(a3_rerun i6)"* ]] \
+  && pass "A3: #6 닫기 실패 경고 끝에 「(댓글은 달렸습니다)」 와 재실행 줄이 있다" || fail "A3: #6 경고 — '$a3_w6' — $a3_out"
+[[ "$a3_out" != *"close-fr $ap_it/i3.md"* && "$a3_out" != *"($ap_it/i3.md)"* ]] \
+  && pass "A3: 연결 없는 FR 은 경고·재실행 줄이 없다" || fail "A3: 연결 없는 FR 에 줄이 있다 — $a3_out"
+[[ "$(gh_count 'issue close 10 --repo o/r')" == 1 && "$(gh_count 'issues/11')" == 0 && "$(gh_count ' 11 --repo')" == 0 ]] \
+  && pass "A3: glob 문자 경로 a[1] 은 그 FR(#10)만 닫고 패턴에 맞는 다른 FR(#11)은 부르지 않는다" || fail "A3: a[1] 선택 — $(<"$GHF/gh.log")"
+# 공백·셸 메타문자 경로의 재실행 줄을 기본 체크아웃에서 그대로 실행한다 — 한 인자로 전달돼 닫히고, `;` 뒤가 명령으로 실행되지 않아야 한다.
+a3_sp="$(printf '%s\n' "$a3_out" | sed -n 's/^archive:   재실행: //p' | grep -F 'items/space' || true)"
+a3_semi="$(printf '%s\n' "$a3_out" | sed -n 's/^archive:   재실행: //p' | grep -F 'items/semi' || true)"
+rm -f "$GHF/fail/issue_close_13" "$GHF/fail/issue_close_14"; : > "$GHF/gh.log"
+a3_sp_rc=0; a3_sp_out="$( cd "$APR" && eval "$a3_sp" 2>&1 )" || a3_sp_rc=$?
+[[ -n "$a3_sp" && "$a3_sp_rc" -eq 0 && "$(gh_count 'issue close 13 --repo o/r')" == 1 ]] \
+  && pass "A3: 공백 경로의 재실행 줄이 상세 경로를 한 인자로 넘겨 Issue 를 닫는다" || fail "A3: 공백 경로 재실행 rc=$a3_sp_rc cmd='$a3_sp' out='$a3_sp_out' — $(<"$GHF/gh.log")"
+a3_semi_rc=0; a3_semi_out="$( cd "$APR" && eval "$a3_semi" 2>&1 )" || a3_semi_rc=$?
+[[ -n "$a3_semi" && "$a3_semi_rc" -eq 0 && "$a3_semi_out" != *INJECTED* && "$(gh_count 'issue close 14 --repo o/r')" == 1 ]] \
+  && pass "A3: 셸 메타문자 경로의 재실행 줄이 다른 명령을 실행하지 않고 Issue 를 닫는다" || fail "A3: ; 경로 재실행 rc=$a3_semi_rc cmd='$a3_semi' out='$a3_semi_out' — $(<"$GHF/gh.log")"
+# 재실행 실효성 — #5 의 실패 표식을 지우고 출력된 명령을 기본 체크아웃에서 그대로 실행한다.
+a3_cmd="$(printf '%s\n' "$a3_out" | sed -n 's/^archive:   재실행: //p' | grep -F "$ap_it/i5.md" || true)"
+rm -f "$GHF/fail/issue_comment_5"; : > "$GHF/gh.log"
+a3_rc=0; ( cd "$APR" && eval "$a3_cmd" ) >/dev/null 2>&1 || a3_rc=$?
+[[ -n "$a3_cmd" && "$a3_rc" -eq 0 && "$(gh_count 'issue close 5 --repo o/r')" == 1 ]] \
+  && pass "A3: 출력된 #5 재실행 명령이 기본 체크아웃에서 Issue 를 닫는다" || fail "A3: 재실행 실효성 rc=$a3_rc cmd='$a3_cmd' — $(<"$GHF/gh.log")"
+
+# A5 — 로컬 전용 모드(--no-remote)는 연결된 FR 이 있어도 gh 를 부르지 않는다.
+ap_promote "$APR" ie
+ap_set_field "$APR/.worktrees/ie" source-fr "$ap_it/i1.md"
+gh_reset; gh_issue 1 open
+ap_archive "$APR/.worktrees/ie" --no-remote
+[[ "$ap_rc" -eq 0 && ! -s "$GHF/gh.log" ]] \
+  && pass "A5: 로컬 전용 발행은 gh 를 부르지 않는다" || fail "A5: rc=$ap_rc gh.log='$(<"$GHF/gh.log")' — $ap_out"
+git -C "$APR" push -q origin main   # 다음 사례의 원격을 로컬에 맞춘다
+
+# A4 — origin 을 해석할 수 없는 로컬 경로로 두면 커밋 URL 을 만들지 못한다 → 경고·재실행 줄, gh 0회.
+APP="$AP/plain.git"
+git init -q --bare "$APP"
+git -C "$APR" remote set-url origin "$APP"
+git -C "$APR" push -q origin main
+ap_promote "$APR" ic
+ap_set_field "$APR/.worktrees/ic" source-fr "$ap_it/i1.md"
+gh_reset; gh_issue 1 open
+ap_archive "$APR/.worktrees/ic"
+a4_pub="$(git -C "$APP" rev-parse main)"
+[[ "$ap_rc" -eq 0 ]] && pass "A4: 커밋 URL 을 못 만들어도 발행은 rc=0 이다" || fail "A4: rc=$ap_rc — $ap_out"
+[[ "$ap_out" == *"archive: WARNING — Issue 닫기 실패 ($ap_it/i1.md):"* ]] \
+  && pass "A4: 경고 첫 줄이 있다" || fail "A4: 경고 누락 — $ap_out"
+[[ "$ap_out" == *"archive:   재실행: bash rd-workflow/scripts/issue_queue.sh close-fr $ap_it/i1.md --skip-closed --commit-url \"\$(bash rd-workflow/scripts/issue_queue.sh commit-url $a4_pub)\""* ]] \
+  && pass "A4: 재실행 줄이 commit-url 명령 치환을 담는다" || fail "A4: 재실행 줄 누락 — $ap_out"
+[[ ! -s "$GHF/gh.log" ]] && pass "A4: gh 를 부르지 않는다" || fail "A4: gh 호출 — $(<"$GHF/gh.log")"
+
+# A6 — 기본 브랜치 push 가 실패하면 Issue 를 닫지 않는다.
+#   origin 을 해석 가능한 URL(https + insteadOf)로 되돌린다 — 해석 불가 origin 이면 push 앞에서 닫더라도 커밋 URL 단계에서
+#   gh 를 부르지 않아 이 단언이 순서 결함을 잡지 못한다.
+git -C "$APR" remote set-url origin https://github.com/o/r.git
+git -C "$APR" push -q origin main
+ap_promote "$APR" id
+ap_set_field "$APR/.worktrees/id" source-fr "$ap_it/i1.md"
+printf '#!/bin/sh\necho "pre-receive 거부(테스트)" >&2\nexit 1\n' > "$APO/hooks/pre-receive"
+chmod +x "$APO/hooks/pre-receive"
+gh_reset; gh_issue 1 open
+ap_archive "$APR/.worktrees/id"
+[[ "$ap_rc" -ne 0 && "$ap_out" == *"main push 실패"* ]] && pass "A6: push 거부로 발행이 rc≠0 이다" || fail "A6: rc=$ap_rc — $ap_out"
+[[ ! -s "$GHF/gh.log" ]] && pass "A6: push 실패 시 gh 를 부르지 않는다" || fail "A6: gh 호출 — $(<"$GHF/gh.log")"
+rm -f "$APO/hooks/pre-receive"
+
+echo "== archive.sh — no-fr 발행의 Issue 닫기 보류 기록 (A7) =="
+A7="$(mktemp -d)" || { echo "mktemp 실패" >&2; exit 1; }
+A7="$(cd "$A7" && pwd -P)"
+_ast_cleanup+=("$A7")
+A7R="$A7/w"; A7O="$A7/gh@github.com:o/r.git"
+ap_repo "$A7R" -
+for _a7 in 1 3 4 5 8; do ap_item "$A7R" "i$_a7" "o/r#$_a7"; done
+ap_item "$A7R" 'pipe|name' 'o/r#1'   # 파일 이름에 `|` 가 든 단일 Source FR — A7a 가 쓴다
+git -C "$A7R" add -A && git -C "$A7R" commit -q -m "FR 상세"
+git init -q --bare "$A7O"
+git -C "$A7R" remote add origin https://github.com/o/r.git
+git -C "$A7R" config "url.$A7O.insteadOf" https://github.com/o/r.git
+git -C "$A7R" push -q origin main
+a7_rec="$A7R/.git/rd-archive-issues"
+a7_work() {  # a7_work <source-fr 경로|-> — no-fr 작업 `repeat` 를 기본 체크아웃에 커밋한다
+  ( cd "$A7R" && bash rd-workflow/scripts/rd task set-title repeat \
+    && bash rd-workflow/scripts/rd task set-base HEAD \
+    && bash rd-workflow/scripts/rd task set-status "구현 중" ) >/dev/null 2>&1
+  [[ "$1" == "-" ]] || ( cd "$A7R" && bash rd-workflow/scripts/rd task set-source-fr "$1" ) >/dev/null 2>&1
+  printf 'code-%s\n' "$RANDOM" >> "$A7R/src.txt"
+  git -C "$A7R" add -A && git -C "$A7R" commit -q -m "구현: repeat"
+}
+a7_hook() { printf '#!/bin/sh\necho "pre-receive 거부(테스트)" >&2\nexit 1\n' > "$A7O/hooks/pre-receive"; chmod +x "$A7O/hooks/pre-receive"; }
+a7_recs() { ls "$a7_rec" 2>/dev/null | LC_ALL=C sort | tr '\n' ' '; }
+
+# A7a — 첫 실행 성공: push 뒤 원격 추적 ref 가 발행 커밋과 같아도 #1 을 닫고, 끝나면 기록이 없다.
+#   Source FR 은 이름에 `|` 가 든 단일 경로다 — 두 FR 로 찢으면 상세를 찾지 못해 #1 을 닫지 못한다.
+a7_work "$ap_it/pipe|name.md"
+gh_reset; gh_issue 1 open
+ap_archive "$A7R"
+[[ "$ap_rc" -eq 0 ]] && pass "A7a: no-fr 발행이 rc=0 이다" || fail "A7a: rc=$ap_rc — $ap_out"
+[[ "$(git -C "$A7R" rev-parse refs/remotes/origin/main)" == "$(git -C "$A7O" rev-parse main)" ]] \
+  && pass "A7a: push 뒤 원격 추적 ref 가 발행 커밋과 같다" || fail "A7a: 원격 추적 ref 가 다르다"
+[[ "$(gh_count 'issue close 1 --repo o/r')" == 1 ]] && pass "A7a: #1 을 닫는다(이름에 | 가 든 단일 Source FR)" || fail "A7a: #1 닫기 호출 수 $(gh_count 'issue close 1 --repo o/r') — $ap_out"
+[[ -z "$(a7_recs)" ]] && pass "A7a: 끝난 뒤 보류 기록이 없다" || fail "A7a: 기록이 남았다 — $(a7_recs)"
+
+# A7b — 같은 이름·Source FR 없음: #1 을 다시 고르지 않는다.
+a7_work -
+gh_reset
+ap_archive "$A7R"
+[[ "$ap_rc" -eq 0 && ! -s "$GHF/gh.log" ]] && pass "A7b: Source FR 없는 같은 이름 작업은 gh 를 부르지 않는다" || fail "A7b: rc=$ap_rc gh.log='$(<"$GHF/gh.log")' — $ap_out"
+
+# A7c — 발행 커밋의 조상이 아닌 작업 커밋 이름의 기록(#8)은 쓰지 않고 남겨 둔다.
+a7_orphan="$(git -C "$A7R" commit-tree "HEAD^{tree}" -p HEAD -m "버려진 작업")"
+mkdir -p "$a7_rec"
+printf 'source-fr=%s/i8.md\n' "$ap_it" > "$a7_rec/$a7_orphan"
+a7_work -
+gh_reset; gh_issue 8 open
+ap_archive "$A7R"
+[[ "$ap_rc" -eq 0 && "$(gh_count 'issues/8')" == 0 && "$(gh_count ' 8 --repo')" == 0 ]] \
+  && pass "A7c: 조상이 아닌 기록의 #8 을 부르지 않는다" || fail "A7c: rc=$ap_rc gh.log='$(<"$GHF/gh.log")'"
+[[ -f "$a7_rec/$a7_orphan" ]] && pass "A7c: 조상이 아닌 기록은 남는다" || fail "A7c: 조상이 아닌 기록이 지워졌다"
+
+# A7e — 같은 이름 이어 발행: push 실패로 남은 #4 기록과 새 작업의 #5 를 함께 닫는다.
+a7_work "$ap_it/i4.md"
+a7_hook
+gh_reset
+ap_archive "$A7R"
+[[ "$ap_rc" -ne 0 && ! -s "$GHF/gh.log" ]] && pass "A7e: #4 작업이 push 실패로 멈추고 gh 를 부르지 않는다" || fail "A7e: 첫 실행 rc=$ap_rc — $ap_out"
+a7_work "$ap_it/i5.md"
+rm -f "$A7O/hooks/pre-receive"
+gh_reset; gh_issue 4 open; gh_issue 5 open
+ap_archive "$A7R"
+[[ "$ap_rc" -eq 0 ]] && pass "A7e: 이어 발행이 rc=0 이다" || fail "A7e: rc=$ap_rc — $ap_out"
+[[ "$(gh_count 'issue close 4 --repo o/r')" == 1 && "$(gh_count 'issue close 5 --repo o/r')" == 1 ]] \
+  && pass "A7e: #4·#5 를 각각 한 번 닫는다" || fail "A7e: 닫기 호출 — $(<"$GHF/gh.log")"
+[[ "$(a7_recs)" == "$a7_orphan " ]] && pass "A7e: 두 기록은 지워지고 비조상 기록만 남는다" || fail "A7e: 남은 기록 '$(a7_recs)' (기대 '$a7_orphan ')"
+
+# A7d — 정리 뒤 push 실패 → set-title 복구 커밋 → 재실행: 첫 실행의 기록(#3)을 재정리 커밋 기준으로 고른다.
+a7_work "$ap_it/i3.md"
+a7_w3="$(git -C "$A7R" rev-parse HEAD)"
+a7_hook
+gh_reset
+ap_archive "$A7R"
+[[ "$ap_rc" -ne 0 && -f "$a7_rec/$a7_w3" ]] && pass "A7d: push 실패 뒤 작업 커밋 이름의 보류 기록이 남는다" || fail "A7d: rc=$ap_rc 기록='$(a7_recs)' — $ap_out"
+( cd "$A7R" && bash rd-workflow/scripts/rd task set-title repeat ) >/dev/null 2>&1
+git -C "$A7R" add -A && git -C "$A7R" commit -q -m "chore: set-title 복구"
+rm -f "$A7O/hooks/pre-receive"
+gh_reset; gh_issue 3 open
+ap_archive "$A7R"
+a7d_pub="$(git -C "$A7O" rev-parse main)"
+[[ "$ap_rc" -eq 0 ]] && pass "A7d: 재실행이 rc=0 이다" || fail "A7d: rc=$ap_rc — $ap_out"
+[[ "$(gh_count 'issue close 3 --repo o/r')" == 1 ]] && pass "A7d: 재실행이 #3 을 닫는다" || fail "A7d: #3 닫기 호출 — $(<"$GHF/gh.log") — $ap_out"
+[[ "$(gh_count "issue comment 3 --repo o/r --body 반영 커밋: https://github.com/o/r/commit/$a7d_pub")" == 1 ]] \
+  && pass "A7d: 댓글의 커밋 URL 이 재실행의 발행 커밋이다" || fail "A7d: 댓글 URL — $(<"$GHF/gh.log") (발행 $a7d_pub)"
+
+# A7f — 로컬 전용(--no-remote) no-fr 발행은 보류 기록을 쓰지 않고 gh 도 부르지 않는다.
+a7_recs_before="$(a7_recs)"
+a7_work "$ap_it/i1.md"
+a7_wf="$(git -C "$A7R" rev-parse HEAD)"
+gh_reset; gh_issue 1 open
+ap_archive "$A7R" --no-remote
+[[ "$ap_rc" -eq 0 && ! -e "$a7_rec/$a7_wf" && "$(a7_recs)" == "$a7_recs_before" ]] \
+  && pass "A7f: 로컬 전용 no-fr 발행은 보류 기록을 쓰지 않는다" || fail "A7f: rc=$ap_rc 기록='$(a7_recs)' (전 '$a7_recs_before') — $ap_out"
+[[ ! -s "$GHF/gh.log" ]] && pass "A7f: 로컬 전용 no-fr 발행은 gh 를 부르지 않는다" || fail "A7f: gh 호출 — $(<"$GHF/gh.log")"
+
+# ---------------------------------------------------------------------------
+# 재실행 판 비교 경고 (change spec 2026-11-19-1430 D1)
+# ---------------------------------------------------------------------------
+echo "== archive.sh — 재실행이 발행 대상과 다른 스크립트 판으로 돌면 알림 (D1) =="
+rv_has() {  # rv_has <출력> <고정 문자열> <라벨> — 없으면 fail
+  [[ "$1" == *"$2"* ]] && return 0
+  fail "$3 — 없음: [$2] — 출력: $1"; return 1
+}
+rv_fixture() {  # rv_fixture — 작업 worktree 하나(rvw)가 있는 저장소를 만든다. 경로는 rv_repo.
+  local d
+  d="$(mktemp -d)" || { echo "mktemp 실패" >&2; exit 1; }
+  d="$(cd "$d" && pwd -P)"
+  _ast_cleanup+=("$d")
+  rv_repo="$d/w"
+  ap_repo "$rv_repo" prev
+  ap_promote "$rv_repo" rvw
+}
+rv_script_commit() {  # 작업 worktree 의 lifecycle 스크립트 하나에 주석 한 줄을 더해 커밋한다
+  printf '# D1 테스트용 주석\n' >> "$rv_repo/.worktrees/rvw/rd-workflow/scripts/lifecycle/promote.sh"
+  git -C "$rv_repo/.worktrees/rvw" add -A
+  git -C "$rv_repo/.worktrees/rvw" commit -q -m "fix: D1 테스트용 스크립트 변경"
+}
+
+# t_reexec_version_quiet — 스크립트를 바꾸지 않은 발행에는 경고가 없다.
+rv_fixture
+ap_archive "$rv_repo/.worktrees/rvw"
+[[ "$ap_rc" -eq 0 ]] && pass "t_reexec_version_quiet: 발행이 rc=0 이다" || fail "t_reexec_version_quiet: rc=$ap_rc — $ap_out"
+[[ "$ap_out" != *"WARNING — 이번 발행은"* ]] \
+  && pass "t_reexec_version_quiet: 스크립트가 같으면 경고가 없다" || fail "t_reexec_version_quiet: 있으면 안 됨: [WARNING — 이번 발행은] — 출력: $ap_out"
+
+# t_reexec_version_warn — 대상에만 있는 스크립트 커밋이 있으면 제목과 함께 알린다.
+rv_fixture
+rv_script_commit
+ap_archive "$rv_repo/.worktrees/rvw"
+[[ "$ap_rc" -eq 0 ]] && pass "t_reexec_version_warn: 발행이 rc=0 이다(알림만 한다)" || fail "t_reexec_version_warn: rc=$ap_rc — $ap_out"
+rv_has "$ap_out" "이번 발행은 기본 체크아웃의 rd-workflow/scripts 로 돕니다" "t_reexec_version_warn: 경고 줄" \
+  && rv_has "$ap_out" "fix: D1 테스트용 스크립트 변경" "t_reexec_version_warn: 커밋 제목" \
+  && rv_has "$ap_out" "이번 발행에 쓰이지 않는 변경:" "t_reexec_version_warn: 커밋 머리" \
+  && pass "t_reexec_version_warn: 경고와 커밋 제목을 낸다"
+
+# t_reexec_version_mixed — 기본 체크아웃에만 있는 미커밋 스크립트 차이도 함께 낸다.
+rv_fixture
+rv_script_commit
+printf '# 기본 체크아웃 미커밋\n' >> "$rv_repo/rd-workflow/scripts/_task_common.sh"
+ap_archive "$rv_repo/.worktrees/rvw"
+rv_has "$ap_out" "fix: D1 테스트용 스크립트 변경" "t_reexec_version_mixed: 커밋 제목" \
+  && rv_has "$ap_out" "기본 체크아웃에만 있는 차이 파일:" "t_reexec_version_mixed: 차이 파일 머리" \
+  && rv_has "$ap_out" "rd-workflow/scripts/_task_common.sh" "t_reexec_version_mixed: 차이 파일 경로" \
+  && pass "t_reexec_version_mixed: 커밋 제목과 기본 체크아웃 차이 파일을 함께 낸다"
+
+# t_reexec_version_default_ahead — fr 을 딴 뒤 기본 브랜치에만 스크립트 커밋이 들어오고 대상은 스크립트를
+# 바꾸지 않았으면, 재실행 판과 merge 결과 판이 같으므로 경고하지 않는다.
+rv_fixture
+printf '# 기본 브랜치에만 있는 변경\n' >> "$rv_repo/rd-workflow/scripts/_task_common.sh"
+git -C "$rv_repo" add -A
+git -C "$rv_repo" commit -q -m "fix: 기본 브랜치 스크립트 변경"
+ap_archive "$rv_repo/.worktrees/rvw"
+[[ "$ap_rc" -eq 0 ]] && pass "t_reexec_version_default_ahead: 발행이 rc=0 이다" || fail "t_reexec_version_default_ahead: rc=$ap_rc — $ap_out"
+[[ "$ap_out" != *"WARNING — 이번 발행은"* ]] \
+  && pass "t_reexec_version_default_ahead: 기본 쪽 커밋만으로는 경고하지 않는다" || fail "t_reexec_version_default_ahead: 있으면 안 됨: [WARNING — 이번 발행은] — 출력: $ap_out"
 
 echo "== 결과: PASS=$PASS FAIL=$FAIL =="
 DONE=1

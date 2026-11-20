@@ -37,11 +37,22 @@ if [[ -z "$base" ]]; then
 elif ! git -C "$ROOT" rev-parse --verify -q "refs/heads/fr/$slug" >/dev/null; then
   hold+=("충돌 판정 생략 — 로컬 브랜치 fr/$slug 가 없습니다")
 else
-  mc_rc=0
-  bad="$(rd_merge_conflicts "$ROOT" "$base" "fr/$slug")" || mc_rc=$?
+  # gitlink 충돌 자동 해소는 fr 끝 커밋의 archive_publish 가 push 일 때만 켭니다 — pr(직접 설치 PR)은 로컬 병합을 거치지
+  # 않고 archive 의 P4 가 자동 해소 없이 판정하므로 같은 판정을 씁니다(발행 큐 pq_merge_check 와 같은 규칙).
+  mc_rc=0; amode=""; amerr=""
+  amerrf="$(mktemp "${TMPDIR:-/tmp}/rd-grant-amode.XXXXXX")" || amerrf=/dev/null
+  amode="$( ( source "$HERE/../lifecycle/_direct_pr_common.sh" >/dev/null 2>&1 || exit 2
+              dpr_archive_mode "$ROOT" "fr/$slug" ) 2>"$amerrf" )" || mc_rc=2
+  if [[ "$amerrf" != /dev/null ]]; then amerr="$(head -1 "$amerrf")"; rm -f "$amerrf"; fi
+  if [[ "$mc_rc" == 0 && "$amode" == push ]]; then
+    bad="$(rd_merge_conflicts "$ROOT" "$base" "fr/$slug" --gitlink-auto)" || mc_rc=$?
+  elif [[ "$mc_rc" == 0 ]]; then
+    bad="$(rd_merge_conflicts "$ROOT" "$base" "fr/$slug")" || mc_rc=$?
+  fi
   case "$mc_rc" in
     0) ;;
     1) hold+=("자동 해소 대상이 아닌 충돌: $(tr '\n' ' ' <<<"$bad")") ;;
+    2) hold+=("충돌 판정 실패 — fr/$slug 의 archive_publish 를 판정할 수 없습니다: ${amerr:-원인 불명}") ;;
     *) hold+=("충돌 판정 실패 — git merge-tree --write-tree 가 결과를 내지 못했습니다(git 2.38 이상 필요)") ;;
   esac
 fi

@@ -40,7 +40,7 @@ run_case() {
 }
 has()  { printf '%s\n' "$ERR" | grep -qF -- "$1"; }
 warns() { printf '%s\n' "$ERR" | grep -c '⚠️'; }
-head_of() { printf -- '- F1 [confidence 8/10] t\n  - 근거: %s\n' "$1"; }
+head_of() { printf -- '- F1 t\n  - 근거: %s\n' "$1"; }
 
 # ok
 run_case "$(head_of '`src/a.sh:5` — `echo "target line"`')"
@@ -48,6 +48,7 @@ run_case "$(head_of '`src/a.sh:5` — `echo "target line"`')"
 has '인용 확인 1'; chk $? "ok: 요약에 인용 확인 1"
 [ "$(wc -l < "$TSV" | tr -d ' ')" = "2" ]; chk $? "ok: tsv 2줄"
 [ "$(sed -n 2p "$TSV" | cut -f7)" = "0" ]; chk $? "ok: tsv 위반 0"
+[ "$(awk -F'\t' '{print NF}' "$TSV" | sort -u)" = "7" ]; chk $? "ok: tsv 머리글·행 7칸"
 
 # cite-mismatch
 run_case "$(head_of '`src/a.sh:5` — `echo "other"`')"
@@ -124,20 +125,15 @@ rm -f "$TMP/sd/SESSION.md"
 run_case "$(head_of '`c.md:1` — `status: 구현 중`')" "$G"
 has 'cite-mismatch'; chk $? "cite-head-oid-legacy: oid 없는 세션은 작업 트리만 읽음"
 
-# confidence-missing
-run_case '- F1 t
-  - 근거: `src/a.sh:5` — `echo "target line"`'
-has 'confidence-missing'; chk $? "confidence-missing"
-
 # cite-missing
-run_case '- F1 [confidence 8/10] t'
-has 'cite-missing'; chk $? "cite-missing"
+run_case '- F1 t'
+has '(턴 002 F1): cite-missing'; chk $? "cite-missing"
 
-# appendix-confidence
+# appendix: 근거 줄 없는 부록 발견은 경고하지 않는다
 run_case '### 부록: 인용하지 못한 발견
-- F2 [confidence 6/10] t
+- F2 t
   - 인용하지 못한 이유: r'
-has 'appendix-confidence'; chk $? "appendix-confidence"
+[ "$(warns)" = "0" ]; chk $? "appendix: 경고 없음"
 
 # none
 run_case '- 없음'
@@ -145,7 +141,7 @@ run_case '- 없음'
 has '발견 0'; chk $? "none: 요약 발견 0"
 
 # not-a-finding
-run_case '- F1 해소 — 설명'
+run_case '- 해소 — 설명'
 has 'not-a-finding'; chk $? "not-a-finding"
 
 # no-findings-section

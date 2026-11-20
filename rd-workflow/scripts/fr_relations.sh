@@ -7,6 +7,7 @@
 #
 # 서브커맨드:
 #   readiness   --root <ROOT>                     활성 FR 1건당 `<stem><TAB><판정>`
+#   in-progress --root <ROOT>                     진행 중 FR 1건당 `<stem><TAB><단계>` (읽기 전용, 판정과 무관)
 #   validate    --root <ROOT>                     위반 1건당 `<종류><TAB><stem><TAB><설명>`
 #   candidates  --root <ROOT> [--slugs "<s> <s>"] 활성 FR 1건당 `<stem><TAB><status><TAB><priority><TAB><판정>`
 #                                                 (--slugs 면 지정한 비활성 FR 도 판정 `-` 로 냄)
@@ -18,6 +19,7 @@
 #
 # 종료 코드:
 #   readiness    0 정상 / 2 실행 불가
+#   in-progress  0 정상 / 2 실행 불가(git worktree list 실패)
 #   validate     0 위반 없음(priority-drift 만 있으면 0) / 1 위반 / 2 실행 불가
 #   candidates   0 정상 / 2 실행 불가(--slugs 미해결 포함)
 #   auto-pick    0 정상 / 2 unavailable(--slugs 미해결 포함)
@@ -442,7 +444,7 @@ compute_verdicts() {
         mget ST "$one"; st="$MV"
         case "$st" in
           done) ;;
-          dropped) checks="${checks:+$checks,}$one" ;;
+          dropped|handed-off) checks="${checks:+$checks,}$one" ;;
           *) waiting="${waiting:+$waiting,}$one" ;;
         esac
       done
@@ -609,6 +611,74 @@ cmd_readiness() {
   return 0
 }
 
+# ---------------------------------------------------------------- in-progress
+
+# 진행 중 FR 을 `<stem><TAB><단계>` 로 낸다. 읽기 전용이다 — `rd task list`(tasks_list.sh)는
+# 지연 정리를 하므로 `/fr list` 가 부르지 않고, 같은 출처(task-state)를 여기서 직접 읽는다.
+#   ① 체크아웃마다(기본 체크아웃 포함) 그 체크아웃의 task-state 파일
+#   ② 체크아웃되지 않은 `fr/*` 브랜치의 tip task-state
+#   ③ `/fr do` 의 active.tsv 3번째 칸 — ①② 에서 나오지 않은 stem 만, 단계는 `/fr do 줄기 <slug>`
+# status 가 `대기 중`·`완료`·빈 값이면 진행 중이 아니다. 같은 stem 은 처음 나온 것만 낸다.
+IP_BUF=""
+IP_SEEN=" "
+ip_emit_state() { # ip_emit_state <task-state 내용>
+  local st src one stem
+  st="$(printf '%s\n' "$1" | awk -F'=' '$1=="status"{sub(/^[^=]+=/,""); print; exit}')"
+  case "$st" in ""|"대기 중"|"완료") return 0 ;; esac
+  src="$(printf '%s\n' "$1" | awk -F'=' '$1=="source-fr"{sub(/^[^=]+=/,""); print; exit}')"
+  local IFS='|'
+  for one in $src; do
+    stem="${one##*/}"; stem="${stem%.md}"
+    valid_stem "$stem" || continue
+    case "$IP_SEEN" in *" $stem "*) continue ;; esac
+    IP_SEEN="${IP_SEEN}${stem} "
+    IP_BUF="${IP_BUF}${stem}	${st}
+"
+  done
+}
+
+cmd_in_progress() {
+  local porc line wt="" main="" checked=" " ref slug stem ts
+  porc="$(git -C "$ROOT" worktree list --porcelain 2>/dev/null)" \
+    || { echo "fr_relations.sh: git worktree list 실패 (root=${ROOT})" >&2; return 2; }
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*)
+        wt="${line#worktree }"
+        [ -n "$main" ] || main="$wt"
+        ts="${wt}/rd-workflow-workspace/.lifecycle/task-state"
+        [ -f "$ts" ] && ip_emit_state "$(cat "$ts")" ;;
+      "branch refs/heads/"*) checked="${checked}${line#branch } " ;;
+    esac
+  done <<EOF
+$porc
+EOF
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    case "$checked" in *" $ref "*) continue ;; esac
+    ts="$(git -C "$ROOT" show "${ref}:rd-workflow-workspace/.lifecycle/task-state" 2>/dev/null)" || continue
+    ip_emit_state "$ts"
+  done <<EOF
+$(git -C "$ROOT" for-each-ref --format='%(refname)' 'refs/heads/fr/*' 2>/dev/null)
+EOF
+  # active.tsv 는 2번째 칸(소유 경로)이 빌 수 있다. 탭 IFS 로 read 하면 빈 칸이 접혀
+  # 3번째 칸이 밀리므로 awk 로 1·3번째 칸을 stem 단위로 풀어 \034 로 넘긴다.
+  ts="${main}/rd-workflow-workspace/.lifecycle/fr-do/active.tsv"
+  if [ -n "$main" ] && [ -f "$ts" ]; then
+    while IFS="$(printf '\034')" read -r slug stem; do
+      valid_stem "$stem" || continue
+      case "$IP_SEEN" in *" $stem "*) continue ;; esac
+      IP_SEEN="${IP_SEEN}${stem} "
+      IP_BUF="${IP_BUF}${stem}	/fr do 줄기 ${slug}
+"
+    done <<EOF
+$(awk -F'\t' '$1!="" {n=split($3,a,";"); for(i=1;i<=n;i++) if(a[i]!="") printf "%s\034%s\n", $1, a[i]}' "$ts")
+EOF
+  fi
+  printf '%s' "$IP_BUF"
+  return 0
+}
+
 # ---------------------------------------------------------------- validate
 
 cmd_validate() {
@@ -661,7 +731,7 @@ cmd_validate() {
     if [ "$MV" = "1" ]; then
       mget BADST "$stem"; sht="$MV"
       [ "$sht" = "-" ] && sht="없음"
-      buf="${buf}parse	${stem}	status 값 오류 (값: ${sht}) — 허용값: idea validated ready-for-request blocked done dropped parked
+      buf="${buf}parse	${stem}	status 값 오류 (값: ${sht}) — 허용값: idea validated ready-for-request blocked done dropped parked handed-off
 "
       viol=1
     fi
@@ -732,7 +802,7 @@ cmd_validate() {
 # ---------------------------------------------------------------- --slugs 해석
 
 # resolve_slugs — SLUGS(short-title 목록)를 stem 으로 풀어 SLUG_STEMS 에 넣는다.
-# 활성이 아닌(done·dropped·parked) FR 은 미해결이 아니다 — auto-pick 결과에서는 빠지고,
+# 활성이 아닌(done·dropped·parked·handed-off) FR 은 미해결이 아니다 — auto-pick 결과에서는 빠지고,
 # candidates 는 판정 `-` 로 낸다. 무인 엔진이 반복 중 완료된 FR 을 목록에 그대로 넘긴다. items/ 에 그 short-title 의
 # 상세 파일이 아예 없을 때만 실패(rc 2)한다.
 # 같은 short-title 이 여러 날짜에 있으면 하나만 고른다 — 인덱스에 행이 있는 stem 중 가장 늦은 날짜,
@@ -772,7 +842,7 @@ resolve_slugs() {
 # ---------------------------------------------------------------- candidates
 
 # --slugs 가 없으면 활성 FR 만 냅니다. --slugs 가 있으면 이름으로 지정해 해석한 FR 을 모두 냅니다.
-# 비활성(done·dropped·parked)은 판정 칸을 `-` 로 냅니다. 소비자(pick.py)가 상태로 제외 사유를 보입니다.
+# 비활성(done·dropped·parked·handed-off)은 판정 칸을 `-` 로 냅니다. 소비자(pick.py)가 상태로 제외 사유를 보입니다.
 cmd_candidates() {
   local stem st v pri rank rows="" line pool seen=" "
   compute_relations || { echo "fr_relations.sh: ${ERR_REASON}" >&2; return 2; }
@@ -831,7 +901,7 @@ state_label_for() {
     check:*)
       split_csv "${v#check:}"
       for one in $SPLIT_OUT; do out="${out:+$out, }${one:11}"; done
-      printf '확인 필요(선행 dropped: %s)' "$out" ;;
+      printf '확인 필요(선행 dropped·handed-off: %s)' "$out" ;;
     error:*) printf '오류(%s)' "${v#error:}" ;;
     *) printf '%s' "$v" ;;
   esac
@@ -909,11 +979,12 @@ cmd_auto_pick() {
 
 case "$CMD" in
   readiness)   cmd_readiness ;;
+  in-progress) cmd_in_progress ;;
   validate)    cmd_validate ;;
   candidates)  cmd_candidates ;;
   auto-pick)   cmd_auto_pick ;;
   ""|-h|--help|help)
-    echo "usage: fr_relations.sh {readiness|validate|candidates|auto-pick} [--root <ROOT>] [--slugs \"<s> <s>\"]" >&2
+    echo "usage: fr_relations.sh {readiness|in-progress|validate|candidates|auto-pick} [--root <ROOT>] [--slugs \"<s> <s>\"]" >&2
     exit 2 ;;
   *)
     echo "fr_relations.sh: 알 수 없는 서브커맨드: ${CMD}" >&2

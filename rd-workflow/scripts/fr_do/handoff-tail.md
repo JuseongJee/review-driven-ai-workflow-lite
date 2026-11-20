@@ -2,6 +2,7 @@
 
 - 발행은 제품의 발행 요청 큐로 합니다. `.claude/rules/rd-workflow/core.md` 「발행 승인」 과 `rd-workflow/docs/flows/AUTONOMY.md` 「종결 마커(seal)와 발행 승인」 절을 따릅니다. 요약: seal → 기록 커밋 → `bash rd-workflow/scripts/rd publish request` → `rd publish wait` 를 백그라운드로 실행 → 허가되면 `rd publish run`. 사용자에게 발행 승인을 묻지 않습니다(이 작업은 호출 세션이 있는 `caller` 경로입니다).
 - `rd publish request` 가 종료 코드 10·11 을 내면(사용자 승인 대상) 그때만 사용자에게 묻습니다.
+- `rd publish request`·`wait` 가 「호출 세션의 감시가 없습니다」 경고를 내면 사용자에게 알립니다. `wait` 가 종료 코드 5 로 끝났으면 알린 뒤 `rd publish wait` 를 다시 백그라운드로 실행합니다(AUTONOMY.md 「감시 없음 경고」).
 - `archive.sh` 의 자동 해소 대상은 `CURRENT_TASK.md`·`stage_metrics.tsv`·`FUTURE_REQUESTS.md`·`review-seals/verify-evidence` 네 파일입니다. 그 밖의 충돌이 예상되면(`git merge-tree --write-tree <기본 브랜치> HEAD`) 요청 대신 호출 세션에 충돌 보고를 보냅니다.
 
 ## 실행 규칙 (반드시 지킵니다)

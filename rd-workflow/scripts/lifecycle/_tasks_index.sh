@@ -381,6 +381,18 @@ tasks_lock_release() {
   return 1
 }
 
+# _tasks_remote_tag_is <tag> <tag_commit_oid> — 원격 origin 의 그 태그가 가리키는 커밋이 <tag_commit_oid> 와 같으면 rc 0.
+# annotated 태그는 `^{}` 줄(peel)을 먼저 보고, 없으면 태그 줄을 봅니다.
+_tasks_remote_tag_is() {
+  local tag="$1" tag_oid="$2" ls remote_oid
+  ls="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}" 2>/dev/null)" || ls=""
+  remote_oid="$(printf '%s\n' "$ls" | awk -v t="refs/tags/${tag}^{}" '$2==t{print $1; exit}')"
+  if [[ -z "$remote_oid" ]]; then
+    remote_oid="$(printf '%s\n' "$ls" | awk -v t="refs/tags/${tag}" '$2==t{print $1; exit}')"
+  fi
+  [[ -n "$remote_oid" && "$remote_oid" == "$tag_oid" ]]
+}
+
 # tasks_publish_evidence <slug> <fr_tip_oid> <default_branch> <remote_mode>
 #   stdout: in-progress | needs-verify | cleanup-pending
 #
@@ -392,6 +404,25 @@ tasks_lock_release() {
 tasks_publish_evidence() {
   local slug="$1" fr_tip="$2" default_branch="$3" remote_mode="$4"
   [[ -z "$default_branch" ]] && { printf 'in-progress\n'; return 0; }
+
+  # PR 경로 (spec D10, 직접 설치 PR) — squash·rebase merge 는 fr tip 이 기본 브랜치의 조상이 아니므로
+  # 아래 조상 판정으로는 완료를 알 수 없다. `rd pr check --apply` 가 merge 커밋에 단 태그의 주석
+  # `pr-head: <리뷰한 fr tip>` 이 지금 fr tip 과 같을 때만 그 태그를 증거로 본다.
+  local prtag prtag_oid
+  while IFS= read -r prtag; do
+    [[ -n "$prtag" ]] || continue
+    git tag -l --format='%(contents)' "$prtag" 2>/dev/null | grep -qxF "pr-head: ${fr_tip}" || continue
+    prtag_oid="$(git rev-parse --verify --quiet "refs/tags/${prtag}^{commit}" 2>/dev/null)" || continue
+    if [[ "$remote_mode" == "remote" ]]; then
+      git merge-base --is-ancestor "$prtag_oid" "refs/remotes/origin/${default_branch}" 2>/dev/null \
+        && _tasks_remote_tag_is "$prtag" "$prtag_oid" \
+        && { printf 'cleanup-pending\n'; return 0; }
+    else
+      git merge-base --is-ancestor "$prtag_oid" "refs/heads/${default_branch}" 2>/dev/null \
+        && { printf 'cleanup-pending\n'; return 0; }
+    fi
+    printf 'needs-verify\n'; return 0
+  done < <(git tag --list "fr/*/${slug}" 2>/dev/null | sort)
 
   git merge-base --is-ancestor "$fr_tip" "refs/heads/${default_branch}" 2>/dev/null || {
     printf 'in-progress\n'; return 0
@@ -413,15 +444,7 @@ tasks_publish_evidence() {
     git merge-base --is-ancestor "$tag_oid" "refs/remotes/origin/${default_branch}" 2>/dev/null || {
       printf 'needs-verify\n'; return 0
     }
-    local ls remote_oid
-    ls="$(git ls-remote --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}" 2>/dev/null)" || ls=""
-    remote_oid="$(printf '%s\n' "$ls" | awk -v t="refs/tags/${tag}^{}" '$2==t{print $1; exit}')"
-    if [[ -z "$remote_oid" ]]; then
-      remote_oid="$(printf '%s\n' "$ls" | awk -v t="refs/tags/${tag}" '$2==t{print $1; exit}')"
-    fi
-    if [[ -z "$remote_oid" || "$remote_oid" != "$tag_oid" ]]; then
-      printf 'needs-verify\n'; return 0
-    fi
+    _tasks_remote_tag_is "$tag" "$tag_oid" || { printf 'needs-verify\n'; return 0; }
   fi
 
   printf 'cleanup-pending\n'

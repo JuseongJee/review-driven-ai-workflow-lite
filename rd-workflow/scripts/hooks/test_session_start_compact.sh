@@ -211,5 +211,17 @@ else
   fail "A13" "SKILL.md 없음: $SKILL_MD"
 fi
 
+# --- A14 안내 주석은 Next Step 값으로 보이지 않는다 ---
+# archive 초기본·템플릿의 Next Step 절은 안내 주석 줄 다음에 `-` 가 온다. 주석이 값으로 나오면 안 된다.
+set_state "구현 중"
+"$BASH_BIN" -c 'source "$1"; emit_current_task_baseline' _ "$SCRIPTS_DIR/lifecycle/_lifecycle_common.sh" > "$T/CURRENT_TASK.md"
+hook_run "$HOOK" '{"source":"startup"}'
+if [[ "$OUT" == *'Next Step: (설정되지 않음)'* && "$OUT" != *'<!--'* ]]; then ok "A14 안내 주석 건너뜀"; else fail "A14" "$OUT"; fi
+
+# --- A15 주석 사이에 본문이 있는 줄은 값으로 남는다 ---
+printf '# Current Task\n\n## Task\ndemo\n\n## Status\n구현 중\n\n## Next Step\n%s\n' '<!-- 인계 --> 배포 결과 확인 <!-- 메모 -->' > "$T/CURRENT_TASK.md"
+hook_run "$HOOK" '{"source":"startup"}'
+if [[ "$OUT" == *'Next Step: <!-- 인계 --> 배포 결과 확인 <!-- 메모 -->'* ]]; then ok "A15 주석 사이 본문 보존"; else fail "A15" "$OUT"; fi
+
 [[ "$FAILS" -eq 0 ]] || exit 1
 exit 0

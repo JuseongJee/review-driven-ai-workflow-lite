@@ -3,7 +3,7 @@
 #
 # 판정 규칙(정본): 값이 비어 있지 않은 첫 `- status:` 줄의 첫 토큰을 쓴다.
 # 그런 줄이 없으면 `- 상태:` 에서 같은 규칙으로 보충한다.
-# 허용값 7개 밖의 값과 빈 값은 비표준이다.
+# 허용값 8개 밖의 값과 빈 값은 비표준이다.
 #
 # 값은 키 뒤 문자열의 앞뒤 공백·탭·CR 을 지운 것이고, 첫 토큰은 첫 공백·탭 앞까지다.
 # 키는 줄 맨 앞의 `- status:` / `- 상태:` 만 인정한다.
@@ -21,7 +21,7 @@
 # bash 3.2·BSD awk 에서 동작한다 (연관배열·gensub·\s 없음).
 
 FR_STATUS_ACTIVE="idea validated ready-for-request blocked"
-FR_STATUS_INACTIVE="done dropped parked"
+FR_STATUS_INACTIVE="done dropped parked handed-off"
 
 FR_STATUS_AWK='
 function frs_trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }

@@ -1,16 +1,16 @@
 ## /fr archive
 
-`FUTURE_REQUESTS.md` 인덱스에서 종료 상태(`done`/`dropped`) 항목을 일괄 삭제합니다. 상세 파일(`items/`)은 삭제하지 않습니다.
+`FUTURE_REQUESTS.md` 인덱스에서 종료 상태(`done`/`dropped`/`handed-off`) 항목을 일괄 삭제합니다. 상세 파일(`items/`)은 삭제하지 않습니다.
 
 ### 절차
 
 1. `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` 읽기.
-2. 인덱스에서 status가 `done` 또는 `dropped`인 행을 모두 찾습니다.
+2. 인덱스에서 status가 `done`·`dropped`·`handed-off` 인 행을 모두 찾습니다.
 3. 대상이 0건이면 "삭제할 종료 항목이 없습니다" 출력 후 종료.
 4. 대상 행을 인덱스에서 일괄 삭제합니다.
-5. 완료 메시지 출력: "archive 완료: done {N}건, dropped {M}건 인덱스에서 삭제"
+5. 완료 메시지 출력: "archive 완료: done {N}건, dropped {M}건, handed-off {K}건 인덱스에서 삭제"
 6. archive 대상 항목들의 short-title 을 모읍니다 — Step 2 에서 식별한 done/dropped 대상 행의 두 번째 컬럼 (short-title) 을 수집. **Step 4 의 인덱스 행 삭제 전에 추출하거나 임시 보관해 두어야 함** (삭제 후에는 행 데이터 접근 불가).
-7. 각 short-title에 대해 `fr` stage 캡처를 `rd-workflow-workspace/raw-captures/archive/` 로 이동합니다 — done 처리한 각 `${SHORT_TITLE}` 에 대해 아래 호출을 반복:
+7. 각 short-title에 대해 `fr` stage 캡처를 `rd-workflow-workspace/raw-captures/archive/` 로 이동합니다 — 인덱스에서 삭제한 각 항목(`done`·`dropped`·`handed-off`)의 `${SHORT_TITLE}` 에 대해 아래 호출을 반복:
    ```bash
    bash rd-workflow/scripts/rd task archive-captures --stages fr --title "${SHORT_TITLE}"
    ```
@@ -20,7 +20,7 @@
 
 ### 규칙
 
-- `done`과 `dropped` 상태 모두 대상입니다. 두 상태 모두 종료 상태이며, 상세 파일에서 원래 상태를 추적할 수 있습니다.
+- `done`·`dropped`·`handed-off` 상태 모두 대상입니다. 모두 종료 상태이며, 상세 파일에서 원래 상태를 추적할 수 있습니다.
 - 상세 파일(`items/*.md`)은 삭제하지 않습니다 — 이력 보존. done/dropped 구분은 상세 파일의 status 필드로 유지됩니다.
 - 인덱스 테이블 형식을 변경하지 않습니다.
 

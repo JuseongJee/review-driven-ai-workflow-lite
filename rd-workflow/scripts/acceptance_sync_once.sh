@@ -10,20 +10,20 @@
 #       sync 5단계가 배포본을 둡니다 (절차 뒤에는 이 경로가 존재합니다)
 #
 # 이어서 **경로 보존 시나리오 셋**을 같은 clone 으로 추가 검증합니다. 보존 목록
-# (sync_template.md 2단계) 의 workflow.json 은 경로가 이미 있으면 내용도 경로 자체도
+# (전파 정책 표, `sync_template.sh policy`) 의 workflow.json 은 경로가 이미 있으면 내용도 경로 자체도
 # 손대지 않아야 하며, 이것이 깨지면 사용자의 명시적 `manual` opt-out 이 조용히 지워집니다.
 #   (A) 기존 regular file  -> byte-for-byte 동일
 #   (B) dangling symlink   -> 링크 자체 보존 (`-e` 만 보면 "부재" 로 오판해 덮어씁니다)
 #   (C) 유효 symlink       -> 링크 정체성 + target 내용 보존 (역참조 덮어쓰기 방지)
 #
 #   (D) 프로젝트 소유 CLAUDE.md · .claude/rules/mine.md 보존 + 템플릿 소유 rules 폴더 미러
-#       (낡은 .claude/rules/rd-workflow/old.md 는 삭제, mine.md 와 CLAUDE.md 는 byte 동일)
+#       (낡은 .claude/rules/rd-workflow/old.md 는 삭제, mine.md 는 byte 동일, CLAUDE.md 는 원문이
+#       접두로 남고 `migrate post` 가 목차 절 하나만 덧붙임)
 #
 # 절차는 sync_template.md 의 단계 순서를 그대로 따른다:
 #   1단계 sync_template.sh(clone) -> 4단계 마이그레이션 -> 5단계 복사 -> 5.1 -> 6단계 검증
 #
-# **sync_template.sh 는 파일을 복사하지 않는다** (clone 경로만 출력). 5단계 복사는 이
-# 스크립트가 수행한다.
+# 5단계 복사는 `apply` 하위 명령이 수행하고, 이 스크립트는 하위 명령 호출만 합니다.
 #
 # **self_test.sh 스텝으로 등록하지 않는다.** 등록하면 self_test 가 self_test 를 호출하는
 # 재귀가 된다. 릴리즈 수용 검증이므로 검증 단계에서 1회 직접 실행한다.
@@ -112,64 +112,32 @@ copy_into() { # $1=src dir  $2=dst dir
   ( cd "$1" && tar cf - . ) | ( cd "$2" && tar xf - )
 }
 
-# sync_template.md 5단계(복사·신규 추가)를 모사합니다. 2단계 보존 목록 중
-# `rd-workflow/config/workflow.json` 은 **경로가 이미 있으면 내용도 경로 자체도
-# 손대지 않습니다.** 「있으면」의 판정은 `[ -e ] || [ -L ]` 입니다 — dangling symlink 는
-# `-e` 가 거짓이므로 `-L` 을 함께 보지 않으면 "부재" 로 오판해 배포본으로 덮어씁니다.
-# 보존은 링크를 따라가지 않는 `mv` 로 옮겼다가 되돌리는 방식이라, 유효 symlink 도
-# 역참조되지 않고 링크 정체성과 target 내용이 그대로 남습니다.
-#
-# 분류 모사 (sync_template.md 2·3·5단계):
-#   - 보존: 루트 `CLAUDE.md` 는 workflow.json 과 같은 방식(판정 `[ -e ] || [ -L ]`,
-#     대피 후 복원)으로 보존합니다. 경로가 없으면 배포본이 그대로 들어옵니다.
-#   - 동기화 대상 + 삭제 후보 승인: `.claude/rules/rd-workflow/` 는 템플릿 소유라 clone 과
-#     같게 미러합니다 (3단계에서 사용자가 삭제 후보를 승인한 상태 — 템플릿에 없는 파일 삭제).
-#     `.claude/rules/` 의 그 밖 파일은 프로젝트 소유라 건드리지 않습니다.
+# sync_template.md 3~5단계를 `sync_template.sh` 하위 명령으로 수행합니다 (clone 의 스크립트, cwd = 프로젝트).
+#   classify -> migrate pre -> apply --delete -> migrate post
+# 분류 정책(보존·부재 시 생성·미러 삭제)은 하위 명령이 판정합니다. 이 스크립트는 호출만 합니다.
+# 프로젝트가 git 저장소여야 하므로 없으면 init 합니다 (임시 디렉터리 안).
 sync_copy_step() { # $1=clone  $2=proj  (실패하면 1 을 반환합니다)
-  local clone="$1" proj="$2" base rc=0
-  local cfg="$proj/rd-workflow/config/workflow.json" saved=""
-  if [ -e "$cfg" ] || [ -L "$cfg" ]; then
-    saved="$proj/rd-workflow/config/.workflow.json.preserve.$$"
-    if ! mv "$cfg" "$saved"; then
-      echo "  보존 대상 대피 실패: $cfg" >&2; rc=1; saved=""
-    fi
+  local clone="$1" proj="$2" rc=0 crc=0 tag
+  tag="$(basename "$proj")"
+  mkdir -p "$proj"
+  [[ -d "$proj/.git" ]] || git -C "$proj" init --quiet
+  local sh="$clone/rd-workflow/scripts/sync_template.sh"
+  ( cd "$proj" && bash "$sh" classify ) > "$WORK/cls1.$tag.out" 2>&1 || crc=$?
+  if [[ "$crc" == "3" ]]; then
+    echo "  classify 가 구조 마이그레이션 대기(rc=3): $tag — 수용 시험 대상이 아닙니다" >&2; cat "$WORK/cls1.$tag.out" >&2; return 1
   fi
-  local md="$proj/CLAUDE.md" md_saved=""
-  if [ -e "$md" ] || [ -L "$md" ]; then
-    md_saved="$proj/.CLAUDE.md.preserve.$$"
-    if ! mv "$md" "$md_saved"; then
-      echo "  보존 대상 대피 실패: $md" >&2; rc=1; md_saved=""
-    fi
+  if [[ "$crc" != "0" ]]; then
+    echo "  classify 실패(rc=$crc): $tag" >&2; cat "$WORK/cls1.$tag.out" >&2; return 1
   fi
-  # rules 미러: clone 에 폴더가 있고 proj 가 비어 있지 않은 경로일 때만 폴더를 비운 뒤 다시 복사한다
-  if [[ -n "$proj" && -d "$clone/.claude/rules/rd-workflow" ]]; then
-    rm -rf "$proj/.claude/rules/rd-workflow"
-  fi
-  for base in $(cd "$clone" && ls -A | grep -v '^\.git$'); do
-    if [[ -d "$clone/$base" ]]; then
-      if ! copy_into "$clone/$base" "$proj/$base"; then
-        echo "  복사 실패(디렉터리): $base" >&2; rc=1
-      fi
-    else
-      if ! cp "$clone/$base" "$proj/$base"; then
-        echo "  복사 실패(파일): $base" >&2; rc=1
-      fi
-    fi
-  done
-  if [[ -n "$saved" ]]; then
-    rm -f "$cfg"
-    if ! mv "$saved" "$cfg"; then
-      echo "  보존 대상 복원 실패: $cfg" >&2; rc=1
-    fi
-  fi
-  if [[ -n "$md_saved" ]]; then
-    rm -f "$md"
-    if ! mv "$md_saved" "$md"; then
-      echo "  보존 대상 복원 실패: $md" >&2; rc=1
-    fi
-  fi
+  ( cd "$proj" && bash "$sh" migrate pre ) > "$WORK/pre.$tag.out" 2>&1 \
+    || { echo "  migrate pre 실패: $tag" >&2; cat "$WORK/pre.$tag.out" >&2; rc=1; }
+  ( cd "$proj" && bash "$sh" apply --delete ) > "$WORK/apply.$tag.out" 2>&1 \
+    || { echo "  apply 실패: $tag" >&2; cat "$WORK/apply.$tag.out" >&2; rc=1; }
+  ( cd "$proj" && bash "$sh" migrate post ) > "$WORK/post.$tag.out" 2>&1 \
+    || { echo "  migrate post 실패: $tag" >&2; cat "$WORK/post.$tag.out" >&2; rc=1; }
   return $rc
 }
+
 
 # 임시 작업 디렉터리는 **경로를 파생하기 전에** fail-closed 로 확정한다.
 # 실패하면 WORK 가 빈 문자열이 되어 REMOTE=/remote · PROJ=/proj 로 계산되고, 권한이 있는
@@ -271,59 +239,11 @@ if [[ "$SYNC_RC" != "0" ]] || ! is_disposable_clone "$CLONE"; then
   exit 1
 fi
 
-echo "== 4단계: 구조 마이그레이션 (M009) =="
-# clone 사본의 MIGRATIONS.md 가 권위다 (sync_template.md Step 4 규정).
-python3 - "$CLONE/rd-workflow/MIGRATIONS.md" "$WORK/m9_zzfx.py" <<'M9EXTRACT'
-import sys
-md, out = sys.argv[1], sys.argv[2]
-lines = open(md, encoding="utf-8").read().split("\n")
-start = None
-for i, l in enumerate(lines):
-    if l.startswith("## M009"):
-        start = i
-        break
-if start is None:
-    sys.exit("M009 절을 찾지 못했습니다")
-body, grab = [], False
-for l in lines[start:]:
-    t = l.strip()
-    if t == "python3 - <<'PY'":
-        grab = True
-        continue
-    if grab and t == "PY":
-        break
-    if grab:
-        body.append(l[3:] if l.startswith("   ") else l)
-if not body:
-    sys.exit("M009 의 python3 heredoc 본문이 비어 있습니다")
-open(out, "w", encoding="utf-8").write("\n".join(body) + "\n")
-M9EXTRACT
-( cd "$PROJ" && python3 "$WORK/m9_zzfx.py" ) > "$WORK/m9.out" 2>&1
-M9_RC=$?
-check "M009 종료코드 0" "$M9_RC" "0"
-if [[ "$M9_RC" != "0" ]]; then
-  echo "--- M009 출력 ---" >&2
-  cat "$WORK/m9.out" >&2
-  echo "--- 추출된 snippet 앞 12줄 ---" >&2
-  head -12 "$WORK/m9_zzfx.py" >&2
-fi
-
-echo "== 5단계: 동기화 실행 (복사·신규 추가) =="
-# sync_template.md 2단계 보존 목록은 덮지 않는다. 이 fixture 에 삭제 후보는 없다.
-#
-# `set -e` 를 켜지 않는다 — 이 스크립트는 진단을 여러 개 모아 보여주는 방식이고 `check "$?"`
-# 패턴이 그것에 의존한다. 대신 복사 실패를 국소 변수에 누적해 명명된 판정으로 낸다.
-# 이것이 없으면 항목 하나의 tar/cp 가 실패해도 루프가 계속되고, 실패한 것이 대표 파일이
-# 아니면 최종 PASS 가 되어 "오류 없는 절차 완주" 주장이 거짓이 된다.
+echo "== 4~5단계: classify → migrate pre → apply → migrate post (하위 명령) =="
+# 결과: self_test 직전까지 sync 절차 밖에서 fixture 를 손대지 않습니다.
 copy_failed=0
-if ! cp "$PROJ/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md" "$WORK/preserve_FR.md"; then
-  echo "  보존 대상 백업 실패" >&2; copy_failed=1
-fi
 sync_copy_step "$CLONE" "$PROJ" || copy_failed=1
-if ! cp "$WORK/preserve_FR.md" "$PROJ/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"; then
-  echo "  보존 대상 복원 실패" >&2; copy_failed=1
-fi
-check "5단계 복사 종료코드 0" "$copy_failed" "0"
+check "4~5단계 종료코드 0" "$copy_failed" "0"
 
 echo "== 5단계 결과: consumer 에 필요한 파일이 들어왔는지 =="
 check "self_test.sh 존재" \
@@ -497,8 +417,15 @@ cp "$PRJ/CLAUDE.md" "$WORK/owned_claude_before.md"
 cp "$PRJ/.claude/rules/mine.md" "$WORK/owned_mine_before.md"
 sync_copy_step "$CLONE" "$PRJ"
 check "D 복사 종료코드 0" "$?" "0"
-check "D CLAUDE.md 가 byte-for-byte 동일" \
-  "$( cmp -s "$WORK/owned_claude_before.md" "$PRJ/CLAUDE.md" && echo same || echo differ )" "same"
+# migrate post 의 M013 이 템플릿 규칙 목차 절을 끝에 덧붙이므로 「byte 동일」이 아니라
+# 「프로젝트 원문이 byte 접두로 남고, 덧붙은 꼬리는 목차 절뿐」이 계약입니다.
+_owned_n="$(wc -c < "$WORK/owned_claude_before.md" | tr -d ' ')"
+check "D CLAUDE.md 원문이 byte 접두로 보존됨" \
+  "$( head -c "$_owned_n" "$PRJ/CLAUDE.md" | cmp -s - "$WORK/owned_claude_before.md" && echo same || echo differ )" "same"
+check "D CLAUDE.md 에 덧붙은 것은 목차 절뿐" \
+  "$( tail -c +"$((_owned_n + 1))" "$PRJ/CLAUDE.md" | grep -c '^## ' )" "1"
+check "D 덧붙은 절이 rd-workflow 규칙 목차" \
+  "$( tail -c +"$((_owned_n + 1))" "$PRJ/CLAUDE.md" | grep -c '^## rd-workflow 규칙$' )" "1"
 check "D rules/mine.md 가 byte-for-byte 동일" \
   "$( cmp -s "$WORK/owned_mine_before.md" "$PRJ/.claude/rules/mine.md" && echo same || echo differ )" "same"
 check "D 낡은 rules/rd-workflow/old.md 삭제" \

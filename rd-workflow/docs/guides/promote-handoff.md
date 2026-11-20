@@ -65,3 +65,7 @@ promote 의 동작:
 - 세션이 살아 있거나 미확정이면(`launch` 가 `launching`·`unknown`, 또는 `ok` 이고 세션이 살아 있거나 판정 불가) promote 는 파일을 바꾸지 않고 `exit 1` 합니다. 그 세션이 이미 파일을 읽고 있을 수 있기 때문입니다. 메시지가 사유와 `rd task resolve-launch <slug>` 안내를 담습니다.
 - `launch` 가 `none`·`failed` 이거나 비어 있거나 세션이 죽었으면 파일을 교체하고 세션을 기동합니다.
 - `--no-worktree` 는 이 재시도 경로를 제공하지 않습니다. 기록에 실패하면 promote 가 출력하는 `cp <원본> <대상>` 명령으로 직접 복사한 뒤 안내된 기동 명령을 실행합니다.
+
+## 비어 있는 submodule
+
+promote 는 메인 체크아웃에서 초기화된 submodule 만 메인을 원천으로 받고, 나머지는 비워 둡니다. 비어 있는 submodule 때문에 검증·빌드가 실패하면 worktree 에서 `bash rd-workflow/scripts/rd submodule init [<경로>...]` 로 받습니다. promote 의 원격 대기 상한은 환경 변수 `RD_SUBMODULE_REMOTE_TIMEOUT`(기본 120초)입니다.

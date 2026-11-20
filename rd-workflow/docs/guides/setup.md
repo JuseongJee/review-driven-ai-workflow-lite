@@ -86,12 +86,31 @@ command -v gemini &>/dev/null && echo "gemini: 설치됨" || echo "gemini: 없�
   "tools": {
     "gemini": { "bin": null, "model": null },
     "codex": { "bin": null },
-    "claude": { "bin": null, "model": null, "self_review_warning": true }
+    "claude": { "bin": null, "self_review_warning": true }
   }
 }
 ```
 
 - 외부 도구가 있으면 `bin`에 경로를 넣으면 교차 리뷰가 가능합니다.
+
+리뷰어의 모델과 추론 깊이(effort)는 `rd-workflow/config/models.json` 에서 고칩니다.
+
+1. `rd-workflow/config/models.json.example` 을 `rd-workflow/config/models.json` 으로 복사합니다.
+2. 바꿀 칸만 고칩니다. 값이 `null` 인 칸은 비어 있고, 비어 있으면 도구 자체 설정을 씁니다.
+3. 다음 리뷰 턴의 실행 줄 `리뷰 도구: <도구> / 모델 요청: <값> (source: …) / effort 시도: <값> (source: …)` 에서 값과 출처를 확인합니다. 리뷰 턴 없이 확인하려면 `bash rd-workflow/scripts/model_select.sh show review` 를 실행합니다.
+
+칸 목록:
+
+- `review.codex.model`: Codex 모델. 계열 이름(`sol` 처럼 소문자만)을 쓰면 `~/.codex/models_cache.json` 에서 그 계열의 최신 모델을 고릅니다. 비어 있으면 `~/.codex/config.toml` 의 모델을 씁니다.
+- `review.codex.effort`: Codex effort 기본값.
+- `review.codex.small_task_effort`: `standard` 등급 리뷰(세션 `execution-path: small-task`)의 Codex effort. `medium` 이 하한입니다.
+- `review.codex.review_types.<리뷰 종류>.effort`: 리뷰 종류별 Codex effort.
+- `review.claude.model`: Claude 모델. 별칭(`opus`·`sonnet`·`haiku`·`fable`)을 씁니다.
+- `review.claude.effort`: Claude effort.
+
+effort 값은 `low`·`medium`·`high`·`xhigh`·`max`·`ultra`·`lowest`·`highest` 입니다. 모델이 지원하지 않는 단계는 바로 아래 지원 단계로 낮추고 경고합니다. `default` 는 「이 칸에서 넘기지 않음」 입니다.
+`RD_REVIEW_EFFORT_OVERRIDE=0` 이면 설정을 남긴 채 Codex effort 를 즉시 무력화합니다.
+`review-tools.json` 의 옛 키(`tools.claude.model`·`tools.codex.reasoning_effort`·`tools.codex.small_task_reasoning_effort`·`overrides.<종류>.tools.codex.reasoning_effort`)는 아직 읽지만 새로 쓰지 마십시오. 옛 키를 쓰면 리뷰 턴이 `models.json` 으로 옮기라고 안내합니다.
 
 ## 첫 작업 시작하기
 

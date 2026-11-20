@@ -170,53 +170,29 @@ printf 'SEED\n' > "$ISO/sub/seed.txt"
 rm -rf "$ISO"
 
 # =============================================================================
-# M008 hook 경로 표기 정규화 (AC 7 / spec §8)
+# M008 hook 경로 표기 정규화 (AC 7 / spec §8) — `sync_template.sh migrate M008` 로 실행
 # =============================================================================
-# `MIGRATIONS.md` 의 스니펫을 **문서에서 추출해** 그대로 실행합니다. 스니펫을 테스트에
-# 복사해 두면 문서와 테스트가 갈라져도 초록이 나오므로, 문서가 유일한 진실이어야 합니다.
-#
-# 이 파일에 두는 이유: 새 테스트 파일을 만들면 `self_test.sh` 의 `run_step` 등록이 하나 늘어
-# self_test 스텝 집계와 청중 exact 집합 단언을 흔듭니다. 이 스텝은 이미 sync·마이그레이션 도구를
-# 담당하는 `consumer` 스텝입니다.
+# 마이그레이션 로직은 clone 의 스크립트(_tpl_migrate.py)가 정본입니다. 시험은 그 하위 명령을 부릅니다.
+# source 한 fixture 함수(_tpl_test_common.sh)는 clone·프로젝트 만들기와 스크립트 복사를 맡습니다.
+# shellcheck source=_tpl_test_common.sh
+source "$SCRIPT_DIR/_tpl_test_common.sh"
 echo "-- M008 hook 표기 정규화 --"
 M8_DIR="$WORK/m008"; mkdir -p "$M8_DIR"
-M8_MD="${SCRIPT_DIR}/../MIGRATIONS.md"
-M8_SNIP="$M8_DIR/m008_snippet_zzfx.py"
-if [[ ! -f "$M8_MD" ]]; then
-  ok "MIGRATIONS.md 없음 — M008 검증 건너뜀 (lite 산출물)"
-else
-  python3 - "$M8_MD" "$M8_SNIP" <<'M8EXTRACT'
-import sys
-md, out = sys.argv[1], sys.argv[2]
-# 줄 기반으로 추출합니다 — 정규식에 백슬래시 이스케이프를 쓰면 이 파일을 생성·편집하는
-# 경로마다 해석이 한 겹씩 달라져 조용히 깨집니다 (구현 중 실제로 겪었습니다).
-lines = open(md).read().split(chr(10))
-begin = None
-for i, l in enumerate(lines):
-    if l.strip() == "python3 - <<'PY'":
-        begin = i + 1
-        break
-if begin is None:
-    sys.stderr.write('M008 스니펫 시작 줄을 찾지 못했습니다' + chr(10)); sys.exit(1)
-buf = []
-for l in lines[begin:]:
-    if l.strip() == 'PY':
-        break
-    buf.append(l[3:] if l.startswith('   ') else l)
-else:
-    sys.stderr.write('M008 스니펫 종료 줄을 찾지 못했습니다' + chr(10)); sys.exit(1)
-code = chr(10).join(buf)
-compile(code, 'm008', 'exec')          # 문서에 든 코드가 컴파일되는지부터 확인
-open(out, 'w').write(code)
-M8EXTRACT
-  if [[ -s "$M8_SNIP" ]]; then ok "MIGRATIONS.md 에서 M008 스니펫 추출·컴파일"; else nok "M008 스니펫 추출 실패"; fi
-fi
+M8_CLONE="$M8_DIR/clone"
+tpl_make_clone "$M8_CLONE" full
+mig() { # mig <프로젝트> <clone> <인자...> — clone 의 스크립트를 프로젝트 cwd 로 실행 (stdout+stderr)
+  local proj="$1" clone="$2"; shift 2
+  ( cd "$proj" && bash "$clone/rd-workflow/scripts/sync_template.sh" migrate "$@" 2>&1 )
+}
+mig_detail() { # 세부 줄만, 앞 두 칸을 뗀다
+  mig "$@" | sed -n 's/^  //p'
+}
 
-if [[ -s "${M8_SNIP:-}" ]]; then
+if true; then
   OLDP='bash rd-workflow/scripts/hooks/'
   NEWP='bash "${CLAUDE_PROJECT_DIR:-.}"/rd-workflow/scripts/hooks/'
-  m8_mk() { mkdir -p "$M8_DIR/$1/.claude"; cat > "$M8_DIR/$1/.claude/settings.json"; }
-  m8_run() { ( cd "$M8_DIR/$1" && python3 "$M8_SNIP" ) ; }
+  m8_mk() { mkdir -p "$M8_DIR/$1/.claude"; git -C "$M8_DIR/$1" init -q; cat > "$M8_DIR/$1/.claude/settings.json"; }
+  m8_run() { mig "$M8_DIR/$1" "$M8_CLONE" M008; }
   m8_count() { grep -c -- "$2" "$M8_DIR/$1/.claude/settings.json" 2>/dev/null || true; }
   m8_items() { python3 -c "
 import json,sys
@@ -349,34 +325,7 @@ J
   if [[ ! -f "$M8_TPL" ]]; then
     ok "템플릿 settings.json 없음 — 종단 검증 건너뜀 (설치본)"
   else
-    M8_MD="${SCRIPT_DIR}/../MIGRATIONS.md"
-    python3 - "$M8_MD" "$M8_DIR/m003_snippet_zzfx.py" <<'M3EXTRACT' || nok "M003 스니펫 추출 실패"
-import sys, textwrap
-md, out = sys.argv[1], sys.argv[2]
-lines = open(md, encoding="utf-8").read().split("\n")
-start = None
-for i, l in enumerate(lines):
-    if l.startswith("## M003"):
-        start = i
-        break
-if start is None:
-    sys.exit("M003 절을 찾지 못했습니다")
-body, grab = [], False
-for l in lines[start + 1:]:
-    s = l.strip()
-    if not grab and l.startswith("## "):
-        break
-    if s.startswith("python3 - ") and s.endswith("<<'PY'"):
-        grab = True
-        continue
-    if grab and s == "PY":
-        break
-    if grab:
-        body.append(l)
-if not body:
-    sys.exit("M003 의 python3 heredoc 본문이 비어 있습니다")
-open(out, "w", encoding="utf-8").write(textwrap.dedent("\n".join(body)) + "\n")
-M3EXTRACT
+    mkdir -p "$M8_CLONE/.claude"; cp "$M8_TPL" "$M8_CLONE/.claude/settings.json"
     # 기대값은 템플릿 settings 에서 계산합니다. 템플릿에 hook 을 더할 때마다 숫자를 손으로 고치지 않게
     # 하려는 것입니다(FR sync-test-gate-count-derived). 분류는 m8_end 와 같습니다.
     # M8_NG = 템플릿 gate hook triple 수, M8_NS = 템플릿 감시 항목 수. fixture 의 gate triple 은 5건 고정입니다.
@@ -394,7 +343,7 @@ print(sum(1 for c in cmds if not c.startswith(': rd-hook-sentinel') and 'rd-work
 import json,os
 h=json.load(open(os.environ['M8F']))['hooks']
 print(sum(1 for gs in h.values() for g in gs for it in g.get('hooks',[]) if it.get('command','').startswith(': rd-hook-sentinel')))")"
-      added="$( ( cd "$M8_DIR/$c" && python3 "$M8_DIR/m003_snippet_zzfx.py" "$M8_TPL" ) | sed -n 's/^M003: added //p' )"
+      added="$(mig "$M8_DIR/$c" "$M8_CLONE" M003 | sed -n 's/^  M003: added //p')"
       added="${added:-0}"
       python3 -c "
 import json,collections,sys
@@ -418,7 +367,7 @@ J
     # 재실행 무변경(AC4): 같은 JSON 의미를 indent=4 로 다시 써서 무조건 재쓰기를 해시로 드러냅니다.
     M8F="$M8_DIR/E1/.claude/settings.json" python3 -c 'import json,os;p=os.environ["M8F"];d=json.load(open(p));json.dump(d,open(p,"w"),indent=4,ensure_ascii=False)'
     m8_h1="$(shasum -a 256 < "$M8_DIR/E1/.claude/settings.json")"
-    check "종단 E1 2회차 → M003 해당 없음" "$( ( cd "$M8_DIR/E1" && python3 "$M8_DIR/m003_snippet_zzfx.py" "$M8_TPL" ) | head -1)" "M003: 해당 없음"
+    check "종단 E1 2회차 → M003 해당 없음" "$(mig_detail "$M8_DIR/E1" "$M8_CLONE" M003 | head -1)" "M003: 해당 없음"
     check "종단 E1 2회차 파일 불변" "$(shasum -a 256 < "$M8_DIR/E1/.claude/settings.json")" "$m8_h1"
 
     # 실패 시 무변경: 앞 event 는 추가 대상이 있고 뒤 event 가 잘못된 형식이라 부분 쓰기를 잡습니다.
@@ -426,9 +375,9 @@ J
 {"hooks":{"SessionStart":[{"hooks":[]}],"Stop":[{"hooks":"oops"}]}}
 J
     m8_before="$(shasum -a 256 < "$M8_DIR/EF/.claude/settings.json")"
-    m8_out="$( ( cd "$M8_DIR/EF" && python3 "$M8_DIR/m003_snippet_zzfx.py" "$M8_TPL" ) 2>&1 )" && m8_rc=0 || m8_rc=1
+    m8_out="$(mig "$M8_DIR/EF" "$M8_CLONE" M003)" && m8_rc=0 || m8_rc=1
     check "M003 형식 오류 → 실패" "$m8_rc" "1"
-    check "M003 형식 오류 → 실패 안내" "$(printf '%s\n' "$m8_out" | grep -c '^M003 실패')" "1"
+    check "M003 형식 오류 → 실패 안내" "$(printf '%s\n' "$m8_out" | grep -c '^  M003 실패')" "1"
     check "M003 형식 오류 → 원본 byte 불변" "$(shasum -a 256 < "$M8_DIR/EF/.claude/settings.json")" "$m8_before"
 
     m8_mk E2 <<'J'
@@ -447,43 +396,16 @@ J
 fi
 
 # --- M009: 보존 파일 정의 문구 마이그레이션 --------------------------------
-# snippet 을 MIGRATIONS.md 에서 추출해 fixture 에 실제로 실행한다.
+# `migrate M009` 를 fixture 에 실제로 실행한다.
 # 정적 문구 검사로 대체하지 않는다 (spec D1).
 M9_DIR="$(mktemp -d)" || { echo "test_sync_template.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$M9_DIR" && -d "$M9_DIR" ]] || { echo "test_sync_template.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
-M9_MD="$SCRIPT_DIR/../MIGRATIONS.md"
-M9_SNIP="$M9_DIR/m9_snippet_zzfx.py"
 
-python3 - "$M9_MD" "$M9_SNIP" <<'M9EXTRACT'
-import sys
-md, out = sys.argv[1], sys.argv[2]
-lines = open(md, encoding="utf-8").read().split("\n")
-start = None
-for i, l in enumerate(lines):
-    if l.startswith("## M009"):
-        start = i
-        break
-if start is None:
-    sys.exit("M009 절을 찾지 못했습니다")
-body, grab = [], False
-for l in lines[start:]:
-    s = l.strip()
-    if s == "python3 - <<'PY'":
-        grab = True
-        continue
-    if grab and s == "PY":
-        break
-    if grab:
-        body.append(l[3:] if l.startswith("   ") else l)
-if not body:
-    sys.exit("M009 의 python3 heredoc 본문이 비어 있습니다")
-open(out, "w", encoding="utf-8").write("\n".join(body) + "\n")
-M9EXTRACT
 
 # 구형 FUTURE_REQUESTS.md (blocked 없음, 인덱스 항목 1건)
 m9_fixture() { # $1=케이스명
   local d="$M9_DIR/$1/rd-workflow-workspace/backlog"
-  mkdir -p "$d"
+  mkdir -p "$d"; git -C "$M9_DIR/$1" init -q
   cat > "$d/FUTURE_REQUESTS.md" <<'FR'
 # FUTURE_REQUESTS
 
@@ -509,7 +431,7 @@ m9_fixture() { # $1=케이스명
 FR
 }
 
-m9_run() { ( cd "$M9_DIR/$1" && python3 "$M9_SNIP" ) ; }
+m9_run() { mig "$M9_DIR/$1" "$M8_CLONE" M009; }
 m9_fr() { echo "$M9_DIR/$1/rd-workflow-workspace/backlog/FUTURE_REQUESTS.md" ; }
 
 echo "== M009: 정상 변환 =="
@@ -585,53 +507,27 @@ check "F2 파일 무변경" \
   "$(diff "$M9_DIR/f2.before" "$(m9_fr F2)" | wc -l | tr -d ' ')" "0"
 
 # 대상 파일 부재 — 해당 없음으로 성공 종료
-mkdir -p "$M9_DIR/F3"
-( cd "$M9_DIR/F3" && python3 "$M9_SNIP" ) > "$M9_DIR/f3.out" 2>&1
+mkdir -p "$M9_DIR/F3"; git -C "$M9_DIR/F3" init -q
+mig "$M9_DIR/F3" "$M8_CLONE" M009 > "$M9_DIR/f3.out" 2>&1
 check "F3 대상 파일 부재 → 종료코드 0" "$?" "0"
-check "F3 해당 없음 출력" "$(grep -c '해당 없음' "$M9_DIR/f3.out")" "1"
+check "F3 해당 없음 출력" "$(grep -c '^  M009: .*해당 없음' "$M9_DIR/f3.out")" "1"
 
 rm -rf "$M9_DIR"
 
 # --- M015: 템플릿 permissions.allow 부재 규칙 추가 -------------------------
-# 스니펫을 MIGRATIONS.md 에서 꺼내 fixture 에 실제로 실행한다 (M009 와 같은 방식).
+# `migrate M015` 를 fixture 에 실제로 실행한다 (M009 와 같은 방식).
 M15_DIR="$(mktemp -d)" || { echo "test_sync_template.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$M15_DIR" && -d "$M15_DIR" ]] || { echo "test_sync_template.sh: 임시 디렉터리 경로 검증 실패" >&2; exit 1; }
-M15_MD="$SCRIPT_DIR/../MIGRATIONS.md"
 M15_TPL="$SCRIPT_DIR/../../.claude/settings.json"
 [[ -f "$SCRIPT_DIR/../../_ROOT_FILES/.claude/settings.json" ]] && M15_TPL="$SCRIPT_DIR/../../_ROOT_FILES/.claude/settings.json"
-M15_SNIP="$M15_DIR/m15_snippet_zzfx.py"
-if [[ ! -f "$M15_MD" || ! -f "$M15_TPL" ]]; then
-  ok "MIGRATIONS.md 또는 템플릿 settings 없음 — M015 검증 건너뜀"
+if [[ ! -f "$M15_TPL" ]]; then
+  ok "템플릿 settings 없음 — M015 검증 건너뜀"
 else
-python3 - "$M15_MD" "$M15_SNIP" <<'M15EXTRACT'
-import sys
-md, out = sys.argv[1], sys.argv[2]
-lines = open(md, encoding="utf-8").read().split("\n")
-start = None
-for i, l in enumerate(lines):
-    if l.startswith("## M015"):
-        start = i
-        break
-if start is None:
-    sys.exit("M015 절을 찾지 못했습니다")
-body, grab = [], False
-for l in lines[start:]:
-    s = l.strip()
-    if s.startswith("python3 - ") and s.endswith("<<'PY'"):
-        grab = True
-        continue
-    if grab and s == "PY":
-        break
-    if grab:
-        body.append(l)
-if not body:
-    sys.exit("M015 의 python3 heredoc 본문이 비어 있습니다")
-open(out, "w", encoding="utf-8").write("\n".join(body) + "\n")
-M15EXTRACT
 
 echo "== M015: permissions.allow 부재 규칙 추가 =="
-m15_mk() { mkdir -p "$M15_DIR/$1/.claude"; cat > "$M15_DIR/$1/.claude/settings.json"; }
-m15_run() { ( cd "$M15_DIR/$1" && python3 "$M15_SNIP" "$M15_TPL" ) 2>&1; }
+m15_mk() { mkdir -p "$M15_DIR/$1/.claude"; git -C "$M15_DIR/$1" init -q; cat > "$M15_DIR/$1/.claude/settings.json"; }
+M15_CLONE="$M15_DIR/clone"; tpl_make_clone "$M15_CLONE" full; mkdir -p "$M15_CLONE/.claude"; cp "$M15_TPL" "$M15_CLONE/.claude/settings.json"
+m15_run() { mig_detail "$M15_DIR/$1" "$M15_CLONE" M015; }
 m15_f() { echo "$M15_DIR/$1/.claude/settings.json"; }
 m15_get() { python3 -c "
 import json,sys
@@ -694,14 +590,14 @@ else
 J
   m15_sha_before="$(shasum -a 256 "$(m15_f W15)" | cut -d' ' -f1)"
   chmod 555 "$M15_DIR/W15/.claude"
-  m15_w_out="$(m15_run W15)"; m15_w_rc=$?
+  m15_w_out="$(mig "$M15_DIR/W15" "$M15_CLONE" M015)"; m15_w_rc=$?
   chmod 755 "$M15_DIR/W15/.claude"
   check "W15 저장 실패 → exit 1" "$m15_w_rc" "1"
-  check "W15 저장 실패 → M015 실패 출력" "$(printf '%s\n' "$m15_w_out" | grep -c '^M015 실패:')" "1"
+  check "W15 저장 실패 → M015 실패 출력" "$(printf '%s\n' "$m15_w_out" | grep -c '^  M015 실패:')" "1"
   check "W15 저장 실패 → settings byte 불변" "$(shasum -a 256 "$(m15_f W15)" | cut -d' ' -f1)" "$m15_sha_before"
 fi
 # 심링크된 settings.json — 링크를 지키고 링크 대상을 고쳐야 공유 설정이 끊기지 않습니다.
-mkdir -p "$M15_DIR/L15/.claude"
+mkdir -p "$M15_DIR/L15/.claude"; git -C "$M15_DIR/L15" init -q
 printf '%s\n' '{"hooks":{}}' > "$M15_DIR/L15/shared.json"
 chmod 644 "$M15_DIR/L15/shared.json"
 ln -s ../shared.json "$M15_DIR/L15/.claude/settings.json"
@@ -713,49 +609,20 @@ fi
 trash "$M15_DIR" 2>/dev/null || true
 
 # --- M005: 템플릿 유래 stale hook 제거 + 저장 실패 -----------------------
-snip_extract() {
-python3 - "$1" "$2" "$3" <<'SNIPEXTRACT'
-import sys, textwrap
-md, head, out = sys.argv[1], sys.argv[2], sys.argv[3]
-lines = open(md, encoding="utf-8").read().split("\n")
-start = next((i for i, l in enumerate(lines) if l.startswith(head)), None)
-if start is None:
-    sys.exit("%s 절을 찾지 못했습니다" % head)
-body, grab = [], False
-for l in lines[start:]:
-    s = l.strip()
-    if s.startswith("python3 - ") and s.endswith("<<'PY'"):
-        grab = True
-        continue
-    if grab and s == "PY":
-        break
-    if grab:
-        body.append(l)
-if not body:
-    sys.exit("%s 의 python3 heredoc 본문이 비어 있습니다" % head)
-open(out, "w", encoding="utf-8").write(textwrap.dedent("\n".join(body)) + "\n")
-SNIPEXTRACT
-}
 
 M5_DIR="$(mktemp -d)" || { echo "test_sync_template.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$M5_DIR" && -d "$M5_DIR" ]] || { echo "test_sync_template.sh: 임시 디렉터리 경로 검증 실패" >&2; exit 1; }
-M5_MD="$SCRIPT_DIR/../MIGRATIONS.md"
-M5_GUIDE="$SCRIPT_DIR/../docs/guides/sync_template.md"
-if [[ ! -f "$M5_MD" || ! -f "$M5_GUIDE" ]]; then
-  ok "MIGRATIONS.md 또는 sync_template.md 없음 — M005 검증 건너뜀"
-else
+if true; then
 echo "== M005: stale hook 제거 =="
-snip_extract "$M5_MD" "## M005" "$M5_DIR/m5_a.py"
-snip_extract "$M5_GUIDE" "#### M005" "$M5_DIR/m5_b.py"
-check "M005 가이드 사본 = MIGRATIONS 본문" "$(cmp -s "$M5_DIR/m5_a.py" "$M5_DIR/m5_b.py" && echo same || echo diff)" "same"
 
+tpl_make_clone "$M5_DIR/clone" full
 mkdir -p "$M5_DIR/clone/.claude" "$M5_DIR/clone/rd-workflow/scripts/hooks"
 echo '{"hooks":{}}' > "$M5_DIR/clone/.claude/settings.json"
-m5_mk() { mkdir -p "$M5_DIR/$1/.claude"; cat > "$M5_DIR/$1/.claude/settings.json"; }
-m5_run() { ( cd "$M5_DIR/$1" && python3 "$M5_DIR/m5_a.py" "$M5_DIR/clone" ) 2>&1; }
+m5_mk() { mkdir -p "$M5_DIR/$1/.claude"; git -C "$M5_DIR/$1" init -q; cat > "$M5_DIR/$1/.claude/settings.json"; }
+m5_run() { mig "$M5_DIR/$1" "$M5_DIR/clone" M005; }
 m5_json='{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/zzfx_gone.sh"},{"type":"command","command":"bash scripts/own_hook.sh"}]}]}}'
 printf '%s\n' "$m5_json" | m5_mk R1
-check "M005 R1 → removed 1줄" "$(m5_run R1 | grep -c '^removed: PreToolUse')" "1"
+check "M005 R1 → removed 1줄" "$(m5_run R1 | grep -c '^  removed: PreToolUse')" "1"
 check "M005 R1 프로젝트 고유 hook 유지" "$(python3 -c "
 import json,sys
 d=json.load(open(sys.argv[1]))
@@ -770,19 +637,123 @@ else
   m5_w_out="$(m5_run W5)"; m5_w_rc=$?
   chmod 755 "$M5_DIR/W5/.claude"
   check "W5 저장 실패 → exit 1" "$m5_w_rc" "1"
-  check "W5 저장 실패 → M005 실패 출력" "$(printf '%s\n' "$m5_w_out" | grep -c '^M005 실패:')" "1"
+  check "W5 저장 실패 → M005 실패 출력" "$(printf '%s\n' "$m5_w_out" | grep -c '^  M005 실패:')" "1"
   check "W5 저장 실패 → settings byte 불변" "$(shasum -a 256 "$M5_DIR/W5/.claude/settings.json" | cut -d' ' -f1)" "$m5_sha_before"
+
+  # M003: settings 는 바꾸고 .gitignore 쓰기가 실패하면 요약과 세부 줄이 실제 상태를 말해야 한다
+  tpl_make_clone "$M5_DIR/clone3" full
+  mkdir -p "$M5_DIR/clone3/.claude"
+  echo '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash x.sh"}]}]}}' > "$M5_DIR/clone3/.claude/settings.json"
+  echo 'zz_ignore' > "$M5_DIR/clone3/.gitignore"
+  mkdir -p "$M5_DIR/G3/.claude"; git -C "$M5_DIR/G3" init -q; echo '{}' > "$M5_DIR/G3/.claude/settings.json"
+  chmod 555 "$M5_DIR/G3"
+  m3_out="$(mig "$M5_DIR/G3" "$M5_DIR/clone3" M003)"
+  chmod 755 "$M5_DIR/G3"
+  check "M003 gitignore 실패 → 요약이 settings 적용을 말함" "$(printf '%s\n' "$m3_out" | head -1)" "M003"$'\t'"FAIL"$'\t'"hooks 1건 추가 적용 후 .gitignore 실패 (.gitignore 는 바꾸지 않았습니다)"
+  check "M003 gitignore 실패 → settings 세부 줄 유지" "$(printf '%s\n' "$m3_out" | grep -c '^  M003: added 1')" "1"
 fi
 # 심링크된 settings.json — 링크를 지키고 링크 대상을 고쳐야 공유 설정이 끊기지 않습니다.
-mkdir -p "$M5_DIR/L5/.claude"
+mkdir -p "$M5_DIR/L5/.claude"; git -C "$M5_DIR/L5" init -q
 printf '%s\n' "$m5_json" > "$M5_DIR/L5/shared.json"
 ln -s ../shared.json "$M5_DIR/L5/.claude/settings.json"
-check "L5 심링크 → removed 1줄" "$(m5_run L5 | grep -c '^removed: PreToolUse')" "1"
+check "L5 심링크 → removed 1줄" "$(m5_run L5 | grep -c '^  removed: PreToolUse')" "1"
 check "L5 settings.json 은 여전히 심링크" "$([[ -L "$M5_DIR/L5/.claude/settings.json" ]] && echo link || echo file)" "link"
 check "L5 링크 대상에서 stale hook 제거" "$(grep -c zzfx_gone "$M5_DIR/L5/shared.json")" "0"
 fi
 trash "$M5_DIR" 2>/dev/null || true
 
+
+# =============================================================================
+# C7: migrate 감지·안내·미등록·구조 대기·멱등, 계획 파일 갱신 (migrate 하위 명령)
+# =============================================================================
+echo "== C7: migrate 안내·미등록·구조 대기 =="
+C7_DIR="$WORK/c7"; mkdir -p "$C7_DIR"
+TAB=$'\t'
+c7_tpl_settings='{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash \"${CLAUDE_PROJECT_DIR:-.}\"/rd-workflow/scripts/hooks/a.sh"}]}]},"permissions":{"allow":["Bash(ls)","Bash(pwd)"]}}'
+C7_CLONE="$C7_DIR/clone"
+tpl_make_clone "$C7_CLONE" full
+tpl_put "$C7_CLONE" .claude/settings.json "$c7_tpl_settings"
+tpl_put "$C7_CLONE" rd-workflow/MIGRATIONS.md '## M000: a
+
+## M099: 시험'
+c7_proj() { # c7_proj <이름> [prev VERSION|-] — 빈 git 프로젝트
+  local d="$C7_DIR/$1"; mkdir -p "$d"; git -C "$d" init -q
+  if [[ "${2:--}" != "-" ]]; then printf '%s\n' "$2" > "$(git -C "$d" rev-parse --absolute-git-dir)/rd-tpl-prev-version"; fi
+}
+c7_has() { printf '%s\n' "$TPL_OUT" | grep -c -- "^$1"; }
+
+c7_proj V1 2026-11-07-120000
+tpl_run "$C7_DIR/V1" "$C7_CLONE" migrate post
+check "M099 미등록 → ASK" "$(c7_has "M099${TAB}ASK${TAB}스크립트에 없는 항목 — MIGRATIONS.md 를 읽고 처리하십시오")" "1"
+check "이전 VERSION 2026-11-07 → M017 NOTICE" "$(c7_has "M017${TAB}NOTICE")" "1"
+check "이전 VERSION 2026-11-07 → M016 NOTICE (같은 날 포함)" "$(c7_has "M016${TAB}NOTICE")" "1"
+check "이전 VERSION 2026-11-07 → M006 NOTICE 없음" "$(c7_has "M006${TAB}NOTICE")" "0"
+check "이전 VERSION 을 알면 모름 안내 없음" "$(c7_has "NOTICE${TAB}-")" "0"
+
+c7_proj V2
+tpl_run "$C7_DIR/V2" "$C7_CLONE" migrate post
+check "이전 VERSION 없음 → M006 NOTICE" "$(c7_has "M006${TAB}NOTICE")" "1"
+check "이전 VERSION 없음 → M017 NOTICE" "$(c7_has "M017${TAB}NOTICE")" "1"
+check "이전 VERSION 없음 → 모름 안내" "$(c7_has "NOTICE${TAB}-${TAB}이전 VERSION 을 몰라 안내를 모두 보였습니다")" "1"
+
+mkdir -p "$C7_DIR/S1/ai"; git -C "$C7_DIR/S1" init -q
+tpl_run "$C7_DIR/S1" "$C7_CLONE" migrate pre
+check "ai/ 프로젝트 migrate pre → exit 3" "$TPL_RC" "3"
+check "ai/ 프로젝트 → M001 ASK" "$(c7_has "M001${TAB}ASK")" "1"
+
+c7_proj P1
+tpl_put "$C7_DIR/P1" .claude/settings.json '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash rd-workflow/scripts/hooks/zz_gone.sh"}]}]}}'
+tpl_run "$C7_DIR/P1" "$C7_CLONE" migrate pre
+check "settings fixture 1회차 pre → exit 0" "$TPL_RC" "0"
+check "1회차 M005 APPLIED (stale hook 제거)" "$(c7_has "M005${TAB}APPLIED")" "1"
+check "1회차 M003 APPLIED" "$(c7_has "M003${TAB}APPLIED")" "1"
+check "1회차 M015 APPLIED" "$(c7_has "M015${TAB}APPLIED")" "1"
+tpl_run "$C7_DIR/P1" "$C7_CLONE" migrate pre
+for m in M003 M005 M008 M015; do
+  check "2회차 $m NOOP" "$(c7_has "${m}${TAB}NOOP")" "1"
+done
+
+echo "== C7: 계획 파일 갱신 (M009) =="
+c7_fr() { # c7_fr <이름> — FUTURE_REQUESTS.md 가 clone·프로젝트에 모두 있는 fixture
+  c7_proj "$1"
+  tpl_put "$C7_DIR/$1" rd-workflow-workspace/backlog/FUTURE_REQUESTS.md '# FUTURE_REQUESTS
+
+## 상태 값
+
+- `parked`: 보류
+- `done` / `dropped`: 삭제
+
+## 파일 분리
+
+- **이 파일**: 활성 항목
+
+## 인덱스
+
+| 날짜 | 제목 |
+|------|------|
+| 2026-01-01 | sample |'
+}
+C7_FRP="rd-workflow-workspace/backlog/FUTURE_REQUESTS.md"
+tpl_put "$C7_CLONE" "$C7_FRP" '# FUTURE_REQUESTS
+
+| 날짜 | 제목 |
+|------|------|'
+c7_plan_fp() { awk -F'\t' -v p="$C7_FRP" '$2==p{print $3}' "$(git -C "$C7_DIR/$1" rev-parse --absolute-git-dir)/rd-tpl-plan.tsv"; }
+c7_sha() { echo "file:$(shasum -a 256 "$C7_DIR/$1/$C7_FRP" | cut -d' ' -f1)"; }
+
+c7_fr R1
+tpl_run "$C7_DIR/R1" "$C7_CLONE" classify
+tpl_run "$C7_DIR/R1" "$C7_CLONE" migrate M009
+check "R1 M009 APPLIED" "$(c7_has "M009${TAB}APPLIED")" "1"
+check "계획 지문 = 바뀐 파일 sha" "$(c7_plan_fp R1)" "$(c7_sha R1)"
+
+c7_fr R2
+tpl_run "$C7_DIR/R2" "$C7_CLONE" classify
+c7_fp_before="$(c7_plan_fp R2)"
+printf '%s\n' '사용자가 확인 뒤 고친 줄' >> "$C7_DIR/R2/$C7_FRP"
+tpl_run "$C7_DIR/R2" "$C7_CLONE" migrate M009
+check "R2 M009 는 적용됨" "$(c7_has "M009${TAB}APPLIED")" "1"
+check "사용자 편집 뒤 계획 지문 그대로" "$(c7_plan_fp R2)" "$c7_fp_before"
 
 echo "--- acceptance_sync_once.sh: 임시 clone 폐기 가능 판정 (재귀 삭제 방어) ---"
 # 그 스크립트는 `set -e` 없이 진단을 모아 내는 방식이라, `mktemp` 가 실패해 경로가 비거나
@@ -817,6 +788,13 @@ if [[ -f "$ACC_SH" ]]; then
 else
   echo "  skip  acceptance_sync_once.sh 없음"
 fi
+
+# 하위 명령별 시험 파일 (test_sync_template_<하위 명령>.sh) — 있는 것만 돌리고 종료 코드를 합친다
+for sub_test in "$SCRIPT_DIR"/test_sync_template_*.sh; do
+  [[ -e "$sub_test" ]] || continue
+  echo "== $(basename "$sub_test") =="
+  bash "$sub_test" || FAIL=1
+done
 
 if [[ "$FAIL" == "0" ]]; then
   echo "test_sync_template: 전체 통과"

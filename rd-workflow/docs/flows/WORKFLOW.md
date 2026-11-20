@@ -205,6 +205,7 @@ herdr app 에서 띄운 작업 세션은 앱 왼쪽 Agents 패널에 부모 세�
 
 - **시점**: `light` 는 유일한 커밋 직전, `standard`·`full` 은 final diff review 세션 생성 직전.
 - **대상**: baseline 이후의 실제 변경 집합 = `git status --porcelain`(staged·unstaged·untracked) + `git diff --name-only <baseline>..HEAD`. 워크플로 생성 파일은 제외.
+- **팀 저장소 반영 확인**: `light` 는 `bash rd-workflow/scripts/rd pr light-check [<base-ref>]` 를 실행하고 결과 줄을 시작 보고·tier-log 에 옮깁니다. 종료 코드 3(`standard 로 상향`)이면 상향합니다 — `light` 는 기본 브랜치에 바로 커밋하므로 PR 단계를 넣을 자리가 없기 때문입니다(`team_publish.light` 가 `pr`, 대상 submodule 의 반영 방식이 `pr`·`push`). 반영 방식 `manual` 인 submodule 만 바꿨다면 `light` 입니다. `team_publish.light` 가 `merge` 이면 `light` 를 유지하고 팀 저장소 반영은 사용자 몫입니다.
 - **판정**: 변경 집합에 현재 등급의 신호를 벗어나는 항목이 있으면 상향하고, 상향된 등급의 필수 단계 중 생략한 것을 그 시점부터 수행합니다. 하향했으면 그 하향 근거에 적은 신호는 상향 사유로 다시 세지 않습니다. 하향 뒤 새로 생긴 신호는 종전대로 상향 사유입니다. 되돌리기 어려운 효과가 새로 보이면 `full` 로 올립니다.
   - `light → standard`: `promote.sh --size small --source-fr <FR|->` (dirty 변경은 `git switch` 로 새 fr 브랜치에 실림) → 축약 REQUEST 작성(`## Risk Tier` 의 baseline HEAD 는 tier-log 행과 같은 값, 이력에 상향 사유) → 변경 + REQUEST 를 **같은 커밋** → final diff review → `archive.sh`. tier-log 에는 이 시점에 확정 행 1개를 append 합니다(최종 등급 `standard`, 이력 `light → standard`) — 같은 커밋에 포함하며 canonical token 밖의 값은 쓰지 않습니다.
   - `standard → full`: 별도 spec/plan 파일 작성 → spec/plan review → final diff review. 브랜치 유지.
@@ -215,15 +216,15 @@ herdr app 에서 띄운 작업 세션은 앱 왼쪽 Agents 패널에 부모 세�
 단일 스키마 `baseline HEAD | 최초 등급 | 최종 등급 | 근거 신호 | override·상향 이력 | 변경 파일 요약`. 기록 시점: `standard`·`full` 은 활성 REQUEST 를 만들 때 `최종 등급` 에 **현재 등급**을 즉시 적고(`-`·빈 값으로 두지 않음 — `full` 은 REQUEST review 부터, `standard` 는 final diff review 에서 이 값을 읽습니다) 재분류 직후 확인·갱신합니다. `light` 는 재분류 직후 tier-log 에 확정 행을 **1회 append** 합니다(시작 시점에는 쓰지 않음 — light 커밋 전 상태는 Git 에 남지 않아 2회 쓰기가 이력을 더하지 않고, 중단되면 `-` 행만 남습니다). 표 값의 `|` 는 `\|` 로, 개행은 공백으로 바꾸고, 변경 파일 요약은 `파일 수 + 대표 경로 ≤ 3` 로 적습니다.
 
 - `light`: `rd-workflow-workspace/reports/tier-log.md` 에 `| 날짜 | baseline HEAD | 최초 등급 | 최종 등급 | 근거 신호 | override·상향 이력 | 변경 파일 요약 |` 한 행을 append 하고 같은 커밋에 포함합니다. 커밋 메시지에는 넣지 않습니다.
-- `standard`·`full`: `REQUEST.md ## Risk Tier` 의 항목에 적고 아카이브와 함께 보존합니다. `- 최종 등급: <token>` 줄은 `prepare_review_pipeline.sh` 가 읽는 기계 판독 줄이므로 형식을 지킵니다(`standard` 면 리뷰 effort 가 `small_task_reasoning_effort` 를 따릅니다).
+- `standard`·`full`: `REQUEST.md ## Risk Tier` 의 항목에 적고 아카이브와 함께 보존합니다. `- 최종 등급: <token>` 줄은 `prepare_review_pipeline.sh` 가 읽는 기계 판독 줄이므로 형식을 지킵니다(`standard` 면 Codex 리뷰 effort 가 `models.json` 의 `review.codex.small_task_effort` 를 따릅니다).
 
 ### light 등급 체크리스트
 
 1. 시작 계약 5항 확인 → 그 직후 시작 보고 블록 1회. 필드는 위 위험 등급 절의 정본 목록을 그대로 상속하고(`실행 모드` 포함), `light` 는 여기에 `baseline HEAD` 만 덧붙입니다 — 블록에만 남기고 파일에는 아직 쓰지 않습니다. `light` 에서 값이 갈리는 필드는 `push 예정` 뿐입니다: 원격 모드면 synchronized 는 "커밋 직후 push", ahead 가 전부 FR 등록 커밋이면 `start_preflight.sh` 의 자동 채택 문구 그대로, 그 외 ahead 는 "보류(미push 커밋 N개)", 사용자가 채택을 명시했으면 "커밋 직후 push(ahead N개 채택)" 로 적고, 로컬 전용 모드는 `없음` 으로 적습니다.
 2. 구현 → 고친 영역 검증.
-3. 커밋 전 재분류 → tier-log 에 확정 행 1개 append(최종 등급 `light`, 변경 파일 요약). 상향이면 위 절차로(행은 `standard` / `light → standard` 로 append).
+3. 커밋 전 재분류 — `bash rd-workflow/scripts/rd pr light-check` 를 실행하고 결과 줄(`standard 로 상향 — …` / `light 유지 — …` / `반영 대상 없음`)을 시작 보고·종료 보고와 tier-log 근거 신호에 옮깁니다. 종료 코드 3 이면 상향이므로 아래 상향 절차로 갑니다. → tier-log 에 확정 행 1개 append(최종 등급 `light`, 변경 파일 요약). 상향이면 위 절차로(행은 `standard` / `light → standard` 로 append).
 4. 기존 FR 이 있으면 done 처리(인덱스 행 삭제 + 상세 `status: done`).
-5. 커밋 1회(한국어 한 줄 요약) → 원격 모드면 push(`push 예정` 이 보류였고 채택이 없으면 push 하지 않고 "미push" 로 보고) → 종료 보고 블록.
+5. 커밋 1회(한국어 한 줄 요약) → 원격 모드면 push(`push 예정` 이 보류였고 채택이 없으면 push 하지 않고 "미push" 로 보고). push 가 성공했고 FR 상세의 `github-issue` 가 `-` 가 아니면 `issue_queue.sh close-fr <상세> --commit-url "$(issue_queue.sh commit-url <sha>)"` 를 부릅니다. 실패해도 마감은 유지하고 종료 보고에 적습니다. → 종료 보고 블록.
 
 ### 설계 중 동작 질문 — 일회용 시제품
 
@@ -287,9 +288,11 @@ Design Reference가 있으면 추천. 없어도 에러/엣지 케이스 점검 �
 
 `promote.sh --size small → 축약 REQUEST → 구현 → 검증 → 커밋 전 재분류 → final diff review → seal → 아카이브 보류 → 기록 커밋 → REQUEST 아카이브(archive.sh)`
 
+submodule 반영 방식이 `pr` 인 overlay 작업은 기록 커밋 뒤 `rd pr open → PR 검토 중 → rd pr check --apply` 가 발행 앞에 들어갑니다(아래 「`PR 검토 중` — 팀 저장소 반영」).
+
 ### `full`
 
-`FR 등록 → REQUEST 정리 → REQUEST review → spec/change spec → plan → spec/plan review → 구현 → 검증 → final diff review → seal → 아카이브 보류 → 기록 커밋 → REQUEST 아카이브`
+`FR 등록 → REQUEST 정리 → REQUEST review → spec/change spec → plan → spec/plan review → 구현 → 검증 → final diff review → seal → 아카이브 보류 → 기록 커밋 → (반영 방식 pr 인 submodule 이 있으면 `rd pr open → PR 검토 중 → rd pr check --apply → 아카이브 보류`) → REQUEST 아카이브`
 
 FR 승격은 `bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug> --size large|small` (`full` = large, `standard` = small). rollback 은 `promote_rollback.sh`.
 
@@ -306,10 +309,11 @@ autopilot 에서는 이 분기가 모드 A(`full`)/모드 B(`standard`) 로 나�
   - 발행은 작업 worktree 에서 부른다(`rd publish run` 또는 `archive.sh`). archive 가 기본 체크아웃에서 merge + tag + push 를 하고 작업 worktree 는 남긴다.
   - 세션은 자기 worktree 를 직접 지우지 않는다. 세션이 끝난 뒤 기본 체크아웃의 `rd task list` 가 worktree 와 branch 를 정리한다.
   - 기본 체크아웃에서 다른 작업을 `--task` 로 발행해도, 그 작업의 세션이 worktree 안에 있으면 archive 가 지우지 않고 정리 대기로 남긴다.
+  - `workflow.json` 의 `archive_publish` 가 `pr` 이면 archive 는 기본 브랜치를 바꾸지 않고 fr 브랜치를 push 해 PR 을 올리는 데서 멈춘다. 팀이 GitHub 에서 merge 한 뒤 `rd pr check --apply` 로 태그를 달고 마감한다. 순서와 명령은 「직접 설치 PR 발행 — `archive_publish: pr`」 절을 따른다.
 
 ### `아카이브 보류` — 리뷰 종결과 발행 사이
 
-`아카이브 보류` 는 canonical Status 10종 중 하나이며, 의미는 「**리뷰 종결·발행 대기**」로 **완료가 아닙니다.** 전이는 `diff review 대기 → 아카이브 보류 → 완료` 이고, 리뷰 후 변경이 필요해지면 `아카이브 보류 → 구현 중` 으로 되돌아갑니다(그러면 마커의 트리 해시가 어긋나 재리뷰·재seal 없이는 발행할 수 없습니다). 외부 검증을 기다리며 작업물을 커밋해야 할 때는 `아카이브 보류 → 검증 중` 으로 전이합니다.
+`아카이브 보류` 는 canonical Status 11종 중 하나이며, 의미는 「**리뷰 종결·발행 대기**」로 **완료가 아닙니다.** 전이는 `diff review 대기 → 아카이브 보류 → 완료` 이고, 리뷰 후 변경이 필요해지면 `아카이브 보류 → 구현 중` 으로 되돌아갑니다(그러면 마커의 트리 해시가 어긋나 재리뷰·재seal 없이는 발행할 수 없습니다). 외부 검증을 기다리며 작업물을 커밋해야 할 때는 `아카이브 보류 → 검증 중` 으로 전이합니다.
 
 **외부 검증 대기 절차**: `아카이브 보류` → `검증 중` → 작업물 커밋 → 검증 후 `검증 중` → `diff review 대기` → (보호 트리가 바뀌었으면 재seal) → `아카이브 보류` → 발행. 이미 작성돼 워킹트리에 있던 파일을 그대로 커밋하면 seal 의 보호 트리 해시는 바뀌지 않고, 보호 트리 내용을 바꾸면 재seal 이 필요합니다. `archive.sh` 는 발행 대상 커밋(fr tip, no-fr 은 HEAD)의 task-state Status 가 `아카이브 보류` 가 아니면 merge·push 전에 거부하므로 `검증 중` 같은 대기 상태에서는 발행되지 않습니다. 사람이 이 검사만 건너뛰려면 `--allow-status-mismatch "<사유>"` 를 주며 사유는 `review-skip-audit.log` 에 기록됩니다. 이 플래그는 `--force-skip-review-check` 와 독립이라 서로를 우회하지 않습니다. no-fr 은 metadata cleanup 뒤 push 가 실패하면 HEAD 의 Status 가 `대기 중` 이 되어, 재실행에 두 플래그가 모두 필요합니다(거부 안내가 이 경우를 알려 줍니다). 발행 시 락을 `rd task list` 의 지연 정리가 잡고 있으면 `archive.sh` 는 상한(`RD_ARCHIVE_LOCK_WAIT_MAX`, 기본 60초) 안에서 기다리고, 정리는 발행 대기 표지를 보면 남은 행을 양보합니다. 리뷰 세션 종결 뒤 커밋 게이트는 Status `구현 중`·`검증 중` 의 커밋을 허용하고 그 밖의 Status 는 종전대로 막습니다.
 
@@ -329,9 +333,139 @@ autopilot 에서는 이 분기가 모드 A(`full`)/모드 B(`standard`) 로 나�
 - 4번 커밋에서 게이트가 보는 대상은 index 만이 아니라 **index ∪ 워킹트리(추적 파일)** 입니다. `git commit -a`·`git commit <경로>` 도 같은 제한을 받으며, 보류 상태에서 기록 경로 밖의 파일이 수정되어 있기만 해도 막힙니다 — 코드 변경이 필요해진 것이므로 `rd task set-status "구현 중"` 으로 되돌린 뒤 재리뷰합니다.
 - 5번에서 `archive.sh` 는 fr 브랜치가 없는(no-fr) 운용일 때 **발행 대상 commit 을 확정한 뒤 tag 를 만들기 전에** 마커가 승인한 보호 트리 해시와 한 번 더 대조합니다. precheck 이후 HEAD 가 전진해 미검토 코드가 발행되는 창을 닫기 위함이며, 어긋나면 되돌리거나 재리뷰(`prepare_review_pipeline.sh diff` → `rd review seal`) 후 다시 실행하라고 안내하고 중단합니다. fr 모드는 merge 이후 구간을 보는 기존 두 검사가 같은 창을 이미 닫습니다.
 
+### `PR 검토 중` — 팀 저장소 반영
+
+overlay 의 최상위 submodule 에서 코드를 바꾼 작업은 마감 때 팀 저장소에 반영합니다. 이 흐름의 정본은 이 절입니다. 다른 문서는 이 절로 링크합니다.
+
+**반영 방식**: `rd-workflow/config/workflow.json` 의 `team_publish` 가 submodule 마다 정합니다(키: `mode`·`base`·`branch_prefix`·`light`·`submodules.<경로>`, 예시는 `workflow.json.example`).
+
+| `mode` | 동작 |
+|---|---|
+| `pr` (기본) | 팀 브랜치를 push 하고 PR 을 만듭니다. merge 뒤에 overlay 를 발행합니다 |
+| `push` | 대상 브랜치에 fast-forward push 합니다. 사용자 승인 뒤 `--approve-push` 로만 실행합니다 |
+| `manual` | 반영하지 않습니다. 팀 저장소 반영은 사용자 몫이며 archive 게이트도 이 submodule 을 보지 않습니다 |
+
+**순서**: `리뷰 종결 → seal → 아카이브 보류 → 기록 커밋 → rd pr open → PR 검토 중 → (팀의 merge) → rd pr check --apply → 아카이브 보류 → 발행`
+
+| # | 행위 | 설명 |
+|---|---|---|
+| 1 | `bash rd-workflow/scripts/rd pr open [--dry-run] [--approved] [--approve-push]` | `아카이브 보류` 에서 실행합니다. 반영 대상 표를 보이고, `pr` 대상마다 팀 브랜치를 push 해 PR 을 만들거나 갱신합니다. PR 이 하나 이상이면 Status 를 `PR 검토 중` 으로 옮기고 PR 기록을 커밋합니다. `--dry-run` 은 표와 PR 제목·본문 첫 줄만 보이고 원격을 바꾸지 않습니다 |
+| 2 | `bash rd-workflow/scripts/rd pr check [--task <slug>]` | PR 상태(merge 됨·수정 요청·닫힘·검토 중)와 다음 행동을 보입니다. 조회만 합니다 |
+| 3 | `bash rd-workflow/scripts/rd pr check --apply` | 모든 `pr` 대상이 merge 되었을 때 submodule 포인터를 팀 브랜치의 merge 된 커밋으로 옮기고 Status 를 `아카이브 보류` 로 되돌립니다. 포인터 커밋과 Status 커밋을 이 명령이 직접 만들므로 사용자가 커밋하지 않아도 되고, 중간에 실패하면 같은 명령을 다시 실행해 이어 갑니다. 실패 뒤 되돌릴 때 실행 도중 생긴 submodule 안쪽 편집과 새 커밋은 지우거나 옮기지 않고, 남은 상태와 직접 되돌릴 명령을 알립니다. seal 은 유지되므로 재리뷰하지 않습니다 |
+| 4 | `rd publish request` 또는 `archive.sh` | 기존 발행 절차입니다 |
+
+- **판정 기준**: `rd pr open` 과 archive 게이트는 둘 다 fr 브랜치에 커밋된 `rd-workflow/config/workflow.json` 과 반영 대상 기준점(seal 마커의 `review-base`, 없으면 SESSION 의 `review-base-oid`, 그다음 fr merge-base, 마지막으로 task-state 의 `base-commit`)과 리뷰한 끝(seal 마커의 `review-head`)으로 대상·반영 방식을 판정합니다. 작업 폴더의 설정이 커밋과 다르면 `rd pr open` 은 커밋한 뒤 다시 실행하라고 하고 멈춥니다. main 을 병합한 뒤에도 리뷰한 범위의 submodule 만 대상입니다. 기준점을 정할 수 없으면 `rd pr open`·`--apply`·archive 게이트는 판정하지 않고 멈추고, `rd pr check`·`rd task list` 는 「대상 판정 실패」 행에 원인과 복구 명령을 보입니다.
+- **seal 과 설정**: `workflow.json` 은 seal 이 보호하는 트리에 들어 있고, `아카이브 보류`·`PR 검토 중` 에서는 커밋 게이트가 기록 경로 밖의 커밋을 막습니다. 그래서 seal 뒤에 반영 방식을 바꾸는 방법은 셋입니다. 이번 작업만 반영하지 않으려면 `archive.sh` 에 `--allow-unpublished-submodule "<사유>"` 를 붙입니다. 다음 작업부터 바꾸려면 기본 브랜치에서 `team_publish.mode` 를 `manual` 로 바꿔 커밋합니다. 이번 fr 브랜치에서 바꾸려면 `rd task set-status "구현 중"` → 설정 커밋 → final diff review 재종결 → `rd review seal` 순서로 합니다.
+- **승인**: `pr` 반영의 승인 주체는 `publish_approval` 입니다(`AUTONOMY.md` 「종결 마커(seal)와 발행 승인」). 사용자 승인이 필요한 조건이면 `rd pr open` 은 대상 표만 보이고 종료 코드 10 으로 멈추며, 사용자 승인 뒤 `--approved` 를 붙여 다시 실행합니다. `push` 대상은 `publish_approval` 과 무관하게 `--approve-push` 없이는 대상 표만 보이고 종료 코드 10 으로 멈춥니다.
+- **수정 요청·닫힘**: `rd pr check` 는 안내만 하고 Status 를 바꾸지 않습니다. 수정 요청이면 `rd task set-status "구현 중"` → 수정·검증 → final diff review 를 같은 세션에서 이어 종결 → `rd review seal` → `아카이브 보류` → `rd pr open` 을 다시 실행합니다(같은 브랜치에 push 하고 열린 PR 의 본문을 갱신하며 새 PR 은 만들지 않습니다). 열린 PR 의 대상 브랜치가 설정과 다르면 `rd pr open` 은 원격을 바꾸지 않고 멈추며, 이어 가는 두 가지를 알립니다. 가) PR 의 대상을 설정에 맞추는 `gh pr edit <URL> --base <설정 base>` 뒤 `rd pr open` 재실행. 나) 실제 대상 브랜치가 맞다면 `workflow.json` 의 `team_publish.base`(또는 `submodules.<경로>.base`)를 그 브랜치로 바꿈(seal 뒤 설정 변경은 아래 「seal 과 설정」 항목). 닫힌 PR 이 있으면 새 PR 을 만들지 않는 정책은 그대로입니다.
+- **닫힘**: PR 이 merge 없이 닫히면 `rd pr check` 가 선택지를 안내하며 Status 는 바뀌지 않습니다. 작업을 폐기하려면 `/fr status <slug> dropped` 뒤 `promote_rollback.sh`, 다시 올리려면 `gh pr reopen <URL>`, 연결된 Issue 의 선점을 풀려면 `gh issue edit <Issue URL> --remove-assignee @me` 입니다.
+- **`--apply` 가 멈추는 경우**: merge 된 PR 에 리뷰 뒤 더해진 커밋이 있거나 merge 결과가 리뷰한 변경과 다르면(충돌 해소·merge 중 수정·squash 중 변경) 포인터를 옮기지 않고 원인을 알립니다. `rd task set-status "구현 중"` → 포인터를 merge 된 커밋으로 옮김 → final diff review 재종결 → `rd review seal` → `아카이브 보류` → 발행 순으로 다시 리뷰합니다.
+- **archive 게이트**: 반영 방식 `pr`·`push` 인 submodule 의 새 포인터가 팀 대상 브랜치의 조상(또는 같음)이어야 `archive.sh` 가 발행합니다. 아니면 어느 submodule 인지와 다음 행동을 알리고 거부합니다. 우회는 `--allow-unpublished-submodule <사유>` 이고 audit 에 `[team-publish]` 가 남습니다. 게이트는 fr 발행과 no-fr 발행(fr 브랜치 없이 기본 브랜치에서 바로 발행) 모두에 적용합니다. no-fr 은 기본 체크아웃의 submodule 로 판정합니다. 대상 경로를 판정할 수 없으면(탭·개행이 든 gitlink 경로, 기준점 오류) 원인과 함께 거부하고 `--allow-unpublished-submodule "<사유>"` 로만 넘어갑니다. 게이트는 fr 작업이면 작업 worktree, no-fr 작업이면 기본 체크아웃의 submodule 로 판정하므로 그 submodule 이 초기화돼 있어야 합니다.
+- **no-fr 작업**: fr 브랜치 없이 기본 브랜치에서 하는 작업도 `rd pr open` → 팀 merge → `rd pr check --apply` → 발행 흐름을 씁니다. 기본 브랜치를 체크아웃한 곳에서 실행하고, `archive_publish` 가 `pr` 이면 기록을 바꾸기 전에 거부합니다. 반영 대상 기준점은 SESSION 의 `review-base-oid`(seal 마커가 있으면 그 `review-base`)이고, 없으면 task-state 의 `base-commit` 입니다.
+- **기록과 목록**: PR 기록 `rd-workflow-workspace/.lifecycle/team-prs.tsv` 는 rd 명령만 쓰고 archive 가 지웁니다. `rd task list` 는 `PR 검토 중` 작업마다 submodule 별 PR 상태와 다음 행동 줄을 보입니다.
+- **종료 코드**: 성공 0, 실패 1, 사용법·판정 불가 2, `light-check` 상향 3, 사용자 승인 필요 10.
+- **Status 규칙**: `PR 검토 중` 은 `완료` 가 아니고 진행 중 작업입니다. 전이는 `아카이브 보류 → PR 검토 중 → 아카이브 보류`(merge 확인 뒤)와 `PR 검토 중 → 구현 중`(수정 요청 반영)이며, 이 상태에서는 기록 경로 밖의 커밋을 막습니다. 발행 요청(`rd publish request`)은 `아카이브 보류` 만 받으므로 `PR 검토 중` 에서는 거부됩니다.
+- **첫 실행 안내**: `team_publish` 설정이 없으면 한 번 알립니다 — `이번부터 마감 때 팀 저장소에 PR 을 올립니다(기본 반영 방식 pr). 이전 방식은 rd-workflow/config/workflow.json 의 team_publish.mode 를 manual 로 설정하십시오.`
+
+### 직접 설치 PR 발행 — `archive_publish: pr`
+
+rd 를 팀 저장소에 직접 설치한 팀은 기본 브랜치를 보호하거나 PR 검토를 merge 조건으로 둡니다. 이 팀은 `archive_publish` 를 `pr` 로 두면 archive 발행이 기본 브랜치 push 대신 PR 생성으로 바뀝니다. overlay submodule 의 `team_publish`(위 「`PR 검토 중` — 팀 저장소 반영」)와 별개 설정입니다.
+
+**설정**: `rd-workflow/config/workflow.json` 최상위 키 `archive_publish` 입니다(예시는 `workflow.json.example`).
+
+| 값 | 동작 |
+|---|---|
+| `push` (기본, 키 없음 포함) | 지금까지의 발행입니다. 기본 브랜치에 merge + tag + push 합니다 |
+| `pr` | fr 브랜치를 push 해 PR 을 올리고 멈춥니다. 기본 브랜치는 바꾸지 않습니다 |
+
+- 값은 fr 브랜치 끝 커밋에 커밋된 `workflow.json` 에서 읽습니다. 작업 폴더의 설정이 아닙니다.
+- 허용 값 밖이거나 JSON 을 읽을 수 없으면 아무것도 바꾸지 않고 종료 코드 1 로 멈춥니다. `push` 로 흡수하지 않습니다.
+- seal 뒤에는 설정을 바꿀 수 없습니다(`workflow.json` 이 보호 트리에 들어 있음). 이번 작업에 적용하려면 `pr` 을 커밋한 뒤 final diff review 와 seal 을 거쳐야 합니다. 다음 작업부터 적용하려면 기본 브랜치에서 바꿔 커밋합니다.
+
+**순서**: `리뷰 종결 → seal → 아카이브 보류 → 기록 커밋 → rd publish request → PR → (팀의 merge) → rd pr check --apply → rd task list 정리`
+
+`archive.sh`(발행 큐 포함)가 `pr` 방식에서 하는 일은 아래와 같습니다. 기존 게이트(Status·seal·기록 커밋 검사)는 `push` 방식과 같습니다.
+
+1. 작업 worktree 의 fr 브랜치 끝에 작업 상태 되돌리기 커밋(`chore(lifecycle): archive <slug> metadata 정리`)을 만듭니다.
+2. fr 브랜치를 force 없이 origin 에 push 합니다.
+3. PR 을 만들거나, 열린 PR 이 있으면 제목·본문을 갱신합니다. PR 본문은 final diff review 의 `## PR 본문` 절입니다.
+4. 기본 브랜치와 기본 worktree 를 바꾸지 않습니다. force push 와 태그를 하지 않습니다. 작업 worktree 와 로컬·원격 fr 브랜치를 지우지 않습니다.
+
+발행 큐(`rd publish run`)는 PR 을 올리면 그 요청을 끝난 것으로 기록하고 `PR 발행 완료: <slug> — merge 뒤 … rd pr check --task <slug> --apply` 한 줄을 냅니다. 태그가 없어도 실패가 아닙니다. 마감은 merge 뒤 `rd pr check --apply` 가 합니다.
+
+발행이 중간에 끊겼으면 같은 발행 요청(`rd publish request`)을 다시 하면 됩니다. `archive.sh` 는 되돌리기 커밋을 push 가 성공한 뒤에만 fr 브랜치에 올리므로, push 전에 끊기면 작업은 `아카이브 보류` 그대로 남고 처음부터 다시 발행합니다. push 뒤에 끊겼으면 원격의 되돌리기 커밋으로 이어 가 PR 만 만듭니다. 마감한 작업이나 PR 단계만 남은 작업을 다시 발행하면 `archive.sh` 는 아무것도 바꾸지 않고 다음 행동(`rd task list` 정리 또는 `rd pr open --task <slug>`)을 알립니다. 원격을 조회하지 못하면 판정하지 않고 연결을 확인한 뒤 다시 실행하라고 알립니다.
+
+발행 승인(`publish_approval`)은 이 PR 생성까지 걸립니다. rd 는 기본 브랜치를 직접 merge 하지 않습니다. merge 는 팀이 GitHub 에서 합니다.
+
+**사전 거부**: 아래 경우는 어떤 커밋·태그·push 보다 먼저 사유와 다음 행동을 알리고 종료 코드 1 로 멈춥니다. `--dry-run` 도 같은 검사를 합니다.
+
+| 조건 | 다음 행동 |
+|---|---|
+| no-fr 작업(fr 브랜치 없이 기본 브랜치에서 하는 작업) | 기본 브랜치의 변경을 fr 작업으로 옮기려면 `promote.sh` 로 작업을 시작합니다 |
+| 원격 없음 또는 `--no-remote` | `origin` 을 설정하거나 `archive_publish` 를 `push` 로 둡니다 |
+| `gh` 없음 | GitHub CLI 를 설치하고 `gh auth login` 뒤 다시 실행합니다 |
+| 기본 브랜치를 정할 수 없음 | `workflow.json` 의 `default_branch` 를 설정합니다 |
+
+`--dry-run` 은 검사 뒤 `would open PR: branch=<fr> base=<기본 브랜치>` 한 줄만 냅니다.
+
+**명령**
+
+| 명령 | 하는 일 |
+|---|---|
+| `bash rd-workflow/scripts/rd pr open [--task <slug>]` | PR 단계만 다시 합니다(PR 생성 실패 재시도). 커밋·push 는 하지 않습니다. 처음 PR 을 올리는 일은 `rd publish request` 로 합니다(이 명령은 종료 코드 2) |
+| `bash rd-workflow/scripts/rd pr check [--task <slug>]` | PR 상태(검토 중·수정 요청·충돌·닫힘·merge 됨)와 다음 행동을 보입니다. 조회만 합니다 |
+| `bash rd-workflow/scripts/rd pr check [--task <slug>] --apply` | merge 를 확인하고 merge 커밋에 태그를 달아 마감합니다. 승인 없이 실행합니다 |
+| `bash rd-workflow/scripts/rd pr reopen [--task <slug>]` | 수정 요청·충돌을 반영하려고 작업을 `구현 중` 으로 되돌립니다 |
+| `bash rd-workflow/scripts/rd pr sync [--task <slug>]` | 기록 파일만 충돌한 PR 에 기본 브랜치를 병합하고 push 해 PR 을 갱신합니다. 재리뷰는 없습니다. 그 밖의 충돌은 아래 「수정 요청·충돌」 순서로 풉니다 |
+
+`--task` 를 생략하면 현재 브랜치 `fr/<slug>` 의 작업이 대상입니다. overlay 작업은 `rd pr open`·`check` 가 지금처럼 `team_publish` 경로로 갑니다. `rd pr reopen` 은 직접 설치 작업 전용입니다(overlay 작업에서는 종료 코드 2 와 `rd task set-status "구현 중"` 안내).
+
+**merge 확인 — `rd pr check --apply`**: merge 방식(merge commit·squash·rebase)은 제한하지 않습니다. 아래 네 조건이 모두 참일 때만 태그를 답니다. 하나라도 거짓이면 태그 없이 어느 조건인지와 다음 행동을 알리고 종료 코드 1 로 멈춥니다.
+
+1. gh 가 PR 상태를 `MERGED` 로 알립니다.
+2. PR 의 merge 대상이 기본 브랜치이고, PR 저장소가 `origin` 의 저장소입니다.
+3. merge 시점의 PR head 가 rd 가 push 했거나 `rd pr sync` 가 검증한 커밋과 같습니다. 리뷰 뒤 커밋이 더해졌거나 GitHub 에서 충돌을 풀었으면 다릅니다. 이 경우 더해진 커밋은 새 작업으로 리뷰하고, 이 작업은 태그 없이 남습니다.
+4. merge 커밋이 `origin/<기본 브랜치>` 에 들어 있습니다. 아직 없으면 잠시 뒤 다시 실행합니다.
+
+통과하면 `fr/<시각>/<slug>` 주석 태그(주석에 PR URL 과 `pr-head`)를 merge 커밋에 달아 push 하고, 원격 태그를 확인한 뒤 작업을 정리 대기로 넘기고 원격 fr 브랜치를 지웁니다. 원격 fr 브랜치 삭제가 실패하면 경고와 명령만 보입니다(완료에는 영향 없음). 마지막 줄은 `마감됨 — 작업 worktree·로컬 브랜치는 기본 체크아웃의 rd task list 가 정리합니다` 입니다. 다만 PR 이 옛 head 로 merge 된 뒤 `rd pr sync` 가 로컬 fr 을 옮겼으면 로컬 fr 끝이 merge 된 head 와 달라 `rd task list` 가 정리하지 않습니다. 이때 마감 출력(과 archive 재실행)은 그 사실과 함께 로컬에만 있는 커밋 확인, 커밋하지 않은 파일·무시 파일 확인(`git status --short --ignored --untracked-files=all` — `status.showUntrackedFiles` 설정과 상관없이 보입니다), fr 이 체크아웃된 곳(작업 worktree·기본 체크아웃·없음)에 맞는 정리 명령을 순서대로 보입니다. 기본 체크아웃의 정리 명령은 `switch --no-overwrite-ignore` 라 무시 파일을 덮지 않고 멈춥니다. `worktree remove` 는 무시 파일을 확인 없이 지우므로 확인을 먼저 합니다. 태그 push·확인이 실패하면 같은 명령을 다시 실행합니다(로컬 태그를 재사용합니다). 이 명령은 기본 체크아웃의 로컬 기본 브랜치를 갱신하지 않으므로, 필요하면 그 체크아웃에서 `git pull --ff-only` 를 실행합니다.
+
+**`PR 검토 중` 표시**: 이 방식의 PR 대기는 task-state Status 가 아니라 작업 색인의 표시입니다. PR head 의 task-state 는 merge 뒤 기본 브랜치의 task-state 가 되므로 `대기 중` 이어야 하기 때문입니다.
+- `rd task list`: PR 대기 행의 단계 칸이 `PR 검토 중` 이고, 아래 줄에 gh 로 조회한 PR 상태와 다음 행동이 나옵니다. 열림은 `→ PR 검토 중: <URL>`, 수정 요청은 `→ 수정 요청: … rd pr reopen --task <slug>`, 충돌은 `→ 충돌: … rd pr check --task <slug> 로 복구 순서 확인`, merge 됨은 `→ merge 됨: … rd pr check --task <slug> --apply`, 닫힘은 `→ 닫힘: … rd pr check --task <slug> 로 선택지 확인` 입니다. 조회가 실패하면 `→ PR 상태 조회 실패 — rd pr check --task <slug>` 가 나옵니다. PR 주소가 기록되지 않았으면 `→ PR 주소가 기록되지 않았습니다 — rd pr open --task <slug>` 가 나옵니다.
+- `rd task status`: 현재 브랜치가 PR 대기 중인 `fr/<slug>` 이면 Status 줄(`대기 중`) 뒤 stderr 에 `PR 검토 중(직접 설치 PR) — <URL 또는 PR 주소 미기록>. 확인: bash rd-workflow/scripts/rd pr check` 안내가 나옵니다. stdout 한 줄은 바뀌지 않습니다.
+- PR 대기 판정은 로컬 ref 만 봅니다. 수정 재개로 fr 브랜치 끝이 전진하거나 push 실패로 PR head 기록이 지워지면 PR 대기가 아닙니다. 그때는 실제 단계를 보이고 `→ 연결된 PR: <URL>` 만 덧붙입니다.
+
+**기록 파일만 충돌**: 기록 파일(다섯 경로)은 `CURRENT_TASK.md`, `rd-workflow-workspace/.lifecycle/stage_metrics.tsv`, `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md`, `rd-workflow-workspace/.lifecycle/review-seals/verify-evidence`, `rd-workflow-workspace/.lifecycle/task-state` 입니다. PR 이 GitHub 에서 충돌로 보이고 충돌 파일이 기록 파일뿐이면 `rd pr check` 가 `rd pr sync --task <slug>` 를 안내합니다. `rd pr sync` 는 PR 을 기다리는 작업에서만 돕니다. 작업 worktree 에 미커밋 변경이 없어야 하고, PR 이 merge 됐거나 닫혔으면 병합하지 않고 멈춥니다. 기본 브랜치가 새로 추적하는 경로(또는 그 상·하위 경로)에 작업 worktree 의 무시 파일이 있으면(같은 경로, 그 하위 경로, 그 상위 경로) push 전에 그 파일 목록을 보이고 멈춥니다 — 파일을 작업 worktree 밖으로 옮긴 뒤 다시 실행합니다. push 뒤 작업 worktree 를 옮기는 보존 절차도 `switch --no-overwrite-ignore` 로 무시 파일을 덮지 않습니다. `rd pr sync` 는 기본 브랜치를 병합해 push 하고 PR 을 갱신하며, 재리뷰와 새 seal 을 요구하지 않습니다. 이 PR 은 `rd pr check --apply` 의 조건 3 을 검증된 head 목록으로 확인하므로, `rd pr sync` 가 만든 커밋이 PR head 여도 마감됩니다. 기록 파일 밖에서도 충돌하면 `rd pr sync` 는 아무것도 바꾸지 않고 아래 「수정 요청·충돌」 순서를 안내합니다.
+
+**수정 요청·충돌**: `rd pr check` 는 안내만 합니다. 이어 가는 순서는 아래와 같습니다.
+1. `bash rd-workflow/scripts/rd pr reopen --task <slug>` — 작업 상태를 복원하고 `구현 중` 으로 옮겨 커밋합니다(`chore(lifecycle): <slug> PR 수정 재개 — 작업 상태 복원`). PR 은 그대로 둡니다. PR 이 이미 merge 됐으면 거부하고 `--apply` 를 안내합니다(종료 코드 1).
+2. 작업 worktree 에서 수정합니다. 충돌이면 `git merge origin/<기본 브랜치>` 로 해소하고 커밋합니다.
+3. 재검증 → 새 final diff review 종결 → `rd review seal` → `아카이브 보류` → 기록 커밋.
+4. `rd publish request` — 열린 PR 의 본문을 갱신하고 fast-forward 로 push 합니다. 새 PR 을 만들지 않고 force push 도 하지 않습니다.
+
+**처음 발행에서 충돌**: PR 이 아직 없는 첫 발행에서 기본 브랜치와의 충돌을 사전에 감지하면 `archive: PR 발행 실패 — P4 충돌 사전 감지` 로 멈추고 순서를 안내합니다. `rd task set-status "구현 중"` → 작업 worktree 에서 `git merge origin/<기본 브랜치>`·해소·커밋 → 재검증 → 새 final diff review → `rd review seal` → `아카이브 보류` → 기록 커밋 → `rd publish request`. 이때는 `rd pr reopen` 을 쓰지 않습니다(PR 이 없음). 충돌 파일이 기록 파일(다섯 경로)뿐이면 경고하고 PR 을 올립니다. PR 이 올라간 뒤 `rd pr sync --task <slug>` 로 풉니다.
+
+**닫힘**: merge 없이 닫힌 PR 은 완료가 아닙니다. `rd pr check`·`rd task list` 는 정리하지 않고 두 경로를 안내합니다. 새 PR 은 만들지 않습니다(닫힌 PR 이 있는 상태의 발행·`rd pr open` 도 같은 안내로 멈춥니다).
+1. 다시 열고 이어 가기: `gh pr reopen <URL>`.
+2. 작업 폐기: `/fr status <slug> dropped` → 기본 체크아웃에서 `bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task <slug>` → `git push origin --delete <fr 브랜치>`. 연결된 Issue 의 선점은 `gh issue edit <Issue URL> --remove-assignee @me` 로 풉니다.
+
+**부분 실패**: 발행 중 실패하면 `archive: PR 발행 실패 — <단계>: <원인>` 뒤에 `archive:   재시도: <명령>` 이 나옵니다.
+
+| 실패 지점 | 상태 | 재시도 |
+|---|---|---|
+| 작업 worktree 확인(미커밋 변경·HEAD 불일치), 원격 fr 브랜치 확인(앞서 있음 — force push 하지 않음), PR 본문 없음 | 바꾼 것 없음 | 원인을 해소한 뒤 `rd publish request` |
+| 기존 PR 조회: 이미 merge 된 PR 이 있음 | 바꾼 것 없음 | `bash rd-workflow/scripts/rd pr check --task <slug> --apply` |
+| 기존 PR 조회: 열린 PR 의 대상 브랜치가 기본 브랜치가 아님 | 바꾼 것 없음 | `gh pr edit <URL> --base <기본 브랜치>` 뒤 `rd publish request` |
+| 기존 PR 조회: PR 이 닫혀 있음 | 바꾼 것 없음 | 위 「닫힘」 선택지를 실행한 뒤 `rd publish request` |
+| 되돌리기 커밋 실패 | 작업 worktree 를 이전 상태로 복원 | 원인 해소 뒤 `rd publish request` |
+| push 실패 | 되돌리기 커밋을 되돌려 `아카이브 보류` 로 복귀 | 원인 해소 뒤 `rd publish request` |
+| PR 생성·갱신 실패 | 커밋·push 는 남음 | `bash rd-workflow/scripts/rd pr open --task <slug>` |
+| 태그 push·확인 실패(`--apply`) | 색인 그대로 | 같은 `rd pr check --apply` |
+
+**종료 코드** (`rd pr open`·`check`·`reopen`): 성공 0, 실패 1, 대상 아님·전제 불충족·판정 불가 2. `archive.sh` 의 사전 거부·PR 발행 실패는 1 입니다.
+
 ### `구현 대기` — spec/plan review 종결과 구현 착수 사이
 
-`구현 대기` 는 canonical Status 10종 중 하나이며, 의미는 「**spec/plan review 종결·구현 착수 대기**」입니다. 전이는 `spec/plan review 대기 → 구현 대기 → 구현 중` 이고, 리뷰 후 변경이 필요해지면 `구현 대기 → spec/plan 작성 중` 으로 되돌아갑니다. spec/plan review 세션의 최신 Reviewer 턴이 `이의 없음` 을 명시해 종결되면 orchestrator 가 그 자리에서 `구현 대기` 로 전이하고, 구현을 실제로 시작하면 `구현 중` 으로 전이합니다(`아카이브 보류` 와 같은 패턴 — 위 절 참조, 다만 `구현 대기` 자체는 별도 발행 절차를 갖지 않는 단순 중간 상태입니다).
+`구현 대기` 는 canonical Status 11종 중 하나이며, 의미는 「**spec/plan review 종결·구현 착수 대기**」입니다. 전이는 `spec/plan review 대기 → 구현 대기 → 구현 중` 이고, 리뷰 후 변경이 필요해지면 `구현 대기 → spec/plan 작성 중` 으로 되돌아갑니다. spec/plan review 세션의 최신 Reviewer 턴이 `이의 없음` 을 명시해 종결되면 orchestrator 가 그 자리에서 `구현 대기` 로 전이하고, 구현을 실제로 시작하면 `구현 중` 으로 전이합니다(`아카이브 보류` 와 같은 패턴 — 위 절 참조, 다만 `구현 대기` 자체는 별도 발행 절차를 갖지 않는 단순 중간 상태입니다).
 
 ## Raw Capture
 
@@ -350,15 +484,12 @@ autopilot 에서는 이 분기가 모드 A(`full`)/모드 B(`standard`) 로 나�
 
 - single source of truth: `CURRENT_TASK.md ## Short Title`
 - canonical: `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` (영문 kebab-case, 영숫자 시작·끝, `-` 단독 / empty / hyphen-only 금지 — `-` 는 reserved sentinel)
-- 부여 진입점 (start point — 3 곳): `/fr add` (FR 시작), `planning-design-intake` (FR 없는 직접 REQUEST), `promote.sh` (FR 없는 직접 `standard` 작업 — `small-task-implement`가 이를 호출하며 skill 자체는 read-only). 부여 조건은 진입점별로 다름:
-  - **`planning-design-intake`(`--mode intake`) · `request-to-reviewed-plan` FR 승격 진입(`--mode promote`)** — 둘 다 `rd task guard` 의 같은 판정 함수(`task_guard_decide`)를 mode 만 다르게 호출한다. 판정 7순위·`fr-branch` 활성 판정은 `rd-workflow/docs/guides/task-state-guide.md` 「guard 판정」·「fr-branch 활성 판정」 절이 정본이며 여기서 중복 서술하지 않는다. 요지만 적으면:
+- 부여 진입점 (start point — 2 곳): `planning-design-intake` (FR 없는 직접 REQUEST), `promote.sh` (`--short-title` — `/fr take`·`small-task-implement`·autopilot·`/fr do` 가 넘김. `small-task-implement` skill 자체는 read-only). 부여 조건은 진입점별로 다름:
+  - **`planning-design-intake`(`--mode intake`) · `request-to-reviewed-plan` FR 승격 진입(`--mode promote`)** — 둘 다 `rd task guard` 의 같은 판정 함수(`task_guard_decide`)를 mode 만 다르게 호출한다. 판정 6순위·`fr-branch` 활성 판정은 `rd-workflow/docs/guides/task-state-guide.md` 「guard 판정」·「fr-branch 활성 판정」 절이 정본이며 여기서 중복 서술하지 않는다. 요지만 적으면:
     - (a) `## Short Title = -` 또는 섹션 부재 → CANDIDATE 기록 (부재 시 섹션 자동 추가)
     - (b) `## Short Title = CANDIDATE` (equal) → read-only continue
-    - (c) 그 외 → 순위 4(같은 source FR 로 재진입) 이후를 따른다 — `fr-branch` 활성이면 차단, `## Status = 대기 중` 이면 stale 값으로 보고 rebind, 그 외(완료 포함)·부재/파싱불가는 차단
-  - **`/fr add`(`--mode fr-add`) — `Intake 규칙` 따라:**
-    - `## Short Title = -` → 새로 부여 (baseline)
-    - non-`-` → read-only (FR 등록 + FR 캡처는 새 short-title, `CURRENT_TASK` 변경 안 함)
-    - 섹션 부재 → warn-only (legacy active task 보호)
+    - (c) 그 외 → 순위 3(같은 source FR 로 재진입) 이후를 따른다 — `fr-branch` 활성이면 차단, `## Status = 대기 중` 이면 stale 값으로 보고 rebind, 그 외(완료 포함)·부재/파싱불가는 차단
+  - **`/fr add`** 는 Short Title 을 바꾸지 않는다(등록 전용).
 - 부여 후 ~ archive 까지 원칙적으로 immutable (변경 금지). 예외: `rd task set-title -` — `## Status == 대기 중` 이고 `fr-branch` 가 비활성일 때만 허용되는 수동 reset(상세는 `task-state-guide.md` 「Short Title reset」)
 - 캡처 단계 (`request-to-reviewed-plan` 의 일반 진입) 는 short-title 부재 시 부여 안 함, 캡처 생략 + 경고
 - post-plan skill (`implement-reviewed-plan`, `final-diff-review`) 은 read-only

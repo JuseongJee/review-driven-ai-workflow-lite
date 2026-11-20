@@ -5,6 +5,9 @@
 #   archive.sh 가 인덱스 단독 충돌을 이 규칙으로 해결한다 (spec D7).
 #   허용 문법(세 입력 모두 검증, 하나라도 어긋나면 fail-closed rc 1): 서문(| 로 시작하는 줄 없음) → 헤더 1줄 → 구분선 1줄(| - : 공백만)
 #   → 행들(헤더와 같은 컬럼 수, 제목 비어 있지 않고 파일 안에서 고유) → 꼬리(빈 줄만).
+#   행들 사이에는 한 줄 HTML 주석(`<!-- … -->` 가 한 줄에서 끝나는 줄)을 둘 수 있다. 주석은 「줄 전체 + 같은 글의
+#   출현 순번」 을 키로 하는 집합 원소이며 행과 같은 3-way 규칙을 받는다(값이 곧 키라 상이 수정 충돌이 없다).
+#   칸 수 검사·칸 단위 재판정·제목 중복 검사는 주석에 적용하지 않는다. 여러 줄 주석은 표 뒤 내용으로 거부한다.
 #   컬럼 분해는 GFM 과 같게 **이스케이프되지 않은 `|` 로만** 나눈다 — 셀 본문의 `\|` 는 코드 스팬 안이든
 #   밖이든 구분자가 아니고, `\\|` 는 「본문 역슬래시 + 구분자」다. 이스케이프되지 않은 생 `|` 는 GFM 에서도
 #   셀이 쪼개지므로 계속 거부하며, 이때 구분자로 센 `|` 를 표시한 행을 함께 낸다(그 거부가 잡던
@@ -13,7 +16,8 @@
 #   기존 행이 이 규칙으로 충돌하면 칸 단위로 같은 규칙을 다시 적용한다(cellpick) — 한쪽은 우선순위만,
 #   다른 쪽은 상태만 바꾼 행이 합쳐진다. 행 삭제 대 수정, 세 판 헤더 줄 불일치(칸 의미가 다를 수 있음)는
 #   칸 단위로 풀지 않고 충돌이다. 같은 칸을 양쪽이 다르게 바꾸면 충돌 칸 이름을 헤더 순서대로 알린다.
-#   순서: base 순서 → ours 신규(ours 순서) → theirs 신규(theirs 순서). 출력은 줄 끝 개행으로 정규화된다.
+#   순서: base 순서 → ours 신규(ours 순서) → theirs 신규(theirs 순서). 새 행은 끝에 붙고, 새 주석은 그쪽 파일에서
+#   앞에 있는 원소 중 결과에 있는 가장 가까운 원소 바로 뒤(없으면 표 본문 맨 앞)에 들어간다. 출력은 줄 끝 개행으로 정규화된다.
 #   stdout = 병합 결과 (rc 0). 충돌·malformed = stderr 한 줄 + rc 1 (stdout 없음).
 set -uo pipefail
 [[ $# -eq 3 ]] || { echo "usage: merge_fr_index.sh <base> <ours> <theirs>" >&2; exit 2; }
@@ -76,10 +80,26 @@ function why(l, got, want) {
   return "여분 파이프 " (got - want) "개 — 본문의 `|` 는 코드 스팬 안이라도 `\\|` 로 이스케이프해야 합니다." \
          " 구분자로 센 위치: " mark(l)
 }
+# 결과 배열 res/rk 의 p 번째 원소 뒤(p=0 이면 맨 앞)에 원소 하나를 끼워 넣는다. inres 는 결과 키 집합이다.
+function ins(p, line, k,   i) {
+  for (i = n; i > p; i--) { res[i + 1] = res[i]; rk[i + 1] = rk[i] }
+  res[p + 1] = line; rk[p + 1] = k; inres[k] = 1; n++
+}
+function add(line, k) { res[++n] = line; rk[n] = k; inres[k] = 1 }
+# 파일 f 의 i 번째 원소(새 주석)를 그 앞 원소 중 결과에 있는 가장 가까운 원소 뒤에 넣는다.
+function addc(f, i,   j, p, k) {
+  k = ord[f, i]; p = 0
+  for (j = i - 1; j >= 1 && p == 0; j--) if (ord[f, j] in inres) for (p = n; rk[p] != ord[f, j]; p--) ;
+  ins(p, row[f, k], k)
+}
 FNR == 1 { fi++ }
 {
   if (st[fi] == 0) { if ($0 ~ /^\|/) { hdr[fi] = $0; ncol[fi] = xn($0); st[fi] = 1 } else pre[fi] = pre[fi] $0 "\n"; next }
   if (st[fi] == 1) { if ($0 !~ /^\|[-: |]+\|$/ || xn($0) != ncol[fi]) bad(role(fi) " " FNR "행 구분선이 잘못됐습니다(형식 또는 컬럼 수): " $0); sep[fi] = $0; st[fi] = 2; next }
+  if (st[fi] == 2 && $0 ~ /^[ \t]*<!--.*-->[ \t]*$/) {
+    k = "\001" $0 "\001" (++ccnt[fi, $0])
+    row[fi, k] = $0; isc[fi, k] = 1; ord[fi, ++cnt[fi]] = k; next
+  }
   if ($0 ~ /^\|/) {
     if (st[fi] == 3) bad(role(fi) " " FNR "행 — 표가 둘 이상 있습니다")
     nc = xn($0)
@@ -109,17 +129,18 @@ END {
       if (CELLST == "skip") bad("행 충돌(양쪽 상이 수정): " k)
       if (CELLST == "conf") bad("행 충돌(같은 칸을 양쪽이 다르게 수정): " k " — 칸: " CELLNAMES)
     }
-    if (r != "") res[++n] = r
+    if (r != "") add(r, k)
   }
-  for (i = 1; i <= cnt[2]; i++) {
-    k = ord[2, i]; if ((1, k) in row) continue
-    o = row[2, k]; t = ((3, k) in row) ? row[3, k] : ""
-    if (t != "" && t != o) bad("신규 행 충돌(양쪽 상이 추가): " k)
-    res[++n] = o
-  }
-  for (i = 1; i <= cnt[3]; i++) { k = ord[3, i]; if ((1, k) in row || (2, k) in row) continue; res[++n] = row[3, k] }
+  for (f = 2; f <= 3; f++)
+    for (i = 1; i <= cnt[f]; i++) {
+      k = ord[f, i]; if ((1, k) in row || k in inres) continue
+      if (isc[f, k]) { addc(f, i); continue }
+      o = row[f, k]; t = (f == 2 && (3, k) in row) ? row[3, k] : ""
+      if (t != "" && t != o) bad("신규 행 충돌(양쪽 상이 추가): " k)
+      add(o, k)
+    }
   hc = xn(H)
-  for (i = 1; i <= n; i++) { rc = xn(res[i]); if (rc != hc) bad("병합 결과의 행 컬럼 " rc "개(헤더는 " hc "개) — 스키마 변경과 행 변경이 함께 있습니다: " res[i]) }
+  for (i = 1; i <= n; i++) { if (substr(rk[i], 1, 1) == "\001") continue; rc = xn(res[i]); if (rc != hc) bad("병합 결과의 행 컬럼 " rc "개(헤더는 " hc "개) — 스키마 변경과 행 변경이 함께 있습니다: " res[i]) }
   printf "%s", P; print H; print S
   for (i = 1; i <= n; i++) print res[i]
   printf "%s", Q

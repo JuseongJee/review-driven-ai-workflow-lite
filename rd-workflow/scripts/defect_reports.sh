@@ -1020,7 +1020,7 @@ EOF
   if ! gh_run "$host" issue edit "$created_url" --add-label defect-report >/dev/null; then
     cat >&2 <<EOF
 전달 완료(라벨 미부착): $created_url
-  라벨 defect-report 를 붙이지 못했습니다. 이 상태로는 정본 /fr pull 의 흡수 대상이
+  라벨 defect-report 를 붙이지 못했습니다. 이 상태로는 rd 정본 저장소 운영자의 흡수 대상이
   아닙니다. maintainer 가 라벨을 붙여야 검토 대기열에 올라갑니다.
 EOF
   fi
