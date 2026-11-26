@@ -206,14 +206,38 @@ tp_extract_pr_body() {
   return 0
 }
 
+# _tp_q <값> — 셸에 붙여 넣을 작은따옴표 인용. 값 안의 ' 는 '\'' 로 끊습니다(tasks_list.sh 의 _tl_q 와 같은 규칙).
+_tp_q() {
+  local v="$1" sq="'"
+  v="${v//$sq/$sq\\$sq$sq}"
+  printf "'%s'" "$v"
+}
+
 # tp_closed_choices <slug> <pr-url> <root> — 닫힌 PR 의 선택지 세 가지(D7). check 도 같은 문구를 씁니다.
+#   1) 줄은 root 의 task-state fr-branch 로 나눕니다(change spec nofr-task-target-resolution D6).
+#     - null(기본 체크아웃 작업): promote_rollback.sh 는 fr/* 가 아니면 멈추므로 기본 체크아웃에서의 정리와 대기 중 전이를 안내합니다.
+#     - 그 밖(fr 작업): promote_rollback.sh 는 지우려는 worktree 안에서 부르면 멈추므로 기본 체크아웃에서 --task 로 부릅니다.
+#     - root 가 비거나 기본 체크아웃(git common dir 의 부모)을 구하지 못하면 종전 문구(이동·--task 없음)입니다.
 #   호스트 없는 참조(o/r#N)는 PR 저장소의 호스트를 가리키므로 PR URL 의 호스트를 붙여 --repo 에 적습니다.
 #   PR 호스트를 알 수 없으면 명령 대신 Issue URL 로 지정하라고 안내합니다(gh 가 다른 호스트를 고르지 않게).
 tp_closed_choices() {
-  local slug="$1" url="$2" root="${3:-}" urls u r ph="" rc=0 err="" w
+  local slug="$1" url="$2" root="${3:-}" urls u r ph="" rc=0 err="" w common="" base="" frv=""
   case "$url" in http://?*/*|https://?*/*) ph="${url#*://}"; ph="${ph%%/*}" ;; esac
+  if [[ -n "$root" ]]; then
+    common="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || common=""
+    [[ -n "$common" ]] && base="$(cd "${common}/.." 2>/dev/null && pwd -P)" || base=""
+    frv="$(awk -F= '$1=="fr-branch"{sub(/^[^=]+=/,""); print; exit}' "$root/rd-workflow-workspace/.lifecycle/task-state" 2>/dev/null)"
+  fi
   printf '  선택지 (사람이 정합니다):\n'
-  printf '    1) dropped 로 닫기: /fr status %s dropped 뒤 bash rd-workflow/scripts/lifecycle/promote_rollback.sh\n' "$slug"
+  if [[ -z "$base" ]]; then
+    printf '    1) dropped 로 닫기: /fr status %s dropped 뒤 bash rd-workflow/scripts/lifecycle/promote_rollback.sh\n' "$slug"
+  elif [[ "$frv" == null ]]; then
+    printf '    1) dropped 로 닫기: /fr status %s dropped 뒤 기본 체크아웃(%s)에서 이 작업의 변경을 정리하고 cd %s && bash rd-workflow/scripts/rd task set-status "대기 중"\n' \
+      "$slug" "$root" "$(_tp_q "$root")"
+  else
+    printf '    1) dropped 로 닫기: /fr status %s dropped 뒤 cd %s && bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task %s\n' \
+      "$slug" "$(_tp_q "$base")" "$(_tp_q "$slug")"
+  fi
   printf '    2) 다시 올리기: gh pr reopen %s\n' "$url"
   urls=""
   if [[ -n "$root" ]]; then
@@ -437,13 +461,14 @@ _tp_do_pr() {
       printf '%s: 팀 브랜치 %s 에 리뷰하지 않은 커밋이 있습니다 (origin/%s=%s, 리뷰한 커밋=%s)\n' "$p" "$br" "$br" "$remote_oid" "$head"
       printf '  확인: git -C %s log --oneline %s..origin/%s\n' "$p" "$head" "$br"
       printf '  복구: 그 커밋이 필요하면 submodule 에 합쳐 다시 리뷰·seal 한 뒤 rd pr open 을 다시 실행합니다.\n'
-      printf '        버려도 되면 force push 여부는 사람이 정합니다: git -C %s push --force-with-lease origin %s:refs/heads/%s\n' "$p" "$head" "$br"
+      printf '        버려도 되면 force push 여부는 사람이 정합니다: git -C %s push --no-follow-tags --force-with-lease origin %s:refs/heads/%s\n' "$p" "$head" "$br"
       T_RESULT[$i]="실패 — 팀 브랜치 ${br} 에 리뷰하지 않은 커밋이 있습니다 (non-fast-forward)"
       rm -f "$errf"; return 1
     fi
   fi
   if [[ "$remote_oid" != "$head" ]]; then
-    if ! git -C "$sub" push -q origin "${head}:refs/heads/${br}" 2>"$errf"; then
+    # submodule 의 push.followTags 설정이 있어도 로컬 태그를 팀 저장소에 보내지 않습니다 (바뀌는 ref 는 팀 브랜치 하나).
+    if ! git -C "$sub" push -q --no-follow-tags origin "${head}:refs/heads/${br}" 2>"$errf"; then
       T_RESULT[$i]="실패 — push 실패: $(head -1 "$errf") (재시도: 같은 명령을 다시 실행)"
       rm -f "$errf"; return 1
     fi
@@ -510,7 +535,8 @@ _tp_do_push() {
       T_RESULT[$i]="실패 — 팀 브랜치 ${base} 가 리뷰한 커밋보다 앞서 있습니다 (non-fast-forward)"
       rm -f "$errf"; return 1
     fi
-    if ! git -C "$sub" push -q origin "${head}:refs/heads/${base}" 2>"$errf"; then
+    # _tp_do_pr 의 push 와 같은 이유로 followTags 설정과 무관하게 대상 브랜치 하나만 보냅니다.
+    if ! git -C "$sub" push -q --no-follow-tags origin "${head}:refs/heads/${base}" 2>"$errf"; then
       T_RESULT[$i]="실패 — push 실패: $(head -1 "$errf") (재시도: 같은 명령을 다시 실행)"; rm -f "$errf"; return 1
     fi
   fi
@@ -976,18 +1002,21 @@ _tp_c_query() {
 
 # _tp_c_row <i> <all-merged 0|1|2> <slug> <root> — 2 는 모두 merge 됐지만 대상 판정에 실패해 --apply 를 안내하지 않습니다.
 # 출력 줄 `<경로>\t<PR URL>\t<판정>\t<남은 행동>` (닫힘은 선택지 줄이 뒤따름)
+# merge 됨·수정 요청의 명령은 판정한 작업 체크아웃(root)으로 옮겨 가는 `cd '<root>' && ` 로 시작합니다(change spec
+# nofr-task-target-resolution D5) — 다른 체크아웃에서 --task 로 조회한 표를 복사해 실행해도 조회한 작업을 바꿉니다.
 _tp_c_row() {
-  local i="$1" allm="$2" slug="$3" root="$4" v act url="${C_URL[$i]:--}"
+  local i="$1" allm="$2" slug="$3" root="$4" v act url="${C_URL[$i]:--}" cdp=""
+  [[ -n "$root" ]] && cdp="cd $(_tp_q "$root") && "
   case "${C_VERDICT[$i]}" in
     MERGED)
       v="merge 됨"
       case "$allm" in
-        1) act="bash rd-workflow/scripts/rd pr check --apply" ;;
+        1) act="${cdp}bash rd-workflow/scripts/rd pr check --apply" ;;
         2) act="아래 대상 판정 실패를 먼저 해결해야 rd pr check --apply 가 진행됩니다" ;;
         *) act="다른 PR 의 merge 를 기다립니다" ;;
       esac ;;
     REC_merged) v="merge 됨"; act="반영 완료 — 포인터를 옮겼습니다" ;;
-    CHANGES_REQUESTED) v="수정 요청"; act="${C_SUMMARY[$i]:-(의견 없음)} / 고치려면 bash rd-workflow/scripts/rd task set-status \"구현 중\"" ;;
+    CHANGES_REQUESTED) v="수정 요청"; act="${C_SUMMARY[$i]:-(의견 없음)} / 고치려면 ${cdp}bash rd-workflow/scripts/rd task set-status \"구현 중\"" ;;
     CLOSED|REC_closed) v="닫힘"; act="PR 이 merge 없이 닫혔습니다 — 아래 선택지에서 사람이 정합니다" ;;
     OPEN) v="검토 중"; act="-" ;;
     REC_pushed) v="push 완료"; act="-" ;;

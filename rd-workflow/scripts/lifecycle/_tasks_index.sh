@@ -511,9 +511,20 @@ tasks_path_occupied() {
         else if (a[i] ~ /^n\// && a[i] !~ /\(.*\)$/ && cur != "") seen[cur] = 1
       } }
     $1 != "" && !($1 in seen) { print $1 }')"
+  # 스냅샷과 CWD 조회 사이에 상태가 바뀐 프로세스는 스냅샷 단계의 거름과 같은 기준으로 지금 상태를 다시 보고 뺀다
+  # (부하가 큰 머신에서 판정불가가 잦던 원인, 2026-11-22 실측).
+  #   - 그 사이 끝나 아직 회수되지 않은 좀비: CWD 가 없고 kill -0 은 성공한다.
+  #   - 그 사이 setuid 프로그램을 exec 한 프로세스: fork 직후 스냅샷에서는 유효 uid 가 나였지만 지금은 다른 계정이라
+  #     lsof 가 CWD 를 읽지 못한다(실측 `/usr/bin/top`).
+  #   상태를 다시 읽지 못하면 빼지 않는다(fail-closed).
+  local now_st now_eu
   while IFS= read -r pid; do
     [[ -z "$pid" ]] && continue
     kill -0 "$pid" 2>/dev/null || continue
+    now_st=""; now_eu=""
+    read -r now_st now_eu <<<"$(ps -o stat=,uid= -p "$pid" 2>/dev/null)" || true
+    [[ "$now_st" == Z* ]] && continue
+    [[ "$now_eu" =~ ^[0-9]+$ && "$now_eu" != "$uid" ]] && continue
     missed=$((missed + 1))
   done <<<"$candidates"
   [[ "$missed" -eq 0 ]] && return 1

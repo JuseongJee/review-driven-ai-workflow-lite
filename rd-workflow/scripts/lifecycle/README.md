@@ -86,6 +86,13 @@ bash rd-workflow/scripts/lifecycle/promote.sh \
 - `standard` 등급(작은 작업) → `--size small` (`구현 중`) (`light` 는 promote 를 타지 않음).
 - `--status <canonical>` 은 복구·마이그레이션 전용이며 `--size` 와 함께 쓸 수 없다.
 
+**착수 확인과 착수 표시:** 원격 모드의 promote 는 같은 FR·같은 slug 의 중복 착수를 막고, 자기 착수를 다른 clone 이 알게 합니다.
+- 확인은 세 가지입니다. 다른 clone 이 원격 `fr/<branch>` 로 올린 착수 표시, 원격 기본 브랜치에서 `done` 이 된 FR, 로컬 기본 브랜치에 없는 커밋을 가리키는 같은 slug 의 발행 태그입니다. 여기에 이 clone 에서 같은 FR 이 진행 중인지 보는 로컬 진행 확인이 더해집니다(원격 모드와 상관없이 합니다).
+- 새 착수는 발견이 있으면 아무것도 만들지 않고 멈춥니다(rc 1, 다음 행동 안내). 이어 가기(`resume`·`--handoff` 재실행·문서 이관 재실행)는 경고만 내고 계속합니다. 같은 slug 의 다른 이력이 원격에 있으면 이어 가기도 멈춥니다.
+- 착수하면 착수 커밋 하나를 원격 `fr/<slug>` 에 push 합니다(`--no-follow-tags`, upstream 설정 없음). 원격 기본 브랜치에 없는 로컬 기본 브랜치 커밋(`/fr add` 등록 커밋 등)이 함께 올라가면 출력에 개수를 적고, 원격에 기본 브랜치가 없으면 이력 전체가 올라갔다고 적습니다. 착수 뒤 구현 커밋과 로컬 태그는 올리지 않습니다. 발행 뒤 남은 같은 slug 원격 브랜치는 확인한 OID 의 lease 로 새 착수 커밋으로 바꿉니다.
+- 원격에 닿지 못하면 경고를 내고 로컬 착수를 계속합니다. 같은 promote 명령을 다시 실행하면 착수 표시를 다시 올립니다(`--dry-run` 은 예정 줄만 냅니다).
+- 원격 조사는 원격 추적 ref·`FETCH_HEAD`·태그 ref 를 바꾸지 않습니다. 원격 명령의 상한은 `RD_DUP_CHECK_TIMEOUT`(초, 기본 30)입니다. 로컬 전용 모드는 원격 확인과 착수 표시를 하지 않습니다.
+
 ### `archive.sh`
 
 작업 완료 + final-diff-review 통과 후 archive 단계에서 호출.
@@ -316,6 +323,10 @@ bash rd-workflow/scripts/lifecycle/promote_rollback.sh \
 ```
 
 **호출 위치:** 기본 브랜치 worktree only.
+
+**원격 착수 표시 삭제.** 원격 모드에서 로컬 `fr/<slug>` 를 지운 뒤, 원격 `fr/<slug>` 의 끝이 이 작업의 커밋(로컬 끝의 조상)일 때만 lease(`--force-with-lease=<ref>:<읽은 OID>`)로 지웁니다. 다른 이력이면 남기고 확인 명령을 안내합니다. 삭제에 실패하면 경고와 lease 형태의 수동 명령을 보여 주며 종료 코드는 바뀌지 않습니다. `--dry-run` 은 원격을 조회하지 않고 예정 줄만 냅니다. 로컬 전용 모드는 건너뜁니다.
+
+**「이미 archive 됨」 검사.** 같은 slug 의 `fr/*/<slug>` 태그 가운데 대상 브랜치 끝이 태그 대상 커밋(또는 태그 메시지 `pr-head:`)의 조상인 것이 있을 때만 멈춥니다. 같은 slug 를 다시 쓴 새 작업은 예전 태그에 막히지 않습니다. 이 변경은 로컬 전용 모드에도 적용됩니다.
 
 **기동 실패 뒤 손으로 띄운 세션의 보호.** 자동 기동이 실패하면(`launch=failed`) 안내가 수동 기동 명령 `cd <worktree> && claude` 를 줍니다. 이 명령으로 띄운 세션은 herdr 이름이 slug 가 아니므로 이름 판정(`session_probe`)이 찾지 못합니다. 그래서 두 명령은 cwd 판정(cwd 가 그 worktree 안인 herdr 에이전트 또는 `claude` 프로세스)을 함께 씁니다. herdr 밖 셸에서도 `claude` 프로세스 관측(`ps`·`lsof`)으로 동작합니다.
 - `bash rd-workflow/scripts/rd task resolve-launch <slug>` 는 `launch=failed` 를 받습니다. 이름 판정이 `alive` 이거나 cwd 판정이 살아 있음을 확인하면 `launch=ok` 로 확정합니다. 확인하지 못하면 색인을 바꾸지 않고 rc 1 로 끝내며, 수동 기동 명령과 「띄운 뒤 같은 명령으로 확정」 안내를 보여 줍니다. `failed` 에 `--assume-ended` 를 주면 거부합니다.

@@ -7,7 +7,7 @@
 1. `rd-workflow-workspace/backlog/FUTURE_REQUESTS.md` 읽기.
 2. 인덱스에서 status가 `idea` / `validated` / `ready-for-request` 인 항목만 추립니다 (`blocked` 은 set-aside 상태로 기본 목록 행에서 제외).
 3. `bash rd-workflow/scripts/fr_relations.sh readiness --root .` 를 실행합니다. 출력은 활성 FR 1건당 `<stem><TAB><판정>` 이고 판정 값은 `ready` / `waiting:<stem>,<stem>` / `check:<stem>,<stem>` / `error:<사유>` 다. `rc=2` 면 판정 없이 기존 목록만 출력하고 `관계 판정 불가 — 의존 상태를 표시하지 않습니다` 경고를 한 줄 남깁니다. 2단계에서 걸러낸 항목의 판정 행은 무시합니다. 단 `error:parse:status` 행은 무시하지 않고 6단계에서 보입니다 — 상세 파일의 status 를 읽지 못한 FR 은 인덱스 status 도 허용값 밖이거나 인덱스에 행이 없어 2단계에서 빠지기 때문입니다.
-3-1. `bash rd-workflow/scripts/fr_relations.sh in-progress --root .` 를 실행합니다. 출력은 진행 중 FR 1건당 `<stem><TAB><단계>` 입니다. 출처는 작업마다의 task-state(체크아웃된 worktree 는 그 파일, 체크아웃되지 않은 `fr/*` 브랜치는 tip)와 `/fr do` 의 `active.tsv` 입니다. 단계는 task-state 의 Status(예: `구현 중`, `PR 검토 중`)이고, `active.tsv` 에만 있는 FR 은 `/fr do 줄기 <slug>` 입니다. `rc=2` 면 진행 표시 없이 목록을 내고 `진행 중 판정 불가 — 진행 중 표시를 하지 않습니다` 경고를 한 줄 남깁니다. `rd task list` 는 지연 정리를 하므로 이 절차에서 부르지 않습니다.
+3-1. `bash rd-workflow/scripts/fr_relations.sh in-progress --root .` 를 실행합니다. 출력은 진행 중 FR 1건당 `<stem><TAB><단계>` 입니다. 출처는 작업마다의 task-state(체크아웃된 worktree 는 그 파일, 체크아웃되지 않은 `fr/*` 브랜치는 tip)와 `/fr do` 의 `active.tsv` 입니다. 단계는 task-state 의 Status(예: `구현 중`, `PR 검토 중`)이고, `active.tsv` 에만 있는 FR 은 `/fr do 줄기 <slug>` 입니다. 로컬 브랜치 `fr/<slug>` 가 없는 `active.tsv` 줄은 `/fr do` 고르기처럼 낡은 줄로 보고 진행 중으로 내지 않습니다. `rc=2` 면 진행 표시 없이 목록을 내고 `진행 중 판정 불가 — 진행 중 표시를 하지 않습니다` 경고를 한 줄 남깁니다. `rd task list` 는 지연 정리를 하므로 이 절차에서 부르지 않습니다.
 4. 판정에 따라 **두 구역**으로 출력합니다. 각 행에는 `착수` 칸을 둡니다.
 
    - **착수 가능**: 판정이 `ready` 인 항목만. 정렬은 인덱스 우선순위(P1 → P2 → P3 → `-`), 동순위는 날짜 오름차순. 시리즈 구성원이면 제목 뒤에 `[<name> N/M]` 을 붙입니다.

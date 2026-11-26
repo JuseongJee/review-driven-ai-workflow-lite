@@ -6,6 +6,7 @@ set -uo pipefail
 # 실제 herdr 호출 차단·바깥 저장소 상속 차단 (lifecycle/test_archive_worktree.sh 와 같은 이유)
 export HERDR_ENV=
 export HC_TERMINAL_ID=
+export ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE=
 export RD_CHILD_SESSION=1
 unset project_root TASK_STATE_PATH
 

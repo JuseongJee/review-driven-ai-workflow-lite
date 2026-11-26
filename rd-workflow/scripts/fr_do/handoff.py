@@ -13,18 +13,24 @@ spec.json 예:
      "frs": ["2026-11-07-fr-index-awk-locale-collation"],
      "owns": "`rd-workflow/scripts/_task_common.sh`, 그 테스트",
      "owns_paths": ["rd-workflow/scripts/_task_common.sh"],
-     "notes": "- 알아 둘 것 불릿들(마크다운)\\n- 검증: 프로젝트 규칙의 검증 절차"}
+     "notes": "- 알아 둘 것 불릿들(마크다운)\\n- 검증: 프로젝트 규칙의 검증 절차",
+     "model": "opus", "effort": "high"}
   ],
   "design_qa": true
 }
 design_qa 는 (선택) 사용자가 이 회차에 「설계 문답」 을 골랐으면 true 입니다. true 면 인계 파일에 「설계 문답」 절을 붙이고, 없거나 false 면 붙이지 않습니다.
 frs 는 items/ 파일 이름에서 .md 를 뗀 stem 입니다.
+model·effort 는 (선택) 그 줄기 작업 세션의 모델·effort 입니다. 호출 세션이 do.md 의 기준표·우선순위로 정한 값을 적습니다.
+값이 있는 칸만 --launch 가 promote 환경에 RD_SESSION_MODEL·RD_SESSION_EFFORT 로 넣습니다. 칸이 없거나 빈 문자열이면
+호출 세션의 환경을 그대로 넘겨 세션 기동의 기본 순서(환경 변수 → models.json 세션 칸 → 부모 세션 따라가기)를 따릅니다.
+허용 값은 세션 칸과 같고 model_select.sh 의 분류기로 판정합니다. 하나라도 어긋나면 인계 파일을 쓰거나 줄기를 띄우기 전에 rc 2 로 끝납니다.
 owns 는 인계 파일에 보이는 사람용 문자열이고, owns_paths 는 --launch 성공 시 active.tsv 에 쓰는 경로 배열입니다.
 active.tsv 한 줄은 `<slug>\t<owns_paths 를 ; 로 이음>\t<frs 를 ; 로 이음>` 입니다(pick.py 가 3번째 칸의 FR 을 재선정에서 보류).
-인계 파일은 <상태 폴더>/waves/<wave>/handoff-<slug>.md 에 씁니다.
+인계 파일은 <상태 폴더>/waves/<wave>/handoff-<slug>.md 에 씁니다. waves/<wave>/ 가 이미 있으면 rc 2 로 멈춥니다(wave 이름은 회차 식별자).
 상태 폴더는 <기본 체크아웃>/rd-workflow-workspace/.lifecycle/fr-do/ 입니다.
 """
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -66,6 +72,55 @@ def state_dir(root: pathlib.Path) -> pathlib.Path:
     return d
 
 
+# 값 판정은 작업 세션이 쓰는 분류기(model_select.sh 의 ms_classify claude)를 그대로 부릅니다.
+# 판정 기준을 한 곳에 두어, 세션 기동이 받는 값과 여기서 받는 값이 어긋나지 않게 합니다.
+MODEL_SELECT = HERE.parent / "model_select.sh"
+CLASSIFY_SH = 'source "$1" || exit 3; shift; while [ $# -gt 0 ]; do ms_classify claude "$1" "$2"; echo; shift 2; done'
+
+
+def classify(pairs):
+    """[(kind, 값)] → 같은 순서의 분류 목록(alias·pinned·default·step·relative·invalid). 판정 불가면 rc 2."""
+    if not pairs:
+        return []
+    args = [a for kv in pairs for a in kv]
+    r = subprocess.run(["bash", "-c", CLASSIFY_SH, "_", str(MODEL_SELECT), *args],
+                       capture_output=True, text=True)
+    out = r.stdout.splitlines()
+    if r.returncode != 0 or len(out) != len(pairs):
+        print(f"세션 모델·effort 값을 판정하지 못했습니다({MODEL_SELECT}, rc={r.returncode}). 어느 줄기도 띄우지 않았습니다.",
+              file=sys.stderr)
+        sys.exit(2)
+    return out
+
+
+def check_session_values(spec):
+    """줄기 항목의 model·effort 를 띄우기 전에 모두 검사합니다. 어긋나면 rc 2."""
+    items = []
+    for s in spec["streams"]:
+        for kind in ("model", "effort"):
+            v = str(s.get(kind) or "")
+            if v:
+                items.append((s["slug"], kind, v))
+    kinds = classify([(k, v) for _, k, v in items])
+    bad = [f"{slug}: {k} {v!r}" for (slug, k, v), c in zip(items, kinds) if c == "invalid"]
+    if bad:
+        print("세션 모델·effort 값이 올바르지 않습니다. 어느 줄기도 띄우지 않았습니다"
+              " (허용 값: rd-workflow/docs/guides/config_reference.md 「작업 세션 칸」):", file=sys.stderr)
+        for b in bad:
+            print(f"  {b}", file=sys.stderr)
+        sys.exit(2)
+
+
+def session_env(s, base):
+    """줄기 spec 하나 → promote 에 줄 환경. 값이 있는 칸만 RD_SESSION_* 로 덮습니다."""
+    env = dict(base)
+    if s.get("model"):
+        env["RD_SESSION_MODEL"] = str(s["model"])
+    if s.get("effort"):
+        env["RD_SESSION_EFFORT"] = str(s["effort"])
+    return env
+
+
 def check_names(spec):
     names = [("wave", spec["wave"])] + [("slug", s["slug"]) for s in spec["streams"]]
     for kind, v in names:
@@ -81,13 +136,22 @@ def build(spec, root, state):
     reports = state / "reports"
     reports.mkdir(parents=True, exist_ok=True)
     tail = (HERE / "handoff-tail.md").read_text().replace("{REPORTS}", str(reports))
-    wave = state / "waves" / spec["wave"]
-    wave.mkdir(parents=True, exist_ok=True)
     items = root / "rd-workflow-workspace/backlog/items"
     for s in streams:
         for stem in s["frs"]:
             if not (items / f"{stem}.md").is_file():
                 sys.exit(f"FR 상세 없음: {items / (stem + '.md')}")
+    # wave 폴더를 원자적으로 예약합니다. wave 이름은 do.md 의 회차 식별자이므로,
+    # 다른 호출이 이미 쓴 이름이면 두 회차가 섞이지 않게 멈춥니다.
+    wave = state / "waves" / spec["wave"]
+    wave.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        wave.mkdir()
+    except FileExistsError:
+        print(f"wave 가 이미 있습니다: {wave} — 다른 wave 이름으로 다시 실행하십시오. 어느 줄기도 띄우지 않았습니다.",
+              file=sys.stderr)
+        sys.exit(2)
+    for s in streams:
         fr_rows = "\n".join(
             f"| `{stem[11:]}` | `rd-workflow-workspace/backlog/items/{stem}.md` |" for stem in s["frs"])
         ctx = f"\n{spec['context']}\n" if spec.get("context") else ""
@@ -126,6 +190,12 @@ def build(spec, root, state):
     return wave
 
 
+def selection_line(lines):
+    """promote 출력 → 마지막 「promote: 다음 기동에 사용할 모델 — …」 줄(접두 뗌). 없으면 빈 값."""
+    found = [l for l in lines if l.startswith("promote: 다음 기동에 사용할 모델")]
+    return found[-1][len("promote: "):] if found else ""
+
+
 def launch_verdict(rc, lines):
     """promote 출력 → (요약 줄, 감시 목록 등록 여부).
 
@@ -137,6 +207,55 @@ def launch_verdict(rc, lines):
     summary = found[-1] if found else ""
     failed = summary.startswith("promote: 세션 기동 결과 — failed")
     return summary, rc == 0 and not failed
+
+
+DUP_PREFIXES = ("promote: 중복 착수", "promote: 중복 확인 경고", "promote: 착수 표시")
+CLAIM_FAIL_PHRASES = ("원격 중복 확인을 하지 못했습니다", "착수 표시를 원격에 올리지 못했습니다",
+                      "착수 표시를 다시 시도하지 않았습니다")
+
+
+def dup_lines(lines):
+    """promote 출력 → 중복 착수 멈춤·확인 경고·착수 표시 머리 줄과, 그 바로 뒤에 이어지는 두 칸 들여쓰기 줄들(순서 유지)."""
+    out, keep = [], False
+    for l in lines:
+        if l.startswith(DUP_PREFIXES):
+            keep = True
+            out.append(l)
+        elif keep and l.startswith("  "):
+            out.append(l)
+        else:
+            keep = False
+    return out
+
+
+def claim_state(rc, lines):
+    """promote 출력 → 착수 표시 상태 한 줄(spec D7 의 1~6 순서로 처음 맞는 것).
+
+    「같은 작업의 다른 흔적」 경고와 「로컬 진행 확인을 하지 못했습니다」 경고는 표시 상태가 아니라 정하지 않습니다.
+    """
+    if any(l.startswith("promote: 중복 착수") for l in lines):
+        return "멈춤(다른 착수·발행 있음)"
+    for l in lines:
+        if not l.startswith("promote: 중복 확인 경고"):
+            continue
+        for ph in CLAIM_FAIL_PHRASES:
+            if ph in l:
+                m = re.search(re.escape(ph) + r"\((.*?)\)\.(?:\s|$)", l)
+                return "못 올림(" + (m.group(1) if m else "색인 사용 중") + ")"
+    for l in lines:
+        if l.startswith("promote: 착수 표시"):
+            if "올렸습니다" in l:
+                n = re.search(r"원격 기본 브랜치에 없는 커밋 (\d+)개", l)
+                if n:
+                    return f"올림(원격에 없던 커밋 {n.group(1)}개 포함)"
+                if "이력 전체" in l:
+                    return "올림(이력 전체)"
+                return "올림"
+            if "이미 이 작업의 착수 표시가 있습니다" in l:
+                return "이미 있음"
+    if rc != 0:
+        return f"착수 실패(promote rc={rc} — promote.log 확인)"
+    return "원격 없음(로컬 전용)"
 
 
 def active_row(s):
@@ -155,9 +274,25 @@ def launch(spec, root, state, wave):
         with log.open("a") as f:
             f.write(f"=== {s['slug']}\n")
             f.flush()
-            rc = subprocess.run(cmd, cwd=root, stdout=f, stderr=subprocess.STDOUT).returncode
-        summary, register = launch_verdict(rc, log.read_text().split(f"=== {s['slug']}\n")[-1].splitlines())
+            rc = subprocess.run(cmd, cwd=root, stdout=f, stderr=subprocess.STDOUT,
+                                env=session_env(s, os.environ)).returncode
+        lines = log.read_text().split(f"=== {s['slug']}\n")[-1].splitlines()
+        summary, register = launch_verdict(rc, lines)
+        dups = dup_lines(lines)
+        stop = next((k for k, d in enumerate(dups) if d.startswith("promote: 중복 착수")), None)
+        if not summary and rc != 0 and stop is not None:
+            # 멈춤 머리 줄은 앞선 확인 경고 뒤에 올 수 있습니다. 머리 줄을 요약에 올리고, 그 들여쓰기 줄은 요약 바로 뒤로 옮깁니다.
+            end = stop + 1
+            while end < len(dups) and dups[end].startswith("  "):
+                end += 1
+            summary, dups = dups[stop], dups[stop + 1:end] + dups[:stop] + dups[end:]
         print(f"{s['slug']}: promote rc={rc} {summary or '(기동 결과 줄 없음 — ' + str(log) + ' 확인)'}")
+        for d in dups:
+            print(f"{s['slug']}: {d}")
+        sel = selection_line(lines)
+        if sel:
+            print(f"{s['slug']}: {sel}")
+        print(f"{s['slug']}: 착수 표시 상태 — {claim_state(rc, lines)}")
         if register:
             rows = active.read_text().splitlines() if active.exists() else []
             if s["slug"] not in [r.split("\t", 1)[0] for r in rows]:
@@ -170,6 +305,7 @@ if __name__ == "__main__":
         sys.exit(__doc__)
     spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
     check_names(spec)
+    check_session_values(spec)
     root = main_checkout()
     state = state_dir(root)
     wave = build(spec, root, state)

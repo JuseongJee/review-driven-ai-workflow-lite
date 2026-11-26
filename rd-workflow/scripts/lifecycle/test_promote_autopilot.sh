@@ -9,6 +9,7 @@ pass() { PASS=$((PASS+1)); printf '  PASS: %s\n' "$1"; }
 # 실제 세션 기동 차단: herdr·herdr app(HC_TERMINAL_ID) 판정을 모두 끈다.
 export HERDR_ENV=
 export HC_TERMINAL_ID=
+export ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE=
 export RD_CHILD_SESSION=1
 source "$SCRIPT_DIR/_lifecycle_common.sh"
 
@@ -143,6 +144,52 @@ out="$(t6_promote ct1)"
 out="$(t6_promote ct2 RD_CHILD_SESSION=1)"
 [[ -z "$(idx_get ct2 caller-id)" && "$out" != *"rd publish watch"* ]] \
   && pass "T6: 자식 세션은 caller-id 를 기록하지 않고 안내도 없다" || fail "T6 자식 세션: id=[$(idx_get ct2 caller-id)] out=$out"
+
+# T4) 깊이 1 제한 (change spec D6) — Orca 는 기동 자식에 env 를 못 넘기므로 세션 정체(launch-tab)로 자식을 판정한다.
+#     RD_LAUNCH_STUB 은 쓰지 않는다(대역 기동은 자식 검사보다 먼저 실행돼 올바른 구현도 실패시킨다).
+#     새 기동 여부는 기록용 orca 대역의 로그에서 `agent launch` 줄 수로 본다.
+ODIR="$RLREPO/orcastub"; mkdir -p "$ODIR"
+cat > "$ODIR/orca" <<'STUBEOF'
+#!/usr/bin/env bash
+dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+printf '%s\n' "$*" >> "$dir/orca.log"
+case "$1 $2" in
+  "agent launch") printf '{"ok":true,"result":{"outcome":{"kind":"terminal","handle":"term_new","paneKey":"T:L"},"prompt":{"outcome":"handed-to-terminal"},"operationId":"op"}}\n' ;;
+  "agent list")   printf '{"ok":true,"result":{"agents":[{"paneKey":"T:L","state":"done","lastAssistantMessage":"x"}]}}\n' ;;
+esac
+exit 0
+STUBEOF
+chmod +x "$ODIR/orca"
+t4_promote() {  # <slug> <env...> — 출력은 $ODIR/out, 기동 횟수는 t4_launches
+  local slug="$1"; shift
+  : > "$ODIR/orca.log"
+  ( cd "$RLREPO" && env HERDR_ENV= HC_TERMINAL_ID= RD_CHILD_SESSION= RD_LAUNCH_STUB= ORCA_TERMINAL_HANDLE= ORCA_AGENT_SESSION_ID= "$@" PATH="$ODIR:$PATH" \
+      bash "$PROMOTE" --short-title "$slug" --size large --source-fr - > "$ODIR/out" 2>&1 ) || true
+}
+t4_launches() { grep -c '^agent launch' "$ODIR/orca.log" || true; }
+t4_seed() {  # <slug> <backend> <tab>
+  ( cd "$RLREPO" && source "$RLREPO/rd-workflow/scripts/lifecycle/_tasks_index.sh" \
+    && tasks_index_upsert "$1" launch-backend="$2" launch-tab="$3" )
+}
+t4_seed t4par1 orca term_c1
+t4_seed t4par2 orca structured-agent-session-s9
+t4_seed t4par3 herdr term_c4
+# a) 터미널 자식 — 기본 체크아웃에서 다른 slug 를 promote 해도 막힌다
+t4_promote t4a ORCA_TERMINAL_HANDLE=term_c1
+[[ "$(t4_launches)" == 0 && "$(idx_get t4a launch-backend)" == "none" && "$(cat "$ODIR/out")" == *"이미 자식 세션입니다(깊이 1 제한)"* ]] \
+  && pass "T4-a: orca 터미널 자식은 기동을 건너뛴다" || fail "T4-a: launches=$(t4_launches) backend=[$(idx_get t4a launch-backend)] out=$(cat "$ODIR/out")"
+# b) 채팅 자식
+t4_promote t4b ORCA_AGENT_SESSION_ID=s9
+[[ "$(t4_launches)" == 0 && "$(idx_get t4b launch-backend)" == "none" && "$(cat "$ODIR/out")" == *"이미 자식 세션입니다(깊이 1 제한)"* ]] \
+  && pass "T4-b: orca 채팅 자식은 기동을 건너뛴다" || fail "T4-b: launches=$(t4_launches) backend=[$(idx_get t4b launch-backend)] out=$(cat "$ODIR/out")"
+# c) 사용자가 손으로 연 세션(색인에 없는 정체)은 자식이 아니다
+t4_promote t4c ORCA_TERMINAL_HANDLE=term_other
+[[ "$(t4_launches)" == 1 && "$(idx_get t4c launch-backend)" == "orca" ]] \
+  && pass "T4-c: 색인에 없는 orca 세션은 자식이 아니다" || fail "T4-c: launches=$(t4_launches) backend=[$(idx_get t4c launch-backend)] out=$(cat "$ODIR/out")"
+# d) 같은 정체 값이어도 행의 launch-backend 가 orca 가 아니면 자식이 아니다
+t4_promote t4d ORCA_TERMINAL_HANDLE=term_c4
+[[ "$(t4_launches)" == 1 && "$(idx_get t4d launch-backend)" == "orca" ]] \
+  && pass "T4-d: launch-backend 가 herdr 인 행은 자식 근거가 아니다" || fail "T4-d: launches=$(t4_launches) backend=[$(idx_get t4d launch-backend)] out=$(cat "$ODIR/out")"
 
 printf 'promote_autopilot: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

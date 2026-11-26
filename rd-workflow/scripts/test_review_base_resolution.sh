@@ -285,6 +285,12 @@ eq "$(session_section "$S1" "Review Target")" "git diff ${C0}..${C1}" \
   "우선순위 1: Review Target 양끝이 고정 OID"
 eq "$(awk -F'=' '$1=="review-session"{print $2}' "${R1}/rd-workflow-workspace/.lifecycle/task-state")" \
   "$(basename "$S1")" "우선순위 1: task-state review-session 포인터 기록"
+# 기본 브랜치 세션 이름에는 작업 slug 가 없습니다 — promote 의 문서 이관이 기본 체크아웃의 세션을 이 이름으로 찾습니다.
+if [[ "$(basename "$S1")" =~ ^[0-9]{8}_[0-9]{6}_final-diff-review$ ]]; then
+  pass "세션 이름: 기본 브랜치는 <시각>_final-diff-review 그대로"
+else
+  fail "세션 이름: 기본 브랜치는 <시각>_final-diff-review 그대로 (실제=[$(basename "$S1")])"
+fi
 
 # --- 우선순위 2: task-state fr-branch → merge-base ---
 # main 을 fr 분기점보다 앞으로 전진시켜, base 가 **merge-base 이지 fr-branch·main tip 이 아님**을
@@ -305,6 +311,45 @@ S2="$(session_dir "$R2")"
 eq "$(bc_field "$S2" review-base-oid)" "$FORK" "우선순위 2: base 는 merge-base(기본 브랜치, fr tip)"
 ne "$(bc_field "$S2" review-base-oid)" "$MAINTIP" "우선순위 2: base 가 기본 브랜치 tip 이 아님"
 eq "$(bc_field "$S2" review-head-oid)" "$FRTIP" "우선순위 2: head 는 현재 HEAD"
+# fr 브랜치 세션 이름에는 시각과 종류 사이에 작업 slug 가 들어갑니다 — 병렬 줄기가 같은 초에 세션을 열어도
+# 이름이 겹치지 않아야 병합(발행) 때 add/add 충돌이 나지 않습니다.
+if [[ "$(basename "$S2")" =~ ^[0-9]{8}_[0-9]{6}_demo_final-diff-review$ ]]; then
+  pass "세션 이름: fr 브랜치는 <시각>_<작업 slug>_final-diff-review"
+else
+  fail "세션 이름: fr 브랜치는 <시각>_<작업 slug>_final-diff-review (실제=[$(basename "$S2")])"
+fi
+# 작업 slug 가 고정 세션 slug 의 일부와 같아도(fr/final) 이름에 들어가야 합니다 — 빠지면 같은 이름의 작업끼리
+# 다시 겹칩니다. slug 를 생략하는 것은 작업 slug 가 이미 든 spec/plan review 이름뿐입니다.
+git -C "$R2" checkout -q -b fr/final
+SNF="$(cd "$R2" && bash rd-workflow/scripts/init_review_pipeline.sh final-diff-review diff-review 2>/dev/null)"
+if [[ "$(basename "$SNF")" =~ ^[0-9]{8}_[0-9]{6}_final_final-diff-review$ ]]; then
+  pass "세션 이름: 작업 slug 가 고정 slug 의 일부여도 들어감 (fr/final)"
+else
+  fail "세션 이름: 작업 slug 가 고정 slug 의 일부여도 들어감 (fr/final) (실제=[$(basename "$SNF")])"
+fi
+git -C "$R2" checkout -q fr/demo
+SNS="$(cd "$R2" && bash rd-workflow/scripts/init_review_pipeline.sh 1743-demo-spec-plan-review spec-plan-review 2>/dev/null)"
+if [[ "$(basename "$SNS")" =~ ^[0-9]{8}_[0-9]{6}_1743-demo-spec-plan-review$ ]]; then
+  pass "세션 이름: spec/plan review 는 작업 slug 를 한 번만 담음"
+else
+  fail "세션 이름: spec/plan review 는 작업 slug 를 한 번만 담음 (실제=[$(basename "$SNS")])"
+fi
+# 다른 작업의 plan(1743-other-demo)은 이름이 이 작업 slug(demo)로 끝나도 생략하지 않습니다 — 생략하면 fr/other-demo 가
+# 같은 plan 으로 연 세션과 이름이 겹칩니다.
+SNO="$(cd "$R2" && bash rd-workflow/scripts/init_review_pipeline.sh 1743-other-demo-spec-plan-review spec-plan-review 2>/dev/null)"
+if [[ "$(basename "$SNO")" =~ ^[0-9]{8}_[0-9]{6}_demo_1743-other-demo-spec-plan-review$ ]]; then
+  pass "세션 이름: 다른 작업의 plan 은 이름이 작업 slug 로 끝나도 slug 를 붙임"
+else
+  fail "세션 이름: 다른 작업의 plan 은 이름이 작업 slug 로 끝나도 slug 를 붙임 (실제=[$(basename "$SNO")])"
+fi
+# 브랜치와 같은 이름의 태그가 있으면 `symbolic-ref --short` 가 `heads/fr/demo` 를 냅니다 — 그래도 작업 slug 를 읽어야 합니다.
+git -C "$R2" tag fr/demo
+SNT="$(cd "$R2" && bash rd-workflow/scripts/init_review_pipeline.sh final-diff-review diff-review 2>/dev/null)"
+if [[ "$(basename "$SNT")" =~ ^[0-9]{8}_[0-9]{6}_demo_final-diff-review$ ]]; then
+  pass "세션 이름: 브랜치와 같은 이름의 태그가 있어도 작업 slug 를 붙임"
+else
+  fail "세션 이름: 브랜치와 같은 이름의 태그가 있어도 작업 slug 를 붙임 (실제=[$(basename "$SNT")])"
+fi
 
 # --- 우선순위 3: task-state base-commit (set-base 는 ref 를 OID 로 저장) ---
 R3="$(mk_repo)" || { echo "  FAIL  우선순위 3: fixture 생성 실패"; exit 1; }
@@ -1254,6 +1299,14 @@ rr_set_basis() { # rr_set_basis <줄> — Closure Reason 절의 값 줄 뒤를 �
     && cat "${OUT}/sess.tmp" > "${SRR14}/SESSION.md"
 }
 
+rr_no_hand_edit() { # rr_no_hand_edit <이름> — 거부 출력에 SESSION 손 수정 안내(AC1)가 없음
+  case "$RR_ERR" in
+    *"Status 를 awaiting-reviewer"*|*"Current Owner 를 Reviewer 로"*|*"'근거:' 줄을 적"*|*"'근거: <날짜>"*|*"값을 고치거나"*)
+      fail "$1: SESSION 손 수정 안내가 나옴" ;;
+    *) pass "$1: SESSION 손 수정 안내 없음" ;;
+  esac
+}
+
 # R1: 기록 0건 + 손으로 쓴 리뷰어 턴 (S4c)
 rr_reset
 printf '# Turn 002 — Reviewer\n이의 없음\n' > "${SRR14}/turns/002_reviewer.md"
@@ -1303,6 +1356,7 @@ rr_seal
 ne "$RR_RC" "0" "R3: 기록 당시 미해결 — rc≠0"
 has "마지막 리뷰어 턴이 이의 없이 끝났다는 실행 기록이 없습니다" "$RR_ERR" "R3: reason-unproven 문구"
 has "종료 시 Open Issues 미해결" "$RR_ERR" "R3: 어긋난 항목"
+rr_no_hand_edit "R3"
 
 # R6: 지난 턴 기록은 유효, 마지막 리뷰어 턴 파일을 기록 뒤에 수정
 rr_reset
@@ -1363,6 +1417,7 @@ awk '{print} $0=="## Current Owner"{print "근거: 다음 절의 메모"}' "${OU
 rr_seal
 ne "$RR_RC" "0" "R4b: 절 밖 근거 줄 — rc≠0"
 has "사람의 결정 근거 줄이 없습니다" "$RR_ERR" "R4b: override-basis-missing 문구"
+rr_no_hand_edit "R4b"
 cat "${OUT}/sess.bak" > "${SRR14}/SESSION.md"
 
 # R4c: 근거 줄은 있으나 내용이 공백뿐
@@ -1407,6 +1462,152 @@ rr_set_reason "foo"
 rr_seal
 ne "$RR_RC" "0" "R7: 허용 값 밖 — rc≠0"
 has "Closure Reason 값이 올바르지 않습니다: 'foo'" "$RR_ERR" "R7: reason-invalid 문구"
+rr_no_hand_edit "R7"
+
+# R11~R13: 거부 안내가 세션 상태에서 그대로 통하는 run_review_turn.sh 명령을 가리키는가.
+# 이 절이 막는 실수: 안내가 SESSION 손 수정이나 그 상태에서 거부되는 옵션을 가리켜, 따라 한 사람이 막히거나
+# 사람 결정 기록 없이 상태를 바꾸는 것. 안내 줄의 명령을 그대로 실행해 run_review_turn.sh 가 받는지 봅니다.
+rr_run_hint() { # rr_run_hint <옵션> <인자> [연장 턴 수] — RR_ERR 에서 그 옵션의 안내 명령을 꺼내 자리표시를 채워 실행합니다(위치: RR_HINT_CWD, 기본 저장소 루트).
+  local cmd ext=""
+  cmd="$(printf '%s\n' "$RR_ERR" | grep -oE "bash [^ ]*/run_review_turn\.sh [^ ]* ${1} \"<[^\"]*>\"( --extend-turns <N>)?" | head -1)"
+  : > "${OUT}/hint.err"
+  [ -n "$cmd" ] || { RR_HINT_RC=99; return; }
+  case "$cmd" in *"--extend-turns <N>") ext=" --extend-turns ${3:-<N>}" ;; esac
+  cmd="${cmd%% \"<*}"
+  ( cd "${RR_HINT_CWD:-$RRR}" && RD_TEST_OUT="$OUT" REVIEW_TOOLS_CONFIG="$TOOLS_JSON" eval "$cmd \"\$2\"${ext}" ) >"${OUT}/hint.out" 2>"${OUT}/hint.err"
+  RR_HINT_RC=$?
+}
+
+# R11: closed 세션의 실행 기록 0건 → 새 세션 안내
+rr_reset
+rr_seal
+has "다시 열지 않습니다" "$RR_ERR" "R11: closed 세션은 다시 열지 않는다고 안내"
+has "/rd-workflow/scripts/prepare_review_pipeline.sh diff" "$RR_ERR" "R11: 새 세션 명령 안내"
+rr_no_hand_edit "R11"
+
+# R12: awaiting-user(수렴) 세션의 손 종결 → 다음 번호 Author 턴 경로와 --reopen 명령, 그 명령이 통한다
+rr_reset
+printf '# Turn 002 — Reviewer\n이의 없음\n' > "${SRR14}/turns/002_reviewer.md"
+set_session_state "$SRR14" "awaiting-user" "User"
+rr_seal
+has "turns/003_author.md 를 쓴 뒤" "$RR_ERR" "R12: 쓸 Author 턴 경로(다음 번호) 안내"
+rr_no_hand_edit "R12"
+printf '# Turn 003 — Author\n재확인 요청\n' > "${SRR14}/turns/003_author.md"
+rm -f "${OUT}/adapter-called"
+rr_run_hint --reopen "손 종결 재확인"
+eq "$RR_HINT_RC" "0" "R12: 안내한 --reopen 명령을 그대로 실행하면 통과 ($(tail -1 "${OUT}/hint.err" 2>/dev/null))"
+[ -f "${OUT}/adapter-called" ] && pass "R12: 리뷰어 턴이 실제로 실행됨" || fail "R12: 리뷰어 턴이 실행되지 않음"
+
+# R13: awaiting-user + 미해결 이의 → --decision·--override 안내, --decision 명령이 통한다
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS" "- F1 (턴 002) — 남은 이의"
+set_session_state "$SRR14" "awaiting-user" "User"
+rr_seal
+has "open-issues-unresolved" "$RR_ERR" "R13: 미해결 이의로 거부"
+has "--override \"<결정한 사람> — <그 사람이 한 말>\"" "$RR_ERR" "R13: --override 명령 안내"
+rr_no_hand_edit "R13"
+printf '# Turn 003 — Author\nF1 은 범위 밖으로 둡니다.\n' > "${SRR14}/turns/003_author.md"
+rm -f "${OUT}/adapter-called"
+rr_run_hint --decision "F1 은 범위 밖"
+eq "$RR_HINT_RC" "0" "R13: 안내한 --decision 명령을 그대로 실행하면 통과 ($(tail -1 "${OUT}/hint.err" 2>/dev/null))"
+[ -f "${OUT}/adapter-called" ] && pass "R13: 리뷰어 턴이 실제로 실행됨" || fail "R13: 리뷰어 턴이 실행되지 않음"
+
+# R13o: 같은 상태에서 안내한 --override 를 그대로 실행하면 종결되고 seal 이 user-override 로 통과한다
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS" "- F1 (턴 002) — 남은 이의"
+set_session_state "$SRR14" "awaiting-user" "User"
+rr_seal
+rr_run_hint --override "주성 — F1 은 덮고 종결"
+eq "$RR_HINT_RC" "0" "R13o: 안내한 --override 명령을 그대로 실행하면 통과 ($(tail -1 "${OUT}/hint.err" 2>/dev/null))"
+eq "$(session_section "$SRR14" "Status")" "closed" "R13o: 세션이 closed 로 종결"
+rr_seal
+eq "$RR_RC" "0" "R13o: 종결 뒤 seal 통과 ($(tail -1 "${OUT}/seal.err" 2>/dev/null))"
+eq "$(grep -cx 'closure-reason=user-override' "$(marker_path "$RRR" "$SRR14ID")")" "1" "R13o: 마커 closure-reason=user-override"
+rr_set_basis ""; rr_set_reason "-"   # 다음 케이스를 위해 Closure Reason 을 비웁니다
+
+# R14: 미해결 이의 + 실행 기록 없는 손 리뷰어 턴 → --override 대신 --decision 먼저 받으라고 안내
+rr_reset
+printf '# Turn 002 — Reviewer\n이의 있음\n' > "${SRR14}/turns/002_reviewer.md"
+printf '# Review Checkpoint\n\n## Open Issues\n- F1 (턴 002) — 남은 이의\n\n## Suggested Next Owner\nAuthor\n' > "${SRR14}/CHECKPOINT.md"
+set_session_state "$SRR14" "awaiting-user" "User"
+rr_seal
+has "지금은 --override 를 받지 않습니다" "$RR_ERR" "R14: 기록이 없으면 --override 를 받지 않는다고 안내"
+case "$RR_ERR" in *"--override \"<"*) fail "R14: 거부될 --override 명령을 안내함" ;; *) pass "R14: 거부될 --override 명령을 안내하지 않음" ;; esac
+
+# R15: 턴 한도(20)에 닿은 미해결 세션 → --decision 명령에 --extend-turns 를 붙여 안내하고, 그 명령이 통한다
+rr_reset
+for i in $(seq 2 19); do
+  if [ $((i % 2)) -eq 0 ]; then r=reviewer; else r=author; fi
+  printf '# Turn %03d\n내용\n' "$i" > "${SRR14}/turns/$(printf '%03d' "$i")_${r}.md"
+done
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS" "- F1 (턴 020) — 남은 이의"
+set_session_state "$SRR14" "awaiting-user" "User"
+rr_seal
+has "--decision \"<사용자 결정>\" --extend-turns <N>" "$RR_ERR" "R15: --decision 안내에 --extend-turns 를 붙임"
+has "turns/021_author.md 를 쓴 뒤" "$RR_ERR" "R15: 쓸 Author 턴 경로(021) 안내"
+printf '# Turn 021 — Author\nF1 반영\n' > "${SRR14}/turns/021_author.md"
+rm -f "${OUT}/adapter-called"
+has "2 이상이어야 합니다" "$RR_ERR" "R15: 최소 연장 턴 수(022 - 20 = 2) 안내"
+rr_run_hint --decision "F1 반영" 2
+# 리뷰어 턴 022 가 늘린 한도(22)에 닿으면 mock 리뷰어(awaiting-author 로 넘김)와 실행기 기대(awaiting-user)가 달라 rc 가 1 이 됩니다.
+# 그래서 rc 대신 연장 거부가 없고 리뷰어 턴 022 가 생겼는지 봅니다.
+case "$(cat "${OUT}/hint.err")" in *"안에 들지 않습니다"*) fail "R15: 안내한 최솟값(2)이 연장 거부됨" ;; *) pass "R15: 안내한 최솟값(2)이 연장 거부되지 않음" ;; esac
+[ -f "${SRR14}/turns/022_reviewer.md" ] && pass "R15: 리뷰어 턴 022 에 도달" || fail "R15: 리뷰어 턴 022 에 도달하지 않음"
+
+# R17: rd-workflow/ 하위 디렉터리에서 seal 을 부르면, 같은 위치에서 안내한 명령을 그대로 실행할 수 있다
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS" "- F1 (턴 002) — 남은 이의"
+set_session_state "$SRR14" "awaiting-user" "User"
+put_evidence "$RRR"
+( cd "${RRR}/rd-workflow" && bash scripts/rd review seal "../${SRR14#${RRR}/}" ) >"${OUT}/seal.out" 2>"${OUT}/seal.err"
+RR_ERR="$(cat "${OUT}/seal.err")"
+has "open-issues-unresolved" "$RR_ERR" "R17: 하위 디렉터리 호출도 미해결 이의로 거부"
+printf '# Turn 003 — Author\nF1 반영\n' > "${SRR14}/turns/003_author.md"
+rm -f "${OUT}/adapter-called"
+RR_HINT_CWD="${RRR}/rd-workflow" rr_run_hint --decision "F1 반영"
+eq "$RR_HINT_RC" "0" "R17: 하위 디렉터리에서 안내한 --decision 을 그대로 실행하면 통과 ($(tail -1 "${OUT}/hint.err" 2>/dev/null))"
+[ -f "${OUT}/adapter-called" ] && pass "R17: 리뷰어 턴이 실제로 실행됨" || fail "R17: 리뷰어 턴이 실행되지 않음"
+
+# R16: 유효 기록이 있어도 마지막 리뷰 뒤 보호 경로가 바뀌면 --override 를 안내하지 않는다 (마지막 케이스 — 저장소에 커밋을 더함)
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS" "- F1 (턴 002) — 남은 이의"
+set_session_state "$SRR14" "awaiting-user" "User"
+commit_code "$RRR" after-review
+rr_seal
+has "코드가 바뀌어 지금은 --override 를 받지 않습니다" "$RR_ERR" "R16: 리뷰 뒤 변경이면 --override 를 받지 않는다고 안내"
+case "$RR_ERR" in *"--override \"<"*) fail "R16: 거부될 --override 명령을 안내함" ;; *) pass "R16: 거부될 --override 명령을 안내하지 않음" ;; esac
+set_bc_field "$SRR14" review-head-policy pinned
+rr_seal
+has "/rd-workflow/scripts/prepare_review_pipeline.sh diff" "$RR_ERR" "R16: 고정 head 세션은 새 세션을 안내"
+
+# R18: 고정(pinned) head 세션의 실행 기록 단계 — 리뷰 뒤 코드가 바뀌었으면 --reopen 대신 새 세션, 그대로면 --reopen
+rr_reset
+printf '# Turn 002 — Reviewer\n이의 없음\n' > "${SRR14}/turns/002_reviewer.md"
+set_session_state "$SRR14" "awaiting-user" "User"
+set_bc_field "$SRR14" review-head-policy pinned
+set_bc_field "$SRR14" review-head-oid "$(git -C "$RRR" rev-parse HEAD~1)"
+rr_seal
+has "새 세션으로 바뀐 내용을 리뷰하십시오" "$RR_ERR" "R18: 고정 head + 리뷰 뒤 변경 → 새 세션 안내"
+case "$RR_ERR" in *"--reopen \"<"*) fail "R18: 다시 막힐 --reopen 을 안내함" ;; *) pass "R18: 다시 막힐 --reopen 을 안내하지 않음" ;; esac
+set_bc_field "$SRR14" review-head-oid "$(git -C "$RRR" rev-parse HEAD)"
+rr_seal
+has "--reopen \"<사유>\"" "$RR_ERR" "R18: 고정 head + 변경 없음 → --reopen 안내"
+
+# R19: reviewed OID 상태 구분 — 한쪽만 있으면 --override 를 내지 않고, 둘 다 없는 이전 형식이면 --override 를 내며 그 명령과 legacy seal 이 통한다
+rr_reset
+fixture_reviewer_turn "$SRR14" "$RRR_SCRIPTS" "- F1 (턴 002) — 남은 이의"
+set_session_state "$SRR14" "awaiting-user" "User"
+del_bc_field "$SRR14" review-head-oid
+rr_seal
+has "reviewed OID 가 한쪽만 있어" "$RR_ERR" "R19: OID 한쪽만 → 손상 안내"
+case "$RR_ERR" in *"--override \"<"*) fail "R19: 손상 세션에 --override 를 안내함" ;; *) pass "R19: 손상 세션에 --override 를 안내하지 않음" ;; esac
+del_bc_field "$SRR14" review-base-oid
+rr_seal
+has "--legacy-unverified" "$RR_ERR" "R19: 이전 형식 → legacy seal 안내"
+rr_run_hint --override "주성 — F1 은 덮고 종결"
+eq "$RR_HINT_RC" "0" "R19: 이전 형식 세션에서 안내한 --override 를 그대로 실행하면 통과 ($(tail -1 "${OUT}/hint.err" 2>/dev/null))"
+seal "$RRR" --legacy-unverified "이전 형식 세션" "${SRR14#${RRR}/}"; rc=$?
+eq "$rc" "0" "R19: 종결 뒤 legacy seal 통과 ($(tail -1 "${OUT}/seal.err" 2>/dev/null))"
 
 echo "=== 15. 기록 커밋 뒤 diff review 의 REQUEST 보관본 ==="
 # 기록 커밋은 루트 REQUEST.md 를 비우고 보관본을 추가합니다. 그 뒤 연 세션이 빈 REQUEST.md 를 읽으면

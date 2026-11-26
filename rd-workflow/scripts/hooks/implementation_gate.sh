@@ -22,6 +22,23 @@ file_path="$(extract_json_field "file_path")"
 # 발생했으므로, autopilot 일 때 꺼지는 차단은 그 사고를 막지 못한다 (시나리오 13 이 고정).
 # is_shared_state_file 은 프로젝트 밖 절대 경로에 스스로 return 1 을 반환하므로
 # 프로젝트 밖 편집은 그대로 통과한다 (시나리오 27 이 고정).
+if [[ -n "$(read_hook_agent_id)" ]]; then
+  # 편집 대상이 속한 worktree 로 판정 루트를 옮긴다 (같은 저장소일 때만. other·none 은 그대로).
+  _abs_path="$file_path"
+  if [[ "$_abs_path" != /* ]]; then
+    _base_dir="$(hook_input_cwd)"; [[ -n "$_base_dir" ]] || _base_dir="$hook_root_default"
+    _abs_path="${_base_dir}/${_abs_path}"
+  fi
+  _abs_path="$(normalize_lexical_path "$_abs_path")"
+  _target="$(resolve_target_root "$_abs_path")"
+  if [[ "$_target" == same\ * ]]; then
+    gate_rebind_root "${_target#same }"
+    # project_root 와 같은 물리 경로 형태로 맞춘다 (is_shared_state_file 은 글자 그대로 비교한다).
+    _near="$(_nearest_existing_dir "$_abs_path")"
+    _near_phys="$(cd -P "$_near" 2>/dev/null && pwd -P)" || _near_phys="$_near"
+    file_path="${_near_phys%/}${_abs_path#"${_near%/}"}"
+  fi
+fi
 if [[ -n "$(read_hook_agent_id)" ]] && is_shared_state_file "$file_path"; then
   rel_path="$(normalize_lexical_path "$file_path")"
   root_norm_path="$(normalize_lexical_path "$project_root")"
@@ -29,6 +46,7 @@ if [[ -n "$(read_hook_agent_id)" ]] && is_shared_state_file "$file_path"; then
   echo "[guard] 이 파일은 orchestrator(메인 세션) 전용입니다: ${rel_path}" >&2
   echo "        병렬 구현자는 공유 진행 상태를 수정하지 않습니다." >&2
   echo "        진행 상황·완료 보고는 결과 텍스트로 반환하면 orchestrator 가 반영합니다." >&2
+  gate_root_notice
   # reason: subagent가 공유 진행 상태 파일(orchestrator 전용)을 쓰려 한 분기.
   guard_deny "implementation_gate.shared-state-write"
 fi

@@ -533,3 +533,15 @@ rd-workflow-workspace/.lifecycle/fr-do/
 - 새 흐름을 쓰려면 `gh` 를 설치하고 팀 저장소 호스트에 로그인합니다(`gh auth status`). 순서는 `rd-workflow/docs/guides/team-overlay-fresh-install.md` 의 「마감 — 팀 저장소 반영」 절에 있습니다.
 - 이전 방식(팀 저장소 반영을 직접 하고 overlay 만 발행)으로 두려면 `rd-workflow/config/workflow.json` 에 `"team_publish": { "mode": "manual" }` 을 적고 커밋합니다. 일부 submodule 만 직접 반영하려면 `team_publish.submodules.<경로>.mode` 를 `manual` 로 적습니다.
 - seal 을 만든 뒤 반영 방식을 바꾸려면 설정을 커밋하고 diff review 를 다시 종결해 seal 을 새로 만들어야 합니다. `workflow.json` 이 seal 보호 트리에 들어 있기 때문입니다.
+
+## M019: 구현 subagent 모델·effort 표시 hook 추가 (`.claude/settings.json`)
+
+**처리**: 안내 (`migrate post`, 이전 VERSION 이 2026-11-21 이하일 때 `NOTICE`). 등록 변경은 M003 이 자동으로 처리합니다.
+
+**조건**: 이 버전 이후로 동기화하는 모든 프로젝트.
+
+**동작 변화**: 새 PreToolUse hook(`subagent_dispatch_display.sh`, matcher `Agent`)이 Status 가 `구현 중` 일 때 Agent 호출마다 넘긴 모델·effort 와 `models.json` 설정·출처·경고를 화면에 한 줄로 보입니다. 넘긴 값이 설정과 다르면 「설정과 다름」 을 붙입니다. 표시 전용이며 호출을 막지 않습니다. 무인 실행에서는 같은 줄이 transcript 에 남습니다(찾는 방법은 `rd-workflow/claude_skills/fr/do.md` 「4. 무인」 7단계).
+
+**실행 절차**: 별도 스니펫이 없습니다. M003 이 새 hook 등록을 더합니다.
+
+**사용자가 할 일**: 없습니다.

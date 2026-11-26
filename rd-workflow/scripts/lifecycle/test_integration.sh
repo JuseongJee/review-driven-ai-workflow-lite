@@ -17,6 +17,7 @@ trap 'rm -rf "$TMPROOT"' EXIT
 # 둘 다 두는 이유는 어느 한쪽 판정이 바뀌어도 차단이 남게 하기 위해서다.
 export HERDR_ENV=
 export HC_TERMINAL_ID=
+export ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE=
 export RD_CHILD_SESSION=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -108,7 +109,9 @@ setup_repo() {
     cp -R "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/lifecycle/. rd-workflow/scripts/lifecycle/; \
     cp -R "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/hooks/. rd-workflow/scripts/hooks/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_state_common.sh rd-workflow/scripts/; \
+    cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/model_select.sh rd-workflow/scripts/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_task_common.sh rd-workflow/scripts/; \
+    cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_fr_status.sh rd-workflow/scripts/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_submodule_common.sh rd-workflow/scripts/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/rd rd-workflow/scripts/; \
     cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_fr_register_common.sh rd-workflow/scripts/; \
@@ -814,6 +817,8 @@ REPO="$(setup_repo)"
 BARE13="$(mk_bare 13)"
 ( cd "$REPO" && git remote add origin "$BARE13" && git push -q origin main )
 run_promote "$REPO" --short-title test-absent --size small --no-worktree >/dev/null
+# promote 가 올린 착수 표시를 지워 "원격 정상 부재" 전제를 만든다.
+git --git-dir="$BARE13" update-ref -d refs/heads/fr/test-absent
 ( cd "$REPO" && echo "ar" > REQUEST.md && git add REQUEST.md && git commit -q -m "archive content" )
 ( cd "$REPO" && git switch main -q )
 cat > "$REPO/.git/hooks/post-commit" <<'HOOK'
@@ -1955,7 +1960,7 @@ arc_assert_block_notice() {  # arc_assert_block_notice <label> <out> <fr_ref> [k
 _d="$(arc_setup test-block1)"
 ( cd "$_d" && git merge -q --no-ff fr/test-block1 -m "merge: test-block1" \
   && printf 'evil\n' > product.txt && git add product.txt && git commit -q -m "리뷰 안 된 수정" ) >/dev/null 2>&1
-_out="$(arc_archive "$_d")" && _rc=0 || _rc=$?
+_out="$(arc_archive "$_d" --task test-block1)" && _rc=0 || _rc=$?
 [[ "$_rc" -ne 0 ]] && pass "회귀 1: 제품 코드 커밋 얹힘 → 차단" || fail "회귀 1: 차단되지 않음 — $_out"
 printf '%s' "$_out" | out_has "허용 경로 밖 변경" && pass "회귀 1: 사유 출력" || fail "회귀 1: 사유 미출력"
 printf '%s' "$_out" | out_has "그대로 보존" && pass "회귀 1: 보존 사실 안내" || fail "회귀 1: 보존 안내 없음"
@@ -1966,7 +1971,7 @@ rm -rf "$_d"
 _d="$(arc_setup test-empty)"
 ( cd "$_d" && git merge -q --no-ff fr/test-empty -m "merge: test-empty" \
   && git commit -q --allow-empty -m "빈 커밋" ) >/dev/null 2>&1
-_out="$(arc_archive "$_d")" && _rc=0 || _rc=$?
+_out="$(arc_archive "$_d" --task test-empty)" && _rc=0 || _rc=$?
 [[ "$_rc" -ne 0 ]] && pass "회귀 3: 빈 커밋 → 차단" || fail "회귀 3: 차단되지 않음 — $_out"
 rm -rf "$_d"
 
@@ -1978,13 +1983,13 @@ _d="$(arc_setup test-humanmerge)"
   git checkout -q -b side && printf 'x\n' > side.txt && git add side.txt && git commit -q -m side
   git checkout -q main && git merge -q --no-ff side -m "사람이 merge"
 ) >/dev/null 2>&1
-_out="$(arc_archive "$_d")" && _rc=0 || _rc=$?
+_out="$(arc_archive "$_d" --task test-humanmerge)" && _rc=0 || _rc=$?
 [[ "$_rc" -ne 0 ]] && pass "회귀 4: 사람 merge 커밋 → 차단" || fail "회귀 4: 차단되지 않음 — $_out"
 rm -rf "$_d"
 
 # 회귀 5 — 이번 실행이 merge 를 만든 정상 경로 → 통과
 _d="$(arc_setup test-normal)"
-_out="$(arc_archive "$_d")" && _rc=0 || _rc=$?
+_out="$(arc_archive "$_d" --task test-normal)" && _rc=0 || _rc=$?
 [[ "$_rc" -eq 0 ]] && pass "회귀 5: 정상 경로 통과" || fail "회귀 5: 정상 경로가 실패 — $_out"
 ( cd "$_d" && [[ -n "$(git tag --list "fr/*/test-normal")" ]] ) && pass "회귀 5: tag 생성" || fail "회귀 5: tag 미생성"
 rm -rf "$_d"
@@ -1992,7 +1997,7 @@ rm -rf "$_d"
 # 회귀 6 — fr 분기 이후 기본 브랜치가 전진한 이력 → 통과 (오탐 없음)
 _d="$(arc_setup test-advance)"
 ( cd "$_d" && printf 'v2\n' > other.txt && git add other.txt && git commit -q -m "기본 브랜치 선행 작업" ) >/dev/null 2>&1
-_out="$(arc_archive "$_d")" && _rc=0 || _rc=$?
+_out="$(arc_archive "$_d" --task test-advance)" && _rc=0 || _rc=$?
 [[ "$_rc" -eq 0 ]] && pass "회귀 6: 분기 이후 선행 커밋은 오탐 없음" || fail "회귀 6: 오탐 발생 — $_out"
 rm -rf "$_d"
 
@@ -2013,7 +2018,7 @@ _d="$(arc_setup test-metaonly)"
 _extra="$( cd "$_d" && git rev-list --first-parent --count "fr/test-metaonly..HEAD" )" \
   || { printf '회귀 2: rev-list 실패 — fixture 구성 중단\n' >&2; exit 1; }
 [[ "$_extra" -ge 2 ]] && pass "회귀 2: 얹힌 커밋이 실제로 존재 ($_extra 건)" || fail "회귀 2: 얹힌 커밋이 없어 무의미 ($_extra 건)"
-_out="$(arc_archive "$_d")" && _rc=0 || _rc=$?
+_out="$(arc_archive "$_d" --task test-metaonly)" && _rc=0 || _rc=$?
 [[ "$_rc" -eq 0 ]] && pass "회귀 2: 최종 내용이 baseline 이면 통과" || fail "회귀 2: 통과하지 못함 — $_out"
 rm -rf "$_d"
 
@@ -2026,7 +2031,7 @@ _d="$(arc_setup test-inject)"
   git add rd-workflow-workspace/.lifecycle/task-state
   git commit -q -m "metadata-only 주입"
 ) >/dev/null 2>&1
-_out="$(arc_archive "$_d")" && _rc=0 || _rc=$?
+_out="$(arc_archive "$_d" --task test-inject)" && _rc=0 || _rc=$?
 [[ "$_rc" -ne 0 ]] && pass "회귀 12: task-state 임의 키 주입 → 차단" || fail "회귀 12: 차단되지 않음 — $_out"
 printf '%s' "$_out" | out_has "소유 키 밖에서 달라졌습니다" && pass "회귀 12: 사유 출력" || fail "회귀 12: 사유 미출력"
 rm -rf "$_d"
@@ -2049,7 +2054,7 @@ rm -rf "$_d"
 # 회귀 7 — fast-forward 로 합쳐진 경우 fr tip 기준선
 _d="$(arc_setup test-ff)"
 ( cd "$_d" && git merge -q --ff-only fr/test-ff ) >/dev/null 2>&1
-_out="$(arc_archive "$_d")" && _rc=0 || _rc=$?
+_out="$(arc_archive "$_d" --task test-ff)" && _rc=0 || _rc=$?
 [[ "$_rc" -eq 0 ]] && pass "회귀 7: fast-forward 는 fr tip 기준선으로 통과" || fail "회귀 7: 실패 — $_out"
 rm -rf "$_d"
 
@@ -2072,7 +2077,7 @@ _d="$(arc_setup test-orphan)"
   git checkout -q main
   git merge -q --no-ff side -m "merge side into main (사람이 손으로)"
 ) >/dev/null 2>&1
-_out="$(arc_archive "$_d")" && _rc=0 || _rc=$?
+_out="$(arc_archive "$_d" --task test-orphan)" && _rc=0 || _rc=$?
 [[ "$_rc" -ne 0 ]] && pass "회귀 8: merge 없고 체인에도 없으면 차단" || fail "회귀 8: 차단되지 않음 — $_out"
 printf '%s' "$_out" | out_has "first-parent 이력에도 없습니다" && pass "회귀 8: 사유 출력" || fail "회귀 8: 사유 미출력"
 arc_assert_block_notice "회귀 8" "$_out" "fr/test-orphan" unknown
@@ -2090,7 +2095,7 @@ _d="$(arc_setup test-octo)"
   git checkout -q main
   git merge -q --no-ff side fr/test-octo -m "octopus"
 ) >/dev/null 2>&1
-_out="$(arc_archive "$_d")" && _rc=0 || _rc=$?
+_out="$(arc_archive "$_d" --task test-octo)" && _rc=0 || _rc=$?
 [[ "$_rc" -ne 0 ]] && pass "회귀 9: octopus 는 차단" || fail "회귀 9: 차단되지 않음 — $_out"
 ( cd "$_d" && [[ -z "$(git tag --list "fr/*/test-octo")" ]] ) \
   && pass "회귀 9: 미리뷰 side 내용이 tag 로 발행되지 않음" || fail "회귀 9: tag 생성됨 (미리뷰 내용 발행)"
@@ -2100,7 +2105,7 @@ rm -rf "$_d"
 _d="$(arc_setup test-spacepath)"
 ( cd "$_d" && git merge -q --no-ff fr/test-spacepath -m "merge: test-spacepath" \
   && printf 'x\n' > "sp ace'q.txt" && git add -A && git commit -q -m "특수문자 경로" ) >/dev/null 2>&1
-_out="$(arc_archive "$_d")" && _rc=0 || _rc=$?
+_out="$(arc_archive "$_d" --task test-spacepath)" && _rc=0 || _rc=$?
 [[ "$_rc" -ne 0 ]] && pass "회귀 10: 공백·따옴표 경로도 정확 판정" || fail "회귀 10: 판정 실패 — $_out"
 rm -rf "$_d"
 

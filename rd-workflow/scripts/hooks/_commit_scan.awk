@@ -47,6 +47,34 @@ function normpath(p,   parts, i, k, seg, out, nseg, r) {
   return (r == "" ? "/" : r)
 }
 
+# git -C·env -C 는 chdir 로 위치를 옮기므로 심링크 뒤의 `..` 를 물리 경로에서 푼다. 문자열로 지우면
+# git 이 실제로 커밋하는 체크아웃과 다른 곳을 고른다. `cd -P` 도 같다. 옵션 없는 cd 와 `cd -L`(셸의 논리
+# 모드)은 `..` 를 문자열로 지우므로 normpath 를 그대로 쓴다. `..` 가 없으면 두 규칙의 결과가 같아 셸을 부르지 않는다.
+# 디렉터리가 없어 풀 수 없으면 문자열 정규화로 둔다.
+# phys 를 주면 `..` 가 없어도 물리 경로로 푼다. `cd -P` 는 셸의 위치(PWD)를 물리 경로로 바꾸므로,
+# 뒤따르는 논리 `cd ..` 는 심링크 표기가 아니라 그 물리 경로의 부모로 간다.
+function chdir_path(base, p, phys,   lex, c, r) {
+  lex = (p ~ /^\//) ? normpath(p) : normpath(base "/" p)
+  if (!phys && p !~ /(^|\/)\.\.(\/|$)/) return lex
+  # 내보낸 CDPATH 를 지운다 — 남아 있으면 상대 경로를 CDPATH 쪽 디렉터리로 풀고 그 경로를 출력한다(git 은 CDPATH 를 쓰지 않는다).
+  # 경로는 -- 뒤에 넘긴다. `-x/..` 처럼 - 로 시작하는 경로를 cd 가 옵션으로 읽지 않게 한다.
+  if (p ~ /^\//) c = "unset CDPATH; cd -P -- " shq(p) " 2>/dev/null && pwd -P"
+  else c = "unset CDPATH; cd -- " shq(base) " 2>/dev/null && cd -P -- " shq(p) " 2>/dev/null && pwd -P"
+  r = ""
+  if ((c | getline r) <= 0) r = ""
+  close(c)
+  # RS 가 \001 이라 getline 은 pwd -P 의 끝 개행까지 읽는다. 남기면 다음 상대 -C 의 cd 가 실패한다.
+  sub(/\n+$/, "", r)
+  return (r ~ /^\// && r !~ /\n/ ? r : lex)
+}
+
+# 셸 홑따옴표 인용. 값 안의 ' 는 '"'"' 로 끊어 잇는다.
+function shq(s,   n, a, i, r) {
+  n = split(s, a, "'"); r = a[1]
+  for (i = 2; i <= n; i++) r = r "'\"'\"'" a[i]
+  return "'" r "'"
+}
+
 # heredoc 델리미터의 quote removal. **인용이 하나라도 있으면 body 는 LITERAL** 이다.
 # 홑따옴표 안의 백슬래시는 리터럴이고(`<<'E\OF'` 의 델리미터는 `E\OF`), 인용 밖 백슬래시는
 # 제거되며(`<<\EOF` -> `EOF`), `$'…'` 는 ANSI-C 로 해석된다(`<<$'EOF'` -> `EOF`).
@@ -424,15 +452,16 @@ BEGIN {
     if (c == "<" && substr(raw, i + 1, 1) == "<") {
       if (cs > 0) { print "gate=0 uncertain=0 ncand=0"; exit 2 }   # 명령 치환 안의 heredoc — 규칙 밖
       if (substr(raw, i + 2, 1) == "<") {                          # <<< here-string
-        # 연산자 3글자만 중성화하고 피연산자는 일반 인용 규칙에 맡긴다.
+        # 연산자 3글자는 그대로 두고(judge 의 리다이렉션 정규화가 걷어 낸다) 피연산자는 일반 인용 규칙에 맡긴다.
         #   <<<'…'  -> 홑따옴표 규칙이 LITERAL 로 처리
         #   <<<"…"  -> 겹따옴표 규칙이 EXPANDING 으로 처리
         #   <<<word -> unquoted 이므로 내부 $( ) 가 실행 위치로 처리
         # 피연산자는 항상 명령 뒤에 오므로 서브커맨드의 첫 워드가 되지 않는다.
-        emit(fill(3)); i += 2; bol = 0; continue
+        emit("<<<"); i += 2; bol = 0; continue
       }
-      # heredoc 델리미터 파싱
-      j = i + 2; emit(fill(2)); dash = 0
+      # heredoc 델리미터 파싱 — 연산자 2글자는 그대로 둔다. 델리미터는 자리표시로 바뀌어
+      # `<<…` 한 워드가 되고, judge 의 리다이렉션 정규화가 그 워드를 걷어 낸다.
+      j = i + 2; emit("<<"); dash = 0
       if (substr(raw, j, 1) == "-") { emit(PH); j++; dash = 1 }
       while (j <= n && substr(raw, j, 1) ~ /[ \t]/) { emit(PH); j++ }
       # 복수 heredoc(`cat <<EOF <<'Q'`)은 pending 을 단일 변수로 보관하면 뒤 것이 앞 것을
@@ -490,6 +519,11 @@ BEGIN {
   for (i = 1; i <= n + 1; i++) {
     c = (i <= n ? substr(masked, i, 1) : ";")
     if (c != ";" && c != "&" && c != "|" && c != "(" && c != ")" && c != "{" && c != "}" && c != "\n") continue
+    # `>&`·`<&`(fd 복제)와 `&>`·`&>>`(두 출력 리다이렉션)의 & 는 경계가 아니다. 경계로 읽으면
+    # `cd x 2>&1 && git commit` 의 cd 연결 연산자를 & 로 보아 위치를 잃는다. `|&` 는 파이프라 경계다.
+    if (c == "&" && (substr(masked, i - 1, 1) ~ /[<>]/ || substr(masked, i + 1, 1) == ">")) continue
+    # `>|`(noclobber 무시 리다이렉션)의 | 도 파이프가 아니다.
+    if (c == "|" && substr(masked, i - 1, 1) == ">") continue
 
     # 경계 종류 판별 (cd 신뢰 규칙: && 만 신뢰)
     op = c
@@ -499,8 +533,8 @@ BEGIN {
 
     # subshell 은 cwd 뿐 아니라 환경 대입도 격리한다 — `( export GIT_DIR=… )` 는 바깥
     # 커밋의 실행 repo 를 바꾸지 못하므로 repo_unc 도 함께 저장·복원한다.
-    if (c == "(") { depth++; saved[depth] = cwd; saved_u[depth] = uncertain; saved_r[depth] = repo_unc }
-    else if (c == ")" && depth > 0) { cwd = saved[depth]; uncertain = saved_u[depth]; repo_unc = saved_r[depth]; depth-- }
+    if (c == "(") { depth++; saved[depth] = cwd; saved_u[depth] = uncertain; saved_r[depth] = repo_unc; saved_c[depth] = cdp_set; saved_a[depth] = alt }
+    else if (c == ")" && depth > 0) { cwd = saved[depth]; uncertain = saved_u[depth]; repo_unc = saved_r[depth]; cdp_set = saved_c[depth]; alt = saved_a[depth]; depth-- }
 
     ss = i + length(op)
     i = ss - 1
@@ -513,6 +547,7 @@ BEGIN {
     gate = 1
     if (CT[i] == "?") unc = 1
     else { ncand++; CAND[ncand] = CT[i] }
+    if (CX[i] != "") { ncand++; CAND[ncand] = CX[i] }
   }
   printf "gate=%d uncertain=%d ncand=%d\n", gate, unc, ncand
   for (i = 1; i <= ncand; i++) print CAND[i]
@@ -528,7 +563,7 @@ function bol_word(   p) {
 }
 
 # 서브커맨드 [a,b] 판정. op = 이 서브커맨드 뒤에 오는 제어 연산자.
-function judge(a, b, op,   i, c, ws, we, nw, k, cmd0, gdir, gunc, gabs, genv, lb, p, edir, eunc, ew, ov, ep, eat, rc2, sv, tname, ext_wrap, esn1) {
+function judge(a, b, op,   i, c, ws, we, nw, k, cmd0, phys, lgc, two, nc, na, rs, pre, tail, ri, j, gdir, gunc, gabs, genv, lb, p, edir, eunc, ew, ov, ep, eat, rc2, sv, tname, ext_wrap, esn1) {
   # MW/RW/UW 는 전역 배열이지만 매 호출에서 1..nw 를 전부 덮어쓰므로 잔류 영향이 없다.
   nw = 0; i = a; split_unsure = 0
   while (i <= b) {
@@ -539,6 +574,25 @@ function judge(a, b, op,   i, c, ws, we, nw, k, cmd0, gdir, gunc, gabs, genv, lb
     we = i - 1
     nw++; MW[nw] = substr(masked, ws, we - ws + 1); RW[nw] = substr(raw, ws, we - ws + 1)
   }
+  # 리다이렉션은 명령의 인자가 아니고 명령의 어느 자리에도 올 수 있다(`cd>/dev/null -P x`·
+  # `git -C >/dev/null . commit`·`git commit&>/dev/null`). 명령별 판정 전에 여기서 한 번 걷어 낸다.
+  # 워드 중간에 붙은 리다이렉션은 그 앞까지가 워드다(`&>` 면 & 앞까지). 맨 앞 숫자(`2>`)는 fd 번호다.
+  # 연산자만 남은 리다이렉션(`>`·`dir>`·`2>`)은 다음 워드가 그 대상이다. 인용 안의 < > 는 마스킹돼 남는다.
+  j = 0
+  for (i = 1; i <= nw; i++) {
+    ri = match(MW[i], /[<>]/)
+    if (ri == 0) { j++; MW[j] = MW[i]; RW[j] = RW[i]; continue }
+    rs = (ri > 1 && substr(MW[i], ri - 1, 1) == "&") ? ri - 1 : ri
+    pre = substr(MW[i], 1, rs - 1)
+    if (pre ~ /^[0-9]+$/) { pre = ""; rs = 1 }
+    # 꼬리는 워드를 덮기 전에 읽는다. 앞 워드가 모두 남으면 j 가 i 와 같아 MW[i] 가 바뀐다.
+    tail = substr(MW[i], rs)
+    if (pre != "") { j++; RW[j] = substr(RW[i], 1, rs - 1); MW[j] = pre }
+    # 꼬리에 리다이렉션이 여럿이면(`>/dev/null<`) 마지막 연산자가 다음 워드를 대상으로 쓴다.
+    # 대상 워드도 연산자로 끝나면(`> /dev/null< x`) 그다음 워드가 다시 대상이다.
+    while (i < nw && tail ~ /(<<<|>>?\|?|<<?|<>|>&|<&)$/) { i++; tail = MW[i] }
+  }
+  nw = j
   if (nw == 0) return 0
 
   # 워드 값 복원(unquote)은 **필요한 워드에만** 수행한다. 전 워드를 미리 복원하면
@@ -592,7 +646,7 @@ function judge(a, b, op,   i, c, ws, we, nw, k, cmd0, gdir, gunc, gabs, genv, lb
         # -C / --chdir 로 정해진 위치를 누적한다 (cd 와 같은 규칙).
         if (ep != "\001") {
           if (ep == "") eunc = 1
-          else edir = (ep ~ /^\//) ? normpath(ep) : normpath((edir != "" ? edir : cwd) "/" ep)
+          else edir = chdir_path((edir != "" ? edir : cwd), ep)
           continue
         }
         # -S / --split-string 문자열을 분해해 **워드 목록에 삽입**한다. macOS env 는 split
@@ -633,6 +687,9 @@ function judge(a, b, op,   i, c, ws, we, nw, k, cmd0, gdir, gunc, gabs, genv, lb
       # repo 대상을 바꾸는 환경 대입은 추적하지 않고 **불확실로 떨어뜨린다**(fail-closed).
       # cd/-C 로 계산한 위치가 실제 커밋 repo 와 달라져 외부 생략이 우회되기 때문이다.
       if (MW[k] ~ /^(GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_OBJECT_DIRECTORY)=/) genv = 1
+      # CDPATH 대입은 cd 의 상대 경로 검색을 바꾼다. 셸 변수만으로도 cd 가 쓰므로
+      # 명령 앞 대입과 단독 대입을 가리지 않고 이후의 cd 를 불확실로 둔다(fail-closed).
+      if (MW[k] ~ /^CDPATH=/) cdp_set = 1
       k++; continue
     }
     # (d) 셸 예약어와 실행 prefix. 값이 필요하므로 여기서 복원한다.
@@ -680,6 +737,7 @@ function judge(a, b, op,   i, c, ws, we, nw, k, cmd0, gdir, gunc, gabs, genv, lb
     if (genv || repo_unc || eunc) CT[NC] = "?"
     else if (edir != "") CT[NC] = edir
     else CT[NC] = (uncertain ? "?" : cwd)
+    CX[NC] = (uncertain && alt != "" && edir == "") ? alt : ""
     return 0
   }
   # 명령 없이 대입만 있는 서브커맨드(`GIT_DIR=…;`)는 **셸 변수를 설정**한다. 그 변수가
@@ -698,20 +756,54 @@ function judge(a, b, op,   i, c, ws, we, nw, k, cmd0, gdir, gunc, gabs, genv, lb
   # 따라서 `=` 유무를 가리지 않고 이름만 일치해도 불확실로 남긴다
   # (`export GIT_DIR; GIT_DIR=<프로젝트>/.git; git -C /tmp commit` 실측 우회).
   if (cmd0 == "export" || cmd0 == "set" || cmd0 == "declare" || cmd0 == "typeset") {
-    for (i = k + 1; i <= nw; i++)
-      if (MW[i] ~ /^(GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_OBJECT_DIRECTORY)(=|$)/) { repo_unc = 1; break }
+    for (i = k + 1; i <= nw; i++) {
+      if (MW[i] ~ /^CDPATH(=|$)/) cdp_set = 1
+      if (MW[i] ~ /^(GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_OBJECT_DIRECTORY)(=|$)/) repo_unc = 1
+    }
     return 0
   }
   if (cmd0 != "cd" && cmd0 != "git") return 0    # 여기서 끝나면 워드 1개만 복원한 셈이다
 
   if (cmd0 == "cd") {
+    # 가능한 위치(alt)는 직전 cd 의 것만 쓴다.
+    alt = ""
     if (op != "&&") { uncertain = 1; return 0 }        # 성공 보장 없음
-    if (k + 1 > nw) { uncertain = 1; return 0 }
-    UW[k+1] = unquote(RW[k+1])
-    if (UW[k+1] == "-") { uncertain = 1; return 0 }
-    p = literal_path(RW[k+1])
+    # 리다이렉션은 판정 앞에서 걷어 냈으므로 k 뒤의 워드가 그대로 cd 의 인자다.
+    na = 0
+    for (i = k + 1; i <= nw; i++) CA[++na] = RW[i]
+    # cd 의 옵션은 경로가 아니다. -L 은 논리 모드, -P 는 물리 모드이고 -- 는 옵션의 끝이다.
+    # 둘을 섞으면 셸마다 결과가 다르다(실측: bash 는 마지막 옵션, zsh 는 -P 가 이긴다).
+    # 그 밖의 옵션은 셸마다 뜻이 다르거나(zsh -q·-s, bash -e·-@) 디렉터리 스택(-2)을 가리킨다.
+    # 이 두 경우는 위치를 확정하지 않는다.
+    phys = 0; lgc = 0; j = 1
+    while (j <= na) {
+      ov = unquote(CA[j])
+      if (ov == "--") { j++; break }
+      if (ov !~ /^-./) break
+      if (ov !~ /^-[LP]+$/) { uncertain = 1; return 0 }
+      if (ov ~ /P/) phys = 1
+      if (ov ~ /L/) lgc = 1
+      j++
+    }
+    if (phys && lgc) { uncertain = 1; return 0 }
+    if (j > na) { uncertain = 1; return 0 }
+    # 경로 뒤에 인자가 더 있으면 셸마다 뜻이 다르다
+    # (실측: zsh 는 `cd old new` 를 현재 경로의 문자열 치환으로, macOS bash 3.2 는 둘째 인자를 무시한다).
+    # 그래서 위치를 확정하지 않되, bash 가 가는 첫 경로를 가능한 위치(alt)로 남긴다.
+    two = (j < na)
+    if (unquote(CA[j]) == "-") { uncertain = 1; return 0 }
+    p = literal_path(CA[j])
     if (p == "") { uncertain = 1; return 0 }
-    cwd = (p ~ /^\//) ? normpath(p) : normpath(cwd "/" p)
+    # 셸의 CDPATH 검색은 셸마다 순서가 다르다(실측: bash 는 CDPATH 쪽, zsh 는 현재 위치를 먼저 고른다).
+    # 그래서 CDPATH 가 있고 경로가 검색 대상(/·./·../ 로 시작하지 않는 상대 경로)이면 위치를 확정하지 않는다.
+    # hook 이 물려받은 환경과 명령 안의 대입(cdp_set)을 함께 본다.
+    if ((ENVIRON["CDPATH"] != "" || cdp_set) && p !~ /^(\/|\.\.?(\/|$))/) { uncertain = 1; return 0 }
+    # -P 는 위치를 물리 경로로 푼다. 논리 모드는 문자열로 지운다.
+    if (phys) nc = chdir_path((p ~ /^\// ? "/" : cwd), p, 1)
+    else nc = (p ~ /^\//) ? normpath(p) : normpath(cwd "/" p)
+    # 앞에서 이미 위치를 잃었으면 상대 경로의 가능한 위치도 알 수 없다.
+    if (two) { if (!uncertain || p ~ /^\//) alt = nc; uncertain = 1; return 0 }
+    cwd = nc
     return 0
   }
 
@@ -727,8 +819,8 @@ function judge(a, b, op,   i, c, ws, we, nw, k, cmd0, gdir, gunc, gabs, genv, lb
       if (k + 1 > nw) break
       p = literal_path(RW[k+1])
       if (p == "") gunc = 1
-      else if (p ~ /^\//) { gdir = normpath(p); gabs = 1 }
-      else gdir = normpath((gdir != "" ? gdir : (edir != "" ? edir : cwd)) "/" p)
+      else if (p ~ /^\//) { gdir = chdir_path("/", p); gabs = 1 }
+      else gdir = chdir_path((gdir != "" ? gdir : (edir != "" ? edir : cwd)), p)
       k += 2; continue
     }
     if (UW[k] == "-c") { k += 2; continue }
@@ -753,5 +845,7 @@ function judge(a, b, op,   i, c, ws, we, nw, k, cmd0, gdir, gunc, gabs, genv, lb
   else if (gdir != "") CT[NC] = (uncertain ? "?" : gdir)
   else if (edir != "") CT[NC] = edir            # env -C 는 cwd 불확실과 무관하게 위치를 정한다
   else CT[NC] = (uncertain ? "?" : cwd)
+  # 위치를 확정하지 못했어도 가능한 위치(alt)가 있으면 그곳도 후보로 낸다. 후보가 늘면 검사만 늘어난다.
+  CX[NC] = (uncertain && alt != "" && gdir == "" && edir == "") ? alt : ""
   return 0
 }

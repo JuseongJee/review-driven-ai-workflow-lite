@@ -17,7 +17,7 @@ FUTURE_REQUESTS에서 작업을 선택하고 파이프라인을 자율 실행한
 
 ```bash
 bash -s <<'RD_SKILL_COMPAT'
-RD_SKILL_BASE=2026-11-08-092219 RD_SKILL_NAME=autopilot
+RD_SKILL_BASE=2026-11-21-001711 RD_SKILL_NAME=autopilot
 vf="rd-workflow/VERSION"
 if [ ! -f "$vf" ] && [ -f "_ROOT_FILES/rd-workflow/VERSION" ]; then exit 0; fi
 v=""; [ -f "$vf" ] && v="$(cat "$vf")"; v="${v#lite-}"
@@ -219,7 +219,7 @@ autopilot_headless: 실행 비용 $0.4213 (정가 환산) · 토큰 입력 1,204
    - 첫 줄이 `none`: 2·3항으로 내려간다.
    - 첫 줄이 `undetermined` (rc=3): `RD_AUTOPILOT_FR` 값과 무관하게(`auto` 든 명시 slug 든) 새 작업을 시작하지 않는다. outcome `blocked:resume-undetermined` 를 기록하고 스크립트 출력의 둘째 줄 이후를 outcome 둘째 줄부터 그대로 옮긴 뒤 종료한다. 생존·소유를 확인할 수 없는 작업을 가로채지 않으려는 것이다. 이 실패는 FR 을 고르기 전의 전역 실패이므로 `ralph_drain.sh` 가 즉시 중단하며, FR status 를 바꾸거나 `CURRENT_TASK` 를 초기화하지 않는다 — 대상 FR 이 없다.
    - 어느 경우든 outcome 둘째 줄 이후에 `재개: <slug> <worktree> (<선택 이유>)` 줄과 스크립트의 `skip`·`info` 줄(제외 사유·다음 조치, 종료 확인 근거)을 적는다. 첫 줄은 토큰 전용이다.
-   - 후보가 여럿이면(`auto` 일 때) `RD_AUTOPILOT_FR` 과 같은 slug 를 먼저, 없으면 색인 순서 첫 후보를 스크립트가 고른다. `launch=ok`(대화형 세션을 기동한 적 있음) 작업은 세 갈래로 나뉜다. 세션 종료가 확인되면(herdr·프로세스 관측이 모두 완전하고 세션 없음) 후보가 되고, 색인의 launch 값은 바뀌지 않는다. herdr app 으로 기동한 작업(`launch-backend=hc`)은 이름 조회를 `hc get` 으로 한다. 세션이 살아 있으면 제외한다 — 사용자의 대화형 작업을 가로채지 않는다. 판정할 수 없으면(herdr 없음·조회 실패·시간 초과·불완전 관측) 제외하고 `rd task resolve-launch <slug> --assume-ended` 로 수동 확정하라고 안내한다.
+   - 후보가 여럿이면(`auto` 일 때) `RD_AUTOPILOT_FR` 과 같은 slug 를 먼저, 없으면 색인 순서 첫 후보를 스크립트가 고른다. `launch=ok`(대화형 세션을 기동한 적 있음) 작업은 세 갈래로 나뉜다. 세션 종료가 확인되면(herdr·프로세스 관측이 모두 완전하고 세션 없음) 후보가 되고, 색인의 launch 값은 바뀌지 않는다. herdr app 으로 기동한 작업(`launch-backend=hc`)은 이름 조회를 `hc get` 으로 하고, Orca 로 기동한 작업(`launch-backend=orca`)은 색인의 `launch-tab` 으로 `orca agent show`·`orca terminal show` 를 부른다. 세션이 살아 있으면 제외한다 — 사용자의 대화형 작업을 가로채지 않는다. 판정할 수 없으면(herdr 없음·조회 실패·시간 초과·불완전 관측) 제외하고 `rd task resolve-launch <slug> --assume-ended` 로 수동 확정하라고 안내한다.
 2. else `RD_AUTOPILOT_FR=<slug>` → 그 FR 을 선택한다.
 3. else `RD_AUTOPILOT_FR=auto` → `bash rd-workflow/scripts/fr_relations.sh auto-pick --root .` 를 실행하고 **첫 줄과 종료 코드**로 분기한다. 후보 집합 계산과 갈림 판정은 이 스크립트가 한다 — 여기서 다시 계산하지 않는다. `eligible` 은 **validated / ready-for-request 후보**(기존 화이트리스트 그대로, `blocked` 은 set-aside 라 제외)이고, `selectable` 은 그중 관계 판정이 `ready` 인 것이다.
    - 첫 줄이 `unavailable` (rc=2): outcome `blocked:relations-unavailable` 을 기록하고 종료한다. 스크립트 출력의 둘째 줄 이후를 outcome 둘째 줄부터 그대로 옮긴다. 이 실패는 FR 을 고르기 전의 전역 실패이므로 `ralph_drain.sh` 가 즉시 중단하며, 일반 blocked 처럼 FR status 를 바꾸거나 `CURRENT_TASK` 를 초기화하지 않는다 — 대상 FR 이 없다.
@@ -348,7 +348,13 @@ bash rd-workflow/scripts/run_review_turn.sh <session-path>
 - **Superpowers가 사용 가능하면 반드시 사용한다:** `brainstorming` → `writing-plans` → `.claude/rules/rd-workflow/core.md` 실행 모드 규칙에 따른 실행 모드. 사용 가능한데 건너뛰지 않는다.
 - 테스트 실패, 빌드 에러 발생 시 `superpowers:systematic-debugging`으로 자율 디버깅한다
 - 디버깅 3회 실패 시 현재 상태를 보고하고 사용자에게 넘긴다
-- **model-strategy 적용**: `rd-workflow/config/model-strategy.json`이 존재하면 `subagent` 값을 읽어 subagent dispatch 시 Agent 도구의 `model` 파라미터로 전달한다. 파일 미존재/파싱 실패/키 누락/허용되지 않은 값(`opus`, `sonnet`, `haiku` 외) → 기본값 `"sonnet"`을 사용한다. 설정 형식 상세는 `/model-strategy` skill 참조.
+- **subagent 모델·effort**: 첫 subagent dispatch 전에 `bash rd-workflow/scripts/model_select.sh subagent` 를 한 번 실행하고, 이 skill 이 하는 모든 subagent dispatch(구현자·task reviewer)에 아래대로 Agent 도구 인자를 넘긴다.
+  - `model=` 줄에 값이 있으면 `model` 인자로 넘긴다. 비어 있으면 `model` 인자를 넘기지 않는다.
+  - `effort=` 줄에 값이 있으면 `effort` 인자로 넘긴다. 이 값은 사용자가 `rd-workflow/config/models.json` 의 `subagent.claude.effort` 에 명시한 effort 다. 비어 있으면 `effort` 인자를 넘기지 않는다.
+  - 명령이 없거나 실패하면 `model` 은 `sonnet` 으로 넘기고 `effort` 는 넘기지 않는다.
+  - 사용자가 이 세션에서 모델·effort 를 말로 정하면 그 지시가 이 항목보다 앞선다.
+  - 화면 표시는 hook(`rd-workflow/scripts/hooks/subagent_dispatch_display.sh`)이 맡는다. Status 가 `구현 중` 일 때 Agent 호출마다 넘긴 값과 설정·경고를 한 줄로 보인다. 응답 텍스트로 따로 옮겨 적지 않는다.
+  - 표시 줄(출력의 마지막 줄)과 stderr 경고는 최종 보고서 「주요 결정」 표의 `subagent 모델·effort` 행에 적는다.
 - **subagent git 안전**: subagent dispatch 시 `rd-workflow/docs/guides/subagent-git-safety.md`의 Subagent Git 안전 문구를 dispatch prompt에 포함한다 (공유 워킹트리에서 git checkout/switch/branch/worktree 전환 금지, read-only git만 허용). read-only 탐색/리뷰 subagent는 `isolation: "worktree"` 격리를 권장한다. 다단계이거나 파괴적 상태를 만드는 task 는 같은 문서 1-2 의 진행 기록 문구도 dispatch prompt 에 포함한다.
 - **phase 병렬 실행**: plan이 phase(파일 비중첩 task 그룹)를 표현하면 phase 내 task 구현자를 병렬 dispatch하고, barrier 후 **orchestrator(실행 세션 본체)가 커밋**한다. 검증은 phase barrier 후 1회 실행한다. 절차 전체는 `rd-workflow/docs/guides/plan-parallel-phases.md`를 따른다. phase 미표현 plan은 순차 실행으로 degrade한다.
 

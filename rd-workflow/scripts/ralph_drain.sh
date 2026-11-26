@@ -15,6 +15,10 @@
 #   RD_RALPH_RELATIONS_CMD    관계 판정 명령 오버라이드 (테스트 훅, 단어 분리되는 문자열; 기본은 <스크립트 디렉터리>/fr_relations.sh 를 공백 안전하게 호출)
 #   RD_RALPH_WRAPPER_CMD      wrapper 호출 명령 오버라이드 (테스트 훅; 기본 "bash rd-workflow/scripts/autopilot_headless.sh")
 #
+# 인자: [--model <값>] [--effort <값>]  무인 세션 모델·effort (플래그 > RD_HEADLESS_CLAUDE_MODEL/_EFFORT > models.json headless.claude).
+#   시작 때 strict 로 한 번 해석해 그 회차 내내 고정하고, 적용할 수 없으면 wrapper 를 부르지 않고 exit 1.
+#   wrapper 로는 내부 변수 RD_HEADLESS_FIXED_MODEL·RD_HEADLESS_FIXED_EFFORT(최종 인자, 없으면 빈 값)·RD_HEADLESS_FIXED_LINE(표시 줄)을 넘긴다.
+#
 # exit code: 0 정상 종료(queue-empty·queue-blocked) / 1 중단(backstop·harness-error 재발·관계/재개 판정 불가·미지 코드)
 set -uo pipefail
 
@@ -32,6 +36,30 @@ case "$NONPROGRESS_LIMIT" in *[!0-9]*|'') _die "RD_RALPH_NONPROGRESS_LIMIT 는 �
 [ "$NONPROGRESS_LIMIT" -ge 1 ] || _die "RD_RALPH_NONPROGRESS_LIMIT 는 1 이상이어야 합니다: '${NONPROGRESS_LIMIT}'"
 case "$FINISH_POLICY" in push|merge|none) ;; *) _die "RD_FINISH_POLICY 는 push|merge|none 중 하나여야 합니다: '${FINISH_POLICY}'" ;; esac
 
+# 인자 — 무인 세션 모델·effort 플래그. 모르는 인자·값 없는 옵션·중복은 사용법과 함께 멈춘다.
+_usage() { echo "ralph_drain: 사용법: ralph_drain.sh [--model <값>] [--effort <값>]" >&2; exit 1; }
+flag_model=""; flag_effort=""; have_model=0; have_effort=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model)
+      [ "$have_model" -eq 0 ] && [ $# -ge 2 ] && [ -n "$2" ] && [ "${2#--}" = "$2" ] || _usage
+      flag_model="$2"; have_model=1; shift 2 ;;
+    --effort)
+      [ "$have_effort" -eq 0 ] && [ $# -ge 2 ] && [ -n "$2" ] && [ "${2#--}" = "$2" ] || _usage
+      flag_effort="$2"; have_effort=1; shift 2 ;;
+    *) _usage ;;
+  esac
+done
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 모델·effort 는 회차 시작에 한 번 strict 로 해석해 고정한다. 실패하면 wrapper 를 부르지 않는다.
+# shellcheck source=/dev/null
+source "$SELF_DIR/model_select.sh" || _die "model_select.sh 를 읽지 못했습니다: ${SELF_DIR}/model_select.sh"
+ms_resolve_headless 1 "$flag_model" "$flag_effort" \
+  || _die "무인 세션 모델·effort 설정을 적용할 수 없습니다 — 위 이유를 고친 뒤 다시 실행하십시오"
+HL_FIXED_MODEL="$MS_HL_MODEL_ARG"; HL_FIXED_EFFORT="$MS_HL_EFFORT_ARG"; HL_FIXED_LINE="$MS_HL_LINE"
+echo "ralph_drain: ${HL_FIXED_LINE}" >&2
+
 # slug 모드 — 설정 여부는 ${VAR+x} 로 가른다. 빈 목록이 auto 로 떨어져 선별에서 뺀 FR 을 실행하지 않게 한다.
 SLUG_MODE=0
 if [ "${RD_RALPH_SLUGS+x}" = "x" ]; then
@@ -40,7 +68,6 @@ if [ "${RD_RALPH_SLUGS+x}" = "x" ]; then
     '') _die "RD_RALPH_SLUGS 가 비어 있습니다 — 실행할 FR 이 없습니다" ;;
   esac
 fi
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 관계 판정 호출. 기본 경로는 따옴표로 감싸 프로젝트 경로의 공백에 안전하다. 테스트 훅은 종전처럼 문자열 명령이다.
 relations() {
   if [ -n "${RD_RALPH_RELATIONS_CMD:-}" ]; then
@@ -95,6 +122,9 @@ invoke_once() {
   RD_AUTOPILOT_MODE=A \
   RD_FINISH_POLICY="$FINISH_POLICY" \
   RD_AUTOPILOT_OUTCOME_FILE="$OUTCOME_FILE" \
+  RD_HEADLESS_FIXED_MODEL="$HL_FIXED_MODEL" \
+  RD_HEADLESS_FIXED_EFFORT="$HL_FIXED_EFFORT" \
+  RD_HEADLESS_FIXED_LINE="$HL_FIXED_LINE" \
   $WRAPPER_CMD
 }
 
@@ -116,6 +146,7 @@ summarize() {
   echo "blocked: ${blocked}${blocked_reasons}"
   echo "iteration: ${iter}"
   echo "종료 사유: ${stop_reason}"
+  echo "${HL_FIXED_LINE}"
   [ -n "${blocked_detail:-}" ] && { echo "---- 대기 상세 ----"; printf '%s\n' "$blocked_detail"; }
   summarize_cost
   summarize_cleanup_pending

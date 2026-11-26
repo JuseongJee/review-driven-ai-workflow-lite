@@ -242,6 +242,40 @@ S="$TMP/t2"; mk_pending "$S" '2 total turns in `turns/*.md`'; author_turn "$S" 0
 run_opt_reject "$S" --decision "더 이어 감"; reject T2 "$S"; has x "--extend-turns" "T2 연장 안내"
 grep -qF '## User Decision' "$S/USER_ACTION.md" && fail "T2 USER_ACTION 불변" || pass "T2 USER_ACTION 불변"
 
+echo "=== T4 턴 한도 거부에 지적 추세 표 ==="
+S="$TMP/t4"; mk_pending "$S" '4 total turns in `turns/*.md`'
+printf '# 002 Reviewer\n\n## Findings\n- F1 첫 지적\n- F2 둘째 지적\n\n## Agreement\n- 없음\n' > "$S/turns/002_reviewer.md"
+author_turn "$S" 003_author.md
+printf '# 004 Reviewer\n\n## Findings\n- F2 둘째 지적 유지\n- F3 새 지적\n\n## Summary\n범위 밖: a.sh — 드문 형태 — 사유\n' > "$S/turns/004_reviewer.md"
+author_turn "$S" 005_author.md
+run_opt_reject "$S" --decision "더 이어 감"; reject T4 "$S"; has x "지적 추세" "T4 추세 표 머리"
+grep -qE '^  002 +2 +2 +0 +F1 F2$' "$TMP/last_err.txt" && pass "T4 첫 턴 행" || fail "T4 첫 턴 행"
+grep -qE '^  004 +2 +1 +1 +F3$' "$TMP/last_err.txt" && pass "T4 새 지적·범위 밖 행" || fail "T4 새 지적·범위 밖 행"
+
+echo "=== T4b 옛 이름(codex)과 새 이름이 섞인 세션의 추세 순서 ==="
+S="$TMP/t4b"; mk_pending "$S" '4 total turns in `turns/*.md`'; rm -f "$S/turns/002_reviewer.md"
+printf '# 002 Reviewer\n\n## Findings\n- F1 같은 지적\n' > "$S/turns/002_codex.md"
+author_turn "$S" 003_author.md
+printf '# 004 Reviewer\n\n## Findings\n- F1 같은 지적\n' > "$S/turns/004_reviewer.md"
+author_turn "$S" 005_author.md
+run_opt_reject "$S" --decision "더 이어 감"; eq "$RC" "1" "T4b rc 1"
+grep -qE '^  002 +1 +1 +0 +F1$' "$TMP/last_err.txt" && pass "T4b 옛 이름 턴이 첫 등장" || fail "T4b 옛 이름 턴이 첫 등장"
+grep -qE '^  004 +1 +0 +0 +-$' "$TMP/last_err.txt" && pass "T4b 뒤 턴은 새 지적 0" || fail "T4b 뒤 턴은 새 지적 0"
+
+echo "=== T5 Reviewer 턴이 한도에 닿으면 지적 추세 표 ==="
+S="$TMP/t5"; mk_session "$S" awaiting-author Author '2 total turns in `turns/*.md`'; author_turn "$S"
+LIMIT_BODY='
+printf "# 002 Reviewer\n\n## Findings\n- F1 남은 지적\n" > "${EXPECTED_TURN_FILE}"
+sed -i.bak -e "s/^awaiting-reviewer$/awaiting-user/" -e "s/^Reviewer$/User/" "${SESSION_PATH}/SESSION.md" && rm -f "${SESSION_PATH}/SESSION.md.bak"'
+rc="$(run_with_mock_adapter "$S" "$LIMIT_BODY")"
+eq "$rc" "0" "T5 rc 0"
+grep -qE '^  002 +1 +1 +0 +F1$' "$TMP/last_err.txt" && pass "T5 추세 표 행" || fail "T5 추세 표 행"
+
+echo "=== T6 한도 전 Reviewer 턴에는 추세 표 없음 ==="
+S="$TMP/t6"; mk_session "$S" awaiting-author Author; author_turn "$S"
+rc="$(run_with_mock_adapter "$S" "$LIMIT_BODY")"
+eq "$rc" "0" "T6 rc 0"; hasnt x "지적 추세" "T6 추세 표 없음"
+
 echo "=== T3 Turn Limit 절 없는 세션(환경값 한도) --extend-turns ==="
 S="$TMP/t3"; mk_pending "$S"; author_turn "$S" 003_author.md
 awk '$0=="## Turn Limit"{skip=1;next} skip&&/^## /{skip=0} !skip' "$S/SESSION.md" > "$S/SESSION.tmp" && mv "$S/SESSION.tmp" "$S/SESSION.md"
@@ -343,11 +377,98 @@ mk_repo_pending() { # $1=세션 $2=review-head-oid
 S="$R/rd-workflow-workspace/handoffs/review_pipeline/o7"; mk_repo_pending "$S" "$A"; cp "$S/CHECKPOINT.md" "$S/CHECKPOINT.orig"
 MOCK_SCRIPT_DIR="$R/rd-workflow/scripts" run_opt_reject "$S" --override "x — y"; reject O7 "$S"; has x "보호 경로가 바뀌어" "O7 안내"
 has x "--decision" "O7 다음 행동 안내"
+has x "run_review_turn.sh 'rd-workflow-workspace/handoffs/review_pipeline/o7' --decision 'x — y (종결 결정 — 리뷰 뒤 변경 확인)'" "O7 확인 턴 명령(인용한 세션 경로·근거)"
+has x "verify_record.sh -- <이 저장소의 검증 명령>" "O7 seal 전 검증 증거 단계"
+has x "rd review seal 'rd-workflow-workspace/handoffs/review_pipeline/o7'" "O7 seal 명령(인용한 세션 경로)"
+has x "--override 'x — y' 로 종결" "O7 확인 뒤 같은 근거 종결 명령"
+hasnt x "--extend-turns" "O7 한도 안이면 연장 없음"
+has x "turns/003_author.md" "O7 Author 턴 경로"
 same "$S/CHECKPOINT.md" "$S/CHECKPOINT.orig" "O7 CHECKPOINT 불변"
+S="$R/rd-workflow-workspace/handoffs/review_pipeline/o7b"; mk_repo_pending "$S" "$A"
+sed -i.bak 's/^20 total turns/2 total turns/' "$S/SESSION.md" && rm -f "$S/SESSION.md.bak"
+MOCK_SCRIPT_DIR="$R/rd-workflow/scripts" run_opt_reject "$S" --override "x — y"; reject O7b "$S"
+has x "(종결 결정 — 리뷰 뒤 변경 확인)' --extend-turns 2" "O7b 한도 넘는 확인 턴에 연장 폭"
+MOCK_SCRIPT_DIR="$R/rd-workflow/scripts" run_opt_reject "$S" --override "검토자 — close!review it's \$HOME"
+has x "--override '검토자 — close!review it'\\''s \$HOME' 로 종결" "O7b 느낌표·작은따옴표·\$ 근거를 작은따옴표 인자로"
+
+echo "=== O7c 대기 중인 Author 턴이 있으면 그 턴을 쓰고 연장 폭을 실행기 기준으로 ==="
+S="$R/rd-workflow-workspace/handoffs/review_pipeline/o7c"; mk_repo_pending "$S" "$A"; author_turn "$S" 003_author.md
+sed -i.bak 's/^20 total turns/2 total turns/' "$S/SESSION.md" && rm -f "$S/SESSION.md.bak"
+MOCK_SCRIPT_DIR="$R/rd-workflow/scripts" run_opt_reject "$S" --override "x — y"; reject O7c "$S"
+has x "대기 중인 Author 턴 rd-workflow-workspace/handoffs/review_pipeline/o7c/turns/003_author.md" "O7c 대기 Author 턴 재사용"
+has x "(종결 결정 — 리뷰 뒤 변경 확인)' --extend-turns 2" "O7c 연장 폭 2"
+hasnt x "004_author.md" "O7c 새 Author 턴 안내 없음"
+
+echo "=== O11 안내대로: 거부 → 확인 턴(이의 남아 awaiting-author) → 다시 물어 받은 근거로 --override 종결 ==="
+S="$R/rd-workflow-workspace/handoffs/review_pipeline/o11"; mk_repo_pending "$S" "$A"
+MOCK_SCRIPT_DIR="$R/rd-workflow/scripts" run_opt_reject "$S" --override "x — y"; eq "$RC" "1" "O11 첫 --override 거부"
+author_turn "$S" 003_author.md
+rc="$(MOCK_SCRIPT_DIR="$R/rd-workflow/scripts" run_with_mock_adapter "$S" "$OK_BODY" --decision "x — y (종결 결정 — 리뷰 뒤 변경 확인)")"
+eq "$rc" "0" "O11 확인 턴 rc 0"
+eq "$(sec_line "$S/SESSION.md" Status)" "awaiting-author" "O11 확인 턴 뒤 awaiting-author"
+# 확인 턴의 이의를 사람에게 다시 물어 받은 새 근거로 종결합니다(근거는 대조하지 않음).
+rc="$(MOCK_SCRIPT_DIR="$R/rd-workflow/scripts" run_with_mock_adapter "$S" "$OK_BODY" --override "주성 — 재확인 이의까지 포함해 종결")"
+eq "$rc" "0" "O11 확인 턴 뒤 --override rc 0"
+eq "$(sec_line "$S/SESSION.md" Status)" "closed" "O11 Status closed"
+grep -qE "^근거: [0-9-]+ 주성 — 재확인 이의까지 포함해 종결$" "$S/SESSION.md" && pass "O11 새 근거 기록" || fail "O11 새 근거 기록"
+
+echo "=== O11b 확인 턴 표식 없는 결정 뒤 awaiting-author 는 --override 거부 ==="
+S="$R/rd-workflow-workspace/handoffs/review_pipeline/o11b"; mk_repo_pending "$S" "$A"; author_turn "$S" 003_author.md
+rc="$(MOCK_SCRIPT_DIR="$R/rd-workflow/scripts" run_with_mock_adapter "$S" "$OK_BODY" --decision "x — y 재검토")"
+eq "$rc" "0" "O11b 결정 턴 rc 0"
+rm -f "$S/seen_session.md"
+MOCK_SCRIPT_DIR="$R/rd-workflow/scripts" run_opt_reject "$S" --override "x — y"; reject O11b "$S"
+has x "확인 턴을 마친 세션에만" "O11b 거부 안내"
 S="$R/rd-workflow-workspace/handoffs/review_pipeline/o8"; mk_repo_pending "$S" "$B"
 rc="$(MOCK_SCRIPT_DIR="$R/rd-workflow/scripts" run_with_mock_adapter "$S" "$OK_BODY" --override "x — y")"
 eq "$rc" "0" "O8 리뷰한 HEAD 그대로면 종결 rc 0"
 eq "$(sec_line "$S/SESSION.md" Status)" "closed" "O8 Status"
+
+echo "=== O12 확인 턴 뒤 보호 경로가 다시 바뀌면 옵션 없는 인계로 다시 확인하고 같은 근거로 종결 (별도 저장소) ==="
+R3="$TMP/repo3"; G3=(git -C "$R3" -c user.name=t -c user.email=t@t -c commit.gpgsign=false)
+mkdir -p "$R3" && git -C "$R3" init -q && echo a > "$R3/app.txt" && "${G3[@]}" add app.txt && "${G3[@]}" commit -qm a
+A3="$(git -C "$R3" rev-parse HEAD)"; echo b > "$R3/app.txt" && "${G3[@]}" commit -qam b
+mkdir -p "$R3/rd-workflow-workspace/.lifecycle" && printf 'fr-branch=null\n' > "$R3/rd-workflow-workspace/.lifecycle/task-state"
+S="$R3/rd-workflow-workspace/handoffs/review_pipeline/o12"
+mk_pending "$S" "" diff-review "- review-base-oid: $A3
+- review-head-oid: $A3"
+printf '002\tcodex\treviewer\t%s\t%s\tunresolved\t1\n' "$A3" "$(git hash-object "$S/turns/002_reviewer.md")" > "$S/reviewer_runs.tsv"
+author_turn "$S" 003_author.md
+rc="$(MOCK_SCRIPT_DIR="$R3/rd-workflow/scripts" run_with_mock_adapter "$S" "$OK_BODY" --decision "x — y (종결 결정 — 리뷰 뒤 변경 확인)")"
+eq "$rc" "0" "O12 첫 확인 턴 rc 0"
+echo c > "$R3/app.txt" && "${G3[@]}" commit -qam c
+MOCK_SCRIPT_DIR="$R3/rd-workflow/scripts" run_opt_reject "$S" --override "x — y"; eq "$RC" "1" "O12 재변경 뒤 --override 거부"
+grep -qxF "    2. bash rd-workflow/scripts/run_review_turn.sh 'rd-workflow-workspace/handoffs/review_pipeline/o12'" "$TMP/last_err.txt" && pass "O12 옵션 없는 인계 명령" || fail "O12 옵션 없는 인계 명령"
+hasnt x "--decision \"x — y (종결 결정" "O12 --decision 안내 없음"
+author_turn "$S" 005_author.md; rm -f "$S/seen_session.md"
+rc="$(MOCK_SCRIPT_DIR="$R3/rd-workflow/scripts" run_with_mock_adapter "$S" "$OK_BODY")"
+eq "$rc" "0" "O12 둘째 확인 턴 rc 0"
+rc="$(MOCK_SCRIPT_DIR="$R3/rd-workflow/scripts" run_with_mock_adapter "$S" "$OK_BODY" --override "x — y")"
+eq "$rc" "0" "O12 같은 근거 --override rc 0"
+eq "$(sec_line "$S/SESSION.md" Status)" "closed" "O12 Status closed"
+
+echo "=== O13 확인 턴 뒤 일반 --reopen 이 새 이의를 남기면 이전 종결 결정으로 덮지 않음 ==="
+CONV_BODY='
+printf "# Turn Reviewer\n이의 없음\n" > "${EXPECTED_TURN_FILE}"
+printf "# Review Checkpoint\n\n## Open Issues\n- 없음\n" > "${SESSION_PATH}/CHECKPOINT.md"
+sed -i.bak -e "s/^awaiting-reviewer$/awaiting-user/" -e "s/^Reviewer$/User/" "${SESSION_PATH}/SESSION.md" && rm -f "${SESSION_PATH}/SESSION.md.bak"'
+OPEN_BODY='
+printf "# Turn Reviewer\nF9 새 이의\n" > "${EXPECTED_TURN_FILE}"
+printf "# Review Checkpoint\n\n## Open Issues\n- F9 (턴 006) — 새 이의 | 해소 조건: 수정 | 상태: 미해결\n" > "${SESSION_PATH}/CHECKPOINT.md"
+sed -i.bak -e "s/^awaiting-reviewer$/awaiting-author/" -e "s/^Reviewer$/Author/" "${SESSION_PATH}/SESSION.md" && rm -f "${SESSION_PATH}/SESSION.md.bak"'
+S="$R3/rd-workflow-workspace/handoffs/review_pipeline/o13"
+mk_pending "$S" "" diff-review "- review-base-oid: $A3
+- review-head-oid: $A3"
+printf '002\tcodex\treviewer\t%s\t%s\tunresolved\t1\n' "$A3" "$(git hash-object "$S/turns/002_reviewer.md")" > "$S/reviewer_runs.tsv"
+author_turn "$S" 003_author.md
+rc="$(MOCK_SCRIPT_DIR="$R3/rd-workflow/scripts" run_with_mock_adapter "$S" "$CONV_BODY" --decision "x — y (종결 결정 — 리뷰 뒤 변경 확인)")"
+eq "$rc" "0" "O13 확인 턴(이의 없음) rc 0"
+author_turn "$S" 005_author.md
+rc="$(MOCK_SCRIPT_DIR="$R3/rd-workflow/scripts" run_with_mock_adapter "$S" "$OPEN_BODY" --reopen "새 커밋 재확인 (이전 기록 인용): 사용자 결정으로 재개: x — y (종결 결정 — 리뷰 뒤 변경 확인)")"
+eq "$rc" "0" "O13 일반 재개 rc 0"
+eq "$(sec_line "$S/SESSION.md" Status)" "awaiting-author" "O13 재개 뒤 awaiting-author"
+rm -f "$S/seen_session.md"
+MOCK_SCRIPT_DIR="$R3/rd-workflow/scripts" run_opt_reject "$S" --override "x — y"; reject O13 "$S"
 
 echo "=== L3 재snapshot 뒤 전환이 거부되면 SESSION 되돌림 (임시 git 저장소) ==="
 # 리뷰한 커밋(A)과 현재 HEAD(B)가 달라 재snapshot 이 SESSION 을 바꾸는 세션. Current Owner 절이 없어 전환 검증이 거부한다.
@@ -398,6 +519,15 @@ echo "=== H5 closed ==="
 S="$TMP/h5"; mk_session "$S" closed User; author_turn "$S"
 run_reject "$S"; reject H5 "$S"; has x "prepare_review_pipeline.sh" "H5 안내"
 
+# 없으면 새는 실수: closed 세션에 --reopen 을 붙이면 「--reopen 없이 다시 실행」 을 안내해,
+# 따르면 다시 closed 로 거부되는 순환에 빠집니다. diff 리뷰는 마지막 리뷰 head 를 base 로 채운 새 세션 명령을 냅니다.
+echo "=== H5b closed diff 세션 + --reopen ==="
+S="$TMP/h5b"; mk_session "$S" closed User "" diff-review "- review-head-oid: 0123456789abcdef0123456789abcdef01234567"; author_turn "$S"
+run_opt_reject "$S" --reopen "seal 직전 검증 실패"; reject H5b "$S"
+hasnt x "--reopen 없이 다시 실행" "H5b 옵션 제거 안내 없음"
+has x "prepare_review_pipeline.sh diff --base 0123456789abcdef0123456789abcdef01234567" "H5b 새 세션 명령(--base 마지막 리뷰 head)"
+has x 'rd task set-status "구현 중"' "H5b 수정 커밋 순서 안내"
+
 echo "=== H6 awaiting-author·Reviewer ==="
 S="$TMP/h6"; mk_session "$S" awaiting-author Reviewer; author_turn "$S"
 run_reject "$S"; reject H6 "$S"; has x "status=awaiting-author" "H6 status 값"; has x "owner=Reviewer" "H6 owner 값"
@@ -425,6 +555,7 @@ eq "$(sec_line "$S/SESSION.md" Status)" "awaiting-reviewer" "H10 도구 선택 �
 eq "$(sec_line "$S/SESSION.md" "Current Owner")" "Reviewer" "H10 도구 선택 실패 뒤 Owner"
 has x "넘겼습니다" "H10 전환 알림"
 has x "어댑터 없음" "H10 도구 선택 실패 경로 도달"
+has x "어댑터 없음, 건너뜀: nosuchtool — 이 설치의 리뷰 도구는 claude·codex 입니다. review-tools.json 우선순위에서 빼려면 /review-config setup" "H10 건너뜀 안내에 리뷰 도구 목록과 고치는 법"
 
 echo "=== H9 diff-review 재snapshot 거부 ==="
 S="$TMP/h9"; mk_session "$S" awaiting-author Author '20 total turns in `turns/*.md`' diff-review "- review-head-oid: 0123456789abcdef0123456789abcdef01234567"; author_turn "$S"

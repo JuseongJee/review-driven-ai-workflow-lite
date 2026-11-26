@@ -178,13 +178,105 @@ _rd_seal_audit_has() {
   grep -q "legacy-unverified: .* | rd-workflow-workspace/handoffs/review_pipeline/${sid}\$" "$audit" 2>/dev/null
 }
 
+# _rd_seal_script_cmd <스크립트 이름> — 호출 위치와 상관없이 그대로 실행되는 `bash <절대 경로>` 명령 머리.
+# seal 은 rd-workflow/ 같은 하위 디렉터리에서도 부를 수 있으므로 저장소 루트 기준 상대 경로를 쓰지 않습니다.
+_rd_seal_script_cmd() {
+  local q
+  printf -v q '%q' "${project_root}/rd-workflow/scripts/$1"
+  printf 'bash %s' "$q"
+}
+
+# _rd_seal_turn_plan <session-dir> — 리뷰어 턴을 다시 받기 전에 할 일을 전역 값으로 정합니다.
+#   RD_SEAL_AUTHOR_STEP : 「Author 턴 <경로> 를 쓴 뒤」 또는 「마지막 턴(<파일>)이 Author 턴이므로 바로」
+#   RD_SEAL_EXTEND      : 턴 한도에 닿으면 " --extend-turns <N>", 아니면 빈 값
+#   RD_SEAL_EXTEND_MIN  : 다음 리뷰어 턴이 늘린 한도 안에 들어가는 최소 연장 턴 수 (한도에 닿지 않으면 빈 값)
+# 한도 판정은 run_review_turn.sh 의 limit_reached 와 같은 식입니다(턴 파일 수 ≥ 한도 또는 다음 리뷰어 턴 번호 > 한도).
+# 한도에 닿지 않은 세션에 --extend-turns 를 붙이면 run_review_turn.sh 가 거부하므로 필요할 때만 붙입니다.
+_rd_seal_turn_plan() {
+  local sd="$1" f b lf="" cnt=0 last=0 limit="" line next
+  for f in "${sd}"/turns/*.md; do
+    [[ -f "$f" ]] || continue
+    cnt=$((cnt + 1))
+    b="$(basename "$f")"
+    lf="$b"
+  done
+  [[ "$lf" =~ ^([0-9]{3})_ ]] && last=$((10#${BASH_REMATCH[1]}))
+  line="$(_rd_session_section "$sd" "Turn Limit" 2>/dev/null)" || line=""
+  [[ "$line" =~ ^([0-9]+)' total turns in' ]] && limit="${BASH_REMATCH[1]}"
+  [[ -n "$limit" ]] || { [[ "${REVIEW_TURN_LIMIT:-}" =~ ^[0-9]+$ ]] && limit="$REVIEW_TURN_LIMIT"; }
+  [[ -n "$limit" ]] || limit=20
+  if [[ "$lf" =~ ^[0-9]{3}_(author|claude)\.md$ ]]; then
+    RD_SEAL_AUTHOR_STEP="마지막 턴(${lf})이 Author 턴이므로 바로"
+    next=$((last + 1))
+  else
+    printf -v b '%03d' $((last + 1))
+    RD_SEAL_AUTHOR_STEP="Author 턴 ${sd}/turns/${b}_author.md 를 쓴 뒤"
+    cnt=$((cnt + 1)); next=$((last + 2))
+  fi
+  RD_SEAL_EXTEND=""; RD_SEAL_EXTEND_MIN=""
+  if [[ "$cnt" -ge "$limit" || "$next" -gt "$limit" ]]; then
+    RD_SEAL_EXTEND=" --extend-turns <N>"
+    # 연장 뒤 run_review_turn.sh 는 다음 리뷰어 턴 번호가 (한도 + N) 안에 드는지만 봅니다.
+    RD_SEAL_EXTEND_MIN=$((next - limit)); [[ "$RD_SEAL_EXTEND_MIN" -ge 1 ]] || RD_SEAL_EXTEND_MIN=1
+  fi
+}
+
+# _rd_seal_extend_note — 턴 한도에 닿은 세션이면 <N> 의 뜻과 최솟값을 한 줄로 냅니다.
+_rd_seal_extend_note() {
+  [[ -n "${RD_SEAL_EXTEND:-}" ]] || return 0
+  echo "      턴 한도에 닿은 세션입니다. <N> 은 사람이 정한 연장 턴 수이고, 다음 리뷰어 턴이 들어가려면 ${RD_SEAL_EXTEND_MIN} 이상이어야 합니다." >&2
+}
+
+# _rd_seal_review_changed <session-dir> — 마지막 리뷰(review-head-oid) 뒤 보호 경로가 바뀌었는가.
+#   rc 0 = 바뀜 / 1 = 그대로 / 2 = 판정 불가 / 3 = 두 OID 가 모두 없는 이전 형식 세션 / 4 = OID 가 한쪽만 있는 손상 세션
+# 3 은 override_seal_precheck 가 대조 없이 받는 세션이고(seal 은 --legacy-unverified), 4 는 seal 검사 3 이 막는 세션입니다.
+# run_review_turn.sh 의 override_seal_precheck·seal 의 검사 4 와 같은 대조입니다(fr 모드는 fr 이 바꾼 경로의 한정 해시,
+# 계산할 수 없으면 전체 보호 트리). 바뀐 세션은 --override 로 종결해도 seal 이 재리뷰를 요구하므로 안내에서 뺍니다.
+_rd_seal_review_changed() {
+  local head base fr_val mode rh="" ch=""
+  head="$(_rd_session_bc "$1" "review-head-oid" 2>/dev/null)" || head=""
+  base="$(_rd_session_bc "$1" "review-base-oid" 2>/dev/null)" || base=""
+  [[ -z "$head" && -z "$base" ]] && return 3
+  [[ -z "$head" || -z "$base" ]] && return 4
+  fr_val="$(state_read_field "fr-branch" 2>/dev/null)" || fr_val=""
+  mode="$(rd_branch_mode "$fr_val" 2>/dev/null)" || return 2
+  if [[ "$mode" == "fr" ]]; then
+    rh="$(rd_fr_changes_hash "$head" 2>/dev/null)" && ch="$(rd_fr_changes_hash HEAD 2>/dev/null)" || { rh=""; ch=""; }
+  fi
+  if [[ -z "$rh" || -z "$ch" ]]; then
+    rh="$(rd_protected_tree_hash "$head" 2>/dev/null)" && ch="$(rd_protected_tree_hash HEAD 2>/dev/null)" || return 2
+  fi
+  [[ "$rh" != "$ch" ]]
+}
+
+# _rd_seal_valid_runs <session-dir> — 유효한 리뷰어 턴 실행 기록 수 (turn 마다 마지막 줄, 7열, 턴 파일 해시 일치).
+# run_review_turn.sh 의 override_seal_precheck 와 같은 기준입니다. 0 이면 --override 가 거부합니다.
+_rd_seal_valid_runs() {
+  local sd runs n=0 turn blob tf cur
+  # 턴 파일 해시를 `git -C "$project_root"` 로 계산하므로 상대 경로를 호출자 cwd 기준 절대 경로로 바꿉니다(_rd_seal_run_check 와 같음).
+  sd="$(cd "$1" 2>/dev/null && pwd)" || sd="$1"
+  runs="${sd}/reviewer_runs.tsv"
+  [[ -f "$runs" ]] || { echo 0; return 0; }
+  while IFS=$'\t' read -r turn blob; do
+    tf="${sd}/turns/${turn}_reviewer.md"
+    [[ -f "$tf" ]] || continue
+    cur="$(git -C "$project_root" hash-object "$tf" 2>/dev/null)" || continue
+    [[ -n "$cur" && "$cur" == "$blob" ]] && n=$((n + 1))
+  done < <(awk -F'\t' '/^#/ || NF == 0 { next } { last[$1] = $0 }
+    END { for (k in last) { c = split(last[k], v, "\t"); if (c == 7 && k ~ /^[0-9][0-9][0-9]$/) print k "\t" v[5] } }' "$runs" 2>/dev/null)
+  echo "$n"
+}
+
 # _rd_seal_reason_hint <사유>: 거부 사유별 복구 안내를 stderr 에 덧붙입니다.
 # 판정은 하지 않습니다 — 판정은 `_guard_common.sh` 의 `is_review_session_resolved` 가 하고,
 # 여기서는 그 사유 문자열의 접두만 읽어 사람이 무엇을 고칠지 알려 줍니다. 형식 오류가 아닌
 # 거부(실제 미해결 이의·진행 중 상태·파일 부재)에 `- 없음` 교체를 권하면 실제 이의를 지우게
 # 되므로 사유 종류별로 나눕니다.
 _rd_seal_reason_hint() {
-  local reason="$1" value=""
+  local reason="$1" sd="${2:-}" value="" rt q="<세션>" chg=0
+  # 안내 명령은 호출 위치와 상관없이 실행돼야 하므로 세션도 호출자 cwd 기준 절대 경로로 씁니다.
+  [[ -n "$sd" ]] && { sd="$(cd "$sd" 2>/dev/null && pwd)" || sd="$2"; printf -v q '%q' "$sd"; }
+  rt="$(_rd_seal_script_cmd run_review_turn.sh) ${q}"
   case "$reason" in
     open-issues-prose-before-marker:*|open-issues-marker-continued:*)
       value="${reason#*:}"
@@ -200,6 +292,33 @@ _rd_seal_reason_hint() {
       value="${reason#*:}"
       echo "  읽힌 값: ${value}" >&2
       echo "  이 항목은 종결 마커('- 없음')가 아닌 리스트 항목입니다. 실제 이의라면 지우지 말고 리뷰를 재개해 해소하십시오." >&2
+      if [[ "${RD_REVIEW_SESSION_STATUS:-}" == "awaiting-user" ]]; then
+        _rd_seal_turn_plan "$sd"
+        echo "  리뷰 재개는 사람이 ${sd:+${sd}/}USER_ACTION.md 의 질문에 답한 뒤 합니다. SESSION 을 손으로 고치지 않습니다." >&2
+        echo "    - 결정대로 이어 가기: 결정을 반영한 ${RD_SEAL_AUTHOR_STEP} 실행합니다: ${rt} --decision \"<사용자 결정>\"${RD_SEAL_EXTEND}" >&2
+        _rd_seal_extend_note
+        # rc 0 = 바뀜, 1 = 그대로, 2 = 판정 불가, 3 = 이전 형식(OID 없음), 4 = 손상(OID 한쪽). `||` 는 rc 0 일 때 chg 를 건드리지 않으므로 초기값이 0 입니다.
+        _rd_seal_review_changed "$sd" || chg=$?
+        if [[ "$chg" -eq 3 ]]; then
+          echo "    - 남은 이의를 덮고 종결하기(사람이 정한 경우만): ${rt} --override \"<결정한 사람> — <그 사람이 한 말>\"" >&2
+          echo "      이 세션은 reviewed OID 가 없는 이전 형식이라 종결 뒤 seal 에 --legacy-unverified \"<사유>\" 를 붙입니다." >&2
+        elif [[ "$chg" -eq 4 ]]; then
+          echo "    - 남은 이의를 덮고 종결하기: 세션의 reviewed OID 가 한쪽만 있어 종결해도 seal 이 판정하지 못합니다. 새 세션으로 리뷰하십시오: $(_rd_seal_script_cmd prepare_review_pipeline.sh) diff" >&2
+        elif [[ "$(_rd_seal_valid_runs "$sd")" -gt 0 && "$chg" -eq 1 ]]; then
+          echo "    - 남은 이의를 덮고 종결하기(사람이 정한 경우만): ${rt} --override \"<결정한 사람> — <그 사람이 한 말>\"" >&2
+        elif [[ "$chg" -eq 0 ]]; then
+          echo "    - 남은 이의를 덮고 종결하기: 마지막 리뷰(review-head-oid) 뒤 코드가 바뀌어 지금은 --override 를 받지 않습니다(종결해도 seal 이 재리뷰를 요구합니다)." >&2
+          if [[ "$(_rd_session_bc "$sd" "review-head-policy" 2>/dev/null)" == "pinned" ]]; then
+            echo "      이 세션은 리뷰 head 가 고정(pinned)돼 --decision 으로도 바뀐 내용을 보지 않습니다. 새 세션으로 리뷰하십시오: $(_rd_seal_script_cmd prepare_review_pipeline.sh) diff" >&2
+          else
+            echo "      먼저 위 --decision 으로 바뀐 내용을 리뷰받고, 그 뒤에도 사람이 덮기로 하면 --override 를 실행합니다." >&2
+          fi
+        elif [[ "$chg" -eq 2 ]]; then
+          echo "    - 남은 이의를 덮고 종결하기: 마지막 리뷰 뒤 코드 변경 여부를 판정할 수 없어 --override 명령을 안내하지 않습니다. ${rt} 를 실행하면 이 세션에 맞는 다음 조치를 알려 줍니다." >&2
+        else
+          echo "    - 남은 이의를 덮고 종결하기: 실제로 실행된 리뷰어 턴 기록이 없어 지금은 --override 를 받지 않습니다. 먼저 위 --decision 으로 리뷰어 턴을 받고, 그 뒤에도 사람이 덮기로 하면 --override 를 실행합니다." >&2
+        fi
+      fi
       echo "  마커 표기 오류(예: '- 없음。')라면 이의가 모두 해소된 경우에만 '- 없음' 으로 고친 뒤 다시 실행하십시오." >&2
       ;;
     status:*|session-missing)
@@ -214,6 +333,39 @@ _rd_seal_reason_hint() {
 # ---------------------------------------------------------------------------
 # 리뷰어 턴 실행 기록 대조 (change-spec review-integrity §4.3)
 # ---------------------------------------------------------------------------
+# _rd_seal_rerun_hint <session-dir> — 리뷰어 턴을 다시 받는 명령을 세션 상태에 맞춰 stderr 에 냅니다.
+# 실행 기록 대조는 검사 1(Status awaiting-user·closed, Open Issues '- 없음') 뒤에 하므로 두 상태만 갈래로 둡니다.
+# SESSION 을 손으로 바꾸는 안내는 내지 않습니다 — 상태 전환과 사람 결정 기록은 run_review_turn.sh 가 남깁니다.
+# 이 단계의 세션은 미해결 이의가 없어 --decision·--override 가 받아들이지 않으므로 --reopen 만 안내합니다.
+_rd_seal_rerun_hint() {
+  local sd="$1" st rt q
+  printf -v q '%q' "$sd"
+  rt="$(_rd_seal_script_cmd run_review_turn.sh) ${q}"
+  st="$(_rd_session_section "$sd" "Status" 2>/dev/null)" || st=""
+  case "$st" in
+    awaiting-user)
+      # 고정(pinned) head 세션은 --reopen 뒤에도 같은 head 를 다시 보므로, 그 뒤 보호 경로가 바뀌었으면
+      # 실행 기록을 채워도 seal 의 검사 4 가 다시 막습니다. 이 경우는 처음부터 새 세션을 안내합니다.
+      if [[ "$(_rd_session_bc "$sd" "review-head-policy" 2>/dev/null)" == "pinned" ]] && _rd_seal_review_changed "$sd"; then
+        echo "  이 세션은 리뷰 head 가 고정(pinned)됐고 마지막 리뷰 뒤 코드가 바뀌어, --reopen 으로 다시 리뷰해도 seal 이 재리뷰를 요구합니다." >&2
+        echo "  새 세션으로 바뀐 내용을 리뷰하십시오: $(_rd_seal_script_cmd prepare_review_pipeline.sh) diff" >&2
+        return 0
+      fi
+      _rd_seal_turn_plan "$sd"
+      echo "  리뷰어 턴 다시 받기: 바뀐 내용을 담은 ${RD_SEAL_AUTHOR_STEP} 실행합니다: ${rt} --reopen \"<사유>\"${RD_SEAL_EXTEND}" >&2
+      _rd_seal_extend_note
+      echo "  사유는 SESSION 의 Reopen History 에 남고, 상태 전환은 이 명령이 합니다(SESSION 을 손으로 고치지 않습니다)." >&2
+      ;;
+    closed)
+      echo "  이 세션은 종결(closed)돼 다시 열지 않습니다. 새 세션을 만들어 리뷰하십시오: $(_rd_seal_script_cmd prepare_review_pipeline.sh) diff" >&2
+      echo "  상태 전이·커밋 순서는 final-diff-review skill 의 「종결된 세션 뒤 재확인」 을 따릅니다." >&2
+      ;;
+    *)
+      echo "  다음 조치를 확인하려면 실행하십시오: ${rt} (세션 상태 '${st:-없음}' 에 맞는 명령을 알려 줍니다)" >&2
+      ;;
+  esac
+}
+
 # _rd_seal_run_check <session-dir> <review-head-oid> — rc 0 이면 전역 RD_SEAL_CLOSURE_REASON 에 사유.
 # Closure Reason 이 비어 있으면 추론 경로, user-override 면 유효 기록 1건 이상만 요구합니다.
 _rd_seal_run_check() {
@@ -258,14 +410,13 @@ _rd_seal_run_check() {
   fi
 
   local fb="  수동 fallback 으로 쓴 리뷰어 턴은 실행 기록을 남기지 않습니다. 리뷰 도구를 실행할 수 없으면 seal 대신 archive.sh --force-skip-review-check <사유> 로 발행하십시오(audit 기록)."
-  local rerun="  리뷰어 턴을 다시 실행하려면 SESSION 의 Status 를 awaiting-reviewer, Current Owner 를 Reviewer 로 바꾼 뒤 bash rd-workflow/scripts/run_review_turn.sh ${sd} 를 실행하십시오. 턴 한도에 도달한 세션은 bash rd-workflow/scripts/prepare_review_pipeline.sh diff 로 새 세션을 만들어 리뷰하십시오."
 
   # 2. 유효 기록 0건이면 거부 (run-missing)
   if [[ "$nvalid" -eq 0 ]]; then
     echo "review seal: 실제로 실행된 리뷰어 턴 기록이 없습니다 (${sd}/reviewer_runs.tsv)." >&2
     [[ "$ninvalid" -gt 0 ]] && echo "  무효 실행 기록 ${ninvalid}건 (${invalid_list})" >&2
-    echo "  조치: 리뷰어 턴을 실행하십시오: SESSION 의 Status 를 awaiting-reviewer, Current Owner 를 Reviewer 로 바꾼 뒤 bash rd-workflow/scripts/run_review_turn.sh ${sd}" >&2
-    echo "  이 기능 이전에 만든 세션(이미 closed·awaiting-user 인 세션 포함)도 같습니다. 턴 한도에 도달한 세션은 bash rd-workflow/scripts/prepare_review_pipeline.sh diff 로 새 세션을 만들어 리뷰하십시오." >&2
+    echo "  조치: run_review_turn.sh 로 리뷰어 턴을 실행해 기록을 남기십시오. 이 기능 이전에 만든 세션도 같습니다." >&2
+    _rd_seal_rerun_hint "$sd"
     echo "$fb" >&2
     return 1
   fi
@@ -277,7 +428,8 @@ _rd_seal_run_check() {
     ""|reviewer-no-objection|user-override) ;;
     *)
       echo "review seal: Closure Reason 값이 올바르지 않습니다: '${creason}' (허용: reviewer-no-objection, user-override)." >&2
-      echo "  조치: SESSION 의 ## Closure Reason 값을 고치거나 비우십시오." >&2
+      echo "  이 값은 run_review_turn.sh --override 만 씁니다(user-override). 손으로 넣은 값이면 그 줄을 지우십시오 — 값이 비면 seal 이 리뷰어 턴 실행 기록으로 판정합니다." >&2
+      echo "  사람이 남은 이의를 덮고 종결하려면 값을 손으로 쓰지 않고 --override 로 합니다. --override 는 미해결 이의가 남은 awaiting-user 세션에만 씁니다." >&2
       return 1
       ;;
   esac
@@ -287,7 +439,9 @@ _rd_seal_run_check() {
     if [[ -z "$obasis" ]]; then
       echo "review seal: Closure Reason 이 user-override 인데 사람의 결정 근거 줄이 없습니다." >&2
       echo "  user-override 는 사람이 리뷰어의 남은 이의를 덮고 종결하기로 정했을 때만 씁니다. 자율 모드(semi-auto·autopilot)는 스스로 정하지 않고 awaiting-user 로 멈춰 사람에게 묻습니다." >&2
-      echo "  조치: 사람이 정했다면 ## Closure Reason 의 user-override 줄 아래에 '근거: <날짜> <결정한 사람> — <그 사람이 한 말>' 한 줄을 적으십시오. 사람이 정하지 않았다면 user-override 를 지우고 리뷰어 턴을 다시 실행하십시오." >&2
+      echo "  근거 줄은 run_review_turn.sh --override \"<결정한 사람> — <그 사람이 한 말>\" 가 날짜와 함께 씁니다. 손으로 적지 않습니다." >&2
+      echo "  조치: 손으로 넣은 user-override 줄을 지우고 리뷰어 턴을 다시 받으십시오. 리뷰어가 이의를 남기면 사람이 --decision 으로 잇거나 --override 로 덮고 종결합니다." >&2
+      _rd_seal_rerun_hint "$sd"
       return 1
     fi
     echo "review seal: user-override 근거 — ${obasis}" >&2
@@ -327,8 +481,8 @@ _rd_seal_run_check() {
   fi
   if [[ -n "$miss" ]]; then
     echo "review seal: 마지막 리뷰어 턴이 이의 없이 끝났다는 실행 기록이 없습니다 (${miss})." >&2
-    echo "  조치: 리뷰어 턴을 다시 실행해 이의 없음을 받으십시오. 남은 이의를 덮고 종결할지는 사람만 정합니다 — 자율 모드는 awaiting-user 로 멈춰 묻고, 사람이 정했으면 ## Closure Reason 에 user-override 와 '근거:' 줄을 적으십시오." >&2
-    echo "$rerun" >&2
+    echo "  조치: 리뷰어 턴을 다시 실행해 이의 없음을 받으십시오. 리뷰어가 이의를 남기면 남은 이의를 덮고 종결할지는 사람만 정합니다 — 사람이 답한 뒤 run_review_turn.sh 의 --decision 으로 잇거나 --override 로 종결하고, 자율 모드는 awaiting-user 로 멈춰 묻습니다." >&2
+    _rd_seal_rerun_hint "$sd"
     [[ "$miss" == *"실행 기록 없음"* ]] && echo "$fb" >&2
     return 1
   fi
@@ -409,7 +563,7 @@ rd_review_seal() {
   # Status 인지 Open Issues 인지 알려면 판정 awk 를 직접 읽어야 했다.
   if ! is_review_session_resolved "$session_path"; then
     echo "review seal: 세션이 종결되지 않았습니다 (${RD_REVIEW_UNRESOLVED_REASON:-사유 불명})." >&2
-    _rd_seal_reason_hint "${RD_REVIEW_UNRESOLVED_REASON:-}"
+    _rd_seal_reason_hint "${RD_REVIEW_UNRESOLVED_REASON:-}" "$session_path"
     return 1
   fi
 
@@ -688,9 +842,11 @@ usage() {
   set-status <값> [--force] [--task <slug>]  전이표 검증 후 Status 갱신 (위반 exit 4)
                                            성공하면 '커밋할 파일: ...' 한 줄 출력 —
                                            실제로 바뀐 파일만(미러·task-state·stage_metrics)
-                                           --task: 대상 작업 명시(worktree 여러 건일 때).
-                                           생략 시 현재 worktree 의 작업, 그마저 없고
-                                           작업이 여러 건이면 목록 안내 후 exit 1
+                                           --task: 대상 작업 명시.
+                                           생략 시 현재 체크아웃의 작업(작업 worktree, 또는
+                                           기본 체크아웃의 fr 브랜치 없는 진행 중 작업).
+                                           현재 체크아웃에 작업이 없고 다른 진행 중 작업이
+                                           있으면 자동으로 고르지 않고 목록 안내 후 exit 1
   list [--rebuild]                         진행 중인 모든 작업의 단계·worktree·세션 상태 출력
                                            (--rebuild: 색인을 worktree 목록에서 재구성)
   resolve-launch <slug> [--assume-ended]    기동 예약(launching)·미확정(unknown)을 사람이 확정/해소

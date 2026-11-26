@@ -9,12 +9,18 @@ DRAIN="${SCRIPT_DIR}/ralph_drain.sh"
 TMP="$(mktemp -d)" || { echo "test_ralph_drain.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$TMP" && -d "$TMP" ]] || { echo "test_ralph_drain.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
+# 무인 세션 모델·effort 해석이 부모 셸 값이나 사용자 models.json 에 흔들리지 않게 한다.
+unset RD_HEADLESS_CLAUDE_MODEL RD_HEADLESS_CLAUDE_EFFORT RD_HEADLESS_FIXED_MODEL RD_HEADLESS_FIXED_EFFORT RD_HEADLESS_FIXED_LINE
+export RD_MODELS_CONFIG="${TMP}/none.json"
 
 # exit code 시퀀스를 반환하는 stub wrapper. 호출마다 counter 파일로 다음 코드를 낸다.
 STUB="${TMP}/stub.sh"
 cat > "$STUB" <<'STUBEOF'
 #!/usr/bin/env bash
 i=$(cat "$RD_STUB_COUNTER" 2>/dev/null || echo 0)
+echo "STUB-ENTER $((i + 1))" >&2
+# 첫 호출에서 RD_STUB_MUTATE 를 실행한다 (회차 중 설정 파일 변경 흉내).
+[ "$i" -eq 0 ] && [ -n "${RD_STUB_MUTATE:-}" ] && eval "$RD_STUB_MUTATE"
 # shellcheck disable=SC2206
 codes=($RD_STUB_CODES)
 code="${codes[$i]:-30}"
@@ -30,6 +36,9 @@ if [ -n "${RD_AUTOPILOT_COST_FILE:-}" ]; then
     unk:*) printf 'cost\tunknown\t%s\n' "${cspec#unk:}" >> "$RD_AUTOPILOT_COST_FILE" ;;
     gone)  rm -f "$RD_AUTOPILOT_COST_FILE" ;;
   esac
+fi
+if [ -n "${RD_STUB_HLLOG:-}" ]; then
+  echo "HLM=${RD_HEADLESS_FIXED_MODEL-}|HLE=${RD_HEADLESS_FIXED_EFFORT-}|HLL=${RD_HEADLESS_FIXED_LINE-}" >> "$RD_STUB_HLLOG"
 fi
 if [ -n "${RD_STUB_ENVLOG:-}" ]; then
   echo "FR=${RD_AUTOPILOT_FR:-} MODE=${RD_AUTOPILOT_MODE:-} FINISH=${RD_FINISH_POLICY:-}" >> "$RD_STUB_ENVLOG"
@@ -51,6 +60,7 @@ STUBEOF
 chmod +x "$STUB"
 
 fail=0
+DRAIN_ARGS=()
 run_case() {
   # $1 이름  $2 기대 exit  $3 codes  나머지: 추가 env (KEY=VAL)
   local name="$1" expect="$2" codes="$3"; shift 3
@@ -67,7 +77,7 @@ run_case() {
         RD_STUB_CODES="$codes" RD_STUB_COUNTER="$counter" \
         RD_AUTOPILOT_OUTCOME_FILE="$outcome" \
         RD_RALPH_WRAPPER_CMD="bash $STUB" \
-        bash "$DRAIN" 2>&1); ec=$?
+        bash "$DRAIN" ${DRAIN_ARGS[@]+"${DRAIN_ARGS[@]}"} 2>&1); ec=$?
   if [ "$ec" -ne "$expect" ]; then
     echo "  FAIL [$name] exit 기대 $expect, 실제 $ec"; echo "$out" | sed 's/^/    /'; fail=1
   else
@@ -337,7 +347,7 @@ assert_contains "stderr: fr_relations.sh: 마지막 오류 줄"
 
 # 프로젝트 경로에 공백이 있어도 기본 관계 판정(훅 미설정)이 실제 fr_relations.sh 로 돈다.
 SP="${TMP}/with space"; mkdir -p "$SP/scripts/lifecycle" "$SP/proj/rd-workflow-workspace/backlog/items"
-cp "${SCRIPT_DIR}/ralph_drain.sh" "${SCRIPT_DIR}/fr_relations.sh" "${SCRIPT_DIR}/_fr_status.sh" "$SP/scripts/"
+cp "${SCRIPT_DIR}/ralph_drain.sh" "${SCRIPT_DIR}/fr_relations.sh" "${SCRIPT_DIR}/_fr_status.sh" "${SCRIPT_DIR}/model_select.sh" "$SP/scripts/"
 cp "${SCRIPT_DIR}/lifecycle/cleanup_pending.sh" "$SP/scripts/lifecycle/"
 printf '# 2026-01-01 b\n- status: validated\n- kind: feature\n- summary: fixture\n' > "$SP/proj/rd-workflow-workspace/backlog/items/2026-01-01-b.md"
 { printf '## 인덱스\n\n| 날짜 | 제목 | 요약 | 종류 | 상태 | 우선순위 | 관계 | 상세 |\n|------|------|------|------|------|----------|------|------|\n'
@@ -357,6 +367,145 @@ if [ "$LAST_INVOCATIONS" = "0" ]; then echo "  ok [slugs] 빈 목록 wrapper 호
 SENV2="${TMP}/slugenv2"; : > "$SENV2"
 run_case "slugs_unset_keeps_auto" 0 "30" RD_STUB_ENVLOG="$SENV2"
 if grep -q "FR=auto" "$SENV2"; then echo "  ok [slugs] 미설정은 FR=auto"; else echo "  FAIL [slugs] envlog: $(cat "$SENV2")"; fail=1; fi
+
+# ------------------------------------------------------------
+# 무인 세션 모델·effort
+# ------------------------------------------------------------
+hd_ok()   { echo "  ok [hl] $1"; }
+hd_bad()  { echo "  FAIL [hl] $1 — ${2:-}"; fail=1; }
+hd_chk()  { if [ "$2" = 0 ]; then hd_ok "$1"; else hd_bad "$1" "${3:-}"; fi; }   # hd_chk <설명> <rc 0=참> [상세]
+
+HD_BIN="${TMP}/hdbin"; mkdir -p "$HD_BIN"
+cat > "${HD_BIN}/claude" <<'FAKE'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--help" ]]; then
+  printf '%s\n' "${RD_FAKE_HELP-  --model <model>
+  --effort <level>}"
+  exit 0
+fi
+if [[ "${1:-}" == "-p" ]]; then
+  [[ -n "${RD_FAKE_ARGS:-}" ]] && printf '%s\n' "$@" > "$RD_FAKE_ARGS"
+  [[ -n "${RD_AUTOPILOT_OUTCOME_FILE:-}" ]] && printf 'queue-empty\n' > "$RD_AUTOPILOT_OUTCOME_FILE"
+  printf '{"result":"ok"}\n'
+  exit 0
+fi
+exit 0
+FAKE
+chmod +x "${HD_BIN}/claude"
+HD_PYFAIL="${TMP}/hdpyfail"; mkdir -p "$HD_PYFAIL"
+printf '#!/bin/sh\nexit 1\n' > "${HD_PYFAIL}/python3"; chmod +x "${HD_PYFAIL}/python3"
+# jq 없는 PATH
+HD_NOJQ="${TMP}/hdnojq"; mkdir -p "$HD_NOJQ"
+for _t in bash awk grep sed cat dirname basename head tr env cut; do
+  _p="$(command -v "$_t" 2>/dev/null)" && ln -sf "$_p" "${HD_NOJQ}/${_t}"
+done
+ln -sf "${HD_BIN}/claude" "${HD_NOJQ}/claude"
+
+# 케이스 CWD(공백 없음)의 rd-workflow/scripts 를 루트 미러로 이어, 드레인 기본 호출이 실제 wrapper 에 닿게 한다.
+HD_CWD="${TMP}/hdcwd"; mkdir -p "$HD_CWD/rd-workflow"; ln -s "$SCRIPT_DIR" "$HD_CWD/rd-workflow/scripts"
+HD_N=0; HD_OUT=""; HD_RC=0; HD_ARGS=""
+# hd_run <env 할당…> -- <드레인 인자…> : 실제 wrapper·가짜 claude 로 드레인을 돈다. 케이스마다 outcome·args 파일이 따로다.
+hd_run() {
+  local envs=()
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
+  shift
+  HD_N=$((HD_N + 1)); HD_ARGS="${TMP}/hd-args-${HD_N}"; rm -f "$HD_ARGS"; HD_RC=0
+  HD_OUT="$( cd "$HD_CWD" && env -u RD_AUTOPILOT_FR -u RD_AUTOPILOT_MODE -u RD_FINISH_POLICY -u RD_RALPH_SLUGS \
+      -u RD_RALPH_WRAPPER_CMD -u RD_RALPH_RELATIONS_CMD -u RD_AUTOPILOT_COST_FILE \
+      RD_AUTOPILOT_OUTCOME_FILE="${TMP}/hd-outcome-${HD_N}" RD_FAKE_ARGS="$HD_ARGS" RD_FR_WALL_MINUTES=0 \
+      PATH="${HD_BIN}:${PATH}" ${envs[@]+"${envs[@]}"} \
+      bash "$HD_CWD/rd-workflow/scripts/ralph_drain.sh" "$@" 2>&1 )" || HD_RC=$?
+}
+# 옵션이 정확히 한 번 나오면 바로 다음 줄 (없거나 두 번 이상이면 빈 값)
+hd_arg_after() { awk -v o="$2" '$0 == o { c++; if (c == 1) getline v } END { if (c == 1) print v }' "$1" 2>/dev/null; }
+hd_has() { printf '%s\n' "$HD_OUT" | grep -qxF -- "$1"; }          # 로그에 줄 전체가 있음
+hd_in_summary() { printf '%s\n' "$HD_OUT" | awk '/---- ralph_drain 요약 ----/{f=1} f' | grep -qxF -- "$1"; }
+
+# AC1·AC4 setsid / AC1 fallback
+L='무인 세션 모델: sonnet (플래그 --model) · effort: high (플래그 --effort)'
+hd_run RD_HEADLESS_CLAUDE_MODEL=haiku RD_HEADLESS_CLAUDE_EFFORT=low -- --model sonnet --effort high
+hd_chk "AC1 setsid exit 0" "$([ "$HD_RC" = 0 ]; echo $?)" "rc=$HD_RC"
+hd_chk "AC1 setsid --model" "$([ "$(hd_arg_after "$HD_ARGS" --model)" = sonnet ]; echo $?)" "$(tr '\n' ' ' < "$HD_ARGS" 2>/dev/null)"
+hd_chk "AC1 setsid --effort" "$([ "$(hd_arg_after "$HD_ARGS" --effort)" = high ]; echo $?)" "$(tr '\n' ' ' < "$HD_ARGS" 2>/dev/null)"
+hd_chk "AC1 드레인 표시 줄" "$(hd_has "ralph_drain: $L"; echo $?)" "$HD_OUT"
+hd_chk "AC1 wrapper 표시 줄" "$(hd_has "autopilot_headless: $L"; echo $?)" "$HD_OUT"
+hd_chk "AC4 요약 절 표시 줄" "$(hd_in_summary "$L"; echo $?)" "$HD_OUT"
+hd_run RD_HEADLESS_CLAUDE_MODEL=haiku RD_HEADLESS_CLAUDE_EFFORT=low PATH="${HD_PYFAIL}:${HD_BIN}:${PATH}" -- --model sonnet --effort high
+hd_chk "AC1 fallback --model" "$([ "$(hd_arg_after "$HD_ARGS" --model)" = sonnet ]; echo $?)" "$HD_OUT"
+hd_chk "AC1 fallback --effort" "$([ "$(hd_arg_after "$HD_ARGS" --effort)" = high ]; echo $?)" "$HD_OUT"
+hd_chk "AC1 fallback 경로 확인(세션 추적 불가)" "$([[ "$HD_OUT" == *"세션 추적 불가"* ]]; echo $?)"
+
+# AC8: ultra → max, 변환 경고는 드레인 해석에서 한 번만
+hd_run RD_HEADLESS_CLAUDE_MODEL=haiku RD_HEADLESS_CLAUDE_EFFORT=low -- --model sonnet --effort ultra
+hd_chk "AC8 --effort max" "$([ "$(hd_arg_after "$HD_ARGS" --effort)" = max ]; echo $?)" "$(tr '\n' ' ' < "$HD_ARGS" 2>/dev/null)"
+hd_chk "AC8 변환 경고 1회" "$([ "$(printf '%s\n' "$HD_OUT" | grep -cF "'max' 로 바꿉니다")" = 1 ]; echo $?)" "$HD_OUT"
+
+# AC3: default 지정·미설정은 인자 없음, wrapper 표시 줄은 구분 유지
+printf '{"headless":{"claude":{"model":"default","effort":"default"}}}' > "${TMP}/hd-default.json"
+hd_run RD_MODELS_CONFIG="${TMP}/hd-default.json" --
+hd_chk "AC3 default args 파일에 -p" "$([ -f "$HD_ARGS" ] && grep -qxF -- -p "$HD_ARGS"; echo $?)" "$HD_OUT"
+hd_chk "AC3 default --model·--effort 없음" "$(! grep -qxF -- --model "$HD_ARGS" && ! grep -qxF -- --effort "$HD_ARGS"; echo $?)"
+hd_chk "AC3 default wrapper 줄 전체" "$(hd_has 'autopilot_headless: 무인 세션 모델: CLI 기본값 (default 지정, models.json headless.claude.model) · effort: CLI 기본값 (default 지정, models.json headless.claude.effort)'; echo $?)" "$HD_OUT"
+hd_run --
+hd_chk "AC3 미설정 args 파일에 -p" "$([ -f "$HD_ARGS" ] && grep -qxF -- -p "$HD_ARGS"; echo $?)" "$HD_OUT"
+hd_chk "AC3 미설정 --model·--effort 없음" "$(! grep -qxF -- --model "$HD_ARGS" && ! grep -qxF -- --effort "$HD_ARGS"; echo $?)"
+hd_chk "AC3 미설정 wrapper 줄 전체" "$(hd_has 'autopilot_headless: 무인 세션 모델: CLI 기본값 (미설정) · effort: CLI 기본값 (미설정)'; echo $?)" "$HD_OUT"
+
+# AC5·AC9: 회차 시작에 한 번 해석해 고정, 설정 줄이 wrapper 첫 진입보다 먼저
+HD_CONF="${TMP}/hd-run.json"; printf '{"headless":{"claude":{"model":"opus"}}}' > "$HD_CONF"
+HD_LL="${TMP}/hd-hllog"; rm -f "$HD_LL"
+run_case "hl_fixed_per_round" 0 "0 30" RD_MODELS_CONFIG="$HD_CONF" RD_STUB_HLLOG="$HD_LL" \
+  RD_STUB_MUTATE="printf '{\"headless\":{\"claude\":{\"model\":\"haiku\"}}}' > $HD_CONF"
+hd_chk "AC5 wrapper 두 번 호출" "$([ "$(wc -l < "$HD_LL" | tr -d ' ')" = 2 ]; echo $?)" "$(cat "$HD_LL" 2>/dev/null)"
+hd_chk "AC5 두 줄 모두 HLM=opus|" "$([ "$(grep -c '^HLM=opus|' "$HD_LL")" = 2 ]; echo $?)" "$(cat "$HD_LL" 2>/dev/null)"
+hd_chk "AC5 두 줄의 HLL 동일" "$([ "$(sed 's/.*|HLL=//' "$HD_LL" | sort -u | wc -l | tr -d ' ')" = 1 ]; echo $?)" "$(cat "$HD_LL" 2>/dev/null)"
+assert_contains "opus (models.json headless.claude.model)"
+hd_chk "AC5 요약 줄에 opus" "$(summary_section | grep -qF 'opus (models.json headless.claude.model)'; echo $?)"
+L_SET="$(printf '%s\n' "$LAST_OUT" | grep -n 'ralph_drain: 무인 세션 모델:' | head -n1 | cut -d: -f1)"
+L_ENTER="$(printf '%s\n' "$LAST_OUT" | grep -n 'STUB-ENTER 1' | head -n1 | cut -d: -f1)"
+hd_chk "AC9 설정 줄이 wrapper 진입보다 먼저" "$([ -n "$L_SET" ] && [ -n "$L_ENTER" ] && [ "$L_SET" -lt "$L_ENTER" ]; echo $?)" "set=$L_SET enter=$L_ENTER"
+
+# AC6: strict 실패는 wrapper 를 부르기 전에 멈춘다
+HD_FAILMSG='ralph_drain: 무인 세션 모델·effort 설정을 적용할 수 없습니다 — 위 이유를 고친 뒤 다시 실행하십시오'
+hd_strict_fail() {  # hd_strict_fail <이름> <포함 문자열…> — 직전 run_case 결과 점검
+  local name="$1"; shift; local s
+  hd_chk "$name HLLOG 없음" "$([ ! -e "$HD_LL" ]; echo $?)"
+  hd_chk "$name 마지막 줄" "$([ "$(printf '%s\n' "$LAST_OUT" | tail -n1)" = "$HD_FAILMSG" ]; echo $?)" "$LAST_OUT"
+  for s in "$@"; do hd_chk "$name 포함 [$s]" "$([[ "$LAST_OUT" == *"$s"* ]]; echo $?)" "$LAST_OUT"; done
+}
+rm -f "$HD_LL"; DRAIN_ARGS=(--model gpt-5)
+run_case "hl_fail_a_flag_model" 1 "30" RD_STUB_HLLOG="$HD_LL"; DRAIN_ARGS=()
+hd_strict_fail "AC6(a)" "플래그 --model" "opus"
+rm -f "$HD_LL"
+run_case "hl_fail_a2_env_model" 1 "30" RD_STUB_HLLOG="$HD_LL" RD_HEADLESS_CLAUDE_MODEL=gpt-5
+hd_strict_fail "AC6(a2)" "환경 변수 RD_HEADLESS_CLAUDE_MODEL" "opus"
+printf '{"headless":{"claude":{"effort":"turbo"}}}' > "${TMP}/hd-bad-effort.json"; rm -f "$HD_LL"
+run_case "hl_fail_b_file_effort" 1 "30" RD_STUB_HLLOG="$HD_LL" RD_MODELS_CONFIG="${TMP}/hd-bad-effort.json"
+hd_strict_fail "AC6(b)" "${TMP}/hd-bad-effort.json" "headless.claude.effort" "low"
+printf '{"headless":' > "${TMP}/hd-bad-syntax.json"; rm -f "$HD_LL"
+run_case "hl_fail_c_syntax" 1 "30" RD_STUB_HLLOG="$HD_LL" RD_MODELS_CONFIG="${TMP}/hd-bad-syntax.json"
+hd_strict_fail "AC6(c)" "파일을 고치십시오"
+printf '{"headless":{"claude":{"model":"opus"}}}' > "${TMP}/hd-nojq.json"; rm -f "$HD_LL"
+run_case "hl_fail_d_nojq" 1 "30" RD_STUB_HLLOG="$HD_LL" RD_MODELS_CONFIG="${TMP}/hd-nojq.json" PATH="$HD_NOJQ"
+hd_strict_fail "AC6(d)" "brew install jq"
+
+# AC7: CLI 가 --effort 를 모르면 strict 실패
+rm -f "$HD_LL"; DRAIN_ARGS=(--effort high)
+run_case "hl_fail_ac7_cli" 1 "30" RD_STUB_HLLOG="$HD_LL" RD_FAKE_HELP="  --model <model>" PATH="${HD_BIN}:${PATH}"; DRAIN_ARGS=()
+hd_chk "AC7 HLLOG 없음" "$([ ! -e "$HD_LL" ]; echo $?)"
+assert_contains "claude update"
+
+# 인자 오류
+hd_arg_case() {  # hd_arg_case <이름> <드레인 인자…>
+  local name="$1"; shift
+  rm -f "$HD_LL"; DRAIN_ARGS=("$@")
+  run_case "hl_args_${name}" 1 "30" RD_STUB_HLLOG="$HD_LL"; DRAIN_ARGS=()
+  hd_chk "인자 ${name} 사용법" "$([[ "$LAST_OUT" == *"사용법"* ]]; echo $?)" "$LAST_OUT"
+  hd_chk "인자 ${name} HLLOG 없음" "$([ ! -e "$HD_LL" ]; echo $?)"
+}
+hd_arg_case "값없음" --model
+hd_arg_case "중복" --model sonnet --model haiku
+hd_arg_case "모르는인자" --bogus
 
 if [ "$fail" -ne 0 ]; then echo "test_ralph_drain: FAIL"; exit 1; fi
 echo "test_ralph_drain: PASS"

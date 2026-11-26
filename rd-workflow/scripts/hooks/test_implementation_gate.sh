@@ -94,12 +94,51 @@ build_fixtures() {
   FX_I_LINK="$(make_fixture "구현 중" "no" "link")" || return 1
   FX_I_HARD="$(make_fixture "구현 중" "no" "hardlink")" || return 1
   FX_LIST=("$FX_V_NO" "$FX_I_NO" "$FX_I_YES" "$FX_I_STATE" "$FX_I_LINK" "$FX_I_HARD")
+  make_worktree_fixture || { echo "test_implementation_gate.sh: worktree fixture 생성 실패" >&2; return 1; }
   local d
   for d in "${FX_LIST[@]}"; do fx_freeze "$d" || { echo "test_implementation_gate.sh: fixture 읽기 전용 보호 실패: $d" >&2; return 1; }; done
   if [[ "$(id -u)" == "0" ]]; then
     echo "주의: root 실행 — 읽기 전용 보호가 무효라 시나리오가 공유 fixture 를 바꿔도 막지 못합니다" >&2
   fi
 }
+# worktree fixture — M(git 저장소, hook·상태 파일 포함), W(M 의 worktree), O(다른 git 저장소).
+# 경로는 mktemp 가 준 형태 그대로 쓴다 (macOS 는 /var/… 이고 물리 경로는 /private/var/… 이다).
+WT_ROOT=""; WT_M=""; WT_W=""; WT_O=""
+make_worktree_fixture() {
+  WT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rd-ig-wt.XXXXXX")" || return 1
+  WT_M="$WT_ROOT/M"; WT_O="$WT_ROOT/O"; WT_W="$WT_M/.worktrees/w"
+  mkdir -p "$WT_M/rd-workflow/scripts/hooks" "$WT_O" || return 1
+  cp "$HOOK_SOURCE" "$WT_M/rd-workflow/scripts/hooks/implementation_gate.sh"
+  cp "$GUARD_COMMON" "$WT_M/rd-workflow/scripts/hooks/_guard_common.sh"
+  cp "$STATE_COMMON" "$WT_M/rd-workflow/scripts/_state_common.sh"
+  printf '%s\n' "# Current Task" "" "## Status" "구현 중" > "$WT_M/CURRENT_TASK.md"
+  printf '%s\n' "# Request" > "$WT_M/REQUEST.md"
+  printf '%s\n' "# Current Task" > "$WT_O/CURRENT_TASK.md"
+  local g="git -c user.name=t -c user.email=t@t -c commit.gpgsign=false"
+  $g -C "$WT_M" init -q . >/dev/null 2>&1 || return 1
+  $g -C "$WT_M" add -A >/dev/null 2>&1 && $g -C "$WT_M" commit -q -m init >/dev/null 2>&1 || return 1
+  $g -C "$WT_M" worktree add -q "$WT_W" -b w >/dev/null 2>&1 || return 1
+  $g -C "$WT_O" init -q . >/dev/null 2>&1 || return 1
+  FX_LIST+=("$WT_ROOT")
+}
+
+# run_wt_scenario <번호> <이름> <입력 cwd> <file_path> <기대 exit> [stderr 에 있어야 할 문자열]
+# M 의 hook 으로 subagent 입력을 실행한다. stderr 를 잡아 판정 기준 worktree 줄을 확인한다.
+run_wt_scenario() {
+  local num="$1" name="$2" cwd="$3" fp="$4" expected="$5" want_err="${6:-}"
+  local payload err rc=0
+  payload="{\"agent_id\":\"agent_abc123\",\"cwd\":\"$(json_str "$cwd")\",\"tool_input\":{\"file_path\":\"$(json_str "$fp")\"}}"
+  err="$(printf '%s' "$payload" | bash "$WT_M/rd-workflow/scripts/hooks/implementation_gate.sh" 2>&1 >/dev/null)" || rc=$?
+  local label="[${MODE:-jq}] scenario ${num}: ${name}"
+  if [[ "$rc" == "$expected" ]] && { [[ -z "$want_err" ]] || [[ "$err" == *"$want_err"* ]]; }; then
+    echo "[PASS] $label (exit=$rc)"
+    PASS=$((PASS + 1))
+  else
+    echo "[FAIL] $label — expected exit=$expected actual=$rc, stderr 기대='${want_err}' 실제='${err}'" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 # fixture_for <status> <autopilot> <with_state> → 경로를 stdout 으로, 모르는 조합은 rc 1
 fixture_for() {
   case "$1|$2|$3" in
@@ -442,6 +481,17 @@ run_scenario 47 "subagent + 해독할 수 없는 이스케이프(\\x) → 차단
   "구현 중" "no" 'raw:{F}/\x.md' 2 "agent_abc123"
 # 48 은 fail-closed 의 오차단을 막는다. 해독기가 첫 줄에서 답을 내고 바로 끝나면 큰 후행 필드를 쓰던
 # 생산자가 SIGPIPE 를 받고, hook 의 pipefail 이 그것을 해독 실패로 읽어 정상 경로를 막는다.
+# 49~51 은 판정 루트를 편집 대상이 속한 worktree 로 옮기는 계약이다 (gate-hook-root-from-cwd).
+# 49: hook 은 M 의 것이지만 세션 cwd·대상이 W 이면 W 기준으로 차단하고 그 worktree 를 알린다.
+_wt_phys="$(cd -P "$WT_W" && pwd -P)"
+run_wt_scenario 49 "subagent + cwd=W + W/CURRENT_TASK.md → 차단, 판정 기준 worktree 안내" \
+  "$WT_W" "$WT_W/CURRENT_TASK.md" 2 "판정 기준 worktree: ${_wt_phys}"
+# 50: 현재 폴더(M)와 다른 worktree 의 파일을 절대 경로로 건드려도 대상 기준으로 차단한다.
+run_wt_scenario 50 "subagent + cwd=M + W/CURRENT_TASK.md → 차단 (cwd 와 다른 worktree)" \
+  "$WT_M" "$WT_W/CURRENT_TASK.md" 2 "판정 기준 worktree: ${_wt_phys}"
+# 51: 다른 저장소의 같은 이름 파일은 이 프로젝트 gate 대상이 아니다.
+run_wt_scenario 51 "subagent + cwd=M + 다른 저장소 O/CURRENT_TASK.md → 통과" \
+  "$WT_M" "$WT_O/CURRENT_TASK.md" 0
 run_scenario 48 "subagent + 여러 줄 JSON·큰 후행 content + 차단 집합 밖 경로 → 통과" \
   "구현 중" "no" "{F}/src/ok.md" 0 "__PRETTYBIG__"
 }

@@ -66,19 +66,25 @@ case "${FAKE_HC:-notfound}" in
   *) cat "$FAKE_HC"; exit 0 ;;
 esac
 FAKE
-chmod +x "$BIN/herdr" "$BIN/ps" "$BIN/lsof" "$BIN/hc"
+# 대역 orca: `orca agent show <id> --json` 만 흉내낸다. FAKE_ORCA 파일 내용을 그대로 낸다.
+cat > "$BIN/orca" <<'FAKE'
+#!/usr/bin/env bash
+echo "orca $1 $2" >> "$FAKE_CALLS"
+cat "$FAKE_ORCA"; exit 0
+FAKE
+chmod +x "$BIN/herdr" "$BIN/ps" "$BIN/lsof" "$BIN/hc" "$BIN/orca"
 # fakes_reset: 케이스마다 대역 상태를 기본값(에이전트 없음·claude 프로세스 없음·이름 조회 부재)으로 되돌린다.
 fakes_reset() {
   export FAKE_CALLS="$TMP/calls" FAKE_LIST="$TMP/fake.list" FAKE_PS="$TMP/fake.ps" FAKE_LSOF="$TMP/fake.lsof"
   : > "$FAKE_CALLS"; : > "$FAKE_PS"; : > "$FAKE_LSOF"
   echo '{"result":{"agents":[]}}' > "$FAKE_LIST"
-  unset FAKE_LIST_SLEEP FAKE_PS_SLEEP FAKE_LSOF_SLEEP FAKE_GET_OUT FAKE_HC T_HERDR_ENV T_TIMEOUT T_HC
+  unset FAKE_LIST_SLEEP FAKE_PS_SLEEP FAKE_LSOF_SLEEP FAKE_GET_OUT FAKE_HC FAKE_ORCA T_HERDR_ENV T_TIMEOUT T_HC T_ORCA
 }
 fakes_reset
 # 조회 상한 기본값은 30초다. 대역은 즉시 답하므로 정상 경로는 기다리지 않는다. 5초였을 때 동시 실행 부하에서
 # 대역 herdr 기동만으로 상한을 넘겨 「agent list 시간 초과」 로 판정이 바뀐 적이 있다(R8, 2026-11-07).
 # 시간 초과 자체를 보는 사례(R7·R17)는 T_TIMEOUT 을 짧게 따로 준다.
-run() { OUT="$(cd "$R" && PATH="$TMP/bin:$PATH" HERDR_ENV="${T_HERDR_ENV-1}" HC_TERMINAL_ID="${T_HC-}" RD_LAUNCH_TIMEOUT="${T_TIMEOUT:-30}" bash "$H" 2>&1)"; RC=$?; FIRST="${OUT%%$'\n'*}"; }
+run() { OUT="$(cd "$R" && PATH="$TMP/bin:$PATH" HERDR_ENV="${T_HERDR_ENV-1}" HC_TERMINAL_ID="${T_HC-}" ORCA_AGENT_SESSION_ID="${T_ORCA-}" ORCA_TERMINAL_HANDLE= RD_LAUNCH_TIMEOUT="${T_TIMEOUT:-30}" bash "$H" 2>&1)"; RC=$?; FIRST="${OUT%%$'\n'*}"; }
 check() { # name expected-first expected-rc
   if [ "$FIRST" = "$2" ] && [ "$RC" -eq "$3" ]; then pass "$1"; else fail "$1 (first='$FIRST' rc=$RC, expected '$2' rc=$3)"; fi
 }
@@ -311,6 +317,18 @@ new_repo; mk_hc a; hc_json '{"state":"starting","cwd":"/x"}'; T_HC=t1 run
 has "H10a 사유" "종료 판정 불가: hc get 응답 형식 이상"
 new_repo; mk_hc a; hc_json '{"cwd":"/x"}'; T_HC=t1 run
 has "H10b 사유" "종료 판정 불가: hc get 응답 형식 이상"
+
+# --- O: Orca 로 기동한 작업 (change spec D5). 색인 줄에 launch-backend=orca·launch-tab 을 붙인다.
+mk_orca() { mk "$1" ok "구현 중"; sed "\$s/\$/${TAB}launch-backend=orca${TAB}launch-tab=structured-agent-session-s1/" "$R/.git/rd-workflow/tasks.local" > "$TMP/idx.orca" && cp "$TMP/idx.orca" "$R/.git/rd-workflow/tasks.local"; }
+orca_json() { printf '%s' "$1" > "$TMP/fake.orca"; export FAKE_ORCA="$TMP/fake.orca"; }
+# O1 orca 종료(places: []) — herdr 없음이어도 hc 와 같은 종료 코드로 후보가 된다
+new_repo; mk_orca a; orca_json '{"ok":true,"result":{"places":[]}}'; T_HERDR_ENV="" T_ORCA=s1 run
+check "O1 orca 종료 → select" "select${TAB}a${TAB}$R/wt/a" 0
+has "O1 orca info 줄(Orca 문구)" "info${TAB}a${TAB}대화형 세션 종료 확인(launch=ok, Orca·프로세스 어디에도 세션 없음)"
+# O2 orca 생존(places 에 그 worktree) → 제외
+new_repo; mk_orca a; orca_json "{\"ok\":true,\"result\":{\"places\":[{\"worktreeId\":\"r::$R/wt/a\"}]}}"; T_HERDR_ENV="" T_ORCA=s1 run
+check "O2 orca 생존 → 제외" "none" 0
+has "O2 생존 사유" "대화형 세션 살아 있음("
 
 [ "$FAIL" -eq 0 ] && echo "ALL PASS" || echo "FAILURES"
 exit "$FAIL"

@@ -162,8 +162,8 @@ source Issue 가 github.com 이 아닌 호스트(GitHub Enterprise)에 있으면
 | 발행 방식 | 닫는 주체와 시점 | 확인 방법 |
 | --- | --- | --- |
 | 기본 브랜치에 직접 push (`archive.sh` 기본) | push 직후 `archive.sh` 가 `issue_queue.sh close-fr` 로 반영 커밋 댓글을 달고 닫습니다 | 발행 출력의 「Issue 를 닫았습니다」·「이미 닫혀 있어 건너뜁니다」 줄. 실패하면 경고와 재실행 명령이 나옵니다 |
-| PR 발행 (`archive_publish=pr`) | `archive.sh` 는 닫지 않습니다. PR 본문 끝의 `Closes <값>` 줄이 올바른 Issue 참조이면, PR 이 기본 브랜치로 merge 될 때 GitHub 가 그 Issue 를 닫습니다([GitHub 문서: PR 과 Issue 연결](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue)) | PR 본문의 `Closes` 줄, merge 뒤 Issue 상태 |
+| PR 발행 (`archive_publish=pr`) | `archive.sh` 는 닫지 않습니다. PR 본문 끝의 `Closes <값>` 줄이 올바른 Issue 참조이면, PR 이 기본 브랜치로 merge 될 때 GitHub 가 그 Issue 를 닫습니다([GitHub 문서: PR 과 Issue 연결](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue)) | 발행 출력의 `rd pr: WARNING` 줄, merge 뒤 Issue 상태 |
 | 로컬 전용 모드 | 닫지 않습니다 | — |
 
-- 두 발행 경로는 같은 형식 검사(`issue_queue.sh issue-refs`)를 씁니다. 값의 조각 하나라도 형식이 어긋나면 직접 push 경로는 어느 Issue 도 건드리지 않고, PR 발행 경로는 PR 본문에 `Closes` 줄을 하나도 넣지 않습니다. 직접 push 경로와 overlay 의 `rd pr open` 은 틀린 조각을 알립니다. 직접 설치 PR 발행(`archive_publish=pr`)은 아직 이 경고를 화면에 내지 않으므로, PR 을 올린 뒤 PR 본문에 `Closes` 줄이 있는지 확인합니다. 경고를 보거나 `Closes` 줄이 없으면 상세의 `github-issue` 를 고치고 PR 본문에 `Closes` 줄을 직접 더합니다.
+- 두 발행 경로는 같은 형식 검사(`issue_queue.sh issue-refs`)를 씁니다. 값의 조각 하나라도 형식이 어긋나면 직접 push 경로는 어느 Issue 도 건드리지 않고, PR 발행 경로는 PR 본문에 `Closes` 줄을 하나도 넣지 않습니다. 직접 push 경로, 직접 설치 PR 발행(`archive_publish=pr`), `rd pr open` 은 모두 틀린 조각을 화면에 알립니다. PR 발행 경로는 「PR 본문에 Closes 줄을 넣지 않았습니다」 줄도 함께 냅니다. 경고를 보면 상세의 `github-issue` 를 먼저 고칩니다. 그다음 직접 push 경로는 발행 출력의 `재실행:` 명령을 실행하고, PR 발행 경로는 PR 본문에 `Closes` 줄을 직접 더합니다.
 - 사람이 닫는 경우: 이미 `done`·`dropped` 인 FR 에 중복 보고를 연결했을 때입니다. 그 FR 로 발행할 작업이 다시 없으므로 자동으로 닫히지 않습니다. 연결한 사람이 Issue 를 직접 닫습니다.

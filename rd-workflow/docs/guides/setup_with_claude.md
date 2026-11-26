@@ -73,19 +73,18 @@ bash rd-workflow/scripts/install_claude_skills.sh project
 
 ### 5. 리뷰 도구 감지
 
-외부 리뷰 도구(Codex, Gemini CLI)가 설치되어 있는지 확인합니다.
+외부 리뷰 도구(Codex)가 설치되어 있는지 확인합니다.
 
 ```bash
 command -v codex &>/dev/null && echo "codex: 설치됨" || echo "codex: 없음"
-command -v gemini &>/dev/null && echo "gemini: 설치됨" || echo "gemini: 없음"
 ```
 
-**하나 이상 설치된 경우:** "리뷰 도구가 감지되었습니다. 교차 리뷰가 가능합니다." 안내 후 다음 단계로 진행.
+**설치된 경우:** "리뷰 도구가 감지되었습니다. 교차 리뷰가 가능합니다." 안내 후 다음 단계로 진행.
 
-**모두 없는 경우:** 아래 메시지를 출력합니다.
+**없는 경우:** 아래 메시지를 출력합니다.
 
 ```
-외부 리뷰 도구(Codex, Gemini CLI)가 감지되지 않았습니다.
+외부 리뷰 도구(Codex)가 감지되지 않았습니다.
 현재 상태에서도 Claude self-review로 동작하지만,
 다른 모델로 교차 리뷰하면 품질이 크게 올라갑니다.
 ```

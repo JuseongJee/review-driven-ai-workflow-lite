@@ -649,9 +649,13 @@ git -C "$fx" checkout -q main
 # 체크아웃된 작업 worktree: 커밋된 값(대기 중)이 아니라 파일 값(구현 중)을 읽어야 한다. FR 2건(| 구분).
 git -C "$fx" worktree add -q -b fr/wt "$fx/wt" >/dev/null 2>&1
 ip_ts "$fx/wt/$TS" "구현 중" "$I/2026-04-01-wa.md|$I/2026-04-01-wb.md"
-# active.tsv: 2번째 칸이 빈 줄, 이미 나온 stem(wa) 은 task-state 단계를 유지
+# active.tsv: 2번째 칸이 빈 줄, 이미 나온 stem(wa) 은 task-state 단계를 유지.
+# 로컬 브랜치 fr/gone 이 없는 줄은 낡은 줄이라 내지 않는다(pick.py 의 stale 기준).
+# 낡은 줄이 같은 FR(solo)을 맡은 살아 있는 줄보다 앞에 있어도 stem 을 차지하지 않아 살아 있는 줄(s9)로 나온다.
+# fr/s9 는 tip task-state 가 대기 중이라 ② 에서는 나오지 않고 ③ 으로만 나온다.
+git -C "$fx" branch fr/s9
 mkdir -p "$fx/rd-workflow-workspace/.lifecycle/fr-do"
-printf 's9\t\t2026-04-01-solo\nwt\trd/x.sh\t2026-04-01-wa;2026-04-01-pr\n' > "$fx/rd-workflow-workspace/.lifecycle/fr-do/active.tsv"
+printf 'gone\t\t2026-04-01-gone;2026-04-01-solo\ns9\t\t2026-04-01-solo\nwt\trd/x.sh\t2026-04-01-wa;2026-04-01-pr\n' > "$fx/rd-workflow-workspace/.lifecycle/fr-do/active.tsv"
 ip_out="$(bash "$TARGET" in-progress --root "$fx" 2>&1 | LC_ALL=C sort)"
 ip_exp="$(printf '2026-04-01-pr\tPR 검토 중\n2026-04-01-solo\t/fr do 줄기 s9\n2026-04-01-wa\t구현 중\n2026-04-01-wb\t구현 중\n' | LC_ALL=C sort)"
 check "in-progress 출력" "$ip_exp" "$ip_out"

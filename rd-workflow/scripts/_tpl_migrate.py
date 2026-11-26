@@ -1,4 +1,4 @@
-"""migrate 하위 명령 — 마이그레이션 M000~M018 (spec 4.6).
+"""migrate 하위 명령 — 마이그레이션 M000~M019 (spec 4.6).
 
 `migrate pre|post|<Mxxx> [--decide '<제목>=adopt|keep|defer']...`
 항목마다 첫 줄 `<Mxxx><TAB><APPLIED|NOOP|ASK|NOTICE|FAIL><TAB><한 줄 요약>`, 그 아래 세부 줄은 두 칸 들여씁니다.
@@ -581,6 +581,7 @@ _N012 = _notice("M012", "2026-09-06", "기본 실행 모드 semi-auto 전환 —
 _N016 = _notice("M016", "2026-11-07", "자기 worktree 삭제 가드 — MIGRATIONS.md M016 안내를 읽으십시오 (등록은 M005·M003 이 처리)")
 _N017 = _notice("M017", "2026-11-08", "/fr batch 별칭화 — MIGRATIONS.md M017 안내를 읽으십시오")
 _N018 = _notice("M018", "2026-11-16", "마감 때 팀 저장소 PR 단계·기본 반영 방식 pr — MIGRATIONS.md M018 안내를 읽으십시오 (설정 파일은 자동으로 쓰지 않음)")
+_N019 = _notice("M019", "2026-11-21", "구현 subagent 모델·effort 표시 hook — MIGRATIONS.md M019 안내를 읽으십시오 (등록은 M003 이 처리)")
 
 REGISTRY: dict = {
     "M000": _entry("procedure", "pre", None, detect=_m000),
@@ -602,11 +603,12 @@ REGISTRY: dict = {
     "M016": _entry("notice", "post", "2026-11-07", notice=_N016),
     "M017": _entry("mixed", "post", "2026-11-08", detect=_m017_detect, notice=_N017),
     "M018": _entry("notice", "post", "2026-11-16", notice=_N018),
+    "M019": _entry("notice", "post", "2026-11-21", notice=_N019),
 }
 
 PRE_ORDER = ["M000", "M001", "M002", "M005", "M008", "M003", "M015", "M009"]
 POST_DETECT = ["M004", "M013", "M011", "M014", "M017"]
-POST_NOTICE = ["M006", "M007", "M010", "M011", "M012", "M016", "M017", "M018"]
+POST_NOTICE = ["M006", "M007", "M010", "M011", "M012", "M016", "M017", "M018", "M019"]
 
 
 # ---------------------------------------------------------------- 실행

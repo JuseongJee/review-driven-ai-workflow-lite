@@ -617,7 +617,9 @@ cmd_readiness() {
 # 지연 정리를 하므로 `/fr list` 가 부르지 않고, 같은 출처(task-state)를 여기서 직접 읽는다.
 #   ① 체크아웃마다(기본 체크아웃 포함) 그 체크아웃의 task-state 파일
 #   ② 체크아웃되지 않은 `fr/*` 브랜치의 tip task-state
-#   ③ `/fr do` 의 active.tsv 3번째 칸 — ①② 에서 나오지 않은 stem 만, 단계는 `/fr do 줄기 <slug>`
+#   ③ `/fr do` 의 active.tsv 3번째 칸 — ①② 에서 나오지 않은 stem 만, 단계는 `/fr do 줄기 <slug>`.
+#      `fr_do/pick.py` 와 같은 기준으로, 로컬 브랜치 `fr/<slug>` 가 없다고 git 이 답한(rc 1)
+#      줄은 낡은 줄이라 내지 않는다. 그 밖의 git 실패는 진행 중으로 둔다.
 # status 가 `대기 중`·`완료`·빈 값이면 진행 중이 아니다. 같은 stem 은 처음 나온 것만 낸다.
 IP_BUF=""
 IP_SEEN=" "
@@ -638,7 +640,7 @@ ip_emit_state() { # ip_emit_state <task-state 내용>
 }
 
 cmd_in_progress() {
-  local porc line wt="" main="" checked=" " ref slug stem ts
+  local porc line wt="" main="" checked=" " ref slug stem ts gone=" " live=" " rc
   porc="$(git -C "$ROOT" worktree list --porcelain 2>/dev/null)" \
     || { echo "fr_relations.sh: git worktree list 실패 (root=${ROOT})" >&2; return 2; }
   while IFS= read -r line; do
@@ -668,6 +670,16 @@ EOF
     while IFS="$(printf '\034')" read -r slug stem; do
       valid_stem "$stem" || continue
       case "$IP_SEEN" in *" $stem "*) continue ;; esac
+      # 한 줄의 stem 이 여러 개면 같은 slug 를 다시 묻지 않도록 판정을 기억한다.
+      case "$gone" in *" $slug "*) continue ;; esac
+      case "$live" in
+        *" $slug "*) ;;
+        *)
+          rc=0
+          git -C "$ROOT" show-ref --verify --quiet "refs/heads/fr/${slug}" </dev/null 2>/dev/null || rc=$?
+          if [ "$rc" -eq 1 ]; then gone="${gone}${slug} "; continue; fi
+          live="${live}${slug} " ;;
+      esac
       IP_SEEN="${IP_SEEN}${stem} "
       IP_BUF="${IP_BUF}${stem}	/fr do 줄기 ${slug}
 "

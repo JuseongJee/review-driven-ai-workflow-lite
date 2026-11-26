@@ -14,6 +14,7 @@ trap _on_exit EXIT
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export HERDR_ENV=
+export ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE=
 export RD_CHILD_SESSION=1
 unset project_root TASK_STATE_PATH
 
@@ -159,17 +160,49 @@ if [[ "$ARCH_RC" == 0 && ! -d "$CASE_WT" ]] && ! git -C "$CASE_REPO" rev-parse -
 else
   fail "W1: rc=$ARCH_RC worktree=$([[ -d "$CASE_WT" ]] && echo 있음 || echo 없음) — $ARCH_OUT"
 fi
+if [[ "$ARCH_RC" == 0 && "$ARCH_OUT" == *"안내 — 반영 방식 manual 인 submodule 의 발행 gitlink 가 팀 기본 브랜치에 없는 커밋입니다"* \
+   && "$ARCH_OUT" == *"- libs/prod: "*"origin/main 에 없습니다"* && "$ARCH_OUT" == *"fetch origin refs/heads/main && git -C "*"checkout --no-overwrite-ignore --detach FETCH_HEAD"* && "$ARCH_OUT" == *"git --literal-pathspecs -C $CASE_REPO commit -m "*" -- libs/prod"* && "$ARCH_OUT" == *"workflow.json 의 team_publish.mode 를 pr 로"* \
+   && "$ARCH_OUT" == *"team_publish.mode 를 pr 로 바꾸면"* ]]; then
+  pass "W1: manual gitlink 가 팀 main 밖 — 발행 성공과 발행 끝 안내"
+else
+  fail "W1: 발행 끝 안내 — rc=$ARCH_RC $ARCH_OUT"
+fi
+if [[ "$(grep -c "안내 — 반영 방식 manual" <<<"$ARCH_OUT")" == 1 ]]; then pass "W1: 안내는 한 번"; else fail "W1: 안내 횟수 — $ARCH_OUT"; fi
 
 echo "== W1c: 발행 뒤 기본 worktree 의 prod 체크아웃이 발행 gitlink 와 같고 merge 메시지에 autopilot 이 없다 =="
 w1_gl="$(git -C "$CASE_REPO" ls-tree -r HEAD libs/prod | awk '{print $3}')"
 w1_co="$(git -C "$CASE_REPO/libs/prod" rev-parse HEAD)"
 w1_st="$(git -C "$CASE_REPO" status --porcelain)"
 w1_msgs="$(git -C "$CASE_REPO" log --first-parent --format=%s -6)"
-if [[ -n "$w1_gl" && "$w1_gl" == "$w1_co" && -z "$w1_st" && "$ARCH_OUT" == *"체크아웃을 발행된 커밋으로 맞췄습니다"* ]] \
+# 팀 원격에 push 한 커밋이므로 기본 체크아웃 submodule 에 rd-archive 브랜치를 만들지 않는다(FR archive-carry-worktree-submodule-commits).
+w1_br="$(git -C "$CASE_REPO/libs/prod" for-each-ref --format='%(refname)' refs/heads/rd-archive)"
+if [[ -n "$w1_gl" && "$w1_gl" == "$w1_co" && -z "$w1_st" && -z "$w1_br" && "$ARCH_OUT" == *"체크아웃을 발행된 커밋으로 맞췄습니다"* ]] \
    && grep -qxF "merge: w1 (archive)" <<<"$w1_msgs" && ! grep -q autopilot <<<"$w1_msgs"; then
-  pass "W1c: 체크아웃=gitlink, status 깨끗, merge 메시지 'merge: w1 (archive)'"
+  pass "W1c: 체크아웃=gitlink, status 깨끗, rd-archive 브랜치 없음, merge 메시지 'merge: w1 (archive)'"
 else
-  fail "W1c: gitlink=$w1_gl checkout=$w1_co status=[$w1_st] msgs=[$w1_msgs] — $ARCH_OUT"
+  fail "W1c: gitlink=$w1_gl checkout=$w1_co status=[$w1_st] rd-archive=[$w1_br] msgs=[$w1_msgs] — $ARCH_OUT"
+fi
+
+echo "== W1t: submodule 커밋을 팀 원격에 태그로만 push, 기본 체크아웃엔 객체만 미리 받음 — rd-archive 브랜치를 만들지 않고 worktree 를 지운다 =="
+# 릴리스 태그로만 push 한 커밋은 원격 추적 ref 가 없다. 작업 쪽 submodule 의 태그를 보지 않으면 이미 팀 원격에 있는 커밋에 브랜치를
+#   만들고 push 하라고 안내한다(AC2 의 부정 조건). 기본 체크아웃에 커밋 객체를 태그 없이 미리 받아 두어, 발행이 커밋을 옮기지 않는
+#   경로에서도 같은 판정을 하는지 본다(옮기는 경로는 W1c·W3b 가 지난다).
+prep_case w1t
+sub_commit "$CASE_WT"
+git -C "$CASE_WT/libs/prod" tag -a w1t-rel -m w1t-rel
+git -C "$CASE_WT/libs/prod" push -q origin refs/tags/w1t-rel
+record_gitlink "$CASE_WT"
+w1t_gl="$(git -C "$CASE_WT" ls-tree HEAD libs/prod | awk '{print $3}')"
+git -C "$CASE_REPO/libs/prod" fetch -q --no-tags origin "$w1t_gl"
+[[ -z "$(git -C "$CASE_REPO/libs/prod" for-each-ref --contains "$w1t_gl")" ]] || { echo "준비 실패: w1t 기본 쪽 ref" >&2; exit 1; }
+run_archive "$CASE_REPO" w1t
+w1t_co="$(git -C "$CASE_REPO/libs/prod" rev-parse HEAD)"
+w1t_br="$(git -C "$CASE_REPO/libs/prod" for-each-ref --format='%(refname)' refs/heads/rd-archive)"
+if [[ "$ARCH_RC" == 0 && -n "$w1t_gl" && "$w1t_co" == "$w1t_gl" && -z "$w1t_br" && ! -d "$CASE_WT" \
+   && "$ARCH_OUT" != *"팀 원격에 없어"* ]]; then
+  pass "W1t: rc=0, 체크아웃=gitlink, rd-archive 브랜치·push 안내 없음, worktree 제거"
+else
+  fail "W1t: rc=$ARCH_RC gitlink=$w1t_gl checkout=$w1t_co rd-archive=[$w1t_br] worktree=$([[ -d "$CASE_WT" ]] && echo 있음 || echo 없음) — $ARCH_OUT"
 fi
 echo "== W1b: 작업 worktree 안에서 archive → 기본 체크아웃 rd task list 가 정리 =="
 prep_case w1b
@@ -192,54 +225,40 @@ else
   fi
 fi
 
-echo "== W3b: submodule 커밋을 push 하지 않음 =="
+echo "== W3b: submodule 커밋을 push 하지 않음 — 발행이 기본 체크아웃 submodule 로 옮기고 브랜치로 남긴 뒤 worktree 를 지운다 =="
+# FR archive-carry-worktree-submodule-commits: 커밋이 작업 worktree 전용 submodule 저장소에만 있으면 submodule update 가
+#   `not our ref` 로 실패하고 기본 체크아웃이 ` M libs/prod` 로 남으며, 정리 판정이 worktree 를 계속 보존했다.
 prep_case w3b
 sub_commit "$CASE_WT"; record_gitlink "$CASE_WT"
+w3b_gl="$(git -C "$CASE_WT" ls-tree HEAD libs/prod | awk '{print $3}')"
 run_archive "$CASE_REPO" w3b
-if [[ -d "$CASE_WT" && "$ARCH_OUT" == *"원격에 없는 커밋"* && "$ARCH_OUT" == *"log --oneline --all --not --remotes"* ]]; then
-  pass "W3b: worktree 보존, 사유·복구 명령 출력"
+w3b_co="$(git -C "$CASE_REPO/libs/prod" rev-parse HEAD)"
+w3b_br="$(git -C "$CASE_REPO/libs/prod" rev-parse -q --verify refs/heads/rd-archive/w3b || true)"
+w3b_st="$(git -C "$CASE_REPO" status --porcelain)"
+if [[ "$ARCH_RC" == 0 && -n "$w3b_gl" && "$w3b_co" == "$w3b_gl" && "$w3b_br" == "$w3b_gl" && -z "$w3b_st" && ! -d "$CASE_WT" \
+   && "$ARCH_OUT" == *"브랜치 rd-archive/w3b 로 남겼습니다"* && "$ARCH_OUT" == *"libs/prod push --no-follow-tags origin rd-archive/w3b"* \
+   && "$ARCH_OUT" != *"정리 잔여 있음"* ]]; then
+  pass "W3b: rc=0, 기본 체크아웃 submodule HEAD=gitlink=rd-archive/w3b, status 깨끗, worktree 제거, 브랜치·push 안내"
 else
-  fail "W3b: worktree=$([[ -d "$CASE_WT" ]] && echo 있음 || echo 없음) — $ARCH_OUT"
+  fail "W3b: rc=$ARCH_RC gitlink=$w3b_gl checkout=$w3b_co branch=$w3b_br status=[$w3b_st] worktree=$([[ -d "$CASE_WT" ]] && echo 있음 || echo 없음) — $ARCH_OUT"
 fi
 
-if [[ "$ARCH_RC" == 0 && "$ARCH_OUT" == *"[submodule]"* && "$ARCH_OUT" == *"체크아웃 갱신 실패"* && "$ARCH_OUT" == *"archive: core 완료 (정리 잔여 있음)"* ]]; then
-  pass "W3: gitlink 커밋을 가져올 수 없으면 rc=0, [submodule] 갱신 실패 잔여, core 완료"
+echo "== W3: gitlink 커밋을 이 컴퓨터에서 옮길 수 없으면 rc=0, 갱신 실패 잔여, worktree 보존 =="
+# 로컬 전송(file)을 막아 옮기기와 원격 fetch 가 모두 실패하게 한다. archive 가 체크아웃 갱신 실패를 정리 잔여로 남기고,
+#   정리 판정이 기본 체크아웃에 없는 커밋을 미push 로 보고 worktree 를 보존하는 연결을 본다.
+prep_case w3
+sub_commit "$CASE_WT"; record_gitlink "$CASE_WT"
+GIT_CONFIG_VALUE_0=never run_archive "$CASE_REPO" w3
+if [[ "$ARCH_RC" == 0 && "$ARCH_OUT" == *"기본 체크아웃 submodule 로 옮기지 못했습니다"* && "$ARCH_OUT" == *"[submodule]"* \
+   && "$ARCH_OUT" == *"체크아웃 갱신 실패"* && "$ARCH_OUT" == *"archive: core 완료 (정리 잔여 있음)"* \
+   && -d "$CASE_WT" && "$ARCH_OUT" == *"원격에 없는 커밋"* && "$ARCH_OUT" == *"log --oneline --all --not --remotes"* ]] \
+   && ! git -C "$CASE_REPO/libs/prod" rev-parse -q --verify refs/heads/rd-archive/w3 >/dev/null; then
+  pass "W3: rc=0, 옮기지 못함 안내, [submodule] 갱신 실패 잔여, worktree 보존·사유·복구 명령, core 완료"
 else
-  fail "W3: rc=$ARCH_RC — $ARCH_OUT"
+  fail "W3: rc=$ARCH_RC worktree=$([[ -d "$CASE_WT" ]] && echo 있음 || echo 없음) — $ARCH_OUT"
 fi
 
-echo "== W3c: submodule 커밋을 push 했지만 gitlink 는 올리지 않음 =="
-prep_case w3c
-echo work > "$CASE_WT/work.txt"; git -C "$CASE_WT" add work.txt; git -C "$CASE_WT" commit -q -m "구현: work"
-sub_commit "$CASE_WT"; sub_push "$CASE_WT"
-run_archive "$CASE_REPO" w3c
-if [[ -d "$CASE_WT" && "$ARCH_OUT" == *"gitlink 로 올리지 않은 커밋"* ]]; then
-  pass "W3c: worktree 보존, gitlink 미반영 사유 출력"
-else
-  fail "W3c: worktree=$([[ -d "$CASE_WT" ]] && echo 있음 || echo 없음) — $ARCH_OUT"
-fi
-
-echo "== W3d: 중첩 submodule(libs/prod/vendor) 안 미추적 파일 — 모든 깊이 검사 =="
-prep_case w3d
-sub_commit "$CASE_WT"; sub_push "$CASE_WT"; record_gitlink "$CASE_WT"
-echo scratch > "$CASE_WT/libs/prod/vendor/untracked.txt"
-run_archive "$CASE_REPO" w3d
-if [[ -d "$CASE_WT" && "$ARCH_OUT" == *"미커밋 변경"* ]]; then
-  pass "W3d: worktree 보존, 미커밋 변경 사유 출력"
-else
-  fail "W3d: worktree=$([[ -d "$CASE_WT" ]] && echo 있음 || echo 없음) — $ARCH_OUT"
-fi
-
-echo "== W3e: submodule 커밋·push 후 상위에서 gitlink 를 스테이징만 하고 커밋하지 않음 =="
-prep_case w3e
-echo work > "$CASE_WT/work.txt"; git -C "$CASE_WT" add work.txt; git -C "$CASE_WT" commit -q -m "구현: work"
-sub_commit "$CASE_WT"; sub_push "$CASE_WT"; git -C "$CASE_WT" add libs/prod
-run_archive "$CASE_REPO" w3e
-if [[ -d "$CASE_WT" && "$ARCH_OUT" == *"미커밋 변경"* ]]; then
-  pass "W3e: worktree 보존, 스테이징만 된 gitlink 를 미커밋 변경으로 안내"
-else
-  fail "W3e: worktree=$([[ -d "$CASE_WT" ]] && echo 있음 || echo 없음) — $ARCH_OUT"
-fi
+# W3c·W3d·W3e 는 보존 판정 함수를 직접 부른다 — 공용 함수를 source 한 뒤인 U 구간 뒤에 있다.
 
 # ---- 팀 저장소 반영 게이트 (change spec D10) · Step 4 PR 기록 정리 ----
 PR_CFG='{"team_publish": {"mode": "pr"}}'
@@ -259,12 +278,35 @@ else
 fi
 
 echo "== t_gate_fetch_fail: 팀 저장소 원격을 가져올 수 없으면 판정 불가로 거부한다 (fail-closed) =="
+tg1_url="$(git -C "$CASE_WT/libs/prod" remote get-url origin)"
 git -C "$CASE_WT/libs/prod" remote set-url origin "$TMP/tg1/missing.git"  # 게이트는 작업 worktree 의 submodule 로 판정한다
 run_archive "$CASE_REPO" tg1
 if [[ "$ARCH_RC" != 0 && "$ARCH_OUT" == *"가져오지 못해"* && "$(gate_main_head)" == "$tg1_before" ]]; then
   pass "t_gate_fetch_fail: 거부, 판정 불가 사유 출력"
 else
   fail "t_gate_fetch_fail: rc=$ARCH_RC — $ARCH_OUT"
+fi
+
+echo "== t_gate_bypass_audit: --allow-unpublished-submodule 은 사유 필수이고 audit 에 [team-publish] 를 남긴다 =="
+# t_gate_rejects_unpublished 의 거부된 상태를 이어 쓴다(promote 한 번을 아낀다 — archive 두 번은 종전과 같다). 원격 주소를 되돌려
+# 거부 사유를 「반영되지 않음」 으로 맞춘 뒤 우회한다.
+git -C "$CASE_WT/libs/prod" remote set-url origin "$tg1_url"
+tg3_rc=0
+tg3_out="$( cd "$CASE_REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task tg1 --no-remote --force-skip-review-check 테스트 \
+  --allow-status-mismatch 테스트 --allow-unpublished-submodule 2>&1 )" || tg3_rc=$?
+if [[ "$tg3_rc" != 0 && "$tg3_out" == *"--allow-unpublished-submodule 사유 필수"* ]]; then
+  pass "t_gate_bypass_audit: 사유 누락은 차단"
+else
+  fail "t_gate_bypass_audit(사유 누락): rc=$tg3_rc — $tg3_out"
+fi
+tg3_rc=0
+tg3_out="$( cd "$CASE_REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task tg1 --no-remote --force-skip-review-check 테스트 \
+  --allow-status-mismatch 테스트 --allow-unpublished-submodule 팀저장소_사후반영 2>&1 )" || tg3_rc=$?
+tg3_audit="$(cat "$CASE_REPO/rd-workflow-workspace/.lifecycle/review-skip-audit.log" 2>/dev/null || true)"
+if [[ "$tg3_rc" == 0 && "$tg3_out" == *"팀 저장소 반영 검사 우회"* && "$tg3_audit" == *"[team-publish] 팀저장소_사후반영"* ]]; then
+  pass "t_gate_bypass_audit: 사유와 함께 우회, audit 에 [team-publish] 기록"
+else
+  fail "t_gate_bypass_audit: rc=$tg3_rc audit=[$tg3_audit] — $tg3_out"
 fi
 
 echo "== t_gate_passes_published: 팀 main 에 반영된 gitlink 는 통과한다 =="
@@ -277,27 +319,7 @@ if [[ "$ARCH_RC" == 0 && "$ARCH_OUT" != *"반영되지 않은"* ]] && grep -qxF 
 else
   fail "t_gate_passes_published: rc=$ARCH_RC — $ARCH_OUT"
 fi
-
-echo "== t_gate_bypass_audit: --allow-unpublished-submodule 은 사유 필수이고 audit 에 [team-publish] 를 남긴다 =="
-CASE_CFG="$PR_CFG" prep_case tg3
-sub_commit "$CASE_WT"; sub_push "$CASE_WT"; record_gitlink "$CASE_WT"
-tg3_rc=0
-tg3_out="$( cd "$CASE_REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task tg3 --no-remote --force-skip-review-check 테스트 \
-  --allow-status-mismatch 테스트 --allow-unpublished-submodule 2>&1 )" || tg3_rc=$?
-if [[ "$tg3_rc" != 0 && "$tg3_out" == *"--allow-unpublished-submodule 사유 필수"* ]]; then
-  pass "t_gate_bypass_audit: 사유 누락은 차단"
-else
-  fail "t_gate_bypass_audit(사유 누락): rc=$tg3_rc — $tg3_out"
-fi
-tg3_rc=0
-tg3_out="$( cd "$CASE_REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task tg3 --no-remote --force-skip-review-check 테스트 \
-  --allow-status-mismatch 테스트 --allow-unpublished-submodule 팀저장소_사후반영 2>&1 )" || tg3_rc=$?
-tg3_audit="$(cat "$CASE_REPO/rd-workflow-workspace/.lifecycle/review-skip-audit.log" 2>/dev/null || true)"
-if [[ "$tg3_rc" == 0 && "$tg3_out" == *"팀 저장소 반영 검사 우회"* && "$tg3_audit" == *"[team-publish] 팀저장소_사후반영"* ]]; then
-  pass "t_gate_bypass_audit: 사유와 함께 우회, audit 에 [team-publish] 기록"
-else
-  fail "t_gate_bypass_audit: rc=$tg3_rc audit=[$tg3_audit] — $tg3_out"
-fi
+if [[ "$ARCH_OUT" != *"팀 기본 브랜치와 비교"* && "$ARCH_OUT" != *"안내 — 반영 방식 manual"* ]]; then pass "t_gate_passes_published: pr 방식은 manual 안내 없음"; else fail "t_gate_passes_published: manual 안내가 나옴 — $ARCH_OUT"; fi
 
 echo "== t_gate_default_notice: team_publish 키가 없으면 거부 출력에 첫 실행 안내가 들어간다 =="
 CASE_CFG=none prep_case tg4
@@ -314,12 +336,22 @@ CASE_CFG="$PR_CFG" prep_case tg6
 sub_commit "$CASE_WT"; sub_push "$CASE_WT"; record_gitlink "$CASE_WT"
 printf '{"team_publish": {"mode": "manual"}}\n' > "$CASE_WT/rd-workflow/config/workflow.json"
 git -C "$CASE_WT" add rd-workflow/config/workflow.json; git -C "$CASE_WT" commit -q -m "설정: manual"
+# t_step4_clears_record 도 이 발행으로 본다(같은 발행 성공 경로 — promote·archive 한 번씩을 아낀다).
+tg5_rec="rd-workflow-workspace/.lifecycle/team-prs.tsv"
+printf 'path\trepo\tbranch\tbase\turl\thead-oid\tstate\tmerged-oid\tcommits\nlibs/prod\to/r\tb\tmain\thttps://example.invalid/pr/1\t0000000000000000000000000000000000000001\tmerged\t-\t1\n' > "$CASE_WT/$tg5_rec"
+git -C "$CASE_WT" add "$tg5_rec"; git -C "$CASE_WT" commit -q -m "기록: PR"
 run_archive "$CASE_REPO" tg6
 tg6_msgs="$(git -C "$CASE_REPO" log --first-parent --format=%s -8)"
 if [[ "$ARCH_RC" == 0 && "$ARCH_OUT" != *"반영되지 않은"* ]] && grep -qxF "merge: tg6 (archive)" <<<"$tg6_msgs"; then
   pass "t_gate_config_from_fr: fr tip 설정(manual)으로 통과"
 else
   fail "t_gate_config_from_fr: rc=$ARCH_RC — $ARCH_OUT"
+fi
+echo "== t_step4_clears_record: Step 4 baseline 커밋이 PR 기록 파일을 지운다 (t_gate_config_from_fr 의 발행) =="
+if [[ "$ARCH_RC" == 0 && ! -e "$CASE_REPO/$tg5_rec" ]] && ! git -C "$CASE_REPO" cat-file -e "HEAD:$tg5_rec" 2>/dev/null; then
+  pass "t_step4_clears_record: rc=0, 기본 브랜치에 기록 파일 없음"
+else
+  fail "t_step4_clears_record: rc=$ARCH_RC 파일=$([[ -e "$CASE_REPO/$tg5_rec" ]] && echo 있음 || echo 없음) — $ARCH_OUT"
 fi
 
 echo "== t_gate_uninit_sub: 작업 worktree 의 submodule 이 초기화되지 않았으면 원인을 밝히고 거부하며 overlay 저장소에 fetch·set-head 를 하지 않는다 =="
@@ -350,19 +382,6 @@ if [[ "$ARCH_RC" != 0 && "$ARCH_OUT" == *"libs/newsub"*"팀 저장소 origin/mai
   pass "t_gate_new_sub: 새 submodule 을 작업 worktree 에서 판정해 미반영 사유로 거부"
 else
   fail "t_gate_new_sub: rc=$ARCH_RC — $ARCH_OUT"
-fi
-
-echo "== t_step4_clears_record: Step 4 baseline 커밋이 PR 기록 파일을 지운다 =="
-prep_case tg5
-sub_commit "$CASE_WT"; sub_push "$CASE_WT"; record_gitlink "$CASE_WT"
-tg5_rec="rd-workflow-workspace/.lifecycle/team-prs.tsv"
-printf 'path\trepo\tbranch\tbase\turl\thead-oid\tstate\tmerged-oid\tcommits\nlibs/prod\to/r\tb\tmain\thttps://example.invalid/pr/1\t0000000000000000000000000000000000000001\tmerged\t-\t1\n' > "$CASE_WT/$tg5_rec"
-git -C "$CASE_WT" add "$tg5_rec"; git -C "$CASE_WT" commit -q -m "기록: PR"
-run_archive "$CASE_REPO" tg5
-if [[ "$ARCH_RC" == 0 && ! -e "$CASE_REPO/$tg5_rec" ]] && ! git -C "$CASE_REPO" cat-file -e "HEAD:$tg5_rec" 2>/dev/null; then
-  pass "t_step4_clears_record: rc=0, 기본 브랜치에 기록 파일 없음"
-else
-  fail "t_step4_clears_record: rc=$ARCH_RC 파일=$([[ -e "$CASE_REPO/$tg5_rec" ]] && echo 있음 || echo 없음) — $ARCH_OUT"
 fi
 
 # ---- 결정표 단위 시험: rd_submodule_checkout_sync 를 직접 부른다(promote·archive 없음) ----
@@ -498,13 +517,41 @@ else
   fail "W4a: rc=$ARCH_RC — $ARCH_OUT"
 fi
 
+# ---- 판정 함수를 직접 부르는 케이스의 준비 ----
+# copy_case <name> — 템플릿을 복사만 한다(promote 없음). 전역: CASE_NAME CASE_REPO CASE_WT
+copy_case() {
+  CASE_NAME="$1"; mkdir -p "$TMP/$1"
+  cp -R "$TEMPLATE_DIR/repo" "$TMP/$1/repo"; cp -R "$TEMPLATE_DIR/overlay.git" "$TMP/$1/overlay.git"
+  CASE_REPO="$TMP/$1/repo"; CASE_WT="$CASE_REPO/.worktrees/$1"
+  git -C "$CASE_REPO" remote set-url origin "$TMP/$1/overlay.git"
+}
+# light_case <name> — 템플릿을 복사하고 promote 없이 fr/<name> worktree 를 만들어 submodule 을 재귀로 초기화한다.
+#   promote 가 쓰는 상태(task-state·CURRENT_TASK)는 만들지 않는다. archive·promote 를 돌리지 않고 판정 함수를
+#   직접 부르는 케이스만 쓴다(promote 호출 한 번, 부하 9 에서 약 9초를 아낀다). 전역: CASE_NAME CASE_REPO CASE_WT
+light_case() {
+  copy_case "$1"
+  git -C "$CASE_REPO" worktree add -q -b "fr/$1" "$CASE_WT"
+  git -C "$CASE_WT" submodule update -q --init --recursive
+  git -C "$CASE_WT/libs/prod" config user.email t@t
+  git -C "$CASE_WT/libs/prod" config user.name t
+}
+source "$SCRIPT_DIR/_merge_precheck.sh"
+ARCH_SH="$SCRIPT_DIR/archive.sh"
+# arch_fns <이름...> — archive.sh 에서 그 이름의 함수 정의만 꺼낸다(archive.sh 는 라이브러리가 아니라 직접 source 할 수 없다).
+arch_fns() {
+  awk -v names=" $* " '
+    /^[A-Za-z_][A-Za-z0-9_]*\(\) *\{/ { n = $0; sub(/\(.*/, "", n); on = (index(names, " " n " ") > 0) }
+    on { print; if ($0 ~ /^\}/ || ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*\(\) *\{.*\}[[:space:]]*$/)) on = 0 }' "$ARCH_SH"
+}
+
 # ---- submodule gitlink 누락 검사 (change spec 2026-11-06-2215 D1~D4) ----
 # prep_gitlink_conflict <name> [extra] — 기본 브랜치가 libs/prod 를 A 로 전진, 작업 브랜치가 갈라진 B 로 전진한 뒤
 # 작업 worktree 에서 `git merge main` 으로 gitlink 충돌을 만든다. A·B 는 submodule 원격에 push 한다.
+#   준비는 GL_PREP(기본 prep_case)로 한다 — 병합 전 검사를 직접 부르는 케이스는 light_case 를 준다.
 #   전역: CASE_NAME CASE_REPO CASE_WT GL_A GL_B
 prep_gitlink_conflict() {
   local n="$1" s
-  prep_case "$n"
+  "${GL_PREP:-prep_case}" "$n"
   git -C "$CASE_REPO/libs/prod" config user.email t@t; git -C "$CASE_REPO/libs/prod" config user.name t
   echo "a-$n" > "$CASE_REPO/libs/prod/a.txt"; git -C "$CASE_REPO/libs/prod" add a.txt; git -C "$CASE_REPO/libs/prod" commit -q -m "main side A"
   GL_A="$(git -C "$CASE_REPO/libs/prod" rev-parse HEAD)"
@@ -539,7 +586,7 @@ gl_make_c() {
   GL_C="$(git -C "$CASE_WT/libs/prod" rev-parse HEAD)"
   git -C "$CASE_WT/libs/prod" push -q origin "HEAD:refs/heads/$CASE_NAME-c"
 }
-# gl_make_c_clone [push] — 별도 clone(케이스 디렉터리 안)에서 C 를 만든다. push 를 주면 submodule 원격에만 올린다. GL_C.
+# gl_make_c_clone — 별도 clone(케이스 디렉터리 안)에서 C 를 만든다. submodule 원격에는 올리지 않는다(G3 가 직접 push). GL_C.
 gl_make_c_clone() {
   local c="$TMP/$CASE_NAME/clone"
   git clone -q "$TEMPLATE_DIR/prod.git" "$c"
@@ -547,7 +594,6 @@ gl_make_c_clone() {
   git -C "$c" checkout -q -b cc "origin/$CASE_NAME"
   git -C "$c" merge -q --no-edit "origin/$CASE_NAME-a" >/dev/null
   GL_C="$(git -C "$c" rev-parse HEAD)"
-  [[ "${1:-}" != push ]] || git -C "$c" push -q origin "HEAD:refs/heads/$CASE_NAME-c"
 }
 run_gl_wt() {    # 작업 worktree 안에서 archive (기본 체크아웃으로 재실행된다)
   ARCH_RC=0
@@ -558,6 +604,15 @@ run_gl_repo() {  # 기본 체크아웃에서 --task 로 archive
   ARCH_RC=0
   ARCH_OUT="$( cd "$CASE_REPO" && bash rd-workflow/scripts/lifecycle/archive.sh --task "$CASE_NAME" \
     --force-skip-review-check 테스트 --allow-status-mismatch 테스트 2>&1 )" || ARCH_RC=$?
+}
+# gl_gate_direct — archive 의 병합 전 gitlink 검사(`archive_gitlink_merge_check fr/<이름> HEAD pre`)를 기본 체크아웃에서
+#   직접 부른다. 누락·판정 불가 케이스는 archive 가 이 검사에서 멈추므로 판정이 같다. archive 가 검사를 부르고 멈출 때
+#   기본 브랜치·원격·tag 가 그대로인지와 우회 안내는 G1(누락)이, 판정 불가에서 멈추는지는 G3 의 push 전 실행이 본다.
+#   출력은 ARCH_OUT, rc 는 ARCH_RC.
+gl_gate_direct() {
+  ARCH_RC=0
+  ARCH_OUT="$( cd "$CASE_REPO" && eval "$(arch_fns archive_gitlink_merge_check _archive_gl_oid _archive_gitlink_is_ancestor)" \
+    && archive_gitlink_merge_check "fr/$CASE_NAME" HEAD pre 2>&1 )" || ARCH_RC=$?
 }
 gl_snap() { printf '%s|%s|%s' "$(git -C "$CASE_REPO" rev-parse HEAD)" "$(git -C "$TMP/$CASE_NAME/overlay.git" rev-parse refs/heads/main 2>/dev/null)" "$(git -C "$CASE_REPO" tag --list | tr '\n' ,)"; }
 gl_head() { git -C "$CASE_REPO" rev-parse HEAD; }
@@ -650,8 +705,8 @@ run_gl_wt
 ok_if "G2g: rc 0" test "$ARCH_RC" -eq 0
 ok_if "G2g: 원격 main libs/prod gitlink == 작업 브랜치 값" eq "$(remote_gitlink)" "$g2g_y"
 
-echo "== G2h: 후손 갈래(topic)를 병합하면서 gitlink 를 이전 값으로 고름 — 부모가 조상 관계여도 막는다 =="
-prep_case g2h
+echo "== G2h: 후손 갈래(topic)를 병합하면서 gitlink 를 이전 값으로 고름 — 부모가 조상 관계여도 막는다 (병합 전 검사 직접 호출) =="
+light_case g2h
 g2h_old="$(git -C "$CASE_WT" rev-parse HEAD:libs/prod)"
 git -C "$CASE_WT" checkout -qb topic
 sub_commit "$CASE_WT"; sub_push "$CASE_WT"; record_gitlink "$CASE_WT"
@@ -659,47 +714,44 @@ git -C "$CASE_WT" checkout -q fr/g2h
 git -C "$CASE_WT" merge --no-ff --no-commit topic >/dev/null 2>&1 || true
 git -C "$CASE_WT" update-index --cacheinfo "160000,$g2h_old,libs/prod"
 git -C "$CASE_WT" commit -qm "merge topic (이전 gitlink 선택)"
-g2h_head="$(gl_head)"
-run_gl_wt
-ok_if "G2h: rc≠0" test "$ARCH_RC" -ne 0
-ok_if "G2h: 기본 브랜치 HEAD 불변" eq "$(gl_head)" "$g2h_head"
+gl_gate_direct
+ok_if "G2h: 누락으로 판정(rc 1)" test "$ARCH_RC" -eq 1
+ok_if "G2h: 빠진 gitlink 안내" out_has "submodule libs/prod 의 커밋을 빠뜨렸습니다"
 
-echo "== G3: C 가 submodule 원격에만 있음 — fetch 로 확인하고 발행된다 =="
-prep_gitlink_conflict g3; gl_resolve "$GL_A"; gl_make_c_clone push; gl_commit_gitlink "$GL_C"
+echo "== G3: C 를 push 하기 전에는 판정 불가로 병합 전에 멈추고, submodule 원격에 push 한 뒤 다시 실행하면 fetch 로 확인하고 발행된다 =="
+prep_gitlink_conflict g3; gl_resolve "$GL_A"; gl_make_c_clone; gl_commit_gitlink "$GL_C"
+# push 전: 병합 전 검사가 판정 불가(rc 2)를 내면 archive 는 병합하지 않는다. G4·G4b 는 판정만 직접 부르므로
+#   archive 게이트가 rc 2 를 차단으로 다루는지는 이 실행이 본다.
+g3_head="$(gl_head)"
+run_gl_wt
+ok_if "G3: push 전 rc≠0" test "$ARCH_RC" -ne 0
+ok_if "G3: push 전 판정 불가 안내" out_has "판정 불가"
+ok_if "G3: push 전 기본 브랜치 HEAD 불변" eq "$(gl_head)" "$g3_head"
+git -C "$TMP/g3/clone" push -q origin "HEAD:refs/heads/g3-c"
 run_gl_wt
 ok_if "G3: rc 0" test "$ARCH_RC" -eq 0
 ok_if "G3: fetch 시작 안내" out_has "원격에서 받습니다"
 ok_if "G3: fetch 완료 안내" out_has "fetch 완료"
 
-echo "== G4: C 를 push 하지 않고 submodule 원격 주소도 접근 불가 — fetch 실패, 판정 불가로 멈춘다 =="
-prep_gitlink_conflict g4; gl_resolve "$GL_A"; gl_make_c_clone; gl_commit_gitlink "$GL_C"
+echo "== G4: C 를 push 하지 않고 submodule 원격 주소도 접근 불가 — fetch 실패, 판정 불가로 멈춘다 (병합 전 검사 직접 호출) =="
+GL_PREP=light_case prep_gitlink_conflict g4; gl_resolve "$GL_A"; gl_make_c_clone; gl_commit_gitlink "$GL_C"
 git -C "$CASE_REPO/libs/prod" remote set-url origin "$TMP/g4/missing.git"
-g4_head="$(gl_head)"
-run_gl_wt
-ok_if "G4: rc≠0" test "$ARCH_RC" -ne 0
+gl_gate_direct
+ok_if "G4: 판정 불가(rc 2)" test "$ARCH_RC" -eq 2
 ok_if "G4: fetch 시작 안내" out_has "원격에서 받습니다"
 ok_if "G4: fetch 실패 안내" out_has "fetch 실패"
 ok_if "G4: 판정 불가 안내" out_has "판정 불가"
-ok_if "G4: 기본 브랜치 HEAD 불변" eq "$(gl_head)" "$g4_head"
 
-echo "== G4b: C 를 push 하지 않음(원격은 정상) — fetch 가 성공해도 객체가 없어 판정 불가로 멈춘다 =="
-prep_gitlink_conflict g4b; gl_resolve "$GL_A"; gl_make_c_clone; gl_commit_gitlink "$GL_C"
-g4b_head="$(gl_head)"
-run_gl_wt
-ok_if "G4b: rc≠0" test "$ARCH_RC" -ne 0
+echo "== G4b: C 를 push 하지 않음(원격은 정상) — fetch 가 성공해도 객체가 없어 판정 불가로 멈춘다 (병합 전 검사 직접 호출) =="
+GL_PREP=light_case prep_gitlink_conflict g4b; gl_resolve "$GL_A"; gl_make_c_clone; gl_commit_gitlink "$GL_C"
+gl_gate_direct
+ok_if "G4b: 판정 불가(rc 2)" test "$ARCH_RC" -eq 2
 ok_if "G4b: fetch 시작 안내" out_has "원격에서 받습니다"
 ok_if "G4b: fetch 완료 안내" out_has "fetch 완료"
 ok_if "G4b: 판정 불가 안내" out_has "판정 불가"
-ok_if "G4b: 기본 브랜치 HEAD 불변" eq "$(gl_head)" "$g4b_head"
 
 # ---- promote 의 submodule 초기화 (FR promote-submodule-worktree-init) ----
-# copy_case <name> — 템플릿을 복사만 한다(promote 없음). 전역: CASE_NAME CASE_REPO CASE_WT
-copy_case() {
-  CASE_NAME="$1"; mkdir -p "$TMP/$1"
-  cp -R "$TEMPLATE_DIR/repo" "$TMP/$1/repo"; cp -R "$TEMPLATE_DIR/overlay.git" "$TMP/$1/overlay.git"
-  CASE_REPO="$TMP/$1/repo"; CASE_WT="$CASE_REPO/.worktrees/$1"
-  git -C "$CASE_REPO" remote set-url origin "$TMP/$1/overlay.git"
-}
+# copy_case 는 G 구간 앞에 있다.
 run_promote() {  # <slug> — stdout 은 PR_OUT, stderr 는 PR_ERR, rc 는 PR_RC
   PR_RC=0
   PR_OUT="$(bash "$CASE_REPO/rd-workflow/scripts/lifecycle/promote.sh" --short-title "$1" --size large --source-fr - 2>"$TMP/pr.err")" || PR_RC=$?
@@ -752,6 +804,7 @@ if [[ -n "$p1_vo" && "$p1_vo" != "$CASE_REPO"* ]]; then pass "P1: vendor origin 
 if [[ "$(git -C "$CASE_REPO" config submodule.libs/prod.url)" == "$p1_cfg_before" ]]; then pass "P1: 공용 config URL 불변"; else fail "P1: 공용 config URL 이 바뀜"; fi
 if [[ "$PR_OUT" == *"submodule 준비 완료"* && "$PR_OUT$PR_ERR" != *"비워 두었습니다"* ]]; then pass "P1: 준비 완료 안내, 비움 안내 없음"; else fail "P1: $PR_OUT / $PR_ERR"; fi
 if [[ "$p1_ino_ok" == 1 ]]; then pass "P1: 객체 파일이 메인과 hardlink (inode 동일)"; else fail "P1: hardlink 아님 (file=$p1_f)"; fi
+if [[ "$PR_RC" == 0 && "$PR_ERR" == *"submodule libs/prod 를 팀 기본 브랜치와 비교하지 못해 알림을 건너뜁니다 — fatal:"* ]]; then pass "P1: 팀 원격 조회 실패 — 알림을 건너뛰고 착수 계속"; else fail "P1: 조회 실패 건너뜀 — rc=$PR_RC $PR_ERR"; fi
 
 echo "== P2: 메인에 없는 gitlink 커밋은 원격 접근이 필요하다는 안내와 함께 원격에서 받는다 =="
 copy_case p2
@@ -770,15 +823,20 @@ p3_v2="$(bump_gitlink "$CASE_REPO" p3 libs/v2 "$TEMPLATE_DIR/vendor.git")"
 p3_v3="$(bump_gitlink "$CASE_REPO" p3 libs/v3 "$TEMPLATE_DIR/vendor.git")"
 mkdir -p "$TMP/p3/hooks"
 printf '#!/bin/sh\ncase "$PWD" in */libs/prod) sleep 3;; esac\n' > "$TMP/p3/hooks/post-checkout"; chmod +x "$TMP/p3/hooks/post-checkout"
-printf '#!/bin/sh\necho $$ >> "%s"\nexec sleep 30\n' "$TMP/p3/ssh-pids" > "$TMP/p3/ssh-hang.sh"; chmod +x "$TMP/p3/ssh-hang.sh"
+# 늦춘 원격은 60초 sleep 을 마치면 완료 표식(ssh-done)을 남긴다. `&&` 라 상한이 sleep 을 끊으면 표식을 쓰지 않는다
+# (`;` 면 그룹 KILL 중 sleep 이 먼저 죽을 때 셸이 다음 줄을 실행해 표식이 생긴다 — U5 주석의 실측).
+printf '#!/bin/sh\necho $$ >> "%s"\nsleep 60 && echo x >> "%s"\n' "$TMP/p3/ssh-pids" "$TMP/p3/ssh-done" > "$TMP/p3/ssh-hang.sh"; chmod +x "$TMP/p3/ssh-hang.sh"
 git -C "$CASE_REPO" config submodule.libs/v2.url "ssh://h/v2.git"
 git -C "$CASE_REPO" config submodule.libs/v3.url "ssh://h/v3.git"
 p3_t0=$SECONDS
 GIT_SSH_COMMAND="$TMP/p3/ssh-hang.sh" GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1="$TMP/p3/hooks" \
   RD_SUBMODULE_REMOTE_TIMEOUT=2 run_promote p3
+p3_late=0; [[ ! -e "$TMP/p3/ssh-done" ]] || p3_late=1
 p3_el=$((SECONDS - p3_t0))
-# 상한이 없으면 응답 없는 원격 두 개로 100초를 넘깁니다. 기준은 머신 부하(실측 최대 27초)를 견디게 60초로 둡니다.
-if [[ "$PR_RC" == 0 && "$p3_el" -lt 60 && -f "$CASE_WT/libs/prod/p.txt" ]]; then pass "P3: rc=0, 경과 ${p3_el}초 (<60), 로컬 submodule 은 받음"; else fail "P3: rc=$PR_RC 경과=${p3_el}초 prod=$([[ -f "$CASE_WT/libs/prod/p.txt" ]] && echo 있음 || echo 없음) — $PR_ERR"; fi
+# 반환 판정은 고정 경과 문턱이 아니라 늦춘 원격의 완료 표식으로 한다. 상한이 듣지 않으면 원격이 60초 sleep 을 마치고
+# 표식을 남긴 뒤에야 promote 가 돌아온다. 고정 60초 문턱은 부하 평균 9~10 에서 정상 경로도 넘겼다(64초 실측, 2026-11-23).
+# 경과 초는 표시용이다.
+if [[ "$PR_RC" == 0 && "$p3_late" == 0 && -f "$CASE_WT/libs/prod/p.txt" ]]; then pass "P3: rc=0, 늦춘 원격의 지연이 끝나기 전에 반환(경과 ${p3_el}초), 로컬 submodule 은 받음"; else fail "P3: rc=$PR_RC 늦춘 원격 완료 표식=$([[ "$p3_late" == 1 ]] && echo 있음 || echo 없음) 경과=${p3_el}초 prod=$([[ -f "$CASE_WT/libs/prod/p.txt" ]] && echo 있음 || echo 없음) — $PR_ERR"; fi
 if [[ "$PR_ERR" == *"submodule 받기 실패: libs/v2"* && "$PR_ERR" == *"시간 초과(2초)"* ]]; then pass "P3: libs/v2 시간 초과(2초) — 로컬 시간이 예산을 깎지 않음"; else fail "P3: libs/v2 안내 — $PR_ERR"; fi
 if [[ "$PR_ERR" == *"submodule 받기 실패: libs/v3"* && "$PR_ERR" == *"원격 대기 상한(2초)을 다 써서 시도하지 않았습니다"* ]]; then pass "P3: libs/v3 예산 소진으로 시도하지 않음"; else fail "P3: libs/v3 안내 — $PR_ERR"; fi
 if [[ "$PR_ERR" == *"재시도: bash rd-workflow/scripts/rd submodule init libs/v2"* && "$PR_ERR" == *"재시도: bash rd-workflow/scripts/rd submodule init libs/v3"* ]]; then pass "P3: 재시도 명령 두 개"; else fail "P3: 재시도 — $PR_ERR"; fi
@@ -824,6 +882,47 @@ rd_init "$CASE_WT" libs/prod/vendor
 if [[ "$INIT_RC" == 0 && -f "$CASE_WT/libs/prod/vendor/v.txt" && "$INIT_OUT" == *"메인 체크아웃에서 초기화하지 않았습니다"* ]]; then pass "P5: worktree 에서 중첩 경로를 받음"; else fail "P5: rc=$INIT_RC — $INIT_OUT"; fi
 rd_init "$CASE_REPO" libs/prod/vendor
 if [[ "$INIT_RC" == 0 && -f "$CASE_REPO/libs/prod/vendor/v.txt" && "$INIT_OUT" == *"메인 체크아웃이라 원천이 자기 자신입니다"* ]]; then pass "P5: 메인 분기에서 중첩 경로를 받음"; else fail "P5: 메인 rc=$INIT_RC — $INIT_OUT"; fi
+
+# ---- 반영 방식 manual 인 submodule 의 gitlink 알림 (FR archive-gitlink-team-default-branch) ----
+# lag_case <name> — copy_case 에 케이스 전용 팀 저장소(prod.git 복사본)를 붙인다. 공유 prod.git 의 main 은 다른 케이스가 옮기므로 쓰지 않는다.
+lag_case() {
+  copy_case "$1"
+  cp -R "$TEMPLATE_DIR/prod.git" "$TMP/$1/prod.git"
+  git -C "$CASE_REPO" config submodule.libs/prod.url "$TMP/$1/prod.git"
+  git -C "$CASE_REPO/libs/prod" remote set-url origin "$TMP/$1/prod.git"
+  LAG_GL="$(git -C "$CASE_REPO" ls-tree HEAD libs/prod | awk '{print $3}')"
+}
+# team_main_push <name> — 케이스 팀 저장소 main 에 커밋 하나를 올린다.
+team_main_push() {
+  local c
+  c="$(mktemp -d "$TMP/$1/main.XXXXXX")" || { echo "team_main_push: 임시 디렉터리 생성 실패" >&2; return 1; }
+  git clone -q "$TMP/$1/prod.git" "$c"
+  echo n > "$c/n.txt"; git -C "$c" add -A; git -C "$c" commit -q -m n; git -C "$c" push -q origin HEAD:main
+}
+wt_gitlink() { git -C "$CASE_WT" ls-tree HEAD libs/prod | awk '{print $3}'; }
+
+echo "== P6: manual gitlink 가 팀 기본 브랜치보다 뒤 — 몇 커밋 뒤인지와 브랜치를 따는 명령을 알리고 gitlink 는 옮기지 않는다 =="
+lag_case p6
+team_main_push p6
+p6_n="$(git -C "$TMP/p6/prod.git" rev-list --count "$LAG_GL..main")"
+run_promote p6
+if [[ "$PR_RC" == 0 && "$PR_ERR" == *"submodule libs/prod 의 gitlink ${LAG_GL:0:7} 가 팀 기본 브랜치 origin/main 끝"*"${p6_n} 커밋 뒤입니다"* ]]; then pass "P6: ${p6_n} 커밋 뒤 알림"; else fail "P6: 뒤짐 알림 — rc=$PR_RC $PR_ERR"; fi
+if [[ "$PR_ERR" == *"git -C $CASE_WT/libs/prod fetch origin refs/heads/main && git -C $CASE_WT/libs/prod switch --no-overwrite-ignore -c p6 FETCH_HEAD"* ]]; then pass "P6: 브랜치를 따는 명령 전문"; else fail "P6: 명령 — $PR_ERR"; fi
+if [[ "$(wt_gitlink)" == "$LAG_GL" ]]; then pass "P6: 작업 브랜치 gitlink 불변"; else fail "P6: gitlink=$(wt_gitlink) 기대=$LAG_GL"; fi
+
+echo "== P7: manual gitlink 가 팀 기본 브랜치에 없는 커밋 — 기본 브랜치 밖 커밋이라고 알린다 =="
+lag_case p7
+p7_new="$(bump_gitlink "$CASE_REPO" p7 libs/prod "$TMP/p7/prod.git")"
+run_promote p7
+if [[ "$PR_RC" == 0 && "$PR_ERR" == *"gitlink ${p7_new:0:7} 는 팀 기본 브랜치 origin/main 에 없는 커밋입니다"* && "$PR_ERR" == *"switch --no-overwrite-ignore -c p7 FETCH_HEAD"* ]]; then pass "P7: 기본 브랜치 밖 커밋 알림"; else fail "P7: rc=$PR_RC — $PR_ERR"; fi
+
+echo "== P8: 반영 방식 pr 이면 gitlink 가 뒤져도 promote 가 비교하지 않는다 =="
+lag_case p8
+printf '%s\n' '{"team_publish": {"mode": "pr"}}' > "$CASE_REPO/rd-workflow/config/workflow.json"
+git -C "$CASE_REPO" commit -q -am "test: pr"
+team_main_push p8
+run_promote p8
+if [[ "$PR_RC" == 0 && "$PR_ERR" != *"팀 기본 브랜치와 비교"* && "$PR_ERR" != *"팀 기본 브랜치 origin/"* ]]; then pass "P8: pr 방식은 알림 없음"; else fail "P8: rc=$PR_RC — $PR_ERR"; fi
 
 echo "== Q1: 받기 실패로 남은 잔여 상태에서 사용자 파일을 덮어쓰지 않는다 =="
 copy_case q1
@@ -905,7 +1004,7 @@ tree_clean() {  # stdout 은 TC_OUT, stderr 는 TC_ERR, rc 는 TC_RC
 }
 
 echo "== U1: 원격에 push 한 annotated tag 로만 닿는 submodule 커밋은 미push 가 아니다 =="
-prep_case u1
+light_case u1
 sub_commit "$CASE_WT"
 git -C "$CASE_WT/libs/prod" tag -a "u1-t1" -m t1; git -C "$CASE_WT/libs/prod" push -q origin "refs/tags/u1-t1"
 record_gitlink "$CASE_WT"
@@ -920,7 +1019,7 @@ tree_clean "$CASE_WT"
 if [[ "$TC_RC" == 1 && "$TC_OUT" == "unpushed"$'\t'"libs/prod" ]]; then pass "U2: unpushed"; else fail "U2: rc=$TC_RC — $TC_OUT"; fi
 
 echo "== U3: 원격 tag 조회(ls-remote)가 실패하면 미push 로 본다 =="
-prep_case u3
+light_case u3
 sub_commit "$CASE_WT"
 git -C "$CASE_WT/libs/prod" tag -a "u3-t1" -m t1; git -C "$CASE_WT/libs/prod" push -q origin "refs/tags/u3-t1"
 record_gitlink "$CASE_WT"
@@ -963,17 +1062,113 @@ else
   fail "U5: rc=$TC_RC 경과=${u5_el}초 (원격 수명 ${u5_hang}초) — $TC_OUT / $TC_ERR"
 fi
 
+echo "== U6: 기본 체크아웃 submodule 의 로컬 브랜치로 닿는 커밋만 미push 에서 빼고, 원격 추적 ref·객체로만 닿는 커밋은 남긴다 =="
+# 없으면 새는 실수: 기본 체크아웃에 gitlink 커밋이 있다는 이유로 worktree 의 다른 미push 커밋까지 빼거나, 객체가 있다는 것만
+#   보고 빼서 worktree 를 지운 뒤 그 커밋을 gc 로 잃는다(FR archive-carry-worktree-submodule-commits). 기본 쪽 원격 추적 ref 는
+#   원격 브랜치가 지워진 뒤 fetch --prune 으로 사라지므로 근거가 아니다 — c2 는 지워진 원격 브랜치의 뒤처진 추적 ref 로만 닿는다.
+light_case u6
+sub_commit "$CASE_WT"; u6_c1="$(git -C "$CASE_WT/libs/prod" rev-parse HEAD)"
+sub_commit "$CASE_WT"; u6_c2="$(git -C "$CASE_WT/libs/prod" rev-parse HEAD)"
+sub_commit "$CASE_WT"; u6_c3="$(git -C "$CASE_WT/libs/prod" rev-parse HEAD)"
+u6_src="$(git -C "$CASE_WT/libs/prod" rev-parse --absolute-git-dir)"
+git -C "$CASE_REPO/libs/prod" fetch -q "$u6_src" "$u6_c1:refs/heads/rd-archive/u6"
+git -C "$CASE_REPO/libs/prod" fetch -q "$u6_src" "$u6_c2:refs/remotes/origin/u6-gone"   # 뒤처진 원격 추적 ref 로만 닿는다
+git -C "$CASE_REPO/libs/prod" fetch -q "$u6_src" "$u6_c3"   # FETCH_HEAD 만 — 브랜치로 닿지 않는다
+u6_rc=0; u6_out="$(_rd_unpushed_commits "$CASE_WT/libs/prod" libs/prod "$CASE_REPO/libs/prod" 2>/dev/null)" || u6_rc=$?
+u6_want="$(printf '%s\n' "$u6_c2" "$u6_c3" | sort)"
+if [[ "$u6_rc" == 0 && "$(sort <<<"$u6_out")" == "$u6_want" ]]; then
+  pass "U6: 미push 목록 = 원격 추적 ref 로만 닿는 커밋과 객체만 있는 커밋(브랜치로 닿는 커밋은 뺌)"
+else
+  fail "U6: rc=$u6_rc 목록=[$u6_out] (기대: $u6_c2 $u6_c3)"
+fi
+
+echo "== U7: 미push 이력이 길어도(15000 커밋) 기본 체크아웃 대조가 목록을 잃지 않는다 =="
+# 없으면 새는 실수: 목록을 환경 변수·인자로 넘기면 OS 인자 크기 상한(macOS ARG_MAX 1MB)을 넘어 awk·git 실행이 실패하고, 빈 출력이
+#   「모두 보존됨」 으로 읽혀 긴 로컬 이력을 가진 worktree 를 지운다. 커밋은 fast-import 로 만든다(약 1초).
+light_case u7
+u7_sub="$CASE_WT/libs/prod"
+u7_from="$(git -C "$u7_sub" rev-parse HEAD)"
+awk -v n=15000 -v from="$u7_from" 'BEGIN { for (i = 1; i <= n; i++) {
+    printf "commit refs/heads/u7-history\nmark :%d\ncommitter t <t@t> %d +0000\ndata 2\nc\n", i, 1700000000 + i
+    if (i == 1) printf "from %s\n", from; else printf "from :%d\n", i - 1
+    printf "\n" } }' | git -C "$u7_sub" fast-import --quiet
+git -C "$CASE_REPO/libs/prod" fetch -q --no-tags "$(git -C "$u7_sub" rev-parse --absolute-git-dir)" refs/heads/u7-history
+u7_rc=0; u7_out="$(_rd_unpushed_commits "$u7_sub" libs/prod "$CASE_REPO/libs/prod" 2>/dev/null)" || u7_rc=$?
+u7_n="$(grep -c . <<<"$u7_out" || true)"
+if [[ "$u7_rc" == 0 && "$u7_n" == 15000 ]]; then
+  pass "U7: 미push 15000 커밋이 모두 목록에 남음"
+else
+  fail "U7: rc=$u7_rc 목록 수=$u7_n (기대 15000)"
+fi
+
+# ---- worktree 보존 판정 (spec 2.4 D15~D18): rd_worktree_remove_safe·rd_worktree_hold_info 를 직접 부른다 ----
+# archive 는 worktree 정리에서 이 두 함수로 지울지 정하고 보존 사유를 낸다. archive 가 두 함수를 부르는 연결(보존·사유·복구
+# 명령 출력)은 W3b 가 본다. 여기서는 상태별 판정과 사유만 본다(케이스마다 promote·archive 한 번씩을 아낀다).
+# wt_hold — 기본 체크아웃에서 작업 worktree 정리를 시도한다. rc 는 HOLD_RC, 보존 사유 줄은 HOLD_INFO.
+wt_hold() {
+  local out
+  HOLD_RC=0; out="$( cd "$CASE_REPO" && rd_worktree_remove_safe "$CASE_WT" )" || HOLD_RC=$?
+  HOLD_INFO="$out"
+  [[ "$HOLD_RC" != 1 ]] || HOLD_INFO="$(rd_worktree_hold_info "${out%%$'\t'*}" "${out#*$'\t'}" "$CASE_WT")"
+}
+
+echo "== W3c: submodule 커밋을 push 했지만 gitlink 는 올리지 않음 =="
+light_case w3c
+echo work > "$CASE_WT/work.txt"; git -C "$CASE_WT" add work.txt; git -C "$CASE_WT" commit -q -m "구현: work"
+sub_commit "$CASE_WT"; sub_push "$CASE_WT"
+wt_hold
+if [[ "$HOLD_RC" == 1 && -d "$CASE_WT" && "$HOLD_INFO" == *"gitlink 로 올리지 않은 커밋"* ]]; then
+  pass "W3c: worktree 보존, gitlink 미반영 사유"
+else
+  fail "W3c: rc=$HOLD_RC worktree=$([[ -d "$CASE_WT" ]] && echo 있음 || echo 없음) — $HOLD_INFO"
+fi
+
+echo "== W3d: 중첩 submodule(libs/prod/vendor) 안 미추적 파일 — 모든 깊이 검사 =="
+light_case w3d
+sub_commit "$CASE_WT"; sub_push "$CASE_WT"; record_gitlink "$CASE_WT"
+echo scratch > "$CASE_WT/libs/prod/vendor/untracked.txt"
+wt_hold
+if [[ "$HOLD_RC" == 1 && -d "$CASE_WT" && "$HOLD_INFO" == *"미커밋 변경"*"submodule 경로: libs/prod/vendor"* ]]; then
+  pass "W3d: worktree 보존, 중첩 submodule 경로의 미커밋 변경 사유"
+else
+  fail "W3d: rc=$HOLD_RC worktree=$([[ -d "$CASE_WT" ]] && echo 있음 || echo 없음) — $HOLD_INFO"
+fi
+
+echo "== W3e: submodule 커밋·push 후 상위에서 gitlink 를 스테이징만 하고 커밋하지 않음 =="
+light_case w3e
+echo work > "$CASE_WT/work.txt"; git -C "$CASE_WT" add work.txt; git -C "$CASE_WT" commit -q -m "구현: work"
+sub_commit "$CASE_WT"; sub_push "$CASE_WT"; git -C "$CASE_WT" add libs/prod
+wt_hold
+if [[ "$HOLD_RC" == 1 && -d "$CASE_WT" && "$HOLD_INFO" == *"미커밋 변경"* ]]; then
+  pass "W3e: worktree 보존, 스테이징만 된 gitlink 를 미커밋 변경으로 안내"
+else
+  fail "W3e: rc=$HOLD_RC worktree=$([[ -d "$CASE_WT" ]] && echo 있음 || echo 없음) — $HOLD_INFO"
+fi
+
+echo "== W3f: 기본 체크아웃 submodule 이 작업 worktree submodule 의 객체를 빌려 씀(alternates) — 그 브랜치를 보존 근거로 쓰지 않음 =="
+# 없으면 새는 실수: 기본 체크아웃 submodule 이 objects/info/alternates 로 작업 worktree submodule 의 객체를 읽으면, 발행이 fetch
+#   없이 그 커밋에 rd-archive 브랜치를 만들고 정리 판정이 그 브랜치를 근거로 worktree 를 지운다. 지운 뒤 브랜치가 가리키는 커밋을
+#   읽을 수 없다(리뷰 F6). 발행이 만드는 브랜치는 update-ref 로 대신한다.
+light_case w3f
+sub_commit "$CASE_WT"; record_gitlink "$CASE_WT"
+w3f_c="$(git -C "$CASE_WT/libs/prod" rev-parse HEAD)"
+w3f_kg="$(git -C "$CASE_REPO/libs/prod" rev-parse --absolute-git-dir)"
+mkdir -p "$w3f_kg/objects/info"
+printf '%s\n' "$(git -C "$CASE_WT/libs/prod" rev-parse --absolute-git-dir)/objects" > "$w3f_kg/objects/info/alternates"
+git -C "$CASE_REPO/libs/prod" update-ref refs/heads/rd-archive/w3f "$w3f_c"
+wt_hold 2>"$TMP/w3f.err"
+if [[ "$HOLD_RC" == 1 && -d "$CASE_WT" && "$HOLD_INFO" == *"원격에 없는 커밋"* ]] \
+   && grep -q -F 'objects/info/alternates' "$TMP/w3f.err" \
+   && git -C "$CASE_REPO/libs/prod" cat-file -e "${w3f_c}^{commit}" 2>/dev/null; then
+  pass "W3f: worktree 보존, 원격에 없는 커밋 사유, alternates 안내 줄, 기본 쪽 브랜치 커밋을 읽을 수 있음"
+else
+  fail "W3f: rc=$HOLD_RC worktree=$([[ -d "$CASE_WT" ]] && echo 있음 || echo 없음) — $HOLD_INFO / stderr=[$(cat "$TMP/w3f.err")]"
+fi
+
 
 # ---- gitlink 조상·자손 자동 해소와 반영 대상 기준점 (change spec 2026-11-18-0900 D1-4·D1-5·D3-2·D3-3) ----
-source "$SCRIPT_DIR/_merge_precheck.sh"
-ARCH_SH="$SCRIPT_DIR/archive.sh"
-# arch_fns <이름...> — archive.sh 에서 그 이름의 함수 정의만 꺼낸다(archive.sh 는 라이브러리가 아니라 직접 source 할 수 없다).
-arch_fns() {
-  awk -v names=" $* " '
-    /^[A-Za-z_][A-Za-z0-9_]*\(\) *\{/ { n = $0; sub(/\(.*/, "", n); on = (index(names, " " n " ") > 0) }
-    on { print; if ($0 ~ /^\}/ || ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*\(\) *\{.*\}[[:space:]]*$/)) on = 0 }' "$ARCH_SH"
-}
-ARCH_FN_LIST="archive_merge_commit_check archive_gitlink_auto_resolve _archive_gl_print_notes _archive_gl_note _archive_gl_acquire"
+# _merge_precheck.sh source 와 arch_fns 는 G 구간 앞에 있다(G2h·G4·G4b 가 병합 전 검사를 직접 부른다).
+ARCH_FN_LIST="archive_merge_commit_check archive_gitlink_auto_resolve _archive_gl_print_notes _archive_gl_note _archive_gl_acquire _archive_gl_fetch"
 # arch_mcc <repo> <M> — archive_merge_commit_check 를 직접 부른다. 출력 MCC_OUT, rc MCC_RC.
 arch_mcc() {
   MCC_RC=0
@@ -1144,7 +1339,7 @@ ARCH_OUT="err=[$gf_err] notes=[$gf_notes]"; ARCH_RC="$gf_rc"
 ok_if "AC2(바): rc 0, 인덱스 libs/prod = B" eq "$gf_rc/$(git -C "$CASE_REPO" ls-files -s libs/prod | awk '{print $2}')" "0/$GF_B"
 ok_if "AC2(바): 원인 줄(transport 'file' not allowed)" bash -c 'grep -q "받지 못했습니다 — .*transport '"'"'file'"'"' not allowed" <<<"$1"' _ "$gf_err"
 ok_if "AC2(바): 전송 정책 안내 줄" bash -c 'grep -qF "이 저장소가 file 전송을 막고 있습니다" <<<"$1"' _ "$gf_err"
-ok_if "AC2(바): (가) push 줄" bash -c 'grep -q "^archive:     (가) git -C .* --git-dir=.* push " <<<"$1"' _ "$gf_notes"
+ok_if "AC2(바): (가) push 줄" bash -c 'grep -q "^archive:     (가) git -C .* --git-dir=.* push --no-follow-tags " <<<"$1"' _ "$gf_notes"
 ok_if "AC2(바): (나) fetch origin refs/heads/rd-archive/" bash -c 'grep -q "^archive:     (나) git -C .* fetch origin refs/heads/rd-archive/gf6-" <<<"$1"' _ "$gf_notes"
 ok_if "AC2(바): (다) checkout" bash -c 'grep -q "^archive:     (다) .* checkout --detach " <<<"$1"' _ "$gf_notes"
 ok_if "AC2(바): 로컬 fetch 재안내 없음" bash -c '! grep -q "fetch .*worktrees/gf6/modules" <<<"$1"' _ "$gf_notes"
@@ -1299,10 +1494,14 @@ ok_if "AC6: no-fr 문구" out_has "이번 작업(기본 브랜치)에서 설정�
 ok_if "AC6: fr 문구 없음" out_lacks "이번 fr 브랜치에서"
 
 # ac11_run <name> — AC6 fixture 의 libs/prod 원격 조회를 늦추고 RD_MERGE_FETCH_TIMEOUT=1 로 archive 를 백그라운드에서 돌린다.
-#   원격 조회가 시작되면(표식) 그 순간 출력에 시작 줄이 있는지 AC11_EARLY 에 남긴다. 전역 ARCH_OUT ARCH_RC AC11_EL AC11_EARLY
+#   원격 조회가 시작되면(표식) 그 순간 출력에 시작 줄이 있는지 AC11_EARLY 에 남긴다.
+#   늦춘 원격은 지연(sleep 60)을 마치면 완료 표식을 남긴다. archive 가 돌아온 순간 그 표식이 있으면 상한이 듣지 않고
+#   원격을 끝까지 기다린 것이므로 AC11_LATE=1 이다. 경과 시간(AC11_EL)은 표시용이다 — archive 의 원격 조회 밖 단계도
+#   들어가 부하에서 늘어나므로 판정에 쓰지 않는다. 전역 ARCH_OUT ARCH_RC AC11_EL AC11_EARLY AC11_LATE
 ac11_run() {
-  local n="$1" want="$2" mark="$TMP/$1/upload-started" outf="$TMP/$1/arch.out" rcf="$TMP/$1/arch.rc" t0 i=0 pid
-  git -C "$CASE_REPO/libs/prod" config remote.origin.uploadpack "echo x > '$mark'; sleep 30; git-upload-pack"
+  local n="$1" want="$2" mark="$TMP/$1/upload-started" done_mark="$TMP/$1/upload-delay-done" outf="$TMP/$1/arch.out" rcf="$TMP/$1/arch.rc" t0 i=0 pid
+  # `sleep 60 && echo` — 상한이 sleep 만 끊었을 때 셸이 다음 명령을 실행해 완료 표식을 남기지 않게 한다.
+  git -C "$CASE_REPO/libs/prod" config remote.origin.uploadpack "echo x > '$mark'; sleep 60 && echo x > '$done_mark'; git-upload-pack"
   t0=$SECONDS
   # 백그라운드 서브셸은 스위트의 EXIT·ERR trap 과 set -e 를 물려받는다 — 풀어 두어야 archive 실패 뒤에도 rc 를 남긴다.
   ( trap - EXIT ERR; set +e; cd "$CASE_REPO" || exit 1
@@ -1312,10 +1511,12 @@ ac11_run() {
   while [[ ! -e "$mark" && "$i" -lt 600 ]] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
   AC11_EARLY=0; [[ -e "$mark" ]] && grep -qF "$want" "$outf" && AC11_EARLY=1
   wait "$pid" || true
+  AC11_LATE=0; [[ -e "$done_mark" ]] && AC11_LATE=1
   AC11_EL=$((SECONDS - t0))
   ARCH_OUT="$(cat "$outf")"; ARCH_RC="$(cat "$rcf" 2>/dev/null || echo 99)"
 }
-# 경과 문턱 20초: 정상 5~7초(공유 머신 부하에서 11초 실측), 상한이 없으면 원격 sleep 30 을 기다려 35~36초(변이 실측).
+# 반환 판정은 고정 경과 문턱이 아니라 늦춘 원격의 완료 표식으로 한다. 고정 20초는 부하 평균 12~17 에서 정상 경로도
+# 넘겼고(31초 실측), archive 시작부터 잰 경과는 원격 조회 밖 단계까지 더해져 62초까지 늘어난 관측이 있다.
 echo "== AC11 (A): 팀 브랜치 fetch 가 상한을 넘으면 시작 줄·원인·재시도 안내와 함께 거부 =="
 nofr_case ta1 '{"team_publish": {"mode": "push", "base": "main"}}' "" session
 ta1_head="$(gl_head)"
@@ -1324,7 +1525,7 @@ ok_if "AC11(A): 원격이 응답하기 전 시작 줄이 이미 나옴" eq "$AC1
 ok_if "AC11(A): rc 1, 기본 브랜치 불변" eq "$ARCH_RC|$(gl_head)" "1|$ta1_head"
 ok_if "AC11(A): 초과 원인" out_has "1초 안에 끝나지 않았습니다"
 ok_if "AC11(A): 재시도 안내" out_has "네트워크·인증을 확인한 뒤 같은 명령을 다시 실행하거나"
-ok_if "AC11(A): 20초 안에 반환 (실측 ${AC11_EL}초)" test "$AC11_EL" -lt 20
+ok_if "AC11(A): 늦춘 원격이 지연을 마치기 전에 반환 (경과 ${AC11_EL}초)" eq "$AC11_LATE" 0
 echo "== AC11 (B): 설정·origin/HEAD 가 없을 때 remote set-head 가 상한을 넘으면 같은 안내로 거부 =="
 nofr_case tb1 "$PUSH_CFG" "" session
 git -C "$CASE_REPO/libs/prod" symbolic-ref -d refs/remotes/origin/HEAD 2>/dev/null || true
@@ -1334,7 +1535,7 @@ ok_if "AC11(B): 원격이 응답하기 전 시작 줄이 이미 나옴" eq "$AC1
 ok_if "AC11(B): rc 1, 기본 브랜치 불변" eq "$ARCH_RC|$(gl_head)" "1|$tb1_head"
 ok_if "AC11(B): 초과 원인" out_has "1초 안에 끝나지 않았습니다"
 ok_if "AC11(B): 재시도 안내" out_has "네트워크·인증을 확인한 뒤 같은 명령을 다시 실행하거나"
-ok_if "AC11(B): 20초 안에 반환 (실측 ${AC11_EL}초)" test "$AC11_EL" -lt 20
+ok_if "AC11(B): 늦춘 원격이 지연을 마치기 전에 반환 (경과 ${AC11_EL}초)" eq "$AC11_LATE" 0
 
 # 정리 커밋은 review-session·base-commit 을 지운다. 재실행 게이트가 그 HEAD 를 판정하면 기준점이 없어 거부된다.
 # push 실패는 overlay 원격의 pre-receive 거부로 만든다(원격 URL 을 틀리게 두면 Step 4 전의 fetch --tags 에서 멈춰 정리 커밋이 생기지 않는다).

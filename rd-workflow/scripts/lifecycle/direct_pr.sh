@@ -123,15 +123,7 @@ _dp_class() {
   esac
 }
 
-# _dp_conflict_guide <slug> <기본 브랜치> — 충돌·수정 요청 뒤 이어 가는 순서(spec D9).
-_dp_conflict_guide() {
-  local slug="$1" def="$2"
-  printf '  순서:\n'
-  printf '    1) bash rd-workflow/scripts/rd pr reopen --task %s   (작업을 구현 중으로 되돌림)\n' "$slug"
-  printf '    2) 작업 worktree 에서 git merge %s → 충돌 해소·커밋 (충돌이 아니라 수정 요청이면 수정·커밋)\n' "$(dpr_shq "origin/$def")"
-  printf '    3) 재검증 → 새 final diff review → bash rd-workflow/scripts/rd review seal → 아카이브 보류 → 기록 커밋\n'
-  printf '    4) bash rd-workflow/scripts/rd publish request   (열린 PR 의 본문을 갱신하고 fast-forward 로 push 합니다)\n'
-}
+_dp_conflict_guide() { dpr_conflict_guide "$@"; }
 
 # _dp_conflict_hint <slug> <fr> <기본 브랜치> <PR headRefOid> <PR baseRefName> — 충돌 PR 이 기록 파일만 충돌하는지 판정합니다
 # (change spec 2026-11-19-1430 D6). 커밋·push 하지 않고, 원격 추적 ref 만 갱신합니다.
@@ -317,7 +309,8 @@ _dp_apply() {
   if [[ "$head" != "$prhead" ]] && ! dpr_verified_has "$SLUG" "$head"; then
     _dp_fail 1 "리뷰한 커밋 뒤에 커밋이 더해진 채 merge 됐습니다 (${prhead} → ${head:-알 수 없음})." \
       "  더해진 커밋은 새 작업으로 리뷰합니다. 이 작업은 태그 없이 남고 정리되지 않습니다." \
-      "  폐기하려면: /fr status $SLUG dropped → 기본 체크아웃에서 bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task $SLUG"; return $?
+      "  폐기하려면: Claude 세션에서 /fr status $SLUG dropped 로 닫은 뒤 터미널에서 아래 줄을 실행합니다" \
+      "    $(dpr_rollback_cmd "$SLUG" "$ROOT")"; return $?
   fi
 
   # 조건 4 — 태그를 달 커밋이 origin/<기본 브랜치> 에 들어 있는가
@@ -347,7 +340,8 @@ _dp_apply() {
   fi
 
   # 태그 OID 를 push 하고 원격에서 확인 — 확인되기 전에는 색인을 바꾸지 않습니다
-  rc=0; out="$(git -C "$ROOT" push origin "${tag_oid}:refs/tags/${tag}" 2>&1)" || rc=$?
+  # push.followTags 설정이 있어도 다른 로컬 태그를 함께 보내지 않습니다(발행 태그 하나만).
+  rc=0; out="$(git -C "$ROOT" push --no-follow-tags origin "${tag_oid}:refs/tags/${tag}" 2>&1)" || rc=$?
   if [[ "$rc" != 0 ]]; then
     _dp_fail 1 "태그 push 실패 — 색인은 바꾸지 않았습니다." "$(printf '%s\n' "$out" | head -6 | sed 's/^/  git: /')" "  재시도: $_DP_RETRY_CHECK (로컬 태그를 재사용합니다)"; return $?
   fi
@@ -371,10 +365,11 @@ _dp_apply() {
     printf '원격 fr 브랜치가 merge 된 head 와 달라 지우지 않았습니다 (원격: %s, merge 된 head: %s). 확인:\n' "$rl" "$head"
     printf '  git fetch --no-tags origin +refs/heads/%s:refs/remotes/origin/%s && git log %s..origin/%s\n' "$FR" "$FR" "$head" "$FR"
   elif [[ -n "$rl" ]]; then
-    rc=0; out="$(git -C "$ROOT" push "--force-with-lease=refs/heads/${FR}:${head}" origin ":refs/heads/${FR}" 2>&1)" || rc=$?
+    # 삭제 push 에도 설정이 태그를 얹으므로 같은 옵션을 씁니다(위 태그 push 주석).
+    rc=0; out="$(git -C "$ROOT" push --no-follow-tags "--force-with-lease=refs/heads/${FR}:${head}" origin ":refs/heads/${FR}" 2>&1)" || rc=$?
     if [[ "$rc" != 0 ]]; then
       printf 'WARNING — 원격 fr 브랜치 %s 를 지우지 못했습니다(완료에는 영향 없음). 직접 지우려면:\n' "$FR"
-      printf '  git push --force-with-lease=refs/heads/%s:%s origin :refs/heads/%s\n' "$FR" "$head" "$FR"
+      printf '  git push --no-follow-tags --force-with-lease=refs/heads/%s:%s origin :refs/heads/%s\n' "$FR" "$head" "$FR"
     else
       printf '원격 fr 브랜치 %s 삭제\n' "$FR"
     fi
@@ -460,7 +455,7 @@ EOF_DPR
   sha="$(git -C "$WT" rev-parse --short HEAD)"
   printf 'rd pr reopen: %s 를 구현 중으로 되돌렸습니다 (커밋 %s, PR %s 는 그대로 둡니다)\n' "$SLUG" "$sha" "$url"
   printf '이어 갈 순서:\n'
-  printf '  1) 작업 worktree(%s)에서 수정·검증 — 충돌이면 git merge %s 후 해소·커밋\n' "$(dpr_shq "$WT")" "$(dpr_shq "origin/$def")"
+  printf '  1) 작업 worktree(%s)에서 수정·검증 — 충돌이면 git merge --no-squash %s 후 해소·커밋\n' "$(dpr_shq "$WT")" "$(dpr_shq "origin/$def")"
   printf '  2) 새 final diff review 종결 → bash rd-workflow/scripts/rd review seal → 아카이브 보류 → 기록 커밋\n'
   printf '  3) bash rd-workflow/scripts/rd publish request   (열린 PR 의 본문을 갱신하고 fast-forward 로 push 합니다)\n'
   return 0
@@ -500,54 +495,7 @@ _dp_wt_state() {
   return 0
 }
 
-# _dp_sync_ignored_clash <옛 head> <새 head> — 옛 head 에 없고 새 head 가 추적하는 경로 A 가 작업 worktree 에서 이미 쓰이고 있으면
-# (A 자리에 무엇이 있거나, A 의 상위 경로 자리에 디렉터리가 아닌 무엇이 있으면) 옮겨야 할 파일을 stdout 에 냅니다. 있으면 rc 1, 없으면 rc 0.
-# 1단계가 작업 worktree 의 HEAD 가 옛 head 이고 무시되지 않은 미추적 파일이 없음을 확인했으므로, 그 자리에 있는 것은 무시 파일입니다.
-# 문자열 비교 대신 파일시스템에 묻습니다 — 대소문자·유니코드 정규화를 같게 보는 볼륨에서도 git 이 실제로 부딪히는 경로를 그대로 찾습니다.
-# 경로는 -z 원본 바이트로 다루고(줄바꿈·제어 문자 포함), 화면에는 줄바꿈을 \n 으로 보입니다. 비용은 추가 경로 수 × 경로 깊이의 파일 확인입니다.
-_dp_sync_ignored_clash() {
-  local old="$1" new="$2" af hf a d f n p wr
-  af="$(mktemp)" && hf="$(mktemp)" || { printf '(임시 파일을 만들지 못했습니다)\n'; return 1; }
-  if ! git -C "$ROOT" diff -z --name-only --no-renames --diff-filter=A "$old" "$new" >"$af" 2>/dev/null; then
-    rm -f "$af" "$hf"; printf '(새 head 의 추가 경로를 읽지 못했습니다)\n'; return 1
-  fi
-  while IFS= read -r -d '' a; do
-    if [[ -e "$WT/$a" || -L "$WT/$a" ]]; then printf '%s\0' "$a" >>"$hf"; continue; fi
-    d="$a"
-    while [[ "$d" == */* ]]; do
-      d="${d%/*}"
-      if [[ -L "$WT/$d" || ( -e "$WT/$d" && ! -d "$WT/$d" ) ]]; then
-        # 옛 head 가 추적하던 파일을 새 head 가 디렉터리로 바꾼 경우는 git 이 처리합니다.
-        git -C "$WT" cat-file -e "${old}:${d}" 2>/dev/null || printf '%s\0' "$d" >>"$hf"
-        break
-      fi
-    done
-  done <"$af"
-  if [[ ! -s "$hf" ]]; then rm -f "$af" "$hf"; return 0; fi
-  # 겹친 경로마다 그 자리(또는 그 아래)의 무시 파일을 디스크의 실제 이름으로 보입니다.
-  # 자리가 디렉터리인데 그 아래 무시 파일이 없으면(추적 파일만 있거나 빈 디렉터리) git 이 처리하므로 충돌이 아닙니다.
-  # 자리가 파일·심링크인데 목록이 비면 경로 자체를 보입니다.
-  : >"$af"
-  wr="$(cd "$WT" && /bin/pwd -P && printf x)" && wr="${wr%$'\n'x}" || wr=""
-  while IFS= read -r -d '' a; do
-    n=0
-    # 디렉터리 자리는 디스크의 실제 이름으로 찾습니다 — 대소문자를 같게 보는 볼륨에서 sLoT 이 새 경로 slot 의 자리를 차지할 수 있습니다.
-    # bash 내장 pwd -P 는 입력한 대소문자를 그대로 돌려주므로 getcwd 를 쓰는 /bin/pwd 를 씁니다.
-    p="$a"
-    if [[ -d "$WT/$a" && ! -L "$WT/$a" && -n "$wr" ]]; then
-      d="$(cd "$WT/$a" && /bin/pwd -P && printf x)" && d="${d%$'\n'x}" && [[ "$d" == "$wr"/* ]] && p="${d#"$wr"/}"
-    fi
-    while IFS= read -r -d '' f; do printf '%s\n' "${f//$'\n'/\\n}" >>"$af"; n=1; done \
-      < <(git -C "$WT" ls-files -z --others --ignored --exclude-standard -- ":(literal)$p" 2>/dev/null)
-    [[ "$n" == 1 ]] && continue
-    [[ -d "$WT/$a" && ! -L "$WT/$a" ]] && continue
-    printf '%s\n' "${a//$'\n'/\\n}" >>"$af"
-  done <"$hf"
-  if [[ ! -s "$af" ]]; then rm -f "$af" "$hf"; return 0; fi
-  sort -u "$af"
-  rm -f "$af" "$hf"
-  return 1
-}
+_dp_sync_ignored_clash() { dpr_ignored_clash "$ROOT" "$WT" "$@"; }
 
 # _dp_sync_ctx — sync 가 쓰는 전역을 채웁니다: _DPS_DEF(기본 브랜치)·_DPS_URL(색인 pr-url)·_DPS_RETRY(재시도 명령).
 _DPS_DEF=""; _DPS_URL=""; _DPS_RETRY=""
@@ -724,11 +672,20 @@ _dp_sync_finish() {
     printf '  무시 파일이 %s 의 경로에 있으면 switch 는 덮지 않고 멈춥니다 — git 이 보인 파일을 작업 worktree 밖으로 옮긴 뒤 switch 부터 다시 실행합니다\n' "$FR"
     return 1
   fi
-  # --no-overwrite-ignore — 기본 브랜치가 추적하기 시작한 경로에 작업 worktree 의 무시 파일이 있으면 덮지 않고 멈춥니다.
+  # dpr_ff_move — --no-squash 와 HEAD 대조로 사용자 mergeOptions 에 속지 않고, 기본 브랜치가 추적하기 시작한 경로의 무시 파일을 덮지 않습니다.
   # 미추적·무시 파일 충돌은 파일을 옮기라고 안내하고, 추적 파일의 로컬 수정은 아래 보존 브랜치 절차로 보냅니다(git 메시지 판별에 LC_ALL=C).
-  rc=0; out="$(LC_ALL=C git -C "$WT" merge -q --ff-only --no-autostash --no-overwrite-ignore "$cand" 2>&1)" || rc=$?
+  rc=0; dpr_ff_move "$WT" "$cand" || rc=$?
+  out="$_DPR_FF_OUT"
   tasks_lock_release >/dev/null 2>&1 || true
   [[ "$rc" == 0 ]] && return 0
+  # 서명 확인 설정(7단계 사전 판정 뒤에 켠 이어 가기 경로)은 보존 브랜치 절차로 풀리지 않습니다.
+  if dpr_sig_refused "$out"; then
+    printf 'rd pr sync: push 와 색인 기록은 끝났습니다 (원격 fr·pr-head = %s)\n' "$sc"
+    printf '  서명 확인 설정이 켜져 있어 서명 없는 병합 커밋으로 작업 worktree 를 옮기지 못했습니다. 작업 worktree 의 커밋·파일은 그대로입니다.\n'
+    printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | head -3 | sed 's/^/  git: /'
+    printf '  merge.verifySignatures 또는 branch.%s.mergeOptions 의 --verify-signatures 를 끈 뒤 같은 명령을 다시 실행하십시오: %s\n' "$FR" "$_DPS_RETRY"
+    return 1
+  fi
   # 추적 파일의 로컬 수정이 함께 있으면(git 이 두 오류를 함께 냄) 보존 브랜치 절차로 보냅니다 — 4) 의 이동도 무시 파일을 덮지 않습니다.
   if [[ "$out" != *"Your local changes to the following files would be overwritten"* ]] \
     && [[ "$out" == *"untracked working tree files would be overwritten"* || "$out" == *"would lose untracked files"* ]]; then
@@ -801,7 +758,7 @@ dp_sync() {
 
 # _dp_sync_run <오류 임시 파일> — dp_sync 의 1~9단계(대상 확정 뒤).
 _dp_sync_run() {
-  local ef="$1" rc=0 url h st l b o line state mo prh base mergeable review vurl tree cand err out
+  local ef="$1" rc=0 url h st l b o line state mo prh base mergeable review vurl tree cand err out vs
   # 1단계 — PR 대기 판정(색인과 fr 브랜치). L 이 H 와 같을 필요는 없습니다(복구 상태는 4단계가 판정).
   url="$_DPS_URL"
   h="$(dpr_index_get "$SLUG" pr-head 2>/dev/null)" || h=""
@@ -887,6 +844,26 @@ EOF_DPS
       _dp_conflict_guide "$SLUG" "$_DPS_DEF"
       return 1 ;;
   esac
+  # 작업 worktree 에 끝나지 않은 병합이 있으면 8단계의 fast-forward 가 막히고(작업 트리가 깨끗해도 MERGE_HEAD 가 남음), 서명 판정도 가려집니다 — push 전에 멈춥니다.
+  if git -C "$WT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    printf 'rd pr sync: 작업 worktree(%s)에 끝나지 않은 병합(MERGE_HEAD)이 있습니다 — 아무것도 바꾸지 않았습니다.\n' "$(dpr_shq "$WT")"
+    printf '  작업 worktree 에서 병합을 커밋하거나 git merge --abort 로 취소한 뒤 다시 실행하십시오: %s\n' "$_DPS_RETRY"
+    return 1
+  fi
+  # 서명 확인 설정이면 8단계의 fast-forward 가 서명 없는 병합 커밋에서 막힙니다 — push 전에 멈춥니다(발행 쪽 자동 병합 fallback 과 같은 복구 순서).
+  vs=0; dpr_verifysig_on "$WT" "$FR" || vs=$?
+  if [[ "$vs" == 2 ]]; then
+    printf 'rd pr sync: 작업 worktree(%s)에서 git merge 를 시험할 수 없어 마무리 이동이 될지 알 수 없습니다 — 아무것도 바꾸지 않았습니다.\n' "$(dpr_shq "$WT")"
+    printf '  git: %s\n' "$_DPR_VS_OUT"
+    printf '  진행 중인 cherry-pick·revert 가 있으면 작업 worktree 에서 마무리하거나 취소(git cherry-pick --abort, git revert --abort)한 뒤 다시 실행하십시오: %s\n' "$_DPS_RETRY"
+    return 1
+  fi
+  if [[ "$vs" == 0 ]]; then
+    printf 'rd pr sync: 서명 확인 설정(merge.verifySignatures 또는 branch.%s.mergeOptions 의 --verify-signatures)이 켜져 있어 서명 없는 병합 커밋으로 작업 브랜치를 옮길 수 없습니다 — 아무것도 바꾸지 않았습니다.\n' "$FR"
+    dpr_verifysig_guide "$SLUG" "$_DPS_DEF"
+    printf '  설정을 끌 수 있으면 끈 뒤 다시 실행하십시오: %s\n' "$_DPS_RETRY"
+    return 1
+  fi
   # 7단계 — 병합 커밋 → 검증 → 목록 기록 → push
   cand="$(git -C "$ROOT" commit-tree "$tree" -p "$l" -p "$b" -m "$(_dpr_sync_subject "$_DPS_DEF" "$FR")" 2>/dev/null)" || {
     _dp_fail 1 "rd pr sync: 병합 커밋을 만들지 못했습니다 — 아무것도 바꾸지 않았습니다" "  재시도: $_DPS_RETRY"; return $?; }

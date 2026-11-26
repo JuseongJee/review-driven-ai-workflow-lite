@@ -8,7 +8,9 @@ TMP="$(mktemp -d)" || { echo "test_session_launch.sh: 임시 디렉터리 생성
 [[ -n "$TMP" && -d "$TMP" ]] || { echo "test_session_launch.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 # 실제 herdr app tab 기동 차단: 케이스마다 HERDR_ENV= 를 주는 것과 같은 이유로 비운다.
-export HC_TERMINAL_ID=
+export HC_TERMINAL_ID= ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE=
+# 부모 세션 상속이 실제 transcript·실제 claude(--help)를 건드리지 않게 파일 전역에서 비운다. 상속을 시험하는 절은 자기 안에서 세션 id 를 지정한다.
+export CLAUDE_CODE_SESSION_ID=
 source "$SCRIPT_DIR/session_launch.sh"
 
 # 1) herdr 밖이면 기동하지 않고 none 을 낸다
@@ -488,169 +490,355 @@ rf_out="$(rf_run -u HC_TERMINAL_ID HERDR_ENV=1 -- --assume-ended)"
   && pass "resolve-launch failed --assume-ended 거부" \
   || fail "resolve-launch failed --assume-ended 거부: $rf_out"
 
-# 14) session_launch_model_valid — 별칭·구체 id 는 허용, 형식 밖 값은 anchored 검증으로 거부한다
-session_launch_model_valid opus && pass "별칭 opus 허용" || fail "별칭 opus 거부됨"
-session_launch_model_valid claude-sonnet-5 && pass "구체 id 허용" || fail "구체 id 거부됨"
-session_launch_model_valid not-a-model && fail "허용 범위 밖 값이 통과함" || pass "허용 범위 밖 값 거부"
-session_launch_model_valid 'claude-x invalid value' && fail "공백 섞인 값이 통과함(F5 재발)" || pass "공백 섞인 값 거부"
-session_launch_model_valid 'claude-x/garbage' && fail "슬래시 섞인 값이 통과함(F5 재발)" || pass "슬래시 섞인 값 거부"
-session_launch_model_valid 'fable-' && fail "빈 접미부(fable-)가 통과함(F5 재발)" || pass "빈 접미부 거부"
+# 14) 모델 값 판정 — 별칭·구체 id 는 허용, 형식 밖 값은 anchored 검증으로 거부한다 (ms_classify claude model)
+_cm() { ms_classify claude model "$1"; }
+[[ "$(_cm opus)" == alias ]] && pass "별칭 opus 허용" || fail "별칭 opus 거부됨"
+[[ "$(_cm claude-sonnet-5)" == pinned ]] && pass "구체 id 허용" || fail "구체 id 거부됨"
+[[ "$(_cm not-a-model)" == invalid ]] && pass "허용 범위 밖 값 거부" || fail "허용 범위 밖 값이 통과함"
+[[ "$(_cm 'claude-x invalid value')" == invalid ]] && pass "공백 섞인 값 거부" || fail "공백 섞인 값이 통과함(F5 재발)"
+[[ "$(_cm 'claude-x/garbage')" == invalid ]] && pass "슬래시 섞인 값 거부" || fail "슬래시 섞인 값이 통과함(F5 재발)"
+[[ "$(_cm 'fable-')" == invalid ]] && pass "빈 접미부 거부" || fail "빈 접미부(fable-)가 통과함(F5 재발)"
 
-# 15) session_launch_model — 우선순위: env > config > 세션 상속 > default, 필드 순서는 source가 먼저다(F2)
-# 이 스위트를 Claude 세션 안에서 돌리면 상속 경로가 실제 transcript 를 타 결과가 환경에
-# 따라 갈린다. 상속을 직접 검사하는 구간 외에는 세션 식별자를 비워 hermetic 하게 만든다.
-export CLAUDE_CODE_SESSION_ID=""
-mkdir -p "$TMP/wt/rd-workflow/config"
-cat > "$TMP/wt/rd-workflow/config/model-strategy.json" <<'JSON'
-{"version": 1, "subagent": "sonnet", "session_model": "haiku"}
-JSON
-out="$(RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>/dev/null)"
-[[ "$out" == $'config\thaiku' ]] && pass "config 값 채택(env 없음), source가 먼저" || fail "config 채택: $out"
-out="$(RD_SESSION_MODEL=opus session_launch_model "$TMP/wt" 2>/dev/null)"
-[[ "$out" == $'env\topus' ]] && pass "env 가 config 보다 우선" || fail "env 우선: $out"
-out="$(RD_SESSION_MODEL=bogus session_launch_model "$TMP/wt" 2>/dev/null)"
-[[ "$out" == $'default\t' ]] && pass "env 값이 허용 범위 밖이면 default(config 는 보지 않음), 빈 model 필드가 보존된다" || fail "env 무효 처리: $out"
+# ---- 작업 세션 선택 하네스 (spec 2026-11-22-1010 D4~D8) ----
+# 설정 루트(호출 체크아웃)는 $ROOT, 대상 worktree 는 $TMP/wt 로 따로 둔다. 가짜 claude 는 PATH 앞에 둔다.
+ROOT="$TMP/root"; mkdir -p "$ROOT/rd-workflow/config" "$TMP/home"
+RCFG="$ROOT/rd-workflow/config"
+CB="$TMP/cb"; CB_OK="$CB/ok"; CB_NOEFF="$CB/noeff"; CB_SLOW="$CB/slow"; mkdir -p "$CB_OK" "$CB_NOEFF" "$CB_SLOW"
+for _cbn in ok noeff slow; do : > "$CB/$_cbn.log"; done
+cat > "$CB_OK/claude" <<STUBEOF
+#!/usr/bin/env bash
+echo "\$*" >> "$CB/ok.log"
+if [[ "\${1-}" == --help ]]; then echo "  --model <model>  Model"; echo "  --effort <level>  Effort level"; fi
+exit 0
+STUBEOF
+cat > "$CB_NOEFF/claude" <<STUBEOF
+#!/usr/bin/env bash
+echo "\$*" >> "$CB/noeff.log"
+if [[ "\${1-}" == --help ]]; then echo "  --model <model>  Model"; fi
+exit 0
+STUBEOF
+cat > "$CB_SLOW/claude" <<STUBEOF
+#!/usr/bin/env bash
+echo "\$*" >> "$CB/slow.log"
+sleep 5
+if [[ "\${1-}" == --help ]]; then echo "  --model <model>"; echo "  --effort <level>"; fi
+exit 0
+STUBEOF
+chmod +x "$CB_OK/claude" "$CB_NOEFF/claude" "$CB_SLOW/claude"
 
-rm -rf "$TMP/wt/rd-workflow/config"
-out="$(RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>/dev/null)"
-[[ "$out" == $'default\t' ]] && pass "설정 파일 없으면 default(경고 없음)" || fail "파일 없음 처리: $out"
+_base_env() {
+  export RD_SESSION_MODEL= RD_SESSION_EFFORT= RD_MODELS_CONFIG= CLAUDE_CODE_SESSION_ID= CLAUDE_CONFIG_DIR=
+  export HOME="$TMP/home" project_root="$ROOT" PATH="$CB_OK:$PATH"
+}
+_run() {  # _run [VAR=값 ...] -- <명령...> — 기본 환경(설정·세션 변수 비움) 위에서 서브셸로 실행한다
+  ( _base_env
+    while [[ "$1" != "--" ]]; do export "$1"; shift; done
+    shift
+    "$@" )
+}
+_sel_core() {
+  session_launch_selection 2>"$TMP/sl.err"
+  printf '%s|%s|%s|%s' "$SL_MODEL" "$SL_EFFORT" "$SL_MODEL_LABEL" "$SL_EFFORT_LABEL"
+}
+_sel() { _run "$@" -- _sel_core; }   # _sel [VAR=값 ...] → "모델|effort|모델 표기|effort 표기"
+_cd_and() { cd "$1"; shift; "$@"; }
+_split() { IFS='|' read -r S_M S_E S_ML S_EL <<<"$1" || true; }
+_mj() { printf '%s' "$1" > "$RCFG/models.json"; }
+_legacy() { printf '%s' "$1" > "$RCFG/model-strategy.json"; }
+_cfg_clear() { rm -f "$RCFG/models.json" "$RCFG/model-strategy.json"; }
+sl_err_has() { [[ "$(cat "$TMP/sl.err")" == *"$2"* ]] && pass "$1" || fail "$1: stderr=[$(cat "$TMP/sl.err")]"; }
+sl_err_lacks() { [[ "$(cat "$TMP/sl.err")" != *"$2"* ]] && pass "$1" || fail "$1: stderr=[$(cat "$TMP/sl.err")]"; }
+LEG="model-strategy.json(옛 키)"; UNSET_L="미지정 — CLI 기본값"; INH="현재 세션 상속"
 
-mkdir -p "$TMP/wt/rd-workflow/config"
-printf '{not valid json' > "$TMP/wt/rd-workflow/config/model-strategy.json"
-err="$(RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>&1 >/dev/null)"
-out="$(RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>/dev/null)"
-[[ "$out" == $'default\t' && -n "$err" ]] && pass "손상된 설정은 경고 후 default" || fail "손상 처리: out=$out err=$err"
+# 15) 모델 우선순위 — env > models.json > model-strategy.json(옛 키) > 세션 상속 > 미지정, 무효·default 는 상속하지 않는다
+_cfg_clear
+_legacy '{"version": 1, "subagent": "sonnet", "session_model": "haiku"}'
+out="$(_sel)"; _split "$out"
+[[ "$S_M|$S_ML" == "haiku|$LEG" ]] && pass "옛 키 값 채택(env 없음), 표기 옛 키" || fail "옛 키 채택: $out"
+sl_err_has "옛 키를 쓰면 옮김 안내를 낸다" "session.claude.model 로 옮기십시오"
+out="$(_sel RD_SESSION_MODEL=opus)"; _split "$out"
+[[ "$S_M|$S_ML" == "opus|RD_SESSION_MODEL" ]] && pass "env 가 옛 키보다 우선" || fail "env 우선: $out"
+out="$(_sel RD_SESSION_MODEL=bogus)"; _split "$out"
+[[ -z "$S_M" && "$S_ML" == "$UNSET_L" ]] && pass "env 값이 허용 범위 밖이면 미지정(옛 키는 보지 않음)" || fail "env 무효 처리: $out"
 
-printf '{"nested":{"session_model":"haiku"}}' > "$TMP/wt/rd-workflow/config/model-strategy.json"
-out="$(RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>/dev/null)"
-[[ "$out" == $'default\t' ]] && pass "중첩된 키는 최상위 키로 오인하지 않는다(F4 재발 방지)" || fail "중첩 키 오인: $out"
+_cfg_clear
+out="$(_sel)"; _split "$out"
+[[ -z "$S_M" && ! -s "$TMP/sl.err" ]] && pass "설정 파일 없으면 미지정(경고 없음)" || fail "파일 없음 처리: $out err=$(cat "$TMP/sl.err")"
 
-printf '{"session_model": 5}' > "$TMP/wt/rd-workflow/config/model-strategy.json"
-out="$(RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>/dev/null)"
-[[ "$out" == $'default\t' ]] && pass "문자열이 아닌 값은 키 없음과 동일 처리(F4)" || fail "타입 오류 처리: $out"
+printf '{not valid json' > "$RCFG/model-strategy.json"
+out="$(_sel)"; _split "$out"
+[[ -z "$S_M" && -s "$TMP/sl.err" ]] && pass "손상된 옛 키 설정은 경고 후 미지정" || fail "손상 처리: out=$out err=$(cat "$TMP/sl.err")"
 
-printf '[1,2,3]' > "$TMP/wt/rd-workflow/config/model-strategy.json"
-err="$(RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>&1 >/dev/null)"
-out="$(RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>/dev/null)"
-[[ "$out" == $'default\t' && -n "$err" ]] && pass "최상위가 object 가 아니면 손상과 동일하게 경고한다(F4)" || fail "비-object 최상위 처리: out=$out err=$err"
+_legacy '{"nested":{"session_model":"haiku"}}'
+out="$(_sel)"; _split "$out"
+[[ -z "$S_M" ]] && pass "중첩된 키는 최상위 키로 오인하지 않는다(F4 재발 방지)" || fail "중첩 키 오인: $out"
+_legacy '{"session_model": 5}'
+out="$(_sel)"; _split "$out"
+[[ -z "$S_M" ]] && pass "문자열이 아닌 값은 키 없음과 동일 처리(F4)" || fail "타입 오류 처리: $out"
+_legacy '[1,2,3]'
+out="$(_sel)"; _split "$out"
+[[ -z "$S_M" && -s "$TMP/sl.err" ]] && pass "최상위가 object 가 아니면 손상과 동일하게 경고한다(F4)" || fail "비-object 최상위 처리: out=$out err=$(cat "$TMP/sl.err")"
+_legacy '{"session_model":"opus"} {}'
+out="$(_sel)"; _split "$out"
+[[ -z "$S_M" && -s "$TMP/sl.err" ]] && pass "파일 하나에 JSON 문서가 두 개면 손상으로 취급한다(F4 turn 004)" || fail "복수 JSON 문서를 정상 채택함: out=$out"
 
-printf '{"session_model":"opus"} {}' > "$TMP/wt/rd-workflow/config/model-strategy.json"
-err="$(RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>&1 >/dev/null)"
-out="$(RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>/dev/null)"
-[[ "$out" == $'default\t' && -n "$err" ]] \
-  && pass "파일 하나에 JSON 문서가 두 개면 손상으로 취급한다(F4 turn 004 재발 방지)" \
-  || fail "복수 JSON 문서를 정상 채택함(F4 재발): out=$out err=$err"
-rm -rf "$TMP/wt/rd-workflow"
-
-# 15b) 세션 상속 — 명시 설정이 없을 때만, transcript 의 마지막 유효 모델을 집는다
+# 15b) 세션 상속 — 설정이 없을 때만, transcript 의 마지막 유효 값을 칸마다 따로 집는다
 _mk_transcript() {  # <session-id> <줄...> — $TMP/home 아래 가짜 transcript 를 만든다
   local sid="$1"; shift
-  local dir="$TMP/home/.claude/projects/-fake-project"
+  local dir="$TMP/home/.claude/projects/p"
   mkdir -p "$dir"
   : > "$dir/$sid.jsonl"
   local l
   for l in "$@"; do printf '%s\n' "$l" >> "$dir/$sid.jsonl"; done
 }
-_inherit_model() {  # <session-id> → session_launch_model 출력
-  HOME="$TMP/home" CLAUDE_CONFIG_DIR="$TMP/home/.claude" \
-    CLAUDE_CODE_SESSION_ID="$1" RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>/dev/null
-}
-
-rm -rf "$TMP/home"
+_isel() { _sel CLAUDE_CODE_SESSION_ID="$1" "${@:2}"; }   # _isel <세션 id> [VAR=값 ...]
+_cfg_clear; rm -rf "$TMP/home/.claude"
 _mk_transcript sid-a \
-  '{"type":"assistant","message":{"model":"claude-sonnet-5"}}' \
+  '{"type":"assistant","message":{"model":"claude-sonnet-5"},"effort":"low"}' \
   '{"type":"user","message":{"role":"user"}}' \
-  '{"type":"assistant","message":{"model":"claude-opus-5"}}'
-out="$(_inherit_model sid-a)"
-[[ "$out" == $'inherit\tclaude-opus-5' ]] \
-  && pass "설정이 없으면 transcript 의 마지막 모델을 상속한다" || fail "상속 실패: $out"
+  '{"type":"assistant","message":{"model":"claude-opus-5"},"effort":"medium"}'
+out="$(_isel sid-a)"; _split "$out"
+[[ "$S_M|$S_ML|$S_E|$S_EL" == "claude-opus-5|$INH|medium|$INH" ]] \
+  && pass "설정이 없으면 transcript 의 마지막 모델·effort 를 상속한다" || fail "상속 실패: $out"
+out="$(_isel sid-a RD_SESSION_MODEL=haiku)"; _split "$out"
+[[ "$S_M|$S_ML" == "haiku|RD_SESSION_MODEL" ]] && pass "env 가 상속보다 우선" || fail "env 우선(상속): $out"
+_legacy '{"session_model":"fable"}'
+out="$(_isel sid-a)"; _split "$out"
+[[ "$S_M|$S_ML" == "fable|$LEG" ]] && pass "옛 키가 상속보다 우선" || fail "옛 키 우선(상속): $out"
+_cfg_clear
 
-out="$(HOME="$TMP/home" CLAUDE_CONFIG_DIR="$TMP/home/.claude" \
-  CLAUDE_CODE_SESSION_ID=sid-a RD_SESSION_MODEL=haiku session_launch_model "$TMP/wt" 2>/dev/null)"
-[[ "$out" == $'env\thaiku' ]] && pass "env 가 상속보다 우선" || fail "env 우선(상속): $out"
-
-mkdir -p "$TMP/wt/rd-workflow/config"
-printf '{"session_model":"fable"}' > "$TMP/wt/rd-workflow/config/model-strategy.json"
-out="$(_inherit_model sid-a)"
-[[ "$out" == $'config\tfable' ]] && pass "config 가 상속보다 우선" || fail "config 우선(상속): $out"
-rm -rf "$TMP/wt/rd-workflow"
-
-# `<synthetic>` 은 모든 세션에 1건씩 섞여 있다 — 유효성 검사에서 탈락해야 한다
+# `<synthetic>` 은 모든 세션에 1건씩 섞여 있다 — 탈락해야 한다 (T2-2b)
 _mk_transcript sid-b '{"type":"assistant","message":{"model":"<synthetic>"}}'
-out="$(_inherit_model sid-b)"
-[[ "$out" == $'default\t' ]] && pass "<synthetic> 만 있으면 상속하지 않는다" || fail "<synthetic> 채택됨: $out"
+out="$(_isel sid-b)"; _split "$out"
+[[ -z "$S_M" && "$S_ML" == "$UNSET_L" ]] && pass "<synthetic> 만 있으면 상속하지 않는다" || fail "<synthetic> 채택됨: $out"
+_mk_transcript sid-b2 \
+  '{"type":"assistant","message":{"model":"claude-opus-5-5"}}' \
+  '{"type":"assistant","message":{"model":"<synthetic>"}}'
+out="$(_isel sid-b2)"; _split "$out"
+[[ "$S_M" == "claude-opus-5-5" ]] && pass "T2-2b 마지막이 <synthetic> 이면 그 앞의 유효 모델을 쓴다" || fail "T2-2b: $out"
 
-# subagent 행이 섞여 들어와도(방어적) 부모 모델을 덮지 않는다
+# subagent 행이 섞여 들어와도(방어적) 부모 값을 덮지 않는다
 _mk_transcript sid-c \
-  '{"type":"assistant","message":{"model":"claude-opus-5"}}' \
-  '{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-4-5-20251001"}}'
-out="$(_inherit_model sid-c)"
-[[ "$out" == $'inherit\tclaude-opus-5' ]] \
-  && pass "sidechain 행은 상속 대상에서 제외한다" || fail "sidechain 채택됨: $out"
+  '{"type":"assistant","message":{"model":"claude-opus-5"},"effort":"high"}' \
+  '{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-4-5-20251001"},"effort":"max"}'
+out="$(_isel sid-c)"; _split "$out"
+[[ "$S_M|$S_E" == "claude-opus-5|high" ]] && pass "T2-4 sidechain 행은 모델·effort 상속 대상에서 제외한다" || fail "sidechain 채택됨: $out"
 
-# 쓰이는 중이라 잘린 마지막 줄은 건너뛰고 그 앞의 유효 값을 쓴다
+# 쓰이는 중이라 잘린 마지막 줄은 건너뛰고 그 앞의 유효 값을 쓴다. type 이 assistant 가 아닌 기록은 effort 를 덮지 않는다.
 _mk_transcript sid-d \
-  '{"type":"assistant","message":{"model":"claude-opus-5"}}' \
-  '{"type":"assistant","message":{"mod'
-out="$(_inherit_model sid-d)"
-[[ "$out" == $'inherit\tclaude-opus-5' ]] \
-  && pass "잘린 마지막 줄은 건너뛴다" || fail "잘린 줄 처리: $out"
+  '{"type":"assistant","message":{"model":"claude-opus-5"},"effort":"high"}' \
+  '{"type":"user","effort":"low"}' \
+  '{"type":"assistant","effort":"hi'
+out="$(_isel sid-d)"; _split "$out"
+[[ "$S_M|$S_E" == "claude-opus-5|high" ]] && pass "T2-4 잘린 마지막 줄은 건너뛰고 user 기록의 effort 는 쓰지 않는다" || fail "잘린 줄·type 처리: $out"
+_mk_transcript sid-e '{"type":"assistant","message":{"model":"claude-opus-5"}}'
+out="$(_isel sid-e)"; _split "$out"
+[[ "$S_M" == "claude-opus-5" && -z "$S_E" && "$S_EL" == "$UNSET_L" ]] \
+  && pass "T2-4 effort 필드가 없으면 effort 는 미지정이다(값을 채우지 않는다)" || fail "effort 부재 처리: $out"
 
-out="$(HOME="$TMP/home" CLAUDE_CONFIG_DIR="$TMP/home/.claude" \
-  CLAUDE_CODE_SESSION_ID= RD_SESSION_MODEL= session_launch_model "$TMP/wt" 2>/dev/null)"
-[[ "$out" == $'default\t' ]] && pass "세션 식별자가 없으면 상속하지 않는다" || fail "식별자 없음: $out"
+out="$(_sel CLAUDE_CODE_SESSION_ID=)"; _split "$out"
+[[ -z "$S_M" && -z "$S_E" ]] && pass "세션 식별자가 없으면 상속하지 않는다" || fail "식별자 없음: $out"
+out="$(_isel sid-none)"; _split "$out"
+[[ -z "$S_M" && -z "$S_E" ]] && pass "transcript 가 없으면 상속하지 않는다" || fail "글롭 0건: $out"
+mkdir -p "$TMP/home/.claude/projects/q"
+cp "$TMP/home/.claude/projects/p/sid-a.jsonl" "$TMP/home/.claude/projects/q/sid-a.jsonl"
+out="$(_isel sid-a)"; _split "$out"
+[[ -z "$S_M" && -z "$S_E" ]] && pass "transcript 가 2건이면 상속하지 않는다" || fail "글롭 2건: $out"
+rm -f "$TMP/home/.claude/projects/q/sid-a.jsonl"
 
-out="$(_inherit_model sid-none)"
-[[ "$out" == $'default\t' ]] && pass "transcript 가 없으면 상속하지 않는다" || fail "글롭 0건: $out"
+# T2-2) 상속 모델이 고정 ID 여도 고정 경고를 내지 않고, models.json 은 칸마다 상속을 막는다
+_mk_transcript sid-t2 \
+  '{"type":"assistant","message":{"model":"claude-sonnet-5-5"},"effort":"low"}' \
+  '{"type":"assistant","message":{"model":"claude-opus-5-5"},"effort":"xhigh"}' \
+  '{"type":"user","effort":"low"}'
+out="$(_isel sid-t2)"; _split "$out"
+[[ "$S_M|$S_ML|$S_E|$S_EL" == "claude-opus-5-5|$INH|xhigh|$INH" ]] \
+  && pass "T2-2 설정이 없으면 모델·effort 모두 부모를 상속한다(user 기록의 low 에 덮이지 않는다)" || fail "T2-2 상속: $out"
+sl_err_lacks "T2-2 상속한 고정 ID 에는 고정 경고가 없다" "고정됨"
+_mj '{"session":{"claude":{"model":"sonnet"}}}'
+out="$(_isel sid-t2)"; _split "$out"
+[[ "$S_M|$S_ML|$S_E|$S_EL" == "sonnet|models.json|xhigh|$INH" ]] \
+  && pass "T2-2 모델만 models.json 이면 effort 는 상속한다" || fail "T2-2 칸별 상속: $out"
+_cfg_clear
 
-# 같은 세션 ID 가 두 프로젝트에 있으면 어느 쪽인지 정할 수 없다 — 판정을 포기한다
-mkdir -p "$TMP/home/.claude/projects/-other-project"
-cp "$TMP/home/.claude/projects/-fake-project/sid-a.jsonl" \
-   "$TMP/home/.claude/projects/-other-project/sid-a.jsonl"
-out="$(_inherit_model sid-a)"
-[[ "$out" == $'default\t' ]] && pass "transcript 가 2건이면 상속하지 않는다" || fail "글롭 2건: $out"
-rm -rf "$TMP/home"
+# T2-3) default·무효는 상속하지 않는다
+out="$(_isel sid-t2 RD_SESSION_EFFORT=default)"; _split "$out"
+[[ -z "$S_E" && "$S_EL" == "default 지정 — CLI 기본값" ]] \
+  && pass "T2-3 effort default 는 상속하지 않고 넘기지 않는다" || fail "T2-3 effort default: $out"
+out="$(_isel sid-t2 RD_SESSION_MODEL=bogus)"; _split "$out"
+[[ -z "$S_M" && "$S_ML" == "$UNSET_L" ]] \
+  && pass "T2-3 env 무효 모델은 상속하지 않는다(미지정)" || fail "T2-3 무효 모델: $out"
+
+# T2-5) 옛 키 — models.json 이 없을 때만, 손상되면 상속 없이 미지정
+_legacy '{"session_model":"haiku"}'
+out="$(_isel sid-t2)"; _split "$out"
+[[ "$S_M|$S_ML" == "haiku|$LEG" ]] && pass "T2-5 옛 키 값이 상속보다 먼저다" || fail "T2-5 옛 키: $out"
+sl_err_has "T2-5 stderr 에 옮김 안내" "session.claude.model 로 옮기십시오"
+sl_err_lacks "T2-5 별칭 옛 키에는 고정 경고가 없다" "고정됨"
+_legacy '{"session_model":"claude-opus-5-5"}'
+out="$(_isel sid-t2)"; _split "$out"
+[[ "$S_M|$S_ML" == "claude-opus-5-5|$LEG" ]] && pass "T2-5 옛 키 고정 ID 를 그대로 쓴다" || fail "T2-5 옛 키 고정 ID: $out"
+sl_err_has "T2-5 옛 키 고정 ID 에 고정 경고" "고정됨, 낡을 수 있음"
+sl_err_has "T2-5 옛 키 고정 ID 에도 옮김 안내" "session.claude.model 로 옮기십시오"
+_legacy '{"session_model":"default"}'
+out="$(_isel sid-t2)"; _split "$out"
+[[ -z "$S_M" && "$S_ML" == "default 지정 — CLI 기본값" ]] \
+  && pass "T2-5 옛 키 default 는 넘기지 않고 상속하지 않는다" || fail "T2-5 옛 키 default: $out"
+sl_err_has "T2-5 옛 키 default 도 옮김 안내" "session.claude.model 로 옮기십시오"
+printf '{not json' > "$RCFG/model-strategy.json"
+out="$(_isel sid-t2)"; _split "$out"
+[[ -z "$S_M" && "$S_ML" == "$UNSET_L" && -s "$TMP/sl.err" ]] \
+  && pass "T2-5 옛 키 손상 → 경고 후 미지정(transcript 가 있어도 상속하지 않음)" || fail "T2-5 손상: $out err=$(cat "$TMP/sl.err")"
+# T2-5b) models.json 이 옛 키보다 먼저다
+_mj '{"session":{"claude":{"model":"opus"}}}'
+_legacy '{"session_model":"haiku"}'
+out="$(_sel)"; _split "$out"
+[[ "$S_M|$S_ML" == "opus|models.json" ]] && pass "T2-5b models.json 이 옛 키보다 우선" || fail "T2-5b: $out"
+sl_err_lacks "T2-5b 옮김 안내 없음" "옮기십시오"
+_cfg_clear
 
 # 16) 수동 기동 명령에 모델이 반영된다(인자 없이 호출 — 자체 계산 경로)
-mkdir -p "$TMP/wt/rd-workflow/config"
-cat > "$TMP/wt/rd-workflow/config/model-strategy.json" <<'JSON'
-{"version": 1, "session_model": "opus"}
-JSON
-cmd="$(session_launch_command "$TMP/wt" alpha)"
+_legacy '{"version": 1, "session_model": "opus"}'
+cmd="$(_run -- session_launch_command "$TMP/wt" alpha 2>/dev/null)"
 [[ "$cmd" == *"--model opus"* ]] && pass "수동 명령에 --model 반영(자체 계산)" || fail "수동 명령 모델: $cmd"
-rm -rf "$TMP/wt/rd-workflow"
-cmd="$(session_launch_command "$TMP/wt" alpha)"
+_cfg_clear
+cmd="$(_run -- session_launch_command "$TMP/wt" alpha 2>/dev/null)" || true
 [[ "$cmd" != *"--model"* ]] && pass "미지정이면 --model 을 붙이지 않는다" || fail "미지정인데 --model 붙음: $cmd"
 
 # 17) 3번째 인자로 모델을 직접 넘기면 재계산하지 않는다(F3 — 호출자 우선)
-cmd="$(session_launch_command "$TMP/wt" alpha haiku)"
+cmd="$(_run -- session_launch_command "$TMP/wt" alpha haiku)"
 [[ "$cmd" == *"--model haiku"* ]] && pass "3번째 인자로 넘긴 모델을 그대로 쓴다" || fail "인자 전달: $cmd"
 
 # 18) 자동 기동(herdr)도 같은 모델을 agent start 인자에 싣는다
-mkdir -p "$TMP/wt/rd-workflow/config"
-cat > "$TMP/wt/rd-workflow/config/model-strategy.json" <<'JSON'
-{"version": 1, "session_model": "haiku"}
-JSON
+_legacy '{"version": 1, "session_model": "haiku"}'
 make_stub 0 0 0
-: "$(PATH="$STUB:$PATH" HERDR_ENV=1 RD_CHILD_SESSION= session_launch "$TMP/wt" alpha REQUEST.md 2>/dev/null)"
+: "$(_run PATH="$STUB:$PATH" HERDR_ENV=1 RD_CHILD_SESSION= -- session_launch "$TMP/wt" alpha REQUEST.md 2>/dev/null)"
 start_call="$(grep '^agent start' "$STUB/calls.log" || true)"
 [[ "$start_call" == *"-- --model haiku"* ]] \
   && pass "자동 기동 agent start 에 -- --model 반영(자체 계산)" || fail "자동 기동 모델: $start_call"
+_cfg_clear
 
 # 19) session_launch 에 모델을 4번째 인자로 직접 넘기면 재계산하지 않는다(F3)
 make_stub 0 0 0
-rm -rf "$TMP/wt/rd-workflow"
 : "$(PATH="$STUB:$PATH" HERDR_ENV=1 RD_CHILD_SESSION= session_launch "$TMP/wt" alpha REQUEST.md opus 2>/dev/null)"
 start_call="$(grep '^agent start' "$STUB/calls.log" || true)"
 [[ "$start_call" == *"-- --model opus"* ]] \
   && pass "session_launch 4번째 인자로 넘긴 모델을 그대로 쓴다(설정 파일 없어도)" || fail "인자 전달: $start_call"
 
 # 20) 경고가 stderr 로 그대로 나온다(2>/dev/null 로 버리지 않는다 — F3)
-mkdir -p "$TMP/wt/rd-workflow/config"
-printf '{"session_model": "bad value"}' > "$TMP/wt/rd-workflow/config/model-strategy.json"
-err="$(session_launch_command "$TMP/wt" alpha 2>&1 >/dev/null)"
+_legacy '{"session_model": "bad value"}'
+err="$(_run -- session_launch_command "$TMP/wt" alpha 2>&1 >/dev/null)" || true
 [[ -n "$err" ]] && pass "session_launch_command 가 잘못된 설정 경고를 stderr 로 낸다" || fail "경고가 사라짐"
-rm -rf "$TMP/wt/rd-workflow"
+_cfg_clear
+
+# ---- T2 새 절: models.json 세션 칸, effort 전달, CLI 지원 확인, 설정 위치 ----
+# T2-1) models.json 세션 칸 opus/high 가 수동 명령·herdr 인자에 실린다
+_mj '{"session":{"claude":{"model":"opus","effort":"high"}}}'
+cmd="$(_run -- session_launch_command "$TMP/wt" alpha 2>/dev/null)"
+[[ "$cmd" == "cd $(printf '%q' "$TMP/wt") && claude --model opus --effort high" ]] \
+  && pass "T2-1 수동 명령에 --model opus --effort high" || fail "T2-1 수동 명령: $cmd"
+make_stub 0 0 0
+: "$(_run PATH="$STUB:$CB_OK:$PATH" HERDR_ENV=1 RD_CHILD_SESSION= -- session_launch "$TMP/wt" alpha REQUEST.md 2>/dev/null)"
+start_call="$(grep '^agent start' "$STUB/calls.log" || true)"
+[[ "$start_call" == *"-- --model opus --effort high" ]] \
+  && pass "T2-1 herdr agent start 에 -- --model opus --effort high" || fail "T2-1 herdr 인자: $start_call"
+
+# T2-6) CLI 가 --effort 를 모르면 인자에서 빼고 표기에 남긴다
+out="$(_sel PATH="$CB_NOEFF:$PATH" RD_SESSION_EFFORT=high)"; _split "$out"
+[[ -z "$S_E" && "$S_EL" == "CLI 미지원으로 뺌, RD_SESSION_EFFORT" ]] \
+  && pass "T2-6 미지원이면 SL_EFFORT 가 비고 표기가 미지원이다" || fail "T2-6 표기: $out"
+sl_err_has "T2-6 stderr 경고" "--effort 를 받지 않습니다"
+make_stub 0 0 0
+: "$(_run PATH="$STUB:$CB_NOEFF:$PATH" HERDR_ENV=1 RD_CHILD_SESSION= RD_SESSION_EFFORT=high -- session_launch "$TMP/wt" alpha REQUEST.md 2>/dev/null)"
+start_call="$(grep '^agent start' "$STUB/calls.log" || true)"
+[[ -n "$start_call" && "$start_call" != *"--effort"* ]] \
+  && pass "T2-6 미지원이면 herdr agent start 에 --effort 가 없다(agent start 는 불렸다)" || fail "T2-6 herdr 인자: [$start_call]"
+_cfg_clear
+out="$(_isel sid-t2 PATH="$CB_NOEFF:$PATH")"; _split "$out"
+[[ -z "$S_E" && "$S_EL" == "CLI 미지원으로 뺌, $INH" ]] \
+  && pass "T2-6 상속한 effort 도 미지원이면 뺀다" || fail "T2-6 상속 미지원: $out"
+
+# T2-6b) 지원 확인이 시간 초과면 effort 를 그대로 넘긴다(미지원으로 오판하지 않는다)
+make_stub 0 0 0
+_t0=$SECONDS
+: "$(_run PATH="$STUB:$CB_SLOW:$PATH" HERDR_ENV=1 RD_CHILD_SESSION= RD_LAUNCH_TIMEOUT=1 RD_SESSION_EFFORT=high -- session_launch "$TMP/wt" alpha REQUEST.md 2>"$TMP/sl.err")"
+start_call="$(grep '^agent start' "$STUB/calls.log" || true)"
+[[ "$start_call" == *"--effort high"* ]] && pass "T2-6b 시간 초과여도 herdr agent start 에 --effort high 가 남는다" || fail "T2-6b herdr 인자: [$start_call]"
+sl_err_has "T2-6b stderr 에 확인 실패 경고" "--effort 지원을 확인하지 못했습니다"
+out="$(_sel PATH="$CB_SLOW:$PATH" RD_LAUNCH_TIMEOUT=1 RD_SESSION_EFFORT=high)"; _split "$out"
+[[ "$S_E|$S_EL" == "high|RD_SESSION_EFFORT" ]] && pass "T2-6b 표기는 요청 출처(미지원 표기 아님)" || fail "T2-6b 표기: $out"
+(( SECONDS - _t0 <= 8 )) && pass "T2-6b 실행 시간이 상한 안($((SECONDS - _t0))초)" || fail "T2-6b 너무 오래 걸림: $((SECONDS - _t0))초"
+_cfg_clear
+
+# T2-7) 설정 루트는 호출 체크아웃이다 — 대상 worktree 의 파일을 읽지 않는다
+mkdir -p "$TMP/wt/rd-workflow/config"
+printf '%s' '{"session":{"claude":{"model":"haiku"}}}' > "$TMP/wt/rd-workflow/config/models.json"
+_mj '{"session":{"claude":{"model":"opus"}}}'
+cmd="$(_run -- session_launch_command "$TMP/wt" alpha 2>/dev/null)"
+[[ "$cmd" == *"--model opus"* && "$cmd" != *haiku* ]] && pass "T2-7 수동 명령은 호출 체크아웃 설정(opus)" || fail "T2-7 수동 명령: $cmd"
+make_stub 0 0 0
+: "$(_run PATH="$STUB:$PATH" HERDR_ENV=1 RD_CHILD_SESSION= -- session_launch "$TMP/wt" alpha REQUEST.md 2>/dev/null)"
+start_call="$(grep '^agent start' "$STUB/calls.log" || true)"
+[[ "$start_call" == *"-- --model opus"* ]] && pass "T2-7 herdr 인자도 호출 체크아웃 설정" || fail "T2-7 herdr 인자: $start_call"
+printf '{}' > "$TMP/alt.json"
+_cfg_clear; _legacy '{"session_model":"sonnet"}'
+out="$(_sel RD_MODELS_CONFIG="$TMP/alt.json")"; _split "$out"
+[[ "$S_M|$S_ML" == "sonnet|$LEG" ]] && pass "T2-7 RD_MODELS_CONFIG 에 세션 칸이 없어도 옛 키는 호출 체크아웃 것을 읽는다" || fail "T2-7 옛 키: $out"
+rm -rf "$TMP/wt/rd-workflow"; _cfg_clear
+
+# T2-8) 상대 RD_MODELS_CONFIG 는 현재 디렉터리가 아니라 호출 체크아웃 기준이다
+mkdir -p "$ROOT/sub" "$TMP/elsewhere/sub"
+printf '%s' '{"session":{"claude":{"model":"opus"}}}' > "$ROOT/sub/m.json"
+printf '%s' '{"session":{"claude":{"model":"haiku"}}}' > "$TMP/elsewhere/sub/m.json"
+cmd="$(_run RD_MODELS_CONFIG=sub/m.json -- _cd_and "$TMP/elsewhere" session_launch_command "$TMP/wt" alpha 2>/dev/null)"
+[[ "$cmd" == *"--model opus"* ]] && pass "T2-8 다른 디렉터리에서도 상대 경로는 호출 체크아웃 기준" || fail "T2-8: $cmd"
+
+# T2-9) jq 없는 PATH — python3 로 같은 결과
+NJ="$TMP/nojq-bin"; mkdir -p "$NJ"
+for _c in python3 bash cat grep sed awk printf dirname basename mktemp rm sleep date head tr; do
+  _p="$(command -v "$_c" 2>/dev/null || true)"; [[ -n "$_p" && -x "$_p" ]] && ln -sf "$_p" "$NJ/$_c"
+done
+cp "$CB_OK/claude" "$NJ/claude"
+_mj '{"session":{"claude":{"model":"sonnet","effort":"medium"}}}'
+cmd="$(_run PATH="$NJ" -- session_launch_command "$TMP/wt" alpha 2>/dev/null)"
+[[ "$cmd" == *"--model sonnet --effort medium" ]] && pass "T2-9 jq 없어도 수동 명령에 --model sonnet --effort medium" || fail "T2-9 수동 명령: $cmd"
+_sl_line_core() { session_launch_selection 2>/dev/null; printf '%s' "$SL_LINE"; }
+line="$(_run PATH="$NJ" -- _sl_line_core)"
+[[ "$line" == *"sonnet (출처: models.json)"* && "$line" == *"effort — medium (출처: models.json)"* ]] \
+  && pass "T2-9 SL_LINE 에 models.json 출처" || fail "T2-9 SL_LINE: $line"
+_cfg_clear
+
+# D8) 표시 한 줄 — 값·출처 모양
+_mj '{"session":{"claude":{"model":"sonnet","effort":"xhigh"}}}'
+line="$(_run -- _sl_line_core)"
+[[ "$line" == "다음 기동에 사용할 모델 — sonnet (출처: models.json) · effort — xhigh (출처: models.json)" ]] \
+  && pass "D8 SL_LINE 은 모델·effort 와 각 출처를 담는다" || fail "D8 SL_LINE: $line"
+line="$(_run PATH="$CB_NOEFF:$PATH" -- _sl_line_core)"
+[[ "$line" == *"effort — CLI 기본값 (CLI 미지원으로 뺌, models.json)" ]] \
+  && pass "D8 미지원이면 effort — CLI 기본값 (CLI 미지원으로 뺌, 출처)" || fail "D8 미지원 SL_LINE: $line"
+_cfg_clear
+
+# T2-10) 기동 실패 경로의 수동 안내에 받은 모델·effort 를 그대로 싣는다
+make_stub 1 0 0
+err="$(PATH="$STUB:$PATH" HERDR_ENV=1 RD_CHILD_SESSION= session_launch "$TMP/wt" alpha REQUEST.md opus herdr high 2>&1 >/dev/null)"
+[[ "$err" == *"--model opus --effort high"* ]] \
+  && pass "T2-10 실패 경로 수동 안내에 --model opus --effort high" || fail "T2-10: $err"
+
+# T2-12) bash 3.2 set -u — 두 칸이 미지정·default 여도 빈 배열 펼침이 터지지 않고 인자가 붙지 않는다
+make_stub 0 0 0
+_t12() {  # <env 대입...> — /bin/bash(3.2) 에서 session_launch 와 session_launch_command 를 돌려 두 결과를 낸다
+  env -i HOME="$TMP/home" PATH="$STUB:/usr/bin:/bin:/usr/sbin:/sbin" HERDR_ENV=1 HC_TERMINAL_ID= project_root="$ROOT" "$@" \
+    /bin/bash -c 'set -euo pipefail; source "$1/session_launch.sh"; session_launch "$2" alpha REQUEST.md >/dev/null; session_launch_command "$2" alpha; printf END' _ "$SCRIPT_DIR" "$TMP/wt" 2>"$TMP/t12.err"
+}
+cmd="$(_t12 RD_SESSION_MODEL= RD_SESSION_EFFORT=)" || true
+start_call="$(grep '^agent start' "$STUB/calls.log" || true)"
+[[ -n "$start_call" && "$start_call" != *" -- "* ]] && pass "T2-12 두 칸 미지정이면 agent start 에 -- 가 없다" || fail "T2-12 agent start: [$start_call] err=$(cat "$TMP/t12.err")"
+[[ "$cmd" == "cd $(printf '%q' "$TMP/wt") && claude"$'\n'"END" ]] && pass "T2-12 두 칸 미지정이면 수동 명령이 cd <wt> && claude (끝까지 실행됨)" || fail "T2-12 수동 명령: [$cmd] err=$(cat "$TMP/t12.err")"
+make_stub 0 0 0
+cmd="$(_t12 RD_SESSION_MODEL=default RD_SESSION_EFFORT=default)" || true
+start_call="$(grep '^agent start' "$STUB/calls.log" || true)"
+[[ -n "$start_call" && "$start_call" != *" -- "* && "$cmd" == "cd $(printf '%q' "$TMP/wt") && claude"$'\n'"END" ]] \
+  && pass "T2-12 두 칸 default 도 같다" || fail "T2-12 default: [$start_call] [$cmd]"
 
 # 8-1) session_probe 판정표 (spec D3) — 실제 herdr 응답 스키마(2026-10-29 실측)로 검사한다.
 #      성공은 stdout 의 단수 `result.agent`, 실패는 stderr 의 `{"error":{"code":..}}` + rc=1 이다.
@@ -720,9 +908,12 @@ out="$(cat "$TMP/launch.out")"
 #      포그라운드로 돌리는 순간 herdr 가 이 코드로 거부한다(2026-11-06 실측). 같은 pane 으로 다시 부른다.
 #   mk_seq_stub <spec>... — agent start 를 부를 때마다 다음 spec 을 쓴다(마지막 spec 은 반복).
 #   busy=stderr busy+rc1, busyout=stdout busy+rc1, ok=rc0, notready=stderr agent_not_ready+rc1,
-#   timeout=rc124, busy124=stderr busy+rc124, slowok=4초 뒤 rc0
+#   timeout=rc124, busy124=stderr busy+rc124,
+#   slowok=마지막 busy 응답 시각 + 창($STUB/win 초) + 1초가 지난 뒤 rc0 — 창은 그 busy 응답 전에 시작했으므로
+#   이 시도는 부하와 관계없이 창이 지난 뒤 끝난다.
 mk_seq_stub() {
   : > "$STUB/calls.log"; printf '0' > "$STUB/seq.n"; printf '%s\n' "$@" > "$STUB/seq.list"
+  rm -f "$STUB/busy.at"
   cat > "$STUB/herdr" <<STUBEOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$STUB/calls.log"
@@ -733,13 +924,14 @@ case "\$1 \$2" in
     n=\$(cat "$STUB/seq.n"); printf '%s' "\$((n + 1))" > "$STUB/seq.n"
     total=\$(wc -l < "$STUB/seq.list"); idx=\$((n + 1)); (( idx > total )) && idx=\$total
     case "\$(sed -n "\${idx}p" "$STUB/seq.list")" in
-      busy) printf '%s' "\$busy" >&2; exit 1 ;;
+      busy) date +%s > "$STUB/busy.at"; printf '%s' "\$busy" >&2; exit 1 ;;
       busyout) printf '%s' "\$busy"; exit 1 ;;
       ok) exit 0 ;;
       notready) echo '{"error":{"code":"agent_not_ready","message":"blocked"}}' >&2; exit 1 ;;
       timeout) exit 124 ;;
       busy124) printf '%s' "\$busy" >&2; exit 124 ;;
-      slowok) sleep 4; exit 0 ;;
+      slowok) until=\$(( \$(cat "$STUB/busy.at") + \$(cat "$STUB/win") + 1 ))
+              while (( \$(date +%s) < until )); do sleep 0.2; done; exit 0 ;;
     esac ;;
   "agent prompt") exit 0 ;;
   "tab close") exit 0 ;;
@@ -808,10 +1000,16 @@ _v="$(RD_LAUNCH_BUSY_RETRY_SECS=0 _b7 2>"$TMP/b7.err")"
 [[ "$_v" == 0 && ! -s "$TMP/b7.err" ]] \
   && pass "busy: B7 0 은 경고 없이 0" || fail "busy: B7 0 → $_v / $(cat "$TMP/b7.err")"
 
-mk_seq_stub busy slowok
-out="$(RD_LAUNCH_BUSY_RETRY_SECS=3 _bl)"
+# B8 전제는 「두 번째 시도가 창 안에서 시작한다」 이다. 부하가 큰 머신에서는 첫 시도 자체가 창을 넘겨
+# 재시도가 시작되지 않는다(제품은 설계대로 failed). 그때는 전제가 서지 않은 것이므로 창을 두 배로 늘려
+# 다시 돈다(3→6→12초). 세 번 모두 시작되지 않으면 FAIL 로 남겨 「재시도 누락」 퇴행을 숨기지 않는다.
+for _b8w in 3 6 12; do
+  mk_seq_stub busy slowok; printf '%s' "$_b8w" > "$STUB/win"
+  out="$(RD_LAUNCH_BUSY_RETRY_SECS=$_b8w _bl)"
+  [[ "$(_nstart)" -eq 1 ]] || break
+done
 [[ "$out" == "ok" && "$(_nstart)" -eq 2 && "$(_nclose)" -eq 0 ]] \
-  && pass "busy: B8 창이 지난 뒤 끝난 시도의 결과(ok)를 따른다" || fail "busy: B8 out=$out start=$(_nstart) close=$(_nclose)"
+  && pass "busy: B8 창이 지난 뒤 끝난 시도의 결과(ok)를 따른다" || fail "busy: B8 out=$out start=$(_nstart) close=$(_nclose) 창=${_b8w}초"
 
 mk_seq_stub busy124
 out="$(_bl)"
@@ -874,6 +1072,237 @@ b="$(HERDR_ENV= HC_TERMINAL_ID= PATH="$STUB:$PATH" session_launch_backend)"
 [[ "$b" == "none" ]] && pass "T1: 둘 다 없음 → none" || fail "backend 판정: $b"
 b="$(HERDR_ENV= HC_TERMINAL_ID=t6 PATH=/usr/bin:/bin session_launch_backend)"
 [[ "$b" == "none" ]] && pass "T1: hc 명령 없음 → none" || fail "backend 판정: $b"
+
+# 대역 orca — `$1/orca.scn` 의 `<하위명령 두 단어>\t<rc>\t<응답 파일>` 행으로 응답을 고르고, 모든 호출 인자를 `$1/orca.log` 에 한 줄씩 남긴다.
+make_orca_stub() {  # <dir>
+  local d="$1"; mkdir -p "$d"; : > "$d/orca.log"; [[ -f "$d/orca.scn" ]] || : > "$d/orca.scn"
+  cat > "$d/orca" <<STUBEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$d/orca.log"
+key="\$1 \$2"
+while IFS=\$'\t' read -r k rc resp; do
+  if [[ "\$k" == "\$key" ]]; then
+    [[ -n "\$resp" && -f "\$resp" ]] && cat "\$resp"
+    exit "\$rc"
+  fi
+done < "$d/orca.scn"
+exit 2
+STUBEOF
+  chmod +x "$d/orca"
+}
+orca_scn() {  # <dir> <두 단어> <rc> <응답 본문>
+  local n; n="$(wc -l < "$1/orca.scn" | tr -d ' ')"
+  printf '%s' "$4" > "$1/resp.$n"
+  printf '%s\t%s\t%s\n' "$2" "$3" "$1/resp.$n" >> "$1/orca.scn"
+}
+
+# T1-orca) 백엔드 판정 — herdr → hc → orca (spec D1)
+OST="$TMP/orca1"; make_orca_stub "$OST"; make_hc_stub live-same; make_stub 0 0 0
+b="$(ORCA_AGENT_SESSION_ID=x HERDR_ENV= HC_TERMINAL_ID= PATH="$OST:$PATH" session_launch_backend)"
+[[ "$b" == "orca" ]] && pass "T1-orca: ORCA_AGENT_SESSION_ID + orca 명령 → orca" || fail "orca 판정(세션 id): $b"
+b="$(ORCA_TERMINAL_HANDLE=term_x HERDR_ENV= HC_TERMINAL_ID= PATH="$OST:$PATH" session_launch_backend)"
+[[ "$b" == "orca" ]] && pass "T1-orca: ORCA_TERMINAL_HANDLE + orca 명령 → orca" || fail "orca 판정(handle): $b"
+# 조상 프로세스 대역 — `ps -o command= -p <pid>` / `ps -o ppid= -p <pid>` 를 표로 답합니다.
+#   표 줄: <pid> <ppid> <command>. 표에 없는 pid(테스트 셸 자신)는 START 줄로 답합니다.
+make_ps_stub() {  # <dir> — 표는 <dir>/ps.tbl
+  mkdir -p "$1"
+  cat > "$1/ps" <<'PSEOF'
+#!/usr/bin/env bash
+tbl="$(dirname "$0")/ps.tbl"; field=""; pid=""
+while [[ $# -gt 0 ]]; do case "$1" in -o) field="$2"; shift 2 ;; -p) pid="$2"; shift 2 ;; *) shift ;; esac; done
+line="$(awk -v p="$pid" '$1==p' "$tbl")"; [[ -n "$line" ]] || line="$(awk '$1=="START"' "$tbl")"
+[[ -n "$line" ]] || exit 1
+case "$field" in
+  ppid=) printf '%s\n' "$(printf '%s' "$line" | awk '{print $2}')" ;;
+  command=) printf '%s\n' "$(printf '%s' "$line" | cut -d' ' -f3-)" ;;
+esac
+PSEOF
+  chmod +x "$1/ps"
+}
+PST="$TMP/psstub"; make_ps_stub "$PST"
+printf 'START 900 -zsh\n900 800 /Users/u/Library/Application Support/orca/daemon-host/macos/terminal-host-1 --x\n800 1 /usr/libexec/launchd\n' > "$PST/ps.tbl.orca"
+printf 'START 700 -zsh\n700 650 /Users/u/.local/bin/herdr server\n650 600 -zsh\n600 1 /Users/u/Library/Application Support/orca/daemon-host/macos/terminal-host-1 --x\n' > "$PST/ps.tbl.herdr"
+printf 'START 500 -zsh\n500 1 /usr/bin/login -fp u\n' > "$PST/ps.tbl.none"
+cp "$PST/ps.tbl.herdr" "$PST/ps.tbl"
+b="$(ORCA_AGENT_SESSION_ID=x HERDR_ENV=1 HC_TERMINAL_ID= PATH="$PST:$STUB:$OST:$PATH" session_launch_backend)"
+[[ "$b" == "herdr" ]] && pass "T1-orca: 조상에 herdr server 가 먼저 → herdr" || fail "herdr 우선(조상 herdr): $b"
+# Orca 데몬이 herdr pane 에서 시작돼 HERDR_* 가 모든 Orca 터미널로 새는 환경(2026-11-24 실측) — 조상이 Orca 면 orca.
+cp "$PST/ps.tbl.orca" "$PST/ps.tbl"
+b="$(ORCA_TERMINAL_HANDLE=term_x HERDR_ENV=1 HERDR_PANE_ID=wF:p1 HC_TERMINAL_ID= PATH="$PST:$STUB:$OST:$PATH" session_launch_backend)"
+[[ "$b" == "orca" ]] && pass "T1-orca: HERDR_ENV 가 새어도 조상이 Orca 면 orca" || fail "새는 HERDR_ENV(조상 orca): $b"
+cp "$PST/ps.tbl.none" "$PST/ps.tbl"
+b="$(ORCA_AGENT_SESSION_ID=x HERDR_ENV=1 HC_TERMINAL_ID= PATH="$PST:$STUB:$OST:$PATH" session_launch_backend)"
+[[ "$b" == "herdr" ]] && pass "T1-orca: 조상으로 가릴 수 없으면 변수 순서(herdr)" || fail "조상 판정 불가: $b"
+b="$(ORCA_AGENT_SESSION_ID=x HERDR_ENV= HC_TERMINAL_ID=t PATH="$STUB:$OST:$PATH" session_launch_backend)"
+[[ "$b" == "hc" ]] && pass "T1-orca: hc 가 orca 보다 먼저" || fail "hc 우선: $b"
+b="$(ORCA_AGENT_SESSION_ID=x HERDR_ENV= HC_TERMINAL_ID= PATH=/usr/bin:/bin session_launch_backend)"
+[[ "$b" == "none" ]] && pass "T1-orca: orca 명령 없음 → none" || fail "orca 명령 없음: $b"
+b="$(ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE= HERDR_ENV= HC_TERMINAL_ID= PATH="$OST:$PATH" session_launch_backend)"
+[[ "$b" == "none" ]] && pass "T1-orca: orca 변수 없음 → none" || fail "orca 변수 없음: $b"
+
+# T1-orca-alive) session_caller_alive orca (spec D2)
+orca_alive_case() {  # <label> <id> <two-words> <rc> <body> <expected-rc>
+  local d="$TMP/oa.$1"; rm -rf "$d"; make_orca_stub "$d"; orca_scn "$d" "$3" "$4" "$5"
+  local got=0; PATH="$d:$PATH" session_caller_alive orca "$2" >/dev/null 2>&1 || got=$?
+  [[ "$got" == "$6" ]] && pass "T1-orca-alive: $1 → rc $6" || fail "orca alive $1: rc=$got (기대 $6)"
+}
+orca_alive_case term-connected term_a "terminal show" 0 '{"id":"x","ok":true,"result":{"terminal":{"handle":"term_a","connected":true,"worktreePath":"/w"}},"_meta":{}}' 0
+orca_alive_case term-closed term_a "terminal show" 0 '{"id":"x","ok":true,"result":{"terminal":{"handle":"term_a","connected":false,"exitCause":{"kind":"operator_close"}}},"_meta":{}}' 1
+orca_alive_case term-stale term_a "terminal show" 1 '{"id":"x","ok":false,"error":{"code":"terminal_handle_stale","message":"m"},"_meta":{}}' 2
+orca_alive_case term-empty term_a "terminal show" 0 '' 2
+orca_alive_case agent-places sess1 "agent show" 0 '{"ok":true,"result":{"orcaSessionId":"o","kind":"chat","places":[{"worktreeId":"r::/w"}]}}' 0
+orca_alive_case agent-noplaces sess1 "agent show" 0 '{"ok":true,"result":{"orcaSessionId":"o","kind":"chat","places":[]}}' 1
+orca_alive_case agent-unknown sess1 "agent show" 1 '{"id":"x","ok":false,"error":{"code":"agent_unknown","message":"m"},"_meta":{}}' 1
+orca_alive_case agent-empty sess1 "agent show" 0 '' 2
+
+# T2-orca) 기동·인계 처리 판정 (spec D3·D4, Task 2 의 2a~2g) — 응답은 spec M5·M6·M7 실측 모양
+OWT="$TMP/owt"; mkdir -p "$OWT"
+O_CHAT='{"id":"1","ok":true,"result":{"outcome":{"kind":"structured","sessionId":"s1","handle":"structured-agent-session-s1","tabId":"structured-agent-session-s1"},"worktreeId":"r::/w","prompt":{"delivery":"submit","outcome":"journaled","messageId":"m"},"operationId":"op1"},"_meta":{}}'
+O_TERM='{"id":"1","ok":true,"result":{"outcome":{"kind":"terminal","handle":"term_t1","paneKey":"p:1"},"worktreeId":"r::/w","prompt":{"delivery":"submit","outcome":"handed-to-terminal"},"operationId":"op1"},"_meta":{}}'
+O_READ_DONE='{"ok":true,"result":{"orcaSessionId":"s1","kind":"chat","entries":[{"kind":"message","role":"user","text":"u"},{"kind":"message","role":"assistant","text":"a"}],"state":"working"}}'
+O_READ_WAIT='{"ok":true,"result":{"orcaSessionId":"s1","kind":"chat","entries":[{"kind":"message","role":"user","text":"u"}],"state":"waiting"}}'
+O_LIST_P1='{"ok":true,"result":{"agents":[{"orcaSessionId":"o1","kind":"terminal","state":"done","paneKey":"p:1","lastAssistantMessage":"a"}]}}'
+# orca_launch <dir> <model> <effort> — 대역 orca 로 session_launch 를 부른다. OL_OUT(stdout)·OL_ERR(stderr)·OL_META(메타 파일 내용)
+orca_launch() {
+  local d="$1" meta="$1/meta"; : > "$meta"
+  OL_OUT="$(ORCA_AGENT_SESSION_ID=x HERDR_ENV= HC_TERMINAL_ID= RD_CHILD_SESSION= RD_LAUNCH_META_FILE="$meta" RD_LAUNCH_PROMPT_TIMEOUT=6 \
+    PATH="$d:$PATH" session_launch "$OWT" alpha "$OWT/REQUEST.md" "$2" orca "$3" 2>"$d/err")"
+  OL_ERR="$(cat "$d/err")"; OL_META="$(cat "$meta")"
+}
+orca_count() { grep -c -- "$2" "$1/orca.log" || true; }   # <dir> <grep 패턴> — orca.log 에서 패턴이 있는 줄 수
+
+# 2a 채팅 정상 — 처리 확인까지 ok, 기동 호출 1회·--prompt 1회·--surface/--focus 없음
+d="$TMP/o2a"; make_orca_stub "$d"; orca_scn "$d" "agent launch" 0 "$O_CHAT"; orca_scn "$d" "agent read" 0 "$O_READ_DONE"
+orca_launch "$d" sonnet high
+[[ "$OL_OUT" == "ok" ]] && pass "2a orca 채팅 정상 → ok" || fail "2a: out=$OL_OUT err=$OL_ERR"
+[[ "$(orca_count "$d" '^agent launch ')" == 1 && "$(grep -o -- '--prompt' "$d/orca.log" | wc -l | tr -d ' ')" == 1 ]] \
+  && pass "2a agent launch 1회, --prompt 1회" || fail "2a 호출 횟수: $(cat "$d/orca.log")"
+! grep -qE -- '--surface|--focus' "$d/orca.log" && pass "2a --surface·--focus 없음" || fail "2a --surface/--focus 있음: $(cat "$d/orca.log")"
+grep -q -- "--worktree path:$OWT " "$d/orca.log" && grep -q -- '--model sonnet --effort high' "$d/orca.log" \
+  && pass "2a --worktree path:<wt>, --model·--effort 전달" || fail "2a 인자: $(head -1 "$d/orca.log")"
+[[ "$OL_META" == *"launch-tab=structured-agent-session-s1"* && "$OL_META" != *launch-pane* ]] \
+  && pass "2a 메타에 launch-tab=structured-agent-session-s1 (launch-pane 없음)" || fail "2a 메타: $OL_META"
+[[ "$OL_ERR" == *"Orca 세션 기동: alpha — 기동 응답을 최대 65초 기다립니다."* && "$OL_ERR" == *"시작 프롬프트 처리 확인: alpha — 첫 턴 시작을 최대 6초 기다립니다."* ]] \
+  && pass "2a 진행 표시 두 줄" || fail "2a 진행 표시: $OL_ERR"
+
+# 2b 터미널 정상 — agent list 의 paneKey 항목으로 처리 확인
+d="$TMP/o2b"; make_orca_stub "$d"; orca_scn "$d" "agent launch" 0 "$O_TERM"; orca_scn "$d" "agent list" 0 "$O_LIST_P1"
+orca_launch "$d" "" ""
+[[ "$OL_OUT" == "ok" && "$OL_META" == *"launch-tab=term_t1"* && "$OL_META" == *"launch-pane=p:1"* ]] \
+  && pass "2b orca 터미널 정상 → ok, 메타에 launch-tab·launch-pane" || fail "2b: out=$OL_OUT meta=$OL_META err=$OL_ERR"
+
+# 2c 도착했으나 미처리 — unknown, 붙여 넣지 말라는 안내, 재기동 없음
+d="$TMP/o2c"; make_orca_stub "$d"; orca_scn "$d" "agent launch" 0 "$O_CHAT"; orca_scn "$d" "agent read" 0 "$O_READ_WAIT"
+orca_launch "$d" "" ""
+[[ "$OL_OUT" == "unknown" && "$OL_ERR" == *"문구를 붙여 넣지 마십시오"* ]] \
+  && pass "2c 미처리 → unknown + 붙여 넣지 말라는 안내" || fail "2c: out=$OL_OUT err=$OL_ERR"
+[[ "$(orca_count "$d" '^agent launch ')" == 1 ]] && pass "2c agent launch 정확히 1회" || fail "2c agent launch 횟수: $(orca_count "$d" '^agent launch ')"
+# 2c-2 prompt.outcome 이 없거나 낯선 값 — unknown, 사이드바 확인 먼저
+d="$TMP/o2c2"; make_orca_stub "$d"; orca_scn "$d" "agent launch" 0 '{"ok":true,"result":{"outcome":{"kind":"structured","handle":"structured-agent-session-s1"},"prompt":{"outcome":"dropped"}}}'
+orca_launch "$d" "" ""
+[[ "$OL_OUT" == "unknown" && "$OL_ERR" == *"인계 도착을 확인하지 못했습니다"* && "$OL_META" == *"launch-tab=structured-agent-session-s1"* ]] \
+  && pass "2c-2 prompt.outcome 낯선 값 → unknown, 메타는 남김" || fail "2c-2: out=$OL_OUT err=$OL_ERR meta=$OL_META"
+
+# 2d ok:false·operationId 없음 → failed + 수동 기동 명령
+d="$TMP/o2d"; make_orca_stub "$d"; orca_scn "$d" "agent launch" 1 '{"id":"1","ok":false,"error":{"code":"worktree_not_found","message":"no wt"}}'
+orca_launch "$d" "" ""
+[[ "$OL_OUT" == "failed" && "$OL_ERR" == *"worktree_not_found"* && "$OL_ERR" == *"cd $OWT && claude"* ]] \
+  && pass "2d ok:false → failed + 수동 기동 명령" || fail "2d: out=$OL_OUT err=$OL_ERR"
+[[ "$(orca_count "$d" '^agent launch ')" == 1 ]] && pass "2d 재생 없음(agent launch 1회)" || fail "2d agent launch 횟수"
+
+# 2e 응답 시간 초과(rc 124 — 실제 잠들기는 최소 상한 11초라 대역이 124 를 낸다) → unknown
+d="$TMP/o2e"; make_orca_stub "$d"; orca_scn "$d" "agent launch" 124 ''
+orca_launch "$d" "" ""
+[[ "$OL_OUT" == "unknown" && "$OL_ERR" == *"시간 안에 오지 않았습니다"* && "$OL_ERR" == *"resolve-launch alpha"* ]] \
+  && pass "2e 시간 초과 → unknown + 안내" || fail "2e: out=$OL_OUT err=$OL_ERR"
+
+# 2f rc 1 + operationId → --retry-launch 로 정확히 한 번 재생, 재생도 실패하면 unknown
+d="$TMP/o2f"; make_orca_stub "$d"; orca_scn "$d" "agent launch" 1 '{"ok":false,"error":{"code":"timeout","message":"m"},"result":{"operationId":"op1"}}'
+orca_launch "$d" "" ""
+[[ "$OL_OUT" == "unknown" && "$(orca_count "$d" '--retry-launch op1')" == 1 && "$(orca_count "$d" '^agent launch ')" == 2 ]] \
+  && pass "2f operationId 재생 정확히 1회, 재생도 실패 → unknown" || fail "2f: out=$OL_OUT launch=$(orca_count "$d" '^agent launch ') retry=$(orca_count "$d" '--retry-launch op1') err=$OL_ERR"
+
+# 2g 모델 없이 effort 만 → --effort 를 넘기지 않고 한 줄 알림
+d="$TMP/o2g"; make_orca_stub "$d"; orca_scn "$d" "agent launch" 0 "$O_CHAT"; orca_scn "$d" "agent read" 0 "$O_READ_DONE"
+orca_launch "$d" "" high
+[[ "$OL_OUT" == "ok" ]] && ! grep -q -- '--effort' "$d/orca.log" && [[ "$OL_ERR" == *"effort(high)를 넘기지 않습니다"* ]] \
+  && pass "2g 모델 없이 effort → --effort 없음 + 안내" || fail "2g: out=$OL_OUT err=$OL_ERR log=$(head -1 "$d/orca.log")"
+
+# 2h' 인계 판정 단독 — 사용 불가 백엔드면 session_handoff_deliver 는 1(보내지 않음)
+d="$TMP/o2h"; make_orca_stub "$d"
+rc=0; ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE= PATH="$d:$PATH" session_handoff_deliver alpha "$OWT" "$OWT/REQUEST.md" orca >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 1 && ! -s "$d/orca.log" ]] && pass "2h' orca 사용 불가 셸 → deliver rc 1, orca 호출 없음" || fail "2h': rc=$rc log=$(cat "$d/orca.log")"
+
+# T3-orca) 생존 조회·종료 판정 (spec D5, Task 3 의 3a~3e) — 색인 대신 tasks_index_get 대역으로 launch-tab·launch-pane 을 준다.
+#   응답은 실측 모양: terminal show = result.terminal{handle,connected,worktreePath}, agent show = result.places[].worktreeId(`<repoId>::<경로>`).
+tasks_index_get() { case "$2" in launch-tab) printf '%s' "${OT_TAB-}" ;; launch-pane) printf '%s' "${OT_PANE-}" ;; esac; }
+OWT_LINK="$TMP/owt-link"; ln -s "$OWT" "$OWT_LINK"
+o_places() { printf '{"ok":true,"result":{"orcaSessionId":"s1","kind":"chat","places":[%s]}}' "$1"; }
+o_term() { printf '{"ok":true,"result":{"terminal":{"handle":"term_t1","connected":%s,"worktreePath":"%s"}}}' "$1" "$2"; }
+O_STALE='{"id":"x","ok":false,"error":{"code":"terminal_handle_stale","message":"m"},"_meta":{}}'
+O_UNKNOWN='{"id":"x","ok":false,"error":{"code":"agent_unknown","message":"m"},"_meta":{}}'
+# orca_probe_case <label> <launch-tab> <two-words> <rc> <body> <기대 probe>
+orca_probe_case() {
+  OPN=$((${OPN:-0}+1)); local d="$TMP/op.$OPN" got; rm -rf "$d"; make_orca_stub "$d"; [[ -z "$3" ]] || orca_scn "$d" "$3" "$4" "$5"
+  got="$(OT_TAB="$2" OT_PANE= ORCA_AGENT_SESSION_ID=x HERDR_ENV= HC_TERMINAL_ID= PATH="$d:$PATH" session_probe alpha "${7-$OWT}" orca 2>/dev/null)"
+  [[ "$got" == "$6" ]] && pass "$1 → $6" || fail "$1: probe=$got (기대 $6)"
+}
+CS=structured-agent-session-s1
+orca_probe_case "3a 채팅 places 에 그 worktree" "$CS" "agent show" 0 "$(o_places "{\"worktreeId\":\"r::$OWT\"}")" alive
+orca_probe_case "3a 채팅 places: []" "$CS" "agent show" 0 "$(o_places "")" dead
+orca_probe_case "3a 채팅 agent_unknown" "$CS" "agent show" 1 "$O_UNKNOWN" dead
+orca_probe_case "3a 채팅 다른 worktree 만" "$CS" "agent show" 0 "$(o_places '{"worktreeId":"r::/nowhere/else"}')" dead
+orca_probe_case "3a 채팅 빈 출력" "$CS" "agent show" 0 "" unknown
+orca_probe_case "3a 채팅 symlink 경로 worktreeId" "$CS" "agent show" 0 "$(o_places "{\"worktreeId\":\"r::$OWT_LINK\"}")" alive
+orca_probe_case "3b 터미널 connected:true·같은 worktreePath" term_t1 "terminal show" 0 "$(o_term true "$OWT")" alive
+orca_probe_case "3b 터미널 connected:false" term_t1 "terminal show" 0 "$(o_term false "$OWT")" dead
+orca_probe_case "3b 터미널 connected:true·다른 worktreePath" term_t1 "terminal show" 0 "$(o_term true /nowhere/else)" dead
+orca_probe_case "3b 터미널 worktreePath 가 symlink 경로(같은 worktree)" term_t1 "terminal show" 0 "$(o_term true "$OWT_LINK")" alive
+orca_probe_case "3c launch-tab 빈 값" "" "" 0 "" unknown
+orca_probe_case "3c launch-tab 낯선 접두" zzz "" 0 "" unknown
+# 3i worktree 경로가 빈 값(Orca 에서 workspace 를 지워 worktree 가 사라짐 — 2026-11-24 실측): 세션 없음은 dead, 있으면 unknown
+orca_probe_case "3i 빈 worktree·채팅 places: []" "$CS" "agent show" 0 "$(o_places "")" dead ""
+orca_probe_case "3i 빈 worktree·채팅 places 있음" "$CS" "agent show" 0 "$(o_places "{\"worktreeId\":\"r::$OWT\"}")" unknown ""
+orca_probe_case "3i 빈 worktree·터미널 connected:false" term_t1 "terminal show" 0 "$(o_term false "$OWT")" dead ""
+orca_probe_case "3i 빈 worktree·터미널 connected:true" term_t1 "terminal show" 0 "$(o_term true "$OWT")" unknown ""
+# 3d stale handle 은 agent list 가 비어 있어도(=같은 서버에 그 세션이 없어 보여도) 언제나 unknown
+d="$TMP/op.3d"; make_orca_stub "$d"; orca_scn "$d" "terminal show" 1 "$O_STALE"; orca_scn "$d" "agent list" 0 '{"ok":true,"result":{"agents":[]}}'
+got="$(OT_TAB=term_t1 OT_PANE=p:1 ORCA_AGENT_SESSION_ID=x HERDR_ENV= HC_TERMINAL_ID= PATH="$d:$PATH" session_probe alpha "$OWT" orca 2>/dev/null)"
+[[ "$got" == "unknown" ]] && pass "3d terminal_handle_stale → unknown(agent list 가 비어도)" || fail "3d: probe=$got"
+# 3d' 사용 불가 셸(Orca 변수 없음)이면 조회하지 않고 unknown
+d="$TMP/op.3d2"; make_orca_stub "$d"; orca_scn "$d" "agent show" 0 "$(o_places "")"
+got="$(OT_TAB="$CS" ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE= HERDR_ENV= HC_TERMINAL_ID= PATH="$d:$PATH" session_probe alpha "$OWT" orca 2>/dev/null)"
+[[ "$got" == "unknown" && ! -s "$d/orca.log" ]] && pass "3d' orca 사용 불가 셸 → unknown, orca 호출 없음" || fail "3d': probe=$got log=$(cat "$d/orca.log")"
+
+# 3e session_ended_judge ... orca — probe 의 dead 를 종료(ended)로, alive 를 생존으로, unknown 을 판정 불가로 낸다.
+#    herdr 목록 관측(ast)이 불완전해도 orca 세션은 herdr 목록에 나타나지 않으므로 판정을 막지 않는다(hc 와 같음).
+: > "$TMP/j.agents"; : > "$TMP/j.procs"
+# orca_judge_case <label> <launch-tab> <two-words> <rc> <body> <기대 접두>
+orca_judge_case() {
+  OPN=$((${OPN:-0}+1)); local d="$TMP/oj.$OPN" got; rm -rf "$d"; make_orca_stub "$d"; orca_scn "$d" "$3" "$4" "$5"
+  got="$(OT_TAB="$2" ORCA_AGENT_SESSION_ID=x HERDR_ENV= HC_TERMINAL_ID= PATH="$d:$PATH" session_ended_judge alpha "$OWT" $'unknown\therdr 사용 불가' "$TMP/j.agents" ok "$TMP/j.procs" orca 2>/dev/null)"
+  [[ "$got" == "$6" || "$got" == "$6"$'\t'* ]] && pass "3e judge $1 → $6" || fail "3e judge $1: $got (기대 $6)"
+}
+orca_judge_case "채팅 places: []" "$CS" "agent show" 0 "$(o_places "")" ended
+orca_judge_case "채팅 agent_unknown" "$CS" "agent show" 1 "$O_UNKNOWN" ended
+orca_judge_case "터미널 connected:false" term_t1 "terminal show" 0 "$(o_term false "$OWT")" ended
+orca_judge_case "채팅 alive" "$CS" "agent show" 0 "$(o_places "{\"worktreeId\":\"r::$OWT\"}")" alive
+orca_judge_case "터미널 alive" term_t1 "terminal show" 0 "$(o_term true "$OWT")" alive
+orca_judge_case "터미널 stale" term_t1 "terminal show" 1 "$O_STALE" unknown
+d="$TMP/oj.unusable"; make_orca_stub "$d"
+got="$(OT_TAB="$CS" ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE= HERDR_ENV= HC_TERMINAL_ID= PATH="$d:$PATH" session_ended_judge alpha "$OWT" ok "$TMP/j.agents" ok "$TMP/j.procs" orca 2>/dev/null)"
+[[ "$got" == unknown$'\t'* && ! -s "$d/orca.log" ]] && pass "3e judge orca 사용 불가 셸 → unknown, orca 호출 없음" || fail "3e judge 사용 불가: $got"
+# 3e' session_observe_name_orca 단독 — absent|alive|unknown 계약
+d="$TMP/oj.obs"; make_orca_stub "$d"; orca_scn "$d" "agent show" 0 "$(o_places "")"
+got="$(OT_TAB="$CS" ORCA_AGENT_SESSION_ID=x HERDR_ENV= HC_TERMINAL_ID= PATH="$d:$PATH" session_observe_name_orca alpha "$OWT" "$OWT" 2>/dev/null)"
+[[ "$got" == absent ]] && pass "3e' observe orca: dead → absent" || fail "3e' observe dead: $got"
+d="$TMP/oj.obs2"; make_orca_stub "$d"; orca_scn "$d" "terminal show" 0 "$(o_term true "$OWT_LINK")"
+got="$(OT_TAB=term_t1 ORCA_AGENT_SESSION_ID=x HERDR_ENV= HC_TERMINAL_ID= PATH="$d:$PATH" session_observe_name_orca alpha "$OWT" "$OWT" 2>/dev/null)"
+[[ "$got" == alive$'\t'* ]] && pass "3e' observe orca: symlink 경로 터미널 → alive" || fail "3e' observe alive: $got"
+d="$TMP/oj.obs3"; make_orca_stub "$d"; orca_scn "$d" "terminal show" 1 "$O_STALE"
+got="$(OT_TAB=term_t1 ORCA_AGENT_SESSION_ID=x HERDR_ENV= HC_TERMINAL_ID= PATH="$d:$PATH" session_observe_name_orca alpha "$OWT" "$OWT" 2>/dev/null)"
+[[ "$got" == unknown$'\t'* ]] && pass "3e' observe orca: stale → unknown" || fail "3e' observe stale: $got"
+unset -f tasks_index_get
 
 # T7) hc 생존 조회 매핑 (spec D4)
 hc_probe_case() {  # <scenario> <expected>
@@ -975,6 +1404,17 @@ got="$(hc_launch alpha)"; runline="$(grep '^run' "$STUB/hc.log" || true)"
   && "$runline" == *"작업(FR): alpha"* ]] \
   && pass "T2: run 인자" || fail "hc run 인자: $runline"
 grep -q -- '--id tbZ --name alpha' "$STUB/app.log" && pass "T2: tab.rename 인자" || fail "rename 인자: $(cat "$STUB/app.log")"
+
+# T2-1) hc 갈래도 선택한 모델·effort 를 claude 인자로 넘긴다
+_mj '{"session":{"claude":{"model":"opus","effort":"high"}}}'
+make_hc_launch_stub ok
+_hc_sel_core() { session_launch_selection 2>/dev/null; HERDR_ENV= HC_TERMINAL_ID=t6 RD_CHILD_SESSION= PATH="$STUB:$PATH" \
+  session_launch /tmp/wt alpha /tmp/wt/REQUEST.md "$SL_MODEL" hc "$SL_EFFORT" 2>/dev/null; }
+: "$(_run -- _hc_sel_core)"
+runline="$(grep '^run' "$STUB/hc.log" || true)"
+[[ "$runline" == *"env RD_CHILD_SESSION=1 claude --model opus --effort high "* ]] \
+  && pass "T2-1 hc run 인자에 claude --model opus --effort high" || fail "T2-1 hc run 인자: $runline"
+_cfg_clear
 
 long="$(printf 'a%.0s' $(seq 1 33))"
 make_hc_launch_stub ok; hc_launch "$long" >/dev/null
@@ -1246,6 +1686,92 @@ else
   fail "F2 짧은 slug 이름 충돌 거부: rc=$f2_rc out=$f2_out"
 fi
 rm -rf "$F2"
+
+# ms_resolve_session — 칸 읽기 공용화(spec D2·D3). model_select.sh 를 직접 source 한다.
+source "$SCRIPT_DIR/../model_select.sh"
+SS="$TMP/ss"; mkdir -p "$SS/rd-workflow/config" "$SS/sub" "$TMP/ss-cwd/sub"
+SSF="$SS/rd-workflow/config/models.json"
+# 출력: 모델 상태|모델 ARG|effort 상태|effort ARG, stderr 는 $TMP/ss.err
+ss_run() { # ss_run [env 대입...] — 서브셸에서 env 를 주고 결과를 stdout, 경고를 $TMP/ss.err 에 낸다
+  ( env "$@" bash -c '
+      source "$1/model_select.sh"; shift
+      ms_resolve_session "$1"
+      printf "%s|%s|%s|%s" "$MS_SS_MODEL_STATE" "$MS_SS_MODEL_ARG" "$MS_SS_EFFORT_STATE" "$MS_SS_EFFORT_ARG"' _ "$SCRIPT_DIR/.." "$SS" 2>"$TMP/ss.err" )
+}
+ss_expect() { # ss_expect <이름> <기대> <실제>
+  [[ "$3" == "$2" ]] && pass "$1" || fail "$1: 기대=[$2] 실제=[$3] stderr=[$(cat "$TMP/ss.err")]"
+}
+ss_err_has() { [[ "$(cat "$TMP/ss.err")" == *"$2"* ]] && pass "$1" || fail "$1: stderr=[$(cat "$TMP/ss.err")]"; }
+ss_err_empty() { [[ ! -s "$TMP/ss.err" ]] && pass "$1" || fail "$1: stderr=[$(cat "$TMP/ss.err")]"; }
+
+printf '{"session":{"claude":{"model":"sonnet","effort":"high"}}}' >"$SSF"
+# T1-1
+ss_expect "T1-1 파일 값" "value|sonnet|value|high" "$(ss_run RD_MODELS_CONFIG= RD_SESSION_MODEL= RD_SESSION_EFFORT=)"
+# SRC 확인 (전역은 서브셸 안이라 한 번 더 직접 호출)
+( RD_MODELS_CONFIG= RD_SESSION_MODEL= RD_SESSION_EFFORT= ms_resolve_session "$SS" 2>/dev/null
+  [[ "$MS_SS_MODEL_SRC" == file && "$MS_SS_EFFORT_SRC" == file ]] ) && pass "T1-1 SRC 둘 다 file" || fail "T1-1 SRC"
+# T1-2
+ss_expect "T1-2 env 모델 + 파일 effort" "value|opus|value|high" "$(ss_run RD_MODELS_CONFIG= RD_SESSION_MODEL=opus RD_SESSION_EFFORT=)"
+( RD_MODELS_CONFIG= RD_SESSION_MODEL=opus RD_SESSION_EFFORT= ms_resolve_session "$SS" 2>/dev/null
+  [[ "$MS_SS_MODEL_SRC" == env && "$MS_SS_EFFORT_SRC" == file ]] ) && pass "T1-2 SRC env/file" || fail "T1-2 SRC"
+# T1-3
+printf '{"session":{"claude":{"effort":"ultra"}}}' >"$SSF"
+ss_expect "T1-3 ultra → max" "unset||value|max" "$(ss_run RD_MODELS_CONFIG= RD_SESSION_MODEL= RD_SESSION_EFFORT=)"
+[[ "$(cat "$TMP/ss.err")" == *ultra* && "$(cat "$TMP/ss.err")" == *max* ]] && pass "T1-3 stderr 에 ultra·max" || fail "T1-3 stderr=[$(cat "$TMP/ss.err")]"
+# T1-4
+printf '{"session":{"claude":{"model":"claude-opus-5-5"}}}' >"$SSF"
+ss_expect "T1-4 고정 ID value" "value|claude-opus-5-5|unset|" "$(ss_run RD_MODELS_CONFIG= RD_SESSION_MODEL= RD_SESSION_EFFORT=)"
+ss_err_has "T1-4 고정 경고" "고정됨, 낡을 수 있음"
+printf '{"session":{"claude":{"model":"default"}}}' >"$SSF"
+ss_expect "T1-4 default" "default||unset|" "$(ss_run RD_MODELS_CONFIG= RD_SESSION_MODEL= RD_SESSION_EFFORT=)"
+printf '{"session":{"claude":{"model":"bad value"}}}' >"$SSF"
+ss_expect "T1-4 invalid" "invalid||unset|" "$(ss_run RD_MODELS_CONFIG= RD_SESSION_MODEL= RD_SESSION_EFFORT=)"
+ss_err_has "T1-4 invalid 경고" "올바르지 않습니다"
+# T1-5 / T1-6: 파일 읽기 여부는 래퍼로 직접 관찰한다
+printf '{not json' >"$SSF"
+ss_observe() { # ss_observe <env 대입...> → "<출력>#<읽기 횟수>"
+  rm -f "$TMP/read.calls"
+  local o
+  o="$( env READ_CALLS="$TMP/read.calls" "$@" bash -c '
+      source "$1/model_select.sh"
+      eval "$(declare -f _ms_claude_section_read | sed "1s/_ms_claude_section_read/_orig_section_read/")"
+      _ms_claude_section_read() { echo x >>"$READ_CALLS"; _orig_section_read "$@"; }
+      ms_resolve_session "$2"
+      printf "%s|%s|%s|%s" "$MS_SS_MODEL_STATE" "$MS_SS_MODEL_ARG" "$MS_SS_EFFORT_STATE" "$MS_SS_EFFORT_ARG"' _ "$SCRIPT_DIR/.." "$SS" 2>"$TMP/ss.err" )"
+  local n=0; [[ -f "$TMP/read.calls" ]] && n="$(wc -l <"$TMP/read.calls" | tr -d ' ')"
+  printf '%s#%s' "$o" "$n"
+}
+ss_expect "T1-5 env 모델 + 손상 파일" "value|haiku|invalid|#1" "$(ss_observe RD_MODELS_CONFIG= RD_SESSION_MODEL=haiku RD_SESSION_EFFORT=)"
+[[ "$(wc -l <"$TMP/ss.err" | tr -d ' ')" == 1 ]] && pass "T1-5 stderr 경고 1줄" || fail "T1-5 stderr=[$(cat "$TMP/ss.err")]"
+ss_expect "T1-6 두 칸 env 면 파일을 읽지 않음" "value|haiku|value|low#0" "$(ss_observe RD_MODELS_CONFIG= RD_SESSION_MODEL=haiku RD_SESSION_EFFORT=low)"
+ss_err_empty "T1-6 stderr 비어 있음"
+# T1-7
+rm -f "$SSF"
+ss_expect "T1-7 파일 없음" "unset||unset|" "$(ss_run RD_MODELS_CONFIG= RD_SESSION_MODEL= RD_SESSION_EFFORT=)"
+ss_err_empty "T1-7 stderr 비어 있음"
+# T1-8 상대 RD_MODELS_CONFIG 는 config-root 기준
+printf '{"session":{"claude":{"model":"sonnet"}}}' >"$SS/sub/m.json"
+printf '{"session":{"claude":{"model":"opus"}}}' >"$TMP/ss-cwd/sub/m.json"
+ss_expect "T1-8 상대 경로는 config-root 기준" "value|sonnet|unset|" "$(cd "$TMP/ss-cwd" && ss_run RD_MODELS_CONFIG=sub/m.json RD_SESSION_MODEL= RD_SESSION_EFFORT=)"
+# T1-9 jq 없는 PATH
+SSBIN="$TMP/ss-nojq-bin"; mkdir -p "$SSBIN"
+for _c in python3 bash cat grep sed awk printf dirname basename; do
+  _p="$(command -v "$_c" 2>/dev/null || true)"; [[ -n "$_p" && -x "$_p" ]] && ln -sf "$_p" "$SSBIN/$_c"
+done
+printf '{"session":{"claude":{"model":"sonnet","effort":"high"}}}' >"$SSF"
+ss_expect "T1-9 jq 없으면 python3 로 같은 결과" "value|sonnet|value|high" "$(ss_run PATH="$SSBIN" RD_MODELS_CONFIG= RD_SESSION_MODEL= RD_SESSION_EFFORT=)"
+# T1-9b 제어 문자가 섞인 값은 jq 유무와 관계없이 무효(TSV 에서 잘려 유효 값으로 바뀌지 않는다)
+printf '{"session":{"claude":{"model":"opus\\n","effort":"high\\t"}}}' >"$SSF"
+ss_expect "T1-9b 제어 문자 값은 jq 경로에서 무효" "invalid||invalid|" "$(ss_run RD_MODELS_CONFIG= RD_SESSION_MODEL= RD_SESSION_EFFORT=)"
+ss_expect "T1-9b 제어 문자 값은 python3 경로에서도 무효" "invalid||invalid|" "$(ss_run PATH="$SSBIN" RD_MODELS_CONFIG= RD_SESSION_MODEL= RD_SESSION_EFFORT=)"
+grep -q "값이 올바르지 않습니다" "$TMP/ss.err" && pass "T1-9b python3 경로도 무효 경고" || fail "T1-9b 경고 없음: $(cat "$TMP/ss.err")"
+printf '{"session":{"claude":{"model":"sonnet","effort":"high"}}}' >"$SSF"
+# T1-10 _ms_headless_read 는 jq 없으면 rc 3
+printf '{"headless":{"claude":{"model":"sonnet"}}}' >"$TMP/hl.json"
+_rc=0; ( PATH="$SSBIN"; _ms_headless_read "$TMP/hl.json" >/dev/null ) || _rc=$?
+[[ "$_rc" == 3 ]] && pass "T1-10 _ms_headless_read jq 없음 rc 3 유지" || fail "T1-10 rc=$_rc"
+# T1-11 기본 경로는 config-root 의 파일(스크립트 체크아웃 파일이 아님)
+ss_expect "T1-11 기본 경로는 config-root 기준" "value|sonnet|value|high" "$(ss_run RD_MODELS_CONFIG= RD_SESSION_MODEL= RD_SESSION_EFFORT=)"
 
 printf 'session_launch: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

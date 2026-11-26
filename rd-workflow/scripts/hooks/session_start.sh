@@ -15,8 +15,8 @@ source "${script_dir}/../_state_common.sh"
 # **`tasks_publish_evidence` 는 여기서 쓰지 않는다** — 아래 `_task_set_summary` 주석 참조.
 source "${script_dir}/../lifecycle/_lifecycle_common.sh"
 source "${script_dir}/../lifecycle/_tasks_index.sh"
-# 기동 상태 표시 문구의 단일 출처(`task_launch_label`) — 함수 정의만 있는 파일이라
-# source 자체는 아무 동작도 하지 않습니다(herdr 를 부르지 않습니다).
+# 기동 상태 표시 문구의 단일 출처(`task_launch_label`) — 함수 정의 중심인 파일이라
+# source 시 herdr 를 부르지 않습니다(`model_select.sh` source 와 전역 변수 초기화만 일어납니다).
 source "${script_dir}/../lifecycle/session_launch.sh"
 # 압축 뒤 autopilot 규칙 재독 안내(함수 정의만, source 시 동작 없음)
 source "${script_dir}/_compact_hint.sh"

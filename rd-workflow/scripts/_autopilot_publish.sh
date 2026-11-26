@@ -131,7 +131,7 @@ run_publish_cmd() {
 }
 
 publish_step() {
-  local first policy name mainwt pre_head post_head logdir log stamp cmd rc tag unsafe_re
+  local first policy name mainwt pre_head post_head logdir log stamp cmd rc tag unsafe_re notice_cut=0
   local pf_reason="" status="" fr_ref merged=0 detail="" tmp reason_lines nextcmd noremote="" pline_policy
   local cause_long="" cause_short="" reason_text="" next_text=""
   first="$(head -n1 "$OUTCOME_FILE" 2>/dev/null | tr -d '[:space:]')"
@@ -218,7 +218,17 @@ publish_step() {
     if grep -q '안전 불변식 위반' "$log" 2>/dev/null; then
       status="unsafe"
     elif (( PUB_TIMED_OUT )); then
-      :   # 완료 문구 뒤 정리 단계가 끝났는지 알 수 없다 — done 으로 보지 않고 아래 HEAD 판정으로 넘긴다
+      # 완료 문구 뒤 정리 단계가 끝났는지 알 수 없다 — done 으로 보지 않고 아래 HEAD 판정으로 넘긴다.
+      # 예외: 완료 문구 뒤에 manual gitlink 비교 시작 줄이 있으면 archive 는 정리·요약을 마치고 팀 원격 비교(안내용)만
+      #   남았던 것이다(archive.sh 의 archive_manual_gitlink_notice 호출 주석). 발행은 성공으로 기록하고 안내가 끊겼다고 알린다.
+      #   파이프(`sed | grep -q`)를 쓰지 않는다 — pipefail 아래에서 grep 이 먼저 끝나면 앞 명령의 SIGPIPE 로 거짓이 된다.
+      local done_ln cmp_ln
+      done_ln="$(grep -nEm1 "$PUB_DONE_RE" "$log" 2>/dev/null)"; done_ln="${done_ln%%:*}"
+      cmp_ln="$(grep -n '의 발행 gitlink 를 팀 기본 브랜치와 비교합니다' "$log" 2>/dev/null | tail -n1)"; cmp_ln="${cmp_ln%%:*}"
+      if [[ -n "$done_ln" && -n "$cmp_ln" ]] && (( cmp_ln > done_ln )); then
+        notice_cut=1
+        if grep -q '^archive: CLEANUP-RECORD-FAILED' "$log" 2>/dev/null; then status="done-recfail"; else status="done"; fi
+      fi
     elif (( rc == 0 )); then
       status="done"
     elif grep -q '^archive: CLEANUP-RECORD-FAILED' "$log" 2>/dev/null; then
@@ -261,6 +271,12 @@ publish_step() {
         [[ "$status" == "done-recfail" ]] && echo "cleanup-record-failed ${name} ${log}"
         sed -n '/^archive: CLEANUP-PENDING/,$p' "$log" 2>/dev/null | grep -Eqm1 "$PUB_DONE_RE" \
           && sed -n '/^archive: CLEANUP-PENDING/,$p' "$log" 2>/dev/null | sed -E "/${PUB_DONE_RE}/,\$d"
+        # 반영 방식 manual 인 submodule 의 gitlink 안내(archive.sh archive_manual_gitlink_notice) — 사용자가 할 일이라 결과에 옮긴다.
+        #   범위 표식(첫 줄·끝 줄)은 archive.sh 의 그 함수 주석에 적혀 있다.
+        sed -n '/^archive: 안내 — 반영 방식 manual/,/^archive:   반영 방식 설정:/p' "$log" 2>/dev/null
+        # 비교를 건너뛴 경로와 원인(archive.sh archive_manual_gitlink_notice 의 건너뜀 줄)도 사용자가 할 일이라 옮긴다.
+        grep '^archive: submodule .* 를 팀 기본 브랜치와 비교하지 못해 안내를 건너뜁니다' "$log" 2>/dev/null
+        (( notice_cut )) && echo "archive: 안내 — 반영 방식 manual 인 submodule 의 팀 기본 브랜치 비교가 끝나지 않았습니다(${cause_short}). 발행은 끝났습니다. 기본 체크아웃의 submodule 이 팀 기본 브랜치에 있는지 직접 확인하십시오 (로그: ${log})"
         true
       } > "${tmp:-$OUTCOME_FILE}" 2>/dev/null || ofail=1
       if [[ -n "$tmp" ]]; then cat "$tmp" > "$OUTCOME_FILE" 2>/dev/null || ofail=1; rm -f "$tmp"; fi
@@ -269,6 +285,7 @@ publish_step() {
         PUBLISH_LINE="autopilot_headless: 발행 완료 — 정리 잔여 기록 실패 (로그: ${log})"
       else
         PUBLISH_LINE="autopilot_headless: 발행 완료 — tag=${tag} (${pline_policy})"
+        (( notice_cut )) && PUBLISH_LINE+=" · manual gitlink 비교 끊김(${cause_short}) (로그: ${log})"
       fi
       ;;
     unsafe)

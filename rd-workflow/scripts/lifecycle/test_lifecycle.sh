@@ -59,7 +59,10 @@ source "$SCRIPT_DIR/slug.sh"
 # herdr app(HC_TERMINAL_ID)도 같은 이유로 비운다.
 export HERDR_ENV=
 export HC_TERMINAL_ID=
+export ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE=
 export RD_CHILD_SESSION=1
+# 부모 세션 상속(모델·effort)이 실제 transcript 를 읽고 PATH 의 실제 claude --help 를 부르지 않게 파일 전역에서 비운다.
+export CLAUDE_CODE_SESSION_ID=
 
 PASS=0; FAIL=0
 assert_eq() {
@@ -953,11 +956,11 @@ if grep -q 'git tag "\$TARGET_TAG" "\$PUBLISH_OID"' "$_arch"; then
   PASS=$((PASS+1)); echo "  PASS: tag 가 PUBLISH_OID 를 명시 소비"
 else FAIL=$((FAIL+1)); echo "  FAIL: tag 가 여전히 암묵 HEAD 를 가리킴" >&2; fi
 
-if grep -q 'push origin "\${PUBLISH_OID}:refs/heads/' "$_arch"; then
+if grep -q 'push .*origin "\${PUBLISH_OID}:refs/heads/' "$_arch"; then
   PASS=$((PASS+1)); echo "  PASS: 기본 브랜치 push 가 PUBLISH_OID 를 명시 소비"
 else FAIL=$((FAIL+1)); echo "  FAIL: push 가 여전히 브랜치 tip 을 해석" >&2; fi
 
-if grep -q 'push origin "\${TAG_OID}:refs/tags/' "$_arch"; then
+if grep -q 'push .*origin "\${TAG_OID}:refs/tags/' "$_arch"; then
   PASS=$((PASS+1)); echo "  PASS: tag push 가 캡처한 tag object OID 를 명시 소비"
 else FAIL=$((FAIL+1)); echo "  FAIL: tag push 가 여전히 로컬 tag ref 이름을 재해석" >&2; fi
 
@@ -1368,16 +1371,24 @@ assert_eq "$(read_fix_source_fr "$FIX13" fix-multi)" \
   "promote rerun: 순서만 다른 값 재지정은 no-op (저장값 불변)"
 
 # --- 정리 대기 행은 진행 중 작업으로 세지 않는다 (tasks-index-cleanup-pending-accumulation) ---
-# G: 정리 대기 2건 + 진행 중 1건 → task_resolve_target 이 「여러 건」 없이 진행 중 1건을 돌려준다
+# G: 정리 대기 2건 + 진행 중 1건 → task_resolve_target read 는 자동 선택 없이 멈추고, 목록에는 진행 중 행만 든다
 FIXG="$TMPDIR_TEST/fix-pending-resolve"
 mk_promote_fixture "$FIXG" "-"
+_g_rc=0
 _g_out="$( cd "$FIXG" && project_root="$FIXG" bash -c '
   source "$1/_tasks_index.sh"; source "$1/../_task_common.sh"
   tasks_index_upsert pend1 fr-branch=fr/pend1 state=cleanup-pending
   tasks_index_upsert pend2 fr-branch=fr/pend2 state=cleanup-pending
   tasks_index_upsert live1 fr-branch=fr/live1 checkout=no
-  task_resolve_target read' _ "$SCRIPT_DIR" 2>&1 )" || true
-assert_eq "$_g_out" "$(printf 'ref\tfr/live1')" "정리 대기 행 2건이 있어도 진행 중 1건이 대상이다 (여러 건 오판 없음)"
+  task_resolve_target read' _ "$SCRIPT_DIR" 2>&1 )" || _g_rc=$?
+assert_eq "$_g_rc|$([[ "$_g_out" == *"- live1"* ]] && echo live1 || echo no-live1)|$([[ "$_g_out" == *"- pend"* ]] && echo pend || echo no-pend)" "1|live1|no-pend" "정리 대기 행은 목록에 들지 않는다 (read 도 진행 중 행만 나열하고 멈춤)"
+# G0: 정리 대기 2건만(진행 중 0건) → 자동 선택 멈춤이 아니라 0건 경로(진행 중 없음·정리 대기 건수 안내)
+_g0_rc=0
+_g0_out="$( cd "$FIXG" && project_root="$FIXG" bash -c '
+  source "$1/_tasks_index.sh"; source "$1/../_task_common.sh"
+  tasks_index_remove live1
+  task_resolve_target read' _ "$SCRIPT_DIR" 2>&1 )" || _g0_rc=$?
+assert_eq "$_g0_rc|$([[ "$_g0_out" == *"진행 중인 작업이 없습니다"* ]] && echo none || echo x)|$([[ "$_g0_out" == *"정리 대기 작업 2건"* ]] && echo pend2 || echo x)|$([[ "$_g0_out" == *"자동으로 고르지 않습니다"* ]] && echo auto-stop || echo no-auto-stop)" "1|none|pend2|no-auto-stop" "G0: 정리 대기 2건만 있으면 0건 경로(진행 중 없음·정리 대기 건수)이고 자동 선택 멈춤이 아니다"
 # H: promote --no-worktree 는 정리 대기 행(no-worktree=yes)이 있어도 거부하지 않는다
 FIXH="$TMPDIR_TEST/fix-pending-nowt"
 mk_promote_fixture "$FIXH" "-"
@@ -1421,6 +1432,59 @@ FIXI2="$TMPDIR_TEST/fix-pend-cwd-2"; mkdir -p "$FIXI2"; _pend_fixture "$FIXI2" 2
 assert_eq "$(_pend_resolve "$FIXI0" write)" "rc=1 out=[] err=[pending task-hint]" "I2: 진행 중 0건이어도 자기 자신으로 fallback 하지 않고 정리 대기 거부"
 assert_eq "$(_pend_resolve "$FIXI2" read)" "rc=1 out=[] err=[pending task-hint]" "I2: 진행 중 2건이어도 「여러 건」 이 아니라 정리 대기 거부"
 assert_eq "$(_pend_resolve "$FIXI1" write live1 | sed "s#$FIXI1#F#")" "rc=0 out=[F/wt-live1] err=[]" "I3: --task 명시는 막지 않는다 (다른 작업 경고 후 진행)"
+
+# --- 기본 체크아웃에서 fr 브랜치 없이 하는 작업(기본 체크아웃 작업)의 대상 선택 (nofr-task-target-resolution) ---
+# 기본 체크아웃 main(task-state fr-branch=null, short-title=nfw, status=<status>) 과 진행 중 색인 작업
+# live1..N(실제 worktree)을 둔다. live 수 0 이면 빈 색인 파일만 만든다(색인을 써 본 저장소).
+_nofr_fixture() {  # <dir> <live 수> <status>
+  local d="$1" n="$2" st="$3" i
+  git init -q -b main "$d/main" && git -C "$d/main" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+  mkdir -p "$d/main/rd-workflow-workspace/.lifecycle"
+  printf 'schema=1\nshort-title=nfw\nstatus=%s\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' "$st" \
+    > "$d/main/rd-workflow-workspace/.lifecycle/task-state"
+  ( cd "$d/main" && project_root="$d/main" bash -c 'source "$1/_tasks_index.sh"; _tasks_index_ensure >/dev/null' _ "$SCRIPT_DIR" )
+  for ((i = 1; i <= n; i++)); do
+    git -C "$d/main" branch "fr/live$i" && git -C "$d/main" worktree add -q "$d/wt-live$i" "fr/live$i"
+    mkdir -p "$d/wt-live$i/rd-workflow-workspace"
+    ( cd "$d/main" && project_root="$d/main" bash -c 'source "$1/_tasks_index.sh"
+      tasks_index_upsert "live$3" fr-branch="fr/live$3" worktree-path="$2/wt-live$3"' _ "$SCRIPT_DIR" "$d" "$i" )
+  done
+}
+_nofr_resolve() {  # <dir> <cwd: main|wt-liveN> <op> [task] → "rc=<n> out=<stdout, <dir> 는 F> err=<stderr 표지>"
+  local d="$1" at="$2" op="$3" task="${4:-}" out err rc=0
+  err="$d/err.txt"
+  out="$( cd "$d/$at" && project_root="$d/$at" bash -c 'source "$1/_tasks_index.sh"; source "$1/../_task_common.sh"
+    task_resolve_target "$2" "$3"' _ "$SCRIPT_DIR" "$op" "$task" 2>"$err" )" || rc=$?
+  local flags=""
+  grep -q 'live1' "$err" && flags+="live1 "
+  grep -q -- '--task' "$err" && flags+="task-hint "
+  grep -q '경고' "$err" && flags+="warn "
+  grep -q '(nfw)' "$err" && flags+="cur-nfw "
+  printf 'rc=%s out=[%s] err=[%s]' "$rc" "${out//"$d"/F}" "${flags% }"
+}
+FIXN1="$TMPDIR_TEST/fix-nofr-1"; mkdir -p "$FIXN1"; FIXN1="$(cd "$FIXN1" && pwd -P)"; _nofr_fixture "$FIXN1" 1 "PR 검토 중"
+# N1 — 없으면 새는 실수: 색인 1건이 기본 체크아웃 작업을 밀어내는 원래 결함(다른 작업의 Status 가 바뀜).
+assert_eq "$(_nofr_resolve "$FIXN1" main write)" "rc=0 out=[F/main] err=[]" "N1: 기본 체크아웃 작업 + 색인 1건 → write 는 기본 체크아웃"
+assert_eq "$(_nofr_resolve "$FIXN1" main read)" "rc=0 out=[$(printf 'checkout\tF/main')] err=[]" "N1: 기본 체크아웃 작업 + 색인 1건 → read 는 checkout<TAB>기본 체크아웃"
+# N2 — 없으면 새는 실수: 판정을 색인 수 판정 뒤에 두면 2건은 「여러 건」, 0건은 「막음」 으로 끝난다.
+FIXN2="$TMPDIR_TEST/fix-nofr-2"; mkdir -p "$FIXN2"; FIXN2="$(cd "$FIXN2" && pwd -P)"; _nofr_fixture "$FIXN2" 2 "PR 검토 중"
+FIXN0="$TMPDIR_TEST/fix-nofr-0"; mkdir -p "$FIXN0"; FIXN0="$(cd "$FIXN0" && pwd -P)"; _nofr_fixture "$FIXN0" 0 "PR 검토 중"
+assert_eq "$(_nofr_resolve "$FIXN2" main write)" "rc=0 out=[F/main] err=[]" "N2: 기본 체크아웃 작업 + 색인 2건 → write 는 기본 체크아웃(여러 건으로 멈추지 않음)"
+assert_eq "$(_nofr_resolve "$FIXN0" main write)" "rc=0 out=[F/main] err=[]" "N2: 기본 체크아웃 작업 + 색인 0건(파일만) → write 는 기본 체크아웃(막지 않음)"
+# N3 — 없으면 새는 실수: 끝난 작업의 체크아웃에서 복사한 명령이 다른 작업을 바꿈(목록을 본 뒤 작업이 끝난 경우).
+FIXN3="$TMPDIR_TEST/fix-nofr-3"; mkdir -p "$FIXN3"; FIXN3="$(cd "$FIXN3" && pwd -P)"; _nofr_fixture "$FIXN3" 1 "대기 중"
+assert_eq "$(_nofr_resolve "$FIXN3" main write)" "rc=1 out=[] err=[live1 task-hint]" "N3: 작업 없는 기본 체크아웃 + 색인 1건 → write 는 자동 선택 없이 목록·--task 안내 후 rc 1"
+assert_eq "$(_nofr_resolve "$FIXN3" main read)" "rc=1 out=[] err=[live1 task-hint]" "N3: 작업 없는 기본 체크아웃 + 색인 1건 → read 도 자동 선택 없이 목록·--task 안내 후 rc 1"
+assert_eq "$(_nofr_resolve "$FIXN3" main write live1)" "rc=0 out=[F/wt-live1] err=[]" "N3: --task live1 명시 write 는 그 작업"
+# N4 — 없으면 새는 실수: D2 를 --task 판정보다 앞에 두면 색인 작업을 명시해도 기본 체크아웃 작업이 바뀐다.
+assert_eq "$(_nofr_resolve "$FIXN1" main write live1)" "rc=0 out=[F/wt-live1] err=[live1 warn cur-nfw]" "N4: 기본 체크아웃 작업 위치에서 --task live1 → 그 작업 + 현재 작업(nfw) 경고"
+assert_eq "$(_nofr_resolve "$FIXN1" wt-live1 write)" "rc=0 out=[F/wt-live1] err=[]" "N4: 색인 작업 worktree 안에서 대상 없이 write → 그 작업"
+# N4b — 없으면 새는 실수: 경고를 이름 비교로 거르면, 기본 체크아웃 작업과 이름이 같은 색인 작업을 --task 로 고를 때
+# 경고 없이 다른 worktree 의 Status 가 바뀐다.
+FIXN5="$TMPDIR_TEST/fix-nofr-5"; mkdir -p "$FIXN5"; FIXN5="$(cd "$FIXN5" && pwd -P)"; _nofr_fixture "$FIXN5" 1 "PR 검토 중"
+printf 'schema=1\nshort-title=live1\nstatus=PR 검토 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\n' \
+  > "$FIXN5/main/rd-workflow-workspace/.lifecycle/task-state"
+assert_eq "$(_nofr_resolve "$FIXN5" main write live1)" "rc=0 out=[F/wt-live1] err=[live1 warn]" "N4b: 기본 체크아웃 작업과 같은 이름의 --task live1 → 색인 작업 + 경고"
 
 # --- 손상된 대상 worktree task-state 의 복구 안내가 목록 전체를 담는가 ---
 # ('실행하고 그대로 검증' 은 rd task set-source-fr 의 복수 positional 지원(T2, 동시
@@ -3288,6 +3352,105 @@ else
     && pass "실행 중인 worktree 자기 자신은 기본 worktree 안내와 함께 중단" || fail "자기-worktree 보호 실패: $out"
 fi
 
+# --- 기본 체크아웃 작업(fr-branch=null)의 CLI 대상 선택 (nofr-task-target-resolution) ---
+# 기본 체크아웃 task-state·CURRENT_TASK.md·색인을 복사해 두고 케이스마다 바꾼 뒤 끝에서 되돌린다.
+NF_TS="$RBREPO/rd-workflow-workspace/.lifecycle/task-state"
+NF_IDX="$(cd "$RBREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_path')"
+NF_SAVE="$TMPDIR_TEST/nofr-rb-save"; mkdir -p "$NF_SAVE"
+cp "$NF_TS" "$NF_SAVE/task-state"; cp "$RBREPO/CURRENT_TASK.md" "$NF_SAVE/CURRENT_TASK.md"; cp "$NF_IDX" "$NF_SAVE/tasks.local"
+_nf_set_base() {  # <status> — 기본 체크아웃 task-state 를 기본 체크아웃 작업(nfw)으로 둔다
+  awk -v st="$1" -F'=' 'BEGIN{OFS="="} $1=="short-title"{print "short-title=nfw"; next} $1=="status"{print "status=" st; next} {print}' \
+    "$NF_SAVE/task-state" > "$NF_TS"
+}
+_nf_field() { awk -F'=' -v k="$2" '$1==k{sub(/^[^=]+=/,""); print; exit}' "$1"; }
+_nf_wt_sums() { cksum "$RBREPO/.worktrees/alpha/rd-workflow-workspace/.lifecycle/task-state" "$RBREPO/.worktrees/alpha/CURRENT_TASK.md" \
+                      "$RBREPO/.worktrees/beta/rd-workflow-workspace/.lifecycle/task-state" "$RBREPO/.worktrees/beta/CURRENT_TASK.md"; }
+_nf_mirror_status() { awk '$0=="## Status"{getline; print; exit}' "$RBREPO/CURRENT_TASK.md"; }
+_nf_idx_pending() {  # <slug...> — 색인의 그 행들을 cleanup-pending 으로 바꾼다(저장본 기준)
+  cp "$NF_SAVE/tasks.local" "$NF_IDX"
+  local s
+  for s in "$@"; do (cd "$RBREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_upsert "$1" state=cleanup-pending' _ "$s"); done
+}
+
+# R1·R1b·R1c — 없으면 새는 실수: 선택 함수는 맞아도 CLI 의 상태 파일 바인딩(rd 의 project_root·TASK_STATE_PATH 교체)이
+# 어긋나 다른 파일을 씀. 진행 중 2건(R1)·1건(R1b)·0건(R1c) 모두 기본 체크아웃 작업이 대상이어야 한다.
+for _nf_case in "R1:" "R1b:beta" "R1c:alpha beta"; do
+  _nf_name="${_nf_case%%:*}"; _nf_pend="${_nf_case#*:}"
+  # shellcheck disable=SC2086
+  _nf_idx_pending $_nf_pend
+  _nf_set_base "PR 검토 중"
+  _nf_snap_before="$(snap)"; _nf_sums_before="$(_nf_wt_sums)"
+  _nf_rc=0
+  _nf_out="$(cd "$RBREPO" && bash rd-workflow/scripts/rd task set-status "구현 중" 2>&1)" || _nf_rc=$?
+  assert_eq "$_nf_rc" "0" "${_nf_name}: 기본 체크아웃 작업 위치에서 대상 없는 set-status 는 성공 (out=${_nf_out})"
+  assert_eq "$(_nf_field "$NF_TS" status)|$(_nf_mirror_status)" "구현 중|구현 중" "${_nf_name}: 기본 체크아웃 task-state·미러 Status 가 구현 중"
+  assert_eq "$(_nf_wt_sums)" "$_nf_sums_before" "${_nf_name}: alpha·beta 의 task-state·CURRENT_TASK.md 불변"
+  if [[ "$_nf_name" == "R1" ]]; then
+    assert_eq "$(snap)" "$_nf_snap_before" "R1: fr ref·두 worktree task-state·색인(snap) 불변"
+  fi
+  cp "$NF_SAVE/CURRENT_TASK.md" "$RBREPO/CURRENT_TASK.md"
+done
+cp "$NF_SAVE/tasks.local" "$NF_IDX"
+
+# R2 — 없으면 새는 실수: D2 결과를 소비하는 rollback 이 기본 체크아웃 작업을 고른 뒤 다른 작업을 지우는 경로.
+_nf_set_base "PR 검토 중"
+_nf_snap_before="$(snap)"
+_nf_rc=0
+_nf_out="$(bash "$RBREPO/rd-workflow/scripts/lifecycle/promote_rollback.sh" 2>&1)" || _nf_rc=$?
+if [[ "$_nf_rc" -ne 0 && "$_nf_out" == *"fr/* 아님"* && "$(snap)" == "$_nf_snap_before" \
+      && -d "$RBREPO/.worktrees/alpha" && -d "$RBREPO/.worktrees/beta" ]] \
+   && git -C "$RBREPO" rev-parse --verify --quiet refs/heads/fr/alpha >/dev/null \
+   && git -C "$RBREPO" rev-parse --verify --quiet refs/heads/fr/beta >/dev/null; then
+  pass "R2: 기본 체크아웃 작업 위치의 대상 없는 rollback 은 「fr/* 아님」 으로 무변경 중단"
+else
+  fail "R2: rollback 결과 rc=${_nf_rc} out=${_nf_out}"
+fi
+
+# RB1 — 없으면 새는 실수: 작업 없는 기본 체크아웃에서 대상 없이 부른 rollback 이 색인의 진행 중 1건을 자동으로 골라 지움.
+_nf_set_base "대기 중"
+_nf_idx_pending beta
+RB1_ONLY=alpha
+_nf_snap_before="$(snap)"
+_nf_rc=0
+_nf_out="$(bash "$RBREPO/rd-workflow/scripts/lifecycle/promote_rollback.sh" 2>&1)" || _nf_rc=$?
+if [[ "$_nf_rc" -ne 0 && "$_nf_out" == *"자동으로 고르지 않습니다"* && "$_nf_out" == *"- ${RB1_ONLY}"* && "$_nf_out" == *"--task"* \
+      && "$(snap)" == "$_nf_snap_before" ]] \
+   && git -C "$RBREPO" rev-parse --verify --quiet "refs/heads/fr/${RB1_ONLY}" >/dev/null; then
+  pass "RB1: 작업 없는 기본 체크아웃 + 진행 중 1건 → 대상 없는 rollback 은 자동 선택 없이 목록·--task 안내로 무변경 중단"
+else
+  fail "RB1: rollback 결과 rc=${_nf_rc} out=${_nf_out}"
+fi
+cp "$NF_SAVE/task-state" "$NF_TS"; cp "$NF_SAVE/CURRENT_TASK.md" "$RBREPO/CURRENT_TASK.md"; cp "$NF_SAVE/tasks.local" "$NF_IDX"
+
+# R3 — 없으면 새는 실수: 끝난 작업의 체크아웃에서 부른 상태 변경이 다른 작업을 바꿈.
+_nf_idx_pending beta
+cp "$NF_SAVE/task-state" "$NF_TS"
+_nf_base_before="$(cksum "$NF_TS" "$RBREPO/CURRENT_TASK.md")"; _nf_sums_before="$(_nf_wt_sums)"
+_nf_rc=0
+_nf_err="$(cd "$RBREPO" && bash rd-workflow/scripts/rd task set-status "구현 중" 2>&1 >/dev/null)" || _nf_rc=$?
+assert_eq "$_nf_rc" "1" "R3: 작업 없는 기본 체크아웃 + 진행 중 1건 → 대상 없는 set-status 는 rc 1"
+if [[ "$_nf_err" == *"alpha"* && "$_nf_err" == *"--task"* && "$_nf_err" == *"fr 브랜치 없이 시작할 수 없습니다"* && "$_nf_err" == *"promote.sh"* ]]; then
+  pass "R3: 안내에 진행 중 작업(alpha)·--task·새 작업 시작 방법(promote.sh)이 있다"
+else
+  fail "R3: 안내 문구 누락: ${_nf_err}"
+fi
+assert_eq "$(cksum "$NF_TS" "$RBREPO/CURRENT_TASK.md")|$(_nf_wt_sums)" "${_nf_base_before}|${_nf_sums_before}" "R3: 기본 체크아웃·alpha·beta 의 task-state·CURRENT_TASK.md 전후 동일"
+_nf_a_ts="$RBREPO/.worktrees/alpha/rd-workflow-workspace/.lifecycle/task-state"
+cp "$_nf_a_ts" "$NF_SAVE/alpha-task-state"; cp "$RBREPO/.worktrees/alpha/CURRENT_TASK.md" "$NF_SAVE/alpha-CURRENT_TASK.md"
+case "$(_nf_field "$_nf_a_ts" status)" in
+  "대기 중") _nf_to="구현 중" ;;
+  "REQUEST review 대기") _nf_to="spec/plan 작성 중" ;;
+  *) _nf_to="대기 중" ;;
+esac
+_nf_rc=0
+_nf_out="$(cd "$RBREPO" && bash rd-workflow/scripts/rd task set-status "$_nf_to" --task alpha 2>&1)" || _nf_rc=$?
+# 「내용 변경 없음」 이면 전이 전후가 같은 값이라 이 단언이 아무것도 보지 않으므로 함께 막는다.
+assert_eq "$_nf_rc|$(_nf_field "$_nf_a_ts" status)|$([[ "$_nf_out" == *"내용 변경 없음"* ]] && echo same || echo changed)" "0|${_nf_to}|changed" "R3: 같은 위치에서 --task alpha 는 alpha 의 Status 를 바꾼다 (out=${_nf_out})"
+assert_eq "$(cksum "$NF_TS" "$RBREPO/CURRENT_TASK.md")" "$_nf_base_before" "R3: --task alpha 실행 뒤 기본 체크아웃 task-state·CURRENT_TASK.md 불변"
+# 복구 — alpha·기본 체크아웃·색인을 이 절 이전 상태로 되돌린다.
+cp "$NF_SAVE/alpha-task-state" "$_nf_a_ts"; cp "$NF_SAVE/alpha-CURRENT_TASK.md" "$RBREPO/.worktrees/alpha/CURRENT_TASK.md"
+cp "$NF_SAVE/task-state" "$NF_TS"; cp "$NF_SAVE/CURRENT_TASK.md" "$RBREPO/CURRENT_TASK.md"; cp "$NF_SAVE/tasks.local" "$NF_IDX"
+
 # launching/unknown 예약 중인 작업은 rollback 이 건드리지 않는다 — promote.sh 는
 # worktree 부착·branch 체크아웃·색인 등록을 먼저 끝낸 뒤 launch=launching 을 기록하고
 # **락을 풀고** 그 밖에서 세션을 기동한다. 그 구간에 rollback 이 끼어들면 막 기동됐거나
@@ -3522,6 +3685,559 @@ else
     || fail "failed→resolve-launch ok→rollback: 손 기동 세션 보호 — rc=$rbl_rc wt=$([[ -d "$rbl_wt" ]] && echo 있음 || echo 없음): $rbl_out"
 fi
 
+
+# ---- Orca 갈래 resolve-launch (change spec D4, Task 2: 2h~2k) — 실제 진입점 `rd task resolve-launch`, `orca` 는 PATH 대역 ----
+LCO="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패 (orca 대역)" >&2; exit 1; }
+LCO="$(cd "$LCO" && pwd -P)"
+_ast_cleanup+=("$LCO")
+mkdir -p "$LCO/bin"
+# 대역 orca — `$LCO/scn` 의 `<두 단어>\t<rc>\t<응답 파일>` 행으로 응답하고 모든 호출을 `$LCO/orca.log` 에 남긴다.
+cat > "$LCO/bin/orca" <<STUBEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$LCO/orca.log"
+key="\$1 \$2"
+while IFS=\$'\t' read -r k rc resp; do
+  if [[ "\$k" == "\$key" ]]; then
+    [[ -n "\$resp" && -f "\$resp" ]] && cat "\$resp"
+    exit "\$rc"
+  fi
+done < "$LCO/scn"
+exit 2
+STUBEOF
+chmod +x "$LCO/bin/orca"
+lco_reset() { : > "$LCO/scn"; : > "$LCO/orca.log"; rm -f "$LCO"/resp.*; }
+lco_scn() {  # <두 단어> <rc> <응답 본문>
+  local n; n="$(wc -l < "$LCO/scn" | tr -d ' ')"
+  printf '%s' "$3" > "$LCO/resp.$n"
+  printf '%s\t%s\t%s\n' "$1" "$2" "$LCO/resp.$n" >> "$LCO/scn"
+}
+# lco_mk <slug> <launch-tab> [<launch-pane>] — launch=unknown·launch-backend=orca 행을 만든다. stdout: worktree 경로
+lco_mk() {
+  ( cd "$RBREPO" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title "$1" --size large --source-fr - ) >/dev/null 2>&1
+  ( cd "$RBREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_upsert "$1" launch=unknown launch-backend=orca launch-tab="$2" launch-pane="${3-}"; tasks_index_get "$1" worktree-path' _ "$1" "$2" "${3-}" )
+}
+lco_launch() { ( cd "$RBREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get "$1" launch' _ "$1" 2>/dev/null || true ); }
+# lco_resolve <slug> <env...> — resolve-launch 를 주어진 환경으로 실행한다. stdout+stderr, rc 는 LCO_RC.
+lco_resolve() {
+  local slug="$1"; shift
+  LCO_RC=0
+  ( cd "$RBREPO" && env -u HERDR_ENV -u HC_TERMINAL_ID RD_LAUNCH_PROMPT_TIMEOUT=6 "$@" bash rd-workflow/scripts/rd task resolve-launch "$slug" 2>&1 ) || LCO_RC=$?
+}
+LCO_SHOW='{"ok":true,"result":{"orcaSessionId":"s1","kind":"chat","places":[{"worktreeId":"repo::WT"}]}}'
+LCO_WAIT='{"ok":true,"result":{"orcaSessionId":"s1","kind":"chat","entries":[{"kind":"message","role":"user","text":"x"}],"state":"waiting"}}'
+LCO_DONE='{"ok":true,"result":{"orcaSessionId":"s1","kind":"chat","entries":[{"kind":"message","role":"user","text":"x"},{"kind":"message","role":"assistant","text":"y"}],"state":"working"}}'
+
+# 2h 채팅 행 — 1회차: 살아 있으나 미처리 → unknown 유지·재전송 없음 / 2회차: 처리 확인 → ok
+lco_wt="$(lco_mk lcochat structured-agent-session-s1)"
+lco_reset; lco_scn "agent show" 0 "${LCO_SHOW//WT/$lco_wt}"; lco_scn "agent read" 0 "$LCO_WAIT"
+_t0=$SECONDS
+_o="$(lco_resolve lcochat PATH="$LCO/bin:$RBL_P:$PATH" ORCA_AGENT_SESSION_ID=sess1; printf '%s\n' "$LCO_RC")"
+LCO_RC="${_o##*$'\n'}"; _o="${_o%$'\n'*}"
+[[ "$LCO_RC" -ne 0 && "$(lco_launch lcochat)" == unknown && "$_o" == *"문구를 붙여 넣지 마십시오"* ]] \
+  && pass "2h-1 orca 채팅: 살아 있으나 미처리 → unknown 유지" || fail "2h-1: rc=$LCO_RC launch=$(lco_launch lcochat): $_o"
+! grep -qE 'agent launch|orchestration' "$LCO/orca.log" && grep -q '^agent read s1' "$LCO/orca.log" \
+  && pass "2h-1 재전송 없음(agent launch·orchestration 호출 없음, agent read 는 있음)" || fail "2h-1 orca.log: $(cat "$LCO/orca.log")"
+lco_reset; lco_scn "agent show" 0 "${LCO_SHOW//WT/$lco_wt}"; lco_scn "agent read" 0 "$LCO_DONE"
+_o="$(lco_resolve lcochat PATH="$LCO/bin:$RBL_P:$PATH" ORCA_AGENT_SESSION_ID=sess1; printf '%s\n' "$LCO_RC")"
+LCO_RC="${_o##*$'\n'}"; _o="${_o%$'\n'*}"
+[[ "$LCO_RC" -eq 0 && "$(lco_launch lcochat)" == ok ]] \
+  && pass "2h-2 orca 채팅: assistant entry 확인 → launch=ok" || fail "2h-2: rc=$LCO_RC launch=$(lco_launch lcochat): $_o"
+echo "  (2h 소요 $((SECONDS - _t0))초)"
+
+# 2i 터미널 행 — 미처리 → unknown / agent list 의 paneKey 항목이 working → ok
+lco_wt="$(lco_mk lcoterm term_t1 p:1)"
+LCO_TSHOW='{"ok":true,"result":{"terminal":{"handle":"term_t1","connected":true,"worktreePath":"WT"}}}'
+lco_reset; lco_scn "terminal show" 0 "${LCO_TSHOW//WT/$lco_wt}"; lco_scn "agent list" 0 '{"ok":true,"result":{"agents":[{"orcaSessionId":"o9","paneKey":"p:9","state":"done","lastAssistantMessage":"z"}]}}'
+_o="$(lco_resolve lcoterm PATH="$LCO/bin:$RBL_P:$PATH" ORCA_TERMINAL_HANDLE=term_x; printf '%s\n' "$LCO_RC")"
+LCO_RC="${_o##*$'\n'}"; _o="${_o%$'\n'*}"
+[[ "$LCO_RC" -ne 0 && "$(lco_launch lcoterm)" == unknown ]] \
+  && pass "2i orca 터미널: 같은 paneKey 항목 없음 → unknown 유지" || fail "2i-1: rc=$LCO_RC launch=$(lco_launch lcoterm): $_o"
+lco_reset; lco_scn "terminal show" 0 "${LCO_TSHOW//WT/$lco_wt}"; lco_scn "agent list" 0 '{"ok":true,"result":{"agents":[{"orcaSessionId":"o1","paneKey":"p:1","state":"working"}]}}'
+_o="$(lco_resolve lcoterm PATH="$LCO/bin:$RBL_P:$PATH" ORCA_TERMINAL_HANDLE=term_x; printf '%s\n' "$LCO_RC")"
+LCO_RC="${_o##*$'\n'}"; _o="${_o%$'\n'*}"
+[[ "$LCO_RC" -eq 0 && "$(lco_launch lcoterm)" == ok ]] \
+  && pass "2i orca 터미널: paneKey 항목이 working → launch=ok" || fail "2i-2: rc=$LCO_RC launch=$(lco_launch lcoterm): $_o"
+
+# 2j AC4 — Orca 변수만 비운 셸(CLI 는 PATH 에 있음): 조회·전송 없이 unknown 과 안내
+lco_wt="$(lco_mk lcoenv structured-agent-session-s1)"
+lco_reset; lco_scn "agent show" 0 "${LCO_SHOW//WT/$lco_wt}"; lco_scn "agent read" 0 "$LCO_DONE"
+_o="$(lco_resolve lcoenv PATH="$LCO/bin:$RBL_P:$PATH" ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE=; printf '%s\n' "$LCO_RC")"
+LCO_RC="${_o##*$'\n'}"; _o="${_o%$'\n'*}"
+[[ "$LCO_RC" -ne 0 && "$(lco_launch lcoenv)" == unknown && "$_o" == *"기동한 환경에서 다시 실행"* && "$_o" == *"--assume-ended"* ]] \
+  && pass "2j Orca 변수 없는 셸 → unknown 과 기동한 환경 안내" || fail "2j: rc=$LCO_RC launch=$(lco_launch lcoenv): $_o"
+[[ ! -s "$LCO/orca.log" ]] && pass "2j orca 를 한 번도 부르지 않았다(orca.log 비어 있음)" || fail "2j orca.log: $(cat "$LCO/orca.log")"
+
+# 2k CLI 자체가 없는 셸(Orca 변수 있음, PATH 에 orca 없음) → 같은 안내
+_lco_path=""; _lco_old="$IFS"; IFS=':'
+for _d in $PATH; do [[ -n "$_d" && ! -x "$_d/orca" ]] && _lco_path="${_lco_path:+$_lco_path:}$_d"; done
+IFS="$_lco_old"
+_o="$(lco_resolve lcoenv PATH="$RBL_P:$_lco_path" ORCA_AGENT_SESSION_ID=sess1; printf '%s\n' "$LCO_RC")"
+LCO_RC="${_o##*$'\n'}"; _o="${_o%$'\n'*}"
+[[ "$LCO_RC" -ne 0 && "$(lco_launch lcoenv)" == unknown && "$_o" == *"기동한 환경에서 다시 실행"* && "$_o" == *"--assume-ended"* ]] \
+  && pass "2k orca CLI 없는 셸 → unknown 과 같은 안내" || fail "2k: rc=$LCO_RC launch=$(lco_launch lcoenv): $_o"
+
+# 3g launch=ok 인 orca 행 + rollback (change spec D5·AC3) — 실제 진입점 promote_rollback.sh
+#   종료(places: [])면 --assume-ended 없이 통과하고, 생존(places 에 그 worktree)이면 취소하지 않으며, 어느 쪽도 인계를 다시 보내지 않는다.
+lco_mk_ok() {  # <slug> <launch-tab> — launch=ok 행. stdout: worktree 경로
+  local w; w="$(lco_mk "$1" "$2")"
+  ( cd "$RBREPO" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_upsert "$1" launch=ok' _ "$1" ) >/dev/null
+  printf '%s\n' "$w"
+}
+rbl_procs '' ''
+lco_rbenv=(env -u HERDR_ENV -u HC_TERMINAL_ID "PATH=$LCO/bin:$RBL_P:$PATH" ORCA_AGENT_SESSION_ID=sess1)
+lco_wt="$(lco_mk_ok lco3gend structured-agent-session-s1)"
+lco_reset; lco_scn "agent show" 0 '{"ok":true,"result":{"orcaSessionId":"s1","kind":"chat","places":[]}}'
+rbl_rc=0; rbl_out="$( cd "$RBREPO" && "${lco_rbenv[@]}" bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task lco3gend 2>&1 )" || rbl_rc=$?
+[[ "$rbl_rc" -eq 0 && "$rbl_out" == *"이미 종료된 것으로 확인됐습니다"* ]] && rbl_gone lco3gend "$lco_wt" \
+  && pass "3g orca 채팅 launch=ok·places: [] → --assume-ended 없이 rollback 통과" \
+  || fail "3g 종료 통과: rc=$rbl_rc wt=$([[ -d "$lco_wt" ]] && echo 있음 || echo 없음): $rbl_out"
+lco_wt="$(lco_mk_ok lco3galive structured-agent-session-s1)"
+lco_reset; lco_scn "agent show" 0 "$(printf '{"ok":true,"result":{"orcaSessionId":"s1","kind":"chat","places":[{"worktreeId":"repo::%s"}]}}' "$lco_wt")"
+rbl_rc=0; rbl_out="$( cd "$RBREPO" && "${lco_rbenv[@]}" bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task lco3galive 2>&1 )" || rbl_rc=$?
+[[ "$rbl_rc" -eq 1 && "$rbl_out" == *"취소하지 않습니다"* ]] && rbl_kept lco3galive "$lco_wt" \
+  && pass "3g orca 채팅 launch=ok·places 에 worktree → rollback 이 취소하지 않음" \
+  || fail "3g 생존 거부: rc=$rbl_rc wt=$([[ -d "$lco_wt" ]] && echo 있음 || echo 없음): $rbl_out"
+! grep -qE 'agent launch|orchestration' "$LCO/orca.log" && grep -q '^agent show s1' "$LCO/orca.log" \
+  && pass "3g 재조회 중 재전송 없음(agent launch·orchestration 호출 없음, agent show 는 있음)" || fail "3g orca.log: $(cat "$LCO/orca.log")"
+
+# 3h launch=unknown 행 + places: [] → resolve-launch 가 --assume-ended 없이 launch=failed 로 확정
+lco_wt="$(lco_mk lco3h structured-agent-session-s1)"
+lco_reset; lco_scn "agent show" 0 '{"ok":true,"result":{"orcaSessionId":"s1","kind":"chat","places":[]}}'
+_o="$(lco_resolve lco3h PATH="$LCO/bin:$RBL_P:$PATH" ORCA_AGENT_SESSION_ID=sess1; printf '%s\n' "$LCO_RC")"
+LCO_RC="${_o##*$'\n'}"; _o="${_o%$'\n'*}"
+[[ "$LCO_RC" -eq 0 && "$(lco_launch lco3h)" == failed ]] \
+  && pass "3h orca launch=unknown·places: [] → 플래그 없이 launch=failed" || fail "3h: rc=$LCO_RC launch=$(lco_launch lco3h): $_o"
+
+echo "== promote 중복 착수 확인 (fr-do-duplicate-start-guard) =="
+# 케이스마다 새 fixture 를 쓴다 — 한 fixture 에 다른 착수 표시가 남으면 어느 판정이 멈췄는지 가려진다.
+DG_ROOT="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패 (중복 착수)" >&2; exit 1; }
+[[ -n "$DG_ROOT" && -d "$DG_ROOT" ]] || { echo "test_lifecycle.sh: 임시 디렉터리 경로 검증 실패 (중복 착수)" >&2; exit 1; }
+DG_ROOT="$(cd "$DG_ROOT" && pwd -P)"
+_ast_cleanup+=("$DG_ROOT")
+DG_FR="rd-workflow-workspace/backlog/items/2026-11-01-dg-fr.md"
+DG_N=0
+# dg_fixture <dir> — <dir>/remote.git(bare) + <dir>/a(이 clone) + <dir>/b(다른 clone, user.name other)
+dg_fixture() {
+  local d="$1"
+  mkdir -p "$d"
+  git init -q --bare -b main "$d/remote.git"
+  mkdir -p "$d/a/rd-workflow"
+  cp -R "$SCRIPT_DIR/.." "$d/a/rd-workflow/scripts"
+  git -C "$d/a" init -q -b main
+  git -C "$d/a" config user.email t@t && git -C "$d/a" config user.name t
+  mkdir -p "$d/a/rd-workflow-workspace/.lifecycle" "$d/a/rd-workflow-workspace/backlog/items"
+  printf '.worktrees/\n' > "$d/a/.gitignore"
+  emit_current_task_baseline > "$d/a/CURRENT_TASK.md"
+  printf 'schema=1\nshort-title=-\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\nbase-commit=null\nreview-session=null\n' \
+    > "$d/a/rd-workflow-workspace/.lifecycle/task-state"
+  printf '# Change Request\n\n## Source FR\n-\n' > "$d/a/REQUEST.md"
+  printf '# FR\n\n- status: validated\n' > "$d/a/$DG_FR"
+  git -C "$d/a" add -A && git -C "$d/a" commit -q -m seed
+  git -C "$d/a" remote add origin "$d/remote.git"
+  git -C "$d/a" push -q origin main
+  git clone -q "$d/remote.git" "$d/b"
+  git -C "$d/b" config user.email o@o && git -C "$d/b" config user.name other
+}
+dg_new() { DG_N=$((DG_N+1)); DG_D="$DG_ROOT/f$DG_N"; dg_fixture "$DG_D"; }
+# dg_promote <clone> <args...> — OUT(stdout+stderr)·RC
+dg_promote() {
+  local c="$1"; shift
+  RC=0
+  OUT="$( cd "$c" && bash rd-workflow/scripts/lifecycle/promote.sh "$@" 2>&1 )" || RC=$?
+}
+dg_remote_oid() { git -C "$1/remote.git" rev-parse --verify -q "$2" 2>/dev/null || true; }
+dg_idx() { ( cd "$1" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_get "$1" fr-branch' _ "$2" 2>/dev/null ) || true; }
+
+# T1 — 다른 clone 이 같은 slug 로 착수해 push
+dg_new
+dg_promote "$DG_D/b" --short-title dg-a --size small --source-fr "$DG_FR"
+git -C "$DG_D/b" push -q origin fr/dg-a
+dg_oid="$(dg_remote_oid "$DG_D" refs/heads/fr/dg-a)"
+dg_promote "$DG_D/a" --short-title dg-a --size small --source-fr "$DG_FR"
+[[ "$RC" -eq 1 ]] && pass "T1 같은 slug 의 원격 착수 → RC=1" || fail "T1 RC=$RC: $OUT"
+[[ "$OUT" == *"중복 착수"* && "$OUT" == *"fr/dg-a"* && "$OUT" == *"git push --no-follow-tags --force-with-lease=refs/heads/fr/dg-a:${dg_oid}"* ]] \
+  && pass "T1 멈춤 출력에 이름과 lease 명령" || fail "T1 출력: $OUT"
+if git -C "$DG_D/a" rev-parse --verify -q refs/heads/fr/dg-a >/dev/null 2>&1; then fail "T1 로컬 fr/dg-a 가 생겼다"; else pass "T1 로컬 fr/dg-a 없음"; fi
+[[ ! -e "$DG_D/a/.worktrees/dg-a" ]] && pass "T1 worktree 없음" || fail "T1 worktree 가 생겼다"
+[[ -z "$(dg_idx "$DG_D/a" dg-a)" ]] && pass "T1 색인 없음" || fail "T1 색인이 생겼다"
+
+# T2 — 다른 slug 로 같은 FR 착수
+dg_new
+dg_promote "$DG_D/b" --short-title dg-other --size small --source-fr "$DG_FR"
+git -C "$DG_D/b" push -q origin fr/dg-other
+dg_promote "$DG_D/a" --short-title dg-a2 --size small --source-fr "$DG_FR"
+[[ "$RC" -eq 1 && "$OUT" == *"fr/dg-other"* ]] && pass "T2 같은 FR 다른 slug → RC=1, fr/dg-other" || fail "T2 RC=$RC: $OUT"
+
+# T2b — PR 정리 커밋이 source-fr 를 비운 원격 끝, 착수 전에 원격에 없는 등록 커밋이 있는 경우
+dg_new
+printf '# FR2\n\n- status: validated\n' > "$DG_D/b/rd-workflow-workspace/backlog/items/2026-11-02-dg-other-fr.md"
+git -C "$DG_D/b" add -A && git -C "$DG_D/b" commit -q -m "docs: FR 등록"
+dg_promote "$DG_D/b" --short-title dg-pr --size small --source-fr "$DG_FR"
+dg_ts="$DG_D/b/.worktrees/dg-pr/rd-workflow-workspace/.lifecycle/task-state"
+sed -i.bak -e 's/^source-fr=.*/source-fr=-/' -e 's/^review-session=.*/review-session=null/' "$dg_ts" && rm -f "$dg_ts.bak"
+git -C "$DG_D/b/.worktrees/dg-pr" add -A && git -C "$DG_D/b/.worktrees/dg-pr" commit -q -m "chore: PR 정리"
+git -C "$DG_D/b" push -q origin fr/dg-pr
+dg_promote "$DG_D/a" --short-title dg-x --size small --source-fr "$DG_FR"
+[[ "$RC" -eq 1 && "$OUT" == *"fr/dg-pr"* ]] && pass "T2b 착수 커밋에서 FR 을 읽어 멈춘다" || fail "T2b RC=$RC: $OUT"
+
+# T3a — 원격 기본 브랜치에서 FR 이 done
+dg_new
+sed -i.bak 's/^- status:.*/- status: done/' "$DG_D/b/$DG_FR" && rm -f "$DG_D/b/$DG_FR.bak"
+git -C "$DG_D/b" add -A && git -C "$DG_D/b" commit -q -m "chore: FR done"
+git -C "$DG_D/b" push -q origin main
+dg_promote "$DG_D/a" --short-title dg-d --size small --source-fr "$DG_FR"
+[[ "$RC" -eq 1 && "$OUT" == *"done"* ]] && pass "T3a 원격에서 done 인 FR → RC=1" || fail "T3a RC=$RC: $OUT"
+
+# T3b — 이 작업에 없는 커밋을 가리키는 같은 이름의 원격 발행 태그
+dg_new
+printf 'x\n' > "$DG_D/b/dg-pub.txt"
+git -C "$DG_D/b" add -A && git -C "$DG_D/b" commit -q -m "feat: 다른 곳 발행"
+git -C "$DG_D/b" tag fr/2026-11-25-0000/dg-t HEAD -m x
+git -C "$DG_D/b" push -q origin main fr/2026-11-25-0000/dg-t
+dg_promote "$DG_D/a" --short-title dg-t --size small --source-fr -
+[[ "$RC" -eq 1 && "$OUT" == *"fr/2026-11-25-0000/dg-t"* ]] && pass "T3b 같은 이름 발행 태그 → RC=1" || fail "T3b RC=$RC: $OUT"
+
+# T4 — origin 이 없는 저장소: 같은 FR 의 로컬 진행
+dg_new
+cp -R "$DG_D/a" "$DG_D/loc"
+git -C "$DG_D/loc" remote remove origin
+dg_promote "$DG_D/loc" --short-title dg-l1 --size small --source-fr "$DG_FR"
+[[ "$RC" -eq 0 ]] && pass "T4 첫 로컬 착수 성공" || fail "T4 첫 착수 RC=$RC: $OUT"
+dg_promote "$DG_D/loc" --short-title dg-l2 --size small --source-fr "$DG_FR"
+[[ "$RC" -eq 1 && "$OUT" == *"이 clone 에서 같은 FR 이 진행 중"* ]] && pass "T4 같은 FR 로컬 진행 → RC=1" || fail "T4 RC=$RC: $OUT"
+[[ "$OUT" == *"bash rd-workflow/scripts/rd task list 에서 확인합니다"* && "$OUT" == *"promote_rollback.sh --task <그 slug>"* ]] \
+  && pass "T4 안내: slug 확인 방법과 rollback 명령" || fail "T4 안내: $OUT"
+if git -C "$DG_D/loc" rev-parse --verify -q refs/heads/fr/dg-l2 >/dev/null 2>&1; then fail "T4 fr/dg-l2 가 생겼다"; else pass "T4 fr/dg-l2 없음"; fi
+
+# T12 — 로컬 전용 저장소에서 같은 명령 재실행: 문구 그대로
+dg_promote "$DG_D/loc" --short-title dg-l1 --size small --source-fr "$DG_FR"
+[[ "$RC" -eq 1 && "$OUT" == *"이미 진행 중"* && "$OUT" == *"아무것도 바꾸지 않습니다"* && "$OUT" != *"로컬 작업은 바꾸지 않습니다"* ]] \
+  && pass "T12 로컬 전용 재실행은 「아무것도 바꾸지 않습니다」 그대로" || fail "T12 RC=$RC: $OUT"
+
+# T2c — 같은 FR 을 다른 slug 두 개로 착수한 원격 브랜치 2개: 발견마다 한 줄, 다음 행동과 lease 명령도 각각
+dg_new
+dg_promote "$DG_D/b" --short-title dg-o1 --size small --source-fr "$DG_FR"
+git -C "$DG_D/b" branch fr/dg-o2 fr/dg-o1
+git -C "$DG_D/b" push -q origin fr/dg-o1 fr/dg-o2
+dg_r="$(dg_remote_oid "$DG_D" refs/heads/fr/dg-o1)"
+dg_promote "$DG_D/a" --short-title dg-m --size small --source-fr "$DG_FR"
+[[ "$RC" -eq 1 ]] && pass "T2c 발견 2건 → RC=1" || fail "T2c RC=$RC: $OUT"
+[[ "$OUT" == *$'\n  - 다른 clone 이 착수했습니다: 원격 fr/dg-o1 '* && "$OUT" == *$'\n  - 다른 clone 이 착수했습니다: 원격 fr/dg-o2 '* ]] \
+  && pass "T2c 발견이 줄마다 하나씩 출력" || fail "T2c 발견 줄: $OUT"
+[[ "$OUT" == *"--force-with-lease=refs/heads/fr/dg-o1:${dg_r} origin :refs/heads/fr/dg-o1"* \
+   && "$OUT" == *"--force-with-lease=refs/heads/fr/dg-o2:${dg_r} origin :refs/heads/fr/dg-o2"* \
+   && "$OUT" == *"git fetch origin fr/dg-o1:fr/dg-o1 "* && "$OUT" == *"git fetch origin fr/dg-o2:fr/dg-o2 "* ]] \
+  && pass "T2c 두 브랜치의 이어 가기·lease 삭제 명령" || fail "T2c 다음 행동: $OUT"
+[[ "$OUT" != *"claimed-fr"* && "$OUT" != *"awk:"* ]] \
+  && pass "T2c 날것 종류 이름·awk 오류 없음" || fail "T2c 깨진 출력: $OUT"
+
+# T7 — 태그 객체가 로컬에 없는 같은 slug 재사용(발행 뒤 남은 브랜치)
+dg_new
+printf 'c\n' > "$DG_D/b/dg-c.txt"
+git -C "$DG_D/b" add -A && git -C "$DG_D/b" commit -q -m "feat: C"
+dg_c="$(git -C "$DG_D/b" rev-parse HEAD)"
+git -C "$DG_D/b" push -q origin main
+git -C "$DG_D/b" push -q origin "${dg_c}:refs/heads/fr/dg-reuse"
+git -C "$DG_D/b" tag fr/2026-01-01-0000/dg-reuse "$dg_c" -m x
+git -C "$DG_D/b" push -q origin fr/2026-01-01-0000/dg-reuse
+git -C "$DG_D/a" pull -q --no-tags origin main
+dg_t7="$(git -C "$DG_D/b" rev-parse refs/tags/fr/2026-01-01-0000/dg-reuse)"
+if git -C "$DG_D/a" cat-file -e "$dg_t7" 2>/dev/null; then fail "T7 전제 붕괴: 태그 객체가 로컬에 있다"; else pass "T7 전제: 태그 객체가 로컬에 없다"; fi
+dg_promote "$DG_D/a" --short-title dg-reuse --size small --source-fr -
+[[ "$RC" -eq 0 ]] && pass "T7 같은 slug 재사용은 막지 않는다" || fail "T7 RC=$RC: $OUT"
+[[ "$(dg_remote_oid "$DG_D" refs/heads/fr/dg-reuse)" == "$(git -C "$DG_D/a" rev-parse fr/dg-reuse)" ]] \
+  && pass "T7 원격 fr/dg-reuse 가 새 착수 커밋" || fail "T7 원격 fr/dg-reuse: $(dg_remote_oid "$DG_D" refs/heads/fr/dg-reuse)"
+
+# T7b — PR squash 병합 뒤 남은 브랜치(태그 pr-head 가 브랜치 끝)
+dg_new
+git -C "$DG_D/b" switch -q -c p
+printf 'p\n' > "$DG_D/b/dg-p.txt"
+git -C "$DG_D/b" add -A && git -C "$DG_D/b" commit -q -m "feat: P"
+dg_p="$(git -C "$DG_D/b" rev-parse HEAD)"
+git -C "$DG_D/b" push -q origin "p:refs/heads/fr/dg-sq"
+git -C "$DG_D/b" switch -q main
+printf 's\n' > "$DG_D/b/dg-s.txt"
+git -C "$DG_D/b" add -A && git -C "$DG_D/b" commit -q -m "feat: S"
+dg_s="$(git -C "$DG_D/b" rev-parse HEAD)"
+git -C "$DG_D/b" push -q origin main
+git -C "$DG_D/b" tag fr/2026-01-02-0000/dg-sq "$dg_s" -m "$(printf 'archive: dg-sq\npr: u\npr-head: %s' "$dg_p")"
+git -C "$DG_D/b" push -q origin fr/2026-01-02-0000/dg-sq
+git -C "$DG_D/a" pull -q --no-tags origin main
+git -C "$DG_D/a" config push.followTags true
+git -C "$DG_D/a" tag local-draft2 main -m x
+dg_promote "$DG_D/a" --short-title dg-sq --size small --source-fr -
+[[ "$RC" -eq 0 ]] && pass "T7b pr-head 와 같은 남은 브랜치는 막지 않는다" || fail "T7b RC=$RC: $OUT"
+[[ "$(dg_remote_oid "$DG_D" refs/heads/fr/dg-sq)" == "$(git -C "$DG_D/a" rev-parse fr/dg-sq)" ]] \
+  && pass "T7b 원격 fr/dg-sq 가 새 착수 커밋" || fail "T7b 원격 fr/dg-sq: $(dg_remote_oid "$DG_D" refs/heads/fr/dg-sq)"
+[[ "$OUT" == *"발행 뒤 남은 원격 fr/dg-sq"* && "$OUT" == *"바꿨습니다"* ]] \
+  && pass "T7b 교체 안내 줄" || fail "T7b 출력: $OUT"
+[[ -z "$(dg_remote_oid "$DG_D" refs/tags/local-draft2)" ]] \
+  && pass "T7b 교체 push 에 로컬 태그가 따라가지 않음" || fail "T7b 원격에 local-draft2 가 올라갔다"
+
+# T7c — 다른 slug 의 squash 발행 잔여 브랜치(그 slug 태그의 pr-head 가 끝)는 다시 연 FR 의 새 착수를 막지 않는다
+dg_new
+dg_promote "$DG_D/b" --short-title dg-old --size small --source-fr "$DG_FR"
+git -C "$DG_D/b" push -q origin fr/dg-old
+dg_p7c="$(git -C "$DG_D/b" rev-parse fr/dg-old)"
+printf 's\n' > "$DG_D/b/dg-s7c.txt"
+git -C "$DG_D/b" add -A && git -C "$DG_D/b" commit -q -m "feat: squash 발행"
+git -C "$DG_D/b" push -q origin main
+git -C "$DG_D/b" tag fr/2026-01-03-0000/dg-old HEAD -m "$(printf 'archive: dg-old\npr: u\npr-head: %s' "$dg_p7c")"
+git -C "$DG_D/b" push -q origin fr/2026-01-03-0000/dg-old
+git -C "$DG_D/a" pull -q --no-tags origin main
+dg_t7c="$(git -C "$DG_D/b" rev-parse refs/tags/fr/2026-01-03-0000/dg-old)"
+if git -C "$DG_D/a" cat-file -e "$dg_t7c" 2>/dev/null; then fail "T7c 전제 붕괴: 태그 객체가 로컬에 있다"; else pass "T7c 전제: 태그 객체가 로컬에 없다"; fi
+dg_promote "$DG_D/a" --short-title dg-new --size small --source-fr "$DG_FR"
+[[ "$RC" -eq 0 && "$OUT" != *"중복 착수"* ]] \
+  && pass "T7c 다른 slug 의 발행 잔여 브랜치는 막지 않는다" || fail "T7c RC=$RC: $OUT"
+
+# T7d — 숫자형 slug: 원격에 fr/01 만 있을 때 slug 1 의 원격 조회는 fr/01 의 끝을 가져오지 않는다(awk 숫자 비교 회귀)
+git -C "$DG_D/b" push -q origin HEAD:refs/heads/fr/01
+dg_t7d="$( ( source "$SCRIPT_DIR/_dup_guard.sh"; dup_scan "$DG_D/a" 1 "" start >/dev/null 2>&1 || true; printf '%s' "$DUP_REMOTE_SLUG_OID" ) )"
+git -C "$DG_D/remote.git" update-ref -d refs/heads/fr/01
+[[ -z "$dg_t7d" ]] && pass "T7d 숫자형 slug 1 이 원격 fr/01 의 끝을 가져오지 않음" || fail "T7d DUP_REMOTE_SLUG_OID=$dg_t7d"
+
+# T10 — 조사는 공유 ref 를 바꾸지 않는다(--dry-run·멈춤 모두)
+dg_new
+git -C "$DG_D/a" fetch -q origin
+printf 'm\n' > "$DG_D/b/dg-m.txt"
+git -C "$DG_D/b" add -A && git -C "$DG_D/b" commit -q -m "feat: main 전진"
+git -C "$DG_D/b" push -q origin main
+dg_promote "$DG_D/b" --short-title dg-a --size small --source-fr "$DG_FR"
+git -C "$DG_D/b" push -q origin fr/dg-a
+dg_t10_ref="$(git -C "$DG_D/a" rev-parse refs/remotes/origin/main)"
+dg_t10_fh="$(cksum < "$DG_D/a/.git/FETCH_HEAD")"
+dg_promote "$DG_D/a" --short-title dg-a --size small --source-fr "$DG_FR" --dry-run
+[[ "$RC" -eq 1 && "$OUT" == *"중복 착수"* ]] && pass "T10 --dry-run 도 멈춤 출력" || fail "T10 dry-run RC=$RC: $OUT"
+dg_promote "$DG_D/a" --short-title dg-a --size small --source-fr "$DG_FR"
+[[ "$RC" -eq 1 ]] && pass "T10 실제 실행 RC=1" || fail "T10 RC=$RC: $OUT"
+[[ "$(git -C "$DG_D/a" rev-parse refs/remotes/origin/main)" == "$dg_t10_ref" ]] \
+  && pass "T10 원격 추적 ref 가 그대로" || fail "T10 refs/remotes/origin/main 이 바뀌었다"
+[[ "$(cksum < "$DG_D/a/.git/FETCH_HEAD")" == "$dg_t10_fh" ]] \
+  && pass "T10 FETCH_HEAD 가 그대로" || fail "T10 FETCH_HEAD 가 바뀌었다"
+[[ -z "$(git -C "$DG_D/a" for-each-ref refs/remotes/origin/fr)" ]] \
+  && pass "T10 원격 fr 추적 ref 가 생기지 않았다" || fail "T10 refs/remotes/origin/fr 이 생겼다"
+
+# ---- 착수 표시(Task 2): 한 fixture 에서 T5 → T5c, T5b, T6 → T6b, T14, T9, T13 을 잇는다 ----
+# 사본은 모두 첫 promote 전에 만든다(착수 뒤 사본은 worktree 등록이 어긋난다). 같은 FR 겹침이 다른 케이스를 멈추지 않게
+# T5 만 dg-local FR, T9 만 DG_FR 을 쓰고 나머지는 source-fr 없이 착수한다.
+dg_new
+DG_C="$DG_D"
+DG_LOCAL_FR="rd-workflow-workspace/backlog/items/2026-11-02-dg-local.md"
+printf '# FR\n\n- status: validated\n' > "$DG_C/a/$DG_LOCAL_FR"
+git -C "$DG_C/a" add -A && git -C "$DG_C/a" commit -q -m "docs: FR 등록"
+git init -q --bare -b main "$DG_C/empty.git"
+cp -R "$DG_C/a" "$DG_C/a5b"; git -C "$DG_C/a5b" remote set-url origin "$DG_C/empty.git"
+cp -R "$DG_C/a" "$DG_C/a6";  git -C "$DG_C/a6" remote set-url origin "$DG_C/nowhere.git"
+cp -R "$DG_C/a" "$DG_C/a13"; git -C "$DG_C/a13" remote set-url origin "$DG_C/nowhere.git"
+cp -R "$DG_C/a" "$DG_C/a14"
+git -C "$DG_C/a14" config push.followTags true
+git -C "$DG_C/a14" tag local-draft -m x
+
+# T5 — 로컬 기본 브랜치에만 있는 FR 등록 커밋 위의 정상 착수
+dg_promote "$DG_C/a" --short-title dg-ok --size small --source-fr "$DG_LOCAL_FR"
+[[ "$RC" -eq 0 ]] && pass "T5 정상 착수 RC=0" || fail "T5 RC=$RC: $OUT"
+[[ -n "$(dg_remote_oid "$DG_C" refs/heads/fr/dg-ok)" && "$(dg_remote_oid "$DG_C" refs/heads/fr/dg-ok)" == "$(git -C "$DG_C/a" rev-parse fr/dg-ok)" ]] \
+  && pass "T5 원격 fr/dg-ok 가 로컬 끝과 같다" || fail "T5 원격 fr/dg-ok: $(dg_remote_oid "$DG_C" refs/heads/fr/dg-ok)"
+[[ "$OUT" == *"착수 표시"* && "$OUT" == *"원격 기본 브랜치에 없는 커밋 1개"* ]] \
+  && pass "T5 착수 표시 줄과 미발행 커밋 수" || fail "T5 출력: $OUT"
+if git --git-dir "$DG_C/remote.git" show "main:$DG_LOCAL_FR" >/dev/null 2>&1; then fail "T5 원격 기본 브랜치에 FR 상세가 올라갔다"; else pass "T5 원격 기본 브랜치에는 FR 상세 없음"; fi
+
+# T5c — 같은 작업의 인계 재실행: 표시가 자기 것이면 「이미 있음」 줄
+printf '# handoff\n' > "$DG_C/h5.md"
+dg_promote "$DG_C/a" --short-title dg-ok --size small --source-fr "$DG_LOCAL_FR" --handoff "$DG_C/h5.md"
+[[ "$OUT" == *"이미 이 작업의 착수 표시가 있습니다"* ]] && pass "T5c 이어 가기에서 이미 있음 줄" || fail "T5c RC=$RC: $OUT"
+
+# T5b — 기본 브랜치가 없는 빈 원격
+dg_promote "$DG_C/a5b" --short-title dg-eb --size small --source-fr "$DG_LOCAL_FR"
+[[ "$RC" -eq 0 && "$OUT" != *"중복 확인 경고"* && "$OUT" == *"이력 전체가 올라갔습니다"* ]] \
+  && pass "T5b 빈 원격: 경고 없이 이력 전체를 올림" || fail "T5b RC=$RC: $OUT"
+[[ -n "$(git -C "$DG_C/empty.git" rev-parse --verify -q refs/heads/fr/dg-eb 2>/dev/null || true)" ]] \
+  && pass "T5b 빈 원격에 fr/dg-eb 있음" || fail "T5b 빈 원격에 fr/dg-eb 없음"
+
+# T6 — 원격에 닿지 못함: 경고 후 로컬 착수
+dg_promote "$DG_C/a6" --short-title dg-off --size small --source-fr -
+dg_s="$(git -C "$DG_C/a6" rev-parse fr/dg-off 2>/dev/null || true)"
+[[ "$RC" -eq 0 && "$OUT" == *"원격 중복 확인을 하지 못했습니다"* && -n "$dg_s" ]] \
+  && pass "T6 원격 불가: 경고, RC=0, 로컬 착수" || fail "T6 RC=$RC: $OUT"
+
+# T6b — 구현 커밋 뒤 같은 명령: dry-run 은 예정 줄만, 실제 실행은 착수 커밋만 올리고 기동 없이 RC=1
+printf 'i\n' > "$DG_C/a6/.worktrees/dg-off/dg-impl.txt"
+git -C "$DG_C/a6/.worktrees/dg-off" add -A && git -C "$DG_C/a6/.worktrees/dg-off" commit -q -m "feat: 구현"
+git -C "$DG_C/a6" remote set-url origin "$DG_C/remote.git"
+dg_promote "$DG_C/a6" --short-title dg-off --size small --source-fr - --dry-run
+[[ "$OUT" == *"(dry-run) 착수 표시를 다시 올릴 예정"* && -z "$(dg_remote_oid "$DG_C" refs/heads/fr/dg-off)" ]] \
+  && pass "T6b dry-run: 예정 줄만, 원격 변화 없음" || fail "T6b dry-run RC=$RC: $OUT"
+dg_promote "$DG_C/a6" --short-title dg-off --size small --source-fr -
+[[ "$RC" -eq 1 && "$OUT" == *"착수 표시"* && "$OUT" == *"이미 진행 중"* && "$OUT" == *"로컬 작업은 바꾸지 않습니다"* && "$OUT" != *"세션 기동 결과"* ]] \
+  && pass "T6b 실제 실행: RC=1, 표시 올림, 기동 없음" || fail "T6b RC=$RC: $OUT"
+[[ "$(dg_remote_oid "$DG_C" refs/heads/fr/dg-off)" == "$dg_s" && "$(git -C "$DG_C/a6" rev-parse fr/dg-off)" != "$dg_s" ]] \
+  && pass "T6b 원격 fr/dg-off = 착수 커밋(구현 커밋은 올리지 않음)" || fail "T6b 원격: $(dg_remote_oid "$DG_C" refs/heads/fr/dg-off) 착수=$dg_s"
+
+# T14 — push.followTags=true 여도 로컬 태그는 따라가지 않는다
+dg_promote "$DG_C/a14" --short-title dg-tag --size small --source-fr -
+[[ -z "$(dg_remote_oid "$DG_C" refs/tags/local-draft)" && -n "$(dg_remote_oid "$DG_C" refs/heads/fr/dg-tag)" ]] \
+  && pass "T14 원격에 태그 없이 fr/dg-tag 만 올라감" || fail "T14 RC=$RC 태그=$(dg_remote_oid "$DG_C" refs/tags/local-draft): $OUT"
+
+# T9 — 이어 가기: 다른 브랜치의 표시는 경고, 자기 표시는 착수 커밋만 올림
+git -C "$DG_C/b" remote set-url origin "$DG_C/nowhere.git"
+dg_promote "$DG_C/b" --short-title dg-rb --size small --source-fr "$DG_FR"
+dg_sb="$(git -C "$DG_C/b" rev-parse fr/dg-rb 2>/dev/null || true)"
+printf 'i\n' > "$DG_C/b/.worktrees/dg-rb/dg-impl.txt"
+git -C "$DG_C/b/.worktrees/dg-rb" add -A && git -C "$DG_C/b/.worktrees/dg-rb" commit -q -m "feat: 구현"
+git -C "$DG_C/b" worktree remove --force "$DG_C/b/.worktrees/dg-rb"
+dg_promote "$DG_C/a" --short-title dg-ra --size small --source-fr "$DG_FR"
+[[ -n "$(dg_remote_oid "$DG_C" refs/heads/fr/dg-ra)" ]] && pass "T9 전제: a 의 표시가 올라갔다" || fail "T9 전제 RC=$RC: $OUT"
+git -C "$DG_C/b" remote set-url origin "$DG_C/remote.git"
+dg_promote "$DG_C/b" --short-title dg-rb --size small --source-fr "$DG_FR"
+[[ "$RC" -eq 0 && "$OUT" == *"이어 가기라 계속합니다"* && "$OUT" == *"fr/dg-ra"* ]] \
+  && pass "T9 이어 가기: 경고 줄만 내고 계속(RC=0)" || fail "T9 RC=$RC: $OUT"
+[[ -n "$dg_sb" && "$(dg_remote_oid "$DG_C" refs/heads/fr/dg-rb)" == "$dg_sb" ]] \
+  && pass "T9 원격 fr/dg-rb = 착수 커밋" || fail "T9 원격: $(dg_remote_oid "$DG_C" refs/heads/fr/dg-rb) 착수=$dg_sb"
+
+# T13 — 동시 착수에서 밀린 쪽의 재시도: 같은 slug 의 다른 이력이면 이어 가기도 멈춘다
+dg_promote "$DG_C/a13" --short-title dg-z --size small --source-fr -
+dg_promote "$DG_C/b" --short-title dg-z --size small --source-fr -
+git -C "$DG_C/a13" remote set-url origin "$DG_C/remote.git"
+printf '# handoff\n' > "$DG_C/h13.md"
+dg_promote "$DG_C/a13" --short-title dg-z --size small --handoff "$DG_C/h13.md"
+[[ "$RC" -eq 1 && "$OUT" == *"중복 착수"* && "$OUT" == *"fr/dg-z"* && "$OUT" != *"세션 기동"* ]] \
+  && pass "T13 같은 slug 의 다른 이력: 이어 가기도 RC=1, 기동 없음" || fail "T13 RC=$RC: $OUT"
+[[ "$OUT" == *"  이 clone 에도 같은 이름의 작업 fr/dg-z 가 있습니다."* \
+   && "$OUT" == *"(기본 체크아웃에서 실행합니다): cd $(printf '%q' "$DG_C/a13") && bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task dg-z && git fetch origin fr/dg-z:fr/dg-z && bash rd-workflow/scripts/lifecycle/promote.sh --short-title dg-z --size small"* \
+   && "$OUT" == *"작업을 남기려면(그 착수를 버린 것이 확실할 때): git push --no-follow-tags --force-with-lease=refs/heads/fr/dg-z:"* ]] \
+  && pass "T13 로컬에 같은 이름의 작업이 있으면 rollback 뒤 이어 가기 안내" || fail "T13 안내: $OUT"
+# T13b — 같은 상태에서 인계 없이 재실행(이미 진행 중 갈래): 다른 이력이 보이면 발행 요청 거절을 알린다
+dg_promote "$DG_C/a13" --short-title dg-z --size small --source-fr -
+[[ "$RC" -eq 1 && "$OUT" == *"이미 진행 중"* && "$OUT" == *"  같은 이름의 다른 이력이 원격에 있어 이 작업은 발행 요청이 거절됩니다."* ]] \
+  && pass "T13b 이미 진행 중 갈래: 발행 요청 거절 안내 줄" || fail "T13b RC=$RC: $OUT"
+
+# T11 — dup_claim_report·dup_claim_push 반환
+dg_o="$(git -C "$DG_ROOT/f1/a" rev-parse HEAD)"
+dg_r="$( ( source "$SCRIPT_DIR/_dup_guard.sh"; DUP_SCAN_ROOT="$DG_ROOT/f1/a"; dup_claim_report 1 dg-a "$dg_o" x ) 2>&1 )" && dg_rc=0 || dg_rc=$?
+[[ "$dg_rc" -eq 1 && "$dg_r" == *"되돌리기(기본 체크아웃에서 실행합니다): cd $(printf '%q' "$DG_ROOT/f1/a") && bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task dg-a"* ]] \
+  && pass "T11 rc 1 → 반환 1, 되돌리기 줄" || fail "T11 rc 1: rc=$dg_rc $dg_r"
+dg_r="$( ( source "$SCRIPT_DIR/_dup_guard.sh"; dup_claim_report 3 dg-a "$dg_o" 'net' ) 2>&1 )" && dg_rc=0 || dg_rc=$?
+[[ "$dg_rc" -eq 0 && "$dg_r" == *"착수 표시를 원격에 올리지 못했습니다(net)"* ]] \
+  && pass "T11 rc 3 → 반환 0, 경고 줄" || fail "T11 rc 3: rc=$dg_rc $dg_r"
+dg_new_c="$(git -C "$DG_ROOT/f1/a" commit-tree 'HEAD^{tree}' -p HEAD -m x)"
+dg_rc=0; ( source "$SCRIPT_DIR/_dup_guard.sh"; dup_claim_push "$DG_ROOT/f1/a" dg-a "$dg_new_c" ) >/dev/null 2>&1 || dg_rc=$?
+[[ "$dg_rc" -eq 1 ]] && pass "T11 다른 이력이 먼저 올라가 있으면 push rc 1" || fail "T11 push rc=$dg_rc"
+
+# T11b — 원격 브랜치 이름이 slug 형식이 아니면 이어 가기 명령을 내지 않고, 셸 메타문자는 인용한다(git fixture 없음)
+dg_line() { printf 'claimed\t다른 clone 이 착수했습니다: 원격 fr/%s (끝 abcdef0, 마지막 커밋 o 2026-01-01 00:00, FR f)' "$1"; }
+dg_r="$( ( source "$SCRIPT_DIR/_dup_guard.sh"; DUP_SCAN_ROOT="$DG_ROOT"; DUP_FOUND_OIDS="feature/review 0123abc
+"; dup_stop_report dg-q "$(dg_line feature/review)" ) 2>&1 )"
+[[ "$dg_r" != *"--short-title feature/review"* && "$dg_r" == *"  원격 브랜치 이름 fr/feature/review 는 이 도구가 만든 작업 이름이 아니라 이어 가기 명령을 내지 않습니다."* ]] \
+  && pass "T11b slug 형식이 아닌 이름은 이어 가기 명령 없음" || fail "T11b (가): $dg_r"
+dg_bad='a$(id)'
+dg_q="$(printf '%q' "refs/heads/fr/${dg_bad}:0123abc")"
+dg_r="$( ( source "$SCRIPT_DIR/_dup_guard.sh"; DUP_SCAN_ROOT="$DG_ROOT"; DUP_FOUND_OIDS="${dg_bad} 0123abc
+"; dup_stop_report dg-q "$(dg_line "$dg_bad")" ) 2>&1 )"
+[[ "$dg_r" == *"git push --no-follow-tags --force-with-lease=${dg_q} origin "* && "$dg_r" != *"--force-with-lease=refs/heads/fr/${dg_bad}:"* ]] \
+  && pass "T11b 셸 메타문자가 든 이름은 lease 명령에서 인용됨" || fail "T11b (나): $dg_r"
+
+# (다) 두 발견 중 한 작성자명에 다른 발견의 머리 문구가 들어 있어도 각 명령은 자기 이름·OID 를 쓴다
+dg_r="$( ( source "$SCRIPT_DIR/_dup_guard.sh"; DUP_SCAN_ROOT="$DG_ROOT"; DUP_FOUND_OIDS="dg-a 1111aaa
+dg-b 2222bbb
+"; dup_stop_report dg-q "$(printf 'claimed\t%sdg-a (끝 1111aaa, 마지막 커밋 원격 fr/dg-b (담당) 2026-01-01 00:00, FR f)\nclaimed\t%sdg-b (끝 2222bbb, 마지막 커밋 o 2026-01-01 00:00, FR f)' "$_DUP_CLAIM_HEAD" "$_DUP_CLAIM_HEAD")" ) 2>&1 )"
+[[ "$dg_r" == *"--force-with-lease=refs/heads/fr/dg-a:1111aaa origin :refs/heads/fr/dg-a"* \
+   && "$dg_r" == *"--force-with-lease=refs/heads/fr/dg-b:2222bbb origin :refs/heads/fr/dg-b"* \
+   && "$dg_r" != *"fr/dg-b:1111aaa"* && "$dg_r" != *"fr/dg-a:2222bbb"* ]] \
+  && pass "T11b 작성자명에 머리 문구가 있어도 발견별 이름·OID 가 맞음" || fail "T11b (다): $dg_r"
+
+# (라) 숫자형 slug 01·1 — 발견마다 자기 ref 의 OID 를 쓴다(awk 숫자 비교로 엇갈리지 않음)
+dg_r="$( ( source "$SCRIPT_DIR/_dup_guard.sh"; DUP_SCAN_ROOT="$DG_ROOT"; DUP_FOUND_OIDS="01 aaaa111
+1 bbbb222
+"; dup_stop_report dg-q "$(printf 'claimed\t%s01 (끝 aaaa111, 마지막 커밋 o 2026-01-01 00:00, FR f)\nclaimed\t%s1 (끝 bbbb222, 마지막 커밋 o 2026-01-01 00:00, FR f)' "$_DUP_CLAIM_HEAD" "$_DUP_CLAIM_HEAD")" ) 2>&1 )"
+[[ "$dg_r" == *"--force-with-lease=refs/heads/fr/01:aaaa111 origin :refs/heads/fr/01"* \
+   && "$dg_r" == *"--force-with-lease=refs/heads/fr/1:bbbb222 origin :refs/heads/fr/1"* \
+   && "$dg_r" != *"fr/1:aaaa111"* && "$dg_r" != *"fr/01:bbbb222"* ]] \
+  && pass "T11b 숫자형 slug 01·1 의 OID 가 엇갈리지 않음" || fail "T11b (라): $dg_r"
+
+# T11c — /fr do 줄기 안내는 감시 목록(active.tsv)을 고치는 명령(close.sh 포함)을 내지 않고 rollback 만 안내한다
+dg_r="$( ( source "$SCRIPT_DIR/_dup_guard.sh"; DUP_SCAN_ROOT="$DG_ROOT"; dup_stop_report dg-q "$(printf 'local\t이 clone 에서 같은 FR 이 진행 중입니다: f (단계: /fr do 줄기 dg-s)')" ) 2>&1 )"
+[[ "$dg_r" != *"awk"* && "$dg_r" != *"active.tsv.tmp"* && "$dg_r" != *" mv "* \
+   && "$dg_r" != *"close.sh"* && "$dg_r" == *"promote_rollback.sh --task dg-s"* ]] \
+  && pass "T11c 줄기 안내: 감시 목록 편집 명령 없이 rollback 만" || fail "T11c: $dg_r"
+
+# T11d — dup_local_inprogress: /fr do 줄기 줄은 로컬 fr/<x> 가 있을 때만 진행 중으로 센다
+dg_new
+mkdir -p "$DG_D/a/rd-workflow-workspace/.lifecycle/fr-do"
+printf 'dg-s\t\t2026-11-01-dg-fr\n' > "$DG_D/a/rd-workflow-workspace/.lifecycle/fr-do/active.tsv"
+dg_rc=0; dg_o="$( ( source "$SCRIPT_DIR/_dup_guard.sh"; dup_local_inprogress "$DG_D/a" 2026-11-01-dg-fr ) 2>&1 )" || dg_rc=$?
+[[ "$dg_rc" -eq 0 && -z "$dg_o" ]] \
+  && pass "T11d (가) 로컬 fr/dg-s 가 없으면 낡은 줄을 건너뜀" || fail "T11d (가): rc=$dg_rc $dg_o"
+git -C "$DG_D/a" branch fr/dg-s
+dg_rc=0; dg_o="$( ( source "$SCRIPT_DIR/_dup_guard.sh"; dup_local_inprogress "$DG_D/a" 2026-11-01-dg-fr ) 2>&1 )" || dg_rc=$?
+[[ "$dg_rc" -eq 1 && "$dg_o" == *"단계: /fr do 줄기 dg-s"* ]] \
+  && pass "T11d (나) 로컬 fr/dg-s 가 있으면 진행 중" || fail "T11d (나): rc=$dg_rc $dg_o"
+
+# T8 — rollback: 원격 착수 표시 삭제(자기 커밋일 때만)와 좁힌 「이미 archive 됨」 검사
+dg_new
+DG_R="$DG_D"
+cp -R "$DG_R/a" "$DG_R/loc8"; git -C "$DG_R/loc8" remote remove origin
+# 두 clone 모두 main 에 커밋 C 를 두고 예전 발행 태그를 건다(rb4·rb6). 태그 대상 C 는 이 작업 끝의 조상이지 후손이 아니다.
+printf 'c\n' > "$DG_R/a/dg-old.txt"
+git -C "$DG_R/a" add -A && git -C "$DG_R/a" commit -q -m "feat: 예전 발행"
+git -C "$DG_R/a" tag fr/2026-01-01-0000/dg-rb4 HEAD -m x
+git -C "$DG_R/a" push -q origin main
+printf 'c\n' > "$DG_R/loc8/dg-old.txt"
+git -C "$DG_R/loc8" add -A && git -C "$DG_R/loc8" commit -q -m "feat: 예전 발행"
+git -C "$DG_R/loc8" tag fr/2026-01-01-0000/dg-rb6 HEAD -m x
+dg_rb() { local c="$1"; shift; RC=0; OUT="$( cd "$c" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh "$@" 2>&1 )" || RC=$?; }
+
+# T8a — 자기 착수 표시는 지운다
+dg_promote "$DG_R/a" --short-title dg-rb1 --size small --source-fr -
+[[ -n "$(dg_remote_oid "$DG_R" refs/heads/fr/dg-rb1)" ]] && pass "T8a 전제: 착수 표시가 올라갔다" || fail "T8a 전제 RC=$RC: $OUT"
+dg_rb "$DG_R/a" --task dg-rb1 --force
+[[ "$RC" -eq 0 && -z "$(dg_remote_oid "$DG_R" refs/heads/fr/dg-rb1)" && "$OUT" == *"원격 착수 표시 fr/dg-rb1 를 지웠습니다"* ]] \
+  && pass "T8a rollback 이 원격 fr/dg-rb1 을 지움" || fail "T8a RC=$RC 원격=$(dg_remote_oid "$DG_R" refs/heads/fr/dg-rb1): $OUT"
+
+# T8b — 원격 끝이 다른 이력이면 남긴다
+dg_promote "$DG_R/a" --short-title dg-rb2 --size small --source-fr -
+printf 'o\n' > "$DG_R/b/dg-other.txt"
+git -C "$DG_R/b" pull -q --no-tags origin main
+git -C "$DG_R/b" add -A && git -C "$DG_R/b" commit -q -m "feat: 다른 이력"
+dg_ob="$(git -C "$DG_R/b" rev-parse HEAD)"
+git -C "$DG_R/b" push -q --force origin "${dg_ob}:refs/heads/fr/dg-rb2"
+git -C "$DG_R/a" fetch -q origin fr/dg-rb2   # 다른 이력의 객체가 로컬에 있어야 조상 판정이 유일한 방어선이 된다
+dg_rb "$DG_R/a" --task dg-rb2 --force
+[[ "$RC" -eq 0 && "$(dg_remote_oid "$DG_R" refs/heads/fr/dg-rb2)" == "$dg_ob" && "$OUT" == *"로컬 브랜치에 없는 커밋이 있어 지우지 않았습니다"* \
+   && "$OUT" == *"git push --no-follow-tags --force-with-lease=refs/heads/fr/dg-rb2:${dg_ob} origin :refs/heads/fr/dg-rb2"* ]] \
+  && pass "T8b 다른 이력의 원격 fr/dg-rb2 는 남고 안내 줄" || fail "T8b RC=$RC 원격=$(dg_remote_oid "$DG_R" refs/heads/fr/dg-rb2): $OUT"
+
+# T8c — --dry-run 은 원격을 건드리지 않고 예정 줄만
+dg_promote "$DG_R/a" --short-title dg-rb3 --size small --source-fr -
+dg_r3="$(dg_remote_oid "$DG_R" refs/heads/fr/dg-rb3)"
+dg_rb "$DG_R/a" --task dg-rb3 --dry-run
+[[ "$RC" -eq 0 && "$OUT" == *"would delete remote claim fr/dg-rb3"* && -n "$dg_r3" && "$(dg_remote_oid "$DG_R" refs/heads/fr/dg-rb3)" == "$dg_r3" ]] \
+  && pass "T8c dry-run: 예정 줄만, 원격 그대로" || fail "T8c RC=$RC: $OUT"
+dg_rb "$DG_R/a" --task dg-rb3 --force
+
+# T8d — 같은 slug 의 예전 태그는 폐기를 막지 않고, 이 작업을 담은 태그는 막는다
+dg_promote "$DG_R/a" --short-title dg-rb4 --size small --source-fr -
+dg_rb "$DG_R/a" --task dg-rb4 --force
+[[ "$RC" -eq 0 && -z "$(dg_remote_oid "$DG_R" refs/heads/fr/dg-rb4)" && "$OUT" != *"이미 archive"* ]] \
+  && pass "T8d 예전 태그가 있어도 폐기, 원격 표시도 지움" || fail "T8d RC=$RC: $OUT"
+dg_promote "$DG_R/a" --short-title dg-rb5 --size small --source-fr -
+git -C "$DG_R/a" tag fr/2026-01-03-0000/dg-rb5 refs/heads/fr/dg-rb5 -m x
+dg_rb "$DG_R/a" --task dg-rb5 --force
+[[ "$RC" -eq 1 && "$OUT" == *"이미 archive 되었습니다"* ]] && git -C "$DG_R/a" rev-parse --verify -q refs/heads/fr/dg-rb5 >/dev/null \
+  && pass "T8d 이 작업을 담은 태그는 「이미 archive 되었습니다」, 브랜치 그대로" || fail "T8d RC=$RC: $OUT"
+
+# T8e — 로컬 전용 저장소에서도 같은 두 갈래, 원격 줄은 없음
+dg_promote "$DG_R/loc8" --short-title dg-rb6 --size small --source-fr -
+dg_rb "$DG_R/loc8" --task dg-rb6 --force
+if git -C "$DG_R/loc8" rev-parse --verify -q refs/heads/fr/dg-rb6 >/dev/null 2>&1; then dg_gone=0; else dg_gone=1; fi
+[[ "$RC" -eq 0 && "$dg_gone" -eq 1 && "$OUT" != *"원격"* ]] \
+  && pass "T8e 로컬 전용: 예전 태그가 있어도 폐기, 원격 줄 없음" || fail "T8e RC=$RC gone=$dg_gone: $OUT"
+dg_promote "$DG_R/loc8" --short-title dg-rb7 --size small --source-fr -
+git -C "$DG_R/loc8" tag fr/2026-01-03-0000/dg-rb7 refs/heads/fr/dg-rb7 -m x
+dg_rb "$DG_R/loc8" --task dg-rb7 --force
+[[ "$RC" -eq 1 && "$OUT" == *"이미 archive 되었습니다"* && "$OUT" != *"원격"* ]] \
+  && pass "T8e 로컬 전용: 이 작업을 담은 태그는 막음" || fail "T8e RC=$RC: $OUT"
+
 echo "== promote.sh 문서 이관 =="
 CREPO="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패 (문서 이관)" >&2; exit 1; }
 [[ -n "$CREPO" && -d "$CREPO" ]] || { echo "test_lifecycle.sh: 임시 디렉터리 경로 검증 실패 (문서 이관)" >&2; exit 1; }
@@ -3754,6 +4470,93 @@ rm -f "${CREPO:?}/$P10"
 git -C "$CREPO" switch -q main 2>/dev/null || true
 git -C "$CREPO" reset -q --hard main
 
+# ---- T12 (REQUEST review 세션 — 이름에 slug 가 없어 SESSION.md 의 Branch Context 로 귀속) ----
+C_RP="rd-workflow-workspace/handoffs/review_pipeline"
+c_mkrsess() {  # <폴더 이름> <short-title> <fr-branch>
+  mkdir -p "$CREPO/$C_RP/$1/turns"
+  printf '# Review Session\n\n## Topic\nrequest-review\n\n## Branch Context\n- fr-branch: %s\n- worktree-path: %s\n- short-title: %s\n- lifecycle-stage: request-review\n' \
+    "$3" "$CREPO" "$2" > "$CREPO/$C_RP/$1/SESSION.md"
+  printf 'cp\n' > "$CREPO/$C_RP/$1/CHECKPOINT.md"
+}
+printf 'rd-workflow-workspace/handoffs/review_pipeline/*/.codex_output.log\n' >> "$CREPO/.gitignore"
+git -C "$CREPO" commit -q -m "ignore review log" -- .gitignore
+c_mkrsess 20261122_100000_request-review ct12 null
+printf 'log\n' > "$CREPO/$C_RP/20261122_100000_request-review/.codex_output.log"
+printf 'ua\n' > "$CREPO/$C_RP/20261122_100000_request-review/USER_ACTION.md"
+c_mkrsess 20261122_100001_request-review ct12-bar null
+c_mkrsess 20261122_100002_request-review ct12 fr/ct12
+c_out="$(cpromote --short-title ct12 --size large --source-fr - 2>&1)" || true
+CT="$CREPO/.worktrees/ct12"
+if [[ "$c_out" == *"문서 이관 — 3건 → fr/ct12"* ]] \
+   && git -C "$CT" show "HEAD:$C_RP/20261122_100000_request-review/SESSION.md" 2>/dev/null | grep -qx -- '- short-title: ct12' \
+   && git -C "$CT" cat-file -e "HEAD:$C_RP/20261122_100000_request-review/CHECKPOINT.md" 2>/dev/null \
+   && [[ ! -e "$CREPO/$C_RP/20261122_100000_request-review" && -d "$CT/$C_RP/20261122_100000_request-review/turns" ]] \
+   && [[ "$(cat "$CT/$C_RP/20261122_100000_request-review/.codex_output.log" 2>/dev/null)" == "log" ]] \
+   && ! git -C "$CT" cat-file -e "HEAD:$C_RP/20261122_100000_request-review/.codex_output.log" 2>/dev/null; then
+  pass "T12 기본 체크아웃에서 만든 이 작업의 REQUEST review 세션은 이관되고 폴더째 정리됨(빈 turns/·git 제외 로그 포함, 로그는 대상으로 옮기고 커밋 안 함)"
+else fail "T12 REQUEST review 세션 이관: $c_out"; fi
+# 정리가 도중에 끊겨도 재실행이 세션을 다시 찾도록 SESSION.md 는 그 세션에서 맨 뒤에 지운다.
+if [[ "$(printf '%s\n' "$c_out" | grep '원본 정리: 완료: .*20261122_100000_request-review/' | tail -1)" == *"/SESSION.md" ]]; then
+  pass "T12 리뷰 세션의 원본 정리는 SESSION.md 를 맨 뒤에 지움"
+else fail "T12 SESSION.md 정리 순서: $c_out"; fi
+if [[ -f "$CREPO/$C_RP/20261122_100001_request-review/SESSION.md" && -f "$CREPO/$C_RP/20261122_100002_request-review/SESSION.md" \
+      && ! -e "$CT/$C_RP/20261122_100001_request-review" && ! -e "$CT/$C_RP/20261122_100002_request-review" ]]; then
+  pass "T12 다른 slug(접두 일치)·fr 브랜치에서 만든 세션은 P 에 남고 T 에 없음"
+else fail "T12 REQUEST review 세션 귀속 배제"; fi
+rm -rf "${CREPO:?}/$C_RP"
+# short-title 부재 표식 unknown 은 같은 이름의 slug 로 promote 해도 귀속하지 않는다.
+c_mkrsess 20261122_100003_request-review unknown null
+c_out="$(cpromote --short-title unknown --size large --source-fr - 2>&1)" || true
+if [[ -f "$CREPO/$C_RP/20261122_100003_request-review/SESSION.md" && ! -e "$CREPO/.worktrees/unknown/$C_RP/20261122_100003_request-review" ]]; then
+  pass "T12 short-title unknown 세션은 slug unknown 으로 promote 해도 P 에 남음"
+else fail "T12 unknown 배제: $c_out"; fi
+rm -rf "${CREPO:?}/$C_RP"
+# 세션의 일부 파일을 건너뛰면 세션 전체를 원본에 남기고, 원인을 풀고 재실행하면 통째로 옮긴다.
+c_mkrsess 20261122_100004_request-review ct12s null
+git -C "$CREPO" add -- "$C_RP/20261122_100004_request-review/CHECKPOINT.md"
+c_out="$(cpromote --short-title ct12s --size large --source-fr - 2>&1)" || true
+if [[ "$c_out" == *"같은 리뷰 세션의 다른 파일을 건너뜀"* && -f "$CREPO/$C_RP/20261122_100004_request-review/SESSION.md" ]] \
+   && ! git -C "$CREPO/.worktrees/ct12s" cat-file -e "HEAD:$C_RP/20261122_100004_request-review/SESSION.md" 2>/dev/null; then
+  pass "T12 일부 파일을 건너뛴 세션은 나누지 않고 P 에 통째로 남음"
+else fail "T12 세션 단위 보존: $c_out"; fi
+git -C "$CREPO" reset -q -- "$C_RP/20261122_100004_request-review/CHECKPOINT.md"
+# 리뷰 턴이 실행 중(Status awaiting-reviewer)인 같은 작업의 세션은 원본에 통째로 남긴다.
+c_mkrsess 20261122_100005_request-review ct12s null
+printf '\n## Status\nawaiting-reviewer\n' >> "$CREPO/$C_RP/20261122_100005_request-review/SESSION.md"
+c_out="$(cpromote --short-title ct12s --size large --source-fr - 2>&1)" || true
+if git -C "$CREPO/.worktrees/ct12s" cat-file -e "HEAD:$C_RP/20261122_100004_request-review/SESSION.md" 2>/dev/null \
+   && git -C "$CREPO/.worktrees/ct12s" cat-file -e "HEAD:$C_RP/20261122_100004_request-review/CHECKPOINT.md" 2>/dev/null \
+   && [[ ! -e "$CREPO/$C_RP/20261122_100004_request-review" ]]; then
+  pass "T12 원인을 풀고 재실행하면 세션 전체가 이관됨"
+else fail "T12 세션 재실행 이관: $c_out"; fi
+if [[ "$c_out" == *"리뷰 턴이 실행 중이거나 Reviewer 차례"* && -f "$CREPO/$C_RP/20261122_100005_request-review/SESSION.md" ]] \
+   && ! git -C "$CREPO/.worktrees/ct12s" cat-file -e "HEAD:$C_RP/20261122_100005_request-review/SESSION.md" 2>/dev/null; then
+  pass "T12 리뷰 턴 실행 중(awaiting-reviewer) 세션은 사유와 함께 P 에 통째로 남음"
+else fail "T12 실행 중 세션 보존: $c_out"; fi
+# 복사만 끝나고 중단된 상태(대상에 같은 바이트의 파일만 있고 turns/ 없음)에서 재실행하면 turns/ 까지 갖춰 이관한다.
+c_mkrsess 20261122_100006_request-review ct12s null
+mkdir -p "$CREPO/.worktrees/ct12s/$C_RP/20261122_100006_request-review"
+cp "$CREPO/$C_RP/20261122_100006_request-review/"*.md "$CREPO/.worktrees/ct12s/$C_RP/20261122_100006_request-review/"
+c_out="$(cpromote --short-title ct12s --size large --source-fr - 2>&1)" || true
+if git -C "$CREPO/.worktrees/ct12s" cat-file -e "HEAD:$C_RP/20261122_100006_request-review/SESSION.md" 2>/dev/null \
+   && [[ -d "$CREPO/.worktrees/ct12s/$C_RP/20261122_100006_request-review/turns" && ! -e "$CREPO/$C_RP/20261122_100006_request-review" ]]; then
+  pass "T12 복사 뒤 중단 상태의 재실행은 대상 turns/ 를 만들고 원본을 정리함"
+else fail "T12 복사 뒤 재실행 turns: $c_out"; fi
+
+# ---- T13 (spec/plan review 세션 — fr 브랜치에서 다른 작업의 plan 을 검토하면 시각 뒤에 그 브랜치의 작업 slug 가 붙는다) ----
+# fr/demo 에서 ct13 의 plan 을 검토한 세션은 ct13 착수 때 따라오고, 이름이 ct13 으로 끝나는 다른 작업(x-ct13)의 세션은 남는다.
+c_mkrsess 20261126_181500_demo_1743-ct13-spec-plan-review ct13 fr/demo
+c_mkrsess 20261126_181500_demo_1743-x-ct13-spec-plan-review x-ct13 fr/demo
+c_out="$(cpromote --short-title ct13 --size large --source-fr - 2>&1)" || true
+CT="$CREPO/.worktrees/ct13"
+if git -C "$CT" cat-file -e "HEAD:$C_RP/20261126_181500_demo_1743-ct13-spec-plan-review/SESSION.md" 2>/dev/null \
+   && [[ ! -e "$CREPO/$C_RP/20261126_181500_demo_1743-ct13-spec-plan-review" ]] \
+   && [[ -f "$CREPO/$C_RP/20261126_181500_demo_1743-x-ct13-spec-plan-review/SESSION.md" ]] \
+   && ! git -C "$CT" cat-file -e "HEAD:$C_RP/20261126_181500_demo_1743-x-ct13-spec-plan-review/SESSION.md" 2>/dev/null; then
+  pass "T13 작업 slug 가 붙은 spec/plan 세션을 이관하고 다른 작업의 세션은 남김"
+else fail "T13 작업 slug 가 붙은 spec/plan 세션 이관: $c_out"; fi
+rm -rf "${CREPO:?}/$C_RP"
+
 echo "== cleanup_pending 헬퍼 =="
 _cp_repo="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 [[ -n "$_cp_repo" && -d "$_cp_repo" ]] || { echo "test_lifecycle.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
@@ -3897,12 +4700,14 @@ echo "== archive 정리 잔여 기록 =="
 # archive 를 끝까지 도는 fixture 4개 + tasks_list.sh 1회(약 8초). 헬퍼 단위 테스트로는
 # "archive 가 발행 뒤 헬퍼를 부르고 종료 코드를 바꾸는가", "지연 정리가 기록을 푸는가" 를 증명할 수 없어 이 비용을 진다.
 # 잔여는 잠긴 worktree 로 만든다 — archive 가 지우지 못해 3건(worktree 제거 실패·worktree 등록 잔존·local-branch)이 남는다.
+# 작업은 잠긴 worktree 에 있으므로 기본 체크아웃에서 부를 때 --task 로 대상을 명시한다(대상 없는 조회는 자동 선택하지 않음).
 CPR_TMP="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패" >&2; exit 1; }
 CPR_TMP="$(cd "$CPR_TMP" && pwd -P)"; _ast_cleanup+=("$CPR_TMP")
-cpr_archive() { # cpr_archive <경로> — rc 를 CPR_RC, stdout·stderr 를 CPR_OUT·CPR_ERR 에 둔다
+cpr_archive() { # cpr_archive <경로> [archive 인자...] — rc 를 CPR_RC, stdout·stderr 를 CPR_OUT·CPR_ERR 에 둔다
   CPR_RC=0
-  ( cd "$1" && env -u project_root -u TASK_STATE_PATH -u STATE_MIGRATION_BACKUP_DIR \
-      bash "$ARCHIVE_SH" --force-skip-review-check "테스트" --allow-status-mismatch "테스트" \
+  local d="$1"; shift
+  ( cd "$d" && env -u project_root -u TASK_STATE_PATH -u STATE_MIGRATION_BACKUP_DIR \
+      bash "$ARCHIVE_SH" --force-skip-review-check "테스트" --allow-status-mismatch "테스트" "$@" \
   ) >"$CPR_TMP/out" 2>"$CPR_TMP/err" || CPR_RC=$?
   CPR_OUT="$(cat "$CPR_TMP/out")"; CPR_ERR="$(cat "$CPR_TMP/err")"
 }
@@ -3919,7 +4724,7 @@ cpr_common() { git -C "$1" rev-parse --path-format=absolute --git-common-dir; }
 CPR1="$CPR_TMP/r1"; cpr_locked_repo "$CPR1"; CPR1C="$(cpr_common "$CPR1")"
 mkdir -p "$CPR1C/rd-workflow/archive-cleanup-pending"
 printf 'worktree\t/x\t사유\tgit worktree list\n' > "$CPR1C/rd-workflow/archive-cleanup-pending/other"
-cpr_archive "$CPR1"
+cpr_archive "$CPR1" --task audittask
 assert_eq "$CPR_RC" "0" "T2-1 잠긴 worktree 잔여 archive rc 0"
 # 실측: 잠긴 worktree 는 worktree 제거 실패 + 브랜치 등록 잔존 + local-branch 보류의 3건을 남긴다.
 assert_eq "$(wc -l < "$CPR1C/rd-workflow/archive-cleanup-pending/audittask" 2>/dev/null | tr -d ' ')" "3" "T2-1 자기 slug 기록 3줄"
@@ -3951,7 +4756,7 @@ assert_eq "$([[ -e "$CPR3C/rd-workflow/archive-cleanup-pending/audittask" ]] && 
 # T2-4 (AC5·AC7d): 쓰기 실패 → rc 1, stderr 표식, stdout 요약 유지, 발행은 끝남
 CPR4="$CPR_TMP/r4"; cpr_locked_repo "$CPR4"; CPR4C="$(cpr_common "$CPR4")"
 mkdir -p "$CPR4C/rd-workflow"; : > "$CPR4C/rd-workflow/archive-cleanup-pending"
-cpr_archive "$CPR4"
+cpr_archive "$CPR4" --task audittask
 assert_eq "$CPR_RC" "1" "T2-4 기록 쓰기 실패 → rc 1"
 assert_eq "$(printf '%s\n' "$CPR_ERR" | grep -c 'archive: CLEANUP-RECORD-FAILED write')" "1" "T2-4 stderr 표식 write"
 assert_eq "$(printf '%s\n' "$CPR_OUT" | grep -c 'archive: CLEANUP-PENDING')" "1" "T2-4 stdout CLEANUP-PENDING 유지"
@@ -3964,6 +4769,201 @@ mkdir -p "$CPR5C/rd-workflow/archive-cleanup-pending/audittask/x"
 cpr_archive "$CPR5"
 assert_eq "$CPR_RC" "1" "T2-5 기록 해제 실패 → rc 1"
 assert_eq "$(printf '%s\n' "$CPR_ERR" | grep -c 'archive: CLEANUP-RECORD-FAILED clear')" "1" "T2-5 stderr 표식 clear"
+
+echo "== promote 모델·effort 선택 — 실제 promote 진입점 (spec 2026-11-22-1010 D4~D8) =="
+# 가짜 herdr(호출을 calls.log 에 적고 tab create·agent start·agent prompt 에 성공 JSON)와 가짜 claude(--help 출력 제어)를
+# PATH 앞에 두고 HERDR_ENV=1 로 promote 를 실제로 부른다. RD_LAUNCH_STUB 은 쓰지 않는다.
+LS_DIR="$(mktemp -d)" || { echo "test_lifecycle.sh: 임시 디렉터리 생성 실패 (promote 선택)" >&2; exit 1; }
+[[ -n "$LS_DIR" && -d "$LS_DIR" ]] || { echo "test_lifecycle.sh: 임시 디렉터리 경로 검증 실패 (promote 선택)" >&2; exit 1; }
+LS_DIR="$(cd "$LS_DIR" && pwd -P)"
+_ast_cleanup+=("$LS_DIR")
+LS_H="$LS_DIR/herdr-bin"; LS_OK="$LS_DIR/claude-ok"; LS_NE="$LS_DIR/claude-noeff"; LS_NJ="$LS_DIR/nojq-bin"
+mkdir -p "$LS_H" "$LS_OK" "$LS_NE" "$LS_NJ"
+cat > "$LS_H/herdr" <<STUBEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$LS_DIR/calls.log"
+case "\$1 \$2" in
+  "tab create") echo '{"result":{"root_pane":{"pane_id":"wX:p9","tab_id":"wX:t9"},"tab":{"tab_id":"wX:t9"}}}' ;;
+  "agent start") exit 0 ;;
+  "agent prompt") echo '{"id":"cli:agent:prompt","result":{"type":"agent_prompted","agent":{"agent_status":"working"}}}' ;;
+  "agent get") echo '{"error":{"code":"agent_not_found","message":"x"}}' >&2; exit 1 ;;
+  "agent list") echo '{"result":{"agents":[]}}' ;;
+  "tab close") exit 0 ;;
+esac
+STUBEOF
+cat > "$LS_OK/claude" <<STUBEOF
+#!/usr/bin/env bash
+if [[ "\${1-}" == --help ]]; then
+  echo "\$*" >> "$LS_DIR/help.log"
+  [[ -n "\${LS_LOCKDIR-}" ]] && { [[ -d "\$LS_LOCKDIR/tasks.lock" ]] && echo held || echo free; } >> "$LS_DIR/lock.log"
+  echo "  --model <model>"; echo "  --effort <level>"
+fi
+exit 0
+STUBEOF
+cat > "$LS_NE/claude" <<STUBEOF
+#!/usr/bin/env bash
+if [[ "\${1-}" == --help ]]; then echo "\$*" >> "$LS_DIR/help.log"; echo "  --model <model>"; fi
+exit 0
+STUBEOF
+chmod +x "$LS_H/herdr" "$LS_OK/claude" "$LS_NE/claude"
+# ps·lsof 는 claude 프로세스가 없다고 고정한다(resolve-launch 의 cwd 관측이 실제 프로세스를 보지 않게).
+mkdir -p "$LS_DIR/procs-bin"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$LS_DIR/procs-bin/ps"; printf '#!/usr/bin/env bash\nexit 0\n' > "$LS_DIR/procs-bin/lsof"
+chmod +x "$LS_DIR/procs-bin/ps" "$LS_DIR/procs-bin/lsof"
+# jq 만 뺀 PATH — 현재 PATH 의 모든 실행 파일을 링크하되 jq 는 건너뛴다.
+_ls_oldifs="$IFS"; IFS=':'
+for _d in $PATH; do
+  [[ -d "$_d" ]] || continue
+  for _f in "$_d"/*; do
+    _b="${_f##*/}"
+    [[ "$_b" == jq || -e "$LS_NJ/$_b" || ! -x "$_f" || -d "$_f" ]] && continue
+    ln -s "$_f" "$LS_NJ/$_b" 2>/dev/null || true
+  done
+done
+IFS="$_ls_oldifs"
+
+# lsf_new <dir> — rd-workflow 스크립트 사본이 든 임시 저장소(RBREPO 와 같은 모양)를 만든다
+lsf_new() {
+  local d="$1"
+  mkdir -p "$d/rd-workflow"
+  cp -R "$SCRIPT_DIR/.." "$d/rd-workflow/scripts"
+  git -C "$d" init -q -b main
+  git -C "$d" config user.email t@t && git -C "$d" config user.name t
+  mkdir -p "$d/rd-workflow-workspace/.lifecycle" "$d/rd-workflow-workspace/backlog/items"
+  printf '.worktrees/\n' > "$d/.gitignore"
+  emit_current_task_baseline > "$d/CURRENT_TASK.md"
+  printf 'schema=1\nshort-title=-\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\nbase-commit=null\nreview-session=null\n' \
+    > "$d/rd-workflow-workspace/.lifecycle/task-state"
+  printf '# Change Request\n\n## Source FR\n-\n' > "$d/REQUEST.md"
+  git -C "$d" add -A && git -C "$d" commit -q -m seed
+}
+LSF="$LS_DIR/fx"; lsf_new "$LSF"
+LSF_CFG="$LSF/rd-workflow/config"; mkdir -p "$LSF_CFG"
+# lsf_promote <slug> <PATH 값> <env 대입...> — LSF 에서 promote 를 실제로 실행한다. stdout→$LS_DIR/out, stderr→$LS_DIR/err
+lsf_promote() {
+  local slug="$1" path="$2"; shift 2
+  : > "$LS_DIR/calls.log"; : > "$LS_DIR/help.log"
+  ( cd "$LSF" && env -u RD_LAUNCH_STUB RD_SESSION_MODEL= RD_SESSION_EFFORT= RD_MODELS_CONFIG= CLAUDE_CODE_SESSION_ID= \
+      RD_CHILD_SESSION= HERDR_ENV=1 HC_TERMINAL_ID= PATH="$path" "$@" \
+      bash rd-workflow/scripts/lifecycle/promote.sh --short-title "$slug" --size large --source-fr - ) >"$LS_DIR/out" 2>"$LS_DIR/err" || true
+}
+lsf_start_call() { grep '^agent start' "$LS_DIR/calls.log" || true; }
+LS_P="$LS_H:$LS_OK:$PATH"
+
+# L-1 (AC6·7) 낡은 CLI: 출처 줄에 CLI 미지원으로 뺌, 경고, agent start 에 --effort 없음
+lsf_promote ls-l1 "$LS_H:$LS_NE:$PATH" RD_SESSION_EFFORT=high
+_ls_line="$(grep '다음 기동에 사용할 모델 —' "$LS_DIR/out" || true)"
+assert_eq "$(grep -c '^promote: 다음 기동에 사용할 모델 —' "$LS_DIR/out")" "1" "L-1 출처 줄이 정확히 한 번 나온다"
+[[ "$_ls_line" == *"effort — CLI 기본값 (CLI 미지원으로 뺌, RD_SESSION_EFFORT)"* ]] \
+  && pass "L-1 출처 줄에 effort — CLI 기본값 (CLI 미지원으로 뺌, RD_SESSION_EFFORT)" || fail "L-1 출처 줄: [$_ls_line]"
+grep -q -- '--effort 를 받지 않습니다' "$LS_DIR/err" && pass "L-1 stderr 에 --effort 를 받지 않습니다" || fail "L-1 stderr: $(cat "$LS_DIR/err")"
+_ls_start="$(lsf_start_call)"
+[[ -n "$_ls_start" ]] && pass "L-1 agent start 가 불렸다" || fail "L-1 agent start 없음: $(cat "$LS_DIR/calls.log") / $(cat "$LS_DIR/err")"
+[[ -n "$_ls_start" && "$_ls_start" != *"--effort"* ]] && pass "L-1 agent start 에 --effort 가 없다" || fail "L-1 agent start: [$_ls_start]"
+
+# L-2 (AC7) env 로 모델·effort 를 정하면 출처 줄과 agent start 에 함께 나온다
+lsf_promote ls-l2 "$LS_P" RD_SESSION_MODEL=sonnet RD_SESSION_EFFORT=xhigh
+_ls_line="$(grep '다음 기동에 사용할 모델 —' "$LS_DIR/out" || true)"
+[[ "$_ls_line" == *"sonnet (출처: RD_SESSION_MODEL) · effort — xhigh (출처: RD_SESSION_EFFORT)" ]] \
+  && pass "L-2 출처 줄: 모델·effort 와 각 출처" || fail "L-2 출처 줄: [$_ls_line]"
+_ls_start="$(lsf_start_call)"
+[[ "$_ls_start" == *"-- --model sonnet --effort xhigh" ]] && pass "L-2 agent start 에 -- --model sonnet --effort xhigh" || fail "L-2 agent start: [$_ls_start]"
+
+# L-3 (AC8) 호출 체크아웃의 커밋하지 않은 models.json 을 읽는다 — 새 worktree 에는 그 파일이 없다
+printf '%s' '{"session":{"claude":{"model":"opus","effort":"high"}}}' > "$LSF_CFG/models.json"
+lsf_promote ls-l3 "$LS_P"
+_ls_line="$(grep '다음 기동에 사용할 모델 —' "$LS_DIR/out" || true)"
+[[ ! -e "$LSF/.worktrees/ls-l3/rd-workflow/config/models.json" ]] && pass "L-3 전제: 새 worktree 에 models.json 이 없다" || fail "L-3 전제 불성립"
+[[ "$_ls_line" == *"opus (출처: models.json) · effort — high (출처: models.json)" ]] \
+  && pass "L-3 출처 줄이 호출 체크아웃의 models.json 값" || fail "L-3 출처 줄: [$_ls_line] err=$(cat "$LS_DIR/err")"
+_ls_start="$(lsf_start_call)"
+[[ "$_ls_start" == *"--model opus --effort high" ]] && pass "L-3 agent start 에 --model opus --effort high" || fail "L-3 agent start: [$_ls_start]"
+
+# L-4 (AC8a) 같은 설정을 jq 없는 PATH 로
+lsf_promote ls-l4 "$LS_H:$LS_OK:$LS_NJ"
+_ls_line="$(grep '다음 기동에 사용할 모델 —' "$LS_DIR/out" || true)"
+[[ "$_ls_line" == *"opus (출처: models.json) · effort — high (출처: models.json)" ]] \
+  && pass "L-4 jq 없는 PATH 에서도 같은 출처 줄" || fail "L-4 출처 줄: [$_ls_line] err=$(cat "$LS_DIR/err")"
+_ls_start="$(lsf_start_call)"
+[[ "$_ls_start" == *"--model opus --effort high" ]] && pass "L-4 jq 없는 PATH 에서 agent start 에 --model opus --effort high" || fail "L-4 agent start: [$_ls_start]"
+
+# L-3c (AC8b promote 쪽) 하위 디렉터리에서 상대 RD_MODELS_CONFIG 를 호출 체크아웃 기준으로 읽는다
+mkdir -p "$LSF/sub" "$LSF/elsewhere/sub"
+printf '%s' '{"session":{"claude":{"model":"sonnet","effort":"low"}}}' > "$LSF/sub/m.json"
+printf '%s' '{"session":{"claude":{"model":"haiku","effort":"max"}}}' > "$LSF/elsewhere/sub/m.json"
+: > "$LS_DIR/calls.log"; : > "$LS_DIR/help.log"
+( cd "$LSF/elsewhere" && env -u RD_LAUNCH_STUB RD_SESSION_MODEL= RD_SESSION_EFFORT= RD_MODELS_CONFIG=sub/m.json CLAUDE_CODE_SESSION_ID= \
+    RD_CHILD_SESSION= HERDR_ENV=1 HC_TERMINAL_ID= PATH="$LS_P" \
+    bash ../rd-workflow/scripts/lifecycle/promote.sh --short-title ls-l3c --size large --source-fr - ) >"$LS_DIR/out" 2>"$LS_DIR/err" || true
+_ls_line="$(grep '다음 기동에 사용할 모델 —' "$LS_DIR/out" || true)"
+_ls_start="$(lsf_start_call)"
+[[ "$_ls_line" == *"sonnet (출처: models.json) · effort — low (출처: models.json)" && "$_ls_start" == *"--model sonnet --effort low" ]] \
+  && pass "L-3c 하위 디렉터리 promote 도 호출 체크아웃 루트 기준(sonnet·low)" || fail "L-3c: [$_ls_line] [$_ls_start] err=$(cat "$LS_DIR/err")"
+
+# L-3b (AC8 수동 안내) 대상 worktree 에 커밋된 haiku 가 있어도 수동 안내는 호출 체크아웃 설정(opus·high)
+printf '%s' '{"session":{"claude":{"model":"haiku","effort":"low"}}}' > "$LSF_CFG/models.json"
+git -C "$LSF" add -f rd-workflow/config/models.json && git -C "$LSF" commit -q -m "haiku config"
+printf '%s' '{"session":{"claude":{"model":"opus","effort":"high"}}}' > "$LSF_CFG/models.json"
+: > "$LS_DIR/calls.log"
+( cd "$LSF" && env -u RD_LAUNCH_STUB -u HERDR_ENV -u HC_TERMINAL_ID RD_SESSION_MODEL= RD_SESSION_EFFORT= RD_MODELS_CONFIG= CLAUDE_CODE_SESSION_ID= \
+    RD_CHILD_SESSION= PATH="$LS_OK:$PATH" \
+    bash rd-workflow/scripts/lifecycle/promote.sh --short-title ls-l3b --size large --source-fr - ) >"$LS_DIR/out" 2>"$LS_DIR/err" || true
+_ls_wt="$LSF/.worktrees/ls-l3b"
+grep -q 'haiku' "$_ls_wt/rd-workflow/config/models.json" 2>/dev/null && pass "L-3b 전제: 대상 worktree 의 models.json 은 haiku" || fail "L-3b 전제 불성립"
+grep -F "cd $(printf '%q' "$_ls_wt") && claude --model opus --effort high" "$LS_DIR/err" >/dev/null \
+  && pass "L-3b 수동 기동 명령이 대상 worktree 경로와 --model opus --effort high" || fail "L-3b 수동 명령: $(cat "$LS_DIR/err")"
+
+# L-5 (AC8b) 하위 디렉터리에서 rd task resolve-launch — failed 로 기록된 작업의 수동 기동 안내
+lsf_promote ls-l5 "$LS_H:$LS_OK:$PATH"
+printf '%s' '{"session":{"claude":{"model":"opus"}}}' > "$LSF/sub/m.json"
+printf '%s' '{"session":{"claude":{"model":"haiku"}}}' > "$LSF/elsewhere/sub/m.json"
+( cd "$LSF" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_upsert "$1" launch=failed launch-backend=herdr' _ ls-l5 )
+_ls_rl="$( cd "$LSF/elsewhere" && env -u RD_LAUNCH_STUB RD_SESSION_MODEL= RD_SESSION_EFFORT= RD_MODELS_CONFIG=sub/m.json CLAUDE_CODE_SESSION_ID= \
+    RD_CHILD_SESSION= HERDR_ENV=1 HC_TERMINAL_ID= PATH="$LS_H:$LS_DIR/procs-bin:$LS_OK:$PATH" \
+    bash ../rd-workflow/scripts/rd task resolve-launch ls-l5 2>&1 )" || true
+_ls_man="$(printf '%s\n' "$_ls_rl" | grep '수동 기동:' || true)"
+[[ "$_ls_man" == *"$LSF/.worktrees/ls-l5"* && "$_ls_man" == *"--model opus"* && "$_ls_man" != *haiku* ]] \
+  && pass "L-5 resolve-launch 수동 기동 줄이 대상 worktree 경로와 호출 체크아웃 설정(opus)" || fail "L-5: [$_ls_man] / $_ls_rl"
+
+# L-6 (review F7) 인계 파일 기록 실패 — 수동 명령에 선택값이 실리고, 그때 작업 색인 락이 이미 풀려 있다
+lsf_promote ls-l6 "$LS_H:$LS_OK:$PATH" RD_CHILD_SESSION=1
+_ls_wt6="$LSF/.worktrees/ls-l6"
+mkdir -p "$_ls_wt6/rd-workflow-workspace/.lifecycle/handoff.md"
+printf 'handoff\n' > "$LS_DIR/handoff-src.md"
+_ls_lockdir="$( cd "$LSF" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; _tasks_shared_dir_fill >/dev/null 2>&1; printf "%s" "$_TASKS_SD_VAL"' )"
+: > "$LS_DIR/lock.log"; : > "$LS_DIR/help.log"
+_ls_rc=0
+( cd "$LSF" && env -u RD_LAUNCH_STUB RD_SESSION_MODEL= RD_SESSION_EFFORT=high RD_MODELS_CONFIG= CLAUDE_CODE_SESSION_ID= \
+    RD_CHILD_SESSION= HERDR_ENV=1 HC_TERMINAL_ID= LS_LOCKDIR="$_ls_lockdir" PATH="$LS_H:$LS_OK:$PATH" \
+    bash rd-workflow/scripts/lifecycle/promote.sh --short-title ls-l6 --size large --source-fr - --handoff "$LS_DIR/handoff-src.md" ) >"$LS_DIR/out" 2>"$LS_DIR/err" || _ls_rc=$?
+[[ "$_ls_rc" -eq 1 ]] && pass "L-6 인계 기록 실패는 exit 1" || fail "L-6 rc=$_ls_rc: $(cat "$LS_DIR/err")"
+grep -F -- '--effort high' "$LS_DIR/err" >/dev/null && pass "L-6 수동 명령에 선택값(--effort high)" || fail "L-6 stderr: $(cat "$LS_DIR/err")"
+[[ -s "$LS_DIR/lock.log" && "$(sort -u "$LS_DIR/lock.log")" == "free" ]] \
+  && pass "L-6 claude --help 가 실행될 때 작업 색인 락이 없다" || fail "L-6 락 기록: [$(cat "$LS_DIR/lock.log")] lockdir=$_ls_lockdir"
+
+# T2-12 (promote) bash 3.2 — 설정·transcript 가 없어도(두 칸 미지정) promote 가 끝까지 간다
+printf '%s' '{}' > "$LSF_CFG/models.json"
+: > "$LS_DIR/calls.log"
+( cd "$LSF" && env -i HOME="$LS_DIR/home" PATH="$LS_H:/usr/bin:/bin:/usr/sbin:/sbin" HERDR_ENV=1 \
+    /bin/bash rd-workflow/scripts/lifecycle/promote.sh --short-title ls-t12 --size large --source-fr - ) >"$LS_DIR/out" 2>"$LS_DIR/err" || true
+_ls_start="$(lsf_start_call)"
+grep -q '^promote: 세션 기동 결과' "$LS_DIR/out" && [[ -n "$_ls_start" && "$_ls_start" != *" -- "* ]] \
+  && pass "T2-12 /bin/bash 로 두 칸 미지정 promote 가 세션 기동 결과 줄까지 간다" || fail "T2-12 promote: [$_ls_start] out=$(cat "$LS_DIR/out") err=$(cat "$LS_DIR/err")"
+
+# T2-11 (review F6) rd task list — 수동 안내 행이 둘이어도 claude --help 는 한 번, 각 행은 자기 worktree
+LST="$LS_DIR/fx-list"; lsf_new "$LST"; mkdir -p "$LST/rd-workflow/config"
+printf '%s' '{"session":{"claude":{"model":"opus","effort":"high"}}}' > "$LST/rd-workflow/config/models.json"
+for _sl in ls-t11a ls-t11b; do
+  ( cd "$LST" && env -u RD_LAUNCH_STUB RD_SESSION_MODEL= RD_SESSION_EFFORT= RD_MODELS_CONFIG= CLAUDE_CODE_SESSION_ID= RD_CHILD_SESSION=1 HERDR_ENV= HC_TERMINAL_ID= \
+      PATH="$LS_OK:$PATH" bash rd-workflow/scripts/lifecycle/promote.sh --short-title "$_sl" --size large --source-fr - ) >/dev/null 2>&1 || true
+done
+: > "$LS_DIR/help.log"
+_ls_list="$( cd "$LST" && env -u RD_LAUNCH_STUB RD_SESSION_MODEL= RD_SESSION_EFFORT= RD_MODELS_CONFIG= CLAUDE_CODE_SESSION_ID= HERDR_ENV= HC_TERMINAL_ID= \
+    PATH="$LS_H:$LS_OK:$PATH" bash rd-workflow/scripts/rd task list 2>&1 )" || true
+assert_eq "$(wc -l < "$LS_DIR/help.log" | tr -d ' ')" "1" "T2-11 rd task list 의 claude --help 는 한 번"
+_ls_a="$(printf '%s\n' "$_ls_list" | grep -F "cd $(printf '%q' "$LST/.worktrees/ls-t11a") && claude --model opus --effort high" || true)"
+_ls_b="$(printf '%s\n' "$_ls_list" | grep -F "cd $(printf '%q' "$LST/.worktrees/ls-t11b") && claude --model opus --effort high" || true)"
+[[ -n "$_ls_a" && -n "$_ls_b" ]] && pass "T2-11 두 행의 수동 안내가 각자의 worktree 경로와 --model opus --effort high" || fail "T2-11: $_ls_list"
 
 if [[ "$(trap -p EXIT)" == *_suite_on_exit* ]]; then
   PASS=$((PASS+1)); echo "  PASS: 조용한 중단 센티넬(EXIT trap)이 스위트 끝까지 유지됨"

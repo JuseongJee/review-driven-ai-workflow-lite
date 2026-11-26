@@ -4,6 +4,15 @@
 
 [[ -z "${project_root:-}" ]] && { echo "[guard] project_root가 설정되지 않았습니다" >&2; exit 1; }
 
+# 판정 루트 재바인딩용 기록 — source 시점 값을 보관한다 (gate_rebind_root·gate_root_notice·resolve_target_root).
+hook_root_default="$project_root"
+# 물리 경로 사본 — gate_root_notice 가 재바인딩된 project_root(물리 경로)와 같은 형태로 비교한다.
+# (macOS 임시 폴더는 /var/… 논리 경로와 /private/var/… 물리 경로가 달라 문자열 비교가 같은 루트를 다른 루트로 본다.)
+hook_root_default_phys="$(cd -P "$project_root" 2>/dev/null && pwd -P)" || hook_root_default_phys="$project_root"
+# TASK_STATE_PATH·STATE_MIGRATION_BACKUP_DIR 이 env 로 들어왔으면 재바인딩해도 그 값을 유지한다.
+_rd_task_state_from_env=0; [[ -n "${TASK_STATE_PATH:-}" ]] && _rd_task_state_from_env=1
+_rd_backup_dir_from_env=0; [[ -n "${STATE_MIGRATION_BACKUP_DIR:-}" ]] && _rd_backup_dir_from_env=1
+
 # --- task-state I/O (v2 2b) ---
 # _state_common.sh는 project_root 검증 직후 source — $PWD fallback 불사용, project_root 보장 후 진입
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_state_common.sh"
@@ -13,6 +22,8 @@ RD_GUARD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # is_review_session_resolved 가 실패 사유를 남기는 자리. 반환값 계약은 0/1 그대로이고
 # 호출자는 메시지를 만들 때만 이 값을 읽는다 (bash 3.2 — declare -g 를 쓰지 않는다).
 RD_REVIEW_UNRESOLVED_REASON=""
+# is_review_session_resolved 가 읽은 세션 Status. 호출부가 같은 절을 다시 파싱하지 않고 이 값을 씁니다.
+RD_REVIEW_SESSION_STATUS=""
 
 # --- autopilot ---
 
@@ -99,8 +110,10 @@ get_latest_diff_review_dir() {
 is_review_session_resolved() {
   local sf="${1}/SESSION.md" cp="${1}/CHECKPOINT.md" status="" verdict=""
   RD_REVIEW_UNRESOLVED_REASON=""
+  RD_REVIEW_SESSION_STATUS=""
   [[ -f "$sf" ]] || { RD_REVIEW_UNRESOLVED_REASON="session-missing"; return 1; }
   status="$(awk '$0=="## Status"{f=1;next} f&&/^## /{exit} f&&NF{sub(/^[ \t]+/,"");sub(/[ \t]+$/,"");print;exit}' "$sf")"
+  RD_REVIEW_SESSION_STATUS="$status"
   case "$status" in
     awaiting-user|closed) ;;
     *) RD_REVIEW_UNRESOLVED_REASON="status:${status}"; return 1 ;;
@@ -1177,6 +1190,107 @@ read_hook_input() {
   _hook_input_read=1
 }
 
+# --- 판정 루트 해석 (gate-hook-root-from-cwd) ---
+# gate 는 판정 루트(project_root)를 hook 파일 위치로 정한다. 세션이 다른 worktree 를 건드리면
+# 건드린 대상이 속한 worktree 로 판정 루트를 옮긴다.
+
+# hook_input_cwd — hook 입력 .cwd 를 출력한다. 존재하는 디렉터리가 아니면 빈 문자열. 항상 rc 0.
+# read_hook_input 뒤에 부른다. jq 우선, 실패하면 python3 폴백 (subagent_dispatch_display.sh 와 같은 방식).
+hook_input_cwd() {
+  local c=""
+  if command -v jq >/dev/null 2>&1; then
+    c="$(printf '%s' "$_hook_input" | jq -r '(.cwd // "") | tostring' 2>/dev/null)" || c=""
+  fi
+  if [[ -z "$c" ]] && command -v python3 >/dev/null 2>&1; then
+    c="$(printf '%s' "$_hook_input" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    v = d.get("cwd") if isinstance(d, dict) else None
+    sys.stdout.write(v if isinstance(v, str) else "")
+except Exception:
+    pass' 2>/dev/null)" || c=""
+  fi
+  if [[ -n "$c" && -d "$c" ]]; then printf '%s' "$c"; fi
+  return 0
+}
+
+# _git_common_dir <디렉터리> — git 공용 디렉터리의 물리 경로. git 밖이면 빈 문자열.
+_git_common_dir() {
+  local g
+  g="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  [[ -n "$g" && -d "$g" ]] || return 0
+  (cd -P "$g" 2>/dev/null && pwd -P) || true
+}
+
+# _nearest_existing_dir <경로> — 경로 자신(디렉터리)이거나 가장 가까운 존재하는 상위 디렉터리.
+_nearest_existing_dir() {
+  local d="$1"
+  [[ "$d" == /* ]] || d="${hook_root_default}/${d}"
+  while [[ ! -d "$d" && "$d" != "/" && -n "$d" ]]; do d="$(dirname "$d")"; done
+  printf '%s' "$d"
+}
+
+# resolve_target_root <경로> — 한 줄을 출력한다. 항상 rc 0.
+#   same <물리 경로 최상위> : 같은 git 저장소(공용 디렉터리 동일)
+#   other                  : git 저장소지만 공용 디렉터리가 다름
+#   none                   : git 밖이거나 hook_root_default 가 git 밖이라 비교할 수 없음
+resolve_target_root() {
+  local d top common mine
+  d="$(_nearest_existing_dir "$1")"
+  top="$(git -C "$d" rev-parse --show-toplevel 2>/dev/null)" || top=""
+  if [[ -z "$top" ]]; then echo none; return 0; fi
+  mine="$(_git_common_dir "$hook_root_default")"
+  if [[ -z "$mine" ]]; then echo none; return 0; fi
+  common="$(_git_common_dir "$d")"
+  if [[ -z "$common" ]]; then echo none; return 0; fi
+  if [[ "$common" == "$mine" ]]; then
+    printf 'same %s\n' "$(cd -P "$top" 2>/dev/null && pwd -P || printf '%s' "$top")"
+  else
+    echo other
+  fi
+  return 0
+}
+
+# gate_rebind_root <루트> — project_root 를 옮긴다. env 로 받지 않은 task-state 경로는 새 루트로 다시 계산한다.
+# 차단 감사 로그 경로(RD_GUARD_BLOCK_LOG)는 바꾸지 않는다 — 로그는 hook 을 실행한 체크아웃에 남긴다.
+gate_rebind_root() {
+  project_root="$1"
+  if [[ "$_rd_task_state_from_env" != 1 ]]; then
+    TASK_STATE_PATH="${project_root}/rd-workflow-workspace/.lifecycle/task-state"
+  fi
+  if [[ "$_rd_backup_dir_from_env" != 1 ]]; then
+    STATE_MIGRATION_BACKUP_DIR="${project_root}/rd-workflow-workspace/.lifecycle/migration-backup"
+  fi
+}
+
+# gate_root_notice [--cd-hint] — 판정 루트가 hook 파일 위치와 다를 때만 어느 worktree 로 판정했는지 stderr 에 알린다.
+#   --cd-hint: 차단 안내에 실행할 명령이 있는 gate 가 준다. 안내 명령은 상대 경로라 판정 루트 최상위에서
+#   실행해야 하므로, 셸 위치(hook 입력 cwd)가 판정 루트와 다르면 붙여 넣을 수 있는 cd 줄을 더한다.
+#   차단된 명령 안의 `cd X &&` 는 실행되지 않았으므로 셸 위치는 입력 cwd 그대로다.
+#   cwd 가 없으면 위 판정 기준 줄과 같은 조건(hook 파일 위치와 다를 때)으로 붙인다.
+#   경로는 %q 로 셸 리터럴 인자 하나로 인용한다 — 붙여 넣어도 경로의 공백·$·백틱을 셸 구문으로 평가하지 않는다.
+gate_root_notice() {
+  local cur cwd cwd_phys show_cd=0
+  cur="$(cd -P "$project_root" 2>/dev/null && pwd -P)" || cur="$project_root"
+  if [[ "$cur" != "$hook_root_default_phys" ]]; then
+    echo "[guard] 판정 기준 worktree: ${project_root}" >&2
+  fi
+  if [[ "${1:-}" == "--cd-hint" ]]; then
+    cwd="$(hook_input_cwd)"
+    if [[ -n "$cwd" ]]; then
+      cwd_phys="$(cd -P "$cwd" 2>/dev/null && pwd -P)" || cwd_phys="$cwd"
+      [[ "$cwd_phys" != "$cur" ]] && show_cd=1
+    elif [[ "$cur" != "$hook_root_default_phys" ]]; then
+      show_cd=1
+    fi
+    if [[ "$show_cd" == 1 ]]; then
+      printf '[guard] 위 안내의 명령은 판정한 worktree 최상위에서 실행하세요: cd %q\n' "$cur" >&2
+    fi
+  fi
+  return 0
+}
+
 extract_json_field() {
   local field="$1"
   local value=""
@@ -1372,53 +1486,137 @@ commit_target_is_outside() {
   return 0
 }
 
-# 스캔 결과를 보수적으로 해석한다. 0 = 이 프로젝트의 gate 로 판정해야 함.
-# 인자 : $1=스캐너 출력(여러 줄), $2=hook 이름(진단용)
-# 정책 : ① 차단 후보가 없으면(커밋 없음 또는 전부 유효 bypass) 판정 불필요
-#        ② 후보 중 위치 불확실이 있으면 무조건 판정 (fail-closed)
-#        ③ 위치가 확정된 후보는 **전부 밖일 때만** 생략. 하나라도 안이면 판정
-_gate_from_scan() {
-  local out="$1" hook="$2" head gate unc ncand t inside=0 seen=0
+# _abs_path_tokens <명령> — 명령 문자열에 나온 절대 경로 후보를 한 줄에 하나씩(중복 제거) 출력한다.
+#   명령을 셸 워드로 나눈 뒤 워드 전체만 후보로 쓴다. 워드는 인용 밖 공백·;·|·&·(·)·<·>·백틱에서 끊고,
+#   작은따옴표 안은 그대로, 큰따옴표 안은 \" \\ \$ \` 만, 인용 밖은 모든 \<문자> 를 풀어 붙인다.
+#   그래서 `"/a b"/c`·`/a\ b`·`'GIT_DIR=/a b'` 처럼 인용·escape 가 섞인 한 인자가 조각으로 갈라지지 않는다
+#   (조각은 이름 앞부분이 같은 다른 worktree 를 가리켜 엉뚱한 곳을 판정한다).
+#   워드 시작의 인용 밖 # 부터 줄 끝까지는 주석이라 건너뛴다(스캐너와 같은 규칙 — 주석의 따옴표가 뒤 줄을 인용으로 삼키지 않게).
+#   `/` 로 시작하는 워드와 `NAME=/…`·`--opt=/…` 워드의 = 뒤 값을 쓴다. : 로 나누지 않는다
+#   (git 위치를 정하는 값은 목록이 아니고, 나누면 `/a/sp:backup` 이 `/a/sp` 로 잘려 다른 worktree 를 가리킨다).
+#   변수 확장·명령 치환·글롭은 풀지 않는다. 경로가 실재하지 않아도 내보낸다(호출측이 가까운 상위 디렉터리로 푼다).
+_abs_path_tokens() {
+  printf '%s' "$1" | awk '
+    function flush(   v) {
+      if (!inw) return
+      v = w; w = ""; inw = 0
+      if (v !~ /^\//) { if (v ~ /^[-A-Za-z0-9_]*=\//) sub(/^[^=]*=/, "", v); else return }
+      if (!seen[v]++) print v
+    }
+    BEGIN { RS = "\001" }
+    {
+      s = $0; L = length(s); q = ""; w = ""; inw = 0
+      for (i = 1; i <= L; i++) {
+        c = substr(s, i, 1)
+        if (q == "\047") { if (c == "\047") q = ""; else w = w c; continue }
+        if (q == "\"") {
+          if (c == "\"") { q = ""; continue }
+          if (c == "\\" && i < L && index("\"\\$`", substr(s, i + 1, 1))) { i++; w = w substr(s, i, 1); continue }
+          w = w c; continue
+        }
+        if (c == "\\") { if (i < L) { i++; if (substr(s, i, 1) != "\n") { w = w substr(s, i, 1); inw = 1 } } continue }
+        if (c == "\047" || c == "\"") { q = c; inw = 1; continue }
+        if (c == "#" && !inw) { while (i < L && substr(s, i + 1, 1) != "\n") i++; continue }
+        if (c ~ /[ \t\n;|&()<>`]/) { flush(); continue }
+        w = w c; inw = 1
+      }
+      flush()
+    }' 2>/dev/null
+  return 0   # awk 가 없거나 실패해도 호출측의 set -e·pipefail 에 실패로 번지지 않게 한다(후보 없음 = 종전 판정)
+}
+
+# _git_dir_owner <경로> — 경로가 git 디렉터리(`GIT_DIR=<x>/.git` 같은 값) 안이면 그 index 를 쓰는 worktree 를, 아니면 경로를 그대로 출력한다.
+#   git 디렉터리 안에서는 rev-parse --show-toplevel 이 실패해 저장소를 알 수 없기 때문이다.
+#   <x>/.git/worktrees/<이름> 은 linked worktree 의 git 디렉터리다 — 그 안의 gitdir 파일(절대 또는 그 파일 위치 기준 상대 경로)이 가리키는 worktree 로 푼다.
+_git_dir_owner() {
+  local p="$1" g w
+  if [[ "$p" =~ ^(.*/\.git/worktrees/[^/]+)(/|$) && -f "${BASH_REMATCH[1]}/gitdir" ]]; then
+    w="${BASH_REMATCH[1]}"
+    g="$(head -n 1 "${w}/gitdir" 2>/dev/null)"
+    # `git worktree add --relative-paths` 는 gitdir 에 그 파일 위치 기준의 상대 경로를 쓴다.
+    [[ -n "$g" && "$g" != /* ]] && g="${w}/${g}"
+    [[ -n "$g" ]] && { printf '%s\n' "$(dirname "$g")"; return 0; }
+  fi
+  if [[ "$p" =~ ^(.*)/\.git(/|$) ]]; then printf '%s\n' "${BASH_REMATCH[1]:-/}"; return 0; fi
+  printf '%s\n' "$p"
+}
+
+# commit_target_roots <명령> <hook 이름> — 커밋 gate 용. 판정할 루트를 한 줄에 하나씩(중복 제거, 물리 경로) 출력한다.
+# 0줄 = 판정할 커밋 없음. 항상 rc 0.
+# 1단 필터 — 인용·백슬래시·줄 이음을 걷어낸 뒤 `commit` 부분 문자열을 찾는다. `$'…'`(ANSI-C 인용)는 escape 로
+# 문자를 만들 수 있어 있으면 무조건 스캐너로 보낸다. 여기서의 과탐은 무해하다(최종 판정은 스캐너가 한다).
+# 진단: 후보가 모두 밖이면 「판정 생략」, 위치가 불확실하면 「대상 디렉토리를 확정할 수 없어」 를 stderr 에 낸다.
+# 스캐너 출발점은 hook 입력 cwd 그대로다(cd ..·git -C ../x 를 실제 위치에서 계산). cwd 가 없거나 git 밖이면 hook_root_default.
+commit_target_roots() {
+  local cmd="$1" hook="${2:-guard}" probe out start start_res start_root head gate unc ncand t res r
+  local roots="" inside=0 seen=0
+  probe="${cmd//\\$'\n'/}"; probe="${probe//\'/}"; probe="${probe//\"/}"; probe="${probe//\\/}"
+  [[ "$probe" == *commit* || "$cmd" == *\$\'* ]] || return 0
+  start="$(hook_input_cwd)"; start_res=none
+  [[ -n "$start" ]] && start_res="$(resolve_target_root "$start")"
+  case "$start_res" in
+    same\ *) start_root="${start_res#same }" ;;
+    other)    start_root="$hook_root_default" ;;
+    *)        start_root="$hook_root_default"; start="$hook_root_default" ;;
+  esac
+  _roots_add() {
+    case $'\n'"$roots"$'\n' in *$'\n'"$1"$'\n'*) ;; *) roots="${roots:+${roots}$'\n'}$1" ;; esac
+  }
+  if ! out="$(scan_command_commit "$cmd" "$start")"; then
+    printf '[%s] 스캐너 폴백(scan-unavailable) — 문자열 판정으로 처리합니다.\n' "$hook" >&2
+    _legacy_commit_glob "$cmd" && printf '%s\n' "$start_root"
+    return 0
+  fi
   head="${out%%$'\n'*}"
   gate="${head#gate=}";      gate="${gate%% *}"
   unc="${head#*uncertain=}"; unc="${unc%% *}"
   ncand="${head##*ncand=}"
-  [[ "$gate" == 1 ]] || return 1
+  [[ "$gate" == 1 ]] || return 0
   if [[ "$unc" == 1 ]]; then
-    printf '[%s] 대상 디렉토리를 확정할 수 없어 세션 프로젝트 기준으로 판정합니다.\n' "$hook" >&2
-    return 0
+    # 위치를 모르면 넓게 검사한다. 셸 문법을 더 해석하지 않고 명령 문자열의 절대 경로 토큰을 모두 모아
+    # 같은 저장소(공용 git 디렉터리가 같은 worktree)의 루트를 판정 루트에 더한다. 다른 저장소·git 밖 경로는 버린다.
+    # 커밋 메시지 안의 경로처럼 위치가 아닌 경로도 세므로 검사가 늘 수 있다(사용자 결정 — 놓치는 것보다 낫다).
+    _roots_add "$start_root"
+    local extra=0 before
+    while IFS= read -r t; do
+      [[ -n "$t" ]] || continue
+      res="$(resolve_target_root "$(_git_dir_owner "$t")")"
+      case "$res" in
+        same\ *) before="$roots"; _roots_add "${res#same }"; [[ "$roots" != "$before" ]] && extra=$((extra + 1)) ;;
+      esac
+    done <<< "$(_abs_path_tokens "$cmd")"
+    if [[ $extra -gt 0 ]]; then
+      printf '[%s] 대상 디렉토리를 확정할 수 없어 세션 프로젝트와 명령에 나온 같은 저장소의 worktree %d곳을 함께 판정합니다.\n' "$hook" "$extra" >&2
+    else
+      printf '[%s] 대상 디렉토리를 확정할 수 없어 세션 프로젝트 기준으로 판정합니다.\n' "$hook" >&2
+    fi
   fi
-  [[ "$ncand" -gt 0 ]] || return 0     # gate=1 인데 후보 목록이 비면 fail-closed
-  while IFS= read -r t; do
-    [[ -n "$t" ]] || continue
-    seen=$((seen + 1))
-    commit_target_is_outside "$t" || { inside=1; break; }
-  done <<< "${out#*$'\n'}"
-  if [[ $inside -eq 0 && $seen -eq "$ncand" ]]; then
+  if [[ "$ncand" -gt 0 ]]; then
+    while IFS= read -r t; do
+      [[ -n "$t" ]] || continue
+      seen=$((seen + 1))
+      if [[ "$t" == "?" || "$t" == "-" ]]; then
+        _roots_add "$start_root"; inside=1; continue
+      fi
+      res="$(resolve_target_root "$t")"
+      if [[ -d "$t" ]]; then
+        case "$res" in
+          same\ *) r="${res#same }" ;;
+          other)    continue ;;
+          *)        commit_target_is_outside "$t" && continue; r="$hook_root_default" ;;
+        esac
+      else
+        case "$res" in same\ *) r="${res#same }" ;; *) r="$start_root" ;; esac
+      fi
+      inside=1; _roots_add "$r"
+    done <<< "${out#*$'\n'}"
+  else
+    _roots_add "$start_root"   # gate=1 인데 후보 목록이 비면 fail-closed
+  fi
+  if [[ "$unc" != 1 && $inside -eq 0 && $seen -eq "$ncand" && "$ncand" -gt 0 ]]; then
     printf '[%s] 판정 생략 — 커밋 %d건 모두 세션 프로젝트 밖입니다. 이 커밋들은 이 프로젝트의 gate 로 검사되지 않습니다.\n' \
       "$hook" "$ncand" >&2
-    return 1
   fi
+  [[ -n "$roots" ]] && printf '%s\n' "$roots"
   return 0
-}
-
-# 이 명령이 "우리 프로젝트를 대상으로" 실제 커밋을 하는가 (0 = 그렇다)
-# 두 gate(review·archive)가 소비한다. 집계·대상 판정을 흡수하므로 호출측은 참·거짓만 본다.
-command_targets_our_commit() {
-  local cmd="$1" hook="${2:-guard}" out probe
-  # 1단 필터 — 인용·백슬래시를 걷어낸 뒤 검사한다. `git com'mit'` 처럼 쪼개면
-  # `commit` 연속 부분 문자열이 사라지므로 그냥 검사하면 차단 대상을 놓친다.
-  # 과탐은 무해하다 (최종 판정은 스캐너가 한다).
-  # `\<개행>`(line continuation)을 먼저 제거한다 — 백슬래시만 지우면 개행이 남아
-  # `com<개행>mit` 이 되고 `commit` 부분 문자열이 만들어지지 않는다(F12 실측).
-  # `$'…'`(ANSI-C 인용)는 escape 로 문자를 만들 수 있어(`$'com\x6dit'`) 문자열 제거만으로는
-  # `commit` 을 복원하지 못한다. 있으면 무조건 스캐너로 보낸다 — 여기서의 과탐은 무해하다.
-  probe="${cmd//\\$'\n'/}"; probe="${probe//\'/}"; probe="${probe//\"/}"; probe="${probe//\\/}"
-  [[ "$probe" == *commit* || "$cmd" == *\$\'* ]] || return 1
-  if ! out="$(scan_command_commit "$cmd")"; then
-    printf '[%s] 스캐너 폴백(scan-unavailable) — 문자열 판정으로 처리합니다.\n' "$hook" >&2
-    _legacy_commit_glob "$cmd" && return 0
-    return 1
-  fi
-  _gate_from_scan "$out" "$hook"
 }

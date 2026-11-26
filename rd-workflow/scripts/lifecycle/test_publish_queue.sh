@@ -83,7 +83,7 @@ mk_base() {
   ( cd "$main" && mkdir -p rd-workflow/scripts/lifecycle rd-workflow/scripts/hooks &&
     cp "$s"/lifecycle/_tasks_index.sh "$s"/lifecycle/session_launch.sh "$s"/lifecycle/slug.sh "$s"/lifecycle/_lifecycle_common.sh rd-workflow/scripts/lifecycle/ &&
     cp "$s"/hooks/_guard_common.sh rd-workflow/scripts/hooks/ &&
-    cp "$s"/_state_common.sh "$s"/_task_common.sh "$s"/_submodule_common.sh "$s"/rd rd-workflow/scripts/ &&
+    cp "$s"/model_select.sh "$s"/_state_common.sh "$s"/_task_common.sh "$s"/_submodule_common.sh "$s"/rd rd-workflow/scripts/ &&
     printf '# Current Task\n\n## Short Title\n-\n\n## Status\n대기 중\n' >CURRENT_TASK.md &&
     printf '1\n2\n3\n' >code.txt &&
     git add -A && git commit -q -m scripts && git push -q origin master 2>/dev/null )
@@ -309,9 +309,9 @@ test_cancel_more_states() {
   mkreq "$R" ua state=user-approval
   pq "$R" cancel ua
   [[ "$RC" -eq 0 && "$(pqf "$R" "pq_get ua state")" == cancelled ]] && pass "user-approval 취소 → cancelled" || fail "user-approval 취소: rc=$RC out=$OUT"
-  mkreq "$R" pt state=partial
+  mkreq "$R" pt state=partial "worktree='$R'"
   pq "$R" cancel pt
-  [[ "$RC" -eq 1 && "$OUT" == *recover* && "$(pqf "$R" "pq_get pt state")" == partial ]] && pass "partial 취소 거부(recover 안내, 상태 유지)" || fail "partial 취소: rc=$RC out=$OUT"
+  [[ "$RC" -eq 1 && "$OUT" == *"rd publish run"* && "$(pqf "$R" "pq_get pt state")" == partial ]] && pass "worktree 있는 partial 취소 거부(run 안내, 상태 유지)" || fail "partial 취소: rc=$RC out=$OUT"
 }
 test_config_file_without_key() {
   mkdir -p "$R/rd-workflow/config"
@@ -452,9 +452,10 @@ test_precheck_index_merge_ok() {
   [[ "$RC" -eq 0 && -z "$OUT" ]] && pass "서로 다른 행 추가 충돌은 병합기가 풀어 rc 0 (P3)" || fail "P3: rc=$RC out=$OUT err=$ERR"
 }
 test_precheck_merger_missing() {
-  local r lib="$TMP/mc4-lib"
+  # 설치 배치(scripts/_submodule_common.sh, scripts/lifecycle/_merge_precheck.sh)를 따르되 병합기만 뺍니다.
+  local r lib="$TMP/mc4-scripts/lifecycle"
   r="$(mc_repo mc4 "$MC_IDX" "$MC_HDR"$'\n'"$(mc_row a)" "$MC_HDR"$'\n'"$(mc_row a)"$'\n'"$(mc_row x)" "$MC_HDR"$'\n'"$(mc_row a)"$'\n'"$(mc_row y)")"
-  mkdir -p "$lib"; cp "$SCRIPT_DIR/_merge_precheck.sh" "$lib/"
+  mkdir -p "$lib"; cp "$SCRIPT_DIR/_merge_precheck.sh" "$lib/"; cp "$SCRIPT_DIR/../_submodule_common.sh" "$lib/.."
   mc_run "$lib/_merge_precheck.sh" "$r"
   [[ "$RC" -eq 3 ]] && pass "병합기 파일이 없으면 인덱스 충돌은 판정 불가 rc 3 (P4)" || fail "P4: rc=$RC out=$OUT err=$ERR"
 }
@@ -524,9 +525,9 @@ test_gitlink_diverged() {
 }
 test_gitlink_fetch_timeout() {
   # AC0: 객체가 어디에도 없고 submodule 원격이 응답하지 않으면 상한 안에 rc 3, 하위 프로세스 종료, fetch 는 경로당 한 번.
-  local r h0 h1 res t0 el pk="$TMP/gl4.pid" ck="$TMP/gl4.cnt"
+  local r h0 h1 res t0 el pk="$TMP/gl4.pid" ck="$TMP/gl4.cnt" dk="$TMP/gl4.done"
   mc_gl_repo gl4; r="$TMP/gl4"
-  git -C "$r/sub" config remote.origin.uploadpack "echo \$\$ > '$pk'; echo x >> '$ck'; sleep 30; git-upload-pack"
+  git -C "$r/sub" config remote.origin.uploadpack "echo \$\$ > '$pk'; echo x >> '$ck'; sleep 30 && echo x > '$dk'; git-upload-pack"
   mg -C "$r" branch ours; mg -C "$r" branch theirs
   git -C "$r" checkout -q ours; mg -C "$r" update-index --cacheinfo "160000,1111111111111111111111111111111111111111,sub"; mg -C "$r" commit -q -m o
   git -C "$r" checkout -q theirs; mg -C "$r" update-index --cacheinfo "160000,2222222222222222222222222222222222222222,sub"; mg -C "$r" commit -q -m t
@@ -535,16 +536,18 @@ test_gitlink_fetch_timeout() {
   res="$(RD_MERGE_FETCH_TIMEOUT=1 bash -c '
     source "$1/../_state_common.sh"; source "$1/_merge_precheck.sh"
     s=$SECONDS; rc1=0; rd_merge_gitlink_pick "$2" sub 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 || rc1=$?
-    el=$((SECONDS - s)); kids="$(pgrep -P $$ | tr "\n" " ")"
+    el=$((SECONDS - s)); kids="$(pgrep -P $$ | tr "\n" " ")"; done1=0; [[ -e "$3" ]] && done1=1
     rc2=0; out="$(rd_merge_conflicts "$2" ours theirs --gitlink-auto)" || rc2=$?
-    printf "rc1=%s el=%s kids=[%s] rc2=%s out=%s\n" "$rc1" "$el" "$kids" "$rc2" "$out"' _ "$SCRIPT_DIR" "$r" 2>"$r.err")"
+    printf "rc1=%s el=%s done1=%s kids=[%s] rc2=%s out=%s\n" "$rc1" "$el" "$done1" "$kids" "$rc2" "$out"' _ "$SCRIPT_DIR" "$r" "$dk" 2>"$r.err")"
   el=$((SECONDS - t0)); ERR="$(cat "$r.err")"
   h1="$(git -C "$r" rev-parse master)"
   [[ "$res" == "rc1=3 "* ]] && pass "fetch 시간 초과 → pick rc 3 (G4)" || fail "G4 rc: $res err=$ERR"
-  # 경과는 pick 호출 하나만 잰다(res 의 el). 보장은 fetch 상한 + 4초(5초)지만 pick 은 그 앞뒤로 객체 조회(git 여러 번)를
-  # 더 하고, 공유 머신의 병렬 부하에서 벽시계가 8초까지 늘었다(실측). 문턱 15초는 상한이 없어 30초 sleep 을 기다리는
-  # 퇴행을 잡기 위한 값이다. 정밀한 「상한 + 4초」 는 git 을 거치지 않는 G4b(2) 가 본다.
-  [[ "$res" =~ el=([0-9]|1[0-5])\  ]] && pass "상한 안에 반환 — 무한 대기 없음 (G4)" || fail "G4 경과: 전체 ${el}s res=$res"
+  # 「무한 대기 없음」 은 벽시계 문턱이 아니라 늦춘 원격의 완료 표식으로 판정한다. 원격은 30초 sleep 뒤에야
+  # 표식(dk)을 쓰므로, pick 이 돌아온 시점에 표식이 없으면 그 sleep 을 기다리지 않은 것이다. 표식은 sleep 이
+  # 끝까지 돈 경우(&&)에만 쓴다 — sleep 만 중단되고 셸이 살아남아도 표식이 생기지 않는다. 벽시계 문턱(종전 15초)은
+  # 부하가 큰 공유 머신에서 넘어 FAIL 했다. 경과(el)는 진단용으로 실패 메시지에만 남긴다. 정밀한 「상한 + 4초」 는
+  # git 을 거치지 않는 test_team_publish_common.sh 의 t_run_limited_timeout 이 본다.
+  [[ "$res" == *" done1=0 "* ]] && pass "늦춘 원격이 끝나기 전에 반환 — 무한 대기 없음 (G4)" || fail "G4 무한 대기: 전체 ${el}s res=$res"
   [[ "$ERR" == *"rd_merge_conflicts: submodule sub fetch 가 1초 안에 끝나지 않아 중단했습니다"* ]] && pass "초과 안내 한 줄 (G4)" || fail "G4 안내: err=$ERR"
   [[ -s "$pk" ]] && ! kill -0 "$(cat "$pk")" 2>/dev/null && pass "반환 뒤 전송 하위 프로세스가 살아 있지 않음 (G4)" || fail "G4 하위 프로세스: pid=$(cat "$pk" 2>/dev/null)"
   [[ "$res" == *"kids=[]"* ]] && pass "반환 뒤 감시 프로세스가 남지 않음 (G4)" || fail "G4 감시: $res"
@@ -588,28 +591,6 @@ test_gitlink_base_not_gitlink() {
   mg -C "$r-theirs" rm -q sub; mg -C "$r-theirs" update-index --add --cacheinfo "160000,$b,sub"; mg -C "$r-theirs" commit -q -m "sub gl B"
   mc_gl_run "$r" --gitlink-auto
   [[ "$RC" -eq 0 && -z "$OUT" ]] && pass "기준이 일반 파일인 gitlink 조상·자손 → rc 0 (G7)" || fail "G7: rc=$RC out=$OUT err=$ERR"
-}
-test_run_limited() {
-  # AC0 실행기: (1) 정상 종료 뒤 감시 sleep 회수 (2) 부모는 TERM 으로 끝나고 자식만 TERM 무시 → 그룹 KILL.
-  local wf="$TMP/rl.wpid" pp="$TMP/rl.ppid" cp="$TMP/rl.cpid" res
-  # (1) 은 감시 sleep 을 pgrep 으로 찾는다. pgrep 이 프로세스 목록을 얻지 못하는 환경(macOS 기본 PATH 의 「Cannot get process
-  #   list」)에서는 찾을 수 없어 건너뛰고 표식을 낸다. 찾는 대기는 10초로 끊는다.
-  if pgrep -f . >/dev/null 2>&1; then
-    res="$(bash -c 'source "$1/_merge_precheck.sh"; s=$SECONDS; rc=0
-      rd_run_limited 4271 "$2.err" bash -c '"'"'t0=$SECONDS; until p="$(pgrep -f "^sleep 4271$")"; do [[ $((SECONDS - t0)) -lt 10 ]] || exit 1; sleep 0.05; done; echo "$p" > "$1"'"'"' _ "$2" >/dev/null || rc=$?
-      printf "rc=%s el=%s\n" "$rc" "$((SECONDS - s))"' _ "$SCRIPT_DIR" "$wf" 2>/dev/null)"
-    [[ "$res" == "rc=0 el="[0-2] ]] && pass "rd_run_limited 정상 종료 → rc 0, 2초 안 (G4b)" || fail "G4b(1): $res"
-    [[ -s "$wf" ]] && ! kill -0 "$(cat "$wf")" 2>/dev/null && pass "반환 뒤 감시 sleep 이 남지 않음 (G4b)" || fail "G4b(1) 감시 sleep 생존: pid=$(cat "$wf" 2>/dev/null)"
-  else
-    printf 'env-skip: test_publish_queue test_run_limited G4b(1) — pgrep 으로 프로세스 목록을 얻을 수 없는 환경(감시 sleep 관측 불가)\n' >&2
-    printf 'S\n' >>"$TMP/cnt"
-  fi
-  res="$(bash -c 'source "$1/_merge_precheck.sh"; s=$SECONDS; rc=0
-    rd_run_limited 1 "$2.err" bash -c '"'"'echo $$ > "$1"; (trap "" TERM; exec sleep 30) & echo $! > "$2"; wait'"'"' _ "$2" "$3" >/dev/null || rc=$?
-    printf "rc=%s el=%s\n" "$rc" "$((SECONDS - s))"' _ "$SCRIPT_DIR" "$pp" "$cp" 2>/dev/null)"
-  [[ "$res" == "rc=124 el="[0-5] ]] && pass "TERM 무시 자식 → rc 124, 5초 안 (G4b)" || fail "G4b(2): $res"
-  [[ -s "$pp" && -s "$cp" ]] && ! kill -0 "$(cat "$pp")" 2>/dev/null && ! kill -0 "$(cat "$cp")" 2>/dev/null \
-    && pass "반환 뒤 부모·자식 모두 종료 (G4b)" || fail "G4b(2) 생존: parent=$(cat "$pp" 2>/dev/null) child=$(cat "$cp" 2>/dev/null)"
 }
 test_request_undecidable() {
   local W; W="$(mk_work rq11 pq-j)"
@@ -814,6 +795,163 @@ test_partial_reverify_keeps_slot() {
   pq "$W" run
   [[ "$RC" -eq 0 && "$(getk rf state)" == done ]] && pass "원인 제거 뒤 run → done" || fail "원인 제거 뒤 run: rc=$RC state=$(getk rf state) out=$OUT"
 }
+# 작업 worktree 가 있는 부분 완료 — recover 는 상태를 바꾸지 않고 run 을 안내한다 (AC4·AC5).
+test_partial_recover_with_worktree() {
+  setup_run po1 ps1
+  mkstate ps1 partial
+  mkreq "$M" nx state=requested seq=99999999999999
+  pq "$W" recover ps1
+  [[ "$RC" -eq 1 && "$OUT" == *"작업 worktree 가 있습니다"*"rd publish run"* && "$(getk ps1 state)" == partial && "$(pqf "$W" pq_slot_get)" == ps1 ]] \
+    && pass "worktree 있는 partial recover → 거부, run 안내, 상태·슬롯 유지" || fail "worktree 있는 partial recover: rc=$RC out=$OUT"
+  pq "$W" status ps1
+  [[ "$OUT" == *"→ 작업 worktree($W)에서 rd publish run"* ]] && pass "worktree 있는 partial status → 그 worktree 의 run 안내" || fail "status: $OUT"
+  pq "$M" status nx
+  [[ "$OUT" == *"앞 요청 ps1"*"작업 worktree($W)에서 rd publish run"* ]] && pass "앞 요청이 worktree 있는 partial 이면 요청됨 줄이 그 run 을 가리킴" || fail "대기 사유: $OUT"
+  pq "$M" next
+  [[ "$RC" -eq 1 && "$OUT" == *"작업 worktree($W)에서 rd publish run"* ]] && pass "next 거부 문구에 run 안내" || fail "next 거부: rc=$RC out=$OUT"
+}
+# 허가됨의 다음 행동에 실행 위치가 있고, worktree 의 체크아웃이 이 작업이 아니면 거부될 run 대신 되돌리는 길을 안내한다.
+test_granted_action_location() {
+  setup_run ga1 gg1
+  git -C "$W" commit -q --allow-empty -m request-head
+  mkstate gg1 granted
+  pq "$M" status gg1
+  [[ "$OUT" == *"→ 작업 worktree($W)에서 rd publish run" ]] && pass "허가됨 status → 그 worktree 의 run 안내(실행 위치 포함)" || fail "허가됨 위치: $OUT"
+  mkreq "$M" nx state=requested seq=99999999999999
+  # 같은 작업의 옛 커밋을 detached 로 열면 short-title 은 같지만 run 이 재검증(HEAD)에서 요청을 실패로 바꾼다.
+  git -C "$W" checkout -q --detach HEAD~1
+  pq "$M" status gg1
+  [[ "$OUT" == *"→ 작업 worktree($W)의 체크아웃(detached HEAD)이 요청한 fr 브랜치(fr/gg1)가 아님 — 버리려면 rd publish cancel gg1, 발행을 마치려면 git -C '$W' status 로 그 worktree 의 체크아웃을 확인해 fr 브랜치(fr/gg1)로 되돌린 뒤 그 worktree 에서 rd publish run" ]] \
+    && pass "허가됨 worktree 가 같은 작업의 옛 커밋을 detached 로 열면 되돌리는 안내" || fail "허가됨 같은 작업 detached: $OUT"
+  git -C "$W" checkout -q --detach master
+  local back="task-state 가 이 작업(gg1)이 아니라 거기서 rd publish run 이 slug 를 정하지 못함 — 버리려면 rd publish cancel gg1, 발행을 마치려면 git -C '$W' status 로 그 worktree 의 체크아웃을 확인해 fr 브랜치(fr/gg1)로 되돌린 뒤 그 worktree 에서 rd publish run"
+  pq "$M" status gg1
+  [[ "$OUT" == *"$back" && "$OUT" != *"→ 작업 worktree($W)에서 rd publish run"* ]] \
+    && pass "허가됨 worktree 가 detached 면 run 대신 체크아웃을 되돌리는 안내" || fail "허가됨 체크아웃 다름: $OUT"
+  pq "$M" next
+  [[ "$RC" -eq 1 && "$OUT" == *"앞 요청 gg1 가 허가됨 입니다 ("*"$back)"* ]] && pass "허가됨 슬롯이 막는 next 거부 문구에 되돌리는 안내" || fail "허가됨 next 거부: rc=$RC out=$OUT"
+  # wait 는 시작할 때 정한 slug 로 이 보고를 낸다 — 기다리는 동안 체크아웃이 바뀐 경우.
+  OUT="$(pqf "$W" "_pq_wait_report gg1 granted")"
+  [[ "$OUT" == "허가됨: gg1 — 작업 worktree($W)의 $back" ]] && pass "체크아웃이 바뀐 뒤의 wait 허가 보고가 되돌리는 안내" || fail "wait 허가 보고: $OUT"
+}
+# detached 에서 만든 요청은 fr-branch 가 `HEAD` 다. 원래 fr 브랜치로 돌아오면 run 을 안내하고, 되돌릴 브랜치는
+#   요청 커밋의 task-state fr-branch 로 안내한다.
+test_detached_request_branch() {
+  setup_run dr1 dd1
+  git -C "$W" checkout -q --detach HEAD
+  pq "$W" request
+  if [[ "$RC" -ne 0 || "$(getk dd1 fr-branch)" != HEAD ]]; then fail "detached 요청 준비: rc=$RC fr-branch=$(getk dd1 fr-branch) out=$OUT"; return; fi
+  pq "$M" next
+  git -C "$W" checkout -q fr/dd1
+  pq "$M" status dd1
+  [[ "$OUT" == *"→ 작업 worktree($W)에서 rd publish run" ]] && pass "detached 에서 만든 요청도 fr 브랜치로 돌아오면 그 worktree 의 run 안내" || fail "detached 요청 복귀 status: $OUT"
+  OUT="$(pqf "$W" "_pq_wait_report dd1 granted")"
+  [[ "$OUT" == "허가됨: dd1 — 작업 worktree($W)에서 rd publish run" ]] && pass "detached 에서 만든 요청의 wait 허가 보고도 그 worktree 의 run" || fail "detached 요청 복귀 wait: $OUT"
+  git -C "$W" checkout -q --detach master
+  pq "$M" status dd1
+  [[ "$OUT" == *"fr 브랜치(fr/dd1)로 되돌린 뒤 그 worktree 에서 rd publish run" && "$OUT" != *"(HEAD)"* ]] && pass "detached 에서 만든 요청의 되돌릴 브랜치는 요청 커밋의 fr 브랜치" || fail "detached 요청 되돌릴 브랜치: $OUT"
+}
+# 부분 완료 worktree 에 다른 작업 브랜치가 체크아웃돼 있으면 status·next·cancel·recover 가 거부될 run 대신 체크아웃을
+#   되돌리는 길을 안내하고, 안내대로 되돌리면 run 이 발행을 마친다.
+test_partial_other_checkout() {
+  setup_run pc1 pp1
+  mkstate pp1 partial
+  mkreq "$M" nx state=requested seq=99999999999999
+  git -C "$W" checkout -q -b fr/other
+  printf 'schema=1\nshort-title=other\nstatus=아카이브 보류\n' >"$W/rd-workflow-workspace/.lifecycle/task-state"
+  git -C "$W" commit -q -am other
+  local s want="task-state 가 이 작업(pp1)이 아니라 거기서 rd publish run 이 slug 를 정하지 못함 — git -C '$W' status 로 그 worktree 의 체크아웃을 확인해 fr 브랜치(fr/pp1)로 되돌린 뒤 그 worktree 에서 rd publish run 으로 복구"
+  for s in "status pp1" "next" "cancel pp1" "recover pp1"; do
+    pq "$M" $s
+    [[ "$OUT" == *"$want"* && "$OUT" != *"작업 worktree($W)에서 rd publish run"* ]] && pass "체크아웃이 다른 partial: $s 가 run 대신 되돌리는 길을 안내" || fail "체크아웃이 다른 partial $s: $OUT"
+  done
+  [[ "$(getk pp1 state)" == partial && "$(pqf "$W" pq_slot_get)" == pp1 ]] || fail "안내 명령이 상태·슬롯을 바꿈: state=$(getk pp1 state)"
+  git -C "$W" checkout -q fr/pp1
+  pq "$W" run
+  [[ "$RC" -eq 0 && "$(getk pp1 state)" == done ]] && pass "안내대로 fr 브랜치로 되돌린 뒤 run → done" || fail "되돌린 뒤 run: rc=$RC state=$(getk pp1 state) out=$OUT"
+}
+# worktree 없는 부분 완료가 실제로는 발행된 경우 — recover 가 done 으로 바꾸고 슬롯을 푼다 (AC1).
+test_partial_orphan_recover_published() {
+  setup_run po2 ps2
+  mkstate ps2 partial
+  mkreq "$M" nx state=requested seq=99999999999999
+  git -C "$M" merge -q --no-ff -m "merge fr/ps2" fr/ps2 && git -C "$M" tag fr/t/ps2 && git -C "$M" push -q origin master fr/t/ps2 2>/dev/null
+  git -C "$M" worktree remove --force "$W"
+  pq "$M" recover ps2
+  if [[ "$RC" -eq 0 && "$(pqf "$M" "pq_get ps2 state")" == done && -z "$(pqf "$M" pq_slot_get)" ]]; then
+    pass "worktree 없는 발행 완료 partial recover → done, 슬롯 반납"
+  else
+    fail "발행 완료 orphan recover: rc=$RC state=$(pqf "$M" "pq_get ps2 state") out=$OUT"
+  fi
+  pq "$M" next
+  [[ "$RC" -eq 0 && "$(pqf "$M" "pq_get nx state")" == granted ]] && pass "recover 뒤 next 가 다음 요청 허가" || fail "recover 뒤 next: rc=$RC out=$OUT"
+}
+# worktree 없는 부분 완료가 발행되지 않은 경우 — recover 는 바꾸지 않고 cancel 을 안내하고,
+# 안내(status·next)가 recover 를 가리키며, cancel 이 슬롯을 풀고 push 안 된 커밋을 알린다 (AC2·AC3·AC5).
+# worktree 경로는 기본 체크아웃 안에 남은 빈 디렉터리로 둔다(발행 완료 사례가 경로가 사라진 경우를 덮는다).
+test_partial_orphan_unpublished() {
+  setup_run po3 ps3
+  # 이전 판이 저장한 사유(고정 run 안내 포함)를 그대로 둔다 — worktree 가 없으면 실행할 수 없는 run 안내가 나오면 안 된다.
+  mkstate ps3 partial "'reason=병합됐으나 tag·push 미확인 — rd publish run 으로 복구'"
+  mkreq "$M" nx state=requested seq=99999999999999
+  git -C "$M" merge -q --no-ff -m "merge fr/ps3" fr/ps3
+  git -C "$M" worktree remove --force "$W"
+  # 등록이 빠진 빈 디렉터리가 기본 체크아웃 안에 남은 경우 — 바깥 저장소의 작업 트리로 읽혀도 「worktree 없음」 이어야 한다.
+  mkdir -p "$M/.worktrees/ps3"; pqf "$M" "pq_set ps3 worktree='$M/.worktrees/ps3'"
+  pq "$M" recover ps3
+  [[ "$RC" -eq 1 && "$OUT" == *"rd publish cancel ps3"* && "$(pqf "$M" "pq_get ps3 state")" == partial && "$(pqf "$M" pq_slot_get)" == ps3 ]] \
+    && pass "worktree 없는 미발행 partial recover → 상태·슬롯 유지, cancel 안내" || fail "미발행 orphan recover: rc=$RC out=$OUT"
+  pq "$M" status ps3
+  [[ "$OUT" == *"worktree 없음"*"rd publish recover ps3"* && "$OUT" != *"rd publish run"* ]] && pass "worktree 없는 partial status → recover 안내만(이전 사유의 run 안내 없음)" || fail "orphan status: $OUT"
+  pq "$M" status nx
+  [[ "$OUT" == *"rd publish recover ps3"* ]] && pass "앞 요청이 worktree 없는 partial 이면 요청됨 줄이 recover 를 가리킴" || fail "대기 사유: $OUT"
+  pq "$M" next
+  [[ "$RC" -eq 1 && "$OUT" == *"rd publish recover ps3"* ]] && pass "next 거부 문구에 recover 안내" || fail "next 거부: rc=$RC out=$OUT"
+  # 작업이 기본 브랜치에 병합된 채 push 되지 않았으면 슬롯을 풀지 않는다 — 풀면 다음 발행이 그 병합까지 push 한다.
+  pq "$M" cancel ps3
+  if [[ "$RC" -eq 1 && "$(pqf "$M" "pq_get ps3 state")" == partial && "$(pqf "$M" pq_slot_get)" == ps3 && "$OUT" == *"취소하지 않았습니다"*"merge fr/ps3"*"reset --keep 'origin/master'"* ]]; then
+    pass "미push 병합이 남은 orphan cancel → 거부, partial·슬롯 유지, 남은 커밋 안내"
+  else
+    fail "미push 병합 orphan cancel: rc=$RC state=$(pqf "$M" "pq_get ps3 state") out=$OUT"
+  fi
+  pq "$M" next
+  [[ "$RC" -eq 1 && "$(pqf "$M" "pq_get nx state")" == requested ]] && pass "미push 병합이 남은 동안 next 거부" || fail "미push 병합 next: rc=$RC out=$OUT"
+  # 미push 목록이 20개를 넘어 잘리면 reset 명령을 내지 않는다 — 화면 밖 커밋까지 되돌리기 때문이다 (리뷰 F12).
+  local i; for i in $(seq 1 20); do git -C "$M" commit -q --allow-empty -m "local $i"; done
+  pq "$M" cancel ps3
+  [[ "$RC" -eq 1 && "$OUT" == *"외 2개"* && "$OUT" != *"reset --keep"* && "$OUT" == *"직접 확인"* ]] && pass "미push 목록이 잘리면 reset 명령 대신 직접 확인 안내" || fail "잘린 목록 안내: rc=$RC out=$OUT"
+  git -C "$M" reset -q --keep origin/master
+  pq "$M" cancel ps3
+  if [[ "$RC" -eq 0 && "$(pqf "$M" "pq_get ps3 state")" == cancelled && -z "$(pqf "$M" pq_slot_get)" ]]; then
+    pass "병합을 되돌린 뒤 orphan cancel → cancelled, 슬롯 반납"
+  else
+    fail "orphan cancel: rc=$RC state=$(pqf "$M" "pq_get ps3 state") out=$OUT"
+  fi
+  pq "$M" next
+  [[ "$RC" -eq 0 && "$(pqf "$M" "pq_get nx state")" == granted ]] && pass "cancel 뒤 next 가 다음 요청 허가" || fail "cancel 뒤 next: rc=$RC out=$OUT"
+}
+# 발행을 마치기로 한 경우 — 안내대로 worktree 를 다시 만들면 run 이 archive 로 남은 발행을 마친다 (리뷰 F6·F9·F10).
+test_partial_orphan_publish_choice() {
+  setup_run po4 ps4
+  mkstate ps4 partial
+  git -C "$M" merge -q --no-ff -m "merge fr/ps4" fr/ps4
+  # 디렉터리만 치우고 git 등록은 남긴다(파일 관리자로 휴지통에 옮긴 경우) — 큐는 정리 명령을 내지 않고 확인을 요구한다 (리뷰 F13·F15·F16).
+  rm -rf "$W"
+  pq "$M" cancel ps4
+  [[ "$RC" -eq 1 && "$OUT" == *"git -C '$M' worktree list"*"rd publish recover ps4 를 다시 실행"* && "$OUT" != *"worktree prune"* && "$OUT" != *"worktree remove"* && "$OUT" != *"worktree add"* && "$OUT" != *"push origin"* ]] && pass "등록이 남은 경로는 정리 명령 없이 확인 뒤 recover 재실행을 안내" || fail "등록 남은 안내: rc=$RC out=$OUT"
+  # 사람이 등록을 정리한 뒤 다시 물으면 worktree add 안내가 나오고, 그대로 실행하면 발행을 이어 간다.
+  git -C "$M" worktree prune
+  pq "$M" cancel ps4
+  [[ "$RC" -eq 1 && "$OUT" == *"git -C '$M' worktree add '$W' 'fr/ps4'"* && "$OUT" != *"push origin"* ]] && pass "등록 정리 뒤 미push 병합 cancel 거부가 worktree 를 다시 만들어 run 하는 길을 안내(push 명령 없음)" || fail "발행 안내: rc=$RC out=$OUT"
+  local cmd; cmd="$(printf '%s\n' "$OUT" | sed -n 's/.*archive.sh 가 마칩니다): //p' | head -1)"
+  [[ -n "$cmd" ]] && (cd "$M" && eval "$cmd") >/dev/null 2>&1
+  pq "$W" run
+  if [[ "$RC" -eq 0 && "$(getk ps4 state)" == done && -z "$(pqf "$W" pq_slot_get)" ]] && git -C "$B" merge-base --is-ancestor "$(git -C "$W" rev-parse HEAD)" master; then
+    pass "안내대로 worktree 를 다시 만든 뒤 run → done, 슬롯 반납, 원격 기본 브랜치에 발행"
+  else
+    fail "다시 만든 worktree 의 run: rc=$RC state=$(getk ps4 state) out=$OUT"
+  fi
+}
 test_recover_alive_pid() {
   setup_run rn7 rg
   bash -c 'sleep 600; : publish_queue.sh' & local lp=$!
@@ -942,13 +1080,13 @@ runlim() {
 bgend() { local p="$1"; kill "$p" 2>/dev/null; pkill -P "$p" 2>/dev/null; wait "$p" 2>/dev/null; }
 test_wait_wakes_on_grant() {
   local W2 M2 rc; W2="$(mk_work wt1 wa)"; M2="$TMP/wt1"
-  mkreq "$W2" wa state=requested seq=1
+  mkreq "$W2" wa state=requested seq=1 "worktree='$W2'" fr-branch=fr/wa
   bgrun "$W2" "$TMP/wt1.out" wait --timeout 60; local p=$BGPID
   sleep 0.5
   pq "$M2" next
   wait "$p"; rc=$?
-  if [[ "$rc" -eq 0 && "$(cat "$TMP/wt1.out")" == *"rd publish run"* ]]; then
-    pass "wait → next 허가에 깨어 rc 0, 출력에 rd publish run"
+  if [[ "$rc" -eq 0 && "$(cat "$TMP/wt1.out")" == *"허가됨: wa — 작업 worktree($W2)에서 rd publish run"* ]]; then
+    pass "wait → next 허가에 깨어 rc 0, 출력에 그 worktree 의 rd publish run"
   else
     fail "wait 허가: rc=$rc out=$(cat "$TMP/wt1.out") next=$OUT"
   fi
@@ -1070,7 +1208,7 @@ check_no_input_injection() {
 # 통합: 실제 archive.sh 가 「병합 뒤 push 거부 → 중단 → recover → 재실행(병합 건너뛰고 tag·push)」 을 통과하는지.
 # 실제 archive.sh 재실행 경로를 검증하는 유일한 사례라 수 초의 비용을 감수한다(예산 15초).
 test_real_archive_partial_recovery() {
-  export HERDR_ENV= HC_TERMINAL_ID= RD_CHILD_SESSION=1
+  export HERDR_ENV= HC_TERMINAL_ID= ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE= RD_CHILD_SESSION=1
   unset project_root TASK_STATE_PATH
   local REPO="$TMP/int" BARE="$TMP/int.git" WT slug=alpha out
   mkdir -p "$REPO/rd-workflow"; cp -R "$SCRIPT_DIR/.." "$REPO/rd-workflow/scripts"
@@ -1265,14 +1403,80 @@ test_run_bypass_hint() {
   printf '%s\n' "$OUT" | grep -q 'rd publish request --allow-gitlink-drop.*--basis' && pass "안내: 큐 경로 재요청 명령" || fail "안내: rc=$RC out=$OUT"
 }
 
+# --- 발행 요청의 중복 확인 (spec D5)
+# dq_work <name> <slug>: mk_work + task-state source-fr + FR 상세·코드 한 줄 커밋. 기본 체크아웃 master 에도 같은 FR 상세를 push 한다.
+DQ_FR=rd-workflow-workspace/backlog/items/2026-11-25-dq.md
+dq_work() {
+  local name="$1" slug="$2" W main f
+  W="$(mk_work "$name" "$slug")"; main="$TMP/$name"
+  f="$W/rd-workflow-workspace/.lifecycle/task-state"
+  awk -v v="$DQ_FR" 'index($0,"source-fr=")==1{print "source-fr=" v; next}{print}' "$f" >"$f.n" && cat "$f.n" >"$f" && rm -f "$f.n"
+  mkdir -p "$W/$(dirname "$DQ_FR")" "$main/$(dirname "$DQ_FR")"
+  printf -- '- status: validated\n' >"$W/$DQ_FR"; printf '4\n' >>"$W/code.txt"
+  git -C "$W" add -A && git -C "$W" commit -q -m "source-fr dq"
+  printf -- '- status: validated\n' >"$main/$DQ_FR"
+  git -C "$main" add -A && git -C "$main" commit -q -m "fr dq" && git -C "$main" push -q origin master 2>/dev/null
+  printf '%s\n' "$W"
+}
+# dq_other <name>: 같은 원격의 다른 clone 경로를 낸다.
+dq_other() {
+  local o="$TMP/$1-o"
+  git clone -q "$TMP/$1.git" "$o" 2>/dev/null
+  git -C "$o" config user.name other; git -C "$o" config user.email other@example.invalid
+  printf '%s\n' "$o"
+}
+test_request_dup_published() {
+  local W o; W="$(dq_work rq30 dq-a)"; o="$(dq_other rq30)"
+  printf -- '- status: done\n' >"$o/$DQ_FR"; git -C "$o" commit -q -am "fr done" && git -C "$o" push -q origin master 2>/dev/null
+  pq "$W" request
+  if [[ "$RC" -eq 1 && "$OUT" == *"다른 구현이 있습니다"* && "$OUT" == *"promote_rollback.sh --task dq-a"* ]]; then pass "Q1 다른 곳에서 발행된 FR → rc 1·거절 출력"; else fail "Q1: rc=$RC out=$OUT"; fi
+  [[ -z "$(pqf "$W" "pq_get dq-a state" 2>/dev/null)" ]] && pass "Q1 .req 없음" || fail "Q1 .req 있음: $(pqf "$W" "pq_get dq-a state")"
+  mkdir -p "$W/rd-workflow/config"; printf '{"publish_approval":"user"}' >"$W/rd-workflow/config/workflow.json"
+  git -C "$W" add -A && git -C "$W" commit -q -m "approval user"
+  pq "$W" request
+  [[ "$RC" -eq 1 && "$OUT" == *"다른 구현이 있습니다"* ]] && pass "Q1 사용자 승인 모드에서도 rc 1(10 아님)" || fail "Q1 승인 모드: rc=$RC out=$OUT"
+}
+test_request_dup_same_slug() {
+  local W o; W="$(dq_work rq31 dq-b)"; o="$(dq_other rq31)"
+  git -C "$o" checkout -q -b fr/dq-b origin/master && printf 'o\n' >"$o/other.txt" && git -C "$o" add -A && git -C "$o" commit -q -m other
+  git -C "$o" push -q origin fr/dq-b 2>/dev/null
+  pq "$W" request
+  [[ "$RC" -eq 1 && "$OUT" == *"fr/dq-b"* && "$OUT" == *"같은 이름의 원격 브랜치가 다른 이력"* ]] && pass "Q1b 같은 slug 의 다른 이력 → rc 1" || fail "Q1b: rc=$RC out=$OUT"
+}
+test_request_dup_rerun_ok() {
+  local W main; W="$(dq_work rq32 dq-c)"; main="$TMP/rq32"
+  git -C "$main" merge -q --no-ff -m "merge fr/dq-c" fr/dq-c >/dev/null 2>&1
+  printf -- '- status: done\n' >"$main/$DQ_FR"; git -C "$main" commit -q -am "fr done" && git -C "$main" push -q origin master 2>/dev/null
+  pq "$W" request
+  [[ "$RC" -eq 0 && "$OUT" == *"요청했습니다"* ]] && pass "Q2 HEAD 가 원격 기본 브랜치에 있으면 FR done 이어도 rc 0" || fail "Q2: rc=$RC out=$OUT"
+}
+test_request_dup_claim_warns() {
+  local W o; W="$(dq_work rq33 dq-d)"; o="$(dq_other rq33)"
+  git -C "$o" checkout -q -b fr/other origin/master
+  mkdir -p "$o/rd-workflow-workspace/.lifecycle"
+  printf 'schema=1\nshort-title=other\nstatus=구현 중\nfr-branch=fr/other\nsource-fr=%s\n' "$DQ_FR" >"$o/rd-workflow-workspace/.lifecycle/task-state"
+  git -C "$o" add -A && git -C "$o" commit -q -m "claim other" && git -C "$o" push -q origin fr/other 2>/dev/null
+  pq "$W" request
+  [[ "$RC" -eq 0 && "$OUT" == *"다른 clone 에서 같은 FR 이 진행 중"* && "$OUT" == *"요청했습니다"* ]] && pass "Q3 다른 slug 의 같은 FR 착수 → 경고 + rc 0" || fail "Q3: rc=$RC out=$OUT"
+}
+
+test_request_dup_own_remote_ahead() {
+  local W o; W="$(dq_work rq34 dq-e)"; o="$(dq_other rq34)"
+  git -C "$W" push -q origin HEAD:refs/heads/fr/dq-e 2>/dev/null
+  git -C "$o" fetch -q origin fr/dq-e 2>/dev/null; git -C "$o" checkout -q -b fr/dq-e FETCH_HEAD
+  printf 'o\n' >"$o/other.txt" && git -C "$o" add -A && git -C "$o" commit -q -m "ahead" && git -C "$o" push -q origin fr/dq-e 2>/dev/null
+  pq "$W" request
+  [[ "$RC" -eq 0 && "$OUT" != *"같은 작업의 다른 구현"* ]] && pass "Q4 원격 fr 이 HEAD 보다 앞서도 자기 것 → 중복 거절 없음" || fail "Q4: rc=$RC out=$OUT"
+}
+
 SEQ_CASES="test_config_default_caller test_config_invalid_user test_config_file_without_key test_cancel_granted_releases_slot test_cancel_running_refused test_cancel_terminal_and_missing test_cancel_more_states test_status_line test_status_orders_by_seq test_corrupt_req_is_undecidable test_stale_lock_reclaimed test_stale_guard_cleared test_lock_reclaim_rechecks_pid test_lock_without_pid test_unlock_not_owner test_live_lock_blocks test_unimplemented_and_usage"
-PAR_CASES="test_slot_state_must_hold test_prune_done_path_with_space test_request_user_mode test_request_no_caller test_request_preconditions test_request_auto_files_ok test_request_hangul_conflict test_request_auto_plus_code test_request_newline_path test_precheck_task_state_auto test_precheck_index_merge_fails test_precheck_index_merge_ok test_precheck_merger_missing test_gitlink_desc_and_optin test_gitlink_pr_mode_no_auto test_gitlink_diverged test_gitlink_fetch_timeout test_gitlink_rollback test_gitlink_crisscross test_gitlink_base_not_gitlink test_run_limited test_request_undecidable test_request_caller_lost test_request_duplicate_updates test_next_blocked_by_merge_head test_next_oldest_first test_next_parallel_single_grant test_next_refuses_with_corrupt test_approve_user_approval test_run_without_grant test_run_twice test_run_head_changed test_run_success test_partial_retry test_partial_reverify_keeps_slot test_recover_alive_pid test_recover_not_merged test_status_points_recover test_recover_orphan_archive test_recover_lock_owner test_exec_refused_after_recover test_exec_records_pgid_then_recover_refused test_exec_stale_token_next_generation test_exec_refused_non_running_state test_run_failed_reason_last_line test_wait_wakes_on_grant test_wait_timeout test_wait_caller_lost test_request_watch_warning test_wait_watch_gone test_watch_no_default_timeout test_watch_on_request test_watch_on_result test_watch_result_between_watches test_real_archive_partial_recovery test_status_wait_reason test_recover_ps_fail test_exec_ps_fail test_request_bypass_rejects test_request_bypass_passes test_request_bypass_cleared test_run_bypass_hint test_user_approval_bypass_shown"
+PAR_CASES="test_slot_state_must_hold test_prune_done_path_with_space test_request_user_mode test_request_no_caller test_request_preconditions test_request_auto_files_ok test_request_hangul_conflict test_request_auto_plus_code test_request_newline_path test_precheck_task_state_auto test_precheck_index_merge_fails test_precheck_index_merge_ok test_precheck_merger_missing test_gitlink_desc_and_optin test_gitlink_pr_mode_no_auto test_gitlink_diverged test_gitlink_fetch_timeout test_gitlink_rollback test_gitlink_crisscross test_gitlink_base_not_gitlink test_request_undecidable test_request_caller_lost test_request_duplicate_updates test_next_blocked_by_merge_head test_next_oldest_first test_next_parallel_single_grant test_next_refuses_with_corrupt test_approve_user_approval test_run_without_grant test_run_twice test_run_head_changed test_run_success test_partial_retry test_partial_reverify_keeps_slot test_partial_recover_with_worktree test_granted_action_location test_detached_request_branch test_partial_other_checkout test_partial_orphan_recover_published test_partial_orphan_unpublished test_partial_orphan_publish_choice test_recover_alive_pid test_recover_not_merged test_status_points_recover test_recover_orphan_archive test_recover_lock_owner test_exec_refused_after_recover test_exec_records_pgid_then_recover_refused test_exec_stale_token_next_generation test_exec_refused_non_running_state test_run_failed_reason_last_line test_wait_wakes_on_grant test_wait_timeout test_wait_caller_lost test_request_watch_warning test_wait_watch_gone test_watch_no_default_timeout test_watch_on_request test_watch_on_result test_watch_result_between_watches test_real_archive_partial_recovery test_status_wait_reason test_recover_ps_fail test_exec_ps_fail test_request_bypass_rejects test_request_bypass_passes test_request_bypass_cleared test_run_bypass_hint test_user_approval_bypass_shown test_request_dup_published test_request_dup_same_slug test_request_dup_rerun_ok test_request_dup_claim_warns test_request_dup_own_remote_ahead"
 want() { [[ -z "${PQ_TEST_ONLY:-}" || "$PQ_TEST_ONLY" == "$1" ]]; }
 # 실제 ps 를 한 번 실행해 쓸 수 있는지 정한다(샌드박스 등에서는 실패).
 PQ_PS_OK=0
 ps -o pgid= -p $$ >/dev/null 2>&1 && PQ_PS_OK=1
 # ps 로 프로세스 그룹을 확인해야 하는 사례. 병렬 사례만 담는다(순차 루프는 표식이 stderr 에 닿지 않음).
-PQ_NEEDS_PS="test_run_twice test_run_success test_partial_retry test_partial_reverify_keeps_slot test_recover_alive_pid test_recover_orphan_archive test_exec_records_pgid_then_recover_refused test_run_failed_reason_last_line test_real_archive_partial_recovery test_request_bypass_passes test_run_bypass_hint"
+PQ_NEEDS_PS="test_run_twice test_partial_other_checkout test_run_success test_partial_retry test_partial_reverify_keeps_slot test_recover_alive_pid test_recover_orphan_archive test_exec_records_pgid_then_recover_refused test_run_failed_reason_last_line test_real_archive_partial_recovery test_partial_orphan_publish_choice test_request_bypass_passes test_run_bypass_hint"
 # pq_env_skip <사례>: ps 불가 환경이고 목록에 있으면 건너뜀 표식을 내고 0 을 반환한다.
 pq_env_skip() {
   [[ "$PQ_PS_OK" -eq 0 ]] || return 1

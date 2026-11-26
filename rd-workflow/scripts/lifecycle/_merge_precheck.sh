@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # _merge_precheck.sh — 병합 충돌 사전 판정 공용 함수 (source 전용).
-#   archive.sh 와 publish_queue.sh 가 같이 쓴다. 다른 파일을 source 하지 않는다.
+#   archive.sh 와 publish_queue.sh 가 같이 쓴다. 시간 상한 실행기 _rd_run_limited 가 정의돼 있지 않을 때만
+#   ../_submodule_common.sh(함수 정의만 있는 파일)를 source 한다. 그 밖의 파일은 source 하지 않는다.
 #   인덱스 충돌 판정에서 같은 디렉터리의 merge_fr_index.sh 를 하위 프로세스로 실행한다(source 아님).
 #   set -euo pipefail 아래에서 source 돼도 안전하다(실패 가능한 대입은 `|| rc=$?`).
 #   gitlink 객체 찾기(rd_gl_*)는 _state_common.sh 의 _rd_is_repo_root·_rd_git_common_dir·_rd_submodule_object_pool 을
@@ -54,50 +55,11 @@ _rd_merge_index_sim() {
 
 # ---------------------------------------------------------------- 제한 실행기 (spec D1-2)
 
-# rd_run_limited <초> <stderr 파일> <명령…> — 명령의 stdout 을 내고 종료 코드를 돌려준다. 시간 초과는 rc 124.
-#   명령과 감시 프로세스를 각각 자기 프로세스 그룹(set -m)으로 띄운다. 명령의 stdout 은 임시 파일로 받는다
-#   (남은 자식이 호출부 명령 치환의 파이프를 붙잡지 않게 한다). stderr 는 <stderr 파일> 로 간다.
-#   <초> 가 지나도 명령이 살아 있으면 감시가 그룹에 TERM → 2초 → 그룹 KILL 을 보낸다. KILL 은 이 한 곳에서만,
-#   명령의 맨 위 프로세스 생존과 상관없이 보낸다(부모만 TERM 으로 끝나고 자식이 TERM 을 무시하는 경우).
-#   시간 초과면 감시가 끝나기를 기다린 뒤 그룹이 사라질 때까지 최대 2초 기다리고 돌아온다(상한 + 4초).
-#   정상 종료면 감시 그룹(그 안의 sleep 포함)에 TERM 을 보내 회수한다.
-#   _submodule_common.sh 의 _rd_run_limited 는 이 두 점(sleep 회수, 그룹 KILL 뒤 소멸 확인)이 다르다.
-rd_run_limited() {
-  local lim="$1" errf="$2" pid wd rc=0 flag outf had_m=0 i=0
-  shift 2
-  flag="$(mktemp "${TMPDIR:-/tmp}/rd-lim.XXXXXX")" || return 1
-  outf="$(mktemp "${TMPDIR:-/tmp}/rd-lim-out.XXXXXX")" || { rm -f "$flag"; return 1; }
-  [[ "$-" == *m* ]] && had_m=1
-  set -m
-  "$@" </dev/null >"$outf" 2>"$errf" &
-  pid=$!
-  ( sleep "$lim"
-    if kill -0 "$pid" 2>/dev/null; then
-      echo 1 > "$flag"; kill -TERM -- "-$pid" 2>/dev/null
-      sleep 2
-      kill -KILL -- "-$pid" 2>/dev/null
-    fi ) </dev/null >/dev/null 2>&1 &
-  wd=$!
-  [[ "$had_m" == 1 ]] || set +m
-  wait "$pid" 2>/dev/null || rc=$?
-  if [[ -s "$flag" ]]; then
-    rc=124
-    wait "$wd" 2>/dev/null || true
-    while kill -0 -- "-$pid" 2>/dev/null && [[ "$i" -lt 20 ]]; do sleep 0.1; i=$((i + 1)); done
-  else
-    kill -TERM -- "-$wd" 2>/dev/null || true
-    wait "$wd" 2>/dev/null || true
-    # 첫 TERM 이 sleep fork 직전의 감시 서브셸에만 닿으면 그 뒤 생긴 sleep 은 신호를 받지 못한다(즉시 끝나는 명령).
-    # 그룹이 남아 있는 동안 TERM 을 다시 보낸다.
-    while kill -0 -- "-$wd" 2>/dev/null && [[ "$i" -lt 20 ]]; do
-      kill -TERM -- "-$wd" 2>/dev/null || true
-      sleep 0.05; i=$((i + 1))
-    done
-  fi
-  [[ "$rc" == 124 ]] || cat "$outf"
-  rm -f "$flag" "$outf"
-  return "$rc"
-}
+# 시간 상한 실행기는 _submodule_common.sh 의 _rd_run_limited 하나만 쓴다(정의를 두 벌로 두지 않는다).
+#   archive.sh 는 이미 싣고, publish_queue.sh·fr_do/grant_check.sh 는 싣지 않으므로 여기서 실어 둔다.
+if ! declare -F _rd_run_limited >/dev/null 2>&1; then
+  source "$(dirname "${BASH_SOURCE[0]}")/../_submodule_common.sh"
+fi
 
 # ---------------------------------------------------------------- gitlink 객체 찾기 (spec D1-2, archive 와 공용)
 
@@ -160,10 +122,10 @@ rd_gl_git() {
 }
 
 # rd_git_noprompt_env <git 작업 디렉터리> — 원격 조회가 사용자 입력을 기다리지 않게 하는 env 인자를 RD_GIT_NOPROMPT_ENV 배열에 둔다.
-#   rd_run_limited 는 명령을 별도 프로세스 그룹(배경)에 띄우므로, 입력을 묻는 ssh(passphrase·호스트 키 확인)는 SIGTTIN 으로 멈춰
+#   _rd_run_limited 는 명령을 별도 프로세스 그룹(배경)에 띄우므로, 입력을 묻는 ssh(passphrase·호스트 키 확인)는 SIGTTIN 으로 멈춰
 #   상한까지 기다린다. 그래서 GIT_TERMINAL_PROMPT=0 을 늘 넣고, GIT_SSH_COMMAND·GIT_SSH·core.sshCommand(<디렉터리> 기준)가
 #   모두 비었을 때만 `ssh -o BatchMode=yes` 를 넣는다(사용자 전송 설정은 덮어쓰지 않는다).
-#   쓰는 법: rd_git_noprompt_env "$dir"; rd_run_limited … "${RD_GIT_NOPROMPT_ENV[@]}" git -C "$dir" fetch …
+#   쓰는 법: rd_git_noprompt_env "$dir"; _rd_run_limited … "${RD_GIT_NOPROMPT_ENV[@]}" git -C "$dir" fetch …
 #   호출 위치: rd_gl_fetch_once, archive.sh 의 _archive_tpg_remote(팀 저장소 반영 게이트).
 RD_GIT_NOPROMPT_ENV=()
 rd_git_noprompt_env() {
@@ -179,7 +141,7 @@ rd_git_noprompt_env() {
 #   rc 0: fetch 뒤 <miss oid> 커밋이 있음 / rc 1: 이미 시도한 경로, submodule 저장소 아님, fetch 실패·시간 초과, 받은 뒤에도 없음.
 #   안내는 stderr 로 낸다(<접두> 는 호출부가 준다: `archive:` 또는 `rd_merge_conflicts:`).
 #   입력 대기 방지 env 는 rd_git_noprompt_env 가 정한다(GIT_TERMINAL_PROMPT=0, 전송 설정이 없을 때만 BatchMode ssh).
-#   상한은 RD_MERGE_FETCH_TIMEOUT(초, 기본 60)이고 rd_run_limited 가 건다.
+#   상한은 RD_MERGE_FETCH_TIMEOUT(초, 기본 60)이고 _rd_run_limited 가 건다.
 #   호출 위치: rd_merge_gitlink_pick, archive.sh 의 _archive_gitlink_is_ancestor.
 rd_gl_fetch_once() {
   local d="${1:-}" p="${2:-}" miss="${3:-}" pre="${4:-}" dir lim errf frc=0
@@ -195,7 +157,7 @@ rd_gl_fetch_once() {
   rd_git_noprompt_env "$dir"
   cmd=("${RD_GIT_NOPROMPT_ENV[@]}" git -C "$dir" fetch --quiet --no-recurse-submodules)
   errf="$(mktemp "${TMPDIR:-/tmp}/rd-gl-fetch.XXXXXX")" || errf=/dev/null
-  rd_run_limited "$lim" "$errf" "${cmd[@]}" >/dev/null || frc=$?
+  _rd_run_limited "$lim" "$errf" "${cmd[@]}" >/dev/null || frc=$?
   if [[ "$frc" -eq 0 ]]; then
     printf '%s submodule %s fetch 완료\n' "$pre" "$p" >&2
   elif [[ "$frc" -eq 124 ]]; then
@@ -384,9 +346,11 @@ rd_merge_conflict_guide() {
 #   rc 0 해소(결과 파일에 내용) / 1 자동 해소하지 않음(사유 한 줄을 RD_MERGE_RESOLVE_WHY 에 담고, RD_MERGE_RESOLVE_QUIET=1 이
 #   아니면 stderr 에도 낸다). 다섯 경로 밖이면 rc 1. 호출부가 stage 를 임시 파일로 꺼내 넘긴다
 #   (archive.sh: 기본 쪽 = stage 2, 작업 쪽 = stage 3).
+#   stage_metrics.tsv 를 공통 조상 없이(add/add) 해소했으면 RD_MERGE_RESOLVE_SM_ADDADD=1, 그 밖은 0 이다(해소 안내 문구용).
 rd_merge_resolve_record() {
   local path="$1" base="${2:-}" ours="${3:-}" theirs="${4:-}" out="$5"
-  local ct sm idx ve ts why="" bad stg=""
+  local ct sm idx ve ts why="" bad stg="" aa=0
+  RD_MERGE_RESOLVE_SM_ADDADD=0
   ct="$(printf '%s\n' "$RD_MERGE_AUTO_RESOLVE_PATHS" | sed -n 1p)"
   sm="$(printf '%s\n' "$RD_MERGE_AUTO_RESOLVE_PATHS" | sed -n 2p)"
   idx="$(printf '%s\n' "$RD_MERGE_AUTO_RESOLVE_PATHS" | sed -n 3p)"
@@ -408,18 +372,34 @@ rd_merge_resolve_record() {
     elif ! grep -q '^fr-branch=' "$theirs"; then why="task-state 형식 오류"
     else cp "$theirs" "$out" || why="stage 추출 실패: $path"; fi
   elif [[ "$path" == "$sm" ]]; then
-    # 세 판이 모두 있어야 한다. add/add 는 merge-file --union 이 공통 헤더를 한 번만 남겨 형식 검증을 통과하므로 멈춘다.
-    if [[ -z "$base" || -z "$ours" || -z "$theirs" ]]; then
+    # 세 판이 모두 있으면 줄 합집합(merge-file --union)이다. 공통 조상에 파일이 없고 양쪽에만 있으면(add/add — 기본 브랜치에
+    #   파일이 없을 때 띄운 줄기끼리) 두 판의 첫 줄이 정확한 헤더일 때만 헤더 한 번 + 기본 쪽 행 + 작업 쪽의 새 행으로 합친다
+    #   (FR stage-metrics-add-add-auto-resolve). 같은 행은 어느 쪽에서 왔든 처음 나온 자리에 한 번만 남긴다(행 합집합 — 같은
+    #   전이를 같은 초에 두 번 기록하는 일은 없으므로 같은 행은 복사된 중복이다).
+    #   이 파일은 전이 행을 덧붙이기만 하는 기록이라 행 합집합이 곧 병합 결과다.
+    #   한쪽만 있는 경우(delete/modify)는 멈춘다.
+    local hdr=$'# short_title\tfrom_status\tto_status\tepoch'
+    if [[ -z "$base" && -n "$ours" && -n "$theirs" ]]; then
+      if [[ "$(head -n 1 "$ours")" != "$hdr" || "$(head -n 1 "$theirs")" != "$hdr" ]]; then
+        why="stage_metrics.tsv 공통 조상에 파일이 없고 두 판의 헤더가 기준 헤더와 달라 자동 해소하지 않습니다"
+      elif ! awk 'FNR == 1 { if (NR == 1) print; next } !($0 in seen) { seen[$0] = 1; print }' "$ours" "$theirs" > "$out"; then
+        why="stage_metrics.tsv 행 합집합 병합 실패"
+      else
+        aa=1
+      fi
+    elif [[ -z "$base" || -z "$ours" || -z "$theirs" ]]; then
       [[ -n "$base" ]] && stg="${stg}1 "; [[ -n "$ours" ]] && stg="${stg}2 "; [[ -n "$theirs" ]] && stg="${stg}3 "
-      why="stage_metrics.tsv 공통 조상 또는 한쪽 버전이 없어(stage: ${stg:-없음}) 자동 해소하지 않습니다"
+      why="stage_metrics.tsv 한쪽 버전이 없어(stage: ${stg:-없음}) 자동 해소하지 않습니다"
     elif ! git merge-file -p --union "$ours" "$base" "$theirs" > "$out"; then why="stage_metrics.tsv 줄 합집합 병합 실패"
-    else
+    fi
+    if [[ -z "$why" ]]; then
       # 형식: 첫 줄 정확한 헤더 1개, 이후 `#` 줄 없음, 모든 행 탭 4필드(빈 줄은 0필드라 함께 거부).
       bad="$(awk -F'\t' 'NR==1 { if ($0 != "# short_title\tfrom_status\tto_status\tepoch") { print NR ": " substr($0, 1, 40); exit } next }
         /^#/ || NF != 4 { print NR ": " substr($0, 1, 40); exit }
         END { if (NR == 0) print "0: (빈 파일)" }' "$out")"
       [[ -z "$bad" ]] || why="stage_metrics.tsv 형식 오류: $bad"
     fi
+    [[ -n "$why" ]] || RD_MERGE_RESOLVE_SM_ADDADD="$aa"
   elif [[ "$path" == "$idx" ]]; then
     local merger="${_RD_MERGE_PRECHECK_DIR:+$_RD_MERGE_PRECHECK_DIR/merge_fr_index.sh}"
     if [[ -z "$base" || -z "$ours" || -z "$theirs" || -z "$merger" || ! -f "$merger" ]] \

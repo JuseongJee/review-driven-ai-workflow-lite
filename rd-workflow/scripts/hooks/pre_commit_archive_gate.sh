@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # 판정이 필요 없는 입력은 라이브러리를 source 하기 전에 끝낸다 (도구 호출 대기 감소).
-# 기존 1단 필터(command_targets_our_commit)의 상위집합이다 — 과탐은 기존 경로가 판정한다.
+# commit_target_roots 의 1단 필터의 상위집합이다 — 과탐은 그 함수가 판정한다.
 _hook_input="$(cat)"; _hook_input_read=1
 _probe="${_hook_input//\\\\\\n/}"            # JSON 의 `\\\n`(원 명령의 백슬래시+개행) 제거
 _probe="${_probe//\\/}"; _probe="${_probe//\'/}"; _probe="${_probe//\"/}"
@@ -18,10 +18,13 @@ cmd="$(extract_json_field "command")"
 # command가 비어있으면 통과
 [[ -z "$cmd" ]] && exit 0
 
-# 실행 위치의 커밋이 아니면 통과 (인용·heredoc·명령 치환 인식 — _guard_common.sh)
-# 1단 필터는 command_targets_our_commit 이 단일 소유자로 갖는다.
-command_targets_our_commit "$cmd" "archive_gate" || exit 0
+# 판정할 커밋 루트 계산 (인용·heredoc·명령 치환 인식 — _guard_common.sh). 0줄이면 통과.
+# 1단 필터는 commit_target_roots 가 단일 소유자로 갖는다. 커밋 위치의 worktree 마다 따로 판정한다.
+roots="$(commit_target_roots "$cmd" "archive_gate")"
+[[ -z "$roots" ]] && exit 0
 
+
+_judge_root() {
 # --- 이 게이트의 실제 적용 범위 (spec §2.5.3, 리뷰 F2 — 정직한 기술) ---
 # 이 게이트는 REQUEST 가 없거나 Source FR 이 비면 통과하고, `아카이브 보류` 상태의
 # 기록 전용 커밋도 통과한다. 정규 마감은 이 두 경로를 지나므로 **이 게이트는 마감
@@ -34,7 +37,7 @@ command_targets_our_commit "$cmd" "archive_gate" || exit 0
 
 # REQUEST.md에서 Source FR 추출
 request_file="${project_root}/REQUEST.md"
-[[ ! -f "$request_file" ]] && exit 0
+[[ ! -f "$request_file" ]] && return 0
 
 # Source FR 추출·해석 — _state_common.sh 단일 구현에 위임한다 (복수 표현 지원).
 #   from_request_list 가 '## Source FR' 절의 원문을 전부(줄 단위) 반환하고
@@ -43,11 +46,11 @@ request_file="${project_root}/REQUEST.md"
 raw_source_fr_list="$(source_fr_from_request_list "$request_file")"
 
 # 값이 없으면 아카이브 불필요 → 통과
-[[ -z "$raw_source_fr_list" ]] && exit 0
+[[ -z "$raw_source_fr_list" ]] && return 0
 
 # diff review가 통과했는지 확인
 review_dir="$(get_latest_diff_review_dir)"
-[[ -z "$review_dir" ]] && exit 0
+[[ -z "$review_dir" ]] && return 0
 
 # diff review 가 미종결이면 통과시킨다 — 이 시점은 아직 archive 단계가 아니다
 # (구현 중 iteration commit 등). 발행 자체의 차단은 `archive.sh` 가 부르는
@@ -68,7 +71,7 @@ if ! is_review_session_resolved "$review_dir"; then
       printf '[guard]   rd-workflow 배치가 불완전합니다 — hooks 디렉터리에 _open_issues.awk 가 있는지 확인하세요.\n' >&2
       ;;
   esac
-  exit 0
+  return 0
 fi
 
 # --- 여기서부터가 archive 커밋 경로다 ---
@@ -85,10 +88,11 @@ if ! source_fr_list="$(source_fr_resolve_list "$raw_source_fr_list" "$project_ro
   echo "[guard] 위 Source FR 항목을 해석할 수 없어 아카이브 커밋을 막습니다." >&2
   echo "[guard] REQUEST.md 의 ## Source FR 을 다음 형식으로 고치세요:" >&2
   echo "[guard]   rd-workflow-workspace/backlog/items/<파일>.md" >&2
+  gate_root_notice --cd-hint
   # reason: Source FR 항목을 canonical path 로 해석할 수 없어 아카이브 커밋을 막은 분기.
   guard_deny "pre_commit_archive_gate.unresolved-source-fr"
 fi
-[[ -z "$source_fr_list" ]] && exit 0
+[[ -z "$source_fr_list" ]] && return 0
 
 # --- 리뷰 종결 뒤 작업이 다시 열린 Status (구현 중·검증 중) ---
 # 정규 아카이브 기록 커밋은 seal 직후 `아카이브 보류` 에서만 일어난다 (WORKFLOW.md 「아카이브
@@ -100,7 +104,7 @@ fi
 case "$(state_read_field "status")" in
   "구현 중"|"검증 중")
     echo "[guard] Status '$(state_read_field "status")' — 리뷰 종결 뒤 작업이 다시 열린 상태라 이 커밋을 허용합니다. 보호 트리를 바꾸면 재리뷰·재seal 이 필요합니다." >&2
-    exit 0
+    return 0
     ;;
 esac
 
@@ -115,7 +119,7 @@ if [[ "$(state_read_field "status")" == "PR 검토 중" ]]; then
     pr_rc=$?
   fi
   if [[ "$pr_rc" == 0 ]]; then
-    exit 0
+    return 0
   fi
   if [[ "$pr_rc" == 1 ]]; then
     echo "[guard] PR 검토 중이지만 커밋 대상 변경에 기록 경로 밖의 파일이 있습니다." >&2
@@ -123,6 +127,7 @@ if [[ "$(state_read_field "status")" == "PR 검토 중" ]]; then
     echo "[guard] 커밋 대상 변경이 기록 경로 안인지 판정할 수 없어 차단합니다." >&2
   fi
   echo "[guard] PR 검토 중에는 코드를 바꾸지 않습니다. 고치려면 bash rd-workflow/scripts/rd task set-status \"구현 중\"" >&2
+  gate_root_notice --cd-hint
   # reason: PR 검토 중 상태에서 기록 경로 밖 변경(또는 판정 불가)을 커밋하려 해 막은 분기.
   guard_deny "pre_commit_archive_gate.pr-review-out-of-scope"
 fi
@@ -151,7 +156,7 @@ if [[ "$(state_read_field "status")" == "아카이브 보류" ]]; then
   fi
   case "$records_rc" in
     0)
-      exit 0
+      return 0
       ;;
     1)
       echo "[guard] 아카이브 보류 상태이지만 커밋 대상 변경에 기록 경로 밖의 파일이 있습니다." >&2
@@ -190,6 +195,7 @@ fr_status_lib="${script_dir}/../_fr_status.sh"
 if ! { [[ -r "$fr_status_lib" ]] && source "$fr_status_lib" 2>/dev/null; } || [[ -z "${FR_STATUS_AWK:-}" ]]; then
   echo "[guard] FR status 판정 파일을 읽지 못해 아카이브 커밋을 막습니다: ${fr_status_lib}" >&2
   echo "[guard] rd-workflow 배치가 불완전합니다 — rd-workflow/scripts/_fr_status.sh 가 있는지 확인하세요." >&2
+  gate_root_notice --cd-hint
   # reason: FR status 판정 파일(_fr_status.sh)을 읽지 못해 아카이브 커밋을 막은 분기.
   guard_deny "pre_commit_archive_gate.fr-status-lib-missing"
 fi
@@ -227,9 +233,10 @@ if [[ -z "$incomplete" ]]; then
   # 보류 분기에서 이미 차단이 확정된 경우에만 여기로 옵니다.
   # 종전에는 이 조기 통과가 보류 분기보다 앞에 있어 제한이 사실상 죽어 있었습니다.
   if [[ "$pending_block" == "0" ]]; then
-    exit 0
+    return 0
   fi
   pending_out_of_scope_guidance
+  gate_root_notice --cd-hint
   # reason: `아카이브 보류` 상태에서 기록 경로 밖의 변경을 커밋하려 한 분기.
   guard_deny "pre_commit_archive_gate.pending-out-of-scope"
 fi
@@ -243,8 +250,43 @@ if [[ "$pending_block" == "1" ]]; then
   # 아카이브 보류 + 기록 경로 밖 변경: 지금 아카이브하라는 안내는 틀린 다음 행동이다 (외부 검증이
   # 끝나기 전에 발행하게 된다). 보류 상태의 복구 경로를 안내한다.
   pending_out_of_scope_guidance
+elif [[ "$(state_read_field "status")" == "diff review 대기" ]]; then
+  # 종결된 세션이 최신인데 `diff review 대기` 로 커밋하는 경우는 둘이다: seal 을 빠뜨렸거나,
+  # 종결 뒤 고친 내용을 재확인받으려는 중이다. 어느 쪽도 「아카이브를 먼저」 가 다음 행동이 아니다.
+  review_rel="${review_dir#${project_root}/}"
+  # Status 는 위 종결 판정(is_review_session_resolved)이 읽은 값을 그대로 씁니다.
+  review_status="${RD_REVIEW_SESSION_STATUS-}"
+  review_head="$(awk '$0=="## Branch Context"{f=1;next} f&&/^## /{exit} f&&index($0,"- review-head-oid:")==1{sub(/^[^:]*:[ \t]*/,"");sub(/[ \t]+$/,"");print;exit}' "${review_dir}/SESSION.md" 2>/dev/null || true)"
+  [[ -n "$review_head" ]] || review_head="<마지막으로 리뷰한 커밋>"
+  # 종결에는 Reviewer 수렴과 사람의 --override 결정이 모두 있으므로 사유를 단정하지 않습니다.
+  echo "[guard] 최신 final diff review 세션(${review_rel}, status=${review_status:-?})이 이미 종결됐습니다." >&2
+  echo "[guard] 발행하려면 seal 뒤 기록 커밋을 하세요: rd review seal ${review_rel} → rd task set-status \"아카이브 보류\" → 커밋" >&2
+  echo "[guard] 리뷰 뒤 코드를 고쳤다면 수정은 '구현 중' 에서 커밋합니다: bash rd-workflow/scripts/rd task set-status \"구현 중\"" >&2
+  echo "[guard]   수정 커밋 뒤 bash rd-workflow/scripts/rd task set-status \"검증 중\" → verify_record.sh 로 검증 → bash rd-workflow/scripts/rd task set-status \"diff review 대기\"" >&2
+  if [[ "$review_status" == "closed" ]]; then
+    echo "[guard]   그다음 새 세션을 만들고 상태 파일을 커밋합니다 (종결 세션은 다시 열지 않습니다):" >&2
+    echo "[guard]   bash rd-workflow/scripts/prepare_review_pipeline.sh diff --base ${review_head}" >&2
+    echo "[guard]   그다음 새 세션의 turns/001_author.md 를 쓰고 run_review_turn.sh <새 세션> 을 실행합니다." >&2
+  else
+    echo "[guard]   이 상태 파일은 지금 커밋하지 않고 seal 뒤 기록 커밋에 함께 넣습니다. 바뀐 내용을 Author 턴으로 쓰고 재확인 턴을 받습니다:" >&2
+    echo "[guard]   bash rd-workflow/scripts/run_review_turn.sh ${review_rel} --reopen \"<사유>\"" >&2
+  fi
 else
   echo "[guard] REQUEST 아카이브를 먼저 실행하세요." >&2
 fi
+gate_root_notice --cd-hint
 # reason: diff review는 통과했지만 Source FR 중 done/dropped가 아닌 항목이 남은 분기.
 guard_deny "pre_commit_archive_gate.incomplete-source-fr"
+}
+
+while IFS= read -r _r; do
+  [[ -n "$_r" ]] || continue
+  # 서브셸을 `||`·`&&`·`if` 문맥 안에 두면 그 안의 set -e 가 무시된다. 바깥 -e 를 잠시 끄고
+  # 서브셸 안에서 -e 를 다시 켠 채 단독 명령으로 실행한 뒤 rc 를 따로 받는다.
+  set +e
+  ( set -e; gate_rebind_root "$_r"; _judge_root )
+  _rc=$?
+  set -e
+  [[ "$_rc" -eq 0 ]] || exit "$_rc"
+done <<< "$roots"
+exit 0

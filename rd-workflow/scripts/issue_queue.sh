@@ -5,6 +5,7 @@
 # close-fr 는 `--skip-closed` 를 주면 닫힌 Issue 에 댓글·닫기를 하지 않고, stdout 에
 #   Issue 마다 `closed <Issue URL>` 또는 `skipped-closed <Issue URL>` 한 줄을 낸다(연결 없으면 출력 없음).
 #   호스트가 적힌 참조로 닫았는데 같은 번호의 호스트 없는 선점 행이 남으면 `kept-row <repo> <n>` 줄을 더한다.
+#   html_url 키의 행이 다른 FR 에 연결돼 남으면 `kept-other-fr <키> <번호> <FR>` 줄을 낸다.
 #   원격 처리 뒤 장부 정리만 실패한 Issue 는 `ledger-left <repo> <n>` 줄을 낸다(복구는 forget). 이 줄들은 rc 와
 #   상관없이 나온다. 실패가 모두 장부 정리 실패면 rc 10, 원격 실패가 하나라도 있으면 그 rc 다.
 # forget <repo> <n> 은 원격을 건드리지 않고 장부 행만 지운다(닫은 Issue 의 장부 정리 복구용).
@@ -14,9 +15,13 @@
 # gh 는 RD_GH(기본 gh)로 바꿀 수 있다(테스트용 가짜 주입).
 # 장부: RD_ISSUE_LEDGER 또는 $(git rev-parse --git-common-dir)/rd-issue-claims.tsv
 #   행: repo<TAB>number<TAB>url<TAB>fr-stem|-<TAB>claimed-at
+#   claim 은 repo·url 을 gh 응답의 html_url 에서 만든다(repo = `host/owner/repo`, github.com 도 붙임). html_url 이 없던
+#   응답과 옛 장부의 행은 적힌 저장소 그대로다. 호스트 없이 부른 link·release 는 같은 owner/repo·번호의 행이
+#   하나면 그 행을 쓰고, 여러 호스트로 있으면 아무것도 바꾸지 않고 rc 2 로 호스트를 붙인 명령을 알린다.
+#   장부를 읽지 못하면(권한·일반 파일 아님) 원격과 장부를 바꾸지 않고 rc 9 다. forget 은 적힌 키의 행만 지운다.
 # 잠금: "$장부.lock" 디렉터리(mkdir). 대기 초는 RD_ISSUE_LOCK_WAIT(기본 10, 소수 허용).
 # 종료 코드 공통 의미(장부를 고치는 명령): 9 = 원격 변경 전 실패(무변경), 10 = 원격 변경 뒤
-#   장부 정리 실패(행 남음), 11 = 닫힌 Issue(claim). 9·10 의 stderr 마지막 줄은
+#   장부 정리 실패(행 남음), 11 = 닫힌 Issue(claim), 12 = 다른 저장소로 옮겨진 Issue(claim, 무변경). 9·10 의 stderr 마지막 줄은
 #   `장부 행: 남음|없음 — 재실행: <명령>`.
 # bash 3.2·BSD 도구에서 동작한다(연관배열·sed -i 없음). JSON 은 python3 -I.
 
@@ -98,9 +103,22 @@ split_repo() {
   if [ "${#s}" -ge 2 ]; then RHOST="${r%%/*}"; RSLUG="${r#*/}"; else RHOST=""; RSLUG="$r"; fi
 }
 
-repo_url() { # <repo> <n> → REPO_URL
+repo_url() { # <repo> <n> → REPO_URL (호스트가 없으면 github.com 으로 추정한 URL — 장부 키를 만들 때 쓰지 않는다)
   split_repo "$1"
   REPO_URL="https://${RHOST:-github.com}/$RSLUG/issues/$2"
+}
+
+# url_repo <Issue URL> → URL_REPO=`host/owner/repo`(호스트 소문자), URL_NUM=번호. gh 응답의 html_url 에서 장부 키를 만든다.
+#   Issue URL 형식이 아니면 rc 1. 옮겨진 Issue 는 저장소와 번호가 함께 바뀌므로 번호도 대조한다.
+url_repo() {
+  local u="$1" h
+  case "$u" in http://*|https://*) ;; *) return 1 ;; esac
+  u="${u#*://}"; u="${u%/}"
+  printf '%s' "$u" | grep -Eq '^[A-Za-z0-9.-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/issues/[0-9]+$' || return 1
+  h="$(printf '%s' "${u%%/*}" | tr 'A-Z' 'a-z')"
+  u="${u#*/}"
+  URL_REPO="$h/${u%/issues/*}"
+  URL_NUM="${u##*/issues/}"
 }
 
 # remote URL → `o/r`(github.com) 또는 `host/o/r`. 해석 불가면 rc 1.
@@ -212,8 +230,60 @@ has_row() { # <repo> <n>
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# resolve_key <repo> <n> → KEY (장부 행의 키). claim 은 gh 응답의 html_url 로 `host/owner/repo` 키를 쓰므로,
+#   호스트 없이 부른 명령은 장부에서 행을 찾는다. 적힌 키(대소문자 무시)의 행이 있으면 그 키다(호스트 없는 옛 행 포함).
+#   없고 적힌 저장소에 호스트가 없으면 `host/<repo>` 키의 같은 번호 행을 찾아 하나면 그 키, 여럿이면 rc 3 이고
+#   KEY_CANDIDATES 에 후보 키를 줄마다 남긴다. 찾지 못하면 적힌 그대로다. 호스트를 추측하지 않는다.
+KEY_CANDIDATES=""
+resolve_key() {
+  local m cnt
+  KEY="$1"; KEY_CANDIDATES=""
+  ledger_path
+  # 읽지 못한 장부를 「행 없음」으로 넘기면 호스트 없는 인자가 gh 기본 호스트로 간다 — rc 4 로 알린다.
+  #   아직 만들지 않은 장부만 「행 없음」이다.
+  #   상위 디렉터리에 들어갈 수 없으면 장부가 있는지 알 수 없으므로 읽기 실패다(ledger_delete_ref 와 같은 판정).
+  if [ ! -e "$LEDGER" ] && [ ! -L "$LEDGER" ] && [ -d "$(dirname "$LEDGER")" ] && [ -x "$(dirname "$LEDGER")" ]; then return 0; fi
+  { [ -f "$LEDGER" ] && [ -r "$LEDGER" ]; } || return 4
+  m="$(awk -F'\t' -v r="$1" -v n="$2" '$2==n && tolower($1)==tolower(r) {print $1; exit}' "$LEDGER" 2>/dev/null)" || return 4
+  if [ -n "$m" ]; then KEY="$m"; return 0; fi
+  case "$1" in */*/*) return 0 ;; esac
+  m="$(awk -F'\t' -v r="$1" -v n="$2" '$2==n { s=$1; if (sub(/^[^\/]*\//, "", s) && index(s, "/") && tolower(s)==tolower(r)) print $1 }' "$LEDGER" 2>/dev/null)" || return 4
+  cnt="$(printf '%s' "$m" | grep -c .)"
+  [ "$cnt" = 0 ] && return 0
+  if [ "$cnt" = 1 ]; then KEY="$m"; return 0; fi
+  KEY_CANDIDATES="$m"
+  return 3
+}
+
+# 호스트 없는 인자가 여러 호스트의 행과 맞을 때: 아무것도 바꾸지 않고 호스트를 붙인 명령 전문을 알린다. rc 2.
+ambiguous_key() { # <repo> <n> <하위 명령> [뒤 인자]
+  local k
+  die "장부에 $1#$2 의 선점 행이 여러 호스트로 있습니다 — 아무것도 바꾸지 않았습니다. 호스트를 붙여 다시 실행하십시오:"
+  while IFS= read -r k; do
+    [ -n "$k" ] && die "  $SELF_CMD $3 $k $2${4:+ $4}"
+  done <<EOF
+$KEY_CANDIDATES
+EOF
+  return 2
+}
+
+# need_key <repo> <n> <하위 명령> [뒤 인자] → KEY. rc 0 / 2 여러 후보 / 9 장부 읽기 실패(원격·장부 무변경).
+need_key() {
+  local rc=0
+  resolve_key "$1" "$2" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    3) ambiguous_key "$1" "$2" "$3" "${4:-}"; return 2 ;;
+  esac
+  die "장부를 읽을 수 없습니다: $LEDGER — 원격과 장부를 바꾸지 않았습니다. 읽기 권한을 확인하십시오"
+  report_last 남음 "$SELF_CMD $3 $1 $2${4:+ $4}"
+  return 9
+}
+
 ledger_reserve() { # rc 0 / 8 이미 있음 / 9 잠금 실패
   lock_acquire || return 9
+  # 예약은 적힌 키만 본다 — 호스트 없는 인자는 아직 어느 호스트인지 모른다. 다른 표기의 같은 Issue 는
+  #   첫 조회 뒤 ledger_rekey 가 html_url 키로 판정한다.
   if has_row "$1" "$2"; then lock_release; return 8; fi
   repo_url "$1" "$2"
   if ! printf '%s\t%s\t%s\t-\t%s\n' "$1" "$2" "$REPO_URL" "$(now)" >> "$LEDGER"; then
@@ -246,6 +316,8 @@ ledger_delete() { # rc 0 / 1 잠금·쓰기 실패. 행이 없으면 잠금 없�
 # ledger_delete_ref <repo> <n> — 저장소 키(대소문자 무시)와 번호가 같은 행을 지운다. 키는 claim 이 적은 표기
 #   그대로이며 호스트를 추측해 다른 표기의 행을 함께 지우지 않는다.
 #   rc 0 (행 없음 포함) / 1 장부 읽기·잠금·쓰기 실패 — 읽지 못한 장부를 "행 없음" 으로 넘기지 않는다.
+#   DEL_STEM(`|stem|stem|` 목록)이 있으면 FR 칸이 `-` 이거나 목록의 stem 인 행만 지운다(다른 FR 에 연결된 행은 남긴다).
+DEL_STEM=""
 ledger_delete_ref() {
   local rc=0
   ledger_path
@@ -256,11 +328,11 @@ ledger_delete_ref() {
   fi
   { [ -f "$LEDGER" ] && [ -r "$LEDGER" ]; } || { die "장부를 읽을 수 없습니다: $LEDGER"; return 1; }
   # 일치 행 없음은 rc 3 — awk 자체의 실패(rc 1·2)와 구분한다.
-  awk -F'\t' -v r="$1" -v n="$2" 'tolower($1)==tolower(r) && $2==n {f=1} END{exit f?0:3}' "$LEDGER" || rc=$?
+  awk -F'\t' -v r="$1" -v n="$2" -v s="$DEL_STEM" 'tolower($1)==tolower(r) && $2==n && (s=="" || $4=="-" || index(s, "|" $4 "|")) {f=1} END{exit f?0:3}' "$LEDGER" || rc=$?
   [ "$rc" = 3 ] && return 0
   [ "$rc" = 0 ] || { die "장부를 읽지 못했습니다: $LEDGER (rc $rc)"; return 1; }
   lock_acquire || return 1
-  if (umask 077; awk -F'\t' -v r="$1" -v n="$2" '!(tolower($1)==tolower(r) && $2==n)' "$LEDGER" > "$LEDGER.tmp.$$") && ledger_swap "$LEDGER.tmp.$$"; then
+  if (umask 077; awk -F'\t' -v r="$1" -v n="$2" -v s="$DEL_STEM" '!(tolower($1)==tolower(r) && $2==n && (s=="" || $4=="-" || index(s, "|" $4 "|")))' "$LEDGER" > "$LEDGER.tmp.$$") && ledger_swap "$LEDGER.tmp.$$"; then
     lock_release; return 0
   fi
   rm -f "$LEDGER.tmp.$$"
@@ -282,6 +354,23 @@ ledger_link() { # <repo> <n> <stem> rc 0 / 1
   return 0
 }
 
+# ledger_rekey <적힌 키> <n> <새 키> <URL> — claim 이 예약한 행의 키·URL 을 gh 응답의 html_url 기준으로 바꾼다.
+#   rc 0 / 8 새 키의 행이 이미 있음(예약한 행은 지운다) / 1 잠금·쓰기 실패(예약한 행은 그대로).
+ledger_rekey() {
+  lock_acquire || return 1
+  if [ "$1" != "$3" ] && has_row "$3" "$2"; then
+    if (umask 077; awk -F'\t' -v r="$1" -v n="$2" '!($1==r && $2==n)' "$LEDGER" > "$LEDGER.tmp.$$") && ledger_swap "$LEDGER.tmp.$$"; then
+      lock_release; return 8
+    fi
+    rm -f "$LEDGER.tmp.$$"; lock_release; return 1
+  fi
+  if (umask 077; awk -F'\t' -v OFS='\t' -v r="$1" -v n="$2" -v k="$3" -v u="$4" '$1==r && $2==n {$1=k; $3=u} {print}' "$LEDGER" > "$LEDGER.tmp.$$") \
+    && ledger_swap "$LEDGER.tmp.$$"; then
+    lock_release; return 0
+  fi
+  rm -f "$LEDGER.tmp.$$"; lock_release; return 1
+}
+
 # 값이 필요한 옵션 뒤에 값이 없으면 rc 2 (shift 2 실패로 같은 옵션을 무한히 도는 것을 막는다)
 need_val() { [ $# -ge 2 ] || { die "옵션 값이 없습니다: $1"; return 2; }; }
 
@@ -291,7 +380,8 @@ report_last() { # <남음|없음> <명령>
 }
 
 # 원격 결과를 알 수 없어 행을 남길 때: Issue URL 과 푸는 명령을 마지막 줄로 알린다.
-keep_row_report() { # <repo> <n>
+#   claim 은 장부 키(html_url 기준 `host/owner/repo`)를 넘기므로 URL 도 그 호스트다.
+keep_row_report() { # <장부 키> <n>
   repo_url "$1" "$2"
   die "Issue: $REPO_URL"
   report_last 남음 "$SELF_CMD release $1 $2"
@@ -391,61 +481,85 @@ EOF
 
 # ---- claim ----
 cmd_claim() {
-  local repo="$1" n="$2" rc info state cnt logins label a login
+  local repo="$1" n="$2" rc info state hurl cnt logins label a login key out=""
   [ -n "$repo" ] && [ -n "$n" ] || { die "사용법: claim <repo> <n>"; return 2; }
   claim_label; label="$CLAIM_LABEL"
   ledger_reserve "$repo" "$n"; rc=$?
   if [ "$rc" = 9 ]; then report_last 없음 "$SELF_CMD claim $repo $n"; return 9; fi
   if [ "$rc" = 8 ]; then die "이미 장부에 있는 선점입니다: $repo#$n"; return 8; fi
+  key="$repo"
   if ! info="$(view_issue "$repo" "$n")"; then
     die "Issue 를 조회하지 못했습니다: $repo#$n"
-    cleanup_row "$repo" "$n" 9; rc=$?
+    cleanup_row "$key" "$n" 9; rc=$?
     [ "$rc" = 9 ] && report_last 없음 "$SELF_CMD claim $repo $n"
     return "$rc"
   fi
-  IFS=$'\t' read -r state _hurl cnt logins <<EOF
+  IFS=$'\t' read -r state hurl cnt logins <<EOF
 $info
 EOF
-  if [ "$state" = closed ]; then die "닫힌 Issue 입니다: $repo#$n"; cleanup_row "$repo" "$n" 11; return $?; fi
-  if [ "$cnt" -gt 0 ]; then die "이미 담당자가 있습니다: $repo#$n ($logins)"; cleanup_row "$repo" "$n" 4; return $?; fi
+  # 장부 키·URL 을 gh 가 실제로 고른 호스트의 html_url 로 바꾼다(호스트 없는 저장소를 github.com 으로 추정하지 않는다).
+  #   html_url 이 없으면 적힌 저장소와 추정 URL 을 그대로 둔다. 원격 명령은 계속 적힌 저장소로 부른다(같은 셸, 같은 호스트).
+  if url_repo "$hurl" && [ "$URL_NUM" != "$n" ]; then
+    # 옮겨진 Issue — 적힌 번호의 원격 명령은 옮긴 곳의 다른 Issue 에 갈 수 있다. 원격을 바꾸기 전에 멈춘다.
+    #   rc 12 — /fr take 를 처음부터 다시 밟아야 FR 이 만들어지므로 claim 명령을 따로 안내하지 않는다.
+    die "Issue 가 다른 저장소로 옮겨졌습니다: $repo#$n → $hurl — 선점하지 않았습니다. 옮긴 곳의 Issue 는 /fr take 로 다시 고르십시오"
+    cleanup_row "$key" "$n" 12; return $?
+  fi
+  if url_repo "$hurl"; then
+    ledger_rekey "$repo" "$n" "$URL_REPO" "$hurl"; rc=$?
+    if [ "$rc" = 8 ]; then die "이미 장부에 있는 선점입니다: $URL_REPO#$n"; return 8; fi
+    if [ "$rc" != 0 ]; then
+      die "장부 행을 Issue URL 기준으로 바꾸지 못했습니다: $repo#$n"
+      cleanup_row "$key" "$n" 9; rc=$?
+      [ "$rc" = 9 ] && report_last 없음 "$SELF_CMD claim $repo $n"
+      return "$rc"
+    fi
+    key="$URL_REPO"; out="$hurl"
+  fi
+  if [ "$state" = closed ]; then die "닫힌 Issue 입니다: $repo#$n"; cleanup_row "$key" "$n" 11; return $?; fi
+  if [ "$cnt" -gt 0 ]; then die "이미 담당자가 있습니다: $repo#$n ($logins)"; cleanup_row "$key" "$n" 4; return $?; fi
   a=(issue edit "$n" --repo "$repo" --add-assignee @me)
   [ -n "$label" ] && a+=(--add-label "$label")
-  if ! "$GH" "${a[@]}" >/dev/null; then die "선점 호출이 실패했습니다(결과 불명). 장부 행을 남깁니다: $repo#$n"; keep_row_report "$repo" "$n"; return 7; fi
-  if ! info="$(view_issue "$repo" "$n")"; then die "선점 뒤 재조회가 실패했습니다(결과 불명). 장부 행을 남깁니다: $repo#$n"; keep_row_report "$repo" "$n"; return 7; fi
+  if ! "$GH" "${a[@]}" >/dev/null; then die "선점 호출이 실패했습니다(결과 불명). 장부 행을 남깁니다: $repo#$n"; keep_row_report "$key" "$n"; return 7; fi
+  if ! info="$(view_issue "$repo" "$n")"; then die "선점 뒤 재조회가 실패했습니다(결과 불명). 장부 행을 남깁니다: $repo#$n"; keep_row_report "$key" "$n"; return 7; fi
   IFS=$'\t' read -r state _hurl cnt logins <<EOF
 $info
 EOF
   if [ "$state" = closed ]; then
-    remote_release "$repo" "$n" || { die "자기 지정 해제가 실패했습니다. 장부 행을 남깁니다"; keep_row_report "$repo" "$n"; return 7; }
-    die "닫힌 Issue 입니다: $repo#$n"; cleanup_row "$repo" "$n" 11; return $?
+    remote_release "$repo" "$n" || { die "자기 지정 해제가 실패했습니다. 장부 행을 남깁니다"; keep_row_report "$key" "$n"; return 7; }
+    die "닫힌 Issue 입니다: $repo#$n"; cleanup_row "$key" "$n" 11; return $?
   fi
   if [ "$cnt" -gt 1 ]; then
-    remote_release "$repo" "$n" || { die "자기 지정 해제가 실패했습니다. 장부 행을 남깁니다"; keep_row_report "$repo" "$n"; return 7; }
-    die "경합: 다른 담당자가 동시에 지정됐습니다. 물러났습니다: $repo#$n"; cleanup_row "$repo" "$n" 5; return $?
+    remote_release "$repo" "$n" || { die "자기 지정 해제가 실패했습니다. 장부 행을 남깁니다"; keep_row_report "$key" "$n"; return 7; }
+    die "경합: 다른 담당자가 동시에 지정됐습니다. 물러났습니다: $repo#$n"; cleanup_row "$key" "$n" 5; return $?
   fi
   split_repo "$repo"
   login="$(get_login "$RHOST")"
   case ",$logins," in
-    *",$login,"*) [ -n "$login" ] && { repo_url "$repo" "$n"; printf '%s\n' "$REPO_URL"; return 0; } ;;
+    *",$login,"*) [ -n "$login" ] && { [ -n "$out" ] || { repo_url "$repo" "$n"; out="$REPO_URL"; }; printf '%s\n' "$out"; return 0; } ;;
   esac
-  remote_release "$repo" "$n" || { die "자기 지정 해제가 실패했습니다. 장부 행을 남깁니다"; keep_row_report "$repo" "$n"; return 7; }
+  remote_release "$repo" "$n" || { die "자기 지정 해제가 실패했습니다. 장부 행을 남깁니다"; keep_row_report "$key" "$n"; return 7; }
   die "내 계정이 담당자로 지정되지 않았습니다: $repo#$n"
-  cleanup_row "$repo" "$n" 6; return $?
+  cleanup_row "$key" "$n" 6; return $?
 }
 
 cmd_link() {
   local left=없음
   [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ] || { die "사용법: link <repo> <n> <fr-stem>"; return 2; }
-  ledger_path
-  if ledger_link "$1" "$2" "$3"; then return 0; fi
-  has_row "$1" "$2" && left=남음
+  need_key "$1" "$2" link "$3" || return $?
+  if ledger_link "$KEY" "$2" "$3"; then return 0; fi
+  has_row "$KEY" "$2" && left=남음
   report_last "$left" "$SELF_CMD link $1 $2 $3"
   return 9
 }
 
+# release <repo> <n> — 장부 행의 키(호스트 포함)로 원격 선점을 푼다. 행이 없으면 적힌 저장소로 푼다.
 cmd_release() {
-  if ! remote_release "$1" "$2"; then die "원격 해제가 실패했습니다. 장부 행을 남깁니다: $1#$2"; keep_row_report "$1" "$2"; return 7; fi
-  cleanup_row "$1" "$2" 0
+  local key
+  need_key "$1" "$2" release || return $?
+  key="$KEY"
+  if ! remote_release "$key" "$2"; then die "원격 해제가 실패했습니다. 장부 행을 남깁니다: $key#$2"; keep_row_report "$key" "$2"; return 7; fi
+  cleanup_row "$key" "$2" 0
 }
 
 cmd_release_fr() {
@@ -576,7 +690,10 @@ EOF
 #   원격을 건드리지 않는 `forget <적힌 저장소> <번호>` 다(같은 행을 같은 규칙으로 지운다).
 #   호스트가 적힌 참조인데 같은 번호의 호스트 없는 행이 있으면 지우지 않고 알린다(--skip-closed 면 kept-row 줄) — 그 행이
 #   가리키는 호스트는 선점한 셸의 gh 기본 호스트라 여기서 확정할 수 없다.
+#   close_one 이 html_url 에서 얻은 키(CLOSE_KEY)가 있으면 그 키의 행도 지운다(claim 이 쓴 `host/owner/repo` 행).
 CLOSE_SKIP=0
+CLOSE_KEY=""
+CLOSE_STEM=""
 cleanup_closed_row() {
   local slug
   ledger_path
@@ -590,11 +707,36 @@ cleanup_closed_row() {
         die "장부에 호스트 없는 선점 행 $slug#$2 이 남았습니다 — 같은 Issue 면 $SELF_CMD forget $slug $2 로 장부 행만 지우십시오(원격은 건드리지 않습니다)"
       fi ;;
   esac
-  if ! ledger_delete_ref "$1" "$2"; then
-    [ "$CLOSE_SKIP" = 1 ] && printf 'ledger-left %s %s\n' "$1" "$2"
-    report_last 남음 "$SELF_CMD forget $1 $2"
-    return 10
+  # claim 이 html_url 로 만든 키(CLOSE_KEY)의 행과 적힌 키의 행을 지운다. 둘이 같으면(대소문자 무시) 한 번만 지운다.
+  #   하나가 실패해도 다른 하나를 시도하고, 실패한 키마다 ledger-left 줄과 forget 안내를 낸다.
+  local k other keys="$1" left=0 own="|${CLOSE_STEM:--}|"
+  if [ -n "$CLOSE_KEY" ] && [ "$(printf '%s' "$CLOSE_KEY" | tr 'A-Z' 'a-z')" != "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" ]; then
+    keys="$CLOSE_KEY"$'\n'"$1"
   fi
+  while IFS= read -r k; do
+    # html_url 키(CLOSE_KEY)는 FR 에 적힌 참조가 아니다 — 이 FR(CLOSE_STEM) 또는 연결 FR 없는 행만 지우고,
+    #   다른 FR 에 연결된 같은 Issue 의 행은 남긴다(호스트 없는 옛 FR 을 다른 기본 호스트에서 발행하는 경우).
+    DEL_STEM=""
+    if [ "$k" = "$CLOSE_KEY" ] && [ "$k" != "$1" ]; then
+      DEL_STEM="$own"
+      # 보존 판정과 FR 이름을 장부 한 번 읽기로 얻는다 — 두 번 읽으면 그 사이의 forget 이 이름을 비운다.
+      #   찾으면 `=<FR>` 을 내므로 빈 값은 「행 없음」 뿐이다.
+      other=""
+      [ -f "$LEDGER" ] && other="$(awk -F'\t' -v r="$k" -v n="$2" -v s="$DEL_STEM" 'tolower($1)==tolower(r) && $2==n && $4!="-" && !index(s, "|" $4 "|") {print "=" $4; exit}' "$LEDGER" 2>/dev/null)"
+      if [ -n "$other" ]; then
+        [ "$CLOSE_SKIP" = 1 ] && printf 'kept-other-fr %s %s %s\n' "$k" "$2" "${other#=}"
+        die "다른 FR 에 연결된 선점 행 $k#$2 은 남겼습니다 — 그 FR 의 선점입니다"
+      fi
+    fi
+    if ledger_delete_ref "$k" "$2"; then DEL_STEM=""; continue; fi
+    DEL_STEM=""
+    left=1
+    [ "$CLOSE_SKIP" = 1 ] && printf 'ledger-left %s %s\n' "$k" "$2"
+    report_last 남음 "$SELF_CMD forget $k $2"
+  done <<EOF
+$keys
+EOF
+  [ "$left" = 0 ] || return 10
   return 0
 }
 
@@ -602,6 +744,8 @@ cleanup_closed_row() {
 # forget <repo> <n> — 원격을 건드리지 않고 장부 행만 지운다(저장소 키 대소문자 무시). rc 0 / 10 실패.
 cmd_forget() {
   [ -n "$1" ] && [ -n "$2" ] || { die "사용법: forget <repo> <n>"; return 2; }
+  # 복구 명령이므로 적힌 키의 행만 지운다 — 호스트 없는 키로 호스트 붙은 행을 찾지 않는다. 안내한 forget 을 다시
+  #   실행해도 다른 호스트의 같은 번호 행(다른 FR 의 선점)을 지우지 않게 한다.
   if ledger_delete_ref "$1" "$2"; then return 0; fi
   report_last 남음 "$SELF_CMD forget $1 $2"
   return 10
@@ -621,7 +765,10 @@ close_one() {
   IFS=$'\t' read -r state hurl cnt logins <<EOF
 $info
 EOF
-  if [ -z "$hurl" ] || [ "$hurl" = "-" ]; then repo_url "$repo" "$n"; hurl="$REPO_URL"; fi
+  # 장부 키는 gh 가 돌려준 html_url 로만 만든다 — 추정 URL(github.com)로는 다른 호스트의 행을 지울 수 있다.
+  CLOSE_KEY=""
+  if [ -z "$hurl" ] || [ "$hurl" = "-" ]; then repo_url "$repo" "$n"; hurl="$REPO_URL"
+  elif url_repo "$hurl" && [ "$URL_NUM" = "$n" ]; then CLOSE_KEY="$URL_REPO"; fi
   REPO_URL="$hurl"
   # --skip-closed: 이미 닫힌 Issue 는 댓글·닫기 없이 장부 행만 정리한다.
   if [ "$skip" = 1 ] && [ "$state" = closed ]; then
@@ -701,7 +848,7 @@ cmd_issue_refs() {
 #   gh 를 부르기 전에 모든 조각을 검사해, 어긋난 조각이 있으면 아무것도 건드리지 않고 rc 2.
 #   한 Issue 가 실패해도 나머지를 처리하고 처음 실패한 rc 를 돌려준다.
 cmd_close_fr() {
-  local detail="$1" url="" skip=0 gi tok list="" r rc=0 remote_rc=0 total=0 failed="" closed_list="" skipped_list="" reason
+  local detail="$1" url="" skip=0 gi tok list="" r rc=0 remote_rc=0 total=0 failed="" closed_list="" skipped_list="" reason hs
   shift
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -712,6 +859,11 @@ cmd_close_fr() {
   done
   [ -n "$url" ] || { die "사용법: close-fr <detail> --commit-url <URL> [--skip-closed]"; return 2; }
   CLOSE_SKIP="$skip"
+  # 이 FR 의 stem 목록(`stem|stem`): 상세 파일 이름과 상세 첫 줄(`# YYYY-MM-DD 이름` → `YYYY-MM-DD-이름`, fr/add.md 형식).
+  #   발행(archive.sh)은 상세를 임시 파일로 넘기므로 파일 이름만으로는 FR 을 알 수 없다.
+  CLOSE_STEM="$(basename "$detail" .md)"
+  hs="$(sed -n '1s/^# \([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\) \([^ ][^ ]*\)[ \r]*$/\1-\2/p' "$detail" 2>/dev/null)" || hs=""
+  [ -n "$hs" ] && CLOSE_STEM="$CLOSE_STEM|$hs"
   gi="$(read_issue_value "$detail")" || { die "FR 상세를 읽을 수 없습니다: $detail"; return 2; }
   if [ -z "$gi" ] || [ "$gi" = "-" ]; then return 0; fi
   parse_issue_refs "$gi" || return 2

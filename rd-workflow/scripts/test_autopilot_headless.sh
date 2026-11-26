@@ -10,6 +10,10 @@ TMP="$(mktemp -d)" || { echo "test_autopilot_headless.sh: 임시 디렉터리 �
 [[ -n "$TMP" && -d "$TMP" ]] || { echo "test_autopilot_headless.sh: 임시 디렉터리 경로 검증 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 
+# 호출 셸·설치본 설정이 기존 케이스에 새지 않게 격리한다 (무인 모델·effort 선택 변수).
+unset RD_HEADLESS_CLAUDE_MODEL RD_HEADLESS_CLAUDE_EFFORT RD_HEADLESS_FIXED_MODEL RD_HEADLESS_FIXED_EFFORT RD_HEADLESS_FIXED_LINE
+export RD_MODELS_CONFIG="${TMP}/none.json"
+
 FAIL=0
 assert_exit() {
   local desc="$1" outcome="$2" expected="$3"
@@ -330,6 +334,22 @@ case "$RD_FAKE_MODE" in
   unsafe)
     echo 'archive: 완료. tag=archive/x-1'
     echo 'archive: 안전 불변식 위반 — y' >&2; exit 1 ;;
+  manualnote)
+    echo 'archive: 안내 — 반영 방식 manual 인 submodule 의 발행 gitlink 가 팀 기본 브랜치에 없는 커밋입니다.'
+    echo 'archive:   - libs/prod: abc1234 가 origin/main 에 없습니다'
+    echo 'archive:   반영 방식 설정: team_publish.mode'
+    echo 'archive: 완료. tag=archive/x-1'
+    echo 'archive: submodule libs/other 를 팀 기본 브랜치와 비교하지 못해 안내를 건너뜁니다 — 팀 원격 origin 이 없습니다' >&2 ;;
+  notice-hang)
+    git -c user.name=t -c user.email=t@t commit --allow-empty -qm 'merge: x (archive)'
+    git tag fr/2026/x
+    echo 'archive: 완료. tag=fr/2026/x'
+    echo 'archive: submodule libs/prod 의 발행 gitlink 를 팀 기본 브랜치와 비교합니다 (git ls-remote, 최대 20초)' >&2
+    printf '%s\n' "$$" > "$RD_FAKE_PIDFILE"; exec sleep 60 ;;
+  done-hang)
+    git -c user.name=t -c user.email=t@t commit --allow-empty -qm 'merge: x (archive)'
+    echo 'archive: 완료. tag=fr/2026/x'
+    printf '%s\n' "$$" > "$RD_FAKE_PIDFILE"; exec sleep 60 ;;
   silent) exit 0 ;;
   already) echo 'archive: 이미 archive 완료 — nothing to do (tag=fr/2026/x)' ;;
   premerged) echo 'archive: fr/x 이미 merge 됨 — skip'; echo 'archive: push 실패' >&2; exit 1 ;;
@@ -390,6 +410,11 @@ p_check "발행 A args 에 --task x" "$([[ "$(cat "$RD_FAKE_ARGS")" == *"--task 
 p_check "발행 A args 에 --no-remote 없음" "$([[ "$(cat "$RD_FAKE_ARGS")" != *"--no-remote"* ]]; echo $?)"
 p_check "발행 A 발행 완료·push 정책 줄" "$([[ "$P_ALL" == *"autopilot_headless: 발행 완료"* && "$P_ALL" == *"push 정책"* ]]; echo $?)"
 p_check "발행 A 정리 잔여 복구 줄 전달" "$([[ "$P_ALL" == *"archive:     복구: cmd"* ]]; echo $?)"
+
+run_pub AM push manualnote "$PO"
+p_exit_outcome "발행 AM manual gitlink 안내" 0 completed
+p_check "발행 AM 결과에 manual gitlink 안내 묶음 전달" "$([[ "$(cat "$P_OF")" == *"안내 — 반영 방식 manual"*"libs/prod: abc1234"*"반영 방식 설정:"* ]]; echo $?)"
+p_check "발행 AM 결과에 비교 건너뜀 경로·원인 전달" "$([[ "$(cat "$P_OF")" == *"libs/other 를 팀 기본 브랜치와 비교하지 못해 안내를 건너뜁니다 — 팀 원격 origin 이 없습니다"* ]]; echo $?)"
 
 run_pub B merge ok "$PO"
 p_exit_outcome "발행 B merge ok" 0 completed
@@ -452,6 +477,17 @@ pid_gone() {  # pid 파일의 프로세스가 없으면 0 (파일이 없으면 �
 }
 TCAP=(RD_PUBLISH_WALL_MINUTES=0.02 RD_FR_WALL_GRACE_SECONDS=1)
 
+# AN 완료 줄 뒤 manual gitlink 비교 중 상한 → 발행 성공으로 기록하고 비교가 끊겼다고 알린다
+run_pub AN push notice-hang "$PO" "" "${TCAP[@]}"
+p_exit_outcome "AN 완료 뒤 비교 중 상한" 0 completed
+p_check "AN 결과에 비교 끊김 안내(원인: 시간 상한)" "$([[ "$(cat "$P_OF")" == *"비교가 끝나지 않았습니다(발행 시간 상한"* ]]; echo $?)"
+p_check "AN 발행 줄에 끊김 표시" "$([[ "$P_ALL" == *"manual gitlink 비교 끊김(발행 시간 상한"* ]]; echo $?)"
+p_check "AN pid 부재" "$(pid_gone "$P_PIDFILE"; echo $?)"
+# AD 완료 줄 뒤 비교 시작 줄 없이 상한 → 종전대로 성공으로 보지 않는다
+run_pub AD push done-hang "$PO" "" "${TCAP[@]}"
+p_check "AD 완료 줄만 있고 상한 → completed 아님" "$([[ "$P_FIRST" != completed ]]; echo $?)"
+p_check "AD pid 부재" "$(pid_gone "$P_PIDFILE"; echo $?)"
+
 # T1 멈춘 발행 + TERM 무시 → 감시가 상한에서 TERM, 유예 뒤 KILL
 run_pub T1 push hang-noterm "$PO" "" "${TCAP[@]}"
 p_exit_outcome "T1 발행 상한 초과" 20 blocked:publish-failed
@@ -464,10 +500,12 @@ p_check "T1 경과가 가짜 발행 수명(60초) 미만 (${P_ELAPSED}초)" "$((
 reap_pidfile "$P_PIDFILE"
 
 # T2 merge 뒤 멈춤 → incomplete, 이어붙이기 안내
-run_pub T2 push merge-hang "$PO" "" "${TCAP[@]}"
+#   가짜 발행이 상한 안에 merge 커밋을 만들어야 전제가 선다. 1.2초(0.02분)는 부하에서 git commit 이 넘길 수 있어
+#   T2 만 3초(0.05분)로 둔다. 비용은 약 2초다.
+run_pub T2 push merge-hang "$PO" "" RD_PUBLISH_WALL_MINUTES=0.05 RD_FR_WALL_GRACE_SECONDS=1
 p_exit_outcome "T2 merge 뒤 상한 초과" 20 blocked:publish-incomplete
 p_check "T2 --fr-branch 안내" "$([[ "$P_ALL" == *"--fr-branch fr/x"* ]]; echo $?)"
-p_check "T2 발행 줄 상한 초과" "$([[ "$P_ALL" == *"autopilot_headless: 발행 시간 상한(0.02분) 초과 — 병합됐으나"* ]]; echo $?)"
+p_check "T2 발행 줄 상한 초과" "$([[ "$P_ALL" == *"autopilot_headless: 발행 시간 상한(0.05분) 초과 — 병합됐으나"* ]]; echo $?)"
 reap_pidfile "$P_PIDFILE"
 
 # T3 발행 중 wrapper 가 TERM 을 받음 → 발행 그룹 회수, 143
@@ -535,6 +573,151 @@ j_check "J8 비용 줄 확인 불가 — 비용 값이 유한한 0 이상의 수
   "$(printf '%s\n' "$J_OUT" | grep -qxF 'autopilot_headless: 실행 비용 확인 불가 — 비용 값이 유한한 0 이상의 수가 아님'; echo $?)"
 j_check "J8 기록 줄 cost unknown" \
   "$([[ "$(cat "$J8_FILE" 2>/dev/null)" == "$(printf 'cost\tunknown\t비용 값이 유한한 0 이상의 수가 아님')" ]]; echo $?)"
+
+# ------------------------------------------------------------
+# 무인 절 해석 (model_select.sh headless)
+# ------------------------------------------------------------
+MS_SH="${SCRIPT_DIR}/model_select.sh"
+HL_BIN="${TMP}/hlbin"; mkdir -p "$HL_BIN"
+cat > "${HL_BIN}/claude" <<'FAKE'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--help" ]]; then
+  printf '%s\n' "${RD_FAKE_HELP-  --model <model>
+  --effort <level>}"
+  exit 0
+fi
+if [[ "${1:-}" == "-p" ]]; then
+  [[ -n "${RD_FAKE_ARGS:-}" ]] && printf '%s\n' "$@" > "$RD_FAKE_ARGS"
+  [[ -n "${RD_AUTOPILOT_OUTCOME_FILE:-}" ]] && printf 'queue-empty\n' > "$RD_AUTOPILOT_OUTCOME_FILE"
+  printf '{"result":"ok"}\n'
+  exit 0
+fi
+exit 0
+FAKE
+chmod +x "${HL_BIN}/claude"
+# jq 없는 PATH: 가짜 claude 와 기본 도구만 링크한다.
+HL_NOJQ="${TMP}/hlnojq"; mkdir -p "$HL_NOJQ"
+for _t in bash awk grep sed cat dirname basename head tr env cut; do
+  _p="$(command -v "$_t" 2>/dev/null)" && ln -sf "$_p" "${HL_NOJQ}/${_t}"
+done
+ln -sf "${HL_BIN}/claude" "${HL_NOJQ}/claude"
+
+HL_OUT=""; HL_ERR=""; HL_RC=0
+# hl_run <설정 파일 내용|-> <env 할당…> -- <인자…> ; `-` 는 파일 없음, 빈 문자열은 빈 파일
+hl_run() {
+  local content="$1"; shift
+  local envs=()
+  while [[ "${1:-}" != "--" ]]; do envs+=("$1"); shift; done
+  shift
+  local conf="${TMP}/hl-models.json"; rm -f "$conf"
+  [[ "$content" == "-" ]] || printf '%s' "$content" > "$conf"
+  local hlpath="${HL_PATH:-${HL_BIN}:${PATH}}"
+  HL_RC=0
+  env RD_MODELS_CONFIG="$conf" PATH="$hlpath" ${envs[@]+"${envs[@]}"} \
+    "$BASH" "$MS_SH" headless "$@" >"${TMP}/hl.out" 2>"${TMP}/hl.err" || HL_RC=$?
+  HL_OUT="$(cat "${TMP}/hl.out")"; HL_ERR="$(cat "${TMP}/hl.err")"
+}
+hl_pass() { echo "  PASS: $1"; }
+hl_fail() { echo "  FAIL: $1 — $2" >&2; FAIL=1; }
+# hl_line <설명> <기대 rc> <기대 표시 줄 전체>
+hl_line() {
+  if [[ "$HL_RC" == "$2" && "$HL_OUT" == "$3" ]]; then hl_pass "$1"
+  else hl_fail "$1" "rc=${HL_RC} out=[${HL_OUT}] err=[${HL_ERR}]"; fi
+}
+# hl_fails <설명> <stderr 에 있어야 할 문자열…> — rc 1 이어야 한다
+hl_fails() {
+  local desc="$1"; shift
+  local miss="" w
+  for w in "$@"; do case "$HL_ERR" in *"$w"*) ;; *) miss="${miss} [${w}]" ;; esac; done
+  if [[ "$HL_RC" == 1 && -z "$miss" ]]; then hl_pass "$desc"
+  else hl_fail "$desc" "rc=${HL_RC} 없는 문구:${miss} err=[${HL_ERR}]"; fi
+}
+
+HL_UNSET='무인 세션 모델: CLI 기본값 (미설정) · effort: CLI 기본값 (미설정)'
+hl_run - -- ;                  hl_line "headless 미설정 (파일 없음)" 0 "$HL_UNSET"
+hl_run '{"review":{}}' -- ;    hl_line "headless review 전용 파일" 0 "$HL_UNSET"
+hl_run '{"headless":{"claude":{"model":"default","effort":"default"}}}' --
+hl_line "headless default 지정" 0 '무인 세션 모델: CLI 기본값 (default 지정, models.json headless.claude.model) · effort: CLI 기본값 (default 지정, models.json headless.claude.effort)'
+
+HL_FILE='{"headless":{"claude":{"model":"opus","effort":"low"}}}'
+hl_run "$HL_FILE" RD_HEADLESS_CLAUDE_MODEL=haiku RD_HEADLESS_CLAUDE_EFFORT=high --
+hl_line "headless 두 칸 동시 환경 변수 우선" 0 '무인 세션 모델: haiku (환경 변수 RD_HEADLESS_CLAUDE_MODEL) · effort: high (환경 변수 RD_HEADLESS_CLAUDE_EFFORT)'
+hl_run "$HL_FILE" RD_HEADLESS_CLAUDE_EFFORT=high --
+hl_line "headless 칸별 대체 (effort 만 env)" 0 '무인 세션 모델: opus (models.json headless.claude.model) · effort: high (환경 변수 RD_HEADLESS_CLAUDE_EFFORT)'
+hl_run "$HL_FILE" RD_HEADLESS_CLAUDE_MODEL=haiku --
+hl_line "headless 칸별 대체 (model 만 env)" 0 '무인 세션 모델: haiku (환경 변수 RD_HEADLESS_CLAUDE_MODEL) · effort: low (models.json headless.claude.effort)'
+hl_run "$HL_FILE" RD_HEADLESS_CLAUDE_MODEL=haiku RD_HEADLESS_CLAUDE_EFFORT=low -- --model sonnet --effort high
+hl_line "headless 플래그가 환경 변수보다 우선" 0 '무인 세션 모델: sonnet (플래그 --model) · effort: high (플래그 --effort)'
+hl_run - -- --effort ultra
+hl_line "headless ultra 는 max 로 바꿔 표시" 0 '무인 세션 모델: CLI 기본값 (미설정) · effort: ultra → max (플래그 --effort)'
+case "$HL_ERR" in *"'max' 로 바꿉니다"*) hl_pass "headless ultra 경고 줄" ;; *) hl_fail "headless ultra 경고 줄" "err=[${HL_ERR}]" ;; esac
+
+hl_run - -- --model gpt-5;                       hl_fails "headless (a) 플래그 모델 형식 오류" "플래그 --model" "opus"
+hl_run - RD_HEADLESS_CLAUDE_EFFORT=turbo -- ;   hl_fails "headless (a2) 환경 변수 effort 형식 오류" "환경 변수 RD_HEADLESS_CLAUDE_EFFORT" "low"
+hl_run '{"headless":{"claude":{"effort":"turbo"}}}' -- ; hl_fails "headless (b) 파일 effort 형식 오류" "hl-models.json" "headless.claude.effort" "low"
+hl_run "" -- ;                                  hl_fails "headless (c) 빈 파일" "파일을 고치십시오"
+hl_run '{"headless":' -- ;                      hl_fails "headless (c) 문법 오류 파일" "파일을 고치십시오"
+hl_run $'{"headless":{}}\n{"headless":{}}' -- ; hl_fails "headless (c) 객체 두 개 파일" "파일을 고치십시오"
+hl_run '{"headless":"x"}' -- ;                  hl_fails "headless (c) headless 비객체" "파일을 고치십시오"
+HL_PATH="$HL_NOJQ"
+hl_run '{"headless":{"claude":{"model":"opus"}}}' -- ; hl_fails "headless (d) jq 없음 + headless 절" "brew install jq"
+hl_run '{"review":{}}' -- ;                     hl_line "headless (d') jq 없음 + review 전용" 0 "$HL_UNSET"
+unset HL_PATH
+hl_run '{"headless":{"claude":{"effort":"turbo"}}}' -- --model sonnet
+hl_fails "headless 플래그 정상 + 파일 effort 오류" "headless.claude.effort"
+hl_run - RD_FAKE_HELP="  --model <model>" -- --effort high
+hl_fails "headless strict CLI 가 --effort 미지원" "claude update"
+HL_PATH="$HL_NOJQ"; rm -f "${HL_NOJQ}/claude"
+hl_run - -- --model sonnet
+hl_line "headless claude 없음이면 지원 확인 생략" 0 '무인 세션 모델: sonnet (플래그 --model) · effort: CLI 기본값 (미설정)'
+unset HL_PATH
+hl_run - -- --model;                            hl_fails "headless 인자 (값 없는 --model)" "사용법"
+hl_run - -- --model sonnet --model haiku;       hl_fails "headless 인자 (--model 중복)" "사용법"
+hl_run - -- --bogus;                            hl_fails "headless 인자 (모르는 인자)" "사용법"
+
+# ------------------------------------------------------------
+# wrapper 인자 전달 (--model / --effort 와 표시 줄) — setsid 경로만 본다
+# ------------------------------------------------------------
+WR_CWD="${TMP}/wrcwd"; mkdir -p "$WR_CWD"
+WR_RC=0; WR_ERR=""; WR_N=0; WR_ARGS=""
+# wr_run <env 할당…> — 가짜 claude 로 wrapper 를 실제 기동한다. 케이스마다 outcome·args 파일이 따로다.
+wr_run() {
+  WR_N=$((WR_N + 1)); WR_ARGS="${TMP}/wr-args-${WR_N}"
+  rm -f "$WR_ARGS"
+  WR_RC=0
+  ( cd "$WR_CWD" && env RD_AUTOPILOT_FR=auto RD_FR_WALL_MINUTES=0 RD_AUTOPILOT_OUTCOME_FILE="${TMP}/wr-outcome-${WR_N}" \
+      RD_FAKE_ARGS="$WR_ARGS" RD_MODELS_CONFIG="${TMP}/none.json" PATH="${HL_BIN}:${PATH}" ${@+"$@"} \
+      "$BASH" "$WRAPPER" >"${TMP}/wr.out" 2>"${TMP}/wr.err" ) || WR_RC=$?
+  WR_ERR="$(cat "${TMP}/wr.err")"
+}
+arg_after() {  # arg_after <args 파일> <옵션> — 옵션이 정확히 한 번 나오면 바로 다음 줄 (없거나 두 번 이상이면 빈 값)
+  awk -v o="$2" '$0 == o { c++; if (c == 1) getline v } END { if (c == 1) print v }' "$1" 2>/dev/null
+}
+has_line() { grep -qxF -- "$2" "$1" 2>/dev/null; }
+wr_check() {  # wr_check <설명> <조건 rc 0=참>
+  if [[ "$2" == 0 ]]; then hl_pass "$1"; else hl_fail "$1" "rc=${WR_RC} err=[${WR_ERR}] args=[$(tr '\n' ' ' < "$WR_ARGS" 2>/dev/null)]"; fi
+}
+
+wr_run RD_HEADLESS_CLAUDE_MODEL=sonnet RD_HEADLESS_CLAUDE_EFFORT=high
+wr_check "wrapper env 값 --model" "$([[ "$(arg_after "$WR_ARGS" --model)" == sonnet ]]; echo $?)"
+wr_check "wrapper env 값 --effort" "$([[ "$(arg_after "$WR_ARGS" --effort)" == high ]]; echo $?)"
+wr_check "wrapper env 값 stderr 표시 줄·exit 30" "$([[ "$WR_RC" == 30 && "$WR_ERR" == *$'autopilot_headless: 무인 세션 모델: sonnet (환경 변수 RD_HEADLESS_CLAUDE_MODEL) · effort: high (환경 변수 RD_HEADLESS_CLAUDE_EFFORT)'* ]]; echo $?)"
+
+wr_run
+wr_check "wrapper 미설정 args 파일에 -p" "$([[ -f "$WR_ARGS" ]] && has_line "$WR_ARGS" -p; echo $?)"
+wr_check "wrapper 미설정 --model·--effort 없음" "$(! has_line "$WR_ARGS" --model && ! has_line "$WR_ARGS" --effort; echo $?)"
+
+FIXED_LINE='무인 세션 모델: opus (플래그 --model) · effort: CLI 기본값 (미설정)'
+printf '{"headless":{"claude":{"model":"haiku","effort":"high"}}}' > "${TMP}/wr-models.json"
+wr_run RD_MODELS_CONFIG="${TMP}/wr-models.json" RD_HEADLESS_FIXED_MODEL=opus RD_HEADLESS_FIXED_EFFORT= RD_HEADLESS_FIXED_LINE="$FIXED_LINE"
+wr_check "wrapper 고정 값 --model 은 고정 값" "$([[ "$(arg_after "$WR_ARGS" --model)" == opus ]]; echo $?)"
+wr_check "wrapper 고정 값 --effort 없음" "$(! has_line "$WR_ARGS" --effort; echo $?)"
+wr_check "wrapper 고정 값 표시 줄 그대로" "$([[ "$WR_ERR" == *"autopilot_headless: ${FIXED_LINE}"* ]]; echo $?)"
+
+# AC7 직접 호출 (비strict): CLI 가 --effort 를 몰라 effort 를 빼고 계속한다
+wr_run RD_FAKE_HELP="  --model <model>" RD_HEADLESS_CLAUDE_EFFORT=high
+wr_check "wrapper CLI 미지원 --effort 뺌" "$(! has_line "$WR_ARGS" --effort; echo $?)"
+wr_check "wrapper CLI 미지원 경고·표시 줄·exit 30" "$([[ "$WR_RC" == 30 && "$WR_ERR" == *"claude update"* && "$WR_ERR" == *"effort: CLI 기본값 (CLI 미지원으로 뺌, 환경 변수 RD_HEADLESS_CLAUDE_EFFORT)"* ]]; echo $?)"
 
 if [[ $FAIL == 0 ]]; then echo "test_autopilot_headless: PASS"; exit 0
 else echo "test_autopilot_headless: FAIL" >&2; exit 1; fi

@@ -2,8 +2,12 @@
 """/fr do 고르기. fr_relations.sh candidates 출력을 줄기·순서·보류·제외 줄로 바꿉니다.
 
 사용: python3 -I pick.py --mode interactive|headless [--slugs "<s> <s>"]
-        [--max-streams N] [--root <ROOT>] [--active <active.tsv 경로>]
-출력: stream/order/hold/skip 줄(탭 구분). rc 0 정상 / 2 실행 불가.
+        [--max-streams N] [--root <ROOT>] [--active <active.tsv 경로>] [--exclude "<stem> <stem>"]
+출력: stream/order/hold/skip/stale 줄(탭 구분). rc 0 정상 / 2 실행 불가.
+감시 목록 줄은 <ROOT> 저장소에 로컬 브랜치 fr/<slug> 가 있을 때만 실행 중으로 셉니다(중복 착수 확인과 같은 기준).
+git 이 브랜치 없음(rc 1)으로 답한 줄은 낡은 줄이라 보류·겹침·동시 상한에 쓰지 않고 stale 줄로 냅니다.
+그 밖의 git 실패는 실행 중으로 둡니다.
+--exclude 의 FR 은 `skip <stem> 이번 회차 중복 착수` 로 뺍니다.
 """
 import argparse
 import json
@@ -105,6 +109,16 @@ def read_active(path):
     return out
 
 
+def branch_gone(root, slug):
+    """<root> 저장소에 refs/heads/fr/<slug> 가 없다고 git 이 답하면(rc 1) True. git 실패는 False(실행 중으로 봄)."""
+    try:
+        r = subprocess.run(["git", "-C", root, "show-ref", "--verify", "--quiet", "refs/heads/fr/" + slug],
+                           capture_output=True, stdin=subprocess.DEVNULL)
+    except OSError:
+        return False
+    return r.returncode == 1
+
+
 def max_streams_default(root):
     try:
         with open(os.path.join(root, "rd-workflow", "config", "workflow.json"), encoding="utf-8") as fh:
@@ -127,6 +141,7 @@ def main():
     ap.add_argument("--max-streams", type=int, default=None)
     ap.add_argument("--root", default=os.getcwd())
     ap.add_argument("--active", default=None)
+    ap.add_argument("--exclude", default="")
     try:
         a = ap.parse_args()
     except SystemExit as e:
@@ -159,6 +174,16 @@ def main():
                 die("상태 폴더를 찾지 못했습니다 — git worktree list 실패. --active 로 지정하십시오")
             active_path = os.path.join(sd, "active.tsv")
         active = read_active(active_path)
+    stale = []
+    live = []
+    for row in active:
+        if branch_gone(a.root, row[0]):
+            if row[0] not in stale:
+                stale.append(row[0])
+        else:
+            live.append(row)
+    active = live
+    excluded = set(a.exclude.split())
     running = {}
     for slug, _paths, stems in active:
         for st_ in stems:
@@ -167,7 +192,10 @@ def main():
     holds = {}
     order, skips, eligible = [], [], []
     for stem, st, _pri, verdict in cands:
-        if stem in running:
+        if stem in excluded:
+            # 호출 세션이 이번 회차에서 뺀 FR 은 다른 판정보다 먼저 이 사유로 냅니다.
+            skips.append("skip\t%s\t이번 회차 중복 착수" % stem)
+        elif stem in running:
             # 이미 실행 중인 줄기가 맡은 FR 은 상태·경로와 상관없이 다시 띄우지 않습니다.
             holds[stem] = "실행 중 줄기 %s 의 FR" % running[stem]
         elif st not in statuses:
@@ -232,6 +260,7 @@ def main():
         if c[0] in holds:
             lines.append("hold\t%s\t%s" % (c[0], holds[c[0]]))
     lines += skips
+    lines += ["stale\t%s\t로컬 브랜치 fr/%s 없음" % (s, s) for s in stale]
     if lines:
         print("\n".join(lines))
     return 0

@@ -107,11 +107,163 @@ FKEOF
   chk $? "example-copy 가짜 codex 가 effort high 를 받음"
 }
 
+# ============================================================
+# 구현 subagent 칸 (change-spec subagent-model-effort-selection D2~D4·D8)
+# 자기 하네스를 함수 안에서 만든다: $TMP/sa 아래 사본 트리와 jq 를 뺀 PATH 폴더.
+# ============================================================
+subagent_cli_case() {
+  local SAP="$TMP/sa" SAC SANOJQ d SAPY=1
+  mkdir -p "$SAP/rd-workflow/scripts" "$SAP/rd-workflow/config"
+  cp "${script_dir}/model_select.sh" "$SAP/rd-workflow/scripts/model_select.sh"
+  SAC="$SAP/rd-workflow/config"
+  SANOJQ="$TMP/sa-nojq"; mkdir -p "$SANOJQ"
+  for d in /bin /usr/bin /usr/sbin /sbin; do [ -d "$d" ] && ln -s "$d"/* "$SANOJQ/" 2>/dev/null; done
+  rm -f "$SANOJQ/jq"
+  [ -x "$SANOJQ/python3" ] || SAPY=0
+  sa_cli() { ( cd "$SAP" && HOME="$TMP/sa-home" bash rd-workflow/scripts/model_select.sh "$@" ) >"$TMP/sa.out" 2>"$TMP/sa.err"; echo $?; }
+  sa_out() { grep -qxF -- "$1" "$TMP/sa.out"; }
+  sa_has() { grep -qF -- "$1" "$TMP/sa.out"; }
+  sa_err() { grep -qF -- "$1" "$TMP/sa.err"; }
+  sa_reset() { rm -f "$SAC/models.json" "$SAC/model-strategy.json"; }
+  sa_models() { printf '%s' "$1" > "$SAC/models.json"; }
+  sa_legacy() { printf '%s' "$1" > "$SAC/model-strategy.json"; }
+  sa_quiet() { [ ! -s "$TMP/sa.err" ]; }
+
+  # S1 파일 없음
+  sa_reset; eq "$(sa_cli subagent)" 0 "S1 rc 0"
+  eq "$(cat "$TMP/sa.out")" "$(printf '%s\n' 'model=sonnet' 'effort=' "설정 파일: $SAC/models.json" \
+    'subagent 모델: sonnet (기본값) · effort: 넘기지 않음 (미설정)')" "S1 stdout 네 줄 전문·순서(spec D3)"
+  sa_quiet; chk $? "S1 stderr 비어 있음"
+  eq "$(sa_cli subagent extra)" 1 "S1 인자를 주면 rc 1"
+  sa_err "사용법" && [ ! -s "$TMP/sa.out" ]; chk $? "S1 인자 → 사용법·stdout 비어 있음"
+
+  # S2 별칭 모델·단계 effort
+  sa_reset; sa_models '{"subagent":{"claude":{"model":"opus","effort":"high"}}}'; sa_cli subagent >/dev/null
+  sa_out "model=opus" && sa_out "effort=high" \
+    && sa_out "subagent 모델: opus (models.json subagent.claude.model) · effort: high (models.json subagent.claude.effort)"; chk $? "S2 두 값·두 출처"
+  cp "$TMP/sa.out" "$TMP/sa-s2.out"
+  sa_quiet; chk $? "S2 stderr 비어 있음"
+
+  # S3 고정 이름·무효 값·숫자
+  sa_reset; sa_models '{"subagent":{"claude":{"model":"claude-opus-5-5"}}}'; sa_cli subagent >/dev/null
+  sa_out "model=sonnet" && sa_err "고정 이름입니다" && sa_has "sonnet (기본값 — 경고 참조)"; chk $? "S3 고정 이름 → sonnet·「고정 이름입니다」"
+  sa_models '{"subagent":{"claude":{"model":"gpt-5"}}}'; sa_cli subagent >/dev/null
+  sa_out "model=sonnet" && sa_err "올바르지 않습니다: gpt-5"; chk $? "S3 gpt-5 → sonnet·「올바르지 않습니다」"
+  sa_models '{"subagent":{"claude":{"model":3}}}'; sa_legacy '{"subagent":"haiku"}'; sa_cli subagent >/dev/null
+  sa_out "model=sonnet" && sa_err "올바르지 않습니다: 3"; chk $? "S3 숫자 3 → sonnet·「올바르지 않습니다」"
+  ! sa_err "옛 키"; chk $? "S3 숫자 3 → 옛 키로 내려가지 않음(옛 키 안내 없음)"
+
+  # S4 default
+  sa_reset; sa_models '{"subagent":{"claude":{"model":"default"}}}'; sa_cli subagent >/dev/null
+  sa_out "model=" && sa_has "subagent 모델: 넘기지 않음 (default 지정"; chk $? "S4 default → model= 빈 값·표시"
+  sa_quiet; chk $? "S4 stderr 비어 있음"
+
+  # S5 옛 키
+  sa_reset; sa_legacy '{"subagent":"haiku"}'; sa_cli subagent >/dev/null
+  sa_out "model=haiku" && sa_err "ℹ️  subagent 모델을 model-strategy.json(옛 키)" \
+    && sa_has "haiku (model-strategy.json subagent — 옛 키)"; chk $? "S5(a) models.json 없음 + 옛 키 → haiku·안내"
+  sa_models '{"review":{"codex":{"effort":"high"}},"subagent":{"claude":{"effort":"medium"}}}'; sa_cli subagent >/dev/null
+  sa_out "model=haiku" && sa_out "effort=medium" && sa_err "ℹ️  subagent 모델을 model-strategy.json(옛 키)"; chk $? "S5(e) 모델 칸 없음 → 옛 키 haiku + effort=medium"
+  sa_models '{"review":{"codex":{"effort":"high"}},"subagent":{"claude":{"model":null,"effort":"medium"}}}'; sa_cli subagent >/dev/null
+  sa_out "model=haiku" && sa_out "effort=medium" && sa_err "ℹ️  subagent 모델을 model-strategy.json(옛 키)"; chk $? "S5(f) 모델 null → 옛 키 haiku + effort=medium"
+  sa_models '{"subagent":{"claude":{"model":"opus"}}}'; sa_cli subagent >/dev/null
+  sa_out "model=opus" && sa_quiet; chk $? "S5(b) 두 파일 모두 → models.json(opus)·옛 키 안내 없음"
+  rm -f "$SAC/models.json"; sa_legacy '{"subagent":"gpt-5"}'; sa_cli subagent >/dev/null
+  sa_out "model=sonnet" && sa_err "model-strategy.json(옛 키) 의 subagent 값이 올바르지 않습니다: gpt-5"; chk $? "S5(c) 무효 옛 키 → sonnet·경고"
+  sa_legacy '[]'; sa_cli subagent >/dev/null
+  sa_out "model=sonnet" && sa_err "model-strategy.json 를 읽을 수 없습니다"; chk $? "S5(d) 옛 키 파일 [] → sonnet·읽기 경고"
+
+  # S6 models.json 손상 — 옛 키로 내려가지 않는다
+  sa_reset; sa_models '[]'; sa_legacy '{"subagent":"haiku"}'; sa_cli subagent >/dev/null
+  sa_out "model=sonnet" && sa_out "effort=" && sa_err "해석할 수 없습니다" && ! sa_err "옛 키"; chk $? "S6 models.json [] → sonnet·effort 빈 값·옛 키 안내 없음"
+  sa_has "effort: 넘기지 않음 (경고 참조)"; chk $? "S6 effort 표시 「경고 참조」"
+
+  # S7 effort 변환
+  sa_reset; sa_models '{"subagent":{"claude":{"model":"opus","effort":"ultra"}}}'; sa_cli subagent >/dev/null
+  sa_out "effort=max" && sa_err "'ultra' 를 'max' 로 바꿉니다" && sa_has "ultra → max (models.json subagent.claude.effort)"; chk $? "S7 ultra → max(변환 경고)"
+  sa_models '{"subagent":{"claude":{"model":"opus","effort":"lowest"}}}'; sa_cli subagent >/dev/null
+  sa_out "effort=low" && sa_has "lowest → low (models.json subagent.claude.effort)"; chk $? "S7 lowest → low"
+  sa_models '{"subagent":{"claude":{"model":"opus","effort":"default"}}}'; sa_cli subagent >/dev/null
+  sa_out "effort=" && sa_has "effort: 넘기지 않음 (default 지정"; chk $? "S7 default → 빈 값·표시"
+  sa_models '{"subagent":{"claude":{"model":"opus","effort":"huge"}}}'; sa_cli subagent >/dev/null
+  sa_out "effort=" && sa_out "model=opus" && sa_err "effort 값이 올바르지 않습니다: huge" && sa_has "effort: 넘기지 않음 (경고 참조)"; chk $? "S7 huge → effort 빈 값·model=opus 유지·경고"
+
+  # S8 set — 다른 칸 보존·고정 ID 거부
+  sa_reset; sa_models '{"review":{"codex":{"effort":"high"}},"subagent":{"claude":{"model":"opus","effort":"low"}}}'
+  eq "$(sa_cli set subagent.claude.model fable)" 0 "S8 set model fable rc 0"
+  jq -e '.subagent.claude.model == "fable" and .subagent.claude.effort == "low"' "$SAC/models.json" >/dev/null; chk $? "S8 model 반영·다른 subagent 칸(effort) 보존"
+  jq -e '.review.codex.effort == "high"' "$SAC/models.json" >/dev/null; chk $? "S8 review.codex.effort 그대로"
+  eq "$(sa_cli set subagent.claude.effort medium)" 0 "S8 set effort medium rc 0"
+  jq -e '.subagent.claude.effort == "medium" and .subagent.claude.model == "fable" and .review.codex.effort == "high"' "$SAC/models.json" >/dev/null; chk $? "S8 effort 반영·model·review 보존"
+  cp "$SAC/models.json" "$TMP/sa-s8.bak"
+  eq "$(sa_cli set subagent.claude.model claude-opus-5-5)" 1 "S8 고정 ID 저장 rc 1"
+  cmp -s "$SAC/models.json" "$TMP/sa-s8.bak"; chk $? "S8 고정 ID 거부 → 파일 불변"
+  sa_err "Agent 도구는 별칭만 받습니다" && sa_err "models.json 은 바꾸지 않았습니다"; chk $? "S8 고정 ID 거부 안내"
+
+  # S8a null 저장
+  sa_reset; sa_models '{"review":{"codex":{"effort":"high"}},"subagent":{"claude":{"model":"opus","effort":"high"}}}'
+  eq "$(sa_cli set subagent.claude.effort null)" 0 "S8a set effort null rc 0"
+  jq -e '.subagent.claude | has("effort") and .effort == null' "$SAC/models.json" >/dev/null; chk $? "S8a effort 키가 있고 JSON null"
+  jq -e '.review.codex.effort == "high"' "$SAC/models.json" >/dev/null; chk $? "S8a review.codex.effort 그대로"
+  jq -e '.subagent.claude.model == "opus"' "$SAC/models.json" >/dev/null; chk $? "S8a subagent.claude.model 그대로"
+  sa_cli subagent >/dev/null
+  sa_quiet && sa_out "effort=" && sa_has "effort: 넘기지 않음 (미설정)"; chk $? "S8a 이어서 subagent → stderr 없음·effort= ·미설정 표시"
+
+  # S8b jq 없는 PATH 에서 set·apply
+  printf '%s\n%s\n' 'models subagent.claude.model opus' 'models subagent.claude.effort low' > "$TMP/sa-list"
+  sa_reset
+  eq "$(PATH="$SANOJQ" sa_cli set subagent.claude.model opus)" 1 "S8b set(파일 없음) rc 1"
+  sa_err "jq 가 없어 실행할 수 없습니다" && [ ! -s "$TMP/sa.out" ] && [ ! -e "$SAC/models.json" ]; chk $? "S8b set(파일 없음) stderr·stdout 비어 있음·파일 없음 유지"
+  eq "$(PATH="$SANOJQ" sa_cli apply "$TMP/sa-list")" 1 "S8b apply(파일 없음) rc 1"
+  sa_err "jq 가 없어 실행할 수 없습니다" && [ ! -s "$TMP/sa.out" ] && [ ! -e "$SAC/models.json" ]; chk $? "S8b apply(파일 없음) stderr·stdout 비어 있음·파일 없음 유지"
+  sa_models '{"subagent":{"claude":{"model":"haiku"}}}'; cp "$SAC/models.json" "$TMP/sa-s8b.bak"
+  eq "$(PATH="$SANOJQ" sa_cli set subagent.claude.model opus)" 1 "S8b set(기존 파일) rc 1"
+  sa_err "jq 가 없어 실행할 수 없습니다" && [ ! -s "$TMP/sa.out" ] && cmp -s "$SAC/models.json" "$TMP/sa-s8b.bak"; chk $? "S8b set(기존 파일) stderr·stdout 비어 있음·파일 불변"
+  eq "$(PATH="$SANOJQ" sa_cli apply "$TMP/sa-list")" 1 "S8b apply(기존 파일) rc 1"
+  sa_err "jq 가 없어 실행할 수 없습니다" && [ ! -s "$TMP/sa.out" ] && cmp -s "$SAC/models.json" "$TMP/sa-s8b.bak"; chk $? "S8b apply(기존 파일) stderr·stdout 비어 있음·파일 불변"
+
+  # S8c 설정 파일 경로 표시 (공백 경로·상대 경로)
+  mkdir -p "$TMP/sa other" "$SAP/cfg"
+  printf '%s' '{"subagent":{"claude":{"model":"opus"}}}' > "$TMP/sa other/m.json"; printf '%s' '{"subagent":{"claude":{"model":"opus"}}}' > "$SAP/cfg/m.json"
+  RD_MODELS_CONFIG="$TMP/sa other/m.json" sa_cli subagent >/dev/null
+  sa_out "설정 파일: $TMP/sa other/m.json" && sa_out "model=opus"; chk $? "S8c 공백 절대 경로(jq 있음)"
+  RD_MODELS_CONFIG="cfg/m.json" sa_cli subagent >/dev/null
+  sa_out "설정 파일: $SAP/cfg/m.json" && sa_out "model=opus"; chk $? "S8c 상대 경로 → \$PWD 를 붙이고 그 파일을 읽음(jq 있음)"
+  if [ "$SAPY" = 1 ]; then
+    RD_MODELS_CONFIG="$TMP/sa other/m.json" PATH="$SANOJQ" sa_cli subagent >/dev/null
+    sa_out "설정 파일: $TMP/sa other/m.json" && sa_out "model=opus"; chk $? "S8c 공백 절대 경로(jq 없음)"
+    RD_MODELS_CONFIG="cfg/m.json" PATH="$SANOJQ" sa_cli subagent >/dev/null
+    sa_out "설정 파일: $SAP/cfg/m.json" && sa_out "model=opus"; chk $? "S8c 상대 경로 → \$PWD 를 붙이고 그 파일을 읽음(jq 없음)"
+  fi
+
+  # S8d apply 부분 실패 출력 순서
+  sa_reset; sa_models '{"subagent":{"claude":{"model":"haiku","effort":"low"}}}'
+  printf '%s\n%s\n' 'models subagent.claude.model opus' 'models subagent.claude.effort huge' > "$TMP/sa-list"
+  eq "$(sa_cli apply "$TMP/sa-list")" 1 "S8d apply rc 1"
+  case "$(sed -n 1p "$TMP/sa.out")" in 반영됨:*subagent.claude.model*) true ;; *) false ;; esac; chk $? "S8d 1행 반영됨(model)"
+  case "$(sed -n 2p "$TMP/sa.out")" in 실패:*subagent.claude.effort*) true ;; *) false ;; esac; chk $? "S8d 2행 실패(effort)"
+  case "$(sed -n 3p "$TMP/sa.out")" in 다시\ 실행:*subagent.claude.effort*) true ;; *) false ;; esac; chk $? "S8d 3행 다시 실행(effort)"
+  case "$(sed -n 3p "$TMP/sa.out")" in *subagent.claude.model*) false ;; *) true ;; esac; chk $? "S8d 3행에 subagent.claude.model 없음"
+  jq -e '.subagent.claude.model == "opus" and .subagent.claude.effort == "low"' "$SAC/models.json" >/dev/null; chk $? "S8d 파일 model opus·effort low 유지"
+
+  # S9 jq 없이 S2 와 같은 네 줄
+  if [ "$SAPY" = 1 ]; then
+    sa_reset; sa_models '{"subagent":{"claude":{"model":"opus","effort":"high"}}}'
+    PATH="$SANOJQ" sa_cli subagent >/dev/null
+    eq "$(cat "$TMP/sa.out")" "$(cat "$TMP/sa-s2.out")" "S9 jq 없이도 S2 와 같은 네 줄(두 값·두 출처)"
+  fi
+  if [ "$SAPY" = 0 ]; then echo "env-skip: S9 — python3 없음" >&2; fi
+}
+
 case "${RD_TEST_ONLY:-}" in
   "") ;;
   example-copy)
     echo "=== 예시 복사 (example-copy) ==="
     example_copy_case "${RD_TEST_TREE:-$(cd "${script_dir}/../.." && pwd)}"
+    finish ;;
+  subagent)
+    echo "=== 구현 subagent 칸 (subagent) ==="
+    subagent_cli_case
     finish ;;
   *) echo "test_review_effort_override.sh: 알 수 없는 RD_TEST_ONLY 값: ${RD_TEST_ONLY}" >&2; exit 2 ;;
 esac
@@ -230,22 +382,22 @@ f="$(mj u13 '{"review":{"codex":{"review_types":{"request-review":{"effort":"hig
 eq "$(ms ms_load_models "$f" request-review)" "review.codex.review_type_effort${TAB}ok${TAB}high" "U13 현재 리뷰 종류의 칸만 냄"
 eq "$(ms ms_load_models "$f" diff-review)" "" "U13 다른 리뷰 종류면 행 없음"
 
-# --- U21 Codex·Claude 가 아닌 도구는 선택하지 않음 (Claude 환경 변수를 빌려 쓰지 않고 Codex 계열 해석도 하지 않음) ---
+# --- U21 Codex·Claude 가 아닌 도구(adapter-interface.md 로 추가한 어댑터 mytool)는 선택하지 않음 (Claude 환경 변수를 빌려 쓰지 않고 Codex 계열 해석도 하지 않음) ---
 u21="$( ( export HOME="$MSH" RD_MODELS_CONFIG="$TMP/no_models.json" RD_REVIEW_CLAUDE_MODEL=nosuch RD_REVIEW_CLAUDE_EFFORT=high
-          source "$MS"; ms_resolve_review gemini other request-review
+          source "$MS"; ms_resolve_review mytool other request-review
           printf '%s|%s|%s|%s' "$MS_MODEL_VALUE" "$MS_MODEL_SOURCE" "$MS_EFFORT_VALUE" "$MS_EFFORT_SOURCE" ) 2>"$TMP/ms.err" )"
-eq "$u21" "|cli-default||global" "U21 gemini → 모델·effort 값 없음 (cli-default·global)"
-! has_err "계열";                 chk $? "U21 gemini → Codex 계열 경고 없음"
-printf '{"default_priority":["gemini","claude"],"tools":{"gemini":{"model":"gemini-2.5-pro"},"claude":{"model":"sonnet"}}}' > "$TMP/u21b.json"
+eq "$u21" "|cli-default||global" "U21 mytool → 모델·effort 값 없음 (cli-default·global)"
+! has_err "계열";                 chk $? "U21 mytool → Codex 계열 경고 없음"
+printf '{"default_priority":["mytool","claude"],"tools":{"mytool":{"model":"my-model"},"claude":{"model":"sonnet"}}}' > "$TMP/u21b.json"
 u21b="$( ( export HOME="$MSH" RD_MODELS_CONFIG="$TMP/no_models.json" RD_REVIEW_CLAUDE_MODEL=opus
-           source "$MS"; ms_load_legacy "$TMP/u21b.json" request-review; ms_resolve_review gemini other request-review
+           source "$MS"; ms_load_legacy "$TMP/u21b.json" request-review; ms_resolve_review mytool other request-review
            printf '%s|%s|%s' "$MS_MODEL_VALUE" "$MS_MODEL_SOURCE" "$MS_EFFORT_VALUE" ) 2>"$TMP/ms.err" )"
-eq "$u21b" "gemini-2.5-pro|review-tools.json|" "U21b gemini → tools.gemini.model 을 그대로 넘김 (Claude 칸·환경 변수 아님)"
+eq "$u21b" "my-model|review-tools.json|" "U21b mytool → tools.mytool.model 을 그대로 넘김 (Claude 칸·환경 변수 아님)"
 u21r="$( ( source "${script_dir}/run_review_turn.sh" 2>/dev/null; set +e
-           MODEL_VALUE=gemini-2.5-pro; MODEL_ORIGIN="file:$TMP/u21b.json#tools.gemini.model"; REVIEW_JQ_MISSING=0
-           print_selection_recovery gemini "confirmed model" ) 2>&1 )"
-printf '%s' "$u21r" | grep -qF "tools.gemini.model"; chk $? "U21b gemini 모델 거부 안내가 tools.gemini.model 을 가리킴"
-! printf '%s' "$u21r" | grep -q "RD_REVIEW_";      chk $? "U21b gemini 안내에 RD_REVIEW_* 없음"
+           MODEL_VALUE=my-model; MODEL_ORIGIN="file:$TMP/u21b.json#tools.mytool.model"; REVIEW_JQ_MISSING=0
+           print_selection_recovery mytool "confirmed model" ) 2>&1 )"
+printf '%s' "$u21r" | grep -qF "tools.mytool.model"; chk $? "U21b mytool 모델 거부 안내가 tools.mytool.model 을 가리킴"
+! printf '%s' "$u21r" | grep -q "RD_REVIEW_";      chk $? "U21b mytool 안내에 RD_REVIEW_* 없음"
 
 # --- CLI: 임시 프로젝트에 model_select.sh 를 복사해 기본 경로가 임시 폴더가 되게 한다 ---
 MSP="$TMP/msp"
@@ -367,20 +519,24 @@ clean_cfg
 eq "$(cli set-legacy default_priority '["claude","codex"]')" "0" "U19(a) 파일 없음 → rc 0"
 eq "$(jq -c . "$MSC/review-tools.json")" '{"default_priority":["claude","codex"]}' "U19(a) 지정 칸으로 파일 생성"
 clean_cfg
-eq "$(cli set-legacy tools.gemini.model '"g"')" "0" "U19(e) 파일 없음 → rc 0"
+eq "$(cli set-legacy tools.codex.bin '"g"')" "0" "U19(e) 파일 없음 → rc 0"
 eq "$(jq -c .default_priority "$MSC/review-tools.json")" '["codex","claude"]' "U19(e) 기본 우선순위에서 시작"
 leg="$( ( source "$MS"; ms_load_legacy "$MSC/review-tools.json" request-review; printf '%s' "$MS_LEGACY_KV" ) 2>"$TMP/ms.err")"
 ! has_err "파싱 실패";                                    chk $? "U19(e) 지금 로더가 파싱 실패 없이 읽음"
 printf '%s\n' "$leg" | grep -qxF "priority${TAB}codex claude"; chk $? "U19(e) priority 행"
-printf '%s\n' "$leg" | grep -qxF "tool.gemini.model${TAB}g";   chk $? "U19(e) tool.gemini.model 행"
+printf '%s\n' "$leg" | grep -qxF "tool.codex.bin${TAB}g";      chk $? "U19(e) tool.codex.bin 행"
 printf '{"default_priority":["codex"],"tools":{"claude":{"model":"sonnet"}}}' > "$MSC/review-tools.json"
-eq "$(cli set-legacy tools.gemini.model '"g"')" "0" "U19(b) 기존 파일 → rc 0"
+eq "$(cli set-legacy tools.codex.bin '"g"')" "0" "U19(b) 기존 파일 → rc 0"
 eq "$(jq -r '.tools.claude.model' "$MSC/review-tools.json")" "sonnet" "U19(b) 옛 tools.claude.model 보존"
 cp "$MSC/review-tools.json" "$TMP/orig.json"
 eq "$(cli set-legacy tools.codex.reasoning_effort '"high"')" "1" "U19(c) 허용 밖 경로 → rc 1"
 cmp -s "$MSC/review-tools.json" "$TMP/orig.json"; chk $? "U19(c) 원본 그대로"
+eq "$(cli set-legacy tools.gemini.model '"g"')" "1" "U19(f) 어댑터 없는 gemini 칸 → rc 1"
+cmp -s "$MSC/review-tools.json" "$TMP/orig.json"; chk $? "U19(f) 원본 그대로"
+eq "$(cli set-legacy tools.gemini.bin '"/usr/bin/true"')" "1" "U19(g) 어댑터 없는 gemini 실행 파일 칸 → rc 1"
+cmp -s "$MSC/review-tools.json" "$TMP/orig.json"; chk $? "U19(g) 원본 그대로"
 printf '{"default_priority":' > "$MSC/review-tools.json"; cp "$MSC/review-tools.json" "$TMP/orig.json"
-eq "$(cli set-legacy tools.gemini.model '"g"')" "1" "U19(d) 손상 파일 → rc 1"
+eq "$(cli set-legacy tools.codex.bin '"g"')" "1" "U19(d) 손상 파일 → rc 1"
 cmp -s "$MSC/review-tools.json" "$TMP/orig.json"; chk $? "U19(d) 원본 그대로"
 
 # --- U20 apply — 공백이 든 설정 경로, 둘째 줄 실패 ---
@@ -455,9 +611,7 @@ eq "$(rtx_paths 'length == 5 and .[0] == "overrides" and .[2:] == ["tools","code
 eq "$(jq 'has("default_priority")' "$RTX" 2>/dev/null)"               "true" "D5 default_priority 남음"
 eq "$(jq '.tools.codex | has("bin")' "$RTX" 2>/dev/null)"             "true" "D5 tools.codex.bin 남음"
 eq "$(jq '.tools.claude | has("bin")' "$RTX" 2>/dev/null)"            "true" "D5 tools.claude.bin 남음"
-eq "$(jq '.tools.gemini | has("bin")' "$RTX" 2>/dev/null)"            "true" "D5 tools.gemini.bin 남음"
 eq "$(jq '.tools.claude | has("self_review_policy")' "$RTX" 2>/dev/null)" "true" "D5 tools.claude.self_review_policy 남음"
-eq "$(jq '.tools.gemini | has("model")' "$RTX" 2>/dev/null)"          "true" "D5 tools.gemini.model 남음 (Gemini 는 범위 밖)"
 
 # ============================================================
 # 1) 해석 우선순위 (AC 1~8) — run_review_turn.sh 를 source 해 함수만 쓴다
@@ -1058,7 +1212,7 @@ fnone a10b MODEL;                               chk $? "A10b Claude 모델 defau
 # --- D2c skill setup 의 「옛 설정을 따름」 → models.json 칸을 null 로 비워 옛 키로 내려감 ---
 ab_reset; ab_legacy claude '{"tools":{"claude":{"model":"sonnet"}}}'
 ab_models '{"review":{"claude":{"model":"haiku"}}}'
-{ printf '%s\n' 'legacy tools.gemini.model "g"'; skill_line review-config-legacy-choice; } > "$TMP/d2c.list"
+{ printf '%s\n' 'legacy tools.codex.bin null'; skill_line review-config-legacy-choice; } > "$TMP/d2c.list"
 ( cd "$ISO" && HOME="$ABH" list="$TMP/d2c.list" bash -c "$(skill_line review-config-apply)" ) >"$TMP/d2c.out" 2>&1
 fn_run d2c claude request-review other
 eq "$(fv d2c MODEL)" "sonnet"                   "D2c 옛 설정을 따름 → --model sonnet (haiku 에서 바뀜)"
@@ -1098,7 +1252,7 @@ ab_err a12u "지원하지 않는 effort 'ultra'";      chk $? "A12 Claude 하향
 # --- A12b Codex 고정 이름 ---
 ab_reset; ab_legacy codex
 fn_run a12b codex request-review other RD_REVIEW_CODEX_MODEL=gpt-6.2-sol
-ab_err a12b "고정 이름입니다";                  chk $? "A12b Codex 고정 이름 경고"
+! ab_err a12b "고정 이름입니다";                chk $? "A12b Codex 고정 이름은 리뷰 턴에서 경고하지 않음"
 eq "$(fv a12b MODEL)" "gpt-6.2-sol"             "A12b Codex 고정 이름 -m 전달"
 
 # --- A13 Claude 성공 요약 (a12·a1c 실행기 실행의 stdout) ---
@@ -1338,6 +1492,199 @@ chk $? "표시5 프롬프트 NOTE 블록에 같은 식별자·원인"
 sec_i5="$(awk 'index($0,"NOT inlined — read these from disk")>0{f=1;next} f&&/^   - /{exit} f{print}' "$TMP/i5.txt")"
 printf '%s' "$sec_i5" | grep -q 'review-type:bogus-review'; [ $? -ne 0 ]
 chk $? "표시5 unmapped 는 disk-read 목록에 나타나지 않음"
+
+# ============================================================
+# 낡은 Codex 모델 알림 (change-spec stale-pinned-model-warning D1~D6·D9)
+# 격리 디렉터리(.git 없음)에 복사한 model_select.sh 를 source 해, 프로젝트 루트가 격리 디렉터리가 되게 한다.
+# 임시 HOME·CODEX_HOME·XDG_STATE_HOME 으로 돌아 실제 ~/.codex·상태 폴더를 읽거나 쓰지 않는다.
+# ============================================================
+echo "=== 낡은 Codex 모델 알림 ==="
+NISO="$TMP/niso"; mkdir -p "$NISO/rd-workflow/scripts" "$NISO/rd-workflow/config"
+for f in model_select.sh adapter_codex.sh adapter_claude.sh init_review_pipeline.sh; do cp "${script_dir}/$f" "$NISO/rd-workflow/scripts/"; done
+NSH="$TMP/nshome"; mkdir -p "$NSH/.codex"; cp "$MS_SAMPLE" "$NSH/.codex/models_cache.json"
+NBIN="$TMP/nbin"; mkdir -p "$NBIN"
+for f in codex claude; do printf '#!/bin/sh\nexit 0\n' > "$NBIN/$f"; chmod +x "$NBIN/$f"; done
+# ns_tools <우선순위 JSON 배열> [<codex bin>] [<claude bin>] — REVIEW_TOOLS_CONFIG 파일을 쓴다
+ns_tools() {
+  jq -n --argjson p "$1" --arg cb "${2:-}" --arg lb "${3:-}" '
+    {default_priority: $p, tools: ((if $cb != "" then {codex: {bin: $cb}} else {} end)
+      + (if $lb != "" then {claude: {bin: $lb}} else {} end))}' > "$TMP/ns-tools.json"
+}
+# ns <함수|명령...> — NISO 의 model_select.sh 를 source 해 부른다. stderr 는 $TMP/ns.err, 환경은 임시 홈들.
+ns() {
+  ( export HOME="$NSH" XDG_STATE_HOME="${NS_STATE:-$NSH/state}" CODEX_HOME="${NS_CODEX:-$NSH/.codex}" \
+      REVIEW_TOOLS_CONFIG="$TMP/ns-tools.json" RD_MODELS_CONFIG="${NS_MODELS:-$NISO/rd-workflow/config/models.json}"
+    cd "${NS_ROOT:-$NISO}" || exit 99
+    source rd-workflow/scripts/model_select.sh
+    "$@" ) 2>"$TMP/ns.err"
+}
+ns_reset() { # 케이스마다 models.json·config.toml·기록 파일을 지우고 N1 의 기본 도구 배치로 되돌린다
+  rm -rf "$NISO/rd-workflow/config/models.json" "$NSH/.codex/config.toml" "$NISO/.codex" "$NSH/state" "$NSH/.local"
+  cp "$MS_SAMPLE" "$NSH/.codex/models_cache.json"
+  ns_tools '["codex","claude"]' "$NBIN/codex"
+}
+ns_models() { printf '%s\n' "$1" > "$NISO/rd-workflow/config/models.json"; }
+ns_none() { [ ! -s "$TMP/ns.err" ]; }
+ns_has() { grep -qF -- "$1" "$TMP/ns.err"; }
+N1_FRAGS=(
+  "새 모델 'gpt-6.2-sol'"
+  "review.codex.model 을 계열 이름 'sol'"
+  "set review.codex.model sol"
+  "선택 1 — 이번만 옛 모델로 진행"
+  "선택 2 — 옛 모델을 계속 쓰고 기록: bash rd-workflow/scripts/model_select.sh keep-codex-model gpt-6.1-sol gpt-6.2-sol"
+  "사용자에게 물을 수 있으면 첫 리뷰 턴 전에 두 선택지를 묻고 답대로 진행합니다"
+  "무인 실행(autopilot·claude -p)이면 묻지 않고 선택 1 로 진행하고, 그 실행의 보고에 이 경고를 옮깁니다"
+)
+n1_check() { # n1_check <stderr 파일> <라벨> — 일곱 문자열이 모두 있고 경고 첫 줄이 정확히 한 번
+  local f="$1" lab="$2" s ok=0 n
+  for s in "${N1_FRAGS[@]}"; do grep -qF -- "$s" "$f" || { ok=1; echo "    누락: $s"; }; done
+  n="$(grep -cF "새 모델 'gpt-6.2-sol'" "$f")"
+  [ "$n" = 1 ] || { ok=1; echo "    경고 첫 줄 수=$n"; }
+  chk "$ok" "$lab"
+}
+NS_T0=$SECONDS
+
+# --- N1 계열 최신보다 낮은 고정 이름 ---
+ns_reset; ns_models '{"review":{"codex":{"model":"gpt-6.1-sol"}}}'
+ns ms_codex_stale_notice request-review; rc=$?
+eq "$rc" 0 "N1 알림 함수는 rc 0"
+n1_check "$TMP/ns.err" "N1 경고 묶음(일곱 문자열 + 첫 줄 한 번)"
+
+# --- N2 이미 최신 / 계열 이름 ---
+ns_reset; ns_models '{"review":{"codex":{"model":"gpt-6.2-sol"}}}'
+ns ms_codex_stale_notice request-review; ns_none; chk $? "N2 최신 고정 이름은 알리지 않음"
+ns_reset; ns_models '{"review":{"codex":{"model":"sol"}}}'
+ns ms_codex_stale_notice request-review; ns_none; chk $? "N2 계열 이름은 알리지 않음"
+
+# --- N3 config.toml 모델 (고정 값 없음·default·해석 실패) ---
+ns_reset; printf 'model = "gpt-6-sol"\n' > "$NSH/.codex/config.toml"
+ns ms_codex_stale_notice request-review
+ns_has "새 모델 'gpt-6.2-sol'" && ns_has "config.toml 의 model" && ns_has "review.codex.model 을 계열"; chk $? "N3 models.json 없음: config.toml 출처, 바꿀 곳 review.codex.model"
+RD_REVIEW_CODEX_MODEL=default ns ms_codex_stale_notice request-review
+ns_has "새 모델 'gpt-6.2-sol'" && ns_has "config.toml 의 model" && ns_has "환경 변수 RD_REVIEW_CODEX_MODEL 을 계열"; chk $? "N3 환경 변수 default: 바꿀 곳이 환경 변수"
+! ns_has "set review.codex.model"; chk $? "N3 환경 변수는 set 명령을 붙이지 않음"
+ns_models '{"review":{"codex":{"model":"nosuch"}}}'
+ns ms_codex_stale_notice request-review
+ns_has "새 모델 'gpt-6.2-sol'" && ns_has "config.toml 의 model" && ns_has "review.codex.model 을 계열"; chk $? "N3 해석 실패 값: config.toml 출처, 바꿀 곳 review.codex.model"
+
+# --- N3b Codex 가 다른 층에서 모델을 정할 수 있으면 알리지 않음 ---
+ns_reset; printf 'model = "gpt-6-sol"\n' > "$NSH/.codex/config.toml"
+mkdir -p "$NISO/.codex"; printf 'model = "gpt-6.2-sol"\n' > "$NISO/.codex/config.toml"
+ns ms_codex_stale_notice request-review; ns_none; chk $? "N3b 프로젝트 .codex/config.toml 의 model 이 있으면 알리지 않음"
+printf '"model" = "gpt-6.2-sol"\n' > "$NISO/.codex/config.toml"
+ns ms_codex_stale_notice request-review; ns_none; chk $? "N3b 인용한 키(\"model\")도 같은 최상위 키로 보고 알리지 않음"
+printf 'developer_instructions = """\n[Project guide](https://example.org/guide)\n"""\nm = [\n  [1, 2],\n]\nmodel = "gpt-6.2-sol"\n' > "$NISO/.codex/config.toml"
+ns ms_codex_stale_notice request-review; ns_none; chk $? "N3b 여러 줄 문자열·배열 안의 [ 줄을 절 시작으로 보지 않고 뒤의 model 을 찾음"
+ns_reset; printf 'model = "gpt-6-sol"\nprofile = "x"\n' > "$NSH/.codex/config.toml"
+ns ms_codex_stale_notice request-review; ns_none; chk $? "N3b 홈 config.toml 의 profile 이 있으면 알리지 않음"
+
+# --- N3c 저장소 하위 폴더를 프로젝트 루트로 쓰는 배치 (.git 파일 경계) ---
+NOUT="$TMP/nouter"; NREP="$NOUT/nrepo"; NSUB="$NREP/sub"
+mkdir -p "$NSUB/rd-workflow/scripts"
+for f in model_select.sh adapter_codex.sh adapter_claude.sh init_review_pipeline.sh; do cp "${script_dir}/$f" "$NSUB/rd-workflow/scripts/"; done
+printf 'gitdir: %s\n' "$TMP/nowhere" > "$NREP/.git"
+ns_reset; ns_tools '["codex"]' "$NBIN/codex"; printf 'model = "gpt-6-sol"\n' > "$NSH/.codex/config.toml"
+mkdir -p "$NREP/.codex"; printf 'model = "gpt-6.2-sol"\n' > "$NREP/.codex/config.toml"
+NS_ROOT="$NSUB" NS_MODELS="$TMP/none.json" ns ms_codex_stale_notice request-review; ns_none; chk $? "N3c 저장소 경계 안의 설정을 반영(알리지 않음)"
+mkdir -p "$NOUT/.codex"; mv "$NREP/.codex/config.toml" "$NOUT/.codex/config.toml"; rmdir "$NREP/.codex"
+NS_ROOT="$NSUB" NS_MODELS="$TMP/none.json" ns ms_codex_stale_notice request-review
+ns_has "새 모델 'gpt-6.2-sol'" && ns_has "config.toml 의 model"; chk $? "N3c 경계 밖 설정은 보지 않고 알림"
+
+# --- N4 환경 변수와 models.json 의 우선순위 ---
+ns_reset; ns_models '{"review":{"codex":{"model":"gpt-6.2-sol"}}}'
+RD_REVIEW_CODEX_MODEL=gpt-6.1-sol ns ms_codex_stale_notice request-review
+ns_has "'gpt-6.1-sol'(환경 변수 RD_REVIEW_CODEX_MODEL)" && ns_has "환경 변수 RD_REVIEW_CODEX_MODEL 을 계열"; chk $? "N4 환경 변수가 낡으면 출처·바꿀 곳이 환경 변수"
+ns_models '{"review":{"codex":{"model":"gpt-6.1-sol"}}}'
+RD_REVIEW_CODEX_MODEL=gpt-6.2 ns ms_codex_stale_notice request-review
+ns_has "'gpt-6.1-sol'(" && ns_has "review.codex.model)보다 새 모델" && ! ns_has "환경 변수 RD_REVIEW_CODEX_MODEL 을 계열"; chk $? "N4 무효한 환경 변수는 무시하고 models.json 을 판정"
+
+# --- N4a RD_MODELS_CONFIG 가 다른 파일(경로에 공백) ---
+mkdir -p "$TMP/my cfg"; NQ="$(printf %q "$TMP/my cfg/m.json")"
+ns_reset; printf '%s\n' '{"review":{"codex":{"model":"gpt-6.1-sol"}}}' > "$TMP/my cfg/m.json"
+NS_MODELS="$TMP/my cfg/m.json" ns ms_codex_stale_notice request-review
+ns_has "RD_MODELS_CONFIG=$NQ bash rd-workflow/scripts/model_select.sh set review.codex.model sol" && ! ns_has "rd-workflow/config/models.json" \
+  && ns_has "'gpt-6.1-sol'($TMP/my cfg/m.json 의 review.codex.model)"; chk $? "N4a 다른 models.json: 출처·명령이 그 파일, 기본 경로 없음"
+ns_reset; printf '%s\n' '{"version":1}' > "$TMP/my cfg/m.json"; printf 'model = "gpt-6-sol"\n' > "$NSH/.codex/config.toml"
+NS_MODELS="$TMP/my cfg/m.json" ns ms_codex_stale_notice request-review
+ns_has "RD_MODELS_CONFIG=$NQ bash rd-workflow/scripts/model_select.sh set review.codex.model sol" && ! ns_has "rd-workflow/config/models.json"; chk $? "N4a 칸 없음: 명령이 그 파일, 기본 경로 없음"
+ns_has "config.toml 의 model" && ns_has "$TMP/my cfg/m.json 의 review.codex.model 을 계열 이름 'sol'"; chk $? "N4a 칸 없음: 출처 config.toml, 바꿀 곳이 그 파일 경로 전문"
+
+# --- N5 기록 명령 뒤에는 알리지 않고, 더 새 모델이 나오면 다시 알림 ---
+ns_reset; ns_models '{"review":{"codex":{"model":"gpt-6.1-sol"}}}'
+ns bash rd-workflow/scripts/model_select.sh keep-codex-model gpt-6.1-sol gpt-6.2-sol >/dev/null
+ns ms_codex_stale_notice request-review; ns_none; chk $? "N5 기록한 쌍은 다시 알리지 않음"
+mkdir -p "$TMP/nc2"; jq '.models += [{"slug":"gpt-6.4-sol","visibility":"list","priority":0}]' "$MS_SAMPLE" > "$TMP/nc2/models_cache.json"
+NS_CODEX="$TMP/nc2" ns ms_codex_stale_notice request-review; ns_has "새 모델 'gpt-6.4-sol'"; chk $? "N5 더 새 계열 모델이 나오면 다시 알림"
+
+# --- N6 숨은 더 높은 버전은 최신으로 보지 않음 ---
+ns_reset; ns_models '{"review":{"codex":{"model":"gpt-6.3-sol"}}}'
+ns ms_codex_stale_notice request-review; ns_none; chk $? "N6 visibility 가 list 가 아닌 더 높은 버전은 무시"
+
+# --- N7 판정 불가(캐시 없음) ---
+mkdir -p "$TMP/nocodex"
+ns_reset; ns_models '{"review":{"codex":{"model":"gpt-6.1-sol"}}}'
+NS_CODEX="$TMP/nocodex" ns ms_codex_stale_notice request-review
+eq "$(grep -cF '고정됨, 낡을 수 있음' "$TMP/ns.err")" 1 "N7 고정 이름: 판정 불가 한 줄"
+ns_reset; printf 'model = "gpt-6-sol"\n' > "$TMP/nocodex/config.toml"
+NS_CODEX="$TMP/nocodex" ns ms_codex_stale_notice request-review; ns_none; chk $? "N7 config.toml 모델: 판정 불가여도 알리지 않음"
+rm -f "$TMP/nocodex/config.toml"
+
+# --- N8 첫 실행 가능 도구가 Codex 가 아니면 알리지 않음 ---
+ns_reset; ns_models '{"review":{"codex":{"model":"gpt-6.1-sol"}}}'
+printf '%s\n' "{\"default_priority\":[\"codex\"],\"overrides\":{\"request-review\":{\"priority\":[\"claude\"]}},\"tools\":{\"codex\":{\"bin\":\"$NBIN/codex\"},\"claude\":{\"bin\":\"$NBIN/claude\"}}}" > "$TMP/ns-tools.json"
+ns ms_codex_stale_notice request-review; ns_none; chk $? "N8 리뷰 종류 우선순위의 첫 도구가 claude 면 알리지 않음"
+ns_tools '["codex"]' "$TMP/nobin/codex"
+ns ms_codex_stale_notice request-review; ns_none; chk $? "N8 Codex 실행 파일이 없으면 알리지 않음"
+ns_tools '["claude","codex"]' "$NBIN/codex" "$TMP/nobin/claude"
+ns ms_codex_stale_notice request-review; ns_has "새 모델 'gpt-6.2-sol'"; chk $? "N8 Claude 실행 파일이 없으면 다음 도구 Codex 로 알림"
+
+# --- N10 keep-codex-model ---
+NKEEP="$NSH/state/rd-workflow/codex-model-keep.tsv"
+ns_reset
+ns bash rd-workflow/scripts/model_select.sh keep-codex-model gpt-6.1-sol gpt-6.2-astra >/dev/null; rc=$?
+eq "$rc" 1 "N10 (1) 계열이 다르면 exit 1"
+ns bash rd-workflow/scripts/model_select.sh keep-codex-model sol gpt-6.2-sol >/dev/null; rc=$?
+eq "$rc" 1 "N10 (2) 고정 이름이 아니면 exit 1"
+ns bash rd-workflow/scripts/model_select.sh keep-codex-model gpt-6.1-sol gpt-6.2-sol >/dev/null
+out="$(ns bash rd-workflow/scripts/model_select.sh keep-codex-model gpt-6.1-sol gpt-6.2-sol)"; rc=$?
+eq "$(wc -l < "$NKEEP" | tr -d ' ')" 1 "N10 (3) 같은 쌍을 두 번 실행해도 파일 줄 수 1"
+printf '%s' "$out" | grep -qF "이미 기록돼"; chk $? "N10 (3) 둘째 실행은 이미 기록돼 있음 안내"
+printf 'x' > "$TMP/notdir"
+NS_STATE="$TMP/notdir/sub" ns bash rd-workflow/scripts/model_select.sh keep-codex-model gpt-6.1-sol gpt-6.2-sol >/dev/null 2>&1; rc=$?
+eq "$rc" 1 "N10 (4a) 폴더를 만들 수 없으면 exit 1"
+NS_STATE="$TMP/notdir/sub" ns bash rd-workflow/scripts/model_select.sh keep-codex-model gpt-6.1-sol gpt-6.2-sol >/dev/null
+ns_has "폴더를 만들지 못함"; chk $? "N10 (4a) 안내에 폴더를 만들지 못함"
+mkdir -p "$TMP/st4b/rd-workflow/codex-model-keep.tsv"
+NS_STATE="$TMP/st4b" ns bash rd-workflow/scripts/model_select.sh keep-codex-model gpt-6.1-sol gpt-6.2-sol >/dev/null 2>&1; rc=$?
+eq "$rc" 1 "N10 (4b) 덧붙일 수 없으면 exit 1"
+NS_STATE="$TMP/st4b" ns bash rd-workflow/scripts/model_select.sh keep-codex-model gpt-6.1-sol gpt-6.2-sol >/dev/null
+ns_has "파일에 쓰지 못함"; chk $? "N10 (4b) 안내에 파일에 쓰지 못함"
+NS_STATE=rel ns bash rd-workflow/scripts/model_select.sh keep-codex-model gpt-6.1-sol gpt-6.2-sol >/dev/null
+grep -qF "gpt-6.1-sol	gpt-6.2-sol" "$NSH/.local/state/rd-workflow/codex-model-keep.tsv" 2>/dev/null; chk $? "N10 (5) 상태 폴더가 상대 경로면 HOME 아래에 기록"
+rm -rf "$NSH/state"; mkdir -p "$NSH/state/rd-workflow"; printf 'a\tb' > "$NKEEP"
+ns bash rd-workflow/scripts/model_select.sh keep-codex-model gpt-6.1-sol gpt-6.2-sol >/dev/null
+eq "$(wc -l < "$NKEEP" | tr -d ' ')" 2 "N10 (6) 줄바꿈 없이 끝난 파일에 덧붙여도 줄 수 2"
+eq "$(sed -n 2p "$NKEEP")" "$(printf 'gpt-6.1-sol\tgpt-6.2-sol')" "N10 (6) 둘째 줄이 새 쌍"
+# (7) 잠금 폴더가 남아 있으면 30번 다시 시도한 뒤(몇 초) 기록하지 않고 안내한다. 두 기록이 겹치는 경합 자체는 테스트로 두지 않는다.
+mkdir "$NKEEP.lock"
+ns bash rd-workflow/scripts/model_select.sh keep-codex-model gpt-6-sol gpt-6.2-sol >/dev/null; rc=$?
+eq "$rc" 1 "N10 (7) 잠금을 얻지 못하면 exit 1"
+ns_has "잠금 폴더(" && ! grep -qF "gpt-6-sol	gpt-6.2-sol" "$NKEEP"; chk $? "N10 (7) 잠금 폴더 안내, 기록하지 않음"
+rmdir "$NKEEP.lock"
+
+# --- N11 세션 생성이 알림을 한 번 낸다 ---
+ns_reset; ns_models '{"review":{"codex":{"model":"gpt-6.1-sol"}}}'
+( cd "$NISO" && HOME="$NSH" XDG_STATE_HOME="$NSH/state" CODEX_HOME="$NSH/.codex" REVIEW_TOOLS_CONFIG="$TMP/ns-tools.json" \
+    RD_MODELS_CONFIG="$NISO/rd-workflow/config/models.json" bash rd-workflow/scripts/init_review_pipeline.sh n11 request-review ) \
+  >"$TMP/n11.out" 2>"$TMP/n11.err"; rc=$?
+eq "$rc" 0 "N11 init 은 exit 0"
+n11_line="$(head -n 1 "$TMP/n11.out")"
+{ [ "$(wc -l < "$TMP/n11.out" | tr -d ' ')" = 1 ] && case "$n11_line" in rd-workflow-workspace/handoffs/review_pipeline/*) true ;; *) false ;; esac \
+  && [ -f "$NISO/$n11_line/SESSION.md" ]; }; chk $? "N11 stdout 은 세션 경로 한 줄이고 SESSION.md 가 있음"
+n1_check "$TMP/n11.err" "N11 init 의 stderr 가 경고 묶음 한 번"
+echo "  (낡은 Codex 모델 알림 절 실행 $((SECONDS - NS_T0))초)"
+
+echo "=== 구현 subagent 칸 ==="; subagent_cli_case
 
 echo "=== 예시 복사 ==="
 example_copy_case "${RD_TEST_TREE:-$(cd "${script_dir}/../.." && pwd)}"

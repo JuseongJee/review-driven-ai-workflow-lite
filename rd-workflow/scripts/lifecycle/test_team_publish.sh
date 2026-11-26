@@ -11,7 +11,7 @@
 # bash 3.2 호환.
 set -uo pipefail
 
-export HERDR_ENV= HC_TERMINAL_ID= RD_CHILD_SESSION=1
+export HERDR_ENV= HC_TERMINAL_ID= ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE= RD_CHILD_SESSION=1
 unset project_root TASK_STATE_PATH
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always
@@ -291,12 +291,12 @@ want() {
 if [[ -z "${TP_TEST_CASES:-}${TP_SKIP_CASES:-}${TP_SERIAL:-}" ]]; then
   TP_GROUPS=(
     "t_open_closed_pr_stops t_open_lost_url_rerun t_open_two_open_prs t_open_existing_base_mismatch_recorded t_open_existing_base_mismatch_listed t_open_record_commit_scoped t_open_pr_push_non_ff"
-    "t_open_partial_then_merged_retry t_check_states t_apply_partial t_apply_interrupted_waits_for_checks t_apply_interrupted_foreign_change_kept t_apply_resume_interrupted t_apply_rollback_on_second_checkout t_check_task_other_root"
+    "t_open_partial_then_merged_retry t_check_states t_apply_partial t_apply_interrupted_waits_for_checks t_apply_interrupted_foreign_change_kept t_apply_resume_interrupted t_apply_rollback_on_second_checkout t_check_task_other_root t_check_rows_cd"
     "t_open_push_mode t_open_push_non_ff t_open_branch_equals_base"
     "t_open_mixed_modes_table t_apply_mixed_modes t_open_manual_skip"
     "t_apply_dirty_index_refused t_apply_rollback_on_commit_failure t_apply_rollback_keeps_foreign_edit t_apply_rollback_keeps_foreign_head t_apply_gitlink_not_head_refused t_apply_merge_commit t_apply_pointer_moved_by_hand"
     "t_apply_resume_after_status_commit_failure t_apply_resume_mirror_only t_apply_conflict_resolution_blocks t_apply_head_mismatch t_apply_squash_team_ahead_publish"
-    "t_open_nofr_accepted t_open_nofr_refusals t_apply_nofr_refused t_nofr_full_publish"
+    "t_open_nofr_accepted t_open_nofr_refusals t_apply_nofr_refused t_nofr_full_publish t_closed_choice_rollback t_nofr_with_index"
     "t_target_base_main_merged"
     "t_target_merge_before_seal"
     "t_apply_record_outside_scope"
@@ -427,6 +427,10 @@ t_open_closed_pr_stops() {
   eq "t_open_closed_pr_stops: create 총 1회" "$(ghn 'pr create')" "1"
   ok "t_open_closed_pr_stops: 다시 올리기 선택지" "gh pr reopen https://github.com/o/team-a/pull/1" "$OUT"
   ok "t_open_closed_pr_stops: dropped 선택지" "/fr status demo dropped" "$OUT"
+  # t_closed_choice_rollback(fr) — 없으면 새는 실수: 지우려는 worktree 안에서 실행해 멈추는 취소 명령, 또는 호출한 셸의
+  # 다른 작업을 취소하는 명령을 안내합니다. 기본 체크아웃(R)으로 옮겨 --task 로 부르는 한 줄 전체를 봅니다.
+  eq "t_closed_choice_rollback(fr): 1) 줄" "$(printf '%s\n' "$OUT" | grep '1) dropped 로 닫기')" \
+    "    1) dropped 로 닫기: /fr status demo dropped 뒤 cd '$R' && bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task 'demo'"
 }
 want t_open_closed_pr_stops && t_open_closed_pr_stops
 
@@ -746,6 +750,22 @@ t_open_push_mode() {
 }
 want t_open_push_mode && t_open_push_mode
 
+# push.followTags=true 와 로컬 주석 태그가 있어도 팀 저장소에는 지정한 브랜치 하나만 바뀝니다 (_tp_do_pr·_tp_do_push 의 push).
+t_open_no_follow_tags() {
+  local mode br extra
+  for mode in pr push; do
+    if [[ "$mode" == pr ]]; then br=demo; extra=""; else br=main; extra="--approve-push"; fi
+    mk_overlay_with_team "a_${mode}"; setup_fake_gh
+    git -C "$WT/libs/a" config push.followTags true
+    git -C "$WT/libs/a" tag -a ft-old -m ft-old "$HEAD_A" || { fail "t_open_no_follow_tags(${mode}): 준비 — ft-old 태그 생성 실패"; return; }
+    run_open --approved $extra
+    eq "t_open_no_follow_tags(${mode}): rc 0" "$RC" "0"
+    eq "t_open_no_follow_tags(${mode}): 팀 ${br} 가 리뷰한 커밋 (push 가 돌았음)" "$(team_ref a "$br")" "$HEAD_A"
+    eq "t_open_no_follow_tags(${mode}): 팀 저장소에 로컬 태그 없음" "$(git --git-dir="$W/team-a.git" rev-parse -q --verify refs/tags/ft-old)" ""
+  done
+}
+want t_open_no_follow_tags && t_open_no_follow_tags
+
 t_open_push_non_ff() {
   local m1
   mk_overlay_with_team a_push; setup_fake_gh
@@ -978,7 +998,7 @@ t_apply_two_targets() {
     run_check
     eq "t_check_states: rc 0" "$RC" "0"
     ok "t_check_states: merge 됨" "$(printf 'libs/a\thttps://github.com/o/team-a/pull/1\tmerge 됨\t다른 PR 의 merge 를 기다립니다')" "$OUT"
-    ok "t_check_states: 수정 요청" "$(printf 'libs/b\thttps://github.com/o/team-b/pull/2\t수정 요청\tkim: 이름을 바꿔 주세요 / 고치려면 bash rd-workflow/scripts/rd task set-status "구현 중"')" "$OUT"
+    ok "t_check_states: 수정 요청" "$(printf 'libs/b\thttps://github.com/o/team-b/pull/2\t수정 요청\tkim: 이름을 바꿔 주세요 / 고치려면 cd '\''%s'\'' && bash rd-workflow/scripts/rd task set-status "구현 중"' "$WT")" "$OUT"
     cmd7="$(printf '%s\n' "$OUT" | grep -o 'bash rd-workflow/scripts/rd task set-status .*' | head -1)"
     eval "set -- ${cmd7#bash }"
     eq "t_check_states: 안내 명령의 set-status 인자 1개" "$# ${4:-}" "4 구현 중"
@@ -1359,6 +1379,37 @@ t_check_task_other_root() {
 }
 want t_check_task_other_root && t_check_task_other_root
 
+# 기본 체크아웃(R)에서 --task demo 로 조회한 표의 명령이 `cd '<demo worktree>' &&` 로 시작하고, 그 명령을 R 의 셸에서
+# 그대로 실행하면 demo 만 바뀝니다. R 은 fr 브랜치 없는 진행 중 작업(PR 검토 중)으로 두어, 접두가 빠진 명령이면
+# R 의 작업이 대신 바뀌도록 합니다(R 이 작업 없는 위치면 자동 선택 거부로 멈춰 차이가 보이지 않습니다).
+# 없으면 새는 실수: 다른 worktree 에서 조회한 표의 명령을 복사하면 호출한 쪽 작업이 바뀜.
+t_check_rows_cd() {
+  local c=t_check_rows_cd rts="$R/rd-workflow-workspace/.lifecycle/task-state" sv="$TMP/rows-cd-save" line cmd r_before MA MB
+  mk_opened ab_pr
+  mkdir -p "$sv"; cp "$rts" "$sv/task-state"; cp "$R/CURRENT_TASK.md" "$sv/CURRENT_TASK.md"
+  awk -F= 'BEGIN{OFS="="} $1=="fr-branch"{print "fr-branch=null"; next} $1=="status"{print "status=PR 검토 중"; next} {print}' \
+    "$sv/task-state" >"$rts"
+  r_before="$(cksum <"$rts")/$(cksum <"$R/CURRENT_TASK.md")"
+  pr_set o/team-b OPEN "$HEAD_B" "" 1 CHANGES_REQUESTED "kim:이름을 바꿔 주세요"
+  RC=0; ( cd "$R" && bash rd-workflow/scripts/rd pr check --task demo ) >"$TMP/out" 2>"$TMP/err" || RC=$?; OUT="$(cat "$TMP/out")"
+  eq "$c: 수정 요청 조회 rc 0" "$RC" "0"
+  line="$(printf '%s\n' "$OUT" | grep "$(printf '\t수정 요청\t')")"
+  ok "$c: 수정 요청 줄의 명령" "/ 고치려면 cd '$WT' && bash rd-workflow/scripts/rd task set-status \"구현 중\"" "$line"
+  cmd="${line#*/ 고치려면 }"
+  RC=0; ( cd "$R" && eval "$cmd" ) >"$TMP/out" 2>&1 || RC=$?
+  eq "$c: 표의 명령 rc 0" "$RC" "0"
+  eq "$c: 조회한 작업(demo) Status 구현 중" "$(status_of)" "구현 중"
+  eq "$c: 호출한 쪽(R) task-state·CURRENT_TASK.md 불변" "$(cksum <"$rts")/$(cksum <"$R/CURRENT_TASK.md")" "$r_before"
+  # merge 됨 줄 — 실행은 기존 apply 테스트가 맡으므로 문자열만 봅니다.
+  MA="$(team_merge a merge)"; MB="$(team_merge b merge)"
+  pr_set o/team-a MERGED "$HEAD_A" "$MA" 1; pr_set o/team-b MERGED "$HEAD_B" "$MB" 1
+  RC=0; ( cd "$R" && bash rd-workflow/scripts/rd pr check --task demo ) >"$TMP/out" 2>"$TMP/err" || RC=$?; OUT="$(cat "$TMP/out")"
+  ok "$c: merge 됨 줄의 명령" "$(printf 'merge 됨\tcd '\''%s'\'' && bash rd-workflow/scripts/rd pr check --apply' "$WT")" "$OUT"
+  cp "$sv/task-state" "$rts"; cp "$sv/CURRENT_TASK.md" "$R/CURRENT_TASK.md"
+  rm -rf "${W:?}" "$sv"; CUR_TPL=""
+}
+want t_check_rows_cd && t_check_rows_cd
+
 # ---------------------------------------------------------------------------
 # no-fr 작업(fr-branch=null, 기본 브랜치에서 작업)의 open·--apply (spec D3-1, AC4·AC10)
 # ---------------------------------------------------------------------------
@@ -1537,7 +1588,7 @@ t_nofr_full_publish() {
     "$([[ "$(git --git-dir="$W/team-a.git" rev-parse "$MA^{tree}")" != "$(git -C "$R/libs/a" rev-parse "$NF_A^{tree}")" ]] && echo 다름 || echo 같음)" "다름"
   run_check_r
   eq "$c: merge 뒤 check rc 0" "$RC" "0"
-  ok "$c: merge 뒤 check merge 됨 행·--apply 안내" "$(printf 'libs/a\t%s\tmerge 됨\tbash rd-workflow/scripts/rd pr check --apply' "$URL")" "$OUT"
+  ok "$c: merge 뒤 check merge 됨 행·--apply 안내" "$(printf 'libs/a\t%s\tmerge 됨\tcd '\''%s'\'' && bash rd-workflow/scripts/rd pr check --apply' "$URL" "$R")" "$OUT"
   pre="$(git -C "$R" rev-parse HEAD)"
   run_check_r --apply
   eq "$c: apply rc 0" "$RC" "0"
@@ -1549,6 +1600,65 @@ t_nofr_full_publish() {
   [[ "$RC" == 0 ]] || printf '%s\n' "$OUT" | tail -15 >&2
   tag="$(git -C "$R" tag --list "fr/*/$SLUG" | tail -1)"
   eq "$c: 태그 커밋의 libs/a gitlink = merged 커밋" "$(git -C "$R" rev-parse "${tag:-없음}^{commit}:libs/a" 2>/dev/null)" "$MA"
+  rm -rf "${W:?}"; CUR_TPL=""
+}
+# 기본 체크아웃 작업(no-fr)의 닫힌 PR 표에서 1) 줄은 promote_rollback.sh(fr/* 가 아니면 멈춤) 대신 기본 체크아웃에서의 정리와
+# 대기 중 전이를 안내합니다. fr 작업 쪽 1) 줄은 t_open_closed_pr_stops 가 봅니다.
+# 없으면 새는 실수: 기본 체크아웃 작업에 실행하면 멈추는 취소 명령, 또는 호출한 셸의 다른 작업을 바꾸는 명령을 안내.
+t_closed_choice_rollback() {
+  local c="t_closed_choice_rollback(no-fr)" line
+  mk_nofr; setup_fake_gh
+  run_open_r --approved
+  eq "$c: 준비 — open rc 0" "$RC" "0"
+  set_pr_state o/team-a CLOSED
+  run_check_r
+  line="$(printf '%s\n' "$OUT" | grep '1) dropped 로 닫기')"
+  eq "$c: 1) 줄" "$line" \
+    "    1) dropped 로 닫기: /fr status demo dropped 뒤 기본 체크아웃($R)에서 이 작업의 변경을 정리하고 cd '$R' && bash rd-workflow/scripts/rd task set-status \"대기 중\""
+  no "$c: promote_rollback.sh 를 안내하지 않음" "promote_rollback.sh" "$line"
+  rm -rf "${W:?}"; CUR_TPL=""
+}
+
+# nf_add_index_task <status> — 기본 체크아웃(R) 밖에 진행 중 색인 작업 other(실제 worktree, task-state·CURRENT_TASK.md)를
+# 더합니다. 전역 NF_OT(그 worktree)·NF_OT_SUM(두 파일의 요약).
+nf_add_index_task() {
+  NF_OT="$W/wt-other"
+  git -C "$R" worktree add -q -b fr/other "$NF_OT" HEAD
+  mkdir -p "$NF_OT/rd-workflow-workspace/.lifecycle"
+  printf 'schema=1\nshort-title=other\nstatus=%s\nfr-branch=fr/other\nworktree-path=%s\nsource-fr=-\nbase-commit=null\nreview-session=null\n' "$1" "$NF_OT" \
+    >"$NF_OT/rd-workflow-workspace/.lifecycle/task-state"
+  printf '# Current Task\n\n## Short Title\nother\n\n## Status\n%s\n' "$1" >"$NF_OT/CURRENT_TASK.md"
+  ( cd "$R" && project_root="$R" bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh
+      tasks_index_upsert other fr-branch=fr/other worktree-path="$1"' _ "$NF_OT" )
+  NF_OT_SUM="$(cksum <"$NF_OT/rd-workflow-workspace/.lifecycle/task-state")/$(cksum <"$NF_OT/CURRENT_TASK.md")"
+}
+nf_ot_sum() { printf '%s/%s' "$(cksum <"$NF_OT/rd-workflow-workspace/.lifecycle/task-state")" "$(cksum <"$NF_OT/CURRENT_TASK.md")"; }
+
+# AC6: 색인에 다른 진행 중 작업이 1건인 저장소에서 기본 체크아웃 작업의 rd pr open·--apply 가 R 의 Status 만 옮깁니다.
+# 두 명령을 따로 준비합니다(open 결과에 기대지 않음): open 은 색인 작업을 아카이브 보류(→ PR 검토 중 허용)로,
+# --apply 는 색인 작업 없이 open·merge 를 마친 뒤 색인 작업을 PR 검토 중(→ 아카이브 보류 허용)으로 더해 실행합니다.
+# 실행 시간: no-fr open 두 번과 apply 한 번(수 초). 사유: 내부 set-status 가 다른 작업을 바꾸고도 명령은 성공하므로,
+# 두 PR 명령을 실제로 돌려 양쪽 파일을 보지 않으면 원래 결함이 샙니다.
+# 없으면 새는 실수: rd pr open·--apply 의 내부 Status 전이가 색인의 다른 작업을 바꿈.
+t_nofr_with_index() {
+  local c=t_nofr_with_index MA
+  mk_nofr; setup_fake_gh
+  nf_add_index_task "아카이브 보류"
+  run_open_r --approved
+  eq "$c: open rc 0" "$RC" "0"
+  eq "$c: open 뒤 R Status PR 검토 중" "$(nf_status)" "PR 검토 중"
+  eq "$c: open 뒤 색인 작업 task-state·CURRENT_TASK.md 불변" "$(nf_ot_sum)" "$NF_OT_SUM"
+
+  mk_nofr; setup_fake_gh
+  run_open_r --approved
+  eq "$c: 준비 — apply 용 open rc 0" "$RC" "0"
+  MA="$(team_merge a merge)"
+  pr_set o/team-a MERGED "$NF_A" "$MA" 1
+  nf_add_index_task "PR 검토 중"
+  run_check_r --apply
+  eq "$c: apply rc 0" "$RC" "0"
+  eq "$c: apply 뒤 R Status 아카이브 보류" "$(nf_status)" "아카이브 보류"
+  eq "$c: apply 뒤 색인 작업 task-state·CURRENT_TASK.md 불변" "$(nf_ot_sum)" "$NF_OT_SUM"
   rm -rf "${W:?}"; CUR_TPL=""
 }
 # 호출부 회귀(fr, spec D2-2): 기본 브랜치가 submodule other 를 바꾼 커밋을 작업 브랜치가 병합한 뒤에도
@@ -1594,6 +1704,8 @@ want t_open_nofr_accepted && t_open_nofr_accepted
 want t_open_nofr_refusals && t_open_nofr_refusals
 want t_apply_nofr_refused && t_apply_nofr_refused
 want t_nofr_full_publish && t_nofr_full_publish
+want t_closed_choice_rollback && t_closed_choice_rollback
+want t_nofr_with_index && t_nofr_with_index
 
 echo
 echo "결과: PASS=$PASS FAIL=$FAIL (소요 $((SECONDS - T0))초)"

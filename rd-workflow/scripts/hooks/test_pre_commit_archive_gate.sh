@@ -580,7 +580,7 @@ git -C "$FX" reset --hard -q HEAD >/dev/null 2>&1
 # --- gate 2: 리뷰 종결 뒤 Status 별 판정 (구현 중·검증 중만 통과) ---
 # 없으면 새는 실수: 허용 Status 열거가 의도보다 넓거나 좁아집니다 (외부 검증 대기 중 작업물
 # 커밋이 막히거나, seal 전 구간·발행 뒤·알 수 없는 값까지 열립니다). FR 은 미완료(idea),
-# 보호 파일(src/app.sh)이 staged 입니다. 비용: hook 실행 8회, 1초 미만.
+# 보호 파일(src/app.sh)이 staged 입니다. 비용: hook 실행 9회, 1초 미만.
 status_case() { # <이름> <Status> <기대 exit> [stderr 부분문자열]
   git -C "$FX" reset --hard -q HEAD >/dev/null 2>&1
   set_fr_status idea
@@ -603,7 +603,30 @@ status_case() { # <이름> <Status> <기대 exit> [stderr 부분문자열]
 }
 status_case "gate 2a: 구현 중 + 보호 파일 staged + FR 미완료 → 통과 + 안내" "구현 중" 0 "리뷰 종결 뒤 작업이 다시 열린"
 status_case "gate 2b: 검증 중 + 보호 파일 staged + FR 미완료 → 통과 + 안내" "검증 중" 0 "리뷰 종결 뒤 작업이 다시 열린"
-status_case "gate 2c: diff review 대기 + 보호 파일 staged → 차단" "diff review 대기" 2
+status_case "gate 2c: diff review 대기 + 보호 파일 staged → 차단 + 구현 중 전이·--reopen 안내" "diff review 대기" 2 'rd task set-status "구현 중"'
+# 없으면 새는 실수: 종결 뒤 재확인하려는 사람에게 「아카이브를 먼저」 라는 틀린 다음 행동을 안내합니다.
+case "$_hook_last_err" in
+  *"REQUEST 아카이브를 먼저 실행하세요"*) echo "[FAIL] gate 2c-2: diff review 대기 차단에 「REQUEST 아카이브를 먼저」 안내가 섞임" >&2; FAIL=$((FAIL + 1)) ;;
+  *'rd task set-status "검증 중"'*'rd task set-status "diff review 대기"'*"--reopen"*) echo "[PASS] gate 2c-2: 이의 없음 수렴 세션 + diff review 대기 차단이 검증 중 → diff review 대기 → --reopen 순서를 안내"; PASS=$((PASS + 1)) ;;
+  *) echo "[FAIL] gate 2c-2: 이의 없음 수렴 세션 + diff review 대기 차단에 검증 중 → diff review 대기 → --reopen 순서 안내가 없음 err=[${_hook_last_err}]" >&2; FAIL=$((FAIL + 1)) ;;
+esac
+# 종결(closed) 세션이면 다시 열 수 없으므로 새 세션 명령을 마지막 리뷰 head 와 함께 안내합니다.
+# 없으면 새는 실수: closed 세션에 --reopen 을 안내해 거부로 이어집니다(FR review-closed-session-recheck-path).
+git -C "$FX" reset --hard -q HEAD >/dev/null 2>&1
+set_fr_status idea
+set_state_status "$FX" "diff review 대기"
+printf '%s\n' "# Review Session" "" "## Status" "closed" "" "## Branch Context" "- short-title: t1" \
+  "- review-head-oid: 0123456789abcdef0123456789abcdef01234567" \
+  > "$FX/rd-workflow-workspace/handoffs/review_pipeline/20260101_000000_final-diff-review/SESSION.md"
+printf 'code v2\n' > "$FX/src/app.sh"
+git -C "$FX" add src/app.sh >/dev/null 2>&1
+run_hook "$FX"
+case "$_hook_last_exit|$_hook_last_err" in
+  *"--reopen"*) echo "[FAIL] gate 2c-3: closed 세션 차단 안내에 --reopen 이 섞임" >&2; FAIL=$((FAIL + 1)) ;;
+  "2|"*'rd task set-status "검증 중"'*'rd task set-status "diff review 대기"'*"prepare_review_pipeline.sh diff --base 0123456789abcdef0123456789abcdef01234567"*)
+    echo "[PASS] gate 2c-3: closed 세션 + diff review 대기 → 차단 + 검증 중 → diff review 대기 → 새 세션 명령(--base 마지막 리뷰 head) 순서 안내"; PASS=$((PASS + 1)) ;;
+  *) echo "[FAIL] gate 2c-3: closed 세션 + diff review 대기 — expected exit=2 + 새 세션 안내, actual=$_hook_last_exit err=[${_hook_last_err}]" >&2; FAIL=$((FAIL + 1)) ;;
+esac
 status_case "gate 2d: 완료 + 보호 파일 staged → 차단" "완료" 2
 status_case "gate 2e: 대기 중 + 보호 파일 staged → 차단" "대기 중" 2
 status_case "gate 2f: 아카이브 보류 + 보호 파일 staged + FR 미완료 → 차단 + 검증 중 전이 안내" "아카이브 보류" 2 'rd task set-status "검증 중"'
@@ -783,6 +806,84 @@ case "$_hook_last_err" in
   *"_open_issues.awk"*) assert_eq "parser-missing: 찾은 경로를 보여준다" "1" "1" ;;
   *) assert_eq "parser-missing: 찾은 경로를 보여준다" "경로 있음" "경로 없음" ;;
 esac
+cleanup_fixture
+
+# --- 커밋 위치의 worktree 로 판정 (gate-hook-root-from-cwd) ---
+# M(기본 체크아웃, hook 포함), W(M 의 worktree, 차단 조건의 REQUEST), O(다른 git 저장소).
+# 없으면 새는 실수: hook 파일 위치(M)의 REQUEST 로만 판정해 W 의 아카이브 커밋을 놓치거나(C3·C3b·C7·C8),
+# 무관한 다른 저장소 커밋을 M 기준으로 막는 것(C6·C7b). 기존 시나리오(git 아닌 fixture, cwd 없음)가 none 경계의 회귀 확인이다.
+GT_ROOT=""; GT_M=""; GT_W=""; GT_O=""
+# make_git_fx <M 도 차단 조건이면 1>
+make_git_fx() {
+  local m_block="${1:-0}" g="git -c user.name=t -c user.email=t@t -c commit.gpgsign=false"
+  GT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rd-ag-wt.XXXXXX")" || return 1
+  _current_fixture="$GT_ROOT"
+  GT_M="$GT_ROOT/M"; GT_W="$GT_ROOT/W"; GT_O="$GT_ROOT/O"
+  mkdir -p "$GT_M" "$GT_O" || return 1
+  fx_clone "$FX_BASE" "$GT_M" || return 1
+  printf '%s\n' "# Change Request" "" "## Task Type" "change" > "$GT_M/REQUEST.md"
+  if [[ "$m_block" == 1 ]]; then
+    printf '%s\n' "# Change Request" "" "## Source FR" '`'"$ITEM"'`' > "$GT_M/REQUEST.md"
+    mkdir -p "$GT_M/$(dirname "$ITEM")"; printf '%s\n' "# fr item" "- status: idea" > "$GT_M/$ITEM"
+  fi
+  $g -C "$GT_M" init -q . >/dev/null 2>&1 || return 1
+  $g -C "$GT_M" add -A >/dev/null 2>&1 && $g -C "$GT_M" commit -q -m init >/dev/null 2>&1 || return 1
+  $g -C "$GT_M" worktree add -q "$GT_W" -b w >/dev/null 2>&1 || return 1
+  printf '%s\n' "# Change Request" "" "## Source FR" '`'"$ITEM"'`' > "$GT_W/REQUEST.md"
+  mkdir -p "$GT_W/$(dirname "$ITEM")" "$GT_W/sub"; printf '%s\n' "# fr item" "- status: idea" > "$GT_W/$ITEM"
+  $g -C "$GT_O" init -q . >/dev/null 2>&1 || return 1
+}
+# run_git_scenario <번호> <이름> <hook 루트> <입력 cwd> <명령> <기대 exit> <stderr 에 있어야 할 문자열(-=검사안함)> <없어야 할 문자열(-=검사안함)>
+run_git_scenario() {
+  local num="$1" name="$2" hroot="$3" cwd="$4" cmd="$5" expected="$6" want="$7" unwant="$8" ok=1
+  _hook_last_exit=0
+  _hook_last_err="$(printf '{"cwd":"%s","tool_input":{"command":"%s"}}' "$cwd" "$cmd" | \
+    bash "$hroot/rd-workflow/scripts/hooks/pre_commit_archive_gate.sh" 2>&1 >/dev/null)" || _hook_last_exit=$?
+  [[ "$_hook_last_exit" == "$expected" ]] || ok=0
+  if [[ "$want" != "-" ]]; then case "$_hook_last_err" in *"$want"*) ;; *) ok=0 ;; esac; fi
+  if [[ "$unwant" != "-" ]]; then case "$_hook_last_err" in *"$unwant"*) ok=0 ;; esac; fi
+  if [[ "$ok" == 1 ]]; then
+    echo "[PASS] scenario ${num}: ${name} (exit=$_hook_last_exit)"; PASS=$((PASS + 1))
+  else
+    echo "[FAIL] scenario ${num}: ${name} — expected exit=$expected actual=$_hook_last_exit want='${want}' unwant='${unwant}' err=[${_hook_last_err}]" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+if make_git_fx 0; then
+  run_git_scenario C3 "M 의 hook, cwd=W → W 의 REQUEST 로 차단, 셸이 W 최상위라 cd 줄 없음" "$GT_M" "$GT_W" "git commit -m x" 2 "판정 기준 worktree: " "실행하세요: cd"
+  run_git_scenario C3b "M 의 hook, cwd=W/sub, cd .. && git commit → 차단" "$GT_M" "$GT_W/sub" "cd .. && git commit -m x" 2 "판정 기준 worktree: " -
+  run_git_scenario C4 "W 의 hook, cwd=W → 차단, 판정 기준 줄 없음" "$GT_W" "$GT_W" "git commit -m x" 2 "done/dropped 필요" "판정 기준 worktree"
+  run_git_scenario C7 "M 의 hook, M 통과 + W 차단 두 루트 → 차단" "$GT_M" "$GT_M" "git -C $GT_M commit -m a; git -C $GT_W commit -m b" 2 "판정 기준 worktree: " -
+  run_git_scenario C7b "M 의 hook, 다른 저장소 후보를 걸러 내고 W 차단" "$GT_M" "$GT_M" "git -C $GT_O commit -m a; git -C $GT_W commit -m b" 2 "판정 기준 worktree: " -
+  run_git_scenario C8 "M 의 hook, 없는 폴더 W/new 커밋 → 차단" "$GT_M" "$GT_M" "git -C $GT_W/new commit -m a" 2 "판정 기준 worktree: " -
+else
+  echo "[FAIL] scenario C3~C8: git fixture 생성 실패" >&2; FAIL=$((FAIL + 1))
+fi
+cleanup_fixture
+if make_git_fx 1; then
+  run_git_scenario C6 "M 의 hook, cwd=다른 저장소 평범한 git commit → 통과(M 이 차단 조건이어도)" "$GT_M" "$GT_O" "git commit -m x" 0 - -
+  # 이동 안내(gate-retarget-cd-hint) — 안내 명령은 상대 경로라 셸이 판정한 worktree 최상위에 있어야 한다.
+  # 없으면 새는 실수: 판정 기준 줄 조건(hook 위치와 다를 때)에 묶어 셸이 W 인 채 M 이 막히면 안내가 빠지는 것(C9),
+  # 경로를 인용하지 않아 붙여 넣은 cd 가 다른 곳으로 가거나 경로 안의 $·백틱을 실행하는 것(C10).
+  _gt_m_phys="$(cd -P "$GT_M" && pwd -P)"
+  run_git_scenario C9 "M 의 hook, cwd=W, git -C M commit → M 차단, 판정 기준 줄 없이 cd M 안내" "$GT_M" "$GT_W" "git -C $GT_M commit -m x" 2 \
+    "실행하세요: cd $(printf '%q' "$_gt_m_phys")" "판정 기준 worktree"
+  GT_X="$GT_ROOT/x d\$HOME\`touch PWNED\`"
+  if git -C "$GT_M" worktree add -q "$GT_X" -b x >/dev/null 2>&1 && mkdir -p "$GT_X/sub"; then
+    run_git_scenario C10 "M 의 hook, cwd=특수문자 경로 X/sub → X 차단" "$GT_M" "$GT_X/sub" "git commit -m x" 2 "실행하세요: cd " -
+    _cdline="$(printf '%s\n' "$_hook_last_err" | sed -n 's/^\[guard\] 위 안내의 명령은 판정한 worktree 최상위에서 실행하세요: //p')"
+    _moved="$(cd "$GT_ROOT" && bash -c "$_cdline && pwd -P" 2>/dev/null)"
+    if [[ -n "$_cdline" && "$_moved" == "$(cd -P "$GT_X" && pwd -P)" && ! -e "$GT_ROOT/PWNED" && ! -e "$GT_X/sub/PWNED" ]]; then
+      echo "[PASS] scenario C10b: 붙여 넣은 cd 줄이 공백·\$·백틱 경로로 이동하고 경로 안 구문을 실행하지 않음"; PASS=$((PASS + 1))
+    else
+      echo "[FAIL] scenario C10b: 안내=[${_cdline}] 이동=[${_moved}]" >&2; FAIL=$((FAIL + 1))
+    fi
+  else
+    echo "[FAIL] scenario C10: 특수문자 worktree 생성 실패" >&2; FAIL=$((FAIL + 1))
+  fi
+else
+  echo "[FAIL] scenario C6: git fixture 생성 실패" >&2; FAIL=$((FAIL + 1))
+fi
 cleanup_fixture
 
 # 보조: 복제 원본이 바뀌지 않았는지 (PASS 줄은 내지 않고 FAIL 만 냅니다)

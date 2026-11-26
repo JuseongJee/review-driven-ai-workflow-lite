@@ -19,6 +19,7 @@
 ## 세션 위치
 
 - `rd-workflow-workspace/handoffs/review_pipeline/<session-id>/`
+- `<session-id>` 는 `<YYYYMMDD_HHMMSS>_<세션 slug>` 입니다. fr 브랜치에서 만든 세션은 시각과 세션 slug 사이에 작업 slug 가 들어갑니다(`<YYYYMMDD_HHMMSS>_<작업 slug>_final-diff-review`). 병렬 줄기가 같은 초에 세션을 열어도 이름이 겹치지 않게 하기 위해서입니다. 자기 plan 의 spec/plan review 세션은 이름에 작업 slug 가 이미 있으므로(`<YYYYMMDD_HHMMSS>_<HHMM>-<작업 slug>-spec-plan-review`) 붙이지 않습니다.
 
 ## 세션 생성
 
@@ -42,6 +43,17 @@ review kind:
 판정된 base 와 현재 HEAD 는 둘 다 **저장소 native full OID 로 resolve** 되어 `Review Target` 에 `git diff <base OID>..<head OID>` 로 기록됩니다. `main` 같은 이동 ref 를 문자열로 남기면 세션 생성과 실제 리뷰 사이에 기준이 바뀝니다.
 
 또한 `diff` 세션 생성 시 그 session-id 가 task-state `review-session` 에 기록됩니다. 발행 게이트는 세션 디렉터리를 뒤지지 않고 이 포인터 하나로 종결 마커를 찾습니다 (`rd-workflow/docs/guides/task-state-guide.md`).
+
+### 낡은 Codex 리뷰 모델 알림
+
+세션 생성(`init_review_pipeline.sh`, `prepare_review_pipeline.sh` 경유 포함)은 이번 리뷰를 Codex 가 맡을 때 Codex 모델이 계열 최신인지 한 번 알립니다. 리뷰 턴마다 알리지 않습니다.
+
+- 경고에는 두 선택지가 있습니다. 선택 1 은 이번만 옛 모델로 진행하는 것이고, 선택 2 는 옛 모델을 계속 쓰기로 기록하는 것입니다.
+- AI 가 세션을 만들었고 사용자에게 물을 수 있으면, 첫 리뷰 턴 전에 두 선택지를 묻고 답대로 진행합니다. 선택 2 면 `bash rd-workflow/scripts/model_select.sh keep-codex-model <현재 모델> <새 모델>` 을 실행합니다.
+- 물을 수 없는 무인 실행(autopilot·`claude -p`)은 묻지 않고 선택 1 로 진행합니다. 그 실행의 보고에 경고를 옮깁니다.
+- 사람이 터미널에서 직접 준비했다면 그 사람이 두 선택지 중 하나를 고릅니다.
+- 기록 파일은 `<상태 폴더>/rd-workflow/codex-model-keep.tsv` 입니다. 상태 폴더는 `XDG_STATE_HOME` 이 `/` 로 시작하면 그 값이고, 아니면 `$HOME/.local/state` 입니다. 한 줄이 `<현재 모델>\t<새 모델>` 한 조합입니다.
+- 같은 조합은 다시 알리지 않습니다. 더 새 모델이 나오면 다시 알립니다. 기록한 조합도 다시 알림을 받으려면 그 줄을 지우거나 모델 설정값을 바꿉니다.
 
 ## 세션 기본 파일
 
@@ -80,16 +92,46 @@ Author는 턴을 쓴 뒤 `SESSION.md`의 Status·Current Owner를 손으로 바�
 | `awaiting-user` + Open Issues 종결(`- 없음`) | 무관 | 형식을 갖춘 Author 턴 (`--reopen "<사유>"`) | 사유를 `## Reopen History`에 남기고 `awaiting-reviewer`·`Reviewer`로 전환한 뒤 Reviewer 턴 실행 |
 | `awaiting-user` + Open Issues 미해결 | 무관 | 무관 (`--reopen`) | 거부 — 사람 질문 대기 세션은 `--reopen` 으로 열지 않음 |
 | `awaiting-user` + Open Issues 미해결 | 무관 | 형식을 갖춘 Author 턴 (`--decision "<사용자 결정>"`) | 결정을 `## Reopen History` 와 `USER_ACTION.md` 의 `## User Decision` 에 남기고 `awaiting-reviewer`·`Reviewer`로 전환한 뒤 Reviewer 턴 실행 |
-| `awaiting-user` + Open Issues 미해결 | 무관 | 무관 (`--override "<결정한 사람> — <말>"`) | `## Closure Reason` 을 `user-override` 와 날짜가 붙은 `근거:` 줄로 쓰고 `closed` 로 바꿈. CHECKPOINT Open Issues 는 `- 없음` 과 남은 이의 원문을 담은 「사용자 종결」 문단이 됨. Reviewer 턴 없음. diff-review 세션에 실제 리뷰어 실행 기록이 없거나 마지막 리뷰 뒤 보호 경로가 바뀌었으면 seal 이 거부하므로 종결하지 않고 `--decision` 을 안내 |
+| `awaiting-user` + Open Issues 미해결 | 무관 | 무관 (`--override "<결정한 사람> — <말>"`) | `## Closure Reason` 을 `user-override` 와 날짜가 붙은 `근거:` 줄로 쓰고 `closed` 로 바꿈. CHECKPOINT Open Issues 는 `- 없음` 과 남은 이의 원문을 담은 「사용자 종결」 문단이 됨. Reviewer 턴 없음. diff-review 세션에 실제 리뷰어 실행 기록이 없으면 seal 이 거부하므로 종결하지 않고 `--decision` 으로 리뷰어 턴을 받으라고 안내. 마지막 리뷰 뒤 보호 경로가 바뀌었으면 같은 이유로 종결하지 않고 아래 「종결 결정 뒤 확인 턴」 의 명령 순서를 세션 경로·근거를 채워 안내 |
+| `awaiting-author` + 종결 결정 뒤 확인 턴을 마침 | 무관 | 무관 (`--override "<결정한 사람> — <말>"`) | 위 `--override` 행과 같이 종결. 조건은 최신 턴이 Reviewer 턴이고, `## Reopen History` 의 마지막 재개 줄(`--decision`·`--reopen`)이 결정 재개(기록 머리 `- <날짜> <시각> <턴 파일> 뒤 사용자 결정으로 재개: `)이며 그 결정이 확인 턴 표식 `(종결 결정 — 리뷰 뒤 변경 확인)` 으로 끝나는 것. 옵션 없는 Author 인계는 재개 줄을 남기지 않으므로 그 뒤 확인 턴에도 종결 결정이 유지되고, 다른 `--decision`·`--reopen` 이 오면 풀림. 근거는 대조하지 않음(보호 범주 이의를 다시 물어 받은 새 근거로 종결). 그 밖의 `awaiting-author` 세션은 거부 |
 | `awaiting-user` + Open Issues 종결 또는 판정 불가 | 무관 | 무관 (`--decision`·`--override`) | 거부 — 종결이면 `--reopen`·seal 안내, 판정 불가(절 없음·빈 절·형식 오류)면 CHECKPOINT 복구 안내 |
-| `closed` | 무관 | 무관 | 거부 — 새 리뷰는 `prepare_review_pipeline.sh`로 새 세션 |
+| `closed` | 무관 | 무관 (옵션 무관 — `--reopen`·`--decision` 포함) | 거부 — 새 리뷰는 `prepare_review_pipeline.sh`로 새 세션. diff 리뷰는 아래 「종결된 세션 뒤 재확인」 순서와 `diff --base <review-head-oid>` 완성 명령을 안내 |
 | 위 밖의 조합 | | | 거부 — Status·Owner 값을 보이고 SESSION 확인 안내 |
 
 전환 뒤 실패(어댑터 오류 등)는 `awaiting-reviewer`·`Reviewer`로 남습니다. 옵션 없이 `run_review_turn.sh <세션>` 으로 다시 실행해 이어 갑니다. `--decision`·`--reopen`·`--extend-turns` 는 첫 실행에서 이미 반영됐으므로 다시 붙이면 거부되고 옵션 없이 실행하라고 안내합니다.
 
 턴 한도에 도달한 세션은 다음 턴을 만들지 않고 거부합니다. 사람이 더 이어 가기로 정했으면 `--decision`·`--reopen` 또는 Author 턴 전환 실행에 늘릴 턴 수 `--extend-turns <N>` 을 붙입니다. `## Turn Limit` 이 늘어난 값으로 바뀌고 `## Reopen History` 에 결정·사유 줄과 따로 `<턴 파일> 뒤 턴 한도 연장: A → B` 줄이 남습니다. 한도에 도달하지 않은 세션에는 거부합니다.
 
-`--reopen`은 이의 없음으로 수렴한 세션에 재확인 턴을 잇는 경로입니다. seal 직전 전체 검증이 실패했거나 기록 커밋·main 병합 뒤 바뀐 부분을 확인받을 때 씁니다. 새 세션과 달리 diff 전체를 처음부터 다시 리뷰하지 않습니다. 수렴 여부는 seal 과 같은 Open Issues 판정(`hooks/_open_issues.awk`)으로 가립니다. awaiting-user 는 「이의 없음 수렴」 과 「사람 질문 대기」 가 같은 상태값이기 때문입니다. `awaiting-user` 가 아닌 세션에 `--reopen`을 붙이면 거부합니다.
+#### 턴 한도 도달
+
+Reviewer 턴이 턴 한도에 닿아 `awaiting-user` 로 끝나거나 한도 때문에 실행을 거부하면, `run_review_turn.sh` 가 stderr 에 지적 추세 표를 냅니다. 표의 행은 Reviewer 턴 하나이고 최근 10턴까지 보입니다. 칸은 지적 수(`## Findings` 의 `- F<번호>` 줄), 새 지적 수(앞 Reviewer 턴에 없던 번호), `범위 밖:` 줄 수, 새 지적 번호입니다. 표시 전용이며 판정을 바꾸지 않습니다.
+
+- Author 는 사람에게 연장·종결을 묻기 전에 이 표와 수렴 판단을 함께 보입니다. 수렴 판단은 최근 턴의 새 지적이 줄었는지와 새 지적이 같은 계열(같은 원인의 다른 입력 형태)인지로 합니다.
+- 새 지적이 턴마다 나오거나 같은 계열이 반복되면 권장안은 연장이 아니라 「남은 이의를 범위 밖으로 넘기고 종결(`--override`)」 입니다. 근본 원인은 후속 FR 후보로 적습니다.
+- 연장은 남은 이의가 줄고 있고 새 지적이 없을 때만 권장안으로 둡니다. 연장 폭은 사람이 정합니다.
+
+#### 종결 결정 뒤 확인 턴
+
+사람이 종결을 정했는데 마지막 리뷰 뒤 보호 경로가 바뀌었으면 `--override` 가 거부합니다. seal 은 리뷰어가 본 트리만 종결하기 때문입니다. 거부 안내는 다음 순서를 세션 경로·근거·필요한 `--extend-turns <N>` 을 채워 출력합니다. 사람의 종결 결정은 다시 묻지 않습니다.
+
+1. 리뷰 뒤 바뀐 내용을 Author 턴으로 씁니다. 최신 턴이 아직 넘기지 않은 Author 턴이면 그 턴에 반영합니다.
+2. `run_review_turn.sh <세션> --decision "<근거> (종결 결정 — 리뷰 뒤 변경 확인)"` 으로 확인 Reviewer 턴 1회를 받습니다. 확인 턴을 이미 마쳐 `awaiting-author` 인 세션(확인 턴 뒤 보호 경로가 다시 바뀐 경우)은 `--decision` 을 받지 않으므로 옵션 없이 `run_review_turn.sh <세션>` 으로 넘깁니다. 확인 턴 번호가 턴 한도를 넘으면 안내가 그 차이만큼 `--extend-turns <N>` 을 붙입니다.
+3. 확인 턴이 이의 없음이면 그대로 종결 상태입니다. 이의가 남으면 Reviewer 는 보통 `awaiting-author` 로 넘기며(턴 한도 턴이면 `awaiting-user`), 두 상태 모두 `--override` 를 받습니다. 새 이의가 기본 사용 경로 결함·데이터 손실·보안이 아니면 다시 묻지 않고 같은 근거로 `--override` 를 실행합니다. 새 이의가 그 셋 가운데 하나이면 그 이의를 보이고 사람에게 다시 묻습니다. 사람이 그래도 종결하면 그 사람의 말을 근거로 `--override` 를 실행합니다.
+4. 리뷰 뒤 트리가 바뀌었으므로 seal 전에 현재 트리의 검증 증거를 `verify_record.sh -- <검증 명령>` 으로 남기고 `rd review seal <세션>` 으로 종결 마커를 만듭니다. 안내의 세션 경로와 근거는 작은따옴표로 인용해 출력합니다(대화형 zsh 의 `!` 이력 참조와 `$` 를 글자 그대로 둡니다).
+
+리뷰 head 가 고정된(`review-head-policy: pinned`) 세션은 `--decision` 으로도 같은 head 를 보므로, 안내는 새 세션(`prepare_review_pipeline.sh diff`)을 권합니다.
+
+`--reopen`은 이의 없음으로 수렴한 세션에 재확인 턴을 잇는 경로입니다. seal 직전 전체 검증이 실패했거나 기록 커밋·main 병합 뒤 바뀐 부분을 확인받을 때 씁니다. 새 세션과 달리 diff 전체를 처음부터 다시 리뷰하지 않습니다. 수렴 여부는 seal 과 같은 Open Issues 판정(`hooks/_open_issues.awk`)으로 가립니다. awaiting-user 는 「이의 없음 수렴」 과 「사람 질문 대기」 가 같은 상태값이기 때문입니다. `awaiting-user` 가 아닌 세션에 `--reopen`을 붙이면 거부합니다. `closed` 세션(사람의 `--override` 종결 포함)은 `--reopen` 으로 다시 열지 않습니다.
+
+**종결된 세션 뒤 재확인**: `closed` 세션 뒤에 코드를 고쳐 재확인받으려면 새 세션을 엽니다. 커밋 게이트(`pre_commit_archive_gate.sh`)는 종결 세션이 최신이고 Status 가 `diff review 대기` 인 커밋을 막습니다. 그래서 순서가 정해져 있습니다.
+
+1. `rd task set-status "구현 중"` 후 수정을 커밋합니다. `구현 중`·`검증 중` 의 커밋은 게이트가 허용합니다.
+2. `rd task set-status "검증 중"` → `verify_record.sh` 로 검증 → `rd task set-status "diff review 대기"`.
+3. `bash rd-workflow/scripts/prepare_review_pipeline.sh diff --base <종결 세션의 review-head-oid>` 로 새 세션을 만듭니다. `--base` 를 주면 마지막으로 리뷰한 커밋 뒤의 변경만 리뷰합니다. 빼면 diff 전체를 처음부터 다시 리뷰합니다.
+4. 새 세션을 만든 뒤 상태 파일(task-state·`CURRENT_TASK.md`)을 커밋합니다. 새 세션은 미종결이라 게이트가 통과시킵니다.
+5. 새 세션의 `turns/001_author.md` 를 쓰고 `run_review_turn.sh <새 세션>` 으로 잇습니다. 종결되면 `rd review seal <새 세션>` 을 실행합니다.
+
+`run_review_turn.sh` 의 closed 거부 안내와 게이트의 차단 안내는 이 순서와 종결 세션의 `review-head-oid` 를 채운 명령을 함께 냅니다. 이의 없음으로 수렴한 `awaiting-user` 세션이 최신일 때는 게이트가 `--reopen` 경로를 안내합니다. 그 경로도 수정 커밋은 `구현 중` 에서 하고, 검증 뒤 `diff review 대기` 로 옮긴 상태 파일은 seal 뒤 기록 커밋에 넣습니다. `검증 중` 에서 `아카이브 보류` 로 바로 갈 수 없기 때문입니다.
 
 기록 커밋 뒤의 diff review 는 루트 `REQUEST.md` 가 빈 템플릿입니다. 세션 준비와 Reviewer 턴은 리뷰 구간(base..head)에 추가된 `rd-workflow-workspace/backlog/request-archive/*.md` 를 이 작업의 REQUEST 로 씁니다. 리뷰 effort 판정, AC 누락 경고, 리뷰어 프롬프트의 완료 기준 출처가 모두 이 파일을 봅니다. 구간에 보관본이 없으면 루트 `REQUEST.md` 를 씁니다.
 
@@ -111,13 +153,19 @@ Author는 턴을 쓴 뒤 `SESSION.md`의 Status·Current Owner를 손으로 바�
   - (가) 사용자가 실제 사용에서 겪는 잘못된 결과·데이터 손실·보안 문제·회귀. 기준 파일의 치명 결함 범주(데이터 안전·경쟁 조건·신뢰 경계·열거형 완전성)가 여기에 든다
   - (나) 요청·AC·spec 이탈, 또는 다음 단계를 잘못 이끄는 요청·설계의 누락·모호함
   - (다) 검증이 실제로 결함을 덮지 못함(고친 동작을 덮는 테스트가 없음, 테스트가 거짓으로 통과함 — 변이 `생존` 포함)
-  - 기준 파일이 이름 붙인 `분할:`·`제거:` 발견은 종전대로 이의다
-- 이의마다 `경로:` 줄에 그 결함이 현실에서 일어나는 경로(누가 어떤 정상 사용에서 겪는가)를 한 줄 적는다. 경로를 적지 못하면 이의가 아니다.
+  - 기준 파일이 이름 붙인 `분할:`·`제거:`·`맞닿은 곳:` 발견은 종전대로 이의다. final diff review 의 `맞닿은 곳:` 발견(목록 누락·근거 없는 「추론」)은 기록 형식이지만 `메모:` 가 아니라 이의다
+    - `맞닿은 곳:` 발견은 PR 본문 「맞닿은 곳」 목록을 diff 와 대조해 낸다. 목록에 없는 맞닿은 곳(바뀐 코드를 부르는 곳·실행 환경, 새 입력을 받는 기존 로직, 기대는 외부 동작, `없음` 인데 있는 경우 포함)과 사실과 다른 항목이 대상이다
+    - 현재 PR 본문은 같은 세션에서 `## PR 본문` 절을 실은 가장 최근 Author 턴의 그 절 전체다. 최신 Author 턴에 그 절이 없으면 그 절을 실은 앞선 Author 턴을 읽는다. Author 가 응답 줄에만 적은 보완은 PR 본문을 바꾸지 않으므로 해소가 아니다
+    - 발행될 본문은 `rd-workflow/scripts/lifecycle/team_publish.sh` 의 `tp_extract_pr_body` 가 그 Author 턴에서 추출하는 결과다. 경계 규칙은 그 함수가 정본이다. 목록이나 `없음 — <사유>` 가 추출 결과에 없으면 목록 누락이다
+    - 「추론」 으로 남은 외부 동작은 이의다. Reviewer 가 직접 확인했으면 그 근거를 발견에 적어 Author 가 목록에 옮기게 한다
+    - 「확인 불가」 인데 확인할 길(공개 소스·문서·로컬 실행)이 있으면 그 길을 발견에 적는다. 길이 없다고 판단하면 근거가 붙은 것으로 본다. Author 와 판단이 갈려 이의가 남으면 `USER_ACTION.md` 에 「그 외부 동작을 확인하지 않은 채 받아들일지」 를 묻는다
+    - 목록 항목을 따라가 찾은 결함은 그 결함의 종류대로 이의다. 새 입력을 받는 기존 로직의 결함은 「이번 변경 전부터 있던 동작」 이 아니라 이번 변경이 드러낸 결함이다
+- 이의마다 `경로:` 줄에 그 결함이 현실에서 일어나는 경로(누가 어떤 정상 사용에서 겪는가)를 한 줄 적는다. `맞닿은 곳:` 발견은 그 맞닿은 곳을 지나는 실제 실행 경로를 적는다. 경로를 적지 못하면 이의가 아니다.
 - 문턱 밖 지적은 Findings 에 넣지 않고 Summary 끝에 `메모: <위치> — <내용>` 줄로 적는다. 문구·서식·주석·유지보수성, 증거·기록 형식(검증 증거가 최신 트리와 어긋남 — `rd review seal` 이 검증 증거의 종료 코드와 트리를 대조한다. 변이 결과표 누락·행 갱신 누락 — 기계 검사가 없으며 작성·갱신은 Author 몫이다(`final-diff-review` skill). 측정 결과를 문서로 옮기지 않음), 실패 주입으로만 재현되는 경로, rd 가 만들지 않는 입력의 경계 사례, 사람이 이미 결정한 사항이 여기에 든다. 메모는 종결을 막지 않고 Author 는 응답하지 않아도 된다. 다음 턴에 같은 메모를 이의로 올리지 않는다.
-- 범위 축소: 다음 Reviewer 턴 번호가 6 을 넘으면(`REVIEW_SCOPE_NARROW_AFTER`, 기본 6) `run_review_turn.sh` 가 리뷰어 지시에 좁힌 문턱을 넣는다. 그 턴부터 종결을 막는 이의는 작업의 기본 사용 경로 결함, 환경과 상관없는 데이터 손실·보안 문제, 요청·AC·spec 이탈, 검증 공백뿐이다. 드문 환경에서만 생기는 잘못된 결과·불편과 방어 절차 추가 요구는 Summary 끝에 `범위 밖: <위치> — <내용> — <사유>` 줄로 적고 종결을 막지 않는다. 앞 턴의 열린 이의가 이 기준으로 범위 밖이 되면 Reviewer 가 Open Issues 에서 빼고 같은 줄로 옮긴다. 사람에게 묻지 않는다.
-- 이미 정한 범위 밖: 리뷰어 지시에는 REQUEST(diff review 는 보관본) `## Constraints` 의 `- 범위 밖:` 줄(사람이 정한 것)과, short-title 이 같고 task-state `base-commit` 에 없던(이번 작업에서 연) 리뷰 세션들의 Reviewer 턴 `범위 밖:` 줄이 함께 들어간다. Reviewer 는 같은 사실·같은 영향의 지적을 이의로도 메모로도 다시 내지 않는다. 새 근거로 드러난 보호 범주(위 범위 축소의 넷) 결함은 이의로 낸다. `run_review_turn.sh` 는 Reviewer 턴 뒤에 그 세션의 `범위 밖:` 줄을 턴 번호와 함께 출력한다.
+- 범위 축소: 다음 Reviewer 턴 번호가 6 을 넘으면(`REVIEW_SCOPE_NARROW_AFTER`, 기본 6) `run_review_turn.sh` 가 리뷰어 지시에 좁힌 문턱을 넣는다. 그 턴부터 종결을 막는 이의는 작업의 기본 사용 경로 결함, 환경과 상관없는 데이터 손실·보안 문제, 요청·AC·spec 이탈, 검증 공백뿐이다. 드문 환경에서만 생기는 잘못된 결과·불편과 방어 절차 추가 요구는 Summary 끝에 `범위 밖: <위치> — <내용> — <사유>` 줄로 적고 종결을 막지 않는다. 앞 턴의 열린 이의가 이 기준으로 범위 밖이 되면 Reviewer 가 Open Issues 에서 빼고 같은 줄로 옮긴다. 사람에게 묻지 않는다. final diff review 에서는 PR 본문 「맞닿은 곳」 목록의 곳에서 나온 결함과 `맞닿은 곳:` 발견을 드문 환경으로 돌리지 않는다. 다른 이의가 모두 범위 밖이어도 이 이의가 남아 있으면 종결하지 않는다.
+- 이미 정한 범위 밖: 리뷰어 지시에는 REQUEST(diff review 는 보관본) `## Constraints` 의 `- 범위 밖:` 줄(사람이 정한 것)과, short-title 이 같고 task-state `base-commit` 에 없던(이번 작업에서 연) 리뷰 세션들의 Reviewer 턴 `범위 밖:` 줄이 함께 들어간다. Reviewer 는 같은 사실·같은 영향의 지적을 이의로도 메모로도 다시 내지 않는다. 새 근거로 드러난 보호 범주(위 범위 축소의 넷) 결함은 이의로 낸다. final diff review 에서는 앞선 Reviewer 턴이 범위 밖으로 돌린 줄이 PR 본문 「맞닿은 곳」 목록의 곳을 덮지 않으며, 사람이 정한 줄(`결정: 사람`)은 그대로 적용한다. `run_review_turn.sh` 는 Reviewer 턴 뒤에 그 세션의 `범위 밖:` 줄을 턴 번호와 함께 출력한다.
 - Author 는 Reviewer 지적에 응답하기 전에 superpowers `receiving-code-review` 를 쓴다. 쓸 수 없으면 같은 원칙을 따른다 — 지적마다 코드·실행으로 사실을 확인하고, 확인 전에 동의하지 않는다.
-- Author 턴 `Findings` 에 지적마다 `- F2 — 수용|반박|보류. 근거: …` 한 줄을 쓴다. 수용은 고친 위치, 반박은 반대 근거 인용(`경로:줄` — `원문`, 또는 명령과 그 결과), 보류는 사람 판단이 필요한 이유를 적는다.
+- Author 턴 `Findings` 에 지적마다 `- F2 — 수용|반박|보류. 근거: …` 한 줄을 쓴다. 수용은 고친 위치, 반박은 반대 근거 인용(`경로:줄` — `원문`, 또는 명령과 그 결과), 보류는 사람 판단이 필요한 이유를 적는다. 반박·보류의 근거가 「이번 변경 전부터 있던 동작」 이거나 그 이유로 범위 밖을 제안하면(사람에게 판단을 요청하기 전, 제안하는 Author 턴에서) 같은 줄에 `새 입력: 넣음|안 넣음 — <근거>` 를 적는다. 이번 변경이 그 로직에 새 입력을 넣으면 그 결함은 이번 변경의 결함이라 반박·범위 밖 근거가 되지 않는다.
 - `run_review_turn.sh` 가 턴 뒤 인용을 파일과 대조해 경고를 보여 준다(턴은 막지 않는다).
 - `run_review_turn.sh` 는 턴이 성공하면 세션 폴더 안의 `.git` 을 찾아 경로와 조치를 경고합니다. 파일을 옮기거나 지우지 않고, 턴 결과도 바꾸지 않습니다.
 
@@ -271,8 +319,8 @@ final-diff-review 진행 중 reviewer 가 코드 수정을 요청하면, author 
 |---|---|---|
 | `run-missing` | 유효한 실행 기록이 0건입니다 (Closure Reason 과 상관없습니다) | 리뷰어 턴을 `run_review_turn.sh` 로 실행합니다 |
 | `reason-invalid` | Closure Reason 이 `reviewer-no-objection`·`user-override` 도 비어 있음도 아닙니다 | 값을 고치거나 비웁니다 |
-| `reason-unproven` | 비어 있음·`reviewer-no-objection` 인데 마지막 리뷰어 턴의 기록이 이의 없음·`head` 일치를 증명하지 않습니다 | 리뷰어 턴을 다시 실행하거나, 사람이 정했다면 `user-override` 와 `근거:` 줄을 적습니다 |
-| `override-basis-missing` | `user-override` 인데 `근거:` 줄이 없거나 내용이 비었습니다 | 사람이 정했으면 근거 줄을 적고, 아니면 `user-override` 를 지우고 리뷰어 턴을 다시 실행합니다 |
+| `reason-unproven` | 비어 있음·`reviewer-no-objection` 인데 마지막 리뷰어 턴의 기록이 이의 없음·`head` 일치를 증명하지 않습니다 | 리뷰어 턴을 다시 받아 이의 없음을 받습니다. 다시 받는 명령은 seal 이 세션 상태에 맞춰 출력합니다(수렴한 `awaiting-user` 는 Author 턴 뒤 `--reopen "<사유>"`, head 가 고정된 뒤 코드가 바뀐 세션과 `closed` 세션은 새 세션). 재리뷰가 `awaiting-author` 로 끝나면 Author 턴을 쓰고 옵션 없이 `run_review_turn.sh` 로 잇습니다. 미해결 이의가 남은 `awaiting-user` 로 멈추면 사람이 정한 뒤 결정을 반영한 Author 턴을 쓰고 `--decision "<사용자 결정>"` 으로 잇거나 `--override "<결정한 사람> — <그 사람이 한 말>"` 로 종결합니다 |
+| `override-basis-missing` | `user-override` 인데 `근거:` 줄이 없거나 내용이 비었습니다 | 손으로 넣은 `user-override` 줄을 지운 뒤 `reason-unproven` 행과 같은 방법으로 리뷰어 턴을 다시 받고 이어 갑니다. 근거 줄은 `--override` 가 씁니다 |
 
 - 봉인에 성공하면 마커에 `closure-reason=<값>` 줄을 남깁니다. 선택 필드입니다.
 - `verified=legacy-unverified` 마커로 통과할 때는 `archive.sh` 와 `rd task status` **양쪽**이 매번 경고를 냅니다 (리뷰 당시 트리를 증명하지 않는 마커이므로).

@@ -248,6 +248,7 @@ for k, hl in groups.items():
         if h.get("command", "").startswith("bash ") and m:
             names.add(m.group(1))
 names.discard("root_mirror_drift_gate")
+names.discard("subagent_dispatch_display")  # 표시 전용 hook — 차단하지 않으므로 gate 감시 대상이 아님
 for k in want:
     sent = [h.get("command", "") for h in groups.get(k, []) if h.get("command", "").startswith(": rd-hook-sentinel v1;")]
     short = k.replace("PreToolUse:", "") + " 그룹" if k != "SessionStart" else "SessionStart 그룹"

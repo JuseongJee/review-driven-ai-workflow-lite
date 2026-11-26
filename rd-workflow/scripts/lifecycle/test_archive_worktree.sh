@@ -23,6 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # herdr app(HC_TERMINAL_ID)도 같은 이유로 비운다.
 export HERDR_ENV=
 export HC_TERMINAL_ID=
+export ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE=
 export RD_CHILD_SESSION=1
 # 바깥 셸의 project_root·TASK_STATE_PATH 를 물려받지 않는다. promote.sh·_state_common.sh 는
 # 두 값이 있으면 그 값을 루트·상태 파일로 쓰므로, 상속되면 fixture 가 아니라 바깥 저장소를
@@ -866,6 +867,49 @@ mo_archive mo3b
   && pass "mo3b: _sm_stop 경로가 사유와 git 출력을 함께 낸다" || fail "mo3b: git 출력/사유 누락 — $mo_out"
 git -C "$REPO" merge --abort >/dev/null 2>&1 || true
 
+# 케이스 4 — 기본 브랜치에 stage_metrics.tsv 가 없을 때 띄운 줄기와 기본 브랜치가 각자 파일을 만든 add/add 충돌을 푼다
+#   (FR stage-metrics-add-add-auto-resolve). 헤더는 한 번, 기본 브랜치 행 뒤에 줄기의 새 행, 같은 행은 어느 쪽에서 왔든 한 번이다
+#   (기본 쪽 안의 중복 mo4-main 포함).
+git -C "$REPO" rm -q -- "$mo_sm"
+RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main: stage_metrics 없음 (mo4)"
+bash "$PROMOTE_SH" --short-title mo4 --size large --source-fr - >/dev/null 2>&1
+mo4_wt="$REPO/.worktrees/mo4"
+[[ -f "$mo4_wt/$mo_sm" ]] || printf '%s\n' "$mo_hdr" > "$mo4_wt/$mo_sm"
+printf 'mo4-dup\t대기 중\t구현 중\t150\nmo4\t구현 중\t검증 중\t200\n' >> "$mo4_wt/$mo_sm"
+printf 'work-mo4\n' > "$mo4_wt/src-mo4.txt"
+git -C "$mo4_wt" add -A
+git -C "$mo4_wt" commit -q -m "구현: mo4"
+printf '%s\nmo4-main\t대기 중\t구현 중\t300\nmo4-dup\t대기 중\t구현 중\t150\nmo4-main\t대기 중\t구현 중\t300\n' "$mo_hdr" > "$REPO/$mo_sm"
+git -C "$REPO" add -A
+RD_LIFECYCLE_BYPASS_REASON=lifecycle git -C "$REPO" commit -q -m "main: stage_metrics 새로 만듦 (mo4)"
+mo_archive mo4
+mo4_sm="$(git -C "$REPO" show "main:$mo_sm" 2>/dev/null || true)"
+if [[ "$mo_rc" -eq 0 && "$mo_out" == *"stage_metrics.tsv 충돌을 줄 합집합으로 해결했습니다 (공통 조상에 파일 없음"* \
+   && "$(sed -n 1p <<<"$mo4_sm")" == "$mo_hdr" && "$(grep -c '^# ' <<<"$mo4_sm")" == 1 \
+   && "$(grep -c $'^mo4-dup\t' <<<"$mo4_sm")" == 1 && "$(grep -c $'^mo4-main\t' <<<"$mo4_sm")" == 1 \
+   && "$(grep -n $'^mo4-main\t' <<<"$mo4_sm" | cut -d: -f1)" == 2 \
+   && "$(grep -n $'^mo4\t구현 중\t검증 중\t200$' <<<"$mo4_sm" | cut -d: -f1)" -gt 2 ]]; then
+  pass "mo4: add/add 발행 rc=0, 헤더 1번, 기본 브랜치 행 뒤에 줄기 행, 같은 행 1번"
+else
+  fail "mo4: rc=$mo_rc stage_metrics=[$mo4_sm] — $mo_out"
+fi
+git -C "$REPO" merge --abort >/dev/null 2>&1 || true
+
+# 케이스 4h — add/add 에서 작업 쪽 헤더만 기준과 다르면 자동 해소하지 않는다(AC6). 작업 쪽 첫 줄은 합칠 때 버려지므로
+#   결과 형식 검증으로는 잡히지 않는다 — 해소 함수를 직접 불러 본다(발행 한 번을 아낀다).
+mo4h_d="$(mktemp -d)" || { echo "test_archive_worktree.sh: mo4h 임시 디렉터리 생성 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+printf '%s\nm\t대기 중\t구현 중\t1\n' "$mo_hdr" > "$mo4h_d/ours"
+printf '# short_title\tfrom\tto\tepoch\nw\t구현 중\t검증 중\t2\n' > "$mo4h_d/theirs"
+mo4h_rc=0; mo4h_why="$( source "$SCRIPT_DIR/_merge_precheck.sh" && RD_MERGE_RESOLVE_QUIET=1 \
+  rd_merge_resolve_record "$mo_sm" "" "$mo4h_d/ours" "$mo4h_d/theirs" "$mo4h_d/out" && exit 0
+  r=$?; printf '%s' "$RD_MERGE_RESOLVE_WHY"; exit "$r" )" || mo4h_rc=$?
+if [[ "$mo4h_rc" == 1 && "$mo4h_why" == *"두 판의 헤더가 기준 헤더와 달라 자동 해소하지 않습니다"* ]]; then
+  pass "mo4h: add/add 작업 쪽 헤더만 다르면 rc=1, 사유 줄"
+else
+  fail "mo4h: rc=$mo4h_rc why=[$mo4h_why]"
+fi
+rm -rf "$mo4h_d"
+
 # CURRENT_TASK.md 충돌 (FR publish-path-interruptions D1) — fr 는 `대기 중` 줄을 `아카이브 보류` 로, main 은 같은 줄을 `구현 중` 으로 바꾼다.
 # mo_ct_diverge <slug> [sm|x|ve|vedel|veonly]  — 케이스 사이에 main 의 CURRENT_TASK.md 를 `대기 중` 기준으로 되돌려 둔 뒤 시작한다.
 #   ve     : sm + FUTURE_REQUESTS.md + verify-evidence 를 양쪽에서 다르게 바꾼다 (2026-11-01 실사례 네 파일 조합).
@@ -1184,6 +1228,7 @@ ap_item "$APR" i1 'o/r#1'; ap_item "$APR" i2 'o/r#2'; ap_item "$APR" i3 '-'
 ap_item "$APR" i5 'o/r#5'; ap_item "$APR" i6 'o/r#6'; ap_item "$APR" i7 'o/r#7'
 ap_item "$APR" i15 'https://github.com/o/r/issues/15'
 ap_item "$APR" i16 'https://github.com/o/r/issues/16, o/r#17'; ap_item "$APR" i18 'o/r#18'
+ap_item "$APR" i19 'o/r#19'   # 장부의 html_url 키 행이 다른 FR 에 연결돼 있어 close-fr 가 남기는 행(AC2)
 # 특수 문자 경로: glob 문자 `a[1]` 와 그 패턴에 맞는 다른 FR `a1`, 공백, 셸 메타문자 `;`.
 ap_item "$APR" 'a[1]' 'o/r#10'; ap_item "$APR" a1 'o/r#11'
 ap_item "$APR" 'space name' 'o/r#13'; ap_item "$APR" 'semi;printf INJECTED;' 'o/r#14'
@@ -1198,7 +1243,7 @@ ap_it="rd-workflow-workspace/backlog/items"
 #   여기에 특수 문자 경로 셋을 얹는다: `a[1]`(#10 — glob 으로 `a1`(#11) 을 고르면 안 됨), 공백(#13)·`;`(#14) 경로는 닫기 실패로
 #   재실행 줄을 내게 한다.
 ap_promote "$APR" ia
-ap_set_field "$APR/.worktrees/ia" source-fr "$ap_it/i15.md|$ap_it/i16.md|$ap_it/i18.md|$ap_it/i1.md|$ap_it/i2.md|$ap_it/i3.md|$ap_it/gone.md|$ap_it/i5.md|$ap_it/i7.md|$ap_it/i6.md|$ap_it/a[1].md|$ap_it/space name.md|$ap_it/semi;printf INJECTED;.md"
+ap_set_field "$APR/.worktrees/ia" source-fr "$ap_it/i15.md|$ap_it/i16.md|$ap_it/i18.md|$ap_it/i1.md|$ap_it/i2.md|$ap_it/i3.md|$ap_it/gone.md|$ap_it/i5.md|$ap_it/i7.md|$ap_it/i6.md|$ap_it/a[1].md|$ap_it/space name.md|$ap_it/semi;printf INJECTED;.md|$ap_it/i19.md"
 gh_reset
 gh_issue 1 open; gh_issue 2 closed; gh_issue 5 open; gh_issue 6 open
 gh_issue 10 open; gh_issue 11 open; gh_issue 13 open; gh_issue 14 open
@@ -1211,6 +1256,9 @@ printf 'o/r\t16\thttps://github.com/o/r/issues/16\t-\t2026-11-16T00:00:00Z\n' >>
 # #18 은 닫은 뒤 장부 잠금이 잡혀 정리만 실패한다 — forget 줄을 내고 close-fr 재실행은 안내하지 않아야 한다.
 gh_issue 18 open
 printf 'o/r\t18\thttps://github.com/o/r/issues/18\t-\t2026-11-16T00:00:00Z\n' >> "$RD_ISSUE_LEDGER"
+# #19 는 html_url 키(github.com/o/r)의 행이 다른 FR(2026-11-21-public)에 연결돼 있다 — close-fr 가 그 행을 남기고, 발행 출력이 그 사실을 알려야 한다.
+printf '{"state":"open","assignees":[],"html_url":"https://github.com/o/r/issues/19"}\n' > "$GHF/resp/api_repos_o_r_issues_19"
+printf 'github.com/o/r\t19\thttps://github.com/o/r/issues/19\t2026-11-21-public\t2026-11-16T00:00:00Z\n' >> "$RD_ISSUE_LEDGER"
 mkdir "$RD_ISSUE_LEDGER.lock"; export RD_ISSUE_LOCK_WAIT=0.2
 gh_fail issue_comment_5; gh_fail issue_close_6; gh_fail api_repos_o_r_issues_7
 gh_fail issue_close_13; gh_fail issue_close_14
@@ -1230,6 +1278,10 @@ a3_pub="$(git -C "$APO" rev-parse main)"
   && pass "A3: 같은 FR 의 #17 이 실패해도 닫은 #16 과 남은 선점 행 안내를 보인다" || fail "A3: #16 부분 실패 안내 누락 — $a3_out"
 [[ "$a3_out" == *"archive: WARNING — Issue 닫기 실패 ($ap_it/i18.md)"* && "$a3_out" == *"archive:   장부 정리: bash rd-workflow/scripts/issue_queue.sh forget o/r 18"* && "$a3_out" != *"close-fr $ap_it/i18.md"* ]] \
   && pass "A3: 장부 정리만 실패한 #18 은 forget 줄을 내고 close-fr 재실행 줄은 내지 않는다" || fail "A3: #18 안내 — $a3_out"
+[[ "$a3_out" == *"archive: 다른 FR(2026-11-21-public)에 연결된 선점 행 github.com/o/r#19 은 남겼습니다 — 그 FR 의 선점입니다"* ]] \
+  && pass "A3-i19-notice: 다른 FR 의 선점 행을 남겼다고 발행 출력에 알린다" || fail "A3-i19-notice: 안내 누락 — $a3_out"
+[[ "$a3_out" != *"WARNING — Issue 닫기 실패 ($ap_it/i19.md)"* ]] \
+  && pass "A3-i19-nowarn: 다른 FR 의 선점 행은 닫기 실패 경고로 보이지 않는다" || fail "A3-i19-nowarn: 경고가 있다 — $a3_out"
 [[ "$(gh_count 'issue close 1 --repo o/r')" == 1 ]] && pass "A3: #1 닫기 호출 1회" || fail "A3: #1 닫기 호출 수 $(gh_count 'issue close 1 --repo o/r') — $(<"$GHF/gh.log")"
 [[ "$(gh_count 'issue comment 2 ')" == 0 && "$(gh_count 'issue close 2 ')" == 0 ]] \
   && pass "A3: 닫힌 #2 에 댓글·닫기 호출이 없다" || fail "A3: #2 호출 — $(<"$GHF/gh.log")"
@@ -1335,12 +1387,78 @@ a7_work() {  # a7_work <source-fr 경로|-> — no-fr 작업 `repeat` 를 기본
 }
 a7_hook() { printf '#!/bin/sh\necho "pre-receive 거부(테스트)" >&2\nexit 1\n' > "$A7O/hooks/pre-receive"; chmod +x "$A7O/hooks/pre-receive"; }
 a7_recs() { ls "$a7_rec" 2>/dev/null | LC_ALL=C sort | tr '\n' ' '; }
+# a7_plain [인자...] — 두 감사 옵션 없이 기본 체크아웃에서 archive.sh 를 부른다(출력 ap_out, 종료코드 ap_rc).
+a7_plain() { ap_rc=0; ap_out="$( cd "$A7R" && bash rd-workflow/scripts/lifecycle/archive.sh "$@" 2>&1 )" || ap_rc=$?; }
+# a7_other_up — 색인에 다른 진행 중 작업 other(fr/other worktree, tip 이 main 에서 닿지 않음)를 만든다. a7_other_down 이 치운다.
+#   없으면 새는 실수: 대상 없는 archive·rollback 이 색인의 다른 작업을 골라 발행하거나 지움.
+a7_other_up() {
+  a7_ow="$A7/wt-other"
+  a7_idx="$(cd "$A7R" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_path')"
+  a7_idx_had=0; [[ -f "$a7_idx" ]] && a7_idx_had=1
+  git -C "$A7R" worktree add -q -b fr/other "$a7_ow" HEAD
+  printf 'other-%s\n' "$RANDOM" > "$a7_ow/other-work.txt"
+  git -C "$a7_ow" add other-work.txt && git -C "$a7_ow" commit -q -m "구현: other"
+  printf 'schema=1\nshort-title=other\nstatus=구현 중\nfr-branch=fr/other\nworktree-path=%s\nsource-fr=-\nbase-commit=null\nreview-session=null\n' "$a7_ow" \
+    > "$a7_ow/rd-workflow-workspace/.lifecycle/task-state"
+  # task-state 를 커밋해 worktree 를 깨끗하게 둔다 — 잘못 고르면 other 가 실제로 병합·tag 되게 하는 조건이다(더러우면 발행이 먼저 멈춰 결함이 가려진다).
+  git -C "$a7_ow" add -A && git -C "$a7_ow" commit -q -m "progress: other task-state"
+  ( cd "$A7R" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_upsert other fr-branch=fr/other worktree-path="$1"' _ "$a7_ow" )
+  if git -C "$A7R" merge-base --is-ancestor fr/other main; then fail "a7_other_up: fr/other 가 main 의 조상이다(사전 조건)"; fi
+}
+a7_other_down() {
+  git -C "$A7R" worktree remove --force "$a7_ow" >/dev/null 2>&1 || true
+  git -C "$A7R" branch -D fr/other >/dev/null 2>&1 || true
+  ( cd "$A7R" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_remove other' ) || true
+  [[ "$a7_idx_had" == 1 ]] || rm -f "$a7_idx"
+  return 0
+}
+# a7_fns <이름...> — archive.sh 에서 그 이름의 함수 정의만 꺼낸다(test_archive_submodule.sh 의 arch_fns 와 같은 방식).
+a7_fns() {
+  awk -v names=" $* " '
+    /^[A-Za-z_][A-Za-z0-9_]*\(\) *\{/ { n = $0; sub(/\(.*/, "", n); on = (index(names, " " n " ") > 0) }
+    on { print; if ($0 ~ /^\}/ || ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*\(\) *\{.*\}[[:space:]]*$/)) on = 0 }' "$SCRIPT_DIR/archive.sh"
+}
+a7_call() {  # a7_call <SLUG> <함수 [인자...]> — 기본 체크아웃에서 archive.sh 의 함수를 서브셸로 부른다
+  local _slug="$1"; shift
+  ( cd "$A7R" && source "$SCRIPT_DIR/slug.sh" && source "$SCRIPT_DIR/_lifecycle_common.sh" && source "$SCRIPT_DIR/_team_publish_common.sh" \
+    && source "$SCRIPT_DIR/_direct_pr_common.sh" \
+    && eval "$(a7_fns _archive_nofr_gate_tip _archive_nofr_retry_commit _archive_nofr_name_hint _archive_field_at _archive_status_at _archive_only_lifecycle_paths)" \
+    && SLUG="$_slug" BRANCH_MODE=no-fr && "$@" ) 2>&1
+}
 
 # A7a — 첫 실행 성공: push 뒤 원격 추적 ref 가 발행 커밋과 같아도 #1 을 닫고, 끝나면 기록이 없다.
 #   Source FR 은 이름에 `|` 가 든 단일 경로다 — 두 FR 로 찢으면 상세를 찾지 못해 #1 을 닫지 못한다.
 a7_work "$ap_it/pipe|name.md"
+# t_A7a_with_index — 색인에 다른 진행 중 작업(other, fr/other worktree)이 있어도 기본 체크아웃에서 대상 없이 부른 archive 는
+# 기본 체크아웃 작업(no-fr)을 발행하고 other 를 건드리지 않는다. 끝에서 other 를 지워 A7b 이후가 종전 상태에서 돈다.
+# 없으면 새는 실수: 대상 판정 결과를 받는 archive.sh 가 색인 작업의 fr 브랜치를 발행함.
+a7_ow="$A7/wt-other"
+a7_idx="$(cd "$A7R" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_path')"
+a7_idx_had=0; [[ -f "$a7_idx" ]] && a7_idx_had=1
+git -C "$A7R" worktree add -q -b fr/other "$a7_ow" HEAD
+# other 의 task-state 는 fr 작업으로 둔다 — 브랜치에 커밋된 기본 체크아웃 task-state(fr-branch=null)를 그대로 두면 archive 가
+# other 를 골라도 no-fr 발행으로 흘러 결함이 보이지 않는다.
+printf 'schema=1\nshort-title=other\nstatus=구현 중\nfr-branch=fr/other\nworktree-path=%s\nsource-fr=-\nbase-commit=null\nreview-session=null\n' "$a7_ow" \
+  > "$a7_ow/rd-workflow-workspace/.lifecycle/task-state"
+( cd "$A7R" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_upsert other fr-branch=fr/other worktree-path="$1"' _ "$a7_ow" )
+a7_head="$(git -C "$A7R" rev-parse HEAD)"
+a7_tags0="$(git -C "$A7R" tag --list | LC_ALL=C sort | tr '\n' ' ')"
 gh_reset; gh_issue 1 open
 ap_archive "$A7R"
+a7_newtags="$(git -C "$A7R" tag --list | LC_ALL=C sort | tr '\n' ' ')"
+git -C "$A7O" merge-base --is-ancestor "$a7_head" main 2>/dev/null \
+  && pass "t_A7a_with_index: 원격 main 에 기본 체크아웃 작업 커밋이 발행됐다" || fail "t_A7a_with_index: 원격 main 에 작업 커밋이 없다 — $ap_out"
+[[ "$a7_newtags" != "$a7_tags0" && "$a7_newtags" == *"/repeat "* && "$a7_newtags" != *"/other "* ]] \
+  && pass "t_A7a_with_index: 기본 체크아웃 작업(repeat)의 태그만 생겼다" || fail "t_A7a_with_index: 태그 전 [$a7_tags0] 후 [$a7_newtags]"
+( cd "$A7R" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_slugs' ) | grep -qx other \
+  && pass "t_A7a_with_index: 색인 other 행이 진행 중으로 남았다" || fail "t_A7a_with_index: 색인 other 행이 사라지거나 정리 대기가 됐다"
+git -C "$A7R" rev-parse -q --verify refs/heads/fr/other >/dev/null && [[ -d "$a7_ow" ]] \
+  && pass "t_A7a_with_index: fr/other 브랜치와 worktree 가 그대로다" || fail "t_A7a_with_index: fr/other 브랜치 또는 worktree 가 사라졌다"
+git -C "$A7R" worktree remove --force "$a7_ow" >/dev/null 2>&1 || true
+git -C "$A7R" branch -D fr/other >/dev/null 2>&1 || true
+( cd "$A7R" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_remove other' ) || true
+# 색인 파일이 원래 없었으면 지운다 — 남으면 색인을 써 본 저장소로 판정돼 A7b 의 기본 체크아웃 set-status 가 막힌다.
+[[ "$a7_idx_had" == 1 ]] || rm -f "$a7_idx"
 [[ "$ap_rc" -eq 0 ]] && pass "A7a: no-fr 발행이 rc=0 이다" || fail "A7a: rc=$ap_rc — $ap_out"
 [[ "$(git -C "$A7R" rev-parse refs/remotes/origin/main)" == "$(git -C "$A7O" rev-parse main)" ]] \
   && pass "A7a: push 뒤 원격 추적 ref 가 발행 커밋과 같다" || fail "A7a: 원격 추적 ref 가 다르다"
@@ -1380,14 +1498,39 @@ ap_archive "$A7R"
 [[ "$(a7_recs)" == "$a7_orphan " ]] && pass "A7e: 두 기록은 지워지고 비조상 기록만 남는다" || fail "A7e: 남은 기록 '$(a7_recs)' (기대 '$a7_orphan ')"
 
 # A7d — 정리 뒤 push 실패 → set-title 복구 커밋 → 재실행: 첫 실행의 기록(#3)을 재정리 커밋 기준으로 고른다.
+#   AC3·AC4: 색인에 다른 진행 중 작업(other)이 있어도 기본 체크아웃 작업의 재시도는 그 작업이고 other 를 건드리지 않는다.
+#   첫 정리 커밋의 부모는 Status `아카이브 보류` 여야 사슬의 C1 이 된다(실제 발행 대기 상태).
 a7_work "$ap_it/i3.md"
+ap_set_field "$A7R" status "아카이브 보류"
+[[ "$(_a7s="$(git -C "$A7R" show HEAD:rd-workflow-workspace/.lifecycle/task-state)"; printf '%s\n' "$_a7s" | sed -n 's/^status=//p')" == "아카이브 보류" ]] \
+  && pass "A7d(사전 조건): HEAD task-state Status 가 아카이브 보류다" || fail "A7d(사전 조건): Status 가 아카이브 보류가 아니다"
 a7_w3="$(git -C "$A7R" rev-parse HEAD)"
+a7_other_up
 a7_hook
 gh_reset
 ap_archive "$A7R"
 [[ "$ap_rc" -ne 0 && -f "$a7_rec/$a7_w3" ]] && pass "A7d: push 실패 뒤 작업 커밋 이름의 보류 기록이 남는다" || fail "A7d: rc=$ap_rc 기록='$(a7_recs)' — $ap_out"
+# AC3a — 작업 이름이 `-` 인 정리 직후, 옵션 없이 부르면 기본 체크아웃 작업의 재시도로 보고 set-title 안내로 멈춘다.
+a7_plain
+[[ "$ap_rc" -ne 0 && "$ap_out" == *"발행 재시도로 봅니다"* && "$ap_out" == *"rd task set-title"* ]] \
+  && pass "AC3a: 정리 직후 옵션 없는 재실행은 재시도로 보고 set-title 안내로 멈춘다" || fail "AC3a: rc=$ap_rc — $ap_out"
 ( cd "$A7R" && bash rd-workflow/scripts/rd task set-title repeat ) >/dev/null 2>&1
 git -C "$A7R" add -A && git -C "$A7R" commit -q -m "chore: set-title 복구"
+# AC3b — 복구 뒤 옵션 없이: 재시도로 보고 「cleanup 이후 상태」 안내와 두 옵션 이름으로 멈추고 HEAD 를 바꾸지 않는다.
+a7d_head="$(git -C "$A7R" rev-parse HEAD)"
+a7_plain
+[[ "$ap_rc" -ne 0 && "$ap_out" == *"발행 재시도로 봅니다"* && "$ap_out" == *"cleanup 이후 상태"* && "$ap_out" == *"--force-skip-review-check"* && "$ap_out" == *"--allow-status-mismatch"* \
+   && "$(git -C "$A7R" rev-parse HEAD)" == "$a7d_head" ]] \
+  && pass "AC3b: 복구 뒤 옵션 없는 재실행은 재시도 안내와 두 옵션 이름으로 멈추고 HEAD 가 그대로다" || fail "AC3b: rc=$ap_rc — $ap_out"
+# AC4 취소 — 재시도 상태(작업 없음)에서 대상 없이 부른 rollback 은 other 를 고르지 않는다.
+a7_ref0="$(git -C "$A7R" rev-parse fr/other)"
+a7_rb_rc=0
+a7_rb_out="$( cd "$A7R" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh 2>&1 )" || a7_rb_rc=$?
+[[ "$a7_rb_rc" -ne 0 && "$a7_rb_out" == *"자동으로 고르지 않습니다"* && "$a7_rb_out" == *"- other"* && "$a7_rb_out" == *"--task"* \
+   && "$(git -C "$A7R" rev-parse fr/other)" == "$a7_ref0" && -d "$a7_ow" ]] \
+  && pass "AC4: 재시도 상태의 대상 없는 rollback 은 other 를 고르지 않고 목록·--task 로 멈춘다" || fail "AC4: rc=$a7_rb_rc — $a7_rb_out"
+# AC3c — 두 감사 옵션으로 재실행하면 기본 체크아웃 작업(repeat)만 발행되고 other 는 병합·tag 되지 않는다.
+a7_other_oid="$(git -C "$A7R" rev-parse fr/other)"
 rm -f "$A7O/hooks/pre-receive"
 gh_reset; gh_issue 3 open
 ap_archive "$A7R"
@@ -1396,6 +1539,15 @@ a7d_pub="$(git -C "$A7O" rev-parse main)"
 [[ "$(gh_count 'issue close 3 --repo o/r')" == 1 ]] && pass "A7d: 재실행이 #3 을 닫는다" || fail "A7d: #3 닫기 호출 — $(<"$GHF/gh.log") — $ap_out"
 [[ "$(gh_count "issue comment 3 --repo o/r --body 반영 커밋: https://github.com/o/r/commit/$a7d_pub")" == 1 ]] \
   && pass "A7d: 댓글의 커밋 URL 이 재실행의 발행 커밋이다" || fail "A7d: 댓글 URL — $(<"$GHF/gh.log") (발행 $a7d_pub)"
+a7d_tags="$( { git -C "$A7R" tag --list; git -C "$A7O" tag --list; } )"
+a7d_ptags="$(git -C "$A7O" tag --points-at main)"
+[[ "$(git -C "$A7O" rev-parse main)" == "$(git -C "$A7R" rev-parse main)" ]] \
+  && ! git -C "$A7R" merge-base --is-ancestor "$a7_other_oid" main \
+  && ! printf '%s\n' "$a7d_tags" | grep -Eq '^fr/.*/other(-[0-9]+)?$' \
+  && printf '%s\n' "$a7d_ptags" | grep -Eq '^fr/.*/repeat(-[0-9]+)?$' \
+  && pass "AC3c: 기본 체크아웃 작업(repeat)만 발행·tag 되고 other 는 병합·tag 되지 않았다" \
+  || fail "AC3c: other oid 병합 여부·tag 가 어긋남 — tags=[$a7d_tags] points-at=[$a7d_ptags] — $ap_out"
+a7_other_down
 
 # A7f — 로컬 전용(--no-remote) no-fr 발행은 보류 기록을 쓰지 않고 gh 도 부르지 않는다.
 a7_recs_before="$(a7_recs)"
@@ -1406,6 +1558,92 @@ ap_archive "$A7R" --no-remote
 [[ "$ap_rc" -eq 0 && ! -e "$a7_rec/$a7_wf" && "$(a7_recs)" == "$a7_recs_before" ]] \
   && pass "A7f: 로컬 전용 no-fr 발행은 보류 기록을 쓰지 않는다" || fail "A7f: rc=$ap_rc 기록='$(a7_recs)' (전 '$a7_recs_before') — $ap_out"
 [[ ! -s "$GHF/gh.log" ]] && pass "A7f: 로컬 전용 no-fr 발행은 gh 를 부르지 않는다" || fail "A7f: gh 호출 — $(<"$GHF/gh.log")"
+
+# A7g — push 가 두 번 실패한 사슬(C1→R1→C2→R2): 정리 커밋이 HEAD 에서 멀어도 기본 체크아웃 작업의 재시도로 보고,
+#   팀 저장소 반영 게이트 대상은 C1 의 부모이며, 작업 이름 안내가 복구 커밋을 안내한다(D3·D8·D9).
+#   없으면 새는 실수: 두 번째 실패 뒤 옵션 없는 재실행이 재시도로 보이지 않아 색인 작업으로 흘러가거나 「진행 중인 작업이 없습니다」 로 멈춤.
+a7_work -
+ap_set_field "$A7R" status "아카이브 보류"
+a7_hook
+gh_reset
+ap_archive "$A7R"
+a7g_c1="$(git -C "$A7R" rev-parse HEAD)"
+a7g_c1p="$(git -C "$A7R" rev-parse "${a7g_c1}^1")"
+[[ "$ap_rc" -ne 0 ]] && pass "A7g: 첫 발행이 push 에서 실패한다(C1 생성)" || fail "A7g: 첫 실행 rc=$ap_rc — $ap_out"
+# 진행 중 0건인 색인 파일(행을 넣었다 지움)을 남긴다 — 색인이 있어도 재시도로 봐야 한다.
+a7g_idx="$(cd "$A7R" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_path')"
+a7g_idx_had=0; [[ -f "$a7g_idx" ]] && a7g_idx_had=1
+( cd "$A7R" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_index_upsert gtmp fr-branch=fr/gtmp worktree-path=/nonexistent; tasks_index_remove gtmp' )
+( cd "$A7R" && bash rd-workflow/scripts/rd task set-title repeat ) >/dev/null 2>&1
+git -C "$A7R" add -A && git -C "$A7R" commit -q -m "chore: set-title 복구"
+a7g_r1="$(git -C "$A7R" rev-parse HEAD)"
+ap_archive "$A7R"
+[[ "$ap_rc" -ne 0 && "$(git -C "$A7R" log -1 --format=%s)" == "chore(lifecycle): archive repeat metadata 정리" && "$(git -C "$A7R" rev-parse HEAD^)" == "$a7g_r1" ]] \
+  && pass "A7g: 두 번째 발행도 push 에서 실패하고 C2 가 R1 위에 생긴다" || fail "A7g: 두 번째 실행 rc=$ap_rc HEAD='$(git -C "$A7R" log -1 --format=%s)' — $ap_out"
+( cd "$A7R" && bash rd-workflow/scripts/rd task set-title repeat ) >/dev/null 2>&1
+git -C "$A7R" add -A && git -C "$A7R" commit -q -m "chore: set-title 복구"
+a7g_head="$(git -C "$A7R" rev-parse HEAD)"
+a7g_hint="$(a7_call renamed _archive_nofr_name_hint)"
+a7g_recov='archive:   다시 실행: bash rd-workflow/scripts/rd task set-title repeat --force (복구 전용) → git commit -m "chore(lifecycle): repeat 작업 이름 복구" -- rd-workflow-workspace/.lifecycle/task-state CURRENT_TASK.md → archive.sh 재실행'
+[[ "$a7g_hint" == *"원인 후보: 첫 실행의 작업 이름은 repeat 인데 이번 실행은 renamed 입니다"* && "$a7g_hint" == *"$a7g_recov"* \
+   && "$(printf '%s\n' "$a7g_hint" | grep -cF '다시 실행:')" == 1 ]] \
+  && pass "A7g-hint: 두 번 실패한 사슬에서도 작업 이름 복구 줄을 안내한다" || fail "A7g-hint: 안내 누락 — $a7g_hint"
+a7_plain
+[[ "$ap_rc" -ne 0 && "$ap_out" == *"발행 재시도로 봅니다"* && "$ap_out" == *"cleanup 이후 상태"* && "$ap_out" == *"--force-skip-review-check"* && "$ap_out" == *"--allow-status-mismatch"* \
+   && "$ap_out" != *"진행 중인 작업이 없습니다"* && "$(git -C "$A7R" rev-parse HEAD)" == "$a7g_head" ]] \
+  && pass "A7g-1: 두 번 실패한 사슬의 옵션 없는 재실행은 재시도 안내로 멈추고 HEAD 가 그대로다" || fail "A7g-1: rc=$ap_rc — $ap_out"
+a7g_tip="$(a7_call repeat _archive_nofr_gate_tip)"
+[[ "$a7g_tip" == "$a7g_c1p" ]] \
+  && pass "A7g-gate: 팀 저장소 반영 게이트 대상이 C1 의 부모다" || fail "A7g-gate: tip=[$a7g_tip] 기대 [$a7g_c1p]"
+rm -f "$A7O/hooks/pre-receive"
+gh_reset
+ap_archive "$A7R"
+a7g_ptags="$(git -C "$A7O" tag --points-at main)"
+[[ "$ap_rc" -eq 0 && "$(git -C "$A7O" rev-parse main)" == "$(git -C "$A7R" rev-parse main)" && "$ap_out" != *"진행 중인 작업이 없습니다"* ]] \
+  && printf '%s\n' "$a7g_ptags" | grep -Eq '^fr/.*/repeat(-[0-9]+)?$' \
+  && pass "A7g-2: 두 감사 옵션 재실행이 발행하고 repeat tag 가 원격 main 을 가리킨다" || fail "A7g-2: rc=$ap_rc tags=[$a7g_ptags] — $ap_out"
+[[ "$a7g_idx_had" == 1 ]] || rm -f "$a7g_idx"
+
+# A7h — 발행을 모두 마친 뒤(HEAD 가 정리 커밋, 작업 이름 `-`)·사슬이 끊긴 뒤·--fr-branch 명시·fr 작업의 정리 커밋 모양(D3·D5).
+#   없으면 새는 실수: 대상 없는 archive 가 색인 작업(other)을 골라 발행함.
+a7_other_up
+a7h_other_oid="$(git -C "$A7R" rev-parse fr/other)"
+a7_plain
+[[ "$ap_rc" -ne 0 && "$ap_out" == *"발행 재시도로 봅니다"* && "$ap_out" == *"rd task set-title"* ]] \
+  && ! git -C "$A7R" merge-base --is-ancestor "$a7h_other_oid" main \
+  && pass "A7h-1: 발행을 모두 마친 뒤 옵션 없는 호출은 기본 체크아웃 작업으로 보고 set-title 안내로 멈추며 other 를 건드리지 않는다" || fail "A7h-1: rc=$ap_rc — $ap_out"
+# 사슬을 끊는다 — 일반 작업 커밋 하나. 이 뒤에는 기본 체크아웃에 작업이 없고 색인에 other 만 진행 중이다.
+printf 'chain-break-%s\n' "$RANDOM" >> "$A7R/src.txt"
+git -C "$A7R" add -A && git -C "$A7R" commit -q -m "chore: 사슬 끊기"
+a7h_snap() {
+  printf '%s|%s|%s|%s|%s' "$(git -C "$A7R" rev-parse main)" "$(git -C "$A7R" rev-parse fr/other)" \
+    "$(tr '\n' ',' < "$a7_ow/rd-workflow-workspace/.lifecycle/task-state")" "$(tr '\n' ',' < "$a7_idx")" "$(git -C "$A7R" tag --list | LC_ALL=C sort | tr '\n' ' ')"
+}
+a7h_before="$(a7h_snap)"
+a7_plain
+[[ "$ap_rc" -ne 0 && "$ap_out" == *"자동으로 고르지 않습니다"* && "$ap_out" == *"- other"* && "$ap_out" == *"--task"* && "$(a7h_snap)" == "$a7h_before" ]] \
+  && pass "A7h-2: 사슬이 끊긴 뒤 대상 없는 호출은 other 를 고르지 않고 목록·--task 로 멈추며 아무것도 바꾸지 않는다" || fail "A7h-2: rc=$ap_rc — $ap_out"
+a7_plain --dry-run --fr-branch fr/other
+[[ "$ap_rc" -eq 0 && "$ap_out" == *"would archive: branch=fr/other"* && "$ap_out" != *"자동으로 고르지 않습니다"* ]] \
+  && pass "A7h-3: --fr-branch 만 준 호출은 대상 판정 없이 그 브랜치로 진행한다" || fail "A7h-3: rc=$ap_rc — $ap_out"
+# A7h-4 — fr 작업의 정리 커밋 모양(첫 부모가 병합 커밋, fr-branch=fr/x)은 재시도 사슬이 아니다.
+a7h_base="$(git -C "$A7R" rev-parse HEAD)"
+git -C "$A7R" checkout -q -b fr/x
+printf 'schema=1\nshort-title=x\nstatus=아카이브 보류\nfr-branch=fr/x\nworktree-path=null\nsource-fr=-\nbase-commit=null\nreview-session=null\n' \
+  > "$A7R/rd-workflow-workspace/.lifecycle/task-state"
+printf 'x-work\n' > "$A7R/x-work.txt"
+git -C "$A7R" add -A && git -C "$A7R" commit -q -m "구현: x"
+git -C "$A7R" checkout -q main
+git -C "$A7R" merge -q --no-ff fr/x -m "merge: fr/x"
+printf 'schema=1\nshort-title=-\nstatus=대기 중\nfr-branch=null\nworktree-path=null\nsource-fr=-\nbase-commit=null\nreview-session=null\n' \
+  > "$A7R/rd-workflow-workspace/.lifecycle/task-state"
+git -C "$A7R" add -A && git -C "$A7R" commit -q -m "chore(lifecycle): archive x metadata 정리"
+a7_plain
+[[ "$ap_rc" -ne 0 && "$ap_out" != *"발행 재시도로 봅니다"* && "$ap_out" == *"자동으로 고르지 않습니다"* ]] \
+  && pass "A7h-4: fr 작업의 정리 커밋 모양은 재시도로 보지 않는다" || fail "A7h-4: rc=$ap_rc — $ap_out"
+git -C "$A7R" reset -q --hard "$a7h_base"
+git -C "$A7R" branch -D fr/x >/dev/null 2>&1 || true
+a7_other_down
 
 # ---------------------------------------------------------------------------
 # 재실행 판 비교 경고 (change spec 2026-11-19-1430 D1)
@@ -1467,6 +1705,126 @@ ap_archive "$rv_repo/.worktrees/rvw"
 [[ "$ap_rc" -eq 0 ]] && pass "t_reexec_version_default_ahead: 발행이 rc=0 이다" || fail "t_reexec_version_default_ahead: rc=$ap_rc — $ap_out"
 [[ "$ap_out" != *"WARNING — 이번 발행은"* ]] \
   && pass "t_reexec_version_default_ahead: 기본 쪽 커밋만으로는 경고하지 않는다" || fail "t_reexec_version_default_ahead: 있으면 안 됨: [WARNING — 이번 발행은] — 출력: $ap_out"
+
+# ---------------------------------------------------------------------------
+# 직접 실행의 중복 발행 확인 (FR archive-direct-dup-recheck)
+# ---------------------------------------------------------------------------
+echo "== archive.sh — 큐를 거치지 않은 발행도 같은 FR 의 다른 발행을 확인 (DD1~DD5) =="
+DD="$(mktemp -d)" || { echo "mktemp 실패" >&2; exit 1; }
+DD="$(cd "$DD" && pwd -P)"
+_ast_cleanup+=("$DD")
+DDR="$DD/w"; DDO="$DD/o.git"; dd_it="rd-workflow-workspace/backlog/items"
+ap_repo "$DDR" prev
+# dda 의 FR 파일 이름에는 `|` 가 있다 — 중복 확인이 그 단일 경로를 찢지 않고 원격 상세를 읽는지 호출부까지 본다(source_fr_split 계약).
+ap_item "$DDR" '2026-11-01-dd|a' '-'; ap_item "$DDR" 2026-11-01-ddb '-'
+git -C "$DDR" add -A && git -C "$DDR" commit -q -m "FR 상세"
+git init -q --bare -b main "$DDO"
+git -C "$DDR" remote add origin "$DDO"
+git -C "$DDR" push -q origin main
+dd_fra="$dd_it/2026-11-01-dd|a.md"; dd_frb="$dd_it/2026-11-01-ddb.md"
+( cd "$DDR" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title dda --size large --source-fr - ) >/dev/null 2>&1
+( cd "$DDR/.worktrees/dda" && bash rd-workflow/scripts/rd task set-source-fr "$dd_fra" ) >/dev/null 2>&1
+( cd "$DDR" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title ddb --size large --source-fr "$dd_frb" ) >/dev/null 2>&1
+for _dd in a b; do
+  printf 'work\n' > "$DDR/.worktrees/dd$_dd/src-dd$_dd.txt"
+  git -C "$DDR/.worktrees/dd$_dd" add -A && git -C "$DDR/.worktrees/dd$_dd" commit -q -m "구현: dd$_dd"
+done
+[[ "$(sed -n 's/^source-fr=//p' "$DDR/.worktrees/dda/rd-workflow-workspace/.lifecycle/task-state")" == "$dd_fra" ]] \
+  || fail "DD 준비: dda 의 source-fr 이 \`|\` 단일 경로가 아니다"
+# ddc: FR 없는 작업. promote 가 원격 fr/ddc 에 착수 표시를 올린다(DD4 가 이것을 다른 이력으로 바꾼다).
+( cd "$DDR" && bash rd-workflow/scripts/lifecycle/promote.sh --short-title ddc --size large --source-fr - ) >/dev/null 2>&1
+printf 'work\n' > "$DDR/.worktrees/ddc/src-ddc.txt"
+git -C "$DDR/.worktrees/ddc" add -A && git -C "$DDR/.worktrees/ddc" commit -q -m "구현: ddc"
+# 다른 clone 이 두 FR 을 먼저 발행했다(원격 main 에서 done). 이 clone 의 main 도 그 끝까지 받는다 — 발행 push 가 앞서 거부되지 않게.
+git clone -q "$DDO" "$DD/other" 2>/dev/null
+git -C "$DD/other" config user.email o@o && git -C "$DD/other" config user.name o
+for _dd in "$dd_fra" "$dd_frb"; do sed_inplace 's/^- status: idea$/- status: done/' "$DD/other/$_dd"; done
+git -C "$DD/other" commit -q -am "다른 구현 발행" && git -C "$DD/other" push -q origin main
+git -C "$DDR" pull -q --ff-only origin main
+dd_audit="$DDR/rd-workflow-workspace/.lifecycle/review-skip-audit.log"
+
+dd_head="$(git -C "$DDR" rev-parse HEAD)"
+ap_archive "$DDR/.worktrees/dda"
+[[ "$ap_rc" -ne 0 && "$ap_out" == *"같은 작업의 다른 구현이 있습니다"* && "$ap_out" == *"FR 2026-11-01-dd|a 이 done"* && "$ap_out" == *"--allow-duplicate-publish"* ]] \
+  && pass "DD1: 원격 main 에서 같은 FR 이 done 이면 직접 실행도 멈춘다" || fail "DD1: rc=$ap_rc — $ap_out"
+[[ "$(git -C "$DDR" rev-parse HEAD)" == "$dd_head" ]] && pass "DD1: 기본 체크아웃 HEAD 가 바뀌지 않았다" || fail "DD1: HEAD 가 바뀌었다"
+
+ap_archive "$DDR/.worktrees/dda" --allow-duplicate-publish "DD2 두 구현 유지"
+[[ "$ap_rc" -eq 0 ]] && pass "DD2: --allow-duplicate-publish 로 발행이 끝난다" || fail "DD2: rc=$ap_rc — $ap_out"
+grep -qF "| dda | [dup-publish] DD2 두 구현 유지 |" "$dd_audit" 2>/dev/null \
+  && pass "DD2: audit log 에 [dup-publish] 사유가 남는다" || fail "DD2: audit 줄 없음 — $(cat "$dd_audit" 2>&1)"
+
+# 큐 경유: 큐는 archive 로 exec 하기 전에 요청 파일에 state=running 과 archive-pgid 를 쓴다. archive 는 이 셸의 프로세스 그룹에서 돈다.
+if dd_pg="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')" && [[ -n "$dd_pg" ]]; then
+  dd_q="$(cd "$DDR" && bash -c 'source rd-workflow/scripts/lifecycle/_tasks_index.sh; tasks_shared_dir')/publish-queue"
+  mkdir -p "$dd_q"
+  printf 'state=running\narchive-pgid=%s\n' "$dd_pg" > "$dd_q/ddb.req"
+  ap_archive "$DDR/.worktrees/ddb"
+  [[ "$ap_rc" -eq 0 && "$ap_out" != *"같은 작업의 다른 구현"* ]] \
+    && pass "DD3: 큐 경유 실행은 중복 확인을 다시 돌리지 않는다" || fail "DD3: rc=$ap_rc — $ap_out"
+else
+  echo "  SKIP: DD3 — ps 로 프로세스 그룹을 읽을 수 없는 환경"
+fi
+
+# 같은 이름(fr/ddc)으로 다른 clone 이 먼저 착수했다 — 원격 착수 표시를 지우고 다른 이력을 올린다. FR 은 어디에서도 done 이 아니다.
+git --git-dir="$DDO" update-ref -d refs/heads/fr/ddc
+git -C "$DD/other" fetch -q origin
+git -C "$DD/other" checkout -q -b fr/ddc origin/main
+printf 'other\n' > "$DD/other/other-ddc.txt"
+git -C "$DD/other" add -A && git -C "$DD/other" commit -q -m "다른 clone 의 ddc" && git -C "$DD/other" push -q origin fr/ddc
+dd_head="$(git -C "$DDR" rev-parse HEAD)"
+ap_archive "$DDR/.worktrees/ddc"
+[[ "$ap_rc" -ne 0 && "$ap_out" == *"같은 작업의 다른 구현이 있습니다"* && "$ap_out" == *"같은 이름의 원격 브랜치가 다른 이력입니다"* ]] \
+  && pass "DD4: 같은 이름의 원격 착수가 다른 이력이면 직접 실행이 멈춘다" || fail "DD4: rc=$ap_rc — $ap_out"
+[[ "$(git -C "$DDR" rev-parse HEAD)" == "$dd_head" ]] && pass "DD4: 기본 체크아웃 HEAD 가 바뀌지 않았다" || fail "DD4: HEAD 가 바뀌었다"
+
+# 파일 이름에 `|` 가 든 단일 Source FR 은 커밋 트리에 그 경로가 있으면 찢지 않는다(source_fr_split 과 같은 계약).
+dd_p="$DD/pipe"; git init -q -b main "$dd_p"
+mkdir -p "$dd_p/$dd_it"; : > "$dd_p/$dd_it/2026-11-01-p|q.md"
+git -C "$dd_p" add -A && git -C "$dd_p" -c user.email=t@t -c user.name=t commit -q -m pipe
+dd_s="$( source "$DDR/rd-workflow/scripts/lifecycle/_dup_guard.sh"; dup_stems_from_source_fr "$dd_it/2026-11-01-p|q.md" "$dd_p" HEAD )"
+[[ "$dd_s" == "2026-11-01-p|q" ]] && pass "DD5: 트리에 있는 \`|\` 단일 경로는 stem 하나" || fail "DD5: stem=[$dd_s]"
+dd_s="$( source "$DDR/rd-workflow/scripts/lifecycle/_dup_guard.sh"; dup_stems_from_source_fr "$dd_it/2026-11-01-a.md|$dd_it/2026-11-01-b.md" "$dd_p" HEAD | paste -sd, - )"
+[[ "$dd_s" == "2026-11-01-a,2026-11-01-b" ]] && pass "DD5: 트리에 없는 값은 \`|\` 로 나눈다" || fail "DD5: stems=[$dd_s]"
+
+echo "== archive.sh — push.followTags=true 여도 발행 push 는 지정한 ref 만 올린다 (FT1) =="
+# 원격에 없는 옛 annotated 태그가 이미 원격에 있는 커밋을 가리킨다. followTags 는 기본 브랜치 push·태그 push·원격 fr 브랜치
+# 삭제 push 어느 것에서든 이 태그를 함께 올린다(실측). 세 push 가운데 하나라도 --no-follow-tags 가 빠지면 이 단언이 깨진다.
+FT="$(mktemp -d)" || { echo "mktemp 실패" >&2; exit 1; }
+FT="$(cd "$FT" && pwd -P)"
+_ast_cleanup+=("$FT")
+FTR="$FT/w"; FTO="$FT/o.git"
+ap_repo "$FTR" prev
+git init -q --bare -b main "$FTO"
+git -C "$FTR" remote add origin "$FTO"
+git -C "$FTR" push -q origin main
+git -C "$FTR" tag -a ft-old -m "원격에 없는 옛 태그" HEAD
+git -C "$FTR" config push.followTags true
+ap_promote "$FTR" ftg
+[[ -n "$(git --git-dir="$FTO" for-each-ref refs/heads/fr/ftg)" ]] || fail "FT1 준비: promote 가 원격 fr/ftg 착수 표시를 올리지 않았다"
+# 원격이 push 한 번마다 받은 ref 를 한 줄로 남긴다(hook 의 cwd 는 bare 저장소 디렉터리). 개발자 전역 core.hooksPath 가 가리지 않게 고정한다.
+mkdir -p "$FTO/hooks"
+cat > "$FTO/hooks/post-receive" <<'HOOK'
+#!/bin/sh
+refs=""
+while read old new ref; do refs="${refs:+$refs }$ref"; done
+echo "$refs" >> recv.log
+HOOK
+chmod +x "$FTO/hooks/post-receive"
+git --git-dir="$FTO" config --local core.hooksPath "$FTO/hooks"
+ap_archive "$FTR/.worktrees/ftg"
+[[ "$ap_rc" -eq 0 ]] && pass "FT1: followTags 저장소의 원격 발행이 rc=0 이다" || fail "FT1: rc=$ap_rc — $ap_out"
+ft_tags="$(git --git-dir="$FTO" for-each-ref --format='%(refname)' refs/tags)"
+[[ "$ft_tags" == refs/tags/fr/*/ftg && "$ft_tags" != *$'\n'* ]] \
+  && pass "FT1: 원격 태그는 이번 발행 태그 하나뿐이다(옛 로컬 태그가 따라가지 않았다)" || fail "FT1: 원격 태그 — [$ft_tags]"
+[[ -z "$(git --git-dir="$FTO" for-each-ref refs/heads/fr/ftg)" ]] \
+  && pass "FT1: 원격 fr/ftg 삭제 push 가 돌았다" || fail "FT1: 원격 fr/ftg 가 남았다 — $ap_out"
+ft_pub="$(git -C "$FTR" for-each-ref --format='%(refname)' 'refs/tags/fr/*/ftg')"
+ft_want="$(printf '%s\n%s\n%s' refs/heads/main "$ft_pub" refs/heads/fr/ftg)"
+ft_recv="$(cat "$FTO/recv.log" 2>/dev/null || echo 없음)"
+[[ "$ft_recv" == "$ft_want" ]] \
+  && pass "FT1: 원격이 받은 push 는 기본 브랜치 → 발행 태그 → fr 삭제 순서의 세 번이고 각각 ref 하나" \
+  || fail "FT1: 수신 기록 $FTO/recv.log — [$ft_recv] (기대 [$ft_want])"
 
 echo "== 결과: PASS=$PASS FAIL=$FAIL =="
 DONE=1

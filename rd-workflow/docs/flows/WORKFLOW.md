@@ -90,9 +90,12 @@
 | spec·change-spec | `rd-workflow-workspace/specs/{base,changes}/YYYY-MM-DD-HHMM-<slug>-{spec,change-spec}.md` |
 | plan | `rd-workflow-workspace/plans/YYYY-MM-DD-HHMM-<slug>-plan.md` |
 | raw-capture | `rd-workflow-workspace/raw-captures/YYYY-MM-DD-{request,spec,plan}-<slug>.md` |
-| spec/plan review 세션 | `rd-workflow-workspace/handoffs/review_pipeline/YYYYMMDD_HHMMSS_HHMM-<slug>-spec-plan-review/` |
+| spec/plan review 세션 | `rd-workflow-workspace/handoffs/review_pipeline/YYYYMMDD_HHMMSS_HHMM-<slug>-spec-plan-review/` — 다른 작업의 fr 브랜치에서 만든 세션은 시각 뒤에 그 브랜치의 작업 slug 가 붙습니다(`YYYYMMDD_HHMMSS_<그 작업 slug>_HHMM-<slug>-spec-plan-review/`) |
+| REQUEST review 세션 | `rd-workflow-workspace/handoffs/review_pipeline/YYYYMMDD_HHMMSS_request-review/` — 이름에 slug 가 없으므로 그 세션 `SESSION.md` 의 `## Branch Context` 가 `short-title: <slug>`(정확히 일치)와 `fr-branch: null` 을 모두 담을 때만 |
 
-request-review 세션은 이름과 `SESSION.md` 에 slug 가 없어 귀속을 확정할 수 없으므로 이관하지 않습니다.
+REQUEST review 세션의 `short-title` 은 세션을 만들 때의 `CURRENT_TASK.md` `## Short Title` 입니다. 기본 체크아웃에서 `/planning-design-intake` 등으로 short-title 을 먼저 기록한 뒤 연 세션만 이관됩니다. `unknown`(short-title 부재 표식이라 `--short-title unknown` 으로 promote 해도 귀속하지 않습니다)·다른 slug·fr 브랜치에서 만든 세션은 그대로 둡니다. 대상에는 `turns/` 를 만들어 바로 첫 턴을 이어 쓸 수 있게 합니다. 세션의 git 대상 파일이 모두 정리되면, git 이 무시하는 리뷰 런타임 기록(`.codex_output.log`·`.review_wait_status` 등)은 커밋하지 않고 대상 세션 폴더로 옮긴 뒤 원본 세션 폴더를 지웁니다. 옮긴 파일은 `원본 정리: 로컬 파일 이동(git 제외, 커밋 안 함)` 줄로 보입니다. 대상에 같은 경로가 이미 있으면 덮어쓰지 않고 원본에 남긴 채 그 사실을 출력합니다.
+
+리뷰 세션(REQUEST review·spec/plan review)은 폴더 하나를 한 단위로 옮깁니다. 세션 안에 건너뛰는 파일이 하나라도 있으면(예: staged 파일) 그 세션의 나머지 파일도 건너뛰어 원본에 통째로 남기고 사유를 출력합니다. 원인을 해소한 뒤 같은 promote 명령을 다시 실행하면 세션 전체가 옮겨집니다. 리뷰 턴이 실행 중인 세션(Status `awaiting-reviewer` 또는 상태 잠금 `.state.lock` 있음)도 같은 방식으로 통째로 남깁니다. 턴이 끝난 뒤 다시 실행합니다. 원본을 정리할 때는 세션의 `SESSION.md` 를 맨 뒤에 지웁니다. 정리가 도중에 끊겨도 같은 명령을 다시 실행하면 남은 정리를 이어받습니다.
 
 **P 쪽에서 허용하는 Git 상태**는 untracked 파일과, `REQUEST.md` 한정으로 「working tree 만 수정, index 는 HEAD 와 같음」입니다. 이미 커밋된 파일은 후보가 아닙니다. tracked 수정 spec·plan, staged `REQUEST.md`, 다른 작업의 REQUEST 는 이관하지 않고 원본을 그대로 둔 채 경고합니다. 대상 worktree(T) 쪽에서도 쓸 경로의 index 가 HEAD 와 같을 때만 씁니다. T 에 사용자가 staged 한 내용이 있으면 건너뜁니다. T 의 해당 경로가 디렉터리나 링크처럼 일반 파일이 아니면 부재로 보지 않고 건너뜁니다(안의 사용자 파일을 커밋하지 않기 위함).
 
@@ -105,24 +108,42 @@ request-review 세션은 이름과 `SESSION.md` 에 slug 가 없어 귀속을 �
 
 ### 세션 기동
 
-worktree 를 만든 뒤 `promote.sh` 는 **그 worktree 에서 작업할 에이전트 세션을 기동하려 시도**합니다. 여기서 보장하는 것은 두 가지뿐입니다 — worktree 가 준비되고, 그 안에서 세션을 여는 명령이 화면에 제시됩니다. **실제 자동 기동은 터미널 herdr(`HERDR_ENV=1`) 또는 herdr app(`HC_TERMINAL_ID`) 안에서 돌고 있을 때만** 일어나며, 그 밖의 환경에서는 제시된 명령을 사람이 직접 실행합니다. 즉 두 herdr 는 선택적 의존이지 전제가 아닙니다.
+worktree 를 만든 뒤 `promote.sh` 는 **그 worktree 에서 작업할 에이전트 세션을 기동하려 시도**합니다. 여기서 보장하는 것은 두 가지뿐입니다 — worktree 가 준비되고, 그 안에서 세션을 여는 명령이 화면에 제시됩니다. **실제 자동 기동은 터미널 herdr(`HERDR_ENV=1`), herdr app(`HC_TERMINAL_ID`), Orca(`ORCA_AGENT_SESSION_ID` 또는 `ORCA_TERMINAL_HANDLE` 과 `orca` 명령) 중 한 곳 안에서 돌고 있을 때만** 일어나며, 그 밖의 환경에서는 제시된 명령을 사람이 직접 실행합니다. 즉 세 백엔드는 선택적 의존이지 전제가 아닙니다.
 
-**백엔드 판정과 기록.** promote 는 터미널 herdr → herdr app → 없음(`none`) 순서로 기동 백엔드를 고릅니다. 두 환경 변수가 함께 있으면 터미널 herdr 를 씁니다. 고른 값은 기동 예약 때 색인의 `launch-backend` 필드(`herdr`|`hc`|`none`)에 남습니다. 이후 생존 조회·인계 확인·`resolve-launch`·rollback 은 지금 셸의 환경이 아니라 이 기록값의 백엔드로 조회합니다. 값이 없는 옛 행은 `herdr` 로 봅니다.
+**백엔드 판정과 기록.** promote 는 터미널 herdr → herdr app → Orca → 없음(`none`) 순서로 기동 백엔드를 고릅니다. 여러 환경 변수가 함께 있으면 앞 순서의 백엔드를 씁니다. 고른 값은 기동 예약 때 색인의 `launch-backend` 필드(`herdr`|`hc`|`orca`|`none`)에 남습니다. Orca 는 이 필드와 함께 `launch-tab` 에 세션 handle 을 남깁니다(`term_…` 는 터미널, `structured-agent-session-<id>` 는 채팅). 이후 생존 조회·인계 확인·`resolve-launch`·rollback 은 지금 셸의 환경이 아니라 이 기록값의 백엔드로 조회합니다. 값이 없는 옛 행은 `herdr` 로 봅니다.
 
-| 항목 | 터미널 herdr | herdr app |
-|---|---|---|
-| 기동 방식 | `herdr` 로 tab 을 만들고 그 안에서 에이전트를 시작 | `hc run --bg --outlive-parent` 로 세션을 띄우고 `herdr.space` 라벨로 현재 space 에 tab 생성 |
-| tab 이름 | 작업 slug | 번호로 생긴 tab 을 기동 직후 작업 slug 로 바꿈 |
-| 인계 전달 | 세션이 뜬 뒤 인계 문구를 입력으로 보냄 | 인계 문구를 기동 인자로 넘기고, 첫 턴이 시작됐는지로 처리를 확인 |
-| 생존 조회 | `herdr` 의 agent 상태 | `hc get` 의 상태(`finished` 면 종료) |
-| 세션 종료 시 tab | 남음(사람이 닫음) | 저절로 사라짐 |
-| 확인한 OS | macOS | macOS |
+| 항목 | 터미널 herdr | herdr app | Orca |
+|---|---|---|---|
+| 기동 방식 | `herdr` 로 tab 을 만들고 그 안에서 에이전트를 시작 | `hc run --bg --outlive-parent` 로 세션을 띄우고 `herdr.space` 라벨로 현재 space 에 tab 생성 | `orca agent launch --worktree path:<wt>` 로 그 worktree 에 채팅 에이전트를 시작(focus 를 옮기지 않음) |
+| tab 이름 | 작업 slug | 번호로 생긴 tab 을 기동 직후 작업 slug 로 바꿈 | 이름을 붙이지 않음. 사이드바의 `fr/<slug>` worktree 아래에 나타남 |
+| 인계 전달 | 세션이 뜬 뒤 인계 문구를 입력으로 보냄 | 인계 문구를 기동 인자로 넘기고, 첫 턴이 시작됐는지로 처리를 확인 | 인계 문구를 기동 인자(`--prompt`)로 넘기고, 첫 턴이 시작됐는지로 처리를 확인 |
+| 생존 조회 | `herdr` 의 agent 상태 | `hc get` 의 상태(`finished` 면 종료) | 채팅은 `orca agent show`, 터미널은 `orca terminal show` 로 그 worktree 에 붙어 있는지 확인 |
+| 세션 종료 시 tab | 남음(사람이 닫음) | 저절로 사라짐 | 남음(사람이 닫음). 채팅은 CLI 로 닫을 수 없음 |
+| 확인한 OS | macOS | macOS | macOS 에서 확인함(Orca 1.4.271) |
 
 herdr app 에서 띄운 작업 세션은 앱 왼쪽 Agents 패널에 부모 세션의 하위 항목으로 나타납니다. Claude Code 의 Agent 도구 subagent 는 같은 프로세스 안에서 돌므로 이 패널에 나타나지 않습니다. 진행 상황은 Claude Code 하단 표시줄에서 확인합니다.
 
+Orca 에서 띄운 작업 세션은 Orca 사이드바의 `fr/<slug>` 아래 에이전트로 나타납니다. `rd task list` 는 이 에이전트를 닫지 않으므로 직접 닫아 주십시오.
+
 기동은 **현재 workspace 안에 tab 을 새로 만들어** 그 안에 세션을 띄웁니다(화면을 분할하지 않습니다). tab 의 이름은 작업 slug 이고, herdr 의 agents 패널은 행마다 그 tab 이름을 보여주므로 **동시에 여러 작업이 떠 있어도 목록에서 바로 구분됩니다.** 사용자의 focus 는 가져오지 않습니다.
 
-**기동되는 세션의 모델.** 기본값은 **현재 세션과 같은 모델**입니다 — 별도 설정 없이도 작업 탭이 부모를 따라갑니다. 우선순위는 `RD_SESSION_MODEL` 환경변수 > `rd-workflow/config/model-strategy.json` 의 `session_model` 키 > 현재 세션 상속 > 미지정(CLI 기본값)이고, 앞의 둘 중 하나라도 있으면 그쪽이 이깁니다. 상속은 `CLAUDE_CODE_SESSION_ID` 로 찾은 transcript 에서 **실제로 응답한 모델**을 읽는 것이라, 세션 도중 `/model` 로 바꾼 것도 따라옵니다. 어느 경로가 쓰였는지는 promote 출력의 `다음 기동에 사용할 모델 — <모델> (출처: <출처>)` 한 줄로 확인합니다. 상속에 실패하면(식별자·transcript 없음 등) 조용히 미지정으로 떨어져 CLI 기본값으로 뜹니다.
+**기동되는 세션의 모델과 effort.** 설정이 없으면 작업 탭은 **현재 세션과 같은 모델과 effort** 로 뜹니다. 별도 설정 없이도 부모를 따라갑니다. 칸마다 높은 것부터 아래 순서로 정합니다.
+
+| 순서 | 모델 | effort |
+| --- | --- | --- |
+| 1 | `RD_SESSION_MODEL` 환경 변수 | `RD_SESSION_EFFORT` 환경 변수 |
+| 2 | `models.json` 의 `session.claude.model` | `models.json` 의 `session.claude.effort` |
+| 3 | `model-strategy.json` 의 `session_model` (옛 키, 읽기만 함) | 없음 |
+| 4 | 현재 세션 상속 | 현재 세션 상속 |
+| 5 | 미지정(CLI 기본값) | 미지정(CLI 기본값) |
+
+`default` 는 그 칸에서 값을 넘기지 않는다는 뜻입니다. 아래 순서로 내려가지 않고 상속도 하지 않습니다. 옛 키를 쓰면 promote 가 `models.json` 으로 옮기라고 안내합니다.
+
+상속은 `CLAUDE_CODE_SESSION_ID` 로 찾은 transcript 를 읽습니다. 모델은 **실제로 응답한 모델**이라 세션 도중 `/model` 로 바꾼 것도 따라옵니다. effort 는 응답 기록의 최상위 `effort` 값입니다. 상속에 실패하면(식별자·transcript 없음 등) 그 칸은 조용히 미지정으로 떨어져 CLI 기본값으로 뜹니다.
+
+설정 파일 위치는 호출한 체크아웃 기준입니다. `models.json` 은 `RD_MODELS_CONFIG` 가 있으면 그 경로를 씁니다. 상대 경로는 호출 체크아웃 루트 기준입니다. 없으면 호출 체크아웃의 `rd-workflow/config/models.json` 을 씁니다. 옛 키 파일 `model-strategy.json` 은 늘 호출 체크아웃에서 읽습니다. 수동 기동 안내 명령은 안내를 만드는 시점의 설정으로 다시 계산합니다.
+
+어느 값이 쓰였는지는 promote 출력의 `promote: 다음 기동에 사용할 모델 — <모델> (출처: <출처>) · effort — <effort> (출처: <출처>)` 한 줄로 확인합니다. Claude CLI 가 `--effort` 를 받지 않으면 경고를 내고 effort 없이 기동하며, 이 줄에 `effort — CLI 기본값 (CLI 미지원으로 뺌, <요청 출처>)` 로 표시합니다.
 
 기동 직후 세션이 신뢰 확인 같은 다이얼로그를 띄워 `blocked` 로 들어가는 경우가 있습니다 — worktree 는 늘 처음 여는 경로라 드문 일이 아닙니다. 이때 결과는 `unknown` 이고 **tab 은 닫지 않습니다.** 승인은 사람이 합니다. 다만 **승인만으로 작업이 이어지지는 않습니다** — 인계 문구는 승인 뒤에야 전달할 수 있으므로, 그 세션은 승인 직후 지시를 기다리는 상태입니다. 승인한 뒤 `bash rd-workflow/scripts/rd task resolve-launch <slug>` 를 실행하면 세션 생존을 확인해 `launch=ok` 로 확정하고 **그 자리에서 인계 문구를 전달**합니다. 전달에 실패해도 생존 확정은 유효하며, 그때는 인계 문구를 화면에 출력하므로 세션에 직접 붙여 넣으면 됩니다. 시작 요청 뒤 응답이 늦어 시간 초과된 경우(`unknown`)도 같습니다 — tab 을 닫지 않고 같은 명령으로 확인·인계합니다.
 
@@ -163,7 +184,7 @@ herdr app 에서 띄운 작업 세션은 앱 왼쪽 Agents 패널에 부모 세�
 
 #### 기동한 백엔드로 조회할 수 없을 때
 
-지금 셸에서 기동한 백엔드를 쓸 수 없으면(예: herdr app 에서 띄운 작업을 터미널 herdr 나 일반 셸에서 조회, herdr 미설치) 생존 조회가 언제나 "판정 불가" 로 돌아옵니다. `resolve-launch` 는 이때 그 작업을 어느 환경에서 기동했는지 함께 알려 줍니다. 그래도 작업을 끝낼 수 있도록 `resolve-launch` 는 두 갈래로 갈립니다.
+지금 셸에서 기동한 백엔드를 쓸 수 없으면(예: herdr app 이나 Orca 에서 띄운 작업을 터미널 herdr 나 일반 셸에서 조회, herdr 미설치) 생존 조회가 언제나 "판정 불가" 로 돌아옵니다. `resolve-launch` 는 이때 그 작업을 어느 환경에서 기동했는지 함께 알려 줍니다. 그래도 작업을 끝낼 수 있도록 `resolve-launch` 는 두 갈래로 갈립니다.
 
 - **자동 기동을 시도한 기록이 없는 작업** — 기동 예약(`launch-token`)이 없는 행입니다. 구버전 작업을 색인으로 흡수할 때 `launch=unknown` 으로 적히는 경우가 여기 해당합니다. 띄운 세션이 애초에 없으므로 사람 확인 없이 `launch=none` 으로 확정하고, 그 자리에서 `rollback`·`archive` 차단이 풀립니다.
 - **기동을 시도했는데 결과를 모르는 작업** — 조용히 확정하지 않습니다. 살아 있는 세션을 없다고 적으면 같은 worktree 에 두 번째 세션을 띄우게 되기 때문입니다. 세션이 없거나 이미 끝났음을 **직접 확인한 뒤** `bash rd-workflow/scripts/rd task resolve-launch <slug> --assume-ended` 로 `failed` 확정합니다.
@@ -175,8 +196,11 @@ herdr app 에서 띄운 작업 세션은 앱 왼쪽 Agents 패널에 부모 세�
 | 호출 | 대상 판정 |
 |---|---|
 | 대상 지정 없이, 현재 체크아웃이 그 작업의 worktree 안 | 그 작업 (인자 불요) |
-| 대상 지정 없이, 그 밖의 위치(기본 브랜치 worktree 등) | 진행 중인 작업이 1건이면 그 작업 / **2건 이상이면 아무것도 바꾸지 않고 중단** + 목록과 `--task` 지정 방법 안내 |
-| `--task <slug>` 명시 | 어느 위치에서 불러도 그 작업. 현재 worktree 의 작업과 다르면 **경고 한 줄 후 진행**(거부하지 않음) |
+| 대상 지정 없이, 기본 체크아웃이고 그 task-state 가 fr 브랜치 없는 진행 중 작업(`fr-branch=null`) | 그 작업 (색인의 진행 중 작업 수와 무관) |
+| 대상 지정 없이 기본 체크아웃에서 발행(`archive`), 그 작업의 발행이 정리 커밋 뒤 멈춘 상태(HEAD 또는 작업 이름 복구 커밋 아래가 fr 브랜치 없는 작업의 정리 커밋) | 그 작업 재시도 (색인 수·색인 파일과 무관) |
+| 대상 지정 없이, 그 밖의 위치 | 진행 중 작업이 있으면 **자동으로 고르지 않고 중단** + 목록과 `--task` 지정 방법 안내 (상태 변경·조회·발행·취소 모두) |
+| `--task <slug>` 명시 | 어느 위치에서 불러도 그 작업. 현재 체크아웃의 작업과 다르면 **경고 한 줄 후 진행**. 기본 체크아웃 작업은 이름으로 고르지 않습니다 |
+| `archive.sh --fr-branch <브랜치>` (`--task` 없음) | 그 브랜치 (대상 판정을 하지 않음) |
 
 ### `--no-worktree` 작업의 마감 경로
 
@@ -343,7 +367,7 @@ overlay 의 최상위 submodule 에서 코드를 바꾼 작업은 마감 때 팀
 |---|---|
 | `pr` (기본) | 팀 브랜치를 push 하고 PR 을 만듭니다. merge 뒤에 overlay 를 발행합니다 |
 | `push` | 대상 브랜치에 fast-forward push 합니다. 사용자 승인 뒤 `--approve-push` 로만 실행합니다 |
-| `manual` | 반영하지 않습니다. 팀 저장소 반영은 사용자 몫이며 archive 게이트도 이 submodule 을 보지 않습니다 |
+| `manual` | 반영하지 않습니다. 팀 저장소 반영은 사용자 몫이며 archive 게이트도 이 submodule 을 보지 않습니다. 작업 worktree 의 submodule 에만 있는 작업 커밋은 발행이 기본 체크아웃 submodule 로 옮기고, 팀 원격에 없는 커밋이면 브랜치 `rd-archive/<작업 이름>` 으로 남깁니다 |
 
 **순서**: `리뷰 종결 → seal → 아카이브 보류 → 기록 커밋 → rd pr open → PR 검토 중 → (팀의 merge) → rd pr check --apply → 아카이브 보류 → 발행`
 
@@ -358,7 +382,7 @@ overlay 의 최상위 submodule 에서 코드를 바꾼 작업은 마감 때 팀
 - **seal 과 설정**: `workflow.json` 은 seal 이 보호하는 트리에 들어 있고, `아카이브 보류`·`PR 검토 중` 에서는 커밋 게이트가 기록 경로 밖의 커밋을 막습니다. 그래서 seal 뒤에 반영 방식을 바꾸는 방법은 셋입니다. 이번 작업만 반영하지 않으려면 `archive.sh` 에 `--allow-unpublished-submodule "<사유>"` 를 붙입니다. 다음 작업부터 바꾸려면 기본 브랜치에서 `team_publish.mode` 를 `manual` 로 바꿔 커밋합니다. 이번 fr 브랜치에서 바꾸려면 `rd task set-status "구현 중"` → 설정 커밋 → final diff review 재종결 → `rd review seal` 순서로 합니다.
 - **승인**: `pr` 반영의 승인 주체는 `publish_approval` 입니다(`AUTONOMY.md` 「종결 마커(seal)와 발행 승인」). 사용자 승인이 필요한 조건이면 `rd pr open` 은 대상 표만 보이고 종료 코드 10 으로 멈추며, 사용자 승인 뒤 `--approved` 를 붙여 다시 실행합니다. `push` 대상은 `publish_approval` 과 무관하게 `--approve-push` 없이는 대상 표만 보이고 종료 코드 10 으로 멈춥니다.
 - **수정 요청·닫힘**: `rd pr check` 는 안내만 하고 Status 를 바꾸지 않습니다. 수정 요청이면 `rd task set-status "구현 중"` → 수정·검증 → final diff review 를 같은 세션에서 이어 종결 → `rd review seal` → `아카이브 보류` → `rd pr open` 을 다시 실행합니다(같은 브랜치에 push 하고 열린 PR 의 본문을 갱신하며 새 PR 은 만들지 않습니다). 열린 PR 의 대상 브랜치가 설정과 다르면 `rd pr open` 은 원격을 바꾸지 않고 멈추며, 이어 가는 두 가지를 알립니다. 가) PR 의 대상을 설정에 맞추는 `gh pr edit <URL> --base <설정 base>` 뒤 `rd pr open` 재실행. 나) 실제 대상 브랜치가 맞다면 `workflow.json` 의 `team_publish.base`(또는 `submodules.<경로>.base`)를 그 브랜치로 바꿈(seal 뒤 설정 변경은 아래 「seal 과 설정」 항목). 닫힌 PR 이 있으면 새 PR 을 만들지 않는 정책은 그대로입니다.
-- **닫힘**: PR 이 merge 없이 닫히면 `rd pr check` 가 선택지를 안내하며 Status 는 바뀌지 않습니다. 작업을 폐기하려면 `/fr status <slug> dropped` 뒤 `promote_rollback.sh`, 다시 올리려면 `gh pr reopen <URL>`, 연결된 Issue 의 선점을 풀려면 `gh issue edit <Issue URL> --remove-assignee @me` 입니다.
+- **닫힘**: PR 이 merge 없이 닫히면 `rd pr check` 가 선택지를 안내하며 Status 는 바뀌지 않습니다. 작업을 폐기하려면 `/fr status <slug> dropped` 뒤, fr 작업은 기본 체크아웃에서 `promote_rollback.sh --task <slug>`, 기본 체크아웃 작업(fr 브랜치 없음)은 기본 체크아웃에서 이 작업의 변경을 정리하고 `rd task set-status "대기 중"` 입니다(`promote_rollback.sh` 는 fr 브랜치가 아니면 멈춥니다 — `rd pr check` 의 선택지 1) 이 작업 종류에 맞는 명령을 보입니다). 다시 올리려면 `gh pr reopen <URL>`, 연결된 Issue 의 선점을 풀려면 `gh issue edit <Issue URL> --remove-assignee @me` 입니다.
 - **`--apply` 가 멈추는 경우**: merge 된 PR 에 리뷰 뒤 더해진 커밋이 있거나 merge 결과가 리뷰한 변경과 다르면(충돌 해소·merge 중 수정·squash 중 변경) 포인터를 옮기지 않고 원인을 알립니다. `rd task set-status "구현 중"` → 포인터를 merge 된 커밋으로 옮김 → final diff review 재종결 → `rd review seal` → `아카이브 보류` → 발행 순으로 다시 리뷰합니다.
 - **archive 게이트**: 반영 방식 `pr`·`push` 인 submodule 의 새 포인터가 팀 대상 브랜치의 조상(또는 같음)이어야 `archive.sh` 가 발행합니다. 아니면 어느 submodule 인지와 다음 행동을 알리고 거부합니다. 우회는 `--allow-unpublished-submodule <사유>` 이고 audit 에 `[team-publish]` 가 남습니다. 게이트는 fr 발행과 no-fr 발행(fr 브랜치 없이 기본 브랜치에서 바로 발행) 모두에 적용합니다. no-fr 은 기본 체크아웃의 submodule 로 판정합니다. 대상 경로를 판정할 수 없으면(탭·개행이 든 gitlink 경로, 기준점 오류) 원인과 함께 거부하고 `--allow-unpublished-submodule "<사유>"` 로만 넘어갑니다. 게이트는 fr 작업이면 작업 worktree, no-fr 작업이면 기본 체크아웃의 submodule 로 판정하므로 그 submodule 이 초기화돼 있어야 합니다.
 - **no-fr 작업**: fr 브랜치 없이 기본 브랜치에서 하는 작업도 `rd pr open` → 팀 merge → `rd pr check --apply` → 발행 흐름을 씁니다. 기본 브랜치를 체크아웃한 곳에서 실행하고, `archive_publish` 가 `pr` 이면 기록을 바꾸기 전에 거부합니다. 반영 대상 기준점은 SESSION 의 `review-base-oid`(seal 마커가 있으면 그 `review-base`)이고, 없으면 task-state 의 `base-commit` 입니다.
@@ -393,7 +417,7 @@ rd 를 팀 저장소에 직접 설치한 팀은 기본 브랜치를 보호하거
 
 발행 큐(`rd publish run`)는 PR 을 올리면 그 요청을 끝난 것으로 기록하고 `PR 발행 완료: <slug> — merge 뒤 … rd pr check --task <slug> --apply` 한 줄을 냅니다. 태그가 없어도 실패가 아닙니다. 마감은 merge 뒤 `rd pr check --apply` 가 합니다.
 
-발행이 중간에 끊겼으면 같은 발행 요청(`rd publish request`)을 다시 하면 됩니다. `archive.sh` 는 되돌리기 커밋을 push 가 성공한 뒤에만 fr 브랜치에 올리므로, push 전에 끊기면 작업은 `아카이브 보류` 그대로 남고 처음부터 다시 발행합니다. push 뒤에 끊겼으면 원격의 되돌리기 커밋으로 이어 가 PR 만 만듭니다. 마감한 작업이나 PR 단계만 남은 작업을 다시 발행하면 `archive.sh` 는 아무것도 바꾸지 않고 다음 행동(`rd task list` 정리 또는 `rd pr open --task <slug>`)을 알립니다. 원격을 조회하지 못하면 판정하지 않고 연결을 확인한 뒤 다시 실행하라고 알립니다.
+발행이 중간에 끊겼으면 같은 발행 요청(`rd publish request`)을 다시 하면 됩니다. `archive.sh` 는 되돌리기 커밋을 push 가 성공한 뒤에만 fr 브랜치에 올리므로, push 전에 끊기면 작업은 `아카이브 보류` 그대로 남고 처음부터 다시 발행합니다. push 뒤에 끊겼으면 원격의 되돌리기 커밋이나 자동 병합 커밋으로 이어 가 PR 만 만듭니다. 이때는 충돌을 다시 판정하지 않습니다. 이어 간 head 가 기본 브랜치와 충돌하면 PR 을 올린 뒤 경고하고 `rd pr check --task <slug>` 를 안내합니다. 자동 병합 커밋으로 fr 브랜치를 옮기다 무시 파일과 겹쳐 멈추면, 안내된 파일을 작업 worktree 밖으로 옮긴 뒤 같은 발행 요청을 다시 합니다. 발행 큐도 이 재개 상태를 알아보고, 로컬 기본 브랜치와 충돌해도 요청을 막지 않습니다. 마감한 작업이나 PR 단계만 남은 작업을 다시 발행하면 `archive.sh` 는 아무것도 바꾸지 않고 다음 행동(`rd task list` 정리 또는 `rd pr open --task <slug>`)을 알립니다. 원격을 조회하지 못하면 판정하지 않고 연결을 확인한 뒤 다시 실행하라고 알립니다.
 
 발행 승인(`publish_approval`)은 이 PR 생성까지 걸립니다. rd 는 기본 브랜치를 직접 merge 하지 않습니다. merge 는 팀이 GitHub 에서 합니다.
 
@@ -442,7 +466,7 @@ rd 를 팀 저장소에 직접 설치한 팀은 기본 브랜치를 보호하거
 3. 재검증 → 새 final diff review 종결 → `rd review seal` → `아카이브 보류` → 기록 커밋.
 4. `rd publish request` — 열린 PR 의 본문을 갱신하고 fast-forward 로 push 합니다. 새 PR 을 만들지 않고 force push 도 하지 않습니다.
 
-**처음 발행에서 충돌**: PR 이 아직 없는 첫 발행에서 기본 브랜치와의 충돌을 사전에 감지하면 `archive: PR 발행 실패 — P4 충돌 사전 감지` 로 멈추고 순서를 안내합니다. `rd task set-status "구현 중"` → 작업 worktree 에서 `git merge origin/<기본 브랜치>`·해소·커밋 → 재검증 → 새 final diff review → `rd review seal` → `아카이브 보류` → 기록 커밋 → `rd publish request`. 이때는 `rd pr reopen` 을 쓰지 않습니다(PR 이 없음). 충돌 파일이 기록 파일(다섯 경로)뿐이면 경고하고 PR 을 올립니다. PR 이 올라간 뒤 `rd pr sync --task <slug>` 로 풉니다.
+**처음 발행에서 충돌**: PR 이 아직 없는 첫 발행에서 기본 브랜치와의 충돌을 사전에 감지하면 `archive: PR 발행 실패 — P4 충돌 사전 감지` 로 멈추고 순서를 안내합니다. `rd task set-status "구현 중"` → 작업 worktree 에서 `git merge origin/<기본 브랜치>`·해소·커밋 → 재검증 → 새 final diff review → `rd review seal` → `아카이브 보류` → 기록 커밋 → `rd publish request`. 이때는 `rd pr reopen` 을 쓰지 않습니다(PR 이 없음). 충돌 파일이 기록 파일(다섯 경로)뿐이면 push 전에 `rd pr sync` 와 같은 병합·검증으로 기본 브랜치를 자동 병합하고, 충돌 없는 PR 을 올립니다. 자동 병합을 하지 못하면 병합 없이 PR 을 올리고 사유와 다음 행동을 경고합니다. 사유는 판정 불가, 기록 파일 밖 충돌, 병합 커밋 생성·검증 실패, 서명 검증 설정(`merge.verifySignatures`), 무시 파일 겹침, 색인 기록 실패입니다. 이 규칙은 열린 PR 을 갱신하는 재발행에도 같습니다.
 
 **닫힘**: merge 없이 닫힌 PR 은 완료가 아닙니다. `rd pr check`·`rd task list` 는 정리하지 않고 두 경로를 안내합니다. 새 PR 은 만들지 않습니다(닫힌 PR 이 있는 상태의 발행·`rd pr open` 도 같은 안내로 멈춥니다).
 1. 다시 열고 이어 가기: `gh pr reopen <URL>`.

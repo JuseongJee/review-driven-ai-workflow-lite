@@ -13,6 +13,13 @@
 #                     맞지 않거나 consumer 모드로 모두 빠진 선택자가 있으면 FAIL 로 끝낸다. 그룹과 함께 주면 합집합이다.
 #   consumer        — 소비 프로젝트에서 뜻이 있는 스텝만 (dev-only 정본 위생 검사 제외)
 #   RD_SELFTEST_DRYRUN=1 — 실행하지 않고 실행 예정 스텝만 출력
+#   RD_SELFTEST_VERBOSE=1 — 스텝 출력 전문을 화면에 낸다 (기본은 압축 출력)
+#
+# 출력 압축(기본): 화면에는 스텝 머리줄과 PASS·FAIL 줄만 낸다. 스텝의 stdout·stderr 전문은
+#   실행마다 `<git-dir>/rd-selftest/run-<시각>-<pid>.log` 에 쓰고(하루 지나면 다음 실행이 지운다),
+#   경로를 실행 첫머리와 끝에 낸다. FAIL 스텝은 실패 줄·마지막 20줄·로그 경로를 함께 낸다.
+#   신호 전용 검사(_SELFTEST_SIGNAL_STEPS)는 PASS 여도 경고 건수와 첫 3줄을 낸다. AI 가 검증마다 수천 줄을 읽지 않게 하려는 것이다(2026-11-04 전수 출력 4,290줄).
+#   git 디렉터리를 찾지 못하면 전문 출력으로 돌아간다.
 #
 # 환경 제약 건너뜀 표식: 테스트가 환경 제약(예: 샌드박스에서 ps 불가)으로 사례를 실행하지 않으면
 #   stderr 에 `env-skip: <사례> — <사유>` 한 줄을 낸다. 줄 머리는 정확히 `env-skip: ` 이며 들여쓰기·접두를 붙이지 않는다.
@@ -37,13 +44,28 @@ if [ -z "${RD_GUARD_BLOCK_LOG:-}" ]; then
     || RD_GUARD_BLOCK_LOG="/dev/null"
   export RD_GUARD_BLOCK_LOG
 fi
+# 세션을 만드는 테스트는 init_review_pipeline.sh 의 낡은 Codex 모델 알림 경로로 Codex 홈(models_cache.json·config.toml)과
+# 기록 파일(XDG_STATE_HOME)을 읽는다. 사용자 셸의 실제 값이 결과를 바꾸지 않게 빈 임시 폴더로 덮는다(호출자 값도 덮음).
+# 만들지 못하면 읽을 수 없는 경로로 둔다. 자신이 만든 폴더만 종료 때 지운다.
+_SELFTEST_OWN_CXD="$(mktemp -d -t rd-codex-iso.XXXXXX 2>/dev/null)" || _SELFTEST_OWN_CXD=""  # mktemp-scan: custom-handler
+if [ -n "$_SELFTEST_OWN_CXD" ] && [ -d "$_SELFTEST_OWN_CXD" ]; then
+  export CODEX_HOME="${_SELFTEST_OWN_CXD}/codex" XDG_STATE_HOME="${_SELFTEST_OWN_CXD}/state"
+else
+  _SELFTEST_OWN_CXD=""
+  export CODEX_HOME="/dev/null/codex" XDG_STATE_HOME="/dev/null/state"
+fi
 # run_step 의 stderr 감시 디렉터리 — 첫 실제 실행 스텝에서 한 번만 만들고 종료 때 지웁니다.
 # `set -u` 하에서 trap 이 참조하므로 등록 전에 정의합니다.
 _SELFTEST_WDIR=""
+# 압축 출력의 실행 로그 경로. 비어 있으면 전문 출력이다. 값은 배너 직전에 정한다.
+_SELFTEST_LOG=""
+# 신호 전용 검사(경고를 stderr 로 내고 exit 0). 압축 출력에서도 경고 건수와 첫 3줄을 화면에 낸다.
+_SELFTEST_SIGNAL_STEPS="skill_reference_existence_check fr_related_files_existence_check fr_index_detail_consistency_check root_settings_hook_registration_check"
 # 진행 중 스텝의 stderr 수집 프로세스(tee) PID. 스텝 도중 self_test 가 끝나면 종료 때 회수합니다.
 _SELFTEST_RPID=""
 _selftest_on_exit() {
   [[ "${_SELFTEST_OWN_GBL:-}" == 1 ]] && rm -f "$RD_GUARD_BLOCK_LOG"
+  [[ -n "${_SELFTEST_OWN_CXD:-}" ]] && rm -rf "$_SELFTEST_OWN_CXD"
   if [[ -n "${_SELFTEST_RPID:-}" ]]; then
     kill "$_SELFTEST_RPID" 2>/dev/null || true
     wait "$_SELFTEST_RPID" 2>/dev/null || true
@@ -64,6 +86,8 @@ SELFTEST_SEL_MATCHED=""
 # 고른 스텝이 모두 청중(consumer 모드)으로 빠진 것이다.
 SELFTEST_SEL_RAN=""
 _SEL_HIT=""
+# 실행 중인 스텝이 선택적 검사를 건너뛴 사유. run_step 이 스텝마다 비운다.
+_SELFTEST_OPT_SKIP=""
 # 실행 중인 스텝을 선택자가 골랐으면 1. 선택적 검사의 건너뜀(_selftest_skip_optional)이 이 값을 본다.
 _SELFTEST_STEP_PICKED=0
 
@@ -73,6 +97,8 @@ _SELFTEST_STEP_PICKED=0
 # 사용법: _selftest_skip_optional "<사유>"
 _selftest_skip_optional() {
   echo "  (skip: $1)"
+  # 압축 출력은 위 줄을 로그로 보내므로 run_step 이 결과 줄에 사유를 붙이도록 남긴다.
+  _SELFTEST_OPT_SKIP="$1"
   if [[ "${_SELFTEST_STEP_PICKED:-0}" == 1 ]]; then
     echo "  선택한 스텝을 이 설치본에서 실행할 수 없습니다: $1" >&2
     return 1
@@ -212,9 +238,13 @@ run_step() {
     STEP_DURATIONS+=(0)
     return 0
   fi
-  local _t0=$SECONDS elapsed rc _errf _w _hit _fifo _openf _rpid _trc _nskip _line _skipnote
+  local _t0=$SECONDS elapsed rc _errf _w _hit _fifo _openf _rpid _trc _nskip _line _skipnote _off=0 _sigwarn
   echo ""
   echo "== ${desc} =="
+  if [[ -n "$_SELFTEST_LOG" ]]; then
+    _off="$(wc -c < "$_SELFTEST_LOG" 2>/dev/null || echo 0)"; _off="${_off//[!0-9]/}"; _off="${_off:-0}"
+    printf '\n== %s ==\n' "$desc" >> "$_SELFTEST_LOG"
+  fi
   # 미정의 헬퍼를 호출한 테스트 스크립트는 FAIL 변수 누적으로 판정해 rc 0 으로 끝날 수 있다.
   # 그때도 bash 는 stderr 에 `...: command not found` 를 남기므로, stderr 를 원래 채널로 흘리면서
   # 사본을 받아 종료 후 그 줄을 찾는다. 대상은 전역 변수를 바꾸는 함수일 수 있어 파이프 좌변(서브셸)
@@ -241,7 +271,11 @@ run_step() {
     return 0
   fi
   # 2. 수집기 — 파이프를 연 뒤 표식을 남기고 tee 로 자신을 바꾼다.
-  { exec 9>&- 0<"$_fifo"; : > "$_openf"; exec tee -a "$_errf" >&2; } &
+  if [[ -n "$_SELFTEST_LOG" ]]; then
+    { exec 9>&- 0<"$_fifo"; : > "$_openf"; exec tee -a "$_errf" >> "$_SELFTEST_LOG"; } &
+  else
+    { exec 9>&- 0<"$_fifo"; : > "$_openf"; exec tee -a "$_errf" >&2; } &
+  fi
   _rpid=$!
   _SELFTEST_RPID=$_rpid
   # 3. 연결 확인 — 최대 2초.
@@ -268,7 +302,12 @@ run_step() {
   # 5. 실행 — 스텝 동안만 PIPE 처리기를 건다(tee 가 죽은 뒤 함수 스텝의 쓰기가 self_test 를 끝내지 않게).
   trap ':' PIPE
   [[ "$_picked" -eq 0 ]] && _SELFTEST_STEP_PICKED=1 || _SELFTEST_STEP_PICKED=0
-  if "$@" 2>&8 8>&-; then rc=0; else rc=$?; fi
+  _SELFTEST_OPT_SKIP=""
+  if [[ -n "$_SELFTEST_LOG" ]]; then
+    if "$@" >> "$_SELFTEST_LOG" 2>&8 8>&-; then rc=0; else rc=$?; fi
+  else
+    if "$@" 2>&8 8>&-; then rc=0; else rc=$?; fi
+  fi
   _SELFTEST_STEP_PICKED=0
   trap - PIPE
   exec 8>&-
@@ -300,19 +339,46 @@ run_step() {
     _nskip=$((_nskip + 1))
     ENV_SKIPPED+=("[${desc}] ${_line#env-skip: }")
   done < <(grep '^env-skip: ' "$_errf" || true)
+  # 압축 출력에서 신호 전용 검사의 경고는 검사 결과 자체이므로 PASS 여도 건수와 첫 3줄을 화면에 낸다.
+  _sigwarn=""
+  if [[ -n "$_SELFTEST_LOG" ]]; then
+    case " ${_SELFTEST_SIGNAL_STEPS} " in
+      *" ${1-} "*) _sigwarn="$(grep -v '^env-skip: ' "$_errf" || true)" ;;
+    esac
+  fi
   : > "$_errf"
   elapsed=$((SECONDS - _t0))
   _skipnote=""
   [[ "$_nskip" -eq 0 ]] || _skipnote=", 환경 제약으로 건너뜀 ${_nskip}건"
+  [[ -z "$_SELFTEST_LOG" || -z "$_SELFTEST_OPT_SKIP" ]] || _skipnote="${_skipnote}, 건너뜀: ${_SELFTEST_OPT_SKIP}"
   [[ -z "$_hit" ]] || echo "  -> 미정의 명령 호출 검출: ${_hit}" >&2
   if [[ "$rc" -eq 0 && -z "$_hit" ]]; then
     echo "  -> PASS: ${desc} (${elapsed}s${_skipnote})"
+    if [[ -n "$_sigwarn" ]]; then
+      echo "     경고 $(printf '%s\n' "$_sigwarn" | grep -c .)줄 — 첫 3줄 (전체: ${_SELFTEST_LOG}):"
+      printf '%s\n' "$_sigwarn" | head -n 3 | sed 's/^/     | /' || true
+    fi
   else
     echo "  -> FAIL: ${desc} (${elapsed}s${_skipnote})" >&2
+    [[ -z "$_SELFTEST_LOG" ]] || _selftest_fail_excerpt "$_off"
     FAIL=1
   fi
   STEP_NAMES+=("$desc")
   STEP_DURATIONS+=("$elapsed")
+}
+
+# 압축 출력에서 FAIL 스텝의 출력 발췌를 stderr 로 낸다. $1 = 스텝 시작 때의 로그 바이트 수.
+_selftest_fail_excerpt() {
+  local seg
+  seg="$(tail -c +"$(( $1 + 1 ))" "$_SELFTEST_LOG" 2>/dev/null || true)"
+  {
+    echo "     실패 줄 (최대 40줄):"
+    printf '%s\n' "$seg" | grep -E 'FAIL|not ok|오류|Error' | head -n 40 | sed 's/^/     | /' || true
+    echo "     마지막 20줄:"
+    printf '%s\n' "$seg" | tail -n 20 | sed 's/^/     | /' || true
+    echo "     전체 출력: ${_SELFTEST_LOG}"
+  } >&2
+  return 0
 }
 
 print_step_summary() {
@@ -948,9 +1014,9 @@ _skill_manual_guard_tree() {  # $1=트리 경로 — 단계 전환 skill(full 6�
 
 _skill_authority_tree() {  # $1=트리 경로
   local tree="$1" rc=0 name f scan cnt val
-  # 호출 가능으로 고정할 11개 — 제거 8 + 판정표의 "변경 없음" 3 (플래그가 다시 붙는 회귀도 잡는다)
-  # lite 빌드에 없는 skill(rules.conf [lite-exclude])은 full 에서만 요구한다 — lite 는 6개, 유지 대상 없음.
-  local -a must_absent=(request-to-reviewed-plan final-diff-review small-task-implement fr \
+  # 호출 가능으로 고정할 12개 — 제거 8 + 판정표의 "변경 없음" 3 + fr-groom (플래그가 다시 붙는 회귀도 잡는다)
+  # lite 빌드에 없는 skill(rules.conf [lite-exclude])은 full 에서만 요구한다 — lite 는 7개, 유지 대상 없음.
+  local -a must_absent=(request-to-reviewed-plan final-diff-review small-task-implement fr fr-groom \
                         autopilot workflow-router)
   local -a keep_always=()
   local -a keep_if_present=(tpl ship publish)
@@ -1338,6 +1404,7 @@ guard_deny_convention_check() {
         case "${f##*/}" in
           session_start.sh) : ;;               # 세션 시작 안내 — 차단 없음
           _compact_hint.sh) : ;;               # session_start.sh 가 source 하는 압축 안내 함수 — 차단 없음
+          subagent_dispatch_display.sh) : ;;   # 구현 subagent 모델·effort 표시 — 차단 없음
           *) echo "  ${rel}: guard_deny 호출이 없습니다 — 차단 가드가 아니면 이 예외 목록에 추가하십시오" >&2; rc=1 ;;
         esac
       else
@@ -1679,7 +1746,23 @@ selftest_count_audiences() {
 }
 selftest_count_audiences "${BASH_SOURCE[0]}" || true
 
+# 압축 출력의 실행 로그를 정한다. dry-run 은 스텝을 실행하지 않으므로 지난 로그를 지우지 않는다.
+if [[ -z "${RD_SELFTEST_VERBOSE:-}" && -z "${RD_SELFTEST_DRYRUN:-}" ]]; then
+  _gd="$(git -C "$SELFTEST_ROOT" rev-parse --absolute-git-dir 2>/dev/null || true)"
+  # 실행마다 파일을 따로 만든다 — 같은 worktree 에서 겹친 실행이 서로의 로그를 지우지 않게 한다.
+  # 하루 지난 로그는 여기서 지운다(실행 중인 로그는 하루를 넘지 않는다).
+  if [[ -n "$_gd" ]] && mkdir -p "${_gd}/rd-selftest" 2>/dev/null; then
+    # `-mtime +1` 은 1일 단위로 버림해 48시간을 넘어야 고르므로 분 단위로 비교한다.
+    find "${_gd}/rd-selftest" -name 'run-*.log' -mmin +1440 -exec rm -f {} + 2>/dev/null || true
+    _lf="${_gd}/rd-selftest/run-$(date +%Y%m%d-%H%M%S)-$$.log"
+    if : > "$_lf" 2>/dev/null; then _SELFTEST_LOG="$_lf"; fi
+  fi
+fi
+
 echo "== self_test 실행 범위 =="
+if [[ -n "$_SELFTEST_LOG" ]]; then
+  echo "  출력: 압축 — 스텝 출력 전문은 ${_SELFTEST_LOG} (화면에 전문을 보려면 RD_SELFTEST_VERBOSE=1)"
+fi
 if [[ "$SELFTEST_MODE" == "consumer" ]]; then
   echo "  모드: consumer — dev-only 정본 위생 검사 제외 (${SELFTEST_AUD_DEVONLY}스텝)"
 else
@@ -1713,6 +1796,7 @@ run_step lifecycle consumer "state 단위 테스트 (test_state_common.sh)" bash
 run_step hooks consumer "guard state fixture (test_guard_state.sh)" bash "${SCRIPT_DIR}/hooks/test_guard_state.sh"
 run_step hooks consumer "archive gate 테스트 (test_pre_commit_archive_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_pre_commit_archive_gate.sh"
 run_step hooks consumer "background dispatch 차단 hook (test_headless_background_gate.sh)" bash "${SCRIPT_DIR}/hooks/test_headless_background_gate.sh"
+run_step hooks consumer "subagent 모델·effort 표시 hook (test_subagent_dispatch_display.sh)" bash "${SCRIPT_DIR}/hooks/test_subagent_dispatch_display.sh"
 run_step hooks consumer "압축 뒤 안내 (test_session_start_compact.sh)" bash "${SCRIPT_DIR}/hooks/test_session_start_compact.sh"
 run_step hooks consumer "가드 차단 계측 (test_guard_block_log.sh)" bash "${SCRIPT_DIR}/hooks/test_guard_block_log.sh"
 run_step hooks consumer "hook 무성 실패 감시 (test_hook_sentinel.sh)" bash "${SCRIPT_DIR}/hooks/test_hook_sentinel.sh"
@@ -1887,7 +1971,13 @@ print_group_summary() {
   if (( ${#GROUP_EXCLUDED[@]} > 0 )); then
     echo ""
     echo "== 선택 밖 스텝 (${#GROUP_EXCLUDED[@]}개, 실행하지 않음 — 지정 그룹:${SELFTEST_GROUPS:- 없음}, 선택자:${SELFTEST_SELECTORS:- 없음}) =="
-    printf '  - %s\n' "${GROUP_EXCLUDED[@]}"
+    if [[ -n "$_SELFTEST_LOG" ]]; then
+      # 압축 출력: 목록은 로그에만 쓴다. 그룹 실행마다 수십 줄이 화면을 채우지 않게 한다.
+      { echo ""; echo "== 선택 밖 스텝 목록 =="; printf '  - %s\n' "${GROUP_EXCLUDED[@]}"; } >> "$_SELFTEST_LOG" || true
+      echo "  (목록: ${_SELFTEST_LOG})"
+    else
+      printf '  - %s\n' "${GROUP_EXCLUDED[@]}"
+    fi
     echo "전체 실행: bash rd-workflow/scripts/self_test.sh"
   fi
 }
@@ -1934,12 +2024,22 @@ if [[ "$SELFTEST_MODE" == "consumer" ]]; then print_audience_summary; fi
 
 echo ""
 echo "== 스텝별 소요 시간 (느린 순) =="
-if ! print_step_summary; then
+if _step_sum="$(print_step_summary)"; then
+  if [[ -n "$_SELFTEST_LOG" && -n "$_step_sum" ]]; then
+    # 화면에는 느린 10개만 내고 전체 목록은 로그에 남긴다.
+    printf '%s\n' "$_step_sum" | head -n 10 || true
+    (( ${#STEP_NAMES[@]} <= 10 )) || echo "  (나머지 $(( ${#STEP_NAMES[@]} - 10 ))개 스텝은 ${_SELFTEST_LOG} 끝에 있습니다)"
+    { echo ""; echo "== 스텝별 소요 시간 (느린 순, 전체) =="; printf '%s\n' "$_step_sum"; } >> "$_SELFTEST_LOG" || true
+  elif [[ -n "$_step_sum" ]]; then
+    printf '%s\n' "$_step_sum"
+  fi
+else
   echo "  (요약 출력 실패 — 최종 판정과 무관하게 계속 진행합니다)" >&2
 fi
 print_env_skip_summary
 
 echo ""
+[[ -z "$_SELFTEST_LOG" ]] || echo "스텝 출력 전문: ${_SELFTEST_LOG}"
 if [[ "$FAIL" -eq 0 ]]; then
   echo "== self_test 결과: PASS =="
   exit 0

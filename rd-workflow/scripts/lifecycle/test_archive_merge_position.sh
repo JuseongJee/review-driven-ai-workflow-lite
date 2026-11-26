@@ -22,6 +22,7 @@ source "$RDW_SRC/scripts/fixtures/review_run_fixture.sh"
 # 실제 herdr 호출 차단 — promote.sh 가 session_launch 를 부른다 (test_archive_worktree.sh 와 같은 사유).
 export HERDR_ENV=
 export HC_TERMINAL_ID=
+export ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE=
 export RD_CHILD_SESSION=1
 # 바깥 셸의 값을 물려받으면 fixture 가 아니라 바깥 저장소를 고친다 (2026-10-29 사고).
 unset project_root TASK_STATE_PATH

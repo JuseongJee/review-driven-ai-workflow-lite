@@ -16,6 +16,7 @@ fi
 export project_root
 source "$SCRIPT_DIR/slug.sh"
 source "$SCRIPT_DIR/_lifecycle_common.sh"
+source "$SCRIPT_DIR/_dup_guard.sh"
 # 대상 선택은 단일 출처(task_resolve_target, Task 3)를 그대로 쓴다 — 판정 로직을
 # 여기서 복제하지 않는다. _task_common.sh 가 tasks_index_*·tasks_lock_*(Task 1) 도
 # 함께 source 한다.
@@ -142,8 +143,23 @@ if [[ -n "$TARGET_DIR" && "$IS_MAIN_WT" -eq 0 ]]; then
   fi
 fi
 
-# Already-archived guard — 동일 slug 의 fr/*/<slug> tag 검색
-EXISTING_TAGS="$(git tag --list "fr/*/$SLUG" 2>/dev/null || true)"
+# Already-archived guard — 동일 slug 의 fr/*/<slug> tag 중 이 작업을 담은 것만 센다.
+#   대상 fr 브랜치 끝이 태그 대상 커밋(또는 태그 메시지 pr-head)의 조상이면 이 작업이 이미 발행된 것이다.
+#   같은 slug 를 다시 쓴 새 작업은 예전 태그에 막히지 않는다. 대상 브랜치가 없으면 태그가 있으면 멈춘다.
+EXISTING_TAGS=""
+_rb_ctip="$(git rev-parse --verify -q "refs/heads/${TARGET_BRANCH}" 2>/dev/null || true)"
+while IFS= read -r _rb_t; do
+  [[ -n "$_rb_t" ]] || continue
+  if [[ -z "$_rb_ctip" ]]; then
+    EXISTING_TAGS="${EXISTING_TAGS:+$EXISTING_TAGS }$_rb_t"; continue
+  fi
+  _rb_tc="$(git rev-parse --verify -q "${_rb_t}^{commit}" 2>/dev/null || true)"
+  _rb_ph="$(git cat-file -p "refs/tags/${_rb_t}" 2>/dev/null | sed -n 's/^pr-head: *//p' | sed -n 1p || true)"
+  if { [[ -n "$_rb_tc" ]] && git merge-base --is-ancestor "$_rb_ctip" "$_rb_tc" 2>/dev/null; } \
+     || { [[ -n "$_rb_ph" ]] && git merge-base --is-ancestor "$_rb_ctip" "$_rb_ph" 2>/dev/null; }; then
+    EXISTING_TAGS="${EXISTING_TAGS:+$EXISTING_TAGS }$_rb_t"
+  fi
+done < <(git tag --list "fr/*/$SLUG" 2>/dev/null || true)
 if [[ -n "$EXISTING_TAGS" ]]; then
   printf 'rollback: 이 fr 는 이미 archive 되었습니다 (tag: %s). git revert 등 별도 절차 사용.\n' "$EXISTING_TAGS" >&2
   exit 1
@@ -194,6 +210,9 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     printf 'would rollback %s (기본 worktree — 제거하지 않고 기본 브랜치로 되돌림: %s)\n' "$TARGET_BRANCH" "$TARGET_DIR"
   else
     printf 'would rollback %s (worktree=%s)\n' "$TARGET_BRANCH" "${TARGET_DIR:-<미체크아웃>}"
+  fi
+  if [[ "$(detect_remote_mode 2>/dev/null)" == "remote" ]]; then
+    printf 'would delete remote claim fr/%s (원격 끝이 이 작업의 커밋일 때만)\n' "$SLUG"
   fi
   exit 0
 fi
@@ -265,7 +284,10 @@ case "$_launch" in
       # 반복된다.** 그러면 사용자에게 보이는 유일한 출구가 `--force` 인데, 그것은 생존
       # 가드와 **미커밋 작업물 보호를 함께** 해제한다 — 보호를 지키는 경로를 만들어 놓고
       # 막힌 화면에 적지 않으면 없는 것과 같다.
-      if [[ "$_rb_probe" == "alive" ]]; then
+      if [[ "$_rb_probe" == "alive" && "$_rb_backend" == "orca" ]]; then
+        printf '  먼저 그 세션을 끝내십시오 (Orca 사이드바의 fr/%s 아래 에이전트를 종료).\n' "$SLUG" >&2
+        printf '  종료 뒤 재시도: bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task %s\n' "$SLUG" >&2
+      elif [[ "$_rb_probe" == "alive" ]]; then
         printf '  먼저 그 세션을 끝내십시오 (herdr 또는 앱 화면에서 그 작업의 tab 을 종료).\n' >&2
         printf '  종료 뒤 재시도: bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task %s\n' "$SLUG" >&2
       else
@@ -290,7 +312,7 @@ case "$_launch" in
     _rb_probe="$(session_probe "$SLUG" "${TARGET_DIR:-}" "$_rb_backend")"
     _rb_evidence=""
     if [[ "$_rb_probe" == "alive" ]]; then
-      _rb_evidence="herdr 에이전트 ${SLUG} 생존"
+      if [[ "$_rb_backend" == "orca" ]]; then _rb_evidence="Orca 세션 생존"; else _rb_evidence="herdr 에이전트 ${SLUG} 생존"; fi
     elif _rb_cwd_msg="$(_task_session_cwd_alive "$SLUG" "${TARGET_DIR:-}" "${_rb_backend:-herdr}")"; then
       _rb_evidence="$_rb_cwd_msg"
     fi
@@ -299,7 +321,11 @@ case "$_launch" in
         printf 'rollback: WARNING — '"'"'%s'"'"' 세션이 살아 있습니다(launch=failed, %s). --force 로 계속합니다.\n' "$SLUG" "$_rb_evidence" >&2
       else
         printf 'rollback: '"'"'%s'"'"' 의 worktree 에서 세션이 살아 있습니다(launch=failed, %s) — 그 세션의 작업을 지우지 않기 위해 취소하지 않습니다 (상태 변경 없음).\n' "$SLUG" "$_rb_evidence" >&2
-        printf '  먼저 그 세션을 끝내십시오 (herdr 또는 앱 화면에서 그 작업의 tab 을 종료).\n' >&2
+        if [[ "$_rb_backend" == "orca" ]]; then
+          printf '  먼저 그 세션을 끝내십시오 (Orca 사이드바의 fr/%s 아래 에이전트를 종료).\n' "$SLUG" >&2
+        else
+          printf '  먼저 그 세션을 끝내십시오 (herdr 또는 앱 화면에서 그 작업의 tab 을 종료).\n' >&2
+        fi
         printf '  종료 뒤 재시도: bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task %s\n' "$SLUG" >&2
         printf '  세션째 버려도 된다면: bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task %s --force\n' "$SLUG" >&2
         printf '    주의 — --force 는 세션 보호뿐 아니라 **커밋되지 않은 작업물 보호까지** 함께 해제합니다.\n' >&2
@@ -356,8 +382,33 @@ fi
 git worktree prune
 
 # Branch 강제 삭제 (대상 branch 만)
+_RB_TIP=""
 if git rev-parse --verify --quiet "refs/heads/${TARGET_BRANCH}" >/dev/null 2>&1; then
+  _RB_TIP="$(git rev-parse "refs/heads/${TARGET_BRANCH}")"
   git branch -D "$TARGET_BRANCH"
+fi
+
+# 원격 착수 표시 삭제 — 원격 모드에서, 원격 fr/<slug> 가 이 작업의 커밋일 때만(lease). 결과는 종료 코드를 바꾸지 않는다.
+if [[ -n "$_RB_TIP" && "$(detect_remote_mode 2>/dev/null)" == "remote" ]]; then
+  _rb_drc=0
+  _rb_derr="$(mktemp "${TMPDIR:-/tmp}/rd-rb-del.XXXXXX")" || _rb_derr=/dev/null
+  dup_claim_delete "$project_root" "$SLUG" "$_RB_TIP" 2>"$_rb_derr" || _rb_drc=$?
+  _rb_dwhy="$(head -1 "$_rb_derr" 2>/dev/null)"
+  [[ "$_rb_derr" == /dev/null ]] || rm -f "$_rb_derr"
+  case "$_rb_drc" in
+    0) if [[ -n "$DUP_DELETE_REMOTE_OID" ]]; then
+         printf 'rollback: 원격 착수 표시 fr/%s 를 지웠습니다\n' "$SLUG"
+       fi ;;
+    1) printf 'rollback: 원격 fr/%s 에 로컬 브랜치에 없는 커밋이 있어 지우지 않았습니다.\n' "$SLUG"
+       printf '  이 작업의 커밋(리뷰 제안 반영 등)이 맞으면 아래 명령으로 지웁니다:\n'
+       printf '  git push --no-follow-tags --force-with-lease=refs/heads/fr/%s:%s origin :refs/heads/fr/%s\n' "$SLUG" "$DUP_DELETE_REMOTE_OID" "$SLUG" ;;
+    *) printf 'rollback: 경고 — 원격 착수 표시를 지우지 못했습니다(%s).\n' "$_rb_dwhy" >&2
+       if [[ -n "$DUP_DELETE_REMOTE_OID" ]]; then
+         printf '  직접 지우려면: git push --no-follow-tags --force-with-lease=refs/heads/fr/%s:%s origin :refs/heads/fr/%s\n' "$SLUG" "$DUP_DELETE_REMOTE_OID" "$SLUG" >&2
+       else
+         printf '  git ls-remote origin refs/heads/fr/%s 로 끝을 확인하고, 그 값이 %s 이거나 그 조상이면: git push --no-follow-tags --force-with-lease=refs/heads/fr/%s:<그 값> origin :refs/heads/fr/%s\n' "$SLUG" "$_RB_TIP" "$SLUG" "$SLUG" >&2
+       fi ;;
+  esac
 fi
 
 # 색인 행 제거 (대상 slug 만 — 다른 작업의 행은 tasks_index_remove 의 slug 단위 계약으로 보존된다)

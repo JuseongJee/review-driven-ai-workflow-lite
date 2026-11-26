@@ -1531,22 +1531,24 @@ run_case20() {
 # 케이스 21: heartbeat 주기·필드와 상태 파일 보존
 # ===========================================================================
 run_case21() {
-  local sandbox expected_turn mock_bin rc=0 output beats
+  local sandbox expected_turn mock_bin rc=0 output beats err
   sandbox="$(make_sandbox)"
   expected_turn="$sandbox/turns/turn-001-reviewer.md"
+  err="$sandbox/err21.txt"
   write_session "$sandbox" "Reviewer" "awaiting-reviewer"
   write_checkpoint "$sandbox" "Author"
 
+  # heartbeat(2초)가 stderr 에 2회 찍힐 때까지 0.5초마다 로그를 내다가 턴을 완성한다.
+  #   고정 6초 실행은 watchdog 기동이 부하로 늦으면 heartbeat 가 1회만 찍힐 수 있다(케이스 31 과 같은 조건 대기).
+  #   heartbeat 가 끝내 안 찍히면 15초 뒤 그대로 끝내 21a 가 FAIL 하게 한다(유휴 상한 30초보다 짧게).
   mock_bin="$(setup_mock "$sandbox" \
-    "for i in 1 2 3 4 5 6; do echo \"working \$i\"; sleep 1; done; printf 'x' > \"$expected_turn\"; exit 0")"
+    "i=0; while [ \$i -lt 30 ]; do echo \"working \$i\"; [ \"\$(grep -c '^\\[review wait\\]' \"$err\" 2>/dev/null || true)\" -ge 2 ] && break; sleep 0.5; i=\$((i+1)); done; printf 'x' > \"$expected_turn\"; exit 0")"
 
-  # HEARTBEAT_INTERVAL 을 2초로 낮춰 6초 실행에서 최소 2회 나오게 한다
-  output="$(
-    TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
-    EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
-    WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=30 RD_REVIEW_HEARTBEAT=2 \
-      bash "$ADAPTER" 2>&1
-  )" || rc=$?
+  TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \
+  EXPECTED_TURN_FILE="$expected_turn" PROJECT_ROOT="$sandbox" \
+  WAIT_TIMEOUT=60 RD_REVIEW_IDLE_TIMEOUT=30 RD_REVIEW_HEARTBEAT=2 \
+    bash "$ADAPTER" >/dev/null 2>"$err" || rc=$?
+  output="$(cat "$err" 2>/dev/null || true)"
 
   beats="$(echo "$output" | grep -c '^\[review wait\]' || true)"
   [ "$beats" -ge 2 ] \
@@ -2409,39 +2411,69 @@ MOCK_EOF
 #   읽기가 느려지면 그 사이 watchdog 이 계속 tick 하며 codex 생존 여부와 무관하게 cap
 #   도달 시 마커를 썼다 — 실제로는 조기 종료인데 "타임아웃" 으로 오분류(rc=124)됐다.
 #   이 케이스는 `tail`(로그·last-message 읽기가 경유하는 유일한 외부 명령)을 PATH 로
-#   가로채 확률에 기대지 않고 그 지연을 **결정적으로** 재현한다 — mock codex 는 cap
-#   보다 훨씬 이전에 턴 파일 없이 자체 종료하므로, 이 지연이 없으면 애초에 cap 에
-#   도달할 수 없다. 수정 전 어댑터로 이 fixture 를 겨누면 rc=124 가 나옴을 별도로
-#   확인했다(final-diff-review-fix-4 작업 리포트 참조).
+#   가로채 확률에 기대지 않고 그 지연을 **결정적으로** 재현한다. 수정 전 어댑터로 이
+#   fixture 를 겨누면 rc=124 가 나옴을 별도로 확인했다(final-diff-review-fix-4 작업
+#   리포트 참조).
+#   시계도 PATH 로 가로챈다(`date +%s` 만). 시계를 그대로 두면 부하로 mock codex 의 수명이
+#   상한 1초를 넘을 때 watchdog 이 정당하게 cap 을 발동해 rc=124 가 났다 — 판정이 부하에
+#   흔들렸다. 그래서 진단 읽기 전에는 시계를 멈추고(codex 가 얼마나 오래 살든 cap 에 닿지
+#   않는다), 진단 읽기가 시작되면 멈춘 값 + 2초에서부터 실제 시간만큼 흐르게 한다. 진단
+#   읽기 동안 watchdog 이 살아 있으면(옛 결함) 시작값을 언제 읽었든 다음 tick 에서 경과가
+#   상한을 넘는다 — 시작값을 진단 시작 뒤에 읽어도 그 뒤로 시계가 흐르기 때문이다.
+#   watchdog 이 시각을 `date +%s` 로 읽는다는 사실에 기댄다. 그 구현이 바뀌면 가로채기가
+#   빠지고 종전의 시간 의존 상태(상한 1초 대 mock 0.2초)로 돌아간다.
 #   판정: ① rc=1(조기 종료) — rc=124(오분류 타임아웃) 아님 ② "턴 완료 전에 종료" 보고
 #         ③ "타임아웃" 오분류 문구 없음
 # ===========================================================================
 run_case32() {
-  local sandbox expected_turn mock_bin wrap_dir real_tail rc=0 out
+  local sandbox expected_turn mock_bin wrap_dir rc=0 out
   sandbox="$(make_sandbox)"
   expected_turn="$sandbox/turns/turn-001-reviewer.md"
   write_session "$sandbox" "Reviewer" "awaiting-reviewer"
   write_checkpoint "$sandbox" "Author"
 
-  # mock: cap(1초)에 한참 못 미치는 0.2초 만에, 턴 파일 없이 자체 종료한다.
+  # mock: 상한(1초) 안에 끝나도록 0.2초 만에, 턴 파일 없이 자체 종료한다. 부하로 더 오래
+  # 살아도 아래 고정 시계가 cap 판정을 막는다.
   mock_bin="$(setup_mock "$sandbox" "sleep 0.2; exit 1")"
 
-  # tail 을 PATH 로 가로채 codex 종료 후 진단 읽기(로그 tail·fd 3 last-message 읽기)만
-  # 지연시킨다. 실제 tail 경로는 PATH 를 바꾸기 전에 미리 확인해 둔다(환경마다
-  # busybox/GNU 등 위치가 다를 수 있어 하드코딩하지 않는다).
-  real_tail="$(command -v tail)"
+  # 두 가로채기의 소스는 고정 문자열이다(따옴표 heredoc). 경로·시각은 아래 실행에서
+  # 환경 변수로 넘긴다 — 경로 문자가 셸 구문으로 해석되지 않게 한다.
+  # tail: codex 종료 후 진단 읽기(로그 tail·fd 3 last-message 읽기)만 지연시킨다. 지연
+  # 전에 진단 시작 시각(실제 epoch)을 RD_TEST_DIAG_FLAG 에 원자적으로 남긴다.
+  # date: `+%s` 만 가짜 값을 낸다. 진단 시작 전에는 RD_TEST_FROZEN, 뒤에는
+  # RD_TEST_FROZEN + 2 + (지금 - 진단 시작 시각). +2 는 상한 1초를 넘기면서 watchdog 의
+  # 시계 점프 보정 임계(30초)보다 작아 보정이 경과를 지우지 않는다.
+  # 실제 tail·date 경로는 PATH 를 바꾸기 전에 미리 확인해 둔다(환경마다 busybox/GNU 등
+  # 위치가 다를 수 있어 하드코딩하지 않는다).
   wrap_dir="$sandbox/wrap"
   mkdir -p "$wrap_dir"
-  cat > "$wrap_dir/tail" <<WRAPEOF
+  cat > "$wrap_dir/tail" <<'WRAPEOF'
 #!/usr/bin/env bash
-if [ -n "\${RD_TEST_DIAG_DELAY:-}" ]; then
-  sleep "\${RD_TEST_DIAG_DELAY}"
+if [ ! -e "$RD_TEST_DIAG_FLAG" ]; then
+  "$RD_TEST_REAL_DATE" +%s > "$RD_TEST_DIAG_FLAG.tmp" && mv "$RD_TEST_DIAG_FLAG.tmp" "$RD_TEST_DIAG_FLAG"
 fi
-exec "$real_tail" "\$@"
+if [ -n "${RD_TEST_DIAG_DELAY:-}" ]; then
+  sleep "${RD_TEST_DIAG_DELAY}"
+fi
+exec "$RD_TEST_REAL_TAIL" "$@"
 WRAPEOF
-  chmod +x "$wrap_dir/tail"
+  cat > "$wrap_dir/date" <<'WRAPEOF'
+#!/usr/bin/env bash
+if [ "$#" -eq 1 ] && [ "$1" = "+%s" ]; then
+  if [ -s "$RD_TEST_DIAG_FLAG" ]; then
+    echo $(( RD_TEST_FROZEN + 2 + $("$RD_TEST_REAL_DATE" +%s) - $(cat "$RD_TEST_DIAG_FLAG") ))
+  else
+    echo "$RD_TEST_FROZEN"
+  fi
+  exit 0
+fi
+exec "$RD_TEST_REAL_DATE" "$@"
+WRAPEOF
+  chmod +x "$wrap_dir/tail" "$wrap_dir/date"
 
   out="$(
+    RD_TEST_REAL_TAIL="$(command -v tail)" RD_TEST_REAL_DATE="$(command -v date)" \
+    RD_TEST_DIAG_FLAG="$sandbox/diag-started" RD_TEST_FROZEN="$(date +%s)" \
     PATH="$wrap_dir:$PATH" \
     RD_TEST_DIAG_DELAY=2 \
     TOOL_BIN="$mock_bin/codex" SESSION_PATH="$sandbox" PROMPT_FILE=/dev/null \

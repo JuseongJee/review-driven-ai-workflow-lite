@@ -768,11 +768,34 @@ dpr_closed_cleanup_guide() {
   fi
 }
 
+# dpr_rollback_cmd <slug> [<저장소>] — 작업 폐기 명령을 stdout 에 냅니다. promote_rollback.sh 는 지우려는 worktree 안에서 부르면 멈추므로
+#   기본 체크아웃(git common dir 의 부모)으로 cd 한 뒤 --task 로 부릅니다. 기본 체크아웃을 구하지 못하면 이동 없이 「기본 체크아웃에서」 를 붙입니다.
+dpr_rollback_cmd() {
+  local slug="$1" root="${2:-$(_dpr_root)}" common base=""
+  common="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || common=""
+  [[ -n "$common" ]] && base="$(cd "${common}/.." 2>/dev/null && pwd -P)" || base=""
+  # --separate-git-dir 등으로 common dir 의 부모가 다른 저장소일 수 있습니다 — 그 위치가 같은 common dir 을 쓰는 체크아웃일 때만 cd 를 안내합니다.
+  if [[ -n "$base" ]]; then
+    [[ "$(git -C "$base" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" == "$common" \
+      && "$(git -C "$base" rev-parse --show-toplevel 2>/dev/null)" -ef "$base" ]] || base=""
+  fi
+  if [[ -n "$base" ]]; then
+    printf 'cd %s && bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task %s' "$(dpr_shq "$base")" "$(dpr_shq "$slug")"
+  else
+    printf '기본 체크아웃에서 bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task %s' "$(dpr_shq "$slug")"
+  fi
+}
+
 dpr_closed_choices() {
   local slug="$1" url="$2" fr="$3" refs r n=0
   printf '  선택지 (사람이 정합니다):\n'
   printf '    1) 다시 열고 이어 가기: gh pr reopen %s\n' "$url"
-  printf '    2) 작업 폐기: /fr status %s dropped → 기본 체크아웃에서 bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task %s → 원격 fr 브랜치 삭제: git push origin --delete %s\n' "$slug" "$slug" "$fr"
+  # 터미널 명령은 설명 없이 한 줄에 하나씩 둡니다 — 그 줄을 그대로 복사해 어느 폴더에서나 실행할 수 있습니다.
+  printf '    2) 작업 폐기: 아래 순서로 진행합니다\n'
+  printf '       a. Claude 세션에서 /fr status %s dropped 로 닫습니다\n' "$slug"
+  # 원격 fr 브랜치는 rollback 이 직접 지웁니다(이 작업의 커밋일 때). 아니면 rollback 이 삭제 명령을 출력합니다.
+  printf '       b. 터미널에서 아래 줄을 실행합니다(작업을 정리하고, 원격 fr 브랜치가 이 작업의 커밋이면 함께 지웁니다. 로컬 브랜치에 없는 커밋이 있으면 지우지 않고 지우는 명령을 출력합니다):\n'
+  printf '          %s\n' "$(dpr_rollback_cmd "$slug")"
   refs="$(_dpr_closed_links "$url")"
   if [[ "$refs" == "?" ]]; then
     printf '    3) 연결된 Issue 선점 풀기: gh issue edit <Issue URL> --remove-assignee @me (이 PR 에 연결된 Issue 를 조회하지 못했습니다 — %s 에서 확인하십시오)\n' "$url"
@@ -832,6 +855,208 @@ _dpr_fr_worktree() {
   printf '%s/' "$wt"
 }
 
+# dpr_resume_head <root> <slug> <fr> <tip> <원격 끝 OID> — 원격 fr 끝이 「이전 발행이 push 뒤에 끊긴 head」인지(spec D2).
+#   첫째: 원격 끝의 부모가 tip 이고 되돌리기 커밋 모양(_dpr_cleanup_shape).
+#   둘째: 원격 끝이 동기화 병합 모양(_dpr_sync_shape)이고 pr-verified 에 있으며, 첫 부모가 되돌리기 커밋 모양이고 그 부모가 tip.
+#   rc 0 재개 상태 / rc 1 아님(객체를 읽지 못해도 1). 저장소·색인을 바꾸지 않고 원격을 조회하지 않습니다(조회·fetch 는 부르는 쪽).
+#   <fr> 은 부르는 쪽 계약을 맞추려고 받습니다 — 동기화 제목은 _dpr_sync_shape 가 색인의 fr 브랜치로 만듭니다.
+dpr_resume_head() {
+  local root="${1:?root}" slug="${2:?slug}" tip="${4-}" r="${5-}" p1
+  [[ -n "$tip" && -n "$r" ]] || return 1
+  if [[ "$(git -C "$root" rev-parse -q --verify "${r}^" 2>/dev/null)" == "$tip" ]] \
+     && _dpr_cleanup_shape "$root" "$r" "$slug"; then
+    return 0
+  fi
+  _dpr_sync_shape "$root" "$r" "$slug" || return 1
+  dpr_verified_has "$slug" "$r" || return 1
+  p1="$(git -C "$root" rev-parse -q --verify "${r}^1" 2>/dev/null)" || return 1
+  _dpr_cleanup_shape "$root" "$p1" "$slug" || return 1
+  [[ "$(git -C "$root" rev-parse -q --verify "${p1}^" 2>/dev/null)" == "$tip" ]]
+}
+
+# _dpr_as_fallback <종류> <사유> <slug> <기본 브랜치> <충돌 경로(줄 구분)> [<추가 값>] — 자동 병합 fallback 경고(spec D5, stderr).
+#   종류: undecidable(판정 불가) / other(대상 밖 충돌) / commit(병합 커밋 생성·검증 실패) / verifysig(서명 설정)
+#         / ignored(무시 파일 겹침 — 추가 값은 파일 목록) / index(색인 기록 실패 — 추가 값은 색인 경로)
+_dpr_as_fallback() {
+  local kind="$1" why="$2" slug="$3" def="$4" paths="$5" extra="${6-}" p='archive:   '
+  {
+    printf 'archive: WARNING — origin/%s 과 합치면 기록 파일이 충돌하지만 자동 병합을 하지 못했습니다: %s\n' "$def" "$why"
+    printf '%sPR 이 GitHub 에서 충돌로 보입니다. 충돌 파일:\n' "$p"
+    printf '%s\n' "$paths" | grep -v '^$' | sed "s/^/${p}  /"
+    case "$kind" in
+      undecidable)
+        printf '%s확인: bash rd-workflow/scripts/rd pr check --task %s\n' "$p" "$slug"
+        printf '%s사유를 풀 수 있으면(설정·속성 제거) 그 뒤 bash rd-workflow/scripts/rd pr sync --task %s\n' "$p" "$slug" ;;
+      verifysig)
+        printf '%s이 설정에서는 rd pr sync 의 마무리 이동도 막힙니다.\n' "$p"
+        dpr_verifysig_guide "$slug" "$def" | sed "s/^/${p}/"
+        printf '%s설정을 끌 수 있으면 끈 뒤 bash rd-workflow/scripts/rd pr sync --task %s\n' "$p" "$slug" ;;
+      ignored)
+        printf '%s작업 worktree 의 무시 파일이 origin/%s 가 추적하는 경로에 있습니다:\n' "$p" "$def"
+        printf '%s\n' "$extra" | grep -v '^$' | sed "s/^/${p}  /"
+        printf '%s이 파일들을 작업 worktree 밖으로 옮긴 뒤, PR 이 올라가면 bash rd-workflow/scripts/rd pr sync --task %s\n' "$p" "$slug" ;;
+      index)
+        printf '%s색인: %s\n' "$p" "$extra"
+        printf '%s순서: 1) 작업 색인을 쓸 수 있게 고칩니다\n' "$p"
+        printf '%s      2) bash rd-workflow/scripts/rd pr open --task %s\n' "$p" "$slug"
+        printf '%s      3) bash rd-workflow/scripts/rd pr check --task %s\n' "$p" "$slug" ;;
+      *)
+        printf '%s확인: bash rd-workflow/scripts/rd pr check --task %s\n' "$p" "$slug" ;;
+    esac
+  } >&2
+}
+
+# _dpr_publish_autosync <root> <wt> <slug> <fr> <기본 브랜치> <tip> <되돌리기 커밋> — 발행 P6 뒤 자동 병합(spec D4).
+#   되돌리기 커밋과 origin/<기본> 이 기록 파일만 충돌하면 rd pr sync 와 같은 트리 계산·검증으로 병합 커밋을 만들고 pr-verified 에 기록합니다.
+#   결과는 전역 _DPR_AS_HEAD(병합 커밋 OID, 병합하지 않으면 빈 값). 늘 rc 0 — fallback 은 실패가 아닙니다(되돌리기 커밋을 올림).
+#   성공 줄·fallback 경고는 stderr. 저장소의 ref·index·작업 트리는 바꾸지 않습니다(객체와 색인 pr-verified 만 씀).
+_DPR_AS_HEAD=""
+_dpr_publish_autosync() {
+  local root="$1" wt="$2" slug="$3" fr="$4" def="$5" tip="$6" cl="$7"
+  local b mt mrc paths tree rc ef err m clash vs
+  _DPR_AS_HEAD=""
+  # 1. 충돌 판정 — 충돌이 없으면 아무것도 하지 않습니다(비목표: 충돌 없는 앞섬의 병합).
+  #   기본 커밋 OID 를 먼저 한 번 읽고 판정·트리 계산·둘째 부모에 모두 씁니다(그사이 추적 ref 가 전진해도 어긋나지 않게).
+  b="$(git -C "$root" rev-parse -q --verify "refs/remotes/origin/${def}^{commit}" 2>/dev/null)" || {
+    _dpr_as_fallback undecidable "origin/$def 를 읽을 수 없습니다" "$slug" "$def" ""; return 0; }
+  mrc=0; mt="$(git -C "$root" merge-tree --write-tree --name-only --no-messages "$cl" "$b" 2>/dev/null)" || mrc=$?
+  [[ "$mrc" != 0 ]] || return 0
+  if [[ "$mrc" != 1 ]]; then
+    _dpr_as_fallback undecidable "merge-tree 판정 실패 (rc $mrc)" "$slug" "$def" ""
+    return 0
+  fi
+  paths="$(printf '%s\n' "$mt" | sed '1d')"
+  # 2. 서명 확인 설정 — 작업 브랜치를 병합 커밋으로 옮기는 fast-forward 가 서명 없는 커밋에서 막힙니다.
+  vs=0; dpr_verifysig_on "$wt" "$fr" || vs=$?
+  if [[ "$vs" == 2 ]]; then
+    _dpr_as_fallback undecidable "작업 worktree 에서 git merge 를 시험할 수 없습니다 ($_DPR_VS_OUT)" "$slug" "$def" "$paths"
+    return 0
+  fi
+  if [[ "$vs" == 0 ]]; then
+    _dpr_as_fallback verifysig "서명 확인 설정(merge.verifySignatures)이 켜져 있어 서명 없는 병합 커밋으로 작업 브랜치를 옮길 수 없습니다" "$slug" "$def" "$paths"
+    return 0
+  fi
+  # 3. 트리 계산 (rd pr sync 와 같은 함수)
+  ef="$(mktemp "${TMPDIR:-/tmp}/rd-dpras.XXXXXX" 2>/dev/null)" || ef=""
+  rc=0; tree="$(RD_MERGE_RESOLVE_QUIET=1 dpr_sync_tree "$root" "$cl" "$b" 2>"${ef:-/dev/null}")" || rc=$?
+  err=""; [[ -z "$ef" ]] || { err="$(head -1 "$ef")"; rm -f "$ef"; }
+  case "$rc" in
+    0) ;;
+    1) _dpr_as_fallback other "자동 해소 대상 밖 충돌 ($(printf '%s\n' "$tree" | grep -v '^$' | tr '\n' ' ' | sed 's/ $//'))" "$slug" "$def" "$paths"; return 0 ;;
+    *) _dpr_as_fallback undecidable "${err:-자동 병합을 대조할 수 없습니다}" "$slug" "$def" "$paths"; return 0 ;;
+  esac
+  # 4. 병합 커밋 — 첫 부모 되돌리기 커밋, 둘째 부모 origin/<기본> (dpr_published_head 의 (나) 가 인정하는 모양)
+  m="$(git -C "$root" commit-tree "$tree" -p "$cl" -p "$b" -m "$(_dpr_sync_subject "$def" "$fr")" 2>/dev/null)" && [[ -n "$m" ]] || {
+    _dpr_as_fallback commit "병합 커밋을 만들지 못했습니다" "$slug" "$def" "$paths"; return 0; }
+  # 5. 무시 파일 겹침 — 작업 브랜치를 병합 커밋으로 옮길 때 덮이거나 멈출 파일
+  clash="$(dpr_ignored_clash "$root" "$wt" "$tip" "$m")" || {
+    _dpr_as_fallback ignored "작업 worktree 의 무시 파일이 병합 결과의 경로와 겹칩니다" "$slug" "$def" "$paths" "$clash"; return 0; }
+  # 6. 검증 — rd 가 발행한 head 로 인정되는지
+  dpr_published_head "$root" "$m" "$slug" "refs/remotes/origin/${def}" >/dev/null 2>&1 || {
+    _dpr_as_fallback commit "만든 병합 커밋이 검증을 통과하지 못했습니다" "$slug" "$def" "$paths"; return 0; }
+  # 7. 검증된 head 목록에 기록 (P7·P8 보다 앞)
+  if ! err="$(dpr_verified_add "$slug" "$cl" "$m" 2>&1)"; then
+    _dpr_as_fallback index "검증된 head 목록에 기록하지 못했습니다 — $(printf '%s\n' "$err" | grep -v '^[[:space:]]*$' | tail -1)" \
+      "$slug" "$def" "$paths" "$(tasks_index_path 2>/dev/null)"
+    return 0
+  fi
+  _DPR_AS_HEAD="$m"
+  printf 'archive: origin/%s 과 기록 파일 충돌을 자동 병합했습니다 (병합 커밋 %s)\n' "$def" "$(git -C "$root" rev-parse --short "$m")" >&2
+  printf 'archive:   해소한 기록 파일: %s\n' "$(printf '%s\n' "$paths" | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')" >&2
+  return 0
+}
+
+# dpr_verifysig_on <wt> <fr> — 작업 브랜치의 fast-forward 가 서명 확인에 막히는 설정이면 rc 0, 아니면 rc 1, 판정할 수 없으면 rc 2.
+#   rc 2 는 git 이 서명 검사 전에 병합을 거부한 경우(진행 중인 cherry-pick·revert 등)이며, 그 출력 첫 줄을 _DPR_VS_OUT 에 둡니다.
+#   설정을 셸로 해석하지 않고 git 에게 직접 묻습니다: 작업 worktree 에서 서명 없는 고아 커밋을 --ff-only --no-squash 로 병합해 봅니다.
+#   git 은 merge.verifySignatures 와 branch.<현재 브랜치>.mergeOptions(따옴표·이스케이프·약칭·옵션 인자·뒤 옵션 우선)를 실제 이동과
+#   같은 방식으로 적용하고, 서명 확인이 켜져 있으면 다른 검사보다 먼저 서명 거부로 끝납니다. 꺼져 있으면 무관한 이력이라 거부합니다.
+#   어느 쪽이든 HEAD·색인·작업 트리는 바뀌지 않습니다. 이 두 결과가 아니면(고아 커밋을 만들지 못한 경우 포함) 꺼짐으로 치지 않고 rc 2 입니다.
+#   <fr> 인자는 호출 호환용이며, 판정은 작업 worktree 의 현재 브랜치 설정을 따릅니다(실제 이동도 그 브랜치에서 일어납니다).
+#   rd 가 만드는 병합 커밋은 서명이 없으므로 이 설정에서는 옮길 수 없습니다. 설정을 덮어쓰지 않고(--no-verify-signatures 를 쓰지 않음) 사람에게 넘깁니다.
+_DPR_VS_OUT=""
+dpr_verifysig_on() {
+  local wt="$1" tree probe out rc=0 orig
+  _DPR_VS_OUT="시험 커밋을 만들 수 없습니다"
+  tree="$(git -C "$wt" rev-parse -q --verify 'HEAD^{tree}' 2>/dev/null)" || return 2
+  probe="$(git -C "$wt" commit-tree --no-gpg-sign "$tree" -m rd-verifysig-probe </dev/null 2>/dev/null)" || return 2
+  # git merge 는 실패해도 ORIG_HEAD 를 현재 HEAD 로 바꿉니다. 사용자의 복구 지점이므로 판정 뒤 원래 값으로 되돌립니다.
+  orig="$(git -C "$wt" rev-parse -q --verify ORIG_HEAD 2>/dev/null)"
+  out="$(LC_ALL=C git -C "$wt" merge -q --ff-only --no-squash --no-autostash --no-overwrite-ignore "$probe" 2>&1)" || rc=$?
+  if [[ -n "$orig" ]]; then git -C "$wt" update-ref --no-deref ORIG_HEAD "$orig" 2>/dev/null
+  else git -C "$wt" update-ref -d ORIG_HEAD 2>/dev/null; fi
+  [[ "$rc" -eq 0 ]] && return 0
+  dpr_sig_refused "$out" && return 0
+  printf '%s\n' "$out" | grep -q '^fatal: refusing to merge unrelated histories' && return 1
+  _DPR_VS_OUT="$(printf '%s\n' "$out" | grep -v '^$' | head -1)"
+  return 2
+}
+
+# dpr_sig_refused <git 출력> — git merge 가 서명 확인으로 거부한 출력이면 rc 0. 진단 줄(fatal: Commit <oid> … GPG signature)에만 맞춥니다 —
+#   덮어쓸 파일 목록에 같은 문자열이 든 경로가 있어도 서명 거부로 보지 않게.
+dpr_sig_refused() {
+  printf '%s\n' "$1" | grep -qE '^fatal: Commit [0-9a-f]+ (does not have a GPG signature|has an untrusted GPG signature|has a bad GPG signature)'
+}
+
+# dpr_verifysig_guide <slug> <기본 브랜치> — 서명 확인 설정을 유지한 채 복구하는 조건과 순서를 stdout 에 냅니다(sync 사전 멈춤·발행 fallback 공용).
+#   작업 브랜치에 기본 브랜치를 병합하는 git merge 도 같은 서명 확인을 거치므로, 기본 브랜치 끝 커밋에 신뢰할 수 있는 서명이 있어야 합니다.
+dpr_verifysig_guide() {
+  local slug="$1" def="$2"
+  printf '  설정을 유지한 채 복구하려면 origin/%s 끝 커밋에 신뢰할 수 있는 서명이 있어야 합니다(작업 브랜치에 병합하는 git merge 도 같은 확인을 거칩니다).\n' "$def"
+  printf '  작업 상태를 바꾸기 전에 작업 worktree 에서 확인하십시오: git verify-commit %s\n' "$(dpr_shq "origin/$def")"
+  printf '  서명이 확인되면 아래 순서로 복구합니다:\n'
+  dpr_conflict_guide "$slug" "$def"
+  printf '  서명이 확인되지 않으면 이 설정으로는 기본 브랜치를 병합할 수 없습니다 — 서명된 커밋이 origin/%s 에 올라온 뒤 다시 확인하거나 설정을 끕니다.\n' "$def"
+}
+
+# dpr_ff_move <wt> <head> — 작업 worktree 의 현재 브랜치를 head 로 fast-forward 합니다. rc 0 이동 / rc 1 멈춤(git 출력은 전역 _DPR_FF_OUT).
+#   --no-squash: branch.<fr>.mergeOptions=--squash 가 있으면 --ff-only 와 함께 HEAD 를 그대로 두고 rc 0 을 냅니다.
+#   그래서 옵션을 끄고, rc 0 이어도 HEAD 가 head 인지 확인합니다. 무시 파일은 덮지 않습니다(git 메시지 판별에 LC_ALL=C).
+_DPR_FF_OUT=""
+dpr_ff_move() {
+  local wt="$1" head="$2"
+  _DPR_FF_OUT="$(LC_ALL=C git -C "$wt" merge -q --ff-only --no-squash --no-autostash --no-overwrite-ignore "$head" 2>&1)" || return 1
+  [[ "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" == "$(git -C "$wt" rev-parse "$head^{commit}" 2>/dev/null)" ]] && return 0
+  _DPR_FF_OUT="git merge 가 rc 0 으로 끝났지만 작업 브랜치 HEAD 가 $(git -C "$wt" rev-parse --short "$head" 2>/dev/null || printf '%s' "$head") 이 아닙니다(git status 로 확인하십시오)"
+  return 1
+}
+
+# _dpr_move_branch <wt> <head> — 발행 P8 에서 작업 브랜치를 push 한 head 로 옮깁니다(spec D7). rc 0 이동 / rc 1 멈춤(안내는 stderr).
+#   병합 커밋(부모 둘)은 fast-forward 로만 옮기고 무시 파일을 덮지 않습니다. 실패해도 원격·색인·파일은 그대로 두며 같은 발행 요청으로 이어 갑니다.
+#   되돌리기 커밋(부모 하나)은 종전대로 reset --keep 입니다.
+_dpr_move_branch() {
+  local wt="$1" head="$2" parents out short ef
+  parents="$(git -C "$wt" rev-list --parents -n 1 "$head" 2>/dev/null)" || parents=""
+  set -- $parents
+  if [[ "$#" -eq 3 ]]; then
+    dpr_ff_move "$wt" "$head" && return 0
+    out="$_DPR_FF_OUT"
+    short="$(git -C "$wt" rev-parse --short "$head" 2>/dev/null || printf '%s' "$head")"
+    {
+      printf 'archive: PR 발행 멈춤 — P8 작업 브랜치 이동: push 는 끝났지만 작업 브랜치를 병합 커밋(%s)으로 옮기지 못했습니다.\n' "$short"
+      if printf '%s\n' "$out" | grep -qE 'untracked working tree files would be overwritten|would lose untracked files' \
+         && ! printf '%s\n' "$out" | grep -q 'Your local changes to the following files would be overwritten'; then
+        printf '%s\n' "$out" | sed -n 's/^[[:space:]][[:space:]]*\([^[:space:]].*\)$/archive:     \1/p'
+        printf 'archive:   이 파일들을 작업 worktree 밖으로 옮긴 뒤 같은 발행 요청을 다시 하십시오: %s\n' "$_DPR_PUBLISH_CMD"
+      else
+        printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | head -8 | sed 's/^/archive:     /'
+        printf 'archive:   원인을 푼 뒤 같은 발행 요청을 다시 하십시오: %s\n' "$_DPR_PUBLISH_CMD"
+        printf 'archive:   직접 옮기려면: git -C %s merge --ff-only --no-squash --no-overwrite-ignore %s\n' "$(dpr_shq "$wt")" "$head"
+      fi
+    } >&2
+    return 1
+  fi
+  ef="$(mktemp "${TMPDIR:-/tmp}/rd-dprmb.XXXXXX" 2>/dev/null)" || ef=/dev/null
+  if ! git -C "$wt" reset -q --keep "$head" 2>"$ef"; then
+    _dpr_fail "P8 push" "push 는 끝났지만 작업 브랜치를 되돌리기 커밋으로 옮기지 못했습니다: $(head -1 "$ef" 2>/dev/null)" \
+      "같은 발행 요청을 다시 하면 이어 갑니다: $_DPR_PUBLISH_CMD"
+    [[ "$ef" == /dev/null ]] || rm -f "$ef"
+    return 1
+  fi
+  [[ "$ef" == /dev/null ]] || rm -f "$ef"
+  return 0
+}
+
 # dpr_publish <slug> <fr-branch> <default-branch> — spec D3 P1~P10. 락을 쥔 archive.sh 가 부릅니다.
 # 기본 브랜치·기본 worktree 를 바꾸지 않고, force push 하지 않고, 태그를 달지 않고, worktree·fr 브랜치를 지우지 않습니다.
 # rc 0 성공 / 1 실패(원인·재시도 명령은 stderr).
@@ -848,7 +1073,7 @@ dpr_publish() {
 _dpr_publish_run() {
   local slug="$1" fr="$2" def="$3" body="$4" errf="$5"
   local root wt tip repo out open_url=""
-  local rline remote_oid p_rc mt mrc new pushed="" rcode=0
+  local rline remote_oid p_rc mrc new head pushed="" resume_conflict="" rcode=0
   root="$(_dpr_root)"
 
   # P1 — 작업 worktree 확인
@@ -880,10 +1105,15 @@ _dpr_publish_run() {
     if ! git -C "$root" fetch -q origin "+refs/heads/${fr}:refs/remotes/origin/${fr}" 2>"$errf"; then
       _dpr_fail "P3 원격 fr 브랜치 확인" "원격 $fr 를 가져오지 못했습니다: $(head -1 "$errf")" "$_DPR_PUBLISH_CMD"; return 1
     fi
+    # ls-remote 와 fetch 사이에 원격이 전진했을 수 있으므로, 판정은 fetch 가 가져온 끝으로 합니다.
+    remote_oid="$(git -C "$root" rev-parse -q --verify "refs/remotes/origin/${fr}^{commit}" 2>/dev/null)" || remote_oid=""
+    if [[ -z "$remote_oid" ]]; then
+      _dpr_fail "P3 원격 fr 브랜치 확인" "가져온 origin/$fr 를 읽지 못했습니다" "$_DPR_PUBLISH_CMD"; return 1
+    fi
     if ! git -C "$root" merge-base --is-ancestor "$remote_oid" "$tip" 2>/dev/null; then
-      # 이전 발행이 push 뒤·브랜치 이동 전에 끊겼으면 원격 끝은 이 tip 위의 되돌리기 커밋입니다 — 그 커밋으로 이어 갑니다(P8).
-      if [[ "$(git -C "$root" rev-parse -q --verify "${remote_oid}^" 2>/dev/null)" == "$tip" ]] \
-         && _dpr_cleanup_shape "$root" "$remote_oid" "$slug"; then
+      # 이전 발행이 push 뒤·브랜치 이동 전에 끊겼으면 원격 끝은 이 tip 위의 되돌리기 커밋이거나 그 위의 검증된 자동 병합 커밋입니다
+      # — 그 커밋으로 이어 갑니다(P8, spec D2).
+      if dpr_resume_head "$root" "$slug" "$fr" "$tip" "$remote_oid"; then
         pushed="$remote_oid"
       else
         _dpr_fail "P3 원격 fr 브랜치 확인" "원격 fr 브랜치가 앞서 있습니다. force push 하지 않습니다." \
@@ -898,24 +1128,24 @@ _dpr_publish_run() {
   if ! git -C "$root" fetch -q origin "+refs/heads/${def}:refs/remotes/origin/${def}" 2>"$errf"; then
     _dpr_fail "P4 충돌 사전 감지" "origin/$def 를 가져오지 못했습니다: $(head -1 "$errf")" "$_DPR_PUBLISH_CMD"; return 1
   fi
-  p_rc=0; out="$(rd_merge_conflicts "$root" "refs/remotes/origin/${def}" "$tip")" || p_rc=$?
-  case "$p_rc" in
-    0) ;;
-    1)
-      printf 'archive: PR 발행 실패 — P4 충돌 사전 감지: origin/%s 와 합치면 충돌합니다 (자동 해소 대상 밖):\n' "$def" >&2
-      printf '%s\n' "$out" | sed 's/^/archive:     /' >&2
-      rd_merge_conflict_guide "archive:   " "$fr" "origin/${def}" "$wt" >&2
-      printf 'archive:   재시도: 위 순서를 마친 뒤 %s\n' "$_DPR_PUBLISH_CMD" >&2
-      return 1 ;;
-    *)
-      _dpr_fail "P4 충돌 사전 감지" "충돌 여부를 판정할 수 없습니다 (merge-tree 실패)" "$_DPR_PUBLISH_CMD"; return 1 ;;
-  esac
-  # 기록 파일만 충돌하면 경고하고 계속합니다(PR 은 GitHub 에서 충돌로 보입니다 — PR 이 올라간 뒤 rd pr sync 로 풉니다).
-  mrc=0; mt="$(git -C "$root" merge-tree --write-tree --name-only --no-messages "refs/remotes/origin/${def}" "$tip" 2>/dev/null)" || mrc=$?
-  if [[ "$mrc" == 1 ]]; then
-    printf 'archive: WARNING — origin/%s 와 합치면 기록 파일이 충돌합니다. PR 이 GitHub 에서 충돌로 보입니다:\n' "$def" >&2
-    printf '%s\n' "$mt" | sed '1d; s/^/archive:     /' >&2
-    printf 'archive:   풀려면 PR 이 올라간 뒤 bash rd-workflow/scripts/rd pr sync --task %s 를 실행하십시오.\n' "$slug" >&2
+  if [[ -z "$pushed" ]]; then
+    p_rc=0; out="$(rd_merge_conflicts "$root" "refs/remotes/origin/${def}" "$tip")" || p_rc=$?
+    case "$p_rc" in
+      0) ;;
+      1)
+        printf 'archive: PR 발행 실패 — P4 충돌 사전 감지: origin/%s 와 합치면 충돌합니다 (자동 해소 대상 밖):\n' "$def" >&2
+        printf '%s\n' "$out" | sed 's/^/archive:     /' >&2
+        rd_merge_conflict_guide "archive:   " "$fr" "origin/${def}" "$wt" >&2
+        printf 'archive:   재시도: 위 순서를 마친 뒤 %s\n' "$_DPR_PUBLISH_CMD" >&2
+        return 1 ;;
+      *)
+        _dpr_fail "P4 충돌 사전 감지" "충돌 여부를 판정할 수 없습니다 (merge-tree 실패)" "$_DPR_PUBLISH_CMD"; return 1 ;;
+    esac
+    # 기록 파일만 충돌하면 P6 뒤 자동 병합 단계(_dpr_publish_autosync)가 풉니다(spec D3·D4).
+  else
+    # 재개: 이미 push 한 head 로 이어 가므로 충돌로 멈추지 않습니다. 충돌이면 PR 생성·갱신이 끝난 뒤에만 알립니다(spec D3).
+    mrc=0; git -C "$root" merge-tree --write-tree "refs/remotes/origin/${def}" "$pushed" >/dev/null 2>&1 || mrc=$?
+    [[ "$mrc" != 1 ]] || resume_conflict=1
   fi
 
   # P5 — PR 제목·본문 (입력 커밋은 정리 전 fr tip)
@@ -933,7 +1163,11 @@ _dpr_publish_run() {
   # 같은 발행 요청으로 처음부터 다시 진행합니다.
   if [[ -n "$pushed" ]]; then
     new="$pushed"
-    printf 'archive: 이전 발행이 push 뒤에 끊겼습니다 — 원격의 되돌리기 커밋(%s)으로 이어 갑니다\n' "$(git -C "$root" rev-parse --short "$new")" >&2
+    if _dpr_sync_shape "$root" "$new" "$slug"; then
+      printf 'archive: 이전 발행이 push 뒤에 끊겼습니다 — 원격의 자동 병합 커밋(%s)으로 이어 갑니다\n' "$(git -C "$root" rev-parse --short "$new")" >&2
+    else
+      printf 'archive: 이전 발행이 push 뒤에 끊겼습니다 — 원격의 되돌리기 커밋(%s)으로 이어 갑니다\n' "$(git -C "$root" rev-parse --short "$new")" >&2
+    fi
   else
     rcode=0; new="$(dpr_cleanup_commit "$wt" "$slug" 2>"$errf")" || rcode=$?
     if [[ "$rcode" != 0 || -z "$new" ]]; then
@@ -948,13 +1182,19 @@ _dpr_publish_run() {
     fi
   fi
 
+  # P6 뒤 자동 병합 (spec D4·D6) — 기록 파일만 충돌하면 검증된 병합 커밋을 head 로 올립니다. 못 하면 되돌리기 커밋을 그대로 올립니다.
+  _DPR_AS_HEAD=""
+  [[ -n "$pushed" ]] || _dpr_publish_autosync "$root" "$wt" "$slug" "$fr" "$def" "$tip" "$new"
+  head="${_DPR_AS_HEAD:-$new}"
+
   # P7 — 색인 기록 (실패는 경고만)
-  dpr_index_set "$slug" "pr-mode=direct" "pr-head=${new}" "pr-base=${def}" \
+  dpr_index_set "$slug" "pr-mode=direct" "pr-head=${head}" "pr-base=${def}" \
     || printf 'archive: WARNING — 작업 색인에 PR 발행 정보를 쓰지 못했습니다(pr-head)\n' >&2
 
-  # P8 — push (force 없음) 뒤 브랜치를 되돌리기 커밋으로 옮김
+  # P8 — push (force 없음) 뒤 작업 브랜치를 발행 head 로 옮김
   if [[ -z "$pushed" ]]; then
-    rcode=0; out="$(git -C "$wt" push origin "${new}:refs/heads/${fr}" 2>&1)" || rcode=$?
+    # push.followTags 설정이 있어도 로컬 태그를 함께 보내지 않습니다(원격에서 바뀌는 ref 는 fr 브랜치 하나).
+    rcode=0; out="$(git -C "$wt" push --no-follow-tags origin "${head}:refs/heads/${fr}" 2>&1)" || rcode=$?
     if [[ "$rcode" != 0 ]]; then
       dpr_index_set "$slug" "pr-head=" || true
       _dpr_fail "P8 push" "git push 실패 (작업 브랜치는 바꾸지 않았습니다)" "원인을 해소한 뒤 $_DPR_PUBLISH_CMD" \
@@ -962,12 +1202,72 @@ _dpr_publish_run() {
       return 1
     fi
   fi
-  if ! git -C "$wt" reset -q --keep "$new" 2>"$errf"; then
-    _dpr_fail "P8 push" "push 는 끝났지만 작업 브랜치를 되돌리기 커밋으로 옮기지 못했습니다: $(head -1 "$errf")" \
-      "같은 발행 요청을 다시 하면 이어 갑니다: $_DPR_PUBLISH_CMD"
-    return 1
-  fi
+  _dpr_move_branch "$wt" "$head" || return 1
 
   # P9·P10 — PR 생성·갱신과 결과 (rd pr open 도 같은 함수를 부릅니다)
-  _dpr_pr_submit "$slug" "$fr" "$def" "$repo" "$title" "$body" "$errf" "$open_url" "$new"
+  rcode=0; _dpr_pr_submit "$slug" "$fr" "$def" "$repo" "$title" "$body" "$errf" "$open_url" "$head" || rcode=$?
+  if [[ "$rcode" == 0 && -n "$resume_conflict" ]]; then
+    printf 'archive: WARNING — 이어 간 head 가 origin/%s 과 충돌합니다. PR 이 GitHub 에서 충돌로 보입니다.\n' "$def" >&2
+    printf 'archive:   확인: bash rd-workflow/scripts/rd pr check --task %s\n' "$slug" >&2
+  fi
+  return "$rcode"
+}
+
+# dpr_conflict_guide <slug> <기본 브랜치> — 충돌·수정 요청 뒤 이어 가는 순서(spec D9).
+dpr_conflict_guide() {
+  local slug="$1" def="$2"
+  printf '  순서:\n'
+  printf '    1) bash rd-workflow/scripts/rd pr reopen --task %s   (작업을 구현 중으로 되돌림)\n' "$slug"
+  printf '    2) 작업 worktree 에서 git merge --no-squash %s → 충돌 해소·커밋 (충돌이 아니라 수정 요청이면 수정·커밋)\n' "$(dpr_shq "origin/$def")"
+  printf '    3) 재검증 → 새 final diff review → bash rd-workflow/scripts/rd review seal → 아카이브 보류 → 기록 커밋\n'
+  printf '    4) bash rd-workflow/scripts/rd publish request   (열린 PR 의 본문을 갱신하고 fast-forward 로 push 합니다)\n'
+}
+
+# dpr_ignored_clash <root> <wt> <옛 head> <새 head> — 옛 head 에 없고 새 head 가 추적하는 경로 A 가 작업 worktree 에서 이미 쓰이고 있으면
+# (A 자리에 무엇이 있거나, A 의 상위 경로 자리에 디렉터리가 아닌 무엇이 있으면) 옮겨야 할 파일을 stdout 에 냅니다. 있으면 rc 1, 없으면 rc 0.
+# 1단계가 작업 worktree 의 HEAD 가 옛 head 이고 무시되지 않은 미추적 파일이 없음을 확인했으므로, 그 자리에 있는 것은 무시 파일입니다.
+# 문자열 비교 대신 파일시스템에 묻습니다 — 대소문자·유니코드 정규화를 같게 보는 볼륨에서도 git 이 실제로 부딪히는 경로를 그대로 찾습니다.
+# 경로는 -z 원본 바이트로 다루고(줄바꿈·제어 문자 포함), 화면에는 줄바꿈을 \n 으로 보입니다. 비용은 추가 경로 수 × 경로 깊이의 파일 확인입니다.
+dpr_ignored_clash() {
+  local root="$1" wt="$2" old="$3" new="$4" af hf a d f n p wr
+  af="$(mktemp)" && hf="$(mktemp)" || { printf '(임시 파일을 만들지 못했습니다)\n'; return 1; }
+  if ! git -C "$root" diff -z --name-only --no-renames --diff-filter=A "$old" "$new" >"$af" 2>/dev/null; then
+    rm -f "$af" "$hf"; printf '(새 head 의 추가 경로를 읽지 못했습니다)\n'; return 1
+  fi
+  while IFS= read -r -d '' a; do
+    if [[ -e "$wt/$a" || -L "$wt/$a" ]]; then printf '%s\0' "$a" >>"$hf"; continue; fi
+    d="$a"
+    while [[ "$d" == */* ]]; do
+      d="${d%/*}"
+      if [[ -L "$wt/$d" || ( -e "$wt/$d" && ! -d "$wt/$d" ) ]]; then
+        # 옛 head 가 추적하던 파일을 새 head 가 디렉터리로 바꾼 경우는 git 이 처리합니다.
+        git -C "$wt" cat-file -e "${old}:${d}" 2>/dev/null || printf '%s\0' "$d" >>"$hf"
+        break
+      fi
+    done
+  done <"$af"
+  if [[ ! -s "$hf" ]]; then rm -f "$af" "$hf"; return 0; fi
+  # 겹친 경로마다 그 자리(또는 그 아래)의 무시 파일을 디스크의 실제 이름으로 보입니다.
+  # 자리가 디렉터리인데 그 아래 무시 파일이 없으면(추적 파일만 있거나 빈 디렉터리) git 이 처리하므로 충돌이 아닙니다.
+  # 자리가 파일·심링크인데 목록이 비면 경로 자체를 보입니다.
+  : >"$af"
+  wr="$(cd "$wt" && /bin/pwd -P && printf x)" && wr="${wr%$'\n'x}" || wr=""
+  while IFS= read -r -d '' a; do
+    n=0
+    # 디렉터리 자리는 디스크의 실제 이름으로 찾습니다 — 대소문자를 같게 보는 볼륨에서 sLoT 이 새 경로 slot 의 자리를 차지할 수 있습니다.
+    # bash 내장 pwd -P 는 입력한 대소문자를 그대로 돌려주므로 getcwd 를 쓰는 /bin/pwd 를 씁니다.
+    p="$a"
+    if [[ -d "$wt/$a" && ! -L "$wt/$a" && -n "$wr" ]]; then
+      d="$(cd "$wt/$a" && /bin/pwd -P && printf x)" && d="${d%$'\n'x}" && [[ "$d" == "$wr"/* ]] && p="${d#"$wr"/}"
+    fi
+    while IFS= read -r -d '' f; do printf '%s\n' "${f//$'\n'/\\n}" >>"$af"; n=1; done \
+      < <(git -C "$wt" ls-files -z --others --ignored --exclude-standard -- ":(literal)$p" 2>/dev/null)
+    [[ "$n" == 1 ]] && continue
+    [[ -d "$wt/$a" && ! -L "$wt/$a" ]] && continue
+    printf '%s\n' "${a//$'\n'/\\n}" >>"$af"
+  done <"$hf"
+  if [[ ! -s "$af" ]]; then rm -f "$af" "$hf"; return 0; fi
+  sort -u "$af"
+  rm -f "$af" "$hf"
+  return 1
 }

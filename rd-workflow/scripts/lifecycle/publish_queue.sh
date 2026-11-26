@@ -23,6 +23,7 @@ source "$_PQ_SELF_DIR/_lifecycle_common.sh"
 source "$_PQ_SELF_DIR/_tasks_index.sh"
 source "$_PQ_SELF_DIR/session_launch.sh"
 source "$_PQ_SELF_DIR/_merge_precheck.sh"
+source "$_PQ_SELF_DIR/_dup_guard.sh"
 
 # 큐 상태 값 (허용 목록). 이 밖의 값은 손상으로 본다.
 PQ_STATES="requested user-approval granted running partial done failed cancelled"
@@ -217,18 +218,144 @@ _pq_state_valid() {
   return 1
 }
 
+# 다음 행동 한 줄. 허가됨·부분 완료의 run 은 요청의 작업 worktree 에서만 돈다 — 실행 위치를 적고, 체크아웃이 이 작업이
+#   아니면(_pq_wt_mismatch — 다른 작업 브랜치, detached) 거부될 run 대신 체크아웃을 fr 브랜치로 되돌리라고 안내한다.
+#   status·next·wait·watch·cancel·recover 와 rd task list 의 지연 정리 보류 줄(tasks_list.sh)이 모두 이 함수를 쓴다.
 _pq_next_action() {
-  local slug="$1"
+  local slug="$1" wt frb why
+  case "$2" in
+    granted|partial)
+      wt="$(pq_get "$slug" worktree 2>/dev/null)"
+      frb="$(_pq_req_branch "$slug")" ;;
+  esac
   case "$2" in
     requested) printf '호출 세션이 rd publish next 로 허가' ;;
     user-approval) printf '사용자 승인 뒤 rd publish approve %s' "$slug" ;;
-    granted) printf 'rd publish run' ;;
+    granted)
+      if _pq_wt_gone "$slug"; then
+        _pq_granted_gone_action "$slug" "$wt" "$frb"
+      elif why="$(_pq_wt_mismatch "$slug" "$wt" "$frb")" && [[ -z "$why" ]]; then
+        printf '작업 worktree(%s)에서 rd publish run' "$wt"
+      else
+        printf '작업 worktree(%s)%s — 버리려면 rd publish cancel %s, 발행을 마치려면 git -C %s status 로 그 worktree 의 체크아웃을 확인해 fr 브랜치(%s)로 되돌린 뒤 그 worktree 에서 rd publish run' \
+          "$wt" "$why" "$slug" "$(_pq_shq "$wt")" "$frb"
+      fi ;;
     running) printf '프로세스가 없으면 rd publish recover %s' "$slug" ;;
-    partial) printf 'rd publish run 으로 복구' ;;
+    partial)
+      if _pq_wt_gone "$slug"; then
+        printf 'worktree 없음 — rd publish recover %s 로 판정' "$slug"
+      elif why="$(_pq_wt_mismatch "$slug" "$wt" "$frb")" && [[ -z "$why" ]]; then
+        printf '작업 worktree(%s)에서 rd publish run 으로 복구' "$wt"
+      else
+        # recover·cancel 은 worktree 가 있는 부분 완료를 받지 않으므로 대안으로 내지 않는다.
+        printf '작업 worktree(%s)%s — git -C %s status 로 그 worktree 의 체크아웃을 확인해 fr 브랜치(%s)로 되돌린 뒤 그 worktree 에서 rd publish run 으로 복구' \
+          "$wt" "$why" "$(_pq_shq "$wt")" "$frb"
+      fi ;;
     done) printf '없음' ;;
     failed) printf '원인 해소 뒤 rd publish request' ;;
     cancelled) printf '필요하면 rd publish request' ;;
   esac
+}
+
+# <worktree> 체크아웃의 task-state short-title — rd publish run 이 slug 를 정하는 값(_pq_current_slug)이다.
+_pq_wt_title() {  # <worktree>
+  [[ -n "$1" ]] || return 0
+  awk -F'=' '$1 == "short-title" { sub(/^[^=]+=/, ""); print; exit }' "$1/rd-workflow-workspace/.lifecycle/task-state" 2>/dev/null
+}
+
+# 요청한 작업의 fr 브랜치. 요청의 fr-branch 는 요청 때의 git rev-parse --abbrev-ref HEAD 라 detached 에서 요청했으면
+#   브랜치가 아닌 `HEAD` 다. 그때는 요청 커밋(head)의 task-state fr-branch(archive.sh 가 발행할 브랜치를 정하는 값)를 읽는다.
+#   둘 다 없으면 빈 값.
+_pq_req_branch() {  # <slug>
+  local b head
+  b="$(pq_get "$1" fr-branch 2>/dev/null)"
+  if [[ -n "$b" && "$b" != HEAD ]]; then printf '%s' "$b"; return 0; fi
+  head="$(pq_get "$1" head 2>/dev/null)"
+  [[ -n "$head" ]] || return 0
+  b="$(git -C "${project_root:-$PWD}" show "${head}:rd-workflow-workspace/.lifecycle/task-state" 2>/dev/null \
+    | awk -F'=' '$1 == "fr-branch" { sub(/^[^=]+=/, ""); print; exit }')"
+  [[ -n "$b" && "$b" != null ]] && printf '%s' "$b"
+  return 0
+}
+
+# 작업 worktree 의 체크아웃이 이 작업이 아닌 이유 — 「작업 worktree(<경로>)」 뒤에 붙는 말. 이 작업이면 빈 값.
+#   run 은 그 체크아웃의 task-state short-title 로 slug 를 정하고(_pq_current_slug), 허가됨이면 HEAD 가 요청 때와 같아야
+#   한다(_pq_reverify). 같은 작업의 옛 커밋을 detached 로 열면 short-title 은 같아도 run 이 재검증에서 요청을 실패로 바꾸므로
+#   요청한 fr 브랜치(_pq_req_branch)도 대조한다. 그 브랜치를 모르면 대조하지 않는다.
+_pq_wt_mismatch() {  # <slug> <worktree> <fr-branch>
+  local cur
+  if [[ "$(_pq_wt_title "$2")" != "$1" ]]; then
+    printf '의 task-state 가 이 작업(%s)이 아니라 거기서 rd publish run 이 slug 를 정하지 못함' "$1"
+    return 0
+  fi
+  [[ -n "$3" ]] || return 0
+  cur="$(git -C "$2" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  [[ "$cur" == "$3" ]] && return 0
+  [[ "$cur" == HEAD ]] && cur="detached HEAD"
+  printf '의 체크아웃(%s)이 요청한 fr 브랜치(%s)가 아님' "${cur:-판정 불가}" "$3"
+}
+
+# 작업 worktree 가 없는 허가됨의 다음 행동. run 을 부를 곳이 없으니 취소(cancel 은 허가됨을 받는다)와 worktree 를 다시
+#   만드는 길을 낸다. 디렉터리만 지워지고 git 등록이 남았으면 worktree add 가 거부하므로, 재개 안내(_pq_resume_hint)처럼
+#   등록 확인·정리를 안내하고 정리 명령은 내지 않는다(prune 은 다른 worktree 의 등록도 지운다). 정리 뒤 다음 안내가 add
+#   명령을 낸다. add 는 그 경로의 등록(브랜치와 상관없이)과 그 fr 브랜치를 쓰는 등록(경로와 상관없이)을 모두 거부하므로
+#   둘 다 찾는다. 요청은 심볼릭 링크 경로를 적을 수 있고 git 은 등록을 실제 경로로 적으므로, 경로는 실제 경로로 풀어
+#   대조한다 — 디렉터리가 없으니 남아 있는 가장 가까운 상위 디렉터리를 풀고 나머지 이름을 붙인다.
+#   등록이 없어도 그 경로에 파일이 남았으면(git 연결만 끊긴 디렉터리) add 가 거부한다(빈 디렉터리는 받는다).
+#   그 파일은 지우라고 하지 않고 확인해 옮기라고 안내한다 — 작업 파일일 수 있다. 항목은 glob 로 센다 — ls 출력을
+#   명령 치환으로 받으면 개행뿐인 파일 이름이 사라지고, 점으로 시작하는 파일(.DS_Store)도 add 를 막는다.
+_pq_granted_gone_action() {  # <slug> <worktree> <fr-branch>
+  local slug="$1" wt="$2" frb="$3" main rp rest base reg ents
+  main="$(_pq_main_checkout)"
+  rp="$wt"; rest=""
+  while [[ "$rp" == /?* && ! -d "$rp" ]]; do rest="/${rp##*/}$rest"; rp="${rp%/*}"; done
+  if base="$(cd "${rp:-/}" 2>/dev/null && pwd -P)"; then rp="${base%/}$rest"; else rp="$wt"; fi
+  # 경로는 awk -v 로 넘기지 않는다 — -v 는 \t 같은 이스케이프를 풀어 백슬래시가 든 경로가 달라진다.
+  reg="$(git -C "$main" worktree list --porcelain 2>/dev/null | PQ_W="worktree $rp" PQ_B="branch refs/heads/$frb" awk '
+    /^worktree /{ if (m && !d) { print p; d = 1 } p = substr($0, 10); m = ($0 == ENVIRON["PQ_W"]); next }
+    $0 == ENVIRON["PQ_B"] { m = 1 }
+    END { if (m && !d) print p }')"
+  ents=()
+  if [[ -n "$wt" && -d "$wt" ]]; then
+    local _dg _ng
+    _dg="$(shopt -p dotglob)"; _ng="$(shopt -p nullglob)"
+    shopt -s dotglob nullglob; ents=("$wt"/*); eval "$_dg"; eval "$_ng"
+  fi
+  if [[ -n "$reg" ]]; then
+    printf 'worktree 가 없고 그 경로나 fr 브랜치(%s)를 쓰는 git 등록(%s)이 남아 지금은 다시 만들 수 없음 — 버리려면 rd publish cancel %s, 발행을 마치려면 git -C %s worktree list 로 그 등록을 확인해 정리(다음 실행이 다시 만드는 명령을 안내)' \
+      "$frb" "$reg" "$slug" "$(_pq_shq "$main")"
+  elif [[ -n "$wt" ]] && [[ -e "$wt" || -L "$wt" ]] && ! [[ -d "$wt" && ${#ents[@]} -eq 0 ]]; then
+    printf 'worktree 경로(%s)에 git 이 worktree 로 알지 못하는 파일이 남아 지금은 다시 만들 수 없음 — 버리려면 rd publish cancel %s, 발행을 마치려면 그 경로의 파일을 확인해 다른 곳으로 옮겨 경로를 비움(다음 실행이 다시 만드는 명령을 안내)' \
+      "$wt" "$slug"
+  else
+    printf 'worktree 없음 — 버리려면 rd publish cancel %s, 발행을 마치려면 git -C %s worktree add %s %s 로 다시 만든 뒤 그 worktree 에서 rd publish run' \
+      "$slug" "$(_pq_shq "$main")" "$(_pq_shq "$wt")" "$(_pq_shq "$frb")"
+  fi
+}
+
+# 요청 파일의 사유. 다음 행동은 _pq_next_action 이 worktree 유무로 따로 안내하므로, 이전 판이 사유 끝에 붙여 저장한
+#   고정 안내(「— rd publish run 으로 복구」·「— 원인을 해소한 뒤 rd publish run」)는 떼고 낸다 — worktree 가 없어진 뒤
+#   같은 줄에 실행할 수 없는 run 과 recover 가 함께 나오지 않게 한다.
+_pq_reason() {  # <slug>
+  local v
+  v="$(pq_get "$1" reason 2>/dev/null)"
+  v="${v% — rd publish run 으로 복구}"
+  v="${v% — 원인을 해소한 뒤 rd publish run}"
+  printf '%s' "$v"
+}
+
+# 요청의 작업 worktree 가 없어졌는지. 요청 파일의 worktree 값이 비었거나, 그 경로가 자기 작업 트리의
+#   최상위가 아니면 rc 0. 등록이 빠진 채 기본 체크아웃 안(.worktrees/<slug>)에 남은 디렉터리는 바깥 저장소의
+#   작업 트리로 읽히므로 최상위 경로를 대조한다. worktree 가 없으면 run(작업 worktree 에서만 실행)으로 이어 갈 수
+#   없다 — recover 판정·cancel 로 푼다.
+_pq_wt_gone() {  # <slug>
+  local wt top real
+  wt="$(pq_get "$1" worktree 2>/dev/null)"
+  [[ -n "$wt" ]] || return 0
+  top="$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null)" || return 0
+  real="$(cd "$wt" 2>/dev/null && pwd -P)" || return 0
+  top="$(cd "$top" 2>/dev/null && pwd -P)" || return 0
+  [[ "$top" != "$real" ]]
 }
 
 # 현재 worktree 의 task-state short-title. 없으면 빈 값 rc 1.
@@ -297,7 +424,7 @@ _pq_status_line() {
     printf '%s  요청 없음\n' "$slug"
     return 1
   fi
-  reason="$(pq_get "$slug" reason)"
+  reason="$(_pq_reason "$slug")"
   local action wait=""
   action="$(_pq_next_action "$slug" "$st")"
   if [[ "$st" == requested ]] && wait="$(_pq_wait_reason "$slug")" && [[ -n "$wait" ]]; then
@@ -316,6 +443,10 @@ _pq_wait_reason() {  # <slug>
   slot="$(pq_slot_get)"
   if [[ -n "$slot" && "$slot" != "$slug" ]]; then
     sst="$(_pq_state_of "$slot" 2>/dev/null)" || sst=""
+    if [[ "$sst" == partial ]]; then
+      printf '앞 요청 %s 가 %s\t%s — 풀린 뒤 호출 세션이 rd publish next 로 허가\n' "$slot" "$(pq_label partial)" "$(_pq_next_action "$slot" partial)"
+      return 0
+    fi
     printf '앞 요청 %s 가 %s\t앞 발행이 끝나면 호출 세션이 rd publish next 로 허가\n' "$slot" "$(pq_label "${sst:-?}")"
     return 0
   fi
@@ -383,9 +514,40 @@ pq_cmd_cancel() {
       pq_set "$slug" state=cancelled "reason=사용자 취소"
       [[ "$(pq_slot_get)" == "$slug" ]] && pq_slot_clear
       ;;
-    running|partial)
+    partial)
+      if ! _pq_wt_gone "$slug"; then
+        pq_unlock
+        printf '%s 는 %s 상태이고 작업 worktree 가 있습니다 — %s\n' "$slug" "$(pq_label "$st")" "$(_pq_next_action "$slug" partial)"
+        return 1
+      fi
+      # worktree 가 없으면 run 으로 이어 갈 수 없다 — 사람이 버리기로 한 요청을 취소하고 슬롯을 푼다.
+      # 단, 이 요청의 작업이 기본 브랜치에 병합된 채 push 되지 않았으면 슬롯을 풀지 않는다 — 풀면 다음 발행이
+      # 그 병합까지 원격에 보낸다. 사용자가 push 할지 되돌릴지 정해 그 병합이 처리된 뒤에 취소된다.
+      if _pq_unpushed_merge "$slug"; then
+        pq_unlock
+        printf '취소하지 않았습니다 — %s 의 작업이 기본 브랜치(%s)에 병합된 채 origin 으로 push 되지 않았습니다. 지금 허가 슬롯을 풀면 다음 발행이 이 병합까지 push 합니다\n' "$slug" "$_PQ_UM_DEF"
+        _pq_unpushed_report
+        printf '다음 행동: 발행을 마칠지 버릴지 사용자에게 물으십시오 (force push 금지)\n'
+        _pq_resume_hint "$slug"
+        # reset 은 목록 전체를 되돌리므로, 목록을 다 보인 경우(20개 이하)에만 그 명령을 안내한다.
+        if [[ "$_PQ_UM_N" -le 20 ]]; then
+          printf '  - 버리기로 했으면 기본 체크아웃(%s)에서 이 병합을 되돌린 뒤 rd publish cancel %s 를 다시 실행합니다 — 위 목록이 모두 이 작업의 커밋이면 git -C %s reset --keep %s 로 되돌릴 수 있습니다\n' \
+            "$_PQ_UM_MAIN" "$slug" "$(_pq_shq "$_PQ_UM_MAIN")" "$(_pq_shq "origin/$_PQ_UM_DEF")"
+        else
+          printf '  - 버리기로 했으면 기본 체크아웃(%s)에서 이 병합을 되돌린 뒤 rd publish cancel %s 를 다시 실행합니다 — 목록이 길어 되돌릴 범위를 git -C %s log --oneline 으로 직접 확인하십시오\n' \
+            "$_PQ_UM_MAIN" "$slug" "$(_pq_shq "$_PQ_UM_MAIN")"
+        fi
+        return 1
+      fi
+      pq_set "$slug" state=cancelled "reason=worktree 없는 부분 완료를 사용자가 취소"
+      [[ "$(pq_slot_get)" == "$slug" ]] && pq_slot_clear
       pq_unlock
-      printf '%s 는 %s 상태입니다 — 발행 중이거나 부분 완료 — rd publish recover 로 판정하십시오\n' "$slug" "$(pq_label "$st")"
+      printf '취소했습니다: %s (worktree 없는 부분 완료)\n' "$slug"
+      return 0
+      ;;
+    running)
+      pq_unlock
+      printf '%s 는 %s 상태입니다 — rd publish recover 로 판정하십시오\n' "$slug" "$(pq_label "$st")"
       return 1
       ;;
     *)
@@ -396,6 +558,63 @@ pq_cmd_cancel() {
   esac
   pq_unlock
   printf '취소했습니다: %s\n' "$slug"
+  return 0
+}
+
+# 원격 모드에서 이 요청의 작업 커밋(head)이 로컬 기본 브랜치에는 있고 origin 기본 브랜치에는 없는지(로컬에만 있는 병합).
+#   rc 0 이면 그렇다. 결과: _PQ_UM_DEF(기본 브랜치) _PQ_UM_MAIN(기본 체크아웃).
+#   판정할 수 없으면 rc 1 — 막지 않는다(로컬 전용 모드·원격 추적 ref 없음).
+_PQ_UM_DEF=""; _PQ_UM_MAIN=""
+_pq_unpushed_merge() {  # <slug>
+  local head
+  [[ "$(cd "${project_root:-$PWD}" && detect_remote_mode 2>/dev/null)" == remote ]] || return 1
+  head="$(pq_get "$1" head 2>/dev/null)"
+  [[ -n "$head" ]] || return 1
+  _PQ_UM_DEF="$(_pq_default_branch)" || return 1
+  [[ -n "$_PQ_UM_DEF" ]] || return 1
+  _PQ_UM_MAIN="$(_pq_main_checkout)" || return 1
+  git -C "$_PQ_UM_MAIN" rev-parse -q --verify "refs/remotes/origin/$_PQ_UM_DEF" >/dev/null 2>&1 || return 1
+  git -C "$_PQ_UM_MAIN" merge-base --is-ancestor "$head" "refs/heads/$_PQ_UM_DEF" 2>/dev/null || return 1
+  ! git -C "$_PQ_UM_MAIN" merge-base --is-ancestor "$head" "refs/remotes/origin/$_PQ_UM_DEF" 2>/dev/null
+}
+
+# 발행을 마치기로 했을 때의 안내 한 줄. fr 브랜치가 남아 있으면 요청의 worktree 를 다시 만들어 rd publish run 으로
+#   이어 가게 한다 — 남은 병합·tag·push 는 archive.sh 가 마친다(이미 병합됐으면 병합을 건너뛰고, 태그는 확인한 OID 로
+#   push 하며, 원격 기본 브랜치가 갈라졌으면 push 를 멈추고 안내한다). 큐가 push 명령을 따로 만들지 않는다.
+#   붙여 넣는 명령이라 경로·브랜치를 셸 인용한다.
+_pq_resume_hint() {  # <slug>
+  local slug="$1" wt frb main
+  wt="$(pq_get "$slug" worktree 2>/dev/null)"
+  frb="$(pq_get "$slug" fr-branch 2>/dev/null)"
+  main="$(_pq_main_checkout)" || return 0
+  if [[ -n "$wt" && -n "$frb" ]] && git -C "$main" rev-parse -q --verify "refs/heads/$frb" >/dev/null 2>&1; then
+    # 디렉터리만 지워지고 git 에 등록이 남았으면 worktree add 가 거부한다. 등록 정리 명령은 내지 않는다 — remove 는
+    #   안내 뒤 되살아난 디렉터리의 git 무시 파일을, prune 은 잠시 옮겨 둔 다른 worktree 의 등록·인덱스를 지운다
+    #   (리뷰 F13·F15). 실행 시점의 디렉터리 상태를 큐가 알 수 없으니 사람이 확인해 정리하고 recover 를 다시 부른다.
+    if git -C "$main" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $wt"; then
+      printf '  - 발행을 마치기로 했으면 worktree 를 다시 만들어 그 worktree 에서 rd publish run 으로 이어 갑니다. 다만 그 경로(%s)가 아직 git 에 worktree 로 등록돼 있어 지금은 다시 만들 수 없습니다 — git -C %s worktree list 로 그 경로의 상태를 확인해 등록을 정리한 뒤 rd publish recover %s 를 다시 실행하십시오(정리 방법은 그 경로와 다른 worktree 의 상태에 따라 달라 큐가 명령을 내지 않습니다)\n' \
+        "$wt" "$(_pq_shq "$main")" "$slug"
+    else
+      printf '  - 발행을 마치기로 했으면 worktree 를 다시 만들고 그 worktree 에서 rd publish run 으로 이어 갑니다(남은 병합·tag·push 는 archive.sh 가 마칩니다): git -C %s worktree add %s %s\n' \
+        "$(_pq_shq "$main")" "$(_pq_shq "$wt")" "$(_pq_shq "$frb")"
+    fi
+  else
+    printf '  - 이 작업의 fr 브랜치(%s)가 없어 worktree 를 다시 만들 수 없습니다 — 발행을 이어 갈 수 없으니 되돌리기를 고르십시오\n' "${frb:-기록 없음}"
+  fi
+}
+
+# 마지막 _pq_unpushed_merge 의 기본 브랜치가 origin 보다 앞선 커밋을 최대 20줄 낸다.
+_PQ_UM_N=0
+_pq_unpushed_report() {
+  local ahead n
+  _PQ_UM_N=0
+  ahead="$(git -C "$_PQ_UM_MAIN" log --oneline "refs/remotes/origin/$_PQ_UM_DEF..refs/heads/$_PQ_UM_DEF" 2>/dev/null)" || return 0
+  [[ -n "$ahead" ]] || return 0
+  n="$(printf '%s\n' "$ahead" | wc -l | tr -d ' ')"
+  _PQ_UM_N="$n"
+  printf 'origin 으로 push 되지 않은 기본 브랜치 커밋 %s개:\n' "$n"
+  printf '%s\n' "$ahead" | head -20 | sed 's/^/  /'
+  if (( n > 20 )); then printf '  … 외 %s개\n' "$(( n - 20 ))"; fi
   return 0
 }
 
@@ -420,6 +639,61 @@ pq_merge_check() {  # <default-branch> <head>
   else
     rd_merge_conflicts "${project_root:-$PWD}" "${1:-}" "${2:-}"
   fi
+}
+
+# 발행 큐의 충돌 관문 (spec D9). pq_merge_check 와 같은 반환 계약(rc 0 통과 / 1 충돌, stdout 경로 / 그 밖 판정 불가).
+#   충돌(rc 1)이고 발행 대상 커밋의 archive_publish 가 pr 일 때만, 원격 fr 끝이 「이전 발행이 push 뒤 끊긴 head」
+#   (dpr_resume_head)인지 원격에서 확인해 맞으면 통과시킨다 — 재개 발행은 archive 의 P4 가 충돌로 멈추지 않고 PR 뒤에 경고만 낸다.
+#   충돌이 없으면 원격을 조회하지 않는다. 확인이 실패하거나 재개가 아니면 처음 판정(rc 1·충돌 경로)을 그대로 돌려준다.
+pq_conflict_gate() {  # <slug> <default-branch> <head>
+  local conflicts rc mode
+  conflicts="$(pq_merge_check "${2:-}" "${3:-}")"; rc=$?
+  if [[ "$rc" -eq 1 ]] && mode="$(pq_archive_mode "${3:-}" 2>/dev/null)" && [[ "$mode" == pr ]] \
+     && _pq_resume_remote "${1:-}" "${3:-}"; then
+    return 0
+  fi
+  [[ -z "$conflicts" ]] || printf '%s\n' "$conflicts"
+  return "$rc"
+}
+
+# _pq_resume_remote <slug> <head> — 원격 fr 끝을 시간 상한 아래에서 조회·fetch 하고 dpr_resume_head 로 재개 상태인지 판정한다.
+#   rc 0 재개(stderr 「재개:」 줄) / rc 1 아님·조회 실패·시간 초과(실패는 stderr 사유 한 줄). 하위 셸에서 source 한다.
+_pq_resume_remote() {  # <slug> <head>
+  ( set +e +u
+    root="${project_root:-$PWD}"
+    cd "$root" || exit 1
+    project_root="$root"; export project_root
+    if ! { source "$_PQ_SELF_DIR/_team_publish_common.sh" >/dev/null 2>&1 \
+           && source "$_PQ_SELF_DIR/_direct_pr_common.sh" >/dev/null 2>&1; }; then
+      printf '재개 여부를 판정할 수 없습니다: _direct_pr_common.sh 를 불러올 수 없습니다\n' >&2; exit 1
+    fi
+    fr="$(dpr_fr_branch "$1")"
+    lim="${RD_MERGE_FETCH_TIMEOUT:-60}"
+    [[ "$lim" =~ ^[0-9]+$ && "$lim" -gt 0 ]] || lim=60
+    printf '재개 여부를 원격에서 확인합니다 (최대 %s초)\n' "$lim" >&2
+    errf="$(mktemp "${TMPDIR:-/tmp}/rd-pq-resume.XXXXXX")" || errf=/dev/null
+    _fin() { [[ "$errf" == /dev/null ]] || rm -f "$errf"; exit "$1"; }
+    _why() {  # <rc> <무엇>
+      if [[ "$1" -eq 124 ]]; then
+        printf '재개 여부 확인 실패: %s 가 %s초 안에 끝나지 않아 중단했습니다\n' "$2" "$lim" >&2
+      else
+        printf '재개 여부 확인 실패: %s 실패 — %s\n' "$2" "$(sed -n 1p "$errf" 2>/dev/null)" >&2
+      fi
+    }
+    rd_git_noprompt_env "$root"
+    frc=0; line="$(_rd_run_limited "$lim" "$errf" "${RD_GIT_NOPROMPT_ENV[@]}" git -C "$root" ls-remote origin "refs/heads/$fr")" || frc=$?
+    [[ "$frc" -eq 0 ]] || { _why "$frc" "git ls-remote origin"; _fin 1; }
+    r="${line%%[[:space:]]*}"
+    [[ -n "$r" ]] || _fin 1
+    frc=0; _rd_run_limited "$lim" "$errf" "${RD_GIT_NOPROMPT_ENV[@]}" git -C "$root" fetch -q origin "+refs/heads/$fr:refs/remotes/origin/$fr" >/dev/null || frc=$?
+    [[ "$frc" -eq 0 ]] || { _why "$frc" "원격 $fr 가져오기(git fetch)"; _fin 1; }
+    # ls-remote 와 fetch 사이에 원격이 전진했을 수 있으므로, 판정은 fetch 가 가져온 끝으로 합니다.
+    r="$(git -C "$root" rev-parse -q --verify "refs/remotes/origin/$fr^{commit}" 2>/dev/null)" || _fin 1
+    git -C "$root" merge-base --is-ancestor "$r" "$2" 2>/dev/null && _fin 1
+    dpr_resume_head "$root" "$1" "$fr" "$2" "$r" || _fin 1
+    printf '재개: 원격 %s 끝(%s)이 이 작업의 발행 head 입니다 — 기본 브랜치 충돌 사전 확인을 건너뜁니다\n' \
+      "$fr" "$(git -C "$root" rev-parse --short "$r" 2>/dev/null || printf '%s' "$r")" >&2
+    _fin 0 )
 }
 
 # pq_archive_mode <commit> — 그 커밋의 archive_publish(push|pr). dpr_archive_mode 를 하위 셸에서 부른다
@@ -558,11 +832,51 @@ _pq_watch_warning_text() {
   printf '경고: 호출 세션의 감시가 없습니다 (%s) — 호출 세션이 이 발행 요청을 모를 수 있습니다. 사용자에게 알리십시오: 호출 세션에서 rd publish watch 또는 /fr do 감시를 다시 띄워야 허가가 납니다\n' "$since"
 }
 
+# 발행 요청 전 중복 확인(spec D5). rc 0 계속(발견 없음·경고만·조사 실패) / rc 1 거절(출력은 stdout).
+_pq_dup_check() {
+  local slug="$1" root="${project_root:-$PWD}" stems found rc=0 kind msg pub="" cl="" fr="" errf why
+  [[ "$(detect_remote_mode 2>/dev/null)" == remote ]] || return 0
+  stems="$(dup_stems_from_source_fr "$(state_read_field source-fr 2>/dev/null)")"
+  errf="$(mktemp "${TMPDIR:-/tmp}/rd-pq-dup.XXXXXX")" || { printf '경고: 임시 파일을 만들지 못해 원격 중복 확인을 하지 못했습니다 — 확인 없이 요청합니다\n'; return 0; }
+  found="$(dup_scan "$root" "$slug" "$stems" publish 2>"$errf")" || rc=$?
+  why="$(head -1 "$errf" 2>/dev/null)"
+  rm -f "$errf"
+  if [[ "$rc" -eq 3 ]]; then
+    printf '경고: 원격 중복 확인을 하지 못했습니다(%s) — 확인 없이 요청합니다\n' "$why"
+    dup_timeout_hint "$why"
+    return 0
+  fi
+  [[ "$rc" -eq 1 ]] || return 0
+  while IFS=$'\t' read -r kind msg; do
+    [[ -n "$kind" ]] || continue
+    case "$kind" in
+      published) pub="${pub}  - ${msg}
+" ;;
+      claimed) cl="${cl}  - ${msg}
+" ;;
+      claimed-fr) fr="${fr}  - ${msg}
+" ;;
+    esac
+  done <<EOF3
+$found
+EOF3
+  if [[ -n "$pub$cl" ]]; then
+    printf '요청할 수 없습니다 — 같은 작업의 다른 구현이 있습니다:\n%s%s' "$pub" "$cl"
+    printf '다음 행동: 이 작업을 버릴지 사용자에게 물으십시오. 버리면 기본 체크아웃에서 bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task %s 를 실행합니다.\n' "$slug"
+    [[ -n "$cl" ]] && printf '같은 이름의 원격 브랜치가 다른 이력입니다 — 확인: git ls-remote origin refs/heads/fr/%s\n' "$slug"
+    return 1
+  fi
+  printf '경고: 다른 clone 에서 같은 FR 이 진행 중입니다 — 먼저 발행하는 쪽이 이기고, 늦은 쪽은 발행 요청 때 멈춥니다:\n%s' "$fr"
+  return 0
+}
+
 pq_cmd_request() {
   local slug mode backend cid launch st dirty def head frb conflicts rc lost=0 cur p bp wm=""
   _pq_parse_bypass "$@" || return 2
   slug="$(_pq_current_slug)" || { printf 'slug 를 정할 수 없습니다 — 작업 worktree 에서 실행하십시오\n' >&2; return 2; }
   _pq_slug_ok "$slug" || { printf '올바르지 않은 slug: %s\n' "$slug" >&2; return 2; }
+  # 같은 작업의 다른 구현 확인(원격 모드만). 사용자 승인 경로(rc 10)보다 앞에 두어 거절 사유를 먼저 보이게 한다.
+  _pq_dup_check "$slug" || return 1
   mode="$(pq_approval_mode)"
   cid="$(tasks_index_get "$slug" caller-id 2>/dev/null || true)"
   launch="$(tasks_index_get "$slug" launch 2>/dev/null || true)"
@@ -592,7 +906,7 @@ pq_cmd_request() {
   def="$(_pq_default_branch)" || { printf '기본 브랜치를 정할 수 없습니다 — 판정 불가\n' >&2; return 3; }
   head="$(git -C "${project_root:-$PWD}" rev-parse HEAD 2>/dev/null)" || return 3
   frb="$(git -C "${project_root:-$PWD}" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-  conflicts="$(pq_merge_check "$def" "$head")"; rc=$?
+  conflicts="$(pq_conflict_gate "$slug" "$def" "$head")"; rc=$?
   if [[ "$rc" -eq 1 ]]; then
     printf '요청할 수 없습니다 — 기본 브랜치(%s)와 병합 충돌하는 파일이 있습니다:\n' "$def"
     while IFS= read -r p; do [[ -n "$p" ]] && printf '  - %s\n' "$p"; done <<EOF2
@@ -674,7 +988,12 @@ pq_cmd_next() {
     fi
     st="$(_pq_state_of "$slot" 2>/dev/null)"
     pq_unlock
-    printf '허가하지 않습니다 — 앞 요청 %s 가 %s 입니다\n' "$slot" "$(pq_label "$st")"
+    # 허가됨·부분 완료는 그 요청의 run 이 슬롯을 풀어야 하므로, 어디서 무엇을 하면 풀리는지(_pq_next_action)를 붙인다.
+    if [[ "$st" == partial || "$st" == granted ]]; then
+      printf '허가하지 않습니다 — 앞 요청 %s 가 %s 입니다 (%s)\n' "$slot" "$(pq_label "$st")" "$(_pq_next_action "$slot" "$st")"
+    else
+      printf '허가하지 않습니다 — 앞 요청 %s 가 %s 입니다\n' "$slot" "$(pq_label "$st")"
+    fi
     return 1
   fi
   for f in "$d"/*.req; do
@@ -758,7 +1077,7 @@ _pq_reverify() {  # <slug> <mode> <head>
   [[ -z "$(git -C "$main" status --porcelain 2>/dev/null)" ]] || { printf '기본 체크아웃에 미커밋 변경이 있습니다\n'; return 1; }
   if [[ "$mode" == granted ]]; then
     def="$(_pq_default_branch)" || { printf '기본 브랜치를 정할 수 없습니다\n'; return 1; }
-    conflicts="$(pq_merge_check "$def" "$head")"; rc=$?
+    conflicts="$(pq_conflict_gate "$slug" "$def" "$head")"; rc=$?
     if [[ "$rc" -eq 1 ]]; then
       printf '기본 브랜치(%s)와 병합 충돌: %s\n' "$def" "$(printf '%s' "$conflicts" | tr '\n' ' ')"
       wtp="$(pq_get "$slug" worktree || true)"
@@ -827,7 +1146,7 @@ pq_cmd_run() {
   why="$(_pq_reverify "$slug" "$from" "$(pq_get "$slug" head)")" || {
     pq_lock || { printf '큐 락 획득 실패 — 상태가 running 으로 남았습니다. rd publish recover %s\n' "$slug" >&2; return 1; }
     if [[ "$from" == partial ]]; then
-      pq_set "$slug" state=partial "run-token=" "reason=재검증 실패: $why — 원인을 해소한 뒤 rd publish run"
+      pq_set "$slug" state=partial "run-token=" "reason=재검증 실패: $why"
     else
       pq_set "$slug" state=failed "run-token=" "reason=재검증 실패: $why"
       [[ "$(pq_slot_get)" == "$slug" ]] && pq_slot_clear
@@ -876,7 +1195,7 @@ pq_cmd_run() {
       [[ "$(pq_slot_get)" == "$slug" ]] && pq_slot_clear
       pq_unlock; printf '발행 완료: %s\n' "$slug"; return 0 ;;
     needs-verify)
-      pq_set "$slug" state=partial "run-token=" "reason=병합됐으나 tag·push 미확인 — rd publish run 으로 복구"
+      pq_set "$slug" state=partial "run-token=" "reason=병합됐으나 tag·push 미확인"
       pq_unlock; printf '부분 완료: 병합됐으나 tag·push 미확인 — rd publish run 으로 복구하십시오\n'; return 1 ;;
     *)
       pq_set "$slug" state=failed "run-token=" "reason=archive.sh 종료 코드 ${arc_rc}${lastline:+ — $lastline}"
@@ -925,6 +1244,60 @@ pq_cmd_exec() {  # <slug> <token>
 
 # ---------------------------------------------------------------- recover (D11)
 
+# 부분 완료 요청의 판정 (큐 락 밖에서 부른다). 작업 worktree 가 있으면 run 으로 이어 가게 하고 상태를 바꾸지 않는다.
+# worktree 가 없으면 발행 증거를 지금 체크아웃 기준으로 다시 판정한다 — 원격 조회가 늦어도 다른 큐 명령이 락을 기다리지
+# 않게 판정은 락 밖에서 하고, 성공으로 바꿀 때만 락을 잡아 판정 전과 같은 요청(state·updated-at)인지 확인한다.
+# 발행됐으면 성공으로 바꾸고 슬롯을 푼다.
+# 발행되지 않았으면 상태·슬롯을 그대로 두고 cancel 을 안내한다(버리는 결정은 사람이 cancel 로 내린다).
+# rc 0 성공으로 바꿈 / 1 바꾸지 않음 / 3 판정 불가.
+_pq_recover_partial() {  # <slug>
+  local slug="$1" ev rc=0 desc def wt u0 rmain rtag
+  u0="$(pq_get "$slug" updated-at)"
+  if ! _pq_wt_gone "$slug"; then
+    printf '%s 는 %s 상태이고 작업 worktree 가 있습니다 — %s\n' "$slug" "$(pq_label partial)" "$(_pq_next_action "$slug" partial)"
+    return 1
+  fi
+  ev="$(_pq_evidence "$slug")" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    printf '판정 불가 — %s 의 발행 증거를 확인할 수 없습니다 (작업 커밋 %s). 발행하지 않기로 했으면 rd publish cancel %s\n' \
+      "$slug" "$(pq_get "$slug" head)" "$slug" >&2
+    return 3
+  fi
+  [[ "$ev" == in-progress ]] && _pq_pr_waiting "$slug" && ev=pr-waiting
+  case "$ev" in
+    pr-waiting|cleanup-pending)
+      def="$(_pq_default_branch)"
+      wt="${project_root:-$PWD}"
+      rmain=""; rtag=""
+      if [[ "$ev" == cleanup-pending ]]; then
+        rmain="$(git -C "$wt" rev-parse "refs/heads/$def" 2>/dev/null)"
+        rtag="$(git -C "$wt" tag --list "fr/*/${slug}" 2>/dev/null | sort | tail -1)"
+      fi
+      pq_lock || { printf '큐 락 획득 실패 — 상태를 바꾸지 않았습니다. 잠시 뒤 rd publish recover %s\n' "$slug" >&2; return 1; }
+      if [[ "$(_pq_state_of "$slug" 2>/dev/null)" != partial || "$(pq_get "$slug" updated-at)" != "$u0" ]]; then
+        pq_unlock
+        printf '판정하는 동안 요청이 바뀌었습니다 — 상태를 바꾸지 않았습니다. rd publish status %s 로 확인하십시오\n' "$slug"
+        return 1
+      fi
+      pq_set "$slug" state=done "run-token=" reason= ${rmain:+"result-main=$rmain"} ${rtag:+"result-tag=$rtag"}
+      [[ "$(pq_slot_get)" == "$slug" ]] && pq_slot_clear
+      pq_unlock
+      if [[ "$ev" == pr-waiting ]]; then
+        printf '복구: PR 발행이 이미 끝났습니다 — merge 뒤 bash rd-workflow/scripts/rd pr check --task %s --apply\n' "$slug"
+      else
+        printf '복구: 발행이 이미 끝났습니다 (성공) — worktree 없는 부분 완료를 성공으로 바꾸고 허가 슬롯을 풀었습니다\n'
+      fi
+      return 0 ;;
+    needs-verify) desc='병합됐으나 tag·push 미확인' ;;
+    *) desc='기본 브랜치에 병합되지 않음' ;;
+  esac
+  printf '발행되지 않았습니다 (%s) — 작업 worktree 가 없어 rd publish run 으로 이어 갈 수 없습니다\n' "$desc"
+  printf '다음 행동: 원격에 발행됐을 수 있으면 git fetch origin 뒤 rd publish recover %s 로 다시 판정합니다. 아니면 발행을 마칠지 버릴지 사용자에게 묻습니다 — 버리기로 했으면 rd publish cancel %s\n' "$slug" "$slug"
+  # 발행을 마저 하는 길도 알린다(worktree 를 다시 만들어 run).
+  _pq_resume_hint "$slug"
+  return 1
+}
+
 pq_cmd_recover() {
   local slug="${1:-}" st rc=0 pid pg err owner own_pid own_cmd own_slug lockf ev cmd
   if [[ -z "$slug" ]]; then
@@ -935,9 +1308,16 @@ pq_cmd_recover() {
   st="$(_pq_state_of "$slug")" || rc=$?
   if [[ "$rc" -eq 3 ]]; then pq_unlock; return 3; fi
   if [[ "$rc" -ne 0 ]]; then pq_unlock; printf '복구할 요청 없음: %s\n' "$slug"; return 1; fi
+  if [[ "$st" == partial ]]; then
+    # 발행 증거 판정은 원격을 조회할 수 있으므로(태그 ls-remote) 큐 락을 놓고 한다 — 판정 뒤 다시 잡아 바뀌지 않았는지 본다.
+    pq_unlock
+    rc=0
+    _pq_recover_partial "$slug" || rc=$?
+    return "$rc"
+  fi
   if [[ "$st" != running ]]; then
     pq_unlock
-    printf '복구 대상이 아닙니다 — %s 는 %s 상태입니다 (partial 은 rd publish run)\n' "$slug" "$(pq_label "$st")"
+    printf '복구 대상이 아닙니다 — %s 는 %s 상태입니다 (복구 대상은 발행 중·부분 완료)\n' "$slug" "$(pq_label "$st")"
     return 1
   fi
   pid="$(pq_get "$slug" run-pid)"
@@ -985,8 +1365,8 @@ pq_cmd_recover() {
       [[ "$(pq_slot_get)" == "$slug" ]] && pq_slot_clear
       printf '복구: 발행이 이미 끝났습니다 (성공)\n' ;;
     needs-verify)
-      pq_set "$slug" state=partial "run-token=" "reason=병합됐으나 tag·push 미확인 — rd publish run 으로 복구"
-      printf '복구: 부분 완료 — rd publish run 으로 이어가십시오\n' ;;
+      pq_set "$slug" state=partial "run-token=" "reason=병합됐으나 tag·push 미확인"
+      printf '복구: 부분 완료 — %s\n' "$(_pq_next_action "$slug" partial)" ;;
     in-progress)
       pq_set "$slug" state=requested "run-token=" "reason=발행 전 중단 — 다시 허가 필요"
       [[ "$(pq_slot_get)" == "$slug" ]] && pq_slot_clear
@@ -1020,9 +1400,10 @@ _pq_timeout_arg() {  # <기본값> <args...>
 # wait 가 요청의 새 상태를 보고한다.
 _pq_wait_report() {  # <slug> <state>
   local slug="$1" st="$2" reason
-  reason="$(pq_get "$slug" reason)"
+  reason="$(_pq_reason "$slug")"
   case "$st" in
-    granted) printf '허가됨: %s — rd publish run 으로 발행하십시오\n' "$slug" ;;
+    # wait 가 기다리는 동안 worktree 의 체크아웃이 바뀌었을 수 있으므로 위치·체크아웃을 다시 보는 안내를 쓴다.
+    granted) printf '허가됨: %s — %s\n' "$slug" "$(_pq_next_action "$slug" granted)" ;;
     user-approval) printf '사용자 승인 대상: %s%s — 사용자에게 승인을 받은 뒤 rd publish approve → rd publish run\n' "$slug" "${reason:+ ($reason)}" ;;
     *) printf '%s: %s%s → %s\n' "$slug" "$(pq_label "$st")" "${reason:+ ($reason)}" "$(_pq_next_action "$slug" "$st")" ;;
   esac
@@ -1104,7 +1485,7 @@ _pq_watch_scan() {
       done|partial|failed|user-approval)
         n="$(pq_get "$s" notified)"
         if [[ "$n" != "$st" ]]; then
-          reason="$(pq_get "$s" reason)"
+          reason="$(_pq_reason "$s")"
           if pq_lock; then
             pq_set "$s" "notified=$st"
             pq_unlock

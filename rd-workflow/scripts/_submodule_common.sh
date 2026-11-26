@@ -441,7 +441,8 @@ _rd_run_limited() {
     fi ) >/dev/null 2>&1 &
   wd=$!
   [[ "$had_m" == 1 ]] || set +m
-  wait "$pid" || rc=$?
+  # 신호로 끝난 작업의 셸 알림(「Terminated: 15 …」·「Killed: 9 …」)이 호출부 stderr 에 섞이지 않게 막습니다.
+  wait "$pid" 2>/dev/null || rc=$?
   # 끝낸 감시를 여기서 거둡니다. 거두지 않으면 bash 가 나중에 「Terminated」 를 호출부 stderr 에 찍습니다.
   # KILL 로 끝냅니다. 호출 셸이 TERM 을 무시하면 감시도 이를 상속해, TERM 으로는 아래 wait 가 시한까지 막힙니다.
   kill -KILL -- "-$wd" 2>/dev/null || true
@@ -456,7 +457,59 @@ _rd_run_limited() {
   return "$rc"
 }
 
-# _rd_unpushed_commits <repo> [표시 경로] — 원격 브랜치에도 원격 tag 에도 없는 커밋을 stdout 으로. 명령 실패는 return 1.
+# _rd_keeper_borrows <keeper 저장소> — <keeper> 가 objects/info/alternates 파일로 다른 저장소의 객체를 빌려 쓰면 0, 아니면 1.
+#   빌린 객체는 원래 저장소가 지워지면 읽을 수 없다. 그 원래 저장소가 정리하려는 작업 worktree 의 submodule 이면, keeper 의
+#   브랜치가 가리키는 커밋을 worktree 와 함께 잃는다. alternates 가 어디를 가리키는지는 해석하지 않고(상대 경로·중첩 alternates),
+#   빌려 쓰는 keeper 는 보존 근거로 쓰지 않는다. 경로를 구하지 못해도 빌려 쓰는 쪽(0)으로 본다.
+_rd_keeper_borrows() {
+  local af
+  af="$(git -C "$1" rev-parse --git-path objects/info/alternates 2>/dev/null)" || return 0
+  [[ -n "$af" ]] || return 0
+  [[ "$af" == /* ]] || af="$1/$af"
+  [[ -s "$af" ]]
+}
+
+# _rd_keeper_drop <keeper 저장소> — stdin 의 커밋 OID 목록에서 <keeper> 의 로컬 브랜치·태그로 닿는 커밋을 빼고 나머지를 낸다.
+#   <keeper> 에 객체만 있거나 원격 추적 ref·FETCH_HEAD·HEAD 로만 닿는 커밋은 빼지 않는다 — gc·체크아웃 이동으로 잃을 수 있고,
+#   원격 추적 ref 는 원격 브랜치가 지워진 뒤 `fetch --prune` 으로 사라진다. 원격에 있는지는 호출부(_rd_unpushed_commits)가
+#   작업 쪽 저장소의 원격 추적 ref 와 원격 tag 조회로 따로 본다.
+#   판정 명령이 실패하면 아무것도 빼지 않는다(미push 로 남기는 안전한 쪽). 호출부는 이 함수가 실패하면 판정 실패(return 1)로 본다.
+#   환경 변수 GIT_ALTERNATE_OBJECT_DIRECTORIES 는 빼고 조회한다. 파일 alternates 를 쓰는 keeper 는 호출부가 넘기지 않는다
+#   (_rd_keeper_borrows).
+_rd_keeper_drop() {
+  local keeper="$1" list have unreach res
+  list="$(cat)"
+  [[ -n "$list" ]] || return 0
+  # 목록은 인자·환경 변수·임시 파일이 아니라 pipe 로 넘긴다 — 미push 이력이 길면(수천~수만 커밋) OS 의 인자 크기 상한(ARG_MAX)을
+  #   넘어 awk·git 실행 자체가 실패하고, 임시 파일은 디스크·할당량이 차면 일부만 쓰인다. 어느 쪽이든 빈 출력이나 빠진 판정이
+  #   「모두 보존됨」 으로 읽혀 worktree 를 지운다.
+  have="$(printf '%s\n' "$list" | env -u GIT_ALTERNATE_OBJECT_DIRECTORIES git -C "$keeper" cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null \
+    | awk '$2 == "commit" { print $1 }')" || have=""
+  if [[ -z "$have" ]]; then printf '%s\n' "$list"; return 0; fi
+  if ! unreach="$(printf '%s\n' "$have" | env -u GIT_ALTERNATE_OBJECT_DIRECTORIES git -C "$keeper" rev-list --stdin --not --branches --tags 2>/dev/null)"; then
+    printf '%s\n' "$list"; return 0
+  fi
+  # 세 목록을 구획 표시(#H·#U·#L)와 함께 한 흐름으로 넘기고(printf 는 셸 내장이라 인자 크기 상한이 없다), 끝 표시 #E 까지 읽었을
+  #   때만 결과를 낸다. 흐름이 중간에 끊기면 awk 가 실패로 끝나고 원래 목록을 그대로 낸다.
+  if ! res="$(printf '%s\n' '#H' "$have" '#U' "$unreach" '#L' "$list" '#E' | awk '
+      /^#/ { sec = $0; next }
+      $0 == "" { next }
+      sec == "#H" { has[$0] = 1; next }
+      sec == "#U" { un[$0] = 1; next }
+      sec == "#L" { out[++n] = $0 }
+      END { if (sec != "#E") exit 3
+            for (i = 1; i <= n; i++) if (!(out[i] in has) || (out[i] in un)) print out[i] }')"; then
+    printf '%s\n' "$list"; return 0
+  fi
+  [[ -z "$res" ]] || printf '%s\n' "$res"
+}
+
+# _rd_unpushed_commits <repo> [표시 경로] [keeper 저장소] — 원격 브랜치에도 원격 tag 에도 없는 커밋을 stdout 으로. 명령 실패는 return 1.
+# <keeper> 를 주면(작업 worktree 의 submodule 에 대응하는 기본 체크아웃의 같은 경로 submodule 저장소) 그 저장소의 로컬 브랜치·태그로
+# 닿는 커밋도 뺍니다 — 발행(archive_submodule_carry)이 작업 커밋을 그 저장소로 옮겨 브랜치로 남기면 worktree 를 지워도 잃지
+# 않습니다(FR archive-carry-worktree-submodule-commits). keeper 의 원격 추적 ref 는 근거로 쓰지 않습니다 — 원격 브랜치가 지워진 뒤
+# `fetch --prune` 하면 사라져, 지운 worktree 의 커밋을 붙잡는 ref 가 남지 않습니다.
+# keeper 가 objects/info/alternates 로 다른 저장소의 객체를 빌려 쓰면 keeper 를 쓰지 않습니다(_rd_keeper_borrows, 안내 줄은 stderr).
 # 원격 tracking ref 만 보면 원격에 push 한 tag 로만 닿는 커밋을 미push 로 셉니다. 그래서 후보가 있을 때만
 # 원격마다 `ls-remote --tags` 를 묻고, 로컬에 있는 tag 객체를 제외 기준에 더해 다시 셉니다.
 # ls-remote 가 실패한 원격(네트워크·인증)은 제외 기준에 넣지 않습니다 — 미push 로 남기는 안전한 쪽입니다.
@@ -465,9 +518,14 @@ _rd_run_limited() {
 # 조회마다 대기 상한(RD_LSREMOTE_TIMEOUT 초, 기본 20)을 둡니다. 이 함수는 `rd task list` 의 공유 락 안에서도
 # 불리므로, 응답하지 않는 원격이 목록과 다른 작업의 promote·archive 를 붙잡지 않게 합니다. 초과는 조회 실패와 같습니다.
 _rd_unpushed_commits() {
-  local repo="$1" disp="${2:-$1}" out remote refs oid name err rc lim="${RD_LSREMOTE_TIMEOUT:-20}"
+  local repo="$1" disp="${2:-$1}" keeper="${3:-}" out remote refs oid name err rc lim="${RD_LSREMOTE_TIMEOUT:-20}"
   local -a excl=()
   out="$(git -C "$repo" rev-list --all --not --remotes 2>/dev/null)" || return 1
+  if [[ -n "$out" && -n "$keeper" ]] && _rd_keeper_borrows "$keeper"; then
+    echo "submodule ${disp}: 기본 체크아웃 submodule 이 다른 저장소의 객체를 빌려 써(objects/info/alternates) 그 브랜치·태그를 보존 근거로 쓰지 않습니다" >&2
+    keeper=""
+  fi
+  [[ -z "$out" || -z "$keeper" ]] || out="$(printf '%s\n' "$out" | _rd_keeper_drop "$keeper")" || return 1
   [[ -n "$out" ]] || return 0
   err="$(mktemp "${TMPDIR:-/tmp}/rd-lsr-err.XXXXXX")" || err=/dev/null
   while IFS= read -r remote; do
@@ -489,16 +547,23 @@ _rd_unpushed_commits() {
   done < <(git -C "$repo" remote 2>/dev/null)
   [[ "$err" == /dev/null ]] || rm -f "$err"
   [[ "${#excl[@]}" -gt 0 ]] || { printf '%s\n' "$out"; return 0; }
-  git -C "$repo" rev-list --all --not --remotes "${excl[@]}" 2>/dev/null
+  out="$(git -C "$repo" rev-list --all --not --remotes "${excl[@]}" 2>/dev/null)" || return 1
+  [[ -z "$out" || -z "$keeper" ]] || out="$(printf '%s\n' "$out" | _rd_keeper_drop "$keeper")" || return 1
+  [[ -z "$out" ]] || printf '%s\n' "$out"
 }
 
 # rd_submodule_tree_clean <path> [--require-pushed] — 최상위와 초기화된 모든 깊이의 submodule 을 검사한다.
 # 0: clean / 1: dirty — stdout 한 줄 `<원인>\t<경로>`, 원인 ∈ changes · unrecorded-commit · unpushed.
 # 판정 불가(명령 실패)도 1 이며 `changes` 로 보고한다.
 rd_submodule_tree_clean() {
-  local wt="$1" req="${2:-}" list tl smp disp head idx st repo
+  local wt="$1" req="${2:-}" list tl smp disp head idx st repo main="" keeper
   list="$(mktemp "${TMPDIR:-/tmp}/rd-wt-sub.XXXXXX")" || { printf 'changes\t.\n'; return 1; }
   # 한 레코드 = toplevel \0 sm_path \0 displaypath \0 HEAD \0 (경로의 개행·탭에 안전하도록 NUL 구분)
+  # 미push 판정에서 커밋을 이미 보존한 곳으로 볼 기본 체크아웃(주 worktree). <wt> 자신이면 쓰지 않는다.
+  if [[ "$req" == "--require-pushed" ]]; then
+    main="$(git -C "$wt" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')" || main=""
+    if [[ -n "$main" ]] && [[ "$(cd "$main" 2>/dev/null && pwd -P)" == "$(cd "$wt" 2>/dev/null && pwd -P)" ]]; then main=""; fi
+  fi
   if ! git -C "$wt" submodule foreach --recursive --quiet \
         'printf "%s\0%s\0%s\0%s\0" "$toplevel" "$sm_path" "$displaypath" "$(git rev-parse HEAD)"' > "$list" 2>/dev/null; then
     rm -f "$list"; printf 'changes\t.\n'; return 1
@@ -523,7 +588,10 @@ rd_submodule_tree_clean() {
       rm -f "$list"; printf 'unrecorded-commit\t%s\n' "$disp"; return 1
     fi
     if [[ "$req" == "--require-pushed" ]]; then
-      if ! st="$(_rd_unpushed_commits "$repo" "$disp")"; then
+      # 기본 체크아웃의 같은 경로가 초기화된 submodule 저장소일 때만 keeper 로 쓴다(빈 디렉터리면 상위 저장소를 잡으므로 최상위 대조).
+      keeper=""
+      if [[ -n "$main" ]] && _rd_is_repo_root "$main/$disp"; then keeper="$main/$disp"; fi
+      if ! st="$(_rd_unpushed_commits "$repo" "$disp" "$keeper")"; then
         rm -f "$list"; printf 'changes\t%s\n' "$disp"; return 1
       fi
       if [[ -n "$st" ]]; then
@@ -574,7 +642,7 @@ rd_worktree_hold_info() {
     unrecorded-commit)
       printf 'submodule %s 에 gitlink 로 올리지 않은 커밋이 체크아웃되어 있어 지우지 않았습니다\tgit -C %q log --oneline -1\n' "$lbl" "$wt/$sub" ;;
     unpushed)
-      printf 'submodule %s 에 원격에 없는 커밋이 있어 지우지 않았습니다. 지우면 그 커밋을 잃습니다. 원격에 이미 있다면 git -C %q fetch 뒤 다시 실행하십시오\tgit -C %q log --oneline --all --not --remotes\n' "$lbl" "$wt/$sub" "$wt/$sub" ;;
+      printf 'submodule %s 에 원격에 없는 커밋(기본 체크아웃 submodule 의 브랜치·태그에도 없음)이 있어 지우지 않았습니다. 지우면 그 커밋을 잃습니다. 원격에 이미 있다면 git -C %q fetch 뒤 다시 실행하십시오\tgit -C %q log --oneline --all --not --remotes\n' "$lbl" "$wt/$sub" "$wt/$sub" ;;
     *)
       if [[ "$sub" != "." ]]; then
         printf 'worktree 또는 그 submodule 에 미커밋 변경이 있어 지우지 않았습니다 (submodule 경로: %s)\tgit -C %q status --short\n' "$lbl" "$wt/$sub"

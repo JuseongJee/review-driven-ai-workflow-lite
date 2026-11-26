@@ -6,6 +6,9 @@
 #   bash model_select.sh set <칸> <값|null>
 #   bash model_select.sh set-legacy <경로> <JSON 값>
 #   bash model_select.sh apply <저장 목록 파일>
+#   bash model_select.sh headless [--model <값>] [--effort <값>]
+#   bash model_select.sh subagent
+#   bash model_select.sh keep-codex-model <현재 모델> <새 모델>
 #
 # 값은 stdout, 경고는 stderr 로 낸다. bash 3.2 호환이며 외부 의존은 jq 뿐이다.
 # 함수는 호출자의 `set -euo pipefail` 아래에서도 돌도록 실패할 수 있는 명령을 모두 감싼다.
@@ -30,6 +33,9 @@ MS_NOTICES=""
 MS_PICK_VALUE=""; MS_PICK_ORIGIN=""; MS_PICK_KIND=""
 MS_MODEL_VALUE=""; MS_MODEL_RAW=""; MS_MODEL_SOURCE=""; MS_MODEL_ORIGIN=""
 MS_EFFORT_VALUE=""; MS_EFFORT_RAW=""; MS_EFFORT_SOURCE=""; MS_EFFORT_ORIGIN=""; MS_EFFORT_REJECTED=""
+MS_HL_MODEL_ARG=""; MS_HL_EFFORT_ARG=""; MS_HL_LINE=""
+_MS_HL_FILE_STATE=""; _MS_HL_FILE_ROWS=""; _MS_HL_FILE_REPORTED=0
+_MS_HL_RAW=""; _MS_HL_ARG=""; _MS_HL_SRC=""; _MS_HL_STATE="unset"
 
 # ------------------------------------------------------------
 # 경로
@@ -99,20 +105,27 @@ _ms_allowed_text() {
 # ------------------------------------------------------------
 # Codex 계열 해석·config.toml·지원 단계 (spec D3·D4)
 # ------------------------------------------------------------
+# 계열 최신 판정의 공용 jq 정의 (spec D3). ms_codex_resolve_family 와 _ms_codex_newer 가 같이 쓴다.
+# ms_latest($fam): visibility 가 list 이고 이름이 gpt-<버전>-<계열> 인 모델 중 버전 배열이 가장 큰 것
+# (같은 버전은 priority 가 가장 작은 것) 의 {s, v, p} 또는 null.
+_MS_JQ_LATEST='def ms_latest($fam):
+  [ .models[]?
+    | select(type == "object" and .visibility == "list")
+    | (.slug // "") as $s
+    | ($s | strings | capture("^gpt-(?<v>[0-9]+(\\.[0-9]+)*)-(?<f>[a-z]+)$")?) as $c
+    | select($c.f == $fam)
+    | { s: $s, v: ($c.v | split(".") | map(tonumber)), p: (.priority // 1e9) } ]
+  | max_by([.v, -.p]);
+'
+
 # ms_codex_resolve_family <계열> → slug (rc 0) 또는 빈 값 (rc 1, 경고)
 ms_codex_resolve_family() {
   local fam="$1" home cache slug=""
   home="$(ms_codex_home)"
   cache="${home}/models_cache.json"
   if [[ -f "$cache" ]] && ms_jq_available; then
-    slug="$(jq -r --arg fam "$fam" '
-      [ .models[]?
-        | select(type == "object" and .visibility == "list")
-        | (.slug // "") as $s
-        | ($s | strings | capture("^gpt-(?<v>[0-9]+(\\.[0-9]+)*)-(?<f>[a-z]+)$")?) as $c
-        | select($c.f == $fam)
-        | { s: $s, v: ($c.v | split(".") | map(tonumber)), p: (.priority // 1e9) } ]
-      | max_by([.v, -.p]) | .s // empty
+    slug="$(jq -r --arg fam "$fam" "${_MS_JQ_LATEST}"'
+      ms_latest($fam) | .s // empty
     ' "$cache" 2>/dev/null)" || slug=""
   fi
   if [[ -n "$slug" ]]; then
@@ -410,7 +423,7 @@ ms_resolve_review() {
   MS_MODEL_VALUE=""; MS_MODEL_RAW=""; MS_MODEL_SOURCE="cli-default"; MS_MODEL_ORIGIN="cli-default"
   MS_EFFORT_VALUE=""; MS_EFFORT_RAW=""; MS_EFFORT_SOURCE="global"; MS_EFFORT_ORIGIN="cli-default"; MS_EFFORT_REJECTED=""
 
-  # 선택 대상은 Codex·Claude 뿐이다. 다른 도구(gemini 등)는 models.json·RD_REVIEW_* 를 쓰지 않고,
+  # 선택 대상은 Codex·Claude 뿐이다. 다른 도구(adapter-interface.md 절차로 추가한 어댑터)는 models.json·RD_REVIEW_* 를 쓰지 않고,
   # 어댑터 계약(TOOL_MODEL)대로 review-tools.json 의 tools.<도구>.model 만 그대로 넘긴다. effort 는 넘기지 않는다.
   case "$tool" in
     codex|claude) ;;
@@ -451,7 +464,10 @@ ms_resolve_review() {
             MS_MODEL_VALUE=""; MS_MODEL_SOURCE="unresolved"
           fi ;;
         pinned)
-          echo "⚠️  ${MS_MODEL_ORIGIN} 의 모델 '${MS_MODEL_RAW}' 은 고정 이름입니다 — 고정됨, 낡을 수 있음." >&2
+          # Codex 는 리뷰 세션을 만들 때 계열 최신 여부와 함께 알린다(ms_codex_stale_notice). 턴마다 같은 경고를 내지 않는다.
+          if [[ "$tool" == "claude" ]]; then
+            echo "⚠️  ${MS_MODEL_ORIGIN} 의 모델 '${MS_MODEL_RAW}' 은 고정 이름입니다 — 고정됨, 낡을 수 있음." >&2
+          fi
           MS_MODEL_VALUE="$MS_MODEL_RAW" ;;
         *) MS_MODEL_VALUE="$MS_MODEL_RAW" ;;
       esac
@@ -519,6 +535,681 @@ ms_resolve_review() {
   fi
   return 0
 }
+
+# ------------------------------------------------------------
+# 무인 실행(claude -p) 절 해석 — spec 2026-11-21-1724-headless-model-effort-selection D1~D6
+# ms_resolve_headless <strict 0|1> [<플래그 모델>] [<플래그 effort>]
+#   rc 0 성공, rc 1 strict 실패(이유·조치는 stderr `⚠️ ` 줄).
+#   전역: MS_HL_MODEL_ARG·MS_HL_EFFORT_ARG(넘길 값, 없으면 빈 값), MS_HL_LINE(표시 줄, 접두 없음)
+# 칸(모델·effort)마다 플래그 > 환경 변수 > models.json headless.claude.* > 미설정.
+# ms_load_models 는 쓰지 않는다(파싱 실패를 경고 후 성공으로 돌려줘 strict 판정에 못 쓴다).
+# ------------------------------------------------------------
+# _ms_claude_section_read <파일> <절 이름> <py|fail> → TSV `<칸>\t<ok|invalid>\t<값>` 행(0행 가능)
+#   절(headless·session)의 claude.{model,effort} 를 읽는다.
+#   rc 0 정상, rc 2 파일 판정 실패(최상위 객체 정확히 하나가 아님, <절>·<절>.claude 가
+#   non-null 비객체, 읽기 실패), rc 3 jq 없음. 파일이 없으면 0행 rc 0.
+#   jq 없음 처리: `fail` 은 "<절>" 문자열이 있을 때 rc 3, 없으면 0행. `py` 는 python3 로 같은 판정을 하고
+#   python3 도 없으면 rc 3 이다.
+_ms_claude_section_read() {
+  local f="$1" sec="$2" nojq="${3:-fail}" out first
+  [[ -e "$f" ]] || return 0
+  if ms_jq_available; then
+    if ! out="$(jq -s -r --arg sec "$sec" '
+        if (length == 1 and (.[0] | type == "object")) then
+          .[0] as $o
+          | if ($o[$sec] != null and ($o[$sec] | type) != "object") then "BAD"
+            elif ($o[$sec].claude != null and ($o[$sec].claude | type) != "object") then "BAD"
+            else "OK",
+              (["model","effort"][] as $k
+               | ($o[$sec].claude // {})[$k] as $v
+               | select($v != null)
+               | [$k, (if ($v | type) == "string" then "ok" else "invalid" end),
+                  ($v | if type == "string" then . else tojson end)] | @tsv)
+            end
+        else "BAD" end' "$f" 2>/dev/null)"; then
+      return 2
+    fi
+  elif [[ "$nojq" == "py" ]] && command -v python3 >/dev/null 2>&1; then
+    if ! out="$(python3 -I - "$f" "$sec" 2>/dev/null <<'PYEND'
+import json, sys
+f, sec = sys.argv[1], sys.argv[2]
+dec = json.JSONDecoder()
+txt = open(f, encoding="utf-8").read()
+docs, i, n = [], 0, len(txt)
+while True:
+    while i < n and txt[i] in " \t\r\n":
+        i += 1
+    if i >= n:
+        break
+    d, i = dec.raw_decode(txt, i)
+    docs.append(d)
+if len(docs) != 1 or not isinstance(docs[0], dict):
+    print("BAD"); sys.exit(0)
+o = docs[0]
+s = o.get(sec)
+if s is not None and not isinstance(s, dict):
+    print("BAD"); sys.exit(0)
+c = (s or {}).get("claude")
+if c is not None and not isinstance(c, dict):
+    print("BAD"); sys.exit(0)
+print("OK")
+for k in ("model", "effort"):
+    v = (c or {}).get(k)
+    if v is None:
+        continue
+    if isinstance(v, str) and not any(ch in v for ch in "\t\n\r"):
+        print("%s\tok\t%s" % (k, v))
+    else:
+        # 제어 문자가 섞인 문자열은 TSV 에서 잘리므로 jq 경로처럼 무효로 둔다(JSON 표기로 내보낸다).
+        print("%s\tinvalid\t%s" % (k, json.dumps(v, ensure_ascii=False, separators=(",", ":"))))
+PYEND
+    )"; then
+      return 2
+    fi
+  else
+    if [[ "$nojq" == "py" ]] || grep -q "\"${sec}\"" "$f" 2>/dev/null; then return 3; fi
+    return 0
+  fi
+  first="${out%%$'\n'*}"
+  [[ "$first" == "OK" ]] || return 2
+  if [[ "$out" == *$'\n'* ]]; then printf '%s\n' "${out#*$'\n'}"; fi
+  return 0
+}
+
+# _ms_headless_read <파일> — headless 절 읽기(계약 불변: jq 없음 + "headless" 있음 → rc 3).
+_ms_headless_read() { _ms_claude_section_read "$1" headless fail; }
+
+# 한 칸을 해석해 _MS_HL_RAW/_ARG/_SRC/_STATE(unset|default|value) 를 채운다. rc 1 은 strict 실패.
+# _ms_hl_col <model|effort> <플래그 값|빈 값> <strict> <models.json 경로>
+_ms_hl_col() {
+  local kind="$1" flag="$2" strict="$3" path="$4"
+  local envvar flagsrc envsrc filesrc raw="" src="" from="" allowed cls conv st val row
+  _MS_HL_RAW=""; _MS_HL_ARG=""; _MS_HL_SRC=""; _MS_HL_STATE="unset"
+  if [[ "$kind" == "model" ]]; then
+    envvar="RD_HEADLESS_CLAUDE_MODEL"; flagsrc="플래그 --model"
+  else
+    envvar="RD_HEADLESS_CLAUDE_EFFORT"; flagsrc="플래그 --effort"
+  fi
+  envsrc="환경 변수 ${envvar}"; filesrc="models.json headless.claude.${kind}"
+
+  if [[ -n "$flag" ]]; then
+    raw="$flag"; src="$flagsrc"; from="cli"
+  elif [[ -n "${!envvar:-}" ]]; then
+    raw="${!envvar}"; src="$envsrc"; from="cli"
+  else
+    if [[ -z "$_MS_HL_FILE_STATE" ]]; then
+      local rc=0
+      _MS_HL_FILE_ROWS="$(_ms_headless_read "$path")" || rc=$?
+      case "$rc" in
+        0) _MS_HL_FILE_STATE="ok" ;;
+        3) _MS_HL_FILE_STATE="nojq" ;;
+        *) _MS_HL_FILE_STATE="bad" ;;
+      esac
+    fi
+    case "$_MS_HL_FILE_STATE" in
+      bad|nojq)
+        if [[ "$_MS_HL_FILE_STATE" == "bad" ]]; then
+          val="⚠️  ${path} 를 해석할 수 없습니다 — 최상위 객체 하나여야 하고 headless·headless.claude 는 객체여야 합니다. 파일을 고치십시오."
+        else
+          val="⚠️  jq 가 없어 ${path} 의 headless 설정을 읽을 수 없습니다 — jq 를 설치하거나(brew install jq) 플래그·환경 변수로 지정하십시오."
+        fi
+        if [[ "$strict" == 1 ]]; then echo "$val" >&2; return 1; fi
+        if [[ "$_MS_HL_FILE_REPORTED" == 0 ]]; then
+          echo "${val} models.json 값은 쓰지 않고 CLI 기본값으로 둡니다." >&2
+          _MS_HL_FILE_REPORTED=1
+        fi
+        return 0 ;;
+    esac
+    row="$(printf '%s\n' "$_MS_HL_FILE_ROWS" | awk -F'\t' -v k="$kind" '$1==k{print; exit}')"
+    [[ -n "$row" ]] || return 0
+    IFS=$'\t' read -r _ st val <<<"$row" || true
+    raw="$val"; src="$filesrc"; from="file"
+    if [[ "$st" == "invalid" ]]; then
+      cls="invalid"
+    fi
+  fi
+
+  [[ -n "${cls:-}" ]] || cls="$(ms_classify claude "$kind" "$raw")"
+  if [[ "$cls" == "invalid" ]]; then
+    allowed="$(_ms_allowed_text claude "$kind")"
+    if [[ "$from" == "cli" ]]; then
+      allowed="$(printf '%s' "$allowed" | sed 's/, null(칸 비우기)$//')"
+      val="⚠️  ${src} 값이 올바르지 않습니다: ${raw} — 허용: ${allowed}."
+    else
+      val="⚠️  ${path} 의 headless.claude.${kind} 값이 올바르지 않습니다: ${raw} — 허용: ${allowed}."
+    fi
+    if [[ "$strict" == 1 ]]; then echo "$val" >&2; return 1; fi
+    echo "${val} 이 칸은 CLI 기본값으로 둡니다." >&2
+    return 0
+  fi
+  _MS_HL_RAW="$raw"; _MS_HL_SRC="$src"
+  if [[ "$cls" == "default" ]]; then _MS_HL_STATE="default"; return 0; fi
+  _MS_HL_STATE="value"
+  if [[ "$kind" == "model" ]]; then
+    if [[ "$cls" == "pinned" ]]; then
+      echo "⚠️  ${src} 의 모델 '${raw}' 은 고정 이름입니다 — 고정됨, 낡을 수 있음." >&2
+    fi
+    _MS_HL_ARG="$raw"
+  else
+    conv="$(ms_convert_effort claude "$raw" "")"
+    _MS_HL_ARG="$conv"
+  fi
+  return 0
+}
+
+_ms_hl_cell() { # _ms_hl_cell <상태> <원래 값> <넘기는 값> <출처>
+  case "$1" in
+    unset)   printf 'CLI 기본값 (미설정)' ;;
+    default) printf 'CLI 기본값 (default 지정, %s)' "$4" ;;
+    dropped) printf 'CLI 기본값 (CLI 미지원으로 뺌, %s)' "$4" ;;
+    *)
+      if [[ "$2" == "$3" ]]; then printf '%s (%s)' "$2" "$4"
+      else printf '%s → %s (%s)' "$2" "$3" "$4"; fi ;;
+  esac
+}
+
+ms_resolve_headless() {
+  local strict="${1:-1}" flag_model="${2:-}" flag_effort="${3:-}"
+  local path help="" opt
+  MS_HL_MODEL_ARG=""; MS_HL_EFFORT_ARG=""; MS_HL_LINE=""
+  _MS_HL_FILE_STATE=""; _MS_HL_FILE_ROWS=""; _MS_HL_FILE_REPORTED=0
+  _ms_path_into path ms_models_path
+
+  local m_state m_raw m_arg m_src e_state e_raw e_arg e_src
+  _ms_hl_col model "$flag_model" "$strict" "$path" || return 1
+  m_state="$_MS_HL_STATE"; m_raw="$_MS_HL_RAW"; m_arg="$_MS_HL_ARG"; m_src="$_MS_HL_SRC"
+  _ms_hl_col effort "$flag_effort" "$strict" "$path" || return 1
+  e_state="$_MS_HL_STATE"; e_raw="$_MS_HL_RAW"; e_arg="$_MS_HL_ARG"; e_src="$_MS_HL_SRC"
+
+  # CLI 지원 확인 (D5): 넘길 인자가 있고 claude 가 있을 때만
+  if [[ -n "$m_arg$e_arg" ]] && command -v claude >/dev/null 2>&1; then
+    help="$(claude --help 2>/dev/null)" || true
+    for opt in model effort; do
+      if [[ "$opt" == "model" ]]; then [[ -n "$m_arg" ]] || continue; else [[ -n "$e_arg" ]] || continue; fi
+      case "$help" in *"--${opt}"*) continue ;; esac
+      local msg="⚠️  Claude CLI 가 --${opt} 를 받지 않습니다 — claude update 로 올리거나 ${opt} 를 비우십시오."
+      if [[ "$strict" == 1 ]]; then echo "$msg" >&2; return 1; fi
+      echo "$msg" >&2
+      if [[ "$opt" == "model" ]]; then m_arg=""; m_state="dropped"; else e_arg=""; e_state="dropped"; fi
+    done
+  fi
+
+  MS_HL_MODEL_ARG="$m_arg"; MS_HL_EFFORT_ARG="$e_arg"
+  MS_HL_LINE="무인 세션 모델: $(_ms_hl_cell "$m_state" "$m_raw" "$m_arg" "$m_src") · effort: $(_ms_hl_cell "$e_state" "$e_raw" "$e_arg" "$e_src")"
+  return 0
+}
+
+# ------------------------------------------------------------
+# 작업 세션 칸 해석 — spec 2026-11-22-1010-session-model-effort-selection D3
+# ms_resolve_session <config-root> → 항상 rc 0. 경고는 stderr.
+#   전역: MS_SS_{MODEL,EFFORT}_{STATE,RAW,ARG,SRC}
+#   STATE value|default|invalid|unset, SRC env|file(unset 이면 빈 값).
+# 칸마다 환경 변수(RD_SESSION_MODEL·RD_SESSION_EFFORT) > models.json session.claude.<칸>.
+# 파일은 환경 변수로 정하지 못한 칸이 있을 때만 한 번 읽고, 판정 실패는 파일까지 내려온 칸만 invalid 로 둔다.
+# ------------------------------------------------------------
+# _ms_ss_col <model|effort> <파일 경로> — _MS_SS_FILE_STATE/_ROWS/_REPORTED 는 ms_resolve_session 이 둔다.
+_ms_ss_col() {
+  local kind="$1" path="$2" up envvar raw="" src="" from="" cls="" st val row allowed conv rc
+  local STATE="unset" RAW="" ARG="" SRC=""
+  if [[ "$kind" == "model" ]]; then up="MODEL"; envvar="RD_SESSION_MODEL"; else up="EFFORT"; envvar="RD_SESSION_EFFORT"; fi
+  if [[ -n "${!envvar:-}" ]]; then
+    raw="${!envvar}"; src="환경 변수 ${envvar}"; from="env"
+  else
+    if [[ -z "$_MS_SS_FILE_STATE" ]]; then
+      rc=0
+      _MS_SS_FILE_ROWS="$(_ms_claude_section_read "$path" session py)" || rc=$?
+      case "$rc" in
+        0) _MS_SS_FILE_STATE="ok" ;;
+        3) _MS_SS_FILE_STATE="nojq" ;;
+        *) _MS_SS_FILE_STATE="bad" ;;
+      esac
+    fi
+    case "$_MS_SS_FILE_STATE" in
+      bad|nojq)
+        if [[ "$_MS_SS_FILE_REPORTED" == 0 ]]; then
+          if [[ "$_MS_SS_FILE_STATE" == "bad" ]]; then
+            echo "⚠️  ${path} 를 해석할 수 없습니다 — 최상위 객체 하나여야 하고 session·session.claude 는 객체여야 합니다. 파일을 고치십시오. 이 파일에서 오는 칸은 CLI 기본값으로 둡니다." >&2
+          else
+            echo "⚠️  jq 와 python3 가 없어 ${path} 의 session 설정을 읽을 수 없습니다 — jq 를 설치하거나(brew install jq) 환경 변수로 지정하십시오. 이 파일에서 오는 칸은 CLI 기본값으로 둡니다." >&2
+          fi
+          _MS_SS_FILE_REPORTED=1
+        fi
+        STATE="invalid"; SRC="file" ;;
+      *)
+        row="$(printf '%s\n' "$_MS_SS_FILE_ROWS" | awk -F'\t' -v k="$kind" '$1==k{print; exit}')"
+        if [[ -n "$row" ]]; then
+          IFS=$'\t' read -r _ st val <<<"$row" || true
+          raw="$val"; src="models.json session.claude.${kind}"; from="file"
+          if [[ "$st" == "invalid" ]]; then cls="invalid"; fi
+        fi ;;
+    esac
+  fi
+  if [[ -n "$from" ]]; then
+    [[ -n "$cls" ]] || cls="$(ms_classify claude "$kind" "$raw")"
+    RAW="$raw"; SRC="$from"
+    if [[ "$cls" == "invalid" ]]; then
+      allowed="$(_ms_allowed_text claude "$kind")"
+      if [[ "$from" == "env" ]]; then allowed="$(printf '%s' "$allowed" | sed 's/, null(칸 비우기)$//')"; fi
+      echo "⚠️  ${src} 의 세션 ${kind} 값이 올바르지 않습니다: ${raw} — 허용: ${allowed}. 이 칸은 CLI 기본값으로 둡니다." >&2
+      STATE="invalid"
+    elif [[ "$cls" == "default" ]]; then
+      STATE="default"
+    else
+      STATE="value"
+      if [[ "$kind" == "model" ]]; then
+        if [[ "$cls" == "pinned" ]]; then
+          echo "⚠️  ${src} 의 모델 '${raw}' 은 고정 이름입니다 — 고정됨, 낡을 수 있음." >&2
+        fi
+        ARG="$raw"
+      else
+        conv="$(ms_convert_effort claude "$raw" "")"
+        ARG="$conv"
+      fi
+    fi
+  fi
+  printf -v "MS_SS_${up}_STATE" '%s' "$STATE"
+  printf -v "MS_SS_${up}_RAW" '%s' "$RAW"
+  printf -v "MS_SS_${up}_ARG" '%s' "$ARG"
+  printf -v "MS_SS_${up}_SRC" '%s' "$SRC"
+}
+
+ms_resolve_session() {
+  local root="${1:-}" path
+  MS_SS_MODEL_STATE="unset"; MS_SS_MODEL_RAW=""; MS_SS_MODEL_ARG=""; MS_SS_MODEL_SRC=""
+  MS_SS_EFFORT_STATE="unset"; MS_SS_EFFORT_RAW=""; MS_SS_EFFORT_ARG=""; MS_SS_EFFORT_SRC=""
+  _MS_SS_FILE_STATE=""; _MS_SS_FILE_ROWS=""; _MS_SS_FILE_REPORTED=0
+  if [[ -n "${RD_MODELS_CONFIG:-}" ]]; then
+    path="$RD_MODELS_CONFIG"
+    [[ "$path" == /* ]] || path="${root}/${path}"
+  else
+    path="${root}/rd-workflow/config/models.json"
+  fi
+  _ms_ss_col model "$path"
+  _ms_ss_col effort "$path"
+  return 0
+}
+
+# ------------------------------------------------------------
+# 구현 subagent 칸 해석 — spec 2026-11-23-1140-subagent-model-effort-selection D2
+# ms_resolve_subagent → 항상 rc 0. 경고는 stderr.
+#   전역: MS_SA_MODEL_ARG·MS_SA_EFFORT_ARG(넘길 값, 없으면 빈 값), MS_SA_PATH(models.json 실제 경로), MS_SA_LINE(표시 줄)
+# 모델 칸은 models.json subagent.claude.model, 비었으면 옛 키(model-strategy.json 의 subagent) 순이다. 기본값은 sonnet.
+# ------------------------------------------------------------
+# _ms_json_top_string <파일> <키> → stdout 값(문자열이 아니면 JSON 표기)
+#   rc 0 값 있음, rc 1 키 없음·null(파일이 없을 때 포함), rc 2 읽기 실패(최상위 객체 하나가 아님, jq·python3 없음)
+_ms_json_top_string() {
+  local f="$1" k="$2" out first
+  [[ -e "$f" ]] || return 1
+  if ms_jq_available; then
+    out="$(jq -s -r --arg k "$k" '
+      if (length == 1 and (.[0] | type == "object")) then
+        .[0][$k] as $v
+        | if $v == null then "N" else "V", ($v | if type == "string" then . else tojson end) end
+      else "BAD" end' "$f" 2>/dev/null)" || return 2
+  elif command -v python3 >/dev/null 2>&1; then
+    out="$(python3 -I - "$f" "$k" 2>/dev/null <<'PYEND'
+import json, sys
+f, k = sys.argv[1], sys.argv[2]
+dec = json.JSONDecoder()
+txt = open(f, encoding="utf-8").read()
+docs, i, n = [], 0, len(txt)
+while True:
+    while i < n and txt[i] in " \t\r\n":
+        i += 1
+    if i >= n:
+        break
+    d, i = dec.raw_decode(txt, i)
+    docs.append(d)
+if len(docs) != 1 or not isinstance(docs[0], dict):
+    print("BAD"); sys.exit(0)
+v = docs[0].get(k)
+if v is None:
+    print("N")
+else:
+    print("V")
+    sys.stdout.write(v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, separators=(",", ":")))
+PYEND
+    )" || return 2
+  else
+    return 2
+  fi
+  first="${out%%$'\n'*}"
+  case "$first" in
+    V) if [[ "$out" == *$'\n'* ]]; then printf '%s' "${out#*$'\n'}"; fi; return 0 ;;
+    N) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# _ms_sa_legacy_model — 모델 칸이 비었을 때만 부른다. MS_SA_MODEL_ARG 와 _MS_SA_MODEL_CELL 을 채운다.
+_ms_sa_legacy_model() {
+  local lf="${_MS_PROJECT_ROOT}/rd-workflow/config/model-strategy.json" v lrc=0
+  v="$(_ms_json_top_string "$lf" subagent)" || lrc=$?
+  case "$lrc" in
+    1)
+      MS_SA_MODEL_ARG="sonnet"; _MS_SA_MODEL_CELL="sonnet (기본값)" ;;
+    2)
+      echo "⚠️  ${lf} 를 읽을 수 없습니다 — subagent 모델은 sonnet 을 씁니다. models.json 의 subagent.claude.model 로 옮기십시오." >&2
+      MS_SA_MODEL_ARG="sonnet"; _MS_SA_MODEL_CELL="sonnet (기본값 — 경고 참조)" ;;
+    *)
+      case "$v" in
+        opus|sonnet|haiku|fable)
+          echo "ℹ️  subagent 모델을 model-strategy.json(옛 키)에서 읽었습니다 — models.json 의 subagent.claude.model 로 옮기십시오." >&2
+          MS_SA_MODEL_ARG="$v"; _MS_SA_MODEL_CELL="${v} (model-strategy.json subagent — 옛 키)" ;;
+        *)
+          echo "⚠️  model-strategy.json(옛 키) 의 subagent 값이 올바르지 않습니다: ${v} — 허용: opus·sonnet·haiku·fable. sonnet 을 씁니다." >&2
+          MS_SA_MODEL_ARG="sonnet"; _MS_SA_MODEL_CELL="sonnet (기본값 — 경고 참조)" ;;
+      esac ;;
+  esac
+}
+
+ms_resolve_subagent() {
+  local path rows="" rc=0 m_row e_row st val cls conv e_cell
+  MS_SA_MODEL_ARG=""; MS_SA_EFFORT_ARG=""; MS_SA_PATH=""; MS_SA_LINE=""
+  _MS_SA_MODEL_CELL=""
+  _ms_path_into path ms_models_path
+  [[ "$path" == /* ]] || path="${PWD}/${path}"
+  MS_SA_PATH="$path"
+  rows="$(_ms_claude_section_read "$path" subagent py)" || rc=$?
+
+  if [[ "$rc" -ne 0 ]]; then
+    # 파일 판정 실패·읽기 도구 없음: 두 칸 모두 못 읽는다. 경고는 한 번만 낸다.
+    if [[ "$rc" -eq 3 ]]; then
+      echo "⚠️  jq 와 python3 가 없어 ${path} 의 subagent 설정을 읽을 수 없습니다 — jq 를 설치하십시오(brew install jq). subagent 모델은 sonnet, effort 는 넘기지 않습니다." >&2
+    else
+      echo "⚠️  ${path} 를 해석할 수 없습니다 — 최상위 객체 하나여야 하고 subagent·subagent.claude 는 객체여야 합니다. 파일을 고치십시오. subagent 모델은 sonnet, effort 는 넘기지 않습니다." >&2
+    fi
+    MS_SA_MODEL_ARG="sonnet"
+    MS_SA_LINE="subagent 모델: sonnet (기본값 — 경고 참조) · effort: 넘기지 않음 (경고 참조)"
+    return 0
+  fi
+
+  m_row="$(printf '%s\n' "$rows" | awk -F'\t' '$1=="model"{print; exit}')"
+  e_row="$(printf '%s\n' "$rows" | awk -F'\t' '$1=="effort"{print; exit}')"
+
+  # 모델 칸
+  if [[ -n "$m_row" ]]; then
+    IFS=$'\t' read -r _ st val <<<"$m_row" || true
+    if [[ "$st" == "invalid" ]]; then cls="invalid"; else cls="$(ms_classify claude model "$val")"; fi
+    case "$cls" in
+      invalid)
+        echo "⚠️  models.json subagent.claude.model 값이 올바르지 않습니다: ${val} — 허용: opus·sonnet·haiku·fable, default, null(칸 비우기). sonnet 을 씁니다." >&2
+        MS_SA_MODEL_ARG="sonnet"; _MS_SA_MODEL_CELL="sonnet (기본값 — 경고 참조)" ;;
+      pinned)
+        echo "⚠️  models.json subagent.claude.model 의 '${val}' 은 고정 이름입니다 — Agent 도구는 별칭(opus·sonnet·haiku·fable)만 받습니다. sonnet 을 씁니다." >&2
+        MS_SA_MODEL_ARG="sonnet"; _MS_SA_MODEL_CELL="sonnet (기본값 — 경고 참조)" ;;
+      default)
+        MS_SA_MODEL_ARG=""; _MS_SA_MODEL_CELL="넘기지 않음 (default 지정 — Agent 도구 기본값)" ;;
+      *)
+        MS_SA_MODEL_ARG="$val"; _MS_SA_MODEL_CELL="${val} (models.json subagent.claude.model)" ;;
+    esac
+  else
+    _ms_sa_legacy_model
+  fi
+
+  # effort 칸
+  if [[ -n "$e_row" ]]; then
+    IFS=$'\t' read -r _ st val <<<"$e_row" || true
+    if [[ "$st" == "invalid" ]]; then cls="invalid"; else cls="$(ms_classify claude effort "$val")"; fi
+    case "$cls" in
+      invalid)
+        echo "⚠️  models.json subagent.claude.effort 값이 올바르지 않습니다: ${val} — 허용: $(_ms_allowed_text claude effort). effort 를 넘기지 않습니다." >&2
+        e_cell="넘기지 않음 (경고 참조)" ;;
+      default)
+        e_cell="넘기지 않음 (default 지정 — Agent 도구 기본값)" ;;
+      *)
+        conv="$(ms_convert_effort claude "$val" "")"
+        MS_SA_EFFORT_ARG="$conv"
+        if [[ "$conv" == "$val" ]]; then
+          e_cell="${val} (models.json subagent.claude.effort)"
+        else
+          e_cell="${val} → ${conv} (models.json subagent.claude.effort)"
+        fi ;;
+    esac
+  else
+    e_cell="넘기지 않음 (미설정)"
+  fi
+
+  MS_SA_LINE="subagent 모델: ${_MS_SA_MODEL_CELL} · effort: ${e_cell}"
+  return 0
+}
+
+# ------------------------------------------------------------
+# 낡은 Codex 모델 알림 (change-spec stale-pinned-model-warning D1~D5)
+# 리뷰 세션을 만들 때(init_review_pipeline.sh) Codex 리뷰 모델이 계열 최신이 아니면 stderr 로 한 번 알린다.
+# 알림 함수는 항상 rc 0 이다. 호출자의 `set -u` 아래에서도 돌도록 변수는 ${…:-} 로 읽는다.
+# ------------------------------------------------------------
+_MS_ST_TARGET=""; _MS_ST_KIND=""; _MS_ST_FROM=""; _MS_ST_FIX=""; _MS_ST_FIX_ENV=0; _MS_ST_FAM=""
+
+# _ms_review_first_tool <리뷰 종류> → stdout 에 이번 세션이 쓸 리뷰 도구 이름 또는 빈 값 (D1)
+# 리뷰 턴 루프(run_review_turn.sh Fallback 루프)는 어댑터 파일 없음·실행 파일 없음일 때만 다음 도구로 넘어간다.
+_ms_review_first_tool() {
+  local rt="${1:-}" _st_lp prio t bin
+  _ms_path_into _st_lp ms_legacy_path
+  ms_load_legacy "$_st_lp" "$rt" 2>/dev/null || true
+  prio="$(printf '%s\n' "${MS_LEGACY_KV:-}" | awk -F'\t' '$1=="priority"{print $2; exit}')"
+  [[ -n "$prio" ]] || prio="codex claude"
+  for t in $prio; do
+    [[ -f "${_MS_SELF_DIR}/adapter_${t}.sh" ]] || continue
+    bin="$(printf '%s\n' "${MS_LEGACY_KV:-}" | awk -F'\t' -v k="tool.${t}.bin" '$1==k{print $2; exit}')"
+    if [[ -z "$bin" || "$bin" == "null" ]]; then bin="$t"; fi
+    if command -v "$bin" >/dev/null 2>&1; then
+      printf '%s' "$t"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# _ms_toml_top_has <파일> <키> → 첫 `[` 절 앞에 그 키가 있으면 rc 0. 값의 형식은 따지지 않는다.
+# 키는 TOML 의 세 꼴(model, "model", 'model')을 모두 같은 키로 본다.
+# 여러 줄 문자열(""" ''')과 여러 줄 배열 안의 줄은 절 시작이나 키로 보지 않는다.
+#   ml: 열린 여러 줄 문자열의 구분자, d: 줄을 넘긴 배열의 깊이(문자열·주석 안의 괄호는 세지 않음).
+_ms_toml_top_has() {
+  [[ -f "${1:-}" ]] || return 1
+  awk -v k="$2" -v q="'" '
+    function n(s, t,   c, i) { c = 0; while ((i = index(s, t)) > 0) { c++; s = substr(s, i + length(t)) } return c }
+    function depth(s) {
+      gsub(/"([^"\\]|\\.)*"/, "", s); gsub(q "[^" q "]*" q, "", s); sub(/#.*/, "", s)
+      return gsub(/\[/, "[", s) - gsub(/\]/, "]", s)
+    }
+    ml != "" { if (n($0, ml) % 2) ml = ""; next }
+    d <= 0 && /^[ \t]*\[/ { exit }
+    d <= 0 && $0 ~ ("^[ \t]*(" k "|\"" k "\"|" q k q ")[ \t]*=") { f = 1; exit }
+    { if (n($0, "\"\"\"") % 2) ml = "\"\"\""; else if (n($0, q q q) % 2) ml = q q q; else d += depth($0) }
+    END { exit f ? 0 : 1 }' "$1" 2>/dev/null
+}
+
+# _ms_codex_other_layer → rc 0 이면 홈 config.toml 말고 다른 층(프로젝트 .codex/config.toml, 홈 profile)이
+# 모델을 정할 수 있다. 프로젝트 층은 .git(파일·폴더)이 있는 가장 가까운 상위 폴더까지만 본다 (D2).
+_ms_codex_other_layer() {
+  local hf d top="" f
+  hf="$(ms_codex_home)/config.toml"
+  if _ms_toml_top_has "$hf" profile; then return 0; fi
+  d="$_MS_PROJECT_ROOT"
+  while :; do
+    if [[ -e "$d/.git" ]]; then top="$d"; break; fi
+    [[ "$d" == "/" ]] && break
+    _ms_parent_of "$d"; d="$_MS_PARENT"
+  done
+  [[ -n "$top" ]] || top="$_MS_PROJECT_ROOT"
+  d="$_MS_PROJECT_ROOT"
+  while :; do
+    f="$d/.codex/config.toml"
+    if [[ -f "$f" && ! "$f" -ef "$hf" ]]; then
+      if _ms_toml_top_has "$f" model || _ms_toml_top_has "$f" profile; then return 0; fi
+    fi
+    [[ "$d" == "$top" || "$d" == "/" ]] && break
+    _ms_parent_of "$d"; d="$_MS_PARENT"
+  done
+  return 1
+}
+
+# MS_MODEL_ORIGIN(env:<변수> | file:<경로>#<칸>) → 사용자가 읽는 이름
+_ms_origin_text() {
+  local v="$1" f
+  case "$v" in
+    env:*)  printf '환경 변수 %s' "${v#env:}" ;;
+    file:*) f="${v#file:}"; printf '%s 의 %s' "${f%#*}" "${f##*#}" ;;
+    *)      printf '%s' "$v" ;;
+  esac
+}
+
+# _ms_codex_stale_target <리뷰 종류> → rc 0 이면 _MS_ST_* 를 채운다. rc 1 은 판정 안 함 (D2).
+_ms_codex_stale_target() {
+  local rt="${1:-}" o raw cls cm _st_mp
+  _MS_ST_TARGET=""; _MS_ST_KIND=""; _MS_ST_FROM=""; _MS_ST_FIX=""; _MS_ST_FIX_ENV=0; _MS_ST_FAM=""
+  ms_resolve_review codex unknown "$rt" 2>/dev/null || true
+  o="${MS_MODEL_ORIGIN:-}"; raw="${MS_MODEL_RAW:-}"
+  if [[ -n "${MS_MODEL_VALUE:-}" ]]; then
+    cls="$(ms_classify codex model "$raw")"
+    [[ "$cls" == "pinned" ]] || return 1
+    _MS_ST_TARGET="$MS_MODEL_VALUE"; _MS_ST_KIND="project"
+    _MS_ST_FROM="$(_ms_origin_text "$o")"; _MS_ST_FIX="$_MS_ST_FROM"
+  else
+    case "$o" in
+      env:*|file:*|cli-default) ;;
+      *) return 1 ;;
+    esac
+    cm="$(ms_codex_config_model)"
+    [[ -n "$cm" ]] || return 1
+    if _ms_codex_other_layer; then return 1; fi
+    _MS_ST_TARGET="$cm"; _MS_ST_KIND="config"
+    _MS_ST_FROM="$(ms_codex_home)/config.toml 의 model"
+    if [[ "$o" == "cli-default" ]]; then
+      _ms_path_into _st_mp ms_models_path
+      _MS_ST_FIX="${_st_mp} 의 review.codex.model"
+    else
+      _MS_ST_FIX="$(_ms_origin_text "$o")"
+    fi
+  fi
+  case "$_MS_ST_FIX" in "환경 변수 "*) _MS_ST_FIX_ENV=1 ;; esac
+  _MS_ST_FAM="${_MS_ST_TARGET##*-}"
+  return 0
+}
+
+# _ms_codex_newer <slug> → rc 0 + stdout 새 모델 / rc 1 새 모델 없음 / rc 2 판정 불가 (D3)
+_ms_codex_newer() {
+  local slug="${1:-}" cache out
+  cache="$(ms_codex_home)/models_cache.json"
+  ms_jq_available || return 2
+  [[ -f "$cache" ]] || return 2
+  out="$(jq -r --arg s "$slug" "${_MS_JQ_LATEST}"'
+    ([ $s | capture("^gpt-(?<v>[0-9]+(\\.[0-9]+)*)-(?<f>[a-z]+)$")? ] | first // null) as $c
+    | if $c == null then "unknown"
+      else ms_latest($c.f) as $l
+        | if $l == null then "unknown"
+          elif $l.v > ($c.v | split(".") | map(tonumber)) then "new:" + $l.s
+          else "same" end
+      end
+  ' "$cache" 2>/dev/null)" || return 2
+  case "$out" in
+    new:*) printf '%s' "${out#new:}"; return 0 ;;
+    same)  return 1 ;;
+    *)     return 2 ;;
+  esac
+}
+
+# _ms_keep_file → stdout 기록 파일 경로 (D5). XDG_STATE_HOME 이 `/` 로 시작할 때만 쓰고, 아니면 $HOME/.local/state.
+_ms_keep_file() {
+  local s="${XDG_STATE_HOME:-}"
+  [[ "$s" == /* ]] || s="${HOME:-}/.local/state"
+  printf '%s/rd-workflow/codex-model-keep.tsv' "$s"
+}
+
+# _ms_keep_has <현재> <새 모델> → 두 칸이 모두 같은 줄이 있으면 rc 0. 파일을 읽지 못하면 없는 것으로 본다.
+_ms_keep_has() {
+  local f
+  f="$(_ms_keep_file)"
+  [[ -f "$f" ]] || return 1
+  awk -F'\t' -v a="$1" -v b="$2" '$1 == a && $2 == b { f = 1 } END { exit f ? 0 : 1 }' "$f" 2>/dev/null
+}
+
+# ms_codex_stale_notice <리뷰 종류> → 항상 rc 0, 출력은 stderr (D4)
+ms_codex_stale_notice() {
+  local rt="${1:-}" tool new rc fam cmd cache mc
+  ms_jq_available || return 0
+  tool="$(_ms_review_first_tool "$rt")"
+  [[ "$tool" == "codex" ]] || return 0
+  _ms_codex_stale_target "$rt" || return 0
+  fam="${_MS_ST_FAM:-}"
+  if new="$(_ms_codex_newer "${_MS_ST_TARGET:-}")"; then rc=0; else rc=$?; fi
+  case "$rc" in
+    0)
+      _ms_keep_has "${_MS_ST_TARGET:-}" "$new" && return 0
+      cmd=""
+      if [[ "${_MS_ST_FIX_ENV:-0}" != 1 ]]; then
+        mc=""
+        if [[ -n "${RD_MODELS_CONFIG:-}" ]]; then mc="RD_MODELS_CONFIG=$(printf %q "$RD_MODELS_CONFIG") "; fi
+        cmd=" (${mc}bash rd-workflow/scripts/model_select.sh set review.codex.model ${fam})"
+      fi
+      {
+        echo "⚠️  Codex 리뷰 모델 '${_MS_ST_TARGET}'(${_MS_ST_FROM})보다 새 모델 '${new}' 이 있습니다 — 늘 최신을 쓰려면 ${_MS_ST_FIX} 을 계열 이름 '${fam}' 로 두십시오.${cmd}"
+        echo "    선택 1 — 이번만 옛 모델로 진행: 그대로 리뷰를 잇습니다. 다음 리뷰 세션에서 다시 알립니다."
+        echo "    선택 2 — 옛 모델을 계속 쓰고 기록: bash rd-workflow/scripts/model_select.sh keep-codex-model ${_MS_ST_TARGET} ${new} (${new} 은 다시 알리지 않고, 더 새 ${fam} 모델이 나오면 다시 알립니다)"
+        echo "    AI 가 실행했다면: 사용자에게 물을 수 있으면 첫 리뷰 턴 전에 두 선택지를 묻고 답대로 진행합니다. 물을 수 없는 무인 실행(autopilot·claude -p)이면 묻지 않고 선택 1 로 진행하고, 그 실행의 보고에 이 경고를 옮깁니다."
+      } >&2 ;;
+    2)
+      if [[ "${_MS_ST_KIND:-}" == "project" ]]; then
+        cache="$(ms_codex_home)/models_cache.json"
+        echo "⚠️  Codex 리뷰 모델 '${_MS_ST_TARGET}'(${_MS_ST_FROM})은 고정 이름입니다 — 고정됨, 낡을 수 있음. 모델 목록(${cache})에서 최신인지 확인하지 못했습니다." >&2
+      fi ;;
+  esac
+  return 0
+}
+
+# keep-codex-model <현재 모델> <새 모델> — 옛 모델을 계속 쓰기로 한 조합을 기록한다 (D5). jq 없이도 돈다.
+_ms_cli_keep_codex_model() {
+  local cur new f d lock i reason="" pre="" rc=0
+  if [[ $# -ne 2 ]]; then
+    echo "사용법: bash rd-workflow/scripts/model_select.sh keep-codex-model <현재 모델> <새 모델>" >&2
+    return 1
+  fi
+  cur="$1"; new="$2"
+  if [[ "$(ms_classify codex model "$cur")" != "pinned" || "$(ms_classify codex model "$new")" != "pinned" ]]; then
+    reason="두 값 모두 gpt-<버전>-<계열> 고정 이름이어야 합니다"
+  elif [[ "${cur##*-}" != "${new##*-}" ]]; then
+    reason="두 모델의 계열이 다릅니다"
+  elif [[ "$cur" == "$new" ]]; then
+    reason="두 모델이 같습니다"
+  fi
+  if [[ -n "$reason" ]]; then
+    echo "⚠️  기록하지 않았습니다: ${reason}" >&2
+    return 1
+  fi
+  f="$(_ms_keep_file)"
+  _ms_parent_of "$f"; d="$_MS_PARENT"
+  if ! mkdir -p "$d" 2>/dev/null; then
+    echo "⚠️  기록하지 못했습니다(${f}) — 폴더를 만들지 못함." >&2
+    return 1
+  fi
+  # 중복 확인부터 덧붙이기까지를 잠금 폴더 하나로 묶는다. 두 기록이 겹쳐도 같은 쌍은 한 줄만 남는다.
+  # 잠금은 0.05초 간격으로 30번 시도한다(부하에 따라 몇 초). 강제 종료로 잠금 폴더가 남으면 사용자가 지우도록 안내한다.
+  lock="${f}.lock"; i=0
+  until mkdir "$lock" 2>/dev/null; do
+    i=$((i + 1))
+    if [[ $i -ge 30 ]]; then
+      echo "⚠️  기록하지 못했습니다(${f}) — 다른 기록이 끝나지 않았거나 폴더(${d})에 쓸 수 없음. 잠금 폴더(${lock})가 남아 있으면 지운 뒤 다시 실행하십시오." >&2
+      return 1
+    fi
+    sleep 0.05
+  done
+  if _ms_keep_has "$cur" "$new"; then
+    echo "이미 기록돼 있습니다: '${cur}' 을 계속 쓰고 '${new}' 은 다시 알리지 않습니다(${f})."
+  else
+    # 마지막 줄이 줄바꿈 없이 끝났으면 먼저 줄바꿈을 쓴다. 보충과 새 줄은 한 번의 리디렉션으로 쓴다.
+    if [[ -f "$f" && -s "$f" && -n "$(tail -c 1 "$f" 2>/dev/null)" ]]; then pre=$'\n'; fi
+    if { printf '%s%s\t%s\n' "$pre" "$cur" "$new" >> "$f"; } 2>/dev/null; then
+      echo "기록했습니다: '${cur}' 을 계속 쓰고 '${new}' 은 다시 알리지 않습니다(${f}). 더 새 ${cur##*-} 모델이 나오면 다시 알립니다."
+    else
+      echo "⚠️  기록하지 못했습니다(${f}) — 파일에 쓰지 못함." >&2
+      rc=1
+    fi
+  fi
+  rmdir "$lock" 2>/dev/null
+  return "$rc"
+}
+
 
 # ------------------------------------------------------------
 # 실제 값 관측 (spec D8) — 표시·계측 전용
@@ -703,6 +1394,8 @@ _ms_cli_set() {
     review.codex.small_task_effort)  tool=codex;  kind=effort; pathjson='["review","codex","small_task_effort"]' ;;
     review.claude.model)             tool=claude; kind=model;  pathjson='["review","claude","model"]' ;;
     review.claude.effort)            tool=claude; kind=effort; pathjson='["review","claude","effort"]' ;;
+    subagent.claude.model)           tool=claude; kind=model;  pathjson='["subagent","claude","model"]' ;;
+    subagent.claude.effort)          tool=claude; kind=effort; pathjson='["subagent","claude","effort"]' ;;
     review.codex.review_types.*.effort)
       rt="${key#review.codex.review_types.}"; rt="${rt%.effort}"
       if ! [[ "$rt" =~ ^[A-Za-z0-9_-]+$ ]]; then
@@ -710,12 +1403,20 @@ _ms_cli_set() {
       fi
       tool=codex; kind=effort; pathjson="[\"review\",\"codex\",\"review_types\",\"${rt}\",\"effort\"]" ;;
     *)
-      echo "⚠️  알 수 없는 칸입니다: ${key} (허용: review.codex.model·review.codex.effort·review.codex.small_task_effort·review.codex.review_types.<종류>.effort·review.claude.model·review.claude.effort). models.json 은 바꾸지 않았습니다." >&2
+      echo "⚠️  알 수 없는 칸입니다: ${key} (허용: review.codex.model·review.codex.effort·review.codex.small_task_effort·review.codex.review_types.<종류>.effort·review.claude.model·review.claude.effort·subagent.claude.model·subagent.claude.effort). models.json 은 바꾸지 않았습니다." >&2
       return 1 ;;
   esac
   if [[ "$val" == "null" ]]; then
     valjson="null"
   else
+    if [[ "$key" == "subagent.claude.model" ]]; then
+      case "$(ms_classify claude model "$val")" in
+        alias|default) ;;
+        *)
+          echo "⚠️  subagent.claude.model 에 쓸 수 없는 값입니다: ${val} — Agent 도구는 별칭만 받습니다: opus·sonnet·haiku·fable, default, null(칸 비우기). models.json 은 바꾸지 않았습니다." >&2
+          return 1 ;;
+      esac
+    fi
     if [[ "$(ms_classify "$tool" "$kind" "$val")" == "invalid" ]]; then
       echo "⚠️  ${key} 에 쓸 수 없는 값입니다: ${val} — $(_ms_allowed_text "$tool" "$kind"). models.json 은 바꾸지 않았습니다." >&2
       return 1
@@ -733,14 +1434,14 @@ _ms_cli_set_legacy() {
     echo "사용법: bash model_select.sh set-legacy <경로> <JSON 값>" >&2; return 1
   fi
   case "$key" in
-    default_priority|tools.codex.bin|tools.claude.bin|tools.gemini.bin|tools.claude.self_review_policy|tools.gemini.model)
+    default_priority|tools.codex.bin|tools.claude.bin|tools.claude.self_review_policy)
       ok=1 ;;
     overrides.*.priority)
       local rt="${key#overrides.}"; rt="${rt%.priority}"
       [[ "$rt" =~ ^[A-Za-z0-9_-]+$ ]] && ok=1 ;;
   esac
   if [[ $ok -ne 1 ]]; then
-    echo "⚠️  review-tools.json 의 ${key} 는 이 명령으로 쓸 수 없습니다 (허용: default_priority·tools.<codex|claude|gemini>.bin·tools.claude.self_review_policy·tools.gemini.model·overrides.<종류>.priority). 모델·effort 는 set 으로 models.json 에 쓰십시오. review-tools.json 은 바꾸지 않았습니다." >&2
+    echo "⚠️  review-tools.json 의 ${key} 는 이 명령으로 쓸 수 없습니다 (허용: default_priority·tools.<codex|claude>.bin·tools.claude.self_review_policy·overrides.<종류>.priority). 모델·effort 는 set 으로 models.json 에 쓰십시오. review-tools.json 은 바꾸지 않았습니다." >&2
     return 1
   fi
   if ! jq -n --argjson v "$val" '$v' >/dev/null 2>&1; then
@@ -871,10 +1572,43 @@ _ms_cli_show() {
   fi
 }
 
+_ms_headless_usage() {
+  cat >&2 <<'EOF'
+사용법:
+  bash rd-workflow/scripts/model_select.sh headless [--model <값>] [--effort <값>]
+EOF
+}
+
+_ms_cli_headless() {
+  local fm="" fe="" hm=0 he=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model)
+        [[ "$hm" == 0 && $# -ge 2 && -n "$2" && "$2" != --* ]] || { _ms_headless_usage; return 1; }
+        fm="$2"; hm=1; shift 2 ;;
+      --effort)
+        [[ "$he" == 0 && $# -ge 2 && -n "$2" && "$2" != --* ]] || { _ms_headless_usage; return 1; }
+        fe="$2"; he=1; shift 2 ;;
+      *) _ms_headless_usage; return 1 ;;
+    esac
+  done
+  ms_resolve_headless 1 "$fm" "$fe" || return 1
+  printf '%s\n' "$MS_HL_LINE"
+}
+
+# bash model_select.sh subagent — 인자 없음. 해석 결과를 네 줄로 낸다(model=, effort=, 설정 파일:, 표시 줄).
+_ms_cli_subagent() {
+  if [[ $# -ne 0 ]]; then
+    echo "사용법: bash rd-workflow/scripts/model_select.sh subagent" >&2; return 1
+  fi
+  ms_resolve_subagent
+  printf 'model=%s\neffort=%s\n설정 파일: %s\n%s\n' "$MS_SA_MODEL_ARG" "$MS_SA_EFFORT_ARG" "$MS_SA_PATH" "$MS_SA_LINE"
+}
+
 _ms_main() {
   local sub="${1:-}"
   [[ $# -gt 0 ]] && shift
-  if ! ms_jq_available && [[ "$sub" != "" ]]; then
+  if ! ms_jq_available && [[ "$sub" != "" && "$sub" != "headless" && "$sub" != "subagent" && "$sub" != "keep-codex-model" ]]; then
     echo "⚠️  jq 가 없어 실행할 수 없습니다 (brew install jq)." >&2
     return 1
   fi
@@ -883,6 +1617,9 @@ _ms_main() {
     set)        _ms_cli_set "$@" ;;
     set-legacy) _ms_cli_set_legacy "$@" ;;
     apply)      _ms_cli_apply "$@" ;;
+    headless)   _ms_cli_headless "$@" ;;
+    subagent)   _ms_cli_subagent "$@" ;;
+    keep-codex-model) _ms_cli_keep_codex_model "$@" ;;
     *)
       cat >&2 <<'EOF'
 사용법:
@@ -890,6 +1627,9 @@ _ms_main() {
   bash rd-workflow/scripts/model_select.sh set <칸> <값|null>
   bash rd-workflow/scripts/model_select.sh set-legacy <경로> <JSON 값>
   bash rd-workflow/scripts/model_select.sh apply <저장 목록 파일>
+  bash rd-workflow/scripts/model_select.sh headless [--model <값>] [--effort <값>]
+  bash rd-workflow/scripts/model_select.sh subagent
+  bash rd-workflow/scripts/model_select.sh keep-codex-model <현재 모델> <새 모델>
 EOF
       return 1 ;;
   esac

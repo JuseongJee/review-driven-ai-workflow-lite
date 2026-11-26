@@ -530,3 +530,175 @@ EOF_LC
   printf 'standard 로 상향 — %s (반영 방식 %s, team_publish.light=pr)\n' "$hit" "$hitmode"
   return 3
 }
+
+# tp_manual_lag <submodule 디렉터리> <gitlink OID> [<대상 브랜치>] — gitlink 를 팀 원격(origin)의 대상 브랜치 끝과 견줍니다.
+#   반영 방식 manual 인 submodule 은 팀 반영을 사용자가 하므로 gitlink 가 작업 커밋에 남습니다. promote 알림과 archive 안내가 씁니다.
+#   대상 브랜치가 비면 `git ls-remote --symref origin HEAD` 가 가리키는 브랜치입니다(호출부가 team_publish.base 를 넘깁니다).
+#   끝 커밋 객체가 로컬에 없을 때만 그 브랜치를 refs/remotes/origin/<브랜치> 로 받습니다.
+#   원격 조회는 RD_TP_LAG_TIMEOUT 초(기본 20) 상한이고 _tp_run_bounded 로 부른 쪽 프로세스 그룹 안에서 돕니다. 입력을 묻지 않습니다(rd_git_noprompt_env — 부르는 쪽이 _merge_precheck.sh 를
+#   싣지 않았으면 처음 부를 때 싣습니다. _dup_guard.sh 와 같은 방식입니다).
+#   결과 한 줄 `<상태><TAB><브랜치><TAB><끝 OID><TAB><뒤 커밋 수>` 를 _TP_LAG_RESULT 에 두고 stdout 으로도 내며 rc 0 입니다.
+#   호출부는 명령 치환 없이 부르고(`tp_manual_lag … >/dev/null`) _TP_LAG_RESULT·_TP_LAG_CAUSE 를 읽습니다 — 명령 치환은 하위 셸이라
+#   실패 원인(_TP_LAG_CAUSE)이 호출부로 돌아오지 않습니다. 상태는
+#     same     gitlink 가 끝과 같음 (뒤 커밋 수 0)
+#     behind   gitlink 가 브랜치 이력 안에 있고 끝보다 뒤 커밋 수만큼 뒤짐
+#     outside  gitlink 가 브랜치 이력에 없음 (작업 커밋·확인용 브랜치 커밋 등, 뒤 커밋 수 -)
+#   판정하지 못하면(초기화 안 됨·origin 없음·조회 실패·시간 초과·객체 없음·얕은 복제라 조상 판정 불가) 출력 없이 rc 1 입니다.
+#   원인 한 줄은 _TP_LAG_CAUSE 에 둡니다.
+#   fetch 는 대상 브랜치의 원격 추적 ref 하나만 갱신합니다 — --no-tags(태그를 따라 받지 않음), --no-write-fetch-head(FETCH_HEAD 를
+#   덮지 않음), --no-recurse-submodules(fetch.recurseSubmodules 설정이 있어도 중첩 submodule 을 받지 않음),
+#   --refmap=(remote.origin.fetch 의 다른 매핑을 함께 갱신하지 않음).
+# _tp_run_bounded <상한 초> <stderr 파일> <명령…> — 명령을 상한 안에서 돌리고 stdout 을 냅니다. 시간 초과는 rc 124.
+#   원격 명령은 자기 프로세스 그룹으로 띄웁니다. git 이 띄운 전송 하위 프로세스(ssh·upload-pack·remote helper)는 부모가 먼저
+#   끝나 init 으로 옮겨져도 그 그룹에 남으므로, 그룹째 끝내면 ps 로 트리를 찾지 않아도 모두 끝납니다.
+#   감시는 부른 쪽 그룹에 두고(job control 을 끄고 띄움) 다음 경우 원격 명령 그룹을 끝냅니다.
+#     (1) 상한에 닿음 → TERM, 2초 뒤 KILL. 그사이 git 이 먼저 끝나 호출부가 감시에 TERM 을 보내면 (3)처럼 바로 KILL 합니다.
+#     (2) 부른 쪽 그룹이 회수됨(무인 발행의 시간 상한·신호가 archive 그룹에 보내는 TERM) → 감시가 TERM 을 받아 바로 TERM·KILL.
+#         유예가 짧아(1초) 감시가 곧 KILL 되어도 그 전에 끝냅니다.
+#     (3) 원격 명령이 먼저 끝남 → 호출부가 감시에 TERM, 감시가 남은 하위 프로세스가 있으면 끝냅니다.
+#   터미널의 Ctrl-C 는 부른 쪽 그룹에만 닿습니다. 실행 중에만 INT trap 을 걸어 감시와 원격 명령 그룹을 끝내고 130 으로 끝냅니다.
+#   정상 반환이면 부른 쪽의 INT trap 을 되돌립니다.
+#   _rd_run_limited 는 감시도 새 그룹으로 띄워 (2)·Ctrl-C 가 닿지 않으므로 여기서 쓰지 않습니다.
+_TP_RB_PID=""; _TP_RB_WD=""; _TP_RB_GRACE=""
+# _tp_rb_end_group <KILL 전 대기 초> — 원격 명령 그룹에 TERM, 대기 뒤 KILL. 그룹이 비었으면 아무것도 하지 않습니다.
+#   유예 타이머 pid 는 _TP_RB_GRACE 에 둡니다 — 유예 중 감시가 TERM 을 받으면 trap 이 그 타이머도 끝내, 부른 쪽 그룹에
+#   sleep 이 남아 발행 큐의 그룹 대기를 붙잡지 않게 합니다.
+_tp_rb_end_group() {
+  [[ -n "$_TP_RB_PID" ]] || return 0
+  kill -0 -- "-$_TP_RB_PID" 2>/dev/null || return 0
+  kill -TERM -- "-$_TP_RB_PID" 2>/dev/null
+  if [[ "$1" != 0 ]]; then sleep "$1" & _TP_RB_GRACE=$!; wait "$_TP_RB_GRACE"; _TP_RB_GRACE=""; fi
+  kill -KILL -- "-$_TP_RB_PID" 2>/dev/null
+  return 0
+}
+_tp_rb_on_int() {
+  [[ -z "$_TP_RB_WD" ]] || kill -TERM "$_TP_RB_WD" 2>/dev/null
+  _tp_rb_end_group 0
+  trap - INT
+  # 원래대로라면 INT 로 끝났을 셸을 130(128+SIGINT)으로 끝냅니다. 부른 쪽의 EXIT trap(락 해제 등)은 그대로 돕니다.
+  #   INT 를 다시 받아 끝내지 않는 이유: bash 3.2 에는 $BASHPID 가 없어 하위 셸에서 지금 셸의 pid 를 확실히 구할 수 없습니다.
+  exit 130
+}
+_tp_run_bounded() {
+  local lim="$1" errf="$2" rc=0 outf flag had_m=0 old_int
+  shift 2
+  flag="$(mktemp "${TMPDIR:-/tmp}/rd-tpb.XXXXXX")" || return 1
+  outf="$(mktemp "${TMPDIR:-/tmp}/rd-tpb-out.XXXXXX")" || { rm -f "$flag"; return 1; }
+  [[ "$-" == *m* ]] && had_m=1
+  old_int="$(trap -p INT)"
+  set -m
+  "$@" </dev/null >"$outf" 2>"$errf" &
+  _TP_RB_PID=$!
+  set +m
+  ( s=""
+    trap 'kill "$s" ${_TP_RB_GRACE:+"$_TP_RB_GRACE"} 2>/dev/null; _tp_rb_end_group 0; exit 0' TERM
+    sleep "$lim" & s=$!
+    wait "$s"
+    if kill -0 "$_TP_RB_PID" 2>/dev/null; then
+      echo 1 > "$flag"
+      _tp_rb_end_group 2
+    fi ) >/dev/null 2>&1 &
+  _TP_RB_WD=$!
+  [[ "$had_m" == 1 ]] && set -m
+  trap '_tp_rb_on_int' INT
+  wait "$_TP_RB_PID" 2>/dev/null || rc=$?
+  # 감시를 끝냅니다 — 감시의 TERM trap 이 남은 하위 프로세스(상한 뒤 TERM 을 무시한 것 포함)를 그룹째 KILL 합니다.
+  kill -TERM "$_TP_RB_WD" 2>/dev/null || true
+  wait "$_TP_RB_WD" 2>/dev/null || true
+  if [[ -n "$old_int" ]]; then eval "$old_int"; else trap - INT; fi
+  _TP_RB_PID=""; _TP_RB_WD=""
+  [[ -s "$flag" ]] && rc=124
+  [[ "$rc" == 124 ]] || cat "$outf"
+  rm -f "$flag" "$outf"
+  return "$rc"
+}
+
+_TP_LAG_CAUSE=""
+_TP_LAG_RESULT=""
+tp_manual_lag() {
+  local dir="${1:?dir}" oid="${2:?oid}" br="${3-}" lim errf out rc=0 tip="" cnt
+  _TP_LAG_CAUSE=""; _TP_LAG_RESULT=""
+  declare -F rd_git_noprompt_env >/dev/null 2>&1 \
+    || source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_merge_precheck.sh" \
+    || { _TP_LAG_CAUSE="_merge_precheck.sh 를 싣지 못했습니다"; return 1; }
+  lim="${RD_TP_LAG_TIMEOUT:-20}"
+  [[ "$lim" =~ ^[1-9][0-9]*$ ]] || lim=20
+  if ! _rd_is_repo_root "$dir"; then _TP_LAG_CAUSE="submodule 이 초기화되지 않았습니다"; return 1; fi
+  if ! git -C "$dir" remote get-url origin >/dev/null 2>&1; then _TP_LAG_CAUSE="팀 원격 origin 이 없습니다"; return 1; fi
+  if ! git -C "$dir" cat-file -e "${oid}^{commit}" 2>/dev/null; then _TP_LAG_CAUSE="gitlink 커밋 ${oid:0:7} 이 submodule 에 없습니다"; return 1; fi
+  errf="$(mktemp "${TMPDIR:-/tmp}/rd-tplag.XXXXXX")" || { _TP_LAG_CAUSE="임시 파일을 만들 수 없습니다"; return 1; }
+  rd_git_noprompt_env "$dir"
+  if [[ -z "$br" ]]; then
+    out="$(_tp_run_bounded "$lim" "$errf" "${RD_GIT_NOPROMPT_ENV[@]}" git -C "$dir" ls-remote --symref origin HEAD)" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      br="$(printf '%s\n' "$out" | awk -F'\t' '$2 == "HEAD" && $1 ~ /^ref: refs\/heads\// { sub(/^ref: refs\/heads\//, "", $1); print $1; exit }')"
+      tip="$(printf '%s\n' "$out" | awk -F'\t' '$2 == "HEAD" && $1 !~ /^ref:/ { print $1; exit }')"
+    fi
+  else
+    out="$(_tp_run_bounded "$lim" "$errf" "${RD_GIT_NOPROMPT_ENV[@]}" git -C "$dir" ls-remote origin "refs/heads/${br}")" || rc=$?
+    [[ "$rc" -ne 0 ]] || tip="$(printf '%s\n' "$out" | awk -F'\t' -v r="refs/heads/${br}" '$2 == r { print $1; exit }')"
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    if [[ "$rc" -eq 124 ]]; then _TP_LAG_CAUSE="${lim}초 안에 끝나지 않았습니다"
+    else _TP_LAG_CAUSE="$(sed -n 1p "$errf" 2>/dev/null)"; [[ -n "$_TP_LAG_CAUSE" ]] || _TP_LAG_CAUSE="git 종료 코드 $rc"; fi
+    rm -f "$errf"; return 1
+  fi
+  if [[ -z "$br" || -z "$tip" ]]; then
+    _TP_LAG_CAUSE="팀 원격의 기본 브랜치${br:+ ${br}} 를 찾지 못했습니다"
+    rm -f "$errf"; return 1
+  fi
+  if ! git -C "$dir" cat-file -e "${tip}^{commit}" 2>/dev/null; then
+    rc=0
+    _tp_run_bounded "$lim" "$errf" "${RD_GIT_NOPROMPT_ENV[@]}" git -C "$dir" fetch -q --no-tags --no-write-fetch-head --no-recurse-submodules --refmap= origin "+refs/heads/${br}:refs/remotes/origin/${br}" >/dev/null || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      if [[ "$rc" -eq 124 ]]; then _TP_LAG_CAUSE="${lim}초 안에 끝나지 않았습니다"
+      else _TP_LAG_CAUSE="$(sed -n 1p "$errf" 2>/dev/null)"; [[ -n "$_TP_LAG_CAUSE" ]] || _TP_LAG_CAUSE="git 종료 코드 $rc"; fi
+      rm -f "$errf"; return 1
+    fi
+    # 조회와 받기 사이에 원격이 움직였으면 받은 끝을 씁니다.
+    git -C "$dir" cat-file -e "${tip}^{commit}" 2>/dev/null \
+      || tip="$(git -C "$dir" rev-parse -q --verify "refs/remotes/origin/${br}^{commit}" 2>/dev/null)" || tip=""
+    if [[ -z "$tip" ]]; then _TP_LAG_CAUSE="origin/${br} 를 받았지만 끝 커밋을 읽지 못했습니다"; rm -f "$errf"; return 1; fi
+  fi
+  rm -f "$errf"
+  if [[ "$oid" == "$tip" ]]; then
+    _TP_LAG_RESULT="same"$'\t'"$br"$'\t'"$tip"$'\t'"0"
+  else
+    rc=0; git -C "$dir" merge-base --is-ancestor "$oid" "$tip" 2>/dev/null || rc=$?
+    case "$rc" in
+      0) cnt="$(git -C "$dir" rev-list --count "${oid}..${tip}" 2>/dev/null)" || cnt="?"
+         _TP_LAG_RESULT="behind"$'\t'"$br"$'\t'"$tip"$'\t'"$cnt" ;;
+      1)
+        # 얕은 복제는 잘린 이력 때문에 기본 브랜치 안의 커밋도 조상이 아니라고 답할 수 있습니다 — 기본 브랜치 밖이라고 단정하지 않습니다.
+        if [[ "$(git -C "$dir" rev-parse --is-shallow-repository 2>/dev/null)" == true ]]; then
+          _TP_LAG_CAUSE="얕은 복제라 기본 브랜치 이력에 있는지 판정할 수 없습니다 — git -C $(printf '%q' "$dir") fetch --unshallow origin 뒤 다시 확인하십시오"
+          return 1
+        fi
+        _TP_LAG_RESULT="outside"$'\t'"$br"$'\t'"$tip"$'\t'"-" ;;
+      *) _TP_LAG_CAUSE="조상 판정이 실패했습니다(git 종료 코드 $rc)"; return 1 ;;
+    esac
+  fi
+  printf '%s\n' "$_TP_LAG_RESULT"
+  return 0
+}
+
+# tp_config_key <root> <submodule-path> <key> — 그 경로의 <key> 값을 정하는 설정 키 이름을 냅니다(안내 문구용).
+#   경로별 team_publish.submodules.<경로>.<key> 가 있으면 그 이름, 없으면 team_publish.<key> 입니다. 읽지 못해도 후자를 냅니다.
+tp_config_key() {
+  local root="${1:?root}" sub="${2:?sub}" key="${3:?key}" f
+  f="$(_tp_cfg_file "$root")"
+  if [[ -f "$f" ]] && python3 -I - "$f" "$sub" "$key" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    sv = d["team_publish"]["submodules"][sys.argv[2]]
+    sys.exit(0 if isinstance(sv, dict) and sys.argv[3] in sv else 1)
+except Exception:
+    sys.exit(1)
+PY
+  then
+    printf 'team_publish.submodules.%s.%s\n' "$sub" "$key"
+  else
+    printf 'team_publish.%s\n' "$key"
+  fi
+}

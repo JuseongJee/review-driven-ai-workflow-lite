@@ -63,7 +63,7 @@
 
 - `full` 은 `REQUEST review`, `spec/plan review`, `final diff review`를 건너뛰지 않는다. `standard` 는 `final diff review` 를 건너뛰지 않는다.
 - `prepare_review_pipeline.sh`로 세션을 만들고 `run_review_turn.sh`로 턴을 잇는다. 최신 Reviewer 턴이 `이의 없음`을 명시할 때까지 이어가고, 사람 결정이 필요하거나 총 20턴에 도달하면 `awaiting-user`로 바꾸고 멈춘다.
-- 6턴(`REVIEW_SCOPE_NARROW_AFTER`)을 넘긴 Reviewer 턴부터는 사람에게 묻지 않고 범위를 줄인다. 기본 사용 경로의 결함·데이터 손실·보안·REQUEST/AC/spec 이탈·검증 공백만 종결을 막고, 드문 환경의 문제와 방어 절차 추가 요청은 `범위 밖:` 줄로 돌린다(`run_review_turn.sh` 가 리뷰어 지시에 넣는다).
+- 6턴(`REVIEW_SCOPE_NARROW_AFTER`)을 넘긴 Reviewer 턴부터는 사람에게 묻지 않고 범위를 줄인다. 종결을 막는 이의와 `범위 밖:` 줄의 기준은 `FILE_BASED_REVIEW_PIPELINE.md` 「범위 축소」 를 따른다(`run_review_turn.sh` 가 리뷰어 지시에 넣는다). final diff review 에서는 PR 본문 「맞닿은 곳」 목록의 곳을 드문 환경으로 돌리지 않는다.
 - **autopilot·반자율 모드에서는** `rd-workflow/docs/flows/AUTONOMY.md`의 자율 실행 규칙(예: 턴 한도 50턴)이 이 섹션보다 우선한다.
 - **REQUEST review 축약**: spec이 사용자 승인 완료 + REQUEST.md가 그 spec을 참조(승인된 결정의 백필)이면 1턴 확인으로 축약한다. 1턴에서 이의가 나오면 일반 수렴 규칙으로 복귀한다.
 - 세션 종료 시 `rd-workflow-workspace/reports/reviews/`에 주요 쟁점과 결론을 요약한 report를 쓴다.

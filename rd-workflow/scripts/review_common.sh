@@ -653,21 +653,33 @@ ${_rp_fb_note}     Follow the review criteria referenced in \"Review goal\" abov
       printf '%s\n\n' "$_attempt_history"
     fi
     if [[ -n "$_rp_decided" ]]; then
+      # final diff review 한정: 앞선 Reviewer 턴의 범위 밖 줄은 PR 본문 「맞닿은 곳」 목록의 곳을 덮지 않는다
+      local _rp_decided_contact=""
+      if [[ "$review_type" == "diff-review" ]]; then
+        _rp_decided_contact='- Final diff review: a line from an earlier reviewer turn does not cover a point on the "맞닿은 곳" list in the PR body. Review that point as usual. A line marked "결정: 사람" still applies.
+'
+      fi
       cat <<EOF
 ALREADY DECIDED OUT OF SCOPE (by a person or by an earlier reviewer turn of this task):
 ${_rp_decided}
 - Do not raise these again, as an objection or as a 메모 line, when the fact and the impact are the same.
 - Exception: if new evidence shows data loss, a security problem, a deviation from the request/AC/spec, a verification gap, or a defect on the task's default usage path, raise it as an objection.
-
+${_rp_decided_contact}
 EOF
     fi
     if [[ "$_rp_narrow" -eq 1 ]]; then
+      # final diff review 한정: PR 본문 「맞닿은 곳」 목록의 지점은 드문 환경이 아니므로 종결을 막는 이의로 보호한다
+      local _rp_contact_line=""
+      if [[ "$review_type" == "diff-review" ]]; then
+        _rp_contact_line='- Final diff review: points on the "맞닿은 곳" list in the PR body are not uncommon environments. A "맞닿은 곳:" finding, or a defect at one of those points, blocks closure like (1)-(4): keep it open even if every other objection is out of scope.
+'
+      fi
       cat <<EOF
 SCOPE NARROWING (this session has passed ${REVIEW_SCOPE_NARROW_AFTER} turns):
 - From this turn, only these block closure: (1) a defect on the task's default usage path, (2) data loss or a security problem in any environment, (3) a deviation from the request/AC/spec, (4) a verification gap (the tests do not cover the defect).
 - Wrong results or inconvenience that occur only in uncommon environments, and requests to add defensive procedures, do not block. Write each one at the end of Summary as one line: "범위 밖: <location> — <content> — <reason>".
 - If an open objection from an earlier turn now falls out of scope by this rule, remove it from Open Issues and write it as a "범위 밖:" line. Do not ask the user.
-- If every remaining objection is out of scope, close the review with no objections. If any objection in (1)-(4) remains, keep it open.
+${_rp_contact_line}- If every remaining objection is out of scope, close the review with no objections. If any objection in (1)-(4) remains, keep it open.
 
 EOF
     fi

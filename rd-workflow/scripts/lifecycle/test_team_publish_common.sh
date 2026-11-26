@@ -479,5 +479,174 @@ t_run_limited_no_leftover() {
 }
 t_run_limited_no_leftover
 
+# 정상 종료 뒤 실제 감시 sleep 이 남지 않습니다. 감시는 자기 프로세스 그룹에 있어 위 사례(호출 셸 그룹 확인)로는 보이지 않습니다.
+#   명령이 감시의 `sleep 4271` 을 pgrep 으로 찾아 PID 를 남기고, 반환 뒤 그 PID 가 죽었는지 봅니다(옛 test_publish_queue.sh G4b(1)).
+#   같은 머신의 다른 검증이 띄운 `sleep 4271` 을 잡지 않게, 실행기 셸($PPID)의 자식(감시 서브셸) 아래 sleep 만 찾고
+#   정확히 1개일 때만 기록합니다. 그 밖이면 명령이 rc 1 로 끝나 첫 단언이 FAIL 합니다.
+#   pgrep 이 프로세스 목록을 얻지 못하는 환경(macOS 기본 PATH 의 「Cannot get process list」)에서는 건너뛰고 표식을 냅니다.
+t_run_limited_watchdog_reaped() {
+  local wf="$TMP/rlwd.pid" res
+  if ! pgrep -f . >/dev/null 2>&1; then
+    printf 'env-skip: test_team_publish_common t_run_limited_watchdog_reaped — pgrep 으로 프로세스 목록을 얻을 수 없는 환경(감시 sleep 관측 불가)\n' >&2
+    return 0
+  fi
+  res="$(bash -c 'source "$1"; s=$SECONDS; rc=0
+    _rd_run_limited 4271 /dev/null bash -c '"'"'f="$1"; t0=$SECONDS
+      while :; do
+        p=""; for w in $(pgrep -P "$PPID"); do [[ "$w" == "$$" ]] || p="$p $(pgrep -P "$w" -x sleep)"; done
+        set -- $p; [[ $# -eq 0 ]] || break
+        [[ $((SECONDS - t0)) -lt 10 ]] || exit 1; sleep 0.05
+      done
+      [[ $# -eq 1 ]] || exit 1; echo "$1" > "$f"'"'"' _ "$2" >/dev/null || rc=$?
+    printf "rc=%s el=%s\n" "$rc" "$((SECONDS - s))"' _ "$SCRIPT_DIR/../_submodule_common.sh" "$wf" 2>/dev/null)"
+  eq "_rd_run_limited 감시 sleep 관측 뒤 정상 종료 → rc 0, 2초 안" "$([[ "$res" == "rc=0 el="[0-2] ]] && echo yes || echo "no $res")" "yes"
+  eq "_rd_run_limited 정상 종료 뒤 감시 sleep 이 남지 않음" \
+    "$([[ -s "$wf" ]] && ! kill -0 "$(cat "$wf")" 2>/dev/null && echo yes || echo "no pid=$(cat "$wf" 2>/dev/null)")" "yes"
+}
+t_run_limited_watchdog_reaped
+
+# 시간 초과: 부모는 TERM 으로 끝나고 자식만 TERM 을 무시해도 그룹 KILL 로 상한 + 4초 안에 rc 124 로 돌아오고 둘 다 남지 않습니다.
+#   호출부 stderr 는 비어 있어야 합니다(옛 rd_run_limited 의 `wait 2>/dev/null` 을 합치며 들였습니다).
+#   (옛 test_publish_queue.sh G4b(2). _merge_precheck.sh 의 실행기를 _rd_run_limited 로 합치며 옮겼습니다.)
+t_run_limited_timeout() {
+  local pp="$TMP/rlto.ppid" cp="$TMP/rlto.cpid" ef="$TMP/rlto.err" res
+  res="$(bash -c 'source "$1"; s=$SECONDS; rc=0
+    _rd_run_limited 1 /dev/null bash -c '"'"'echo $$ > "$1"; (trap "" TERM; exec sleep 30) & echo $! > "$2"; wait'"'"' _ "$2" "$3" >/dev/null || rc=$?
+    printf "rc=%s el=%s\n" "$rc" "$((SECONDS - s))"' _ "$SCRIPT_DIR/../_submodule_common.sh" "$pp" "$cp" 2>"$ef")"
+  eq "_rd_run_limited TERM 무시 자식 → rc 124, 5초 안" "$([[ "$res" == "rc=124 el="[0-5] ]] && echo yes || echo "no $res")" "yes"
+  eq "_rd_run_limited 시간 초과 뒤 부모·자식 모두 종료" \
+    "$([[ -s "$pp" && -s "$cp" ]] && ! kill -0 "$(cat "$pp")" 2>/dev/null && ! kill -0 "$(cat "$cp")" 2>/dev/null && echo yes || echo "no parent=$(cat "$pp" 2>/dev/null) child=$(cat "$cp" 2>/dev/null)")" "yes"
+  # 시간 초과 안내는 호출부가 냅니다. 셸의 작업 알림(「Terminated」·「Killed」)이 호출부 stderr 에 섞이지 않아야 합니다.
+  eq "_rd_run_limited 시간 초과가 호출부 stderr 에 셸 작업 알림을 남기지 않음" "$(cat "$ef")" ""
+}
+t_run_limited_timeout
+
+echo "== manual gitlink 와 팀 기본 브랜치 비교 (tp_manual_lag) =="
+
+# 세계: sub 의 gitlink(BASE 시점 = 팀 main 의 첫 커밋 a)와 팀 main 끝(b), 팀 dev 브랜치에만 있는 커밋.
+t_manual_lag() {
+  local a res rc dev
+  mk_world
+  a="$(git -C "$TMP/root" ls-tree HEAD sub | awk '{print $3}')"
+  eq "끝과 같음 → same" "$(tp_manual_lag "$TMP/root/sub" "$NEWOID")" "same	main	$NEWOID	0"
+  eq "기본 브랜치 이력 안 → behind 1" "$(tp_manual_lag "$TMP/root/sub" "$a")" "behind	main	$NEWOID	1"
+  G "$TMP/teamwc" switch -q -c dev; printf 'd\n' >"$TMP/teamwc/f"; G "$TMP/teamwc" commit -q -am d
+  dev="$(git -C "$TMP/teamwc" rev-parse HEAD)"; G "$TMP/teamwc" push -q origin dev 2>/dev/null
+  git -C "$TMP/root/sub" fetch -q origin 2>/dev/null
+  res="$(tp_manual_lag "$TMP/root/sub" "$dev")"
+  eq "기본 브랜치 밖 커밋 → outside" "${res%%	*}" "outside"
+  eq "대상 브랜치를 주면 그 브랜치와 견줌" "$(tp_manual_lag "$TMP/root/sub" "$dev" dev)" "same	dev	$dev	0"
+  # 끝 커밋 객체가 로컬에 없으면 그 브랜치를 받아 셉니다.
+  G "$TMP/teamwc" switch -q main; printf 'c\n' >"$TMP/teamwc/f"; G "$TMP/teamwc" commit -q -am c
+  G "$TMP/teamwc" tag t-c; G "$TMP/teamwc" push -q origin main t-c 2>/dev/null
+  # 받기의 쓰기 범위: 다른 fetch 매핑(backup)과 FETCH_HEAD 는 건드리지 않습니다.
+  git -C "$TMP/root/sub" config --add remote.origin.fetch '+refs/heads/main:refs/remotes/backup/main'
+  local fh0; fh0="$(cat "$(git -C "$TMP/root/sub" rev-parse --git-path FETCH_HEAD)" 2>/dev/null)"
+  # 명령 치환 없이 불러 결과를 _TP_LAG_RESULT 로 받습니다(호출부와 같은 방식).
+  tp_manual_lag "$TMP/root/sub" "$a" >/dev/null
+  eq "끝 객체가 없으면 받아서 판정 → behind 2" "$(cut -f1,4 <<<"$_TP_LAG_RESULT")" "behind	2"
+  eq "받기는 태그를 따라 받지 않음" "$(git -C "$TMP/root/sub" tag -l)" ""
+  eq "받기는 다른 fetch 매핑을 갱신하지 않음" "$(git -C "$TMP/root/sub" for-each-ref refs/remotes/backup)" ""
+  eq "받기는 FETCH_HEAD 를 덮지 않음" "$(cat "$(git -C "$TMP/root/sub" rev-parse --git-path FETCH_HEAD)" 2>/dev/null)" "$fh0"
+  # 얕은 복제: 지난 커밋과 main 끝을 모두 가졌어도 사이 이력이 잘려 있으면 기본 브랜치 밖이라고 단정하지 않습니다.
+  G "$TMP/teamwc" push -q origin "$a:refs/heads/picked" 2>/dev/null
+  git clone -q --depth=1 --no-single-branch "file://$TMP/team.git" "$TMP/shallow" 2>/dev/null
+  rc=0; tp_manual_lag "$TMP/shallow" "$a" >/dev/null 2>&1 || rc=$?
+  eq "얕은 복제에서 조상 아님 → 판정 불가 rc 1" "$rc" "1"
+  eq "얕은 복제 원인 안내" "$([[ "$_TP_LAG_CAUSE" == *"얕은 복제라"*"fetch --unshallow origin"* ]] && echo yes || echo "no [$_TP_LAG_CAUSE]")" "yes"
+  # 원격 조회 실패 → rc 1, 원인 있음, 출력 없음.
+  git -C "$TMP/root/sub" remote set-url origin "$TMP/missing.git"
+  rc=0; res="$(tp_manual_lag "$TMP/root/sub" "$a" 2>/dev/null)" || rc=$?
+  eq "원격 조회 실패 → rc 1, 출력 없음" "$rc/$res" "1/"
+  tp_manual_lag "$TMP/root/sub" "$a" >/dev/null 2>&1 || true
+  eq "원격 조회 실패 원인이 남음" "$([[ -n "$_TP_LAG_CAUSE" ]] && echo yes || echo no)" "yes"
+}
+t_manual_lag
+
+# 안내가 가리킬 설정 키: 경로별 mode 가 있으면 그 키, 없으면 전역 키.
+t_config_key() {
+  mk_world
+  cfg '{"team_publish": {"mode": "pr", "submodules": {"sub": {"mode": "manual"}}}}'
+  eq "경로별 mode 가 있으면 경로별 키" "$(tp_config_key "$TMP/root" sub mode)" "team_publish.submodules.sub.mode"
+  cfg '{"team_publish": {"mode": "manual", "submodules": {"sub": {"base": "dev"}}}}'
+  eq "경로별 mode 가 없으면 전역 키" "$(tp_config_key "$TMP/root" sub mode)" "team_publish.mode"
+}
+t_config_key
+
+# 부른 쪽 프로세스 그룹이 회수되면 비교 fetch 도 함께 끝나 반환 뒤 원격 추적 ref 를 쓰지 않습니다(무인 발행의 시간 상한·신호).
+#   팀 원격의 upload-pack 을 두 번째 호출(fetch)에서만 4초 늦추고, fetch 가 시작되면 비교를 돌리는 그룹에 TERM 을 보냅니다.
+#   TERM 은 무인 발행의 그룹 회수, INT 는 터미널 Ctrl-C 입니다. 각각 약 7초 걸립니다 — 회수 뒤 늦은 ref 쓰기가 없는지는 지연이
+#   끝난 뒤에야 볼 수 있습니다.
+t_manual_lag_reaped() {
+  local sig="$1" a before bp i n
+  mk_world
+  a="$(git -C "$TMP/root" ls-tree HEAD sub | awk '{print $3}')"
+  printf 'c\n' >"$TMP/teamwc/f"; G "$TMP/teamwc" commit -q -am c; G "$TMP/teamwc" push -q origin main 2>/dev/null
+  cat >"$TMP/slow-up.sh" <<EOF_UP
+#!/bin/sh
+n=\$(cat "$TMP/up.count" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" >"$TMP/up.count"
+if [ "\$n" -ge 2 ]; then echo \$\$ >"$TMP/up.pid"; sleep 4 & echo \$! >"$TMP/up.child"; wait; fi
+exec git upload-pack "\$@"
+EOF_UP
+  chmod +x "$TMP/slow-up.sh"; rm -f "$TMP/up.count" "$TMP/up.pid" "$TMP/up.child"
+  git -C "$TMP/root/sub" config remote.origin.uploadpack "$TMP/slow-up.sh"
+  before="$(git -C "$TMP/root/sub" rev-parse refs/remotes/origin/main)"
+  # archive·promote 와 같은 조건(job control 없는 새 bash)에서 부르고, 그 프로세스를 자기 그룹으로 띄워 그룹째 신호를 보냅니다.
+  set -m
+  bash -c 'project_root="$1"; source "$2/_lifecycle_common.sh"; source "$2/../_state_common.sh"; source "$2/../_submodule_common.sh"
+    source "$2/_tasks_index.sh"; source "$2/_team_publish_common.sh"; tp_manual_lag "$3" "$4" >/dev/null 2>&1' \
+    _ "$TMP/root" "$SCRIPT_DIR" "$TMP/root/sub" "$a" &
+  bp=$!
+  set +m
+  # 전송 하위 프로세스가 생기자마자 신호를 보냅니다(fetch 시작 직후의 Ctrl-C 도 덮습니다).
+  for ((i = 0; i < 100; i++)); do [[ -s "$TMP/up.child" ]] && break; sleep 0.05; done
+  kill "-$sig" -- "-$bp" 2>/dev/null; wait "$bp" 2>/dev/null
+  # 회수 뒤 1초 안에 전송 하위 프로세스(SIGINT 를 무시하는 sleep)까지 끝났는지 봅니다.
+  for ((i = 0; i < 10; i++)); do ! kill -0 "$(cat "$TMP/up.child" 2>/dev/null)" 2>/dev/null && break; sleep 0.1; done
+  eq "$sig: 전송 하위 프로세스가 남지 않음" "$([[ -s "$TMP/up.child" ]] && ! kill -0 "$(cat "$TMP/up.child")" 2>/dev/null && echo yes || echo no)" "yes"
+  eq "$sig: 회수 시점의 원격 추적 ref 는 그대로" "$(git -C "$TMP/root/sub" rev-parse refs/remotes/origin/main)" "$before"
+  sleep 5
+  eq "$sig: 회수 뒤 늦은 ref 쓰기 없음" "$(git -C "$TMP/root/sub" rev-parse refs/remotes/origin/main)" "$before"
+  eq "$sig: 늦춘 upload-pack 이 남지 않음" "$([[ -s "$TMP/up.pid" ]] && ! kill -0 "$(cat "$TMP/up.pid")" 2>/dev/null && echo yes || echo no)" "yes"
+}
+t_manual_lag_reaped TERM
+t_manual_lag_reaped INT
+
+# 비교 자체가 상한에 걸리면 git 이 띄운 전송 하위 프로세스까지 끝냅니다 — 남으면 발행 큐가 archive 그룹이 빌 때까지 기다립니다.
+#   upload-pack 대역이 TERM 을 무시하는 8초짜리 하위 프로세스를 띄우고 기다립니다. 상한 1초로 비교한 뒤 4초 안에 그 하위
+#   프로세스가 끝났는지, 비교를 돌린 그룹이 반환 직후 비는지 봅니다(TERM 뒤 KILL 까지 가야 끝납니다).
+#   약 4초 걸립니다.
+t_manual_lag_timeout_reaped() {
+  local a i bp el
+  mk_world
+  a="$(git -C "$TMP/root" ls-tree HEAD sub | awk '{print $3}')"
+  cat >"$TMP/hang-up.sh" <<EOF_UP
+#!/bin/sh
+( trap "" TERM; exec sleep 8 ) &
+echo \$! >"$TMP/hang-child.pid"
+wait
+EOF_UP
+  chmod +x "$TMP/hang-up.sh"; rm -f "$TMP/hang-child.pid" "$TMP/hang.rc"
+  git -C "$TMP/root/sub" config remote.origin.uploadpack "$TMP/hang-up.sh"
+  # 발행 실행과 같이 비교를 돌리는 bash 를 자기 그룹으로 띄우고, 반환한 뒤 그 그룹이 바로 비는지 봅니다(발행 큐가 기다리는 조건).
+  set -m
+  bash -c 'project_root="$1"; source "$2/_lifecycle_common.sh"; source "$2/../_state_common.sh"; source "$2/../_submodule_common.sh"
+    source "$2/_tasks_index.sh"; source "$2/_team_publish_common.sh"
+    rc=0; RD_TP_LAG_TIMEOUT=1 tp_manual_lag "$3" "$4" >/dev/null 2>&1 || rc=$?; printf "%s/%s\n" "$rc" "$_TP_LAG_CAUSE" >"$5"' \
+    _ "$TMP/root" "$SCRIPT_DIR" "$TMP/root/sub" "$a" "$TMP/hang.rc" &
+  bp=$!
+  set +m
+  wait "$bp" 2>/dev/null
+  # 반환 직후 0.3초 안에 그룹이 비어야 합니다(유예 타이머·감시·전송 하위 프로세스가 남지 않음).
+  for ((i = 0; i < 6; i++)); do kill -0 -- "-$bp" 2>/dev/null || break; sleep 0.05; done
+  el="$(kill -0 -- "-$bp" 2>/dev/null && echo 남음 || echo 빔)"
+  eq "비교 상한 → rc 1, 원인 시간 초과" "$(cat "$TMP/hang.rc" 2>/dev/null)" "1/1초 안에 끝나지 않았습니다"
+  eq "비교 상한 뒤 부른 쪽 그룹이 바로 빔" "$el" "빔"
+  eq "비교 상한 뒤 전송 하위 프로세스가 남지 않음" "$([[ -s "$TMP/hang-child.pid" ]] && ! kill -0 "$(cat "$TMP/hang-child.pid")" 2>/dev/null && echo yes || echo no)" "yes"
+  [[ ! -s "$TMP/hang-child.pid" ]] || kill -KILL "$(cat "$TMP/hang-child.pid")" 2>/dev/null
+  kill -KILL -- "-$bp" 2>/dev/null
+}
+t_manual_lag_timeout_reaped
+
 printf '\n== 합계 ==\nPASS=%s FAIL=%s\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

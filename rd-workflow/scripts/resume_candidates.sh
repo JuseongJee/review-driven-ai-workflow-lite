@@ -17,6 +17,9 @@ RC_DIR="${BASH_SOURCE[0]%/*}"; [ "$RC_DIR" != "${BASH_SOURCE[0]}" ] || RC_DIR=".
 rc_judge_ok=1
 # shellcheck disable=SC1091
 . "$RC_DIR/lifecycle/session_launch.sh" 2>/dev/null || rc_judge_ok=0
+# orca 갈래의 생존 조회는 색인의 launch-tab 을 tasks_index_get 으로 읽는다 — 색인 라이브러리가 없으면 판정 불가가 된다.
+# shellcheck disable=SC1091
+. "$RC_DIR/lifecycle/_tasks_index.sh" 2>/dev/null || true
 frs_ok=1
 frs_file="$RC_DIR/_fr_status.sh"
 if [ -r "$frs_file" ]; then . "$frs_file" 2>/dev/null; fi
@@ -137,8 +140,8 @@ while IFS= read -r line || [ -n "$line" ]; do
   # 5/6. launch 판정
   case "$launch" in
     none|failed) cand_slugs+=("$slug"); cand_wts+=("$wt"); cand_ended+=(0) ;;
-    # cand_ended: 0 = launch 판정 출신, 1 = herdr 세션 종료 확인, 2 = hc 세션 종료 확인 (info 문구를 가른다)
-    ok) cand_slugs+=("$slug"); cand_wts+=("$wt"); if [ "$backend" = "hc" ]; then cand_ended+=(2); else cand_ended+=(1); fi ;;
+    # cand_ended: 0 = launch 판정 출신, 1 = herdr 세션 종료 확인, 2 = hc 세션 종료 확인, 3 = Orca 세션 종료 확인 (info 문구를 가른다)
+    ok) cand_slugs+=("$slug"); cand_wts+=("$wt"); if [ "$backend" = "orca" ]; then cand_ended+=(3); elif [ "$backend" = "hc" ]; then cand_ended+=(2); else cand_ended+=(1); fi ;;
     *) add_skip "$slug" "불확실: 생존 판정 불가(launch=${launch})" "rd task resolve-launch ${slug} 로 확정하십시오"; uncertain=1 ;;
   esac
 done < "$idx"
@@ -164,6 +167,7 @@ if [ "$pick" -ge 0 ] && [ "$n" -gt 0 ]; then
   case "${cand_ended[$pick]}" in
     1) printf 'info\t%s\t대화형 세션 종료 확인(launch=ok, herdr·프로세스 어디에도 세션 없음)\t색인의 launch 값은 바꾸지 않았습니다\n' "${cand_slugs[$pick]}" ;;
     2) printf 'info\t%s\t대화형 세션 종료 확인(launch=ok, herdr app·프로세스 어디에도 세션 없음)\t색인의 launch 값은 바꾸지 않았습니다\n' "${cand_slugs[$pick]}" ;;
+    3) printf 'info\t%s\t대화형 세션 종료 확인(launch=ok, Orca·프로세스 어디에도 세션 없음)\t색인의 launch 값은 바꾸지 않았습니다\n' "${cand_slugs[$pick]}" ;;
   esac
   printf '%s' "$skips"
   i=0

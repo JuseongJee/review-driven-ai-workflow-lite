@@ -175,5 +175,26 @@ item a done -; item b validated P1
 pick pick_named_done_skip --mode interactive --slugs "a b"
 line pick_named_done_skip "skip	${ST}a	상태 done"; line pick_named_done_skip "$(S 1 ${ST}b '')"; rc0 pick_named_done_skip
 
+# 감시 목록 줄은 로컬 브랜치 fr/<slug> 가 있을 때만 실행 중입니다. 없는 줄(gone)은 FR 보류·경로 겹침·동시 상한에 쓰지 않고 stale 로 냅니다.
+fx stale
+git -C "$D" init -q && git -C "$D" -c user.name=t -c user.email=t@t commit -q --allow-empty -m i && git -C "$D" branch fr/live
+item a validated P1 '`x/1`'; item b validated P2 '`y/1`'; item c validated P3 '`y/1`'; item d validated P4 '`q/1`'
+printf 'live\tq/1\t%sa\ngone\ty/1\t%sb\n' "$ST" "$ST" > "$D/active.tsv"
+pick pick_stale_row --mode interactive --active "$D/active.tsv" --max-streams 2
+line pick_stale_row "hold	${ST}a	실행 중 줄기 live 의 FR"
+line pick_stale_row "$(S 1 ${ST}b,${ST}c 'y/1')"
+line pick_stale_row "hold	${ST}d	실행 중 줄기 live 와 겹침"
+noline pick_stale_row "줄기 gone"
+line pick_stale_row "stale	gone	로컬 브랜치 fr/gone 없음"; count pick_stale_row stale 1; rc0 pick_stale_row
+# --exclude 는 실행 중 줄기의 FR 보류보다 먼저 판정합니다.
+pick pick_exclude_running --mode interactive --active "$D/active.tsv" --exclude "${ST}a"
+line pick_exclude_running "skip	${ST}a	이번 회차 중복 착수"; noline pick_exclude_running "줄기 live 의 FR"
+
+# --exclude 의 FR 은 이번 회차 중복 착수로 뺍니다.
+fx exclude
+item a validated P1 '`a/1`'; item b validated P2 '`b/1`'
+pick pick_exclude --mode interactive --exclude "${ST}a"
+line pick_exclude "skip	${ST}a	이번 회차 중복 착수"; line pick_exclude "$(S 1 ${ST}b 'b/1')"; count pick_exclude stream 1
+
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILED"
 exit "$fail"

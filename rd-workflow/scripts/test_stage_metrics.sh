@@ -17,6 +17,7 @@ LC="${SCRIPT_DIR}/lifecycle/_lifecycle_common.sh"
 # herdr app(HC_TERMINAL_ID)도 같은 이유로 비운다.
 export HERDR_ENV=
 export HC_TERMINAL_ID=
+export ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE=
 export RD_CHILD_SESSION=1
 
 PASS=0; FAIL=0

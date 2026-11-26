@@ -243,12 +243,20 @@ bash rd-workflow/scripts/typecheck.sh
 
 칸 목록:
 
-- `review.codex.model`: Codex 모델. 계열 이름(`sol` 처럼 소문자만)을 쓰면 `~/.codex/models_cache.json` 에서 그 계열의 최신 모델을 고릅니다. 비어 있으면 `~/.codex/config.toml` 의 모델을 씁니다.
+- `review.codex.model`: Codex 모델. 계열 이름(`sol` 처럼 소문자만)을 쓰면 `~/.codex/models_cache.json` 에서 그 계열의 최신 모델을 고릅니다. 비어 있으면 `~/.codex/config.toml` 의 모델을 씁니다. 고정 이름이나 `config.toml` 의 모델보다 그 계열에 더 새 모델이 있으면 리뷰 세션을 만들 때 한 번 알리고, 이번만 옛 모델로 진행할지 옛 모델을 계속 쓰고 기록할지(`model_select.sh keep-codex-model`) 고르게 합니다.
 - `review.codex.effort`: Codex effort 기본값.
 - `review.codex.small_task_effort`: `standard` 등급 리뷰(세션 `execution-path: small-task`)의 Codex effort. `medium` 이 하한입니다.
 - `review.codex.review_types.<리뷰 종류>.effort`: 리뷰 종류별 Codex effort.
 - `review.claude.model`: Claude 모델. 별칭(`opus`·`sonnet`·`haiku`·`fable`)을 씁니다.
 - `review.claude.effort`: Claude effort.
+- `session.claude.model`: promote 가 띄우는 작업 세션의 Claude 모델. 예시 파일의 값은 `null` 입니다.
+- `session.claude.effort`: 작업 세션의 Claude effort. 예시 파일의 값은 `null` 입니다.
+- `subagent.claude.model`: 구현 subagent 를 띄울 때 Agent 도구 `model` 인자로 넘기는 Claude 모델. 별칭(`opus`·`sonnet`·`haiku`·`fable`)이나 `default` 를 씁니다. 예시 파일의 값은 `null` 입니다.
+- `subagent.claude.effort`: 구현 subagent 의 Claude effort(`low`·`medium`·`high`·`xhigh`·`max`·`default`). 예시 파일의 값은 `null` 입니다.
+
+세션 칸이 비어 있으면 작업 세션은 부모 세션의 모델과 effort 를 따라갑니다. 단, 예전 설치에서 남은 `rd-workflow/config/model-strategy.json` 에 `session_model` 이 있으면 모델은 그 값이 부모보다 먼저입니다(promote 가 `models.json` 으로 옮기라고 안내합니다). 바꾸려면 위 칸을 고칩니다. 한 번만 바꾸려면 환경 변수 `RD_SESSION_MODEL`·`RD_SESSION_EFFORT` 를 씁니다. 값을 넘기지 않으려면 `default` 를 적습니다.
+
+구현 subagent 칸이 비어 있으면 모델은 옛 키 `model-strategy.json` 의 `subagent` 를 보고(읽으면 `models.json` 으로 옮기라고 안내합니다), 그것도 없으면 `sonnet` 입니다. effort 는 넘기지 않습니다. 지금 값과 출처는 `bash rd-workflow/scripts/model_select.sh subagent` 로 확인합니다.
 
 effort 값은 `low`·`medium`·`high`·`xhigh`·`max`·`ultra`·`lowest`·`highest` 입니다. 모델이 지원하지 않는 단계는 바로 아래 지원 단계로 낮추고 경고합니다. `default` 는 「이 칸에서 넘기지 않음」 입니다.
 `RD_REVIEW_EFFORT_OVERRIDE=0` 이면 설정을 남긴 채 Codex effort 를 즉시 무력화합니다.
@@ -269,7 +277,7 @@ effort 값은 `low`·`medium`·`high`·`xhigh`·`max`·`ultra`·`lowest`·`highe
     ├── config/
     │   ├── workflow.json        # 워크플로 설정
     │   ├── review-tools.json    # 리뷰 도구 설정
-    │   └── models.json          # 리뷰어 모델·effort 설정
+    │   └── models.json          # 모델·effort 설정(리뷰·작업 세션·구현 subagent)
     ├── docs/
     │   ├── AI_DOC_MAP.md        # 문서 인덱스
     │   ├── USER_MANUAL.md       # 이 파일

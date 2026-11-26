@@ -45,7 +45,7 @@ Typical user requests:
 
 ```bash
 bash -s <<'RD_SKILL_COMPAT'
-RD_SKILL_BASE=2026-11-08-092219 RD_SKILL_NAME=fr
+RD_SKILL_BASE=2026-11-21-001711 RD_SKILL_NAME=fr
 vf="rd-workflow/VERSION"
 if [ ! -f "$vf" ] && [ -f "_ROOT_FILES/rd-workflow/VERSION" ]; then exit 0; fi
 v=""; [ -f "$vf" ] && v="$(cat "$vf")"; v="${v#lite-}"
@@ -66,7 +66,7 @@ RD_SKILL_COMPAT
 - `list` → Read `rd-workflow/claude_skills/fr/list.md` and follow it.
 - `pri` → Read `rd-workflow/claude_skills/fr/pri.md` and follow it.
 - `inspect` → Read `rd-workflow/claude_skills/fr/inspect.md` and follow it.
-- `groom` → Read `rd-workflow/claude_skills/fr/groom.md` and follow it.
+- `groom` → Read `rd-workflow/claude_skills/fr/groom.md` and follow it (it invokes the `fr-groom` skill).
 - `archive` → Read `rd-workflow/claude_skills/fr/archive.md` and follow it.
 - `park` → Read `rd-workflow/claude_skills/fr/park.md` and follow it.
 - `status` → Read `rd-workflow/claude_skills/fr/status.md` and follow it.
@@ -88,14 +88,14 @@ RD_SKILL_COMPAT
 - `/fr list` — 활성 항목 목록 출력
 - `/fr pri` — 우선순위 검토
 - `/fr inspect <제목>` — 단일 FR 심층 검토 + autopilot 가능 여부 보고
-- `/fr groom [<제목들>]` — idea FR 을 문답으로 검증해 validated·parked·dropped 로 정리 (제목 없으면 idea 전부)
+- `/fr groom [<제목들>]` — idea FR 의 판정 권장표를 받아 한 번에 validated·parked·dropped 로 정리 (제목 없으면 idea 전부, `fr-groom` skill 호출. 모델까지 올리려면 `/fr-groom` 직접 입력)
 - `/fr archive` — done 항목 인덱스에서 일괄 삭제
 - `/fr park <제목>` — 항목을 parked로 이동
 - `/fr status <제목> <상태>` — 항목 상태 변경
 - `/fr take` — 팀 GitHub Issue 하나를 골라 선점하고 FR 을 만들어 착수
 - `/fr push [제목]` — 내 FR 을 팀 GitHub Issue 로 넘김 (FR 은 handed-off 로 닫힘)
-- `/fr do [<slug들>]` — 여러 FR 을 줄기로 묶어 병렬로 띄우고 감시·발행 허가·마감까지 처리 (터미널 herdr)
-- `/fr do --headless [--finish push|merge|none] [<slug들>]` — 고른 FR 을 무인으로 순차 완주
+- `/fr do [--model <값>] [--effort <값>] [<slug들>]` — 여러 FR 을 줄기로 묶어 병렬로 띄우고 감시·발행 허가·마감까지 처리 (터미널 herdr)
+- `/fr do --headless [--finish push|merge|none] [--model <값>] [--effort <값>] [<slug들>]` — 고른 FR 을 무인으로 순차 완주 (모델·effort 는 그 회차에만 적용)
 - `/fr batch <인자>` — `/fr do --headless` 의 별칭 (별칭, 다음 배포에서 제거)
 
 예: `/fr add autopilot에서 review gate 자동화`

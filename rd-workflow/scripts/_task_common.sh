@@ -215,6 +215,37 @@ _task_branch_checkout_path() {  # <branch>
   return 1
 }
 
+# _task_nofr_default_checkout — 기본 체크아웃에서 fr 브랜치 없이 하는 진행 중 작업(「기본
+# 체크아웃 작업」)이 있는지 판정한다 (change spec nofr-task-target-resolution D1).
+# 이 작업은 색인에 없으므로 task-state 로만 알아본다.
+#   성공(rc 0): stdout 「<기본 체크아웃 실경로>」, 전역 _TASK_NOFR_TITLE=<short-title>,
+#               전역 _TASK_NOFR_PATH=<기본 체크아웃 실경로> (서브셸 없이 부르는 호출부용 —
+#               명령 치환으로 부르면 전역 값이 부모 셸에 남지 않는다)
+#   실패(rc 1): 출력 없음
+# 조건: 기본 체크아웃(= git common dir 의 부모)의 task-state 가 있고, fr-branch=null 이며,
+# status 가 진행 중(빈 값·`대기 중`·`완료` 가 아님)이다. task-state 가 없는 옛 저장소는
+# 판정하지 않는다 — 색인도 없으므로 종전의 「색인 파일 없음 → 현재 체크아웃」 이 맞다.
+_TASK_NOFR_TITLE=""; _TASK_NOFR_PATH=""
+_task_nofr_default_checkout() {
+  _TASK_NOFR_TITLE=""; _TASK_NOFR_PATH=""
+  local common base ts fr st
+  common="$(git -C "${project_root}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  [[ -n "$common" ]] || return 1
+  base="$(cd "${common}/.." 2>/dev/null && pwd -P)" || return 1
+  ts="${base}/rd-workflow-workspace/.lifecycle/task-state"
+  [[ -f "$ts" ]] || return 1
+  fr="$(awk -F'=' '$1=="fr-branch"{sub(/^[^=]+=/,""); print; exit}' "$ts" 2>/dev/null)"
+  [[ "$fr" == "null" ]] || return 1
+  st="$(awk -F'=' '$1=="status"{sub(/^[^=]+=/,""); print; exit}' "$ts" 2>/dev/null)"
+  case "$st" in
+    ""|"대기 중"|"완료") return 1 ;;
+  esac
+  _TASK_NOFR_TITLE="$(awk -F'=' '$1=="short-title"{sub(/^[^=]+=/,""); print; exit}' "$ts" 2>/dev/null)"
+  _TASK_NOFR_PATH="$base"
+  printf '%s\n' "$base"
+  return 0
+}
+
 # task_resolve_target <op:read|write> [<slug>] — 여러 worktree 작업 중 대상 선택 (spec D4·D13)
 # 단일 출처: archive.sh·promote_rollback.sh 도 이 함수를 source 해 쓴다 — 판정 로직을
 # 복제하지 않는다.
@@ -223,26 +254,30 @@ _task_branch_checkout_path() {  # <branch>
 #         — spec D13, fr tip 의 blob 을 읽으라는 신호일 뿐 이 함수는 blob 을 읽지 않는다)
 #   write stdout: "<worktree-path>" (체크아웃된 worktree 만 — 비체크아웃은 오류로 끝낸다)
 #
-# 대상 선택 규칙 (spec D4):
-#   - <slug> 명시: 그 작업이 대상이다. 현재 worktree 가 다른 작업의 checkout 이면 **경고
-#     후 진행**한다 (거부가 아니다 — `--no-worktree` 로 기본 checkout 이 작업 worktree가
-#     되면 다른 작업을 관리할 진입점이 사라지기 때문).
-#   - 미지정 + 현재 worktree 가 어느 작업의 checkout: 그 작업이 기본 대상 (재확인 없음).
-#   - 미지정 + 색인에 작업이 없음(0건): **하위 호환** — 이 worktree 자체를 단일 작업으로
-#     간주한다 (색인을 쓰지 않는 기존 단일 worktree 사용자·no-fr 직접 작업의 동작을
-#     그대로 유지한다). **단, 색인 파일이 실제로 존재하는데**(이 저장소에서 worktree
-#     동시 진행 기능을 써 본 적이 있는데) **마침 0건이고, 현재 worktree 가 fr 브랜치가
-#     아니면** fallback 하지 않는다(final diff review 지적, AC 4). 기본 브랜치 worktree
-#     는 baseline 이지 작업을 대표하지 않는다 — 그 상태에서 자기 자신을 대상 삼으면
-#     baseline task-state·CURRENT_TASK.md 를 마치 작업인 양 갱신하게 된다. 색인 파일
-#     자체가 없으면(git 저장소가 아닌 단위 테스트, 색인 기능을 전혀 안 써 본 저장소,
-#     no-fr 모드로만 쓰는 저장소) 이 검사를 적용하지 않는다 — "기본 브랜치인지" 가
-#     애초에 무의미한 맥락이고(no-fr 모드는 정의상 기본 브랜치에서 직접 작업한다), 여기서
-#     막으면 색인을 전혀 모르는 기존 사용자가 전부 깨진다.
-#   - 미지정 + 색인에 작업이 2건 이상이고 현재 worktree 가 그중 무엇도 아님: 무엇도 고르지
-#     않고 목록 + `--task` 안내와 함께 실패한다 (상태를 바꾸지 않는다).
+# 대상 선택 규칙 (spec D4, change spec nofr-task-target-resolution D8):
+#   - 미지정 + 현재 worktree 가 어느 작업의 checkout: 그 작업이 대상이다 (인자 불요). 정리
+#     대기 작업이면 다른 작업으로 대체하지 않고 거부한다.
+#   - 미지정 + 현재 체크아웃이 기본 체크아웃이고 그 task-state 가 fr 브랜치 없는 진행 중
+#     작업(`fr-branch=null`, `_task_nofr_default_checkout`): 그 작업이 대상이다. 색인의
+#     진행 중 작업 수와 무관하다 — 그 작업은 색인에 없으므로 수 판정보다 먼저 본다.
+#   - 미지정 + 그 밖의 위치(write·read 모두): 색인에 진행 중 작업이 1건 이상이면 **자동으로
+#     고르지 않고 중단**(rc 1)하고 목록과 `--task` 지정 방법을 안내한다. 이 체크아웃에 없는
+#     작업을 바꾸거나 발행·취소하면 사용자가 의도하지 않은 작업이 대상이 되기 때문이다.
+#     1건이어도 마찬가지이고, 정리 대기 행은 세지도 나열하지도 않는다.
+#   - 미지정 + 진행 중 작업 0건: **하위 호환** — 이 worktree 자체를 단일 작업으로 간주한다
+#     (색인을 쓰지 않는 기존 단일 worktree 사용자·no-fr 직접 작업의 동작을 유지한다).
+#     **단, 색인 파일이 실제로 존재하고 현재 worktree 가 fr 브랜치가 아니면** fallback
+#     하지 않는다(final diff review 지적, AC 4). 기본 브랜치 worktree 는 baseline 이지
+#     작업을 대표하지 않는다 — 그 상태에서 자기 자신을 대상 삼으면 baseline
+#     task-state·CURRENT_TASK.md 를 작업처럼 갱신하게 된다. 색인 파일 자체가 없으면
+#     (git 저장소가 아닌 단위 테스트, 색인 기능을 안 써 본 저장소, no-fr 모드로만 쓰는
+#     저장소) 이 검사를 적용하지 않는다.
+#   - <slug> 명시: 어느 위치에서 불러도 그 작업이 대상이다. 현재 체크아웃의 작업(작업
+#     worktree 또는 기본 체크아웃 작업)과 다르면 **경고 한 줄 후 진행**한다 (거부가
+#     아니다 — `--no-worktree` 로 기본 checkout 이 작업 worktree 가 되면 다른 작업을 관리할
+#     진입점이 사라지기 때문). 기본 체크아웃 작업은 이름으로 고르지 않는다.
 #
-# return: 0 성공 / 1 대상 판정 불가(작업 없음이 아니라 다건 미지정) / 2 write인데 비체크아웃
+# return: 0 성공 / 1 대상 판정 불가(다건 미지정, 미지정 write 의 자동 선택 거부, 막음) / 2 write인데 비체크아웃
 task_resolve_target() {
   local op="$1" explicit="${2:-}"
   local cwd_real="" cwd_slug="" s wt_path wt_real
@@ -272,11 +307,23 @@ task_resolve_target() {
     done <<< "$cwd_candidates"
   fi
 
+  # 기본 체크아웃 작업(D1) — 현재 체크아웃이 작업 worktree 가 아닐 때만 본다. 판정 결과는
+  # 미지정 선택(D2)과 `--task` 경고(D4)가 함께 쓴다.
+  local nofr_here=0 nofr_path=""
+  if [[ -z "$cwd_slug" && -n "$cwd_real" ]]; then
+    # 서브셸 없이 부른다 — _TASK_NOFR_TITLE 을 아래 경고(D4)가 읽는다.
+    _task_nofr_default_checkout >/dev/null && nofr_path="$_TASK_NOFR_PATH"
+    [[ -n "$nofr_path" && "$nofr_path" == "$cwd_real" ]] && nofr_here=1
+  fi
+
   local target_slug=""
   if [[ -n "$explicit" ]]; then
     target_slug="$explicit"
     if [[ -n "$cwd_slug" && "$cwd_slug" != "$explicit" ]]; then
       echo "경고: 현재 worktree 의 작업(${cwd_slug})이 아니라 다른 작업(${explicit})을 대상으로 합니다." >&2
+    elif [[ "$nofr_here" -eq 1 ]]; then
+      # 기본 체크아웃 작업은 이름으로 고르지 않으므로 --task 는 늘 색인 작업을 고른다. 이름이 같아도 다른 작업이다.
+      echo "경고: 이 기본 체크아웃의 작업(${_TASK_NOFR_TITLE})이 아니라 색인의 작업(${explicit})을 대상으로 합니다 — 기본 체크아웃 작업은 이름으로 고르지 않습니다." >&2
     fi
   elif [[ -n "$cwd_slug" ]]; then
     # 정리 대기(발행 끝, worktree 정리만 남음) worktree 는 작업 대상이 아니다. 다른 작업으로
@@ -286,69 +333,87 @@ task_resolve_target() {
       return 1
     fi
     target_slug="$cwd_slug"
+  elif [[ "$nofr_here" -eq 1 ]]; then
+    # 기본 체크아웃 작업(D2) — 이 체크아웃 자신이 대상이다. 색인의 진행 중 작업 수보다
+    # 먼저 본다(그 작업은 색인에 없으므로 수 판정에 맡기면 다른 작업이 대신 골라진다).
+    if [[ "$op" == "write" ]]; then
+      printf '%s\n' "$project_root"
+    else
+      printf 'checkout\t%s\n' "$project_root"
+    fi
+    return 0
   else
-    local count=0 only=""
+    local count=0
     if [[ -n "$slugs" ]]; then
       while IFS= read -r s; do
         [[ -z "$s" ]] && continue
         count=$((count + 1))
-        only="$s"
       done <<< "$slugs"
     fi
-    if [[ "$count" -eq 0 ]]; then
-      # 색인을 쓰지 않는 기존 단일 worktree 사용(no-fr 직접 작업 포함) — 이 worktree
-      # 자체가 대상이다. 단, **색인 파일이 실제로 존재하는데(=이 저장소에서 worktree
-      # 동시 진행 기능을 써 본 적이 있는데) 마침 0건이고, 현재 worktree 가 fr 브랜치가
-      # 아닐 때는** fallback 하지 않는다(final diff review 지적, AC 4). 기본 브랜치
-      # worktree 는 baseline 이지 작업을 대표하지 않는다 — "색인이 0건" 만으로 자기
-      # 자신을 대상 삼으면 baseline task-state·CURRENT_TASK.md 를 마치 작업인 양
-      # 갱신해 AC 4 를 깬다.
-      #   색인 파일 자체가 없으면(이 저장소가 worktree 기능을 아예 안 써 본 경우 — git
-      #   저장소가 아닌 단위 테스트 fixture, no-fr 모드로만 쓰는 저장소 등) 이 검사를
-      #   적용하지 않는다. 그 경우 "기본 브랜치인지" 는 애초에 무의미한 질문이고
-      #   (no-fr 모드는 정의상 기본 브랜치에서 직접 작업한다), 여기서 막으면 색인을
-      #   전혀 모르는 기존 단일 worktree·no-fr 사용자가 전부 깨진다.
-      local idx_path="" idx_exists=0
-      idx_path="$(tasks_index_path 2>/dev/null)" || idx_path=""
-      [[ -n "$idx_path" && -f "$idx_path" ]] && idx_exists=1
-      local blocked=0 cur_branch=""
-      if [[ "$idx_exists" -eq 1 ]]; then
-        cur_branch="$(git -C "${project_root}" symbolic-ref --quiet --short HEAD 2>/dev/null)" || cur_branch=""
-        [[ "$cur_branch" != fr/* ]] && blocked=1
-      fi
-      if [[ "$blocked" -eq 1 ]]; then
-        # 막는 동작은 유지하고 원인과 복구 방법을 알린다. 정리 대기 수 = 전체 행 − 진행 중 행.
-        local all_n=0 act_n=0 pend_n=0 _l
-        while IFS= read -r _l; do [[ -n "$_l" ]] && all_n=$((all_n + 1)); done <<< "$cwd_candidates"
-        while IFS= read -r _l; do [[ -n "$_l" ]] && act_n=$((act_n + 1)); done <<< "$slugs"
-        pend_n=$((all_n - act_n))
-        echo "진행 중인 작업이 없습니다." >&2
-        echo "  원인: 이 저장소는 worktree 작업 색인(${idx_path})을 쓰므로, fr 브랜치가 아닌 체크아웃(${cur_branch:-detached})을 작업 대상으로 고르지 않습니다 — 기본 브랜치의 기준 상태를 작업처럼 바꾸지 않기 위해서입니다." >&2
-        echo "  새 작업 시작: bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug> --size small|large --source-fr <FR 경로|->" >&2
-        if [[ "$pend_n" -gt 0 ]]; then
-          echo "  기본 브랜치에서 직접(no-fr) 작업하려면: 정리 대기 작업 ${pend_n}건이 남아 있습니다 — 먼저 bash rd-workflow/scripts/rd task list 로 정리한 뒤 다시 실행하십시오" >&2
-        else
-          # 빈 색인을 지우면 「색인을 써 본 적 없는 저장소」 와 같아져 기존 fallback 이 적용된다.
-          echo "  기본 브랜치에서 직접(no-fr) 작업하려면: 색인에 남은 작업이 없으므로 색인 파일을 지우면 됩니다: rm '${idx_path}'" >&2
-        fi
-        return 1
-      fi
+    if [[ "$count" -gt 0 ]]; then
+      # 현재 위치에 대상 작업이 없으면 색인의 다른 작업을 자동으로 고르지 않는다(D3·D4).
+      # 1건이어도 마찬가지이며 write·read 모두 멈춘다.
       if [[ "$op" == "write" ]]; then
-        printf '%s\n' "$project_root"
+        echo "이 체크아웃(${project_root})에는 Status 를 바꿀 진행 중 작업이 없습니다 — 다른 작업을 자동으로 고르지 않습니다." >&2
       else
-        printf 'checkout\t%s\n' "$project_root"
+        echo "이 체크아웃(${project_root})에는 대상 작업이 없습니다 — 다른 작업을 자동으로 고르지 않습니다." >&2
       fi
-      return 0
-    elif [[ "$count" -gt 1 ]]; then
-      echo "진행 중인 작업이 여러 건입니다 — --task <slug> 로 대상을 지정하세요:" >&2
+      echo "  진행 중 작업:" >&2
       while IFS= read -r s; do
         [[ -z "$s" ]] && continue
         echo "  - $s" >&2
       done <<< "$slugs"
+      if [[ "$op" == "write" ]]; then
+        echo "  대상을 지정하십시오: bash rd-workflow/scripts/rd task set-status <값> --task <slug>" >&2
+        echo "  새 작업을 시작하려던 것이면: 다른 작업이 진행 중인 동안에는 이 체크아웃에서 fr 브랜치 없이 시작할 수 없습니다. 새 fr 브랜치와 별도 worktree 로 시작하려면: bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug> --size small|large --source-fr <FR 경로|->" >&2
+      else
+        echo "  대상을 지정하십시오: 같은 명령에 --task <slug> 를 붙여 다시 실행하십시오" >&2
+      fi
       return 1
-    else
-      target_slug="$only"
     fi
+    # 여기 닿는 호출은 진행 중 작업 0건이다(위 분기가 1건 이상이면 반환). 색인을 쓰지 않는 기존 단일 worktree 사용(no-fr 직접 작업 포함) — 이 worktree
+    # 자체가 대상이다. 단, **색인 파일이 실제로 존재하는데(=이 저장소에서 worktree
+    # 동시 진행 기능을 써 본 적이 있는데) 마침 0건이고, 현재 worktree 가 fr 브랜치가
+    # 아닐 때는** fallback 하지 않는다(final diff review 지적, AC 4). 기본 브랜치
+    # worktree 는 baseline 이지 작업을 대표하지 않는다 — "색인이 0건" 만으로 자기
+    # 자신을 대상 삼으면 baseline task-state·CURRENT_TASK.md 를 마치 작업인 양
+    # 갱신해 AC 4 를 깬다.
+    #   색인 파일 자체가 없으면(이 저장소가 worktree 기능을 아예 안 써 본 경우 — git
+    #   저장소가 아닌 단위 테스트 fixture, no-fr 모드로만 쓰는 저장소 등) 이 검사를
+    #   적용하지 않는다. 그 경우 "기본 브랜치인지" 는 애초에 무의미한 질문이고
+    #   (no-fr 모드는 정의상 기본 브랜치에서 직접 작업한다), 여기서 막으면 색인을
+    #   전혀 모르는 기존 단일 worktree·no-fr 사용자가 전부 깨진다.
+    local idx_path="" idx_exists=0
+    idx_path="$(tasks_index_path 2>/dev/null)" || idx_path=""
+    [[ -n "$idx_path" && -f "$idx_path" ]] && idx_exists=1
+    local blocked=0 cur_branch=""
+    if [[ "$idx_exists" -eq 1 ]]; then
+      cur_branch="$(git -C "${project_root}" symbolic-ref --quiet --short HEAD 2>/dev/null)" || cur_branch=""
+      [[ "$cur_branch" != fr/* ]] && blocked=1
+    fi
+    if [[ "$blocked" -eq 1 ]]; then
+      # 막는 동작은 유지하고 원인과 복구 방법을 알린다. 정리 대기 수 = 전체 행 − 진행 중 행.
+      local all_n=0 act_n=0 pend_n=0 _l
+      while IFS= read -r _l; do [[ -n "$_l" ]] && all_n=$((all_n + 1)); done <<< "$cwd_candidates"
+      while IFS= read -r _l; do [[ -n "$_l" ]] && act_n=$((act_n + 1)); done <<< "$slugs"
+      pend_n=$((all_n - act_n))
+      echo "진행 중인 작업이 없습니다." >&2
+      echo "  원인: 이 저장소는 worktree 작업 색인(${idx_path})을 쓰므로, fr 브랜치가 아닌 체크아웃(${cur_branch:-detached})을 작업 대상으로 고르지 않습니다 — 기본 브랜치의 기준 상태를 작업처럼 바꾸지 않기 위해서입니다." >&2
+      echo "  새 작업 시작: bash rd-workflow/scripts/lifecycle/promote.sh --short-title <slug> --size small|large --source-fr <FR 경로|->" >&2
+      if [[ "$pend_n" -gt 0 ]]; then
+        echo "  기본 브랜치에서 직접(no-fr) 작업하려면: 정리 대기 작업 ${pend_n}건이 남아 있습니다 — 먼저 bash rd-workflow/scripts/rd task list 로 정리한 뒤 다시 실행하십시오" >&2
+      else
+        # 빈 색인을 지우면 「색인을 써 본 적 없는 저장소」 와 같아져 기존 fallback 이 적용된다.
+        echo "  기본 브랜치에서 직접(no-fr) 작업하려면: 색인에 남은 작업이 없으므로 색인 파일을 지우면 됩니다: rm '${idx_path}'" >&2
+      fi
+      return 1
+    fi
+    if [[ "$op" == "write" ]]; then
+      printf '%s\n' "$project_root"
+    else
+      printf 'checkout\t%s\n' "$project_root"
+    fi
+    return 0
   fi
 
   wt_path="$(tasks_index_get "$target_slug" worktree-path 2>/dev/null)" || wt_path=""
@@ -497,12 +562,12 @@ task_resolve_launch() {
     alive)
       local _req="" _drc=1
       _req="$(session_handoff_request_path "$wt")" || _req=""
-      if [[ "$backend" == "hc" ]]; then
-        # hc 는 인계문을 기동 인자로 넣었으므로 보내지 않고 처리 여부만 확인한다(spec D5·D6).
+      if [[ "$backend" == "hc" || "$backend" == "orca" ]]; then
+        # hc·orca 는 인계문을 기동 인자로 넣었으므로 보내지 않고 처리 여부만 확인한다(spec D5·D6).
         # 처리가 확인되기 전에는 ok 로 확정하지 않는다 — 신뢰 확인 대기 중인 세션을 ok 로
         # 두면 아무도 그 세션을 승인하러 가지 않는다. 안내는 deliver 가 stderr 로 낸다.
         _drc=0
-        session_handoff_deliver "$slug" "$wt" "${_req:-}" hc || _drc=$?
+        session_handoff_deliver "$slug" "$wt" "${_req:-}" "$backend" || _drc=$?
         if [[ "$_drc" -ne 0 ]]; then
           echo "resolve-launch: '${slug}' 세션은 살아 있지만 인계가 처리됐는지 확인되지 않아 launch 를 바꾸지 않았습니다(launch=${launch} 유지)." >&2
           return 1
@@ -565,9 +630,19 @@ task_resolve_launch() {
       if session_backend_usable "$backend"; then
         if [[ "$backend" == "hc" ]]; then
           echo "  확인: hc get $(_session_launch_agent_name "$slug")" >&2
+        elif [[ "$backend" == "orca" ]]; then
+          local _otab=""
+          _otab="$(tasks_index_get "$slug" launch-tab 2>/dev/null)" || _otab=""
+          case "$_otab" in
+            structured-agent-session-?*) echo "  확인: orca agent show ${_otab#structured-agent-session-} --json" >&2 ;;
+            term_?*) echo "  확인: orca terminal show --terminal ${_otab} --json" >&2 ;;
+            *) echo "  확인: Orca 사이드바의 fr/${slug} 아래 에이전트" >&2 ;;
+          esac
         else
           echo "  확인: herdr agent get $(_session_launch_agent_name "$slug")" >&2
         fi
+      elif [[ "$backend" == "orca" ]]; then
+        echo "  이 작업은 Orca 에서 기동했습니다. 기동한 환경에서 다시 실행하거나, 세션이 끝났음을 확인했다면 --assume-ended 로 확정하십시오." >&2
       elif [[ "$backend" == "hc" ]]; then
         echo "  이 작업은 herdr app 에서 기동했습니다. 앱의 터미널에서 다시 실행하거나, 세션이 끝났음을 확인했다면 --assume-ended 로 확정하십시오." >&2
       elif [[ "$backend" == "none" ]]; then
@@ -652,7 +727,7 @@ _task_resolve_launch_failed() {
   [[ -n "$backend" ]] || backend="herdr"
   probe="$(session_probe "$slug" "$wt" "$backend")"
   if [[ "$probe" == "alive" ]]; then
-    evidence="herdr 에이전트 ${slug} 생존"
+    if [[ "$backend" == "orca" ]]; then evidence="Orca 세션 생존"; else evidence="herdr 에이전트 ${slug} 생존"; fi
   else
     cwd_msg="$(_task_session_cwd_alive "$slug" "$wt" "$backend")" && cwd_rc=0 || cwd_rc=1
     [[ "$cwd_rc" -eq 0 ]] && evidence="$cwd_msg"

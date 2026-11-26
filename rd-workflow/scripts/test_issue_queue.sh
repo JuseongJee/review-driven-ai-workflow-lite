@@ -321,6 +321,89 @@ check claim_concurrent_ledger.rc3 "$(printf '%s\n%s\n' "$(<"$C/rc.w3")" "$(<"$C/
 check claim_concurrent_ledger.rows "$(ledger | grep -c .)" 3
 check claim_concurrent_ledger.row3 "$(ledger | grep -c "^a/b${TAB}3${TAB}")" 1
 
+# 장부 키·URL 은 gh 가 고른 호스트의 html_url 에서 만든다 — 호스트 없는 저장소를 github.com 으로 추정하지 않는다.
+GHU=https://ghe.example.com/a/b/issues/7
+newcase claim_html_url_key
+claim_setup "$(iju open "$GHU")" "{\"state\":\"open\",\"html_url\":\"$GHU\",\"assignees\":[{\"login\":\"me\"}]}"
+run claim a/b 7
+check claim_html_url_key.rc "$RC" 0
+check claim_html_url_key.url "$OUT" "$GHU"
+if ledger | grep -q "^ghe.example.com/a/b${TAB}7${TAB}${GHU}${TAB}-${TAB}"; then ok; else nok "claim_html_url_key.row ($(ledger))"; fi
+
+# 결과 불명으로 행을 남길 때 안내 URL·풀기 명령도 장부 행(html_url 기준)을 따른다.
+newcase claim_html_url_unknown
+claim_setup "$(iju open "$GHU")" "$(iju open "$GHU")"
+flag fail issue_edit
+run claim a/b 7
+check claim_html_url_unknown.rc "$RC" 7
+has   claim_html_url_unknown.url "$ERR" "Issue: $GHU"
+has   claim_html_url_unknown.cmd "$(lastline "$ERR")" "issue_queue.sh release ghe.example.com/a/b 7"
+
+# 호스트 없이 부른 명령은 같은 owner/repo·번호의 호스트 붙은 행 하나를 찾는다. release 는 그 행의 호스트로 푼다.
+newcase hostless_finds_host_row
+rowu ghe.example.com/a/b 7 "$GHU" > "$RD_ISSUE_LEDGER"
+run link a/b 7 2026-11-16-x
+check hostless_finds_host_row.link "$RC/$(ledger | cut -f1,4 | tr '\t\n' '  ')" "0/ghe.example.com/a/b 2026-11-16-x "
+run release a/b 7
+check hostless_finds_host_row.release "$RC/$(ledger)" "0/"
+has   hostless_finds_host_row.remote "$(glog)" "issue edit 7 --repo ghe.example.com/a/b --remove-assignee @me"
+# forget 은 복구 명령이라 적힌 키만 지운다 — 호스트 없는 키로는 호스트 붙은 행을 지우지 않는다.
+rowu ghe.example.com/a/b 7 "$GHU" > "$RD_ISSUE_LEDGER"; BEFORE="$(ledger)"
+run forget a/b 7
+check hostless_finds_host_row.forget_exact "$RC/$(ledger)" "0/$BEFORE"
+run forget ghe.example.com/a/b 7
+check hostless_finds_host_row.forget "$RC/$(ledger)" "0/"
+
+# 중복 판정은 첫 조회의 html_url 키로 한다 — 같은 호스트의 행은 중복(rc 8, 예약 행 정리), 다른 호스트의 같은 번호는 선점한다.
+newcase claim_dup_by_html_url
+claim_setup "$(iju open "$GHU")" "$(iju open "$GHU")"
+rowu ghe.example.com/a/b 7 "$GHU" > "$RD_ISSUE_LEDGER"; BEFORE="$(ledger)"
+run claim a/b 7
+check claim_dup_by_html_url.same_host "$RC" 8
+lacks claim_dup_by_html_url.noedit "$(glog)" "issue edit"
+check claim_dup_by_html_url.ledger "$(ledger)" "$BEFORE"
+newcase claim_other_host_same_number
+claim_setup "$(iju open "$GHU")" "{\"state\":\"open\",\"html_url\":\"$GHU\",\"assignees\":[{\"login\":\"me\"}]}"
+rowu github.com/a/b 7 https://github.com/a/b/issues/7 > "$RD_ISSUE_LEDGER"
+run claim a/b 7
+check claim_other_host_same_number.rc "$RC" 0
+check claim_other_host_same_number.keys "$(ledger | cut -f1 | tr '\n' ' ')" "github.com/a/b ghe.example.com/a/b "
+
+# 장부를 읽지 못하면 호스트 없는 release 는 원격을 건드리지 않는다(gh 기본 호스트의 다른 Issue 를 풀지 않게).
+newcase release_unreadable_ledger
+rowu ghe.example.com/a/b 7 "$GHU" > "$RD_ISSUE_LEDGER"; chmod 200 "$RD_ISSUE_LEDGER"
+run release a/b 7
+chmod 600 "$RD_ISSUE_LEDGER"
+check release_unreadable_ledger.rc "$RC/$(glog)" "9/"
+has   release_unreadable_ledger.last "$(lastline "$ERR")" "장부 행: 남음 — 재실행: bash rd-workflow/scripts/issue_queue.sh release a/b 7"
+# 상위 디렉터리에 들어갈 수 없으면 장부가 있는지 알 수 없다 — 「장부 없음」으로 넘기지 않는다.
+mkdir "$C/private"; export RD_ISSUE_LEDGER="$C/private/ledger.tsv"
+rowu ghe.example.com/a/b 7 "$GHU" > "$RD_ISSUE_LEDGER"; chmod 600 "$C/private"
+run release a/b 7
+chmod 700 "$C/private"
+check release_unreadable_ledger.parent "$RC/$(glog)" "9/"
+
+# 옮겨진 Issue(html_url 의 번호가 다름)는 원격을 바꾸기 전에 rc 12 로 멈추고 옮긴 URL 을 알린다.
+#   claim 명령은 안내하지 않는다 — FR 없이 선점만 생기면 /fr take 가 그 Issue 에서 rc 8 로 막힌다.
+newcase claim_transferred
+claim_setup "$(iju open https://ghe.example.com/a/moved/issues/19)" "$(iju open https://ghe.example.com/a/moved/issues/19)"
+run claim a/b 7
+check claim_transferred.rc "$RC/$(ledger)" "12/"
+lacks claim_transferred.noedit "$(glog)" "issue edit"
+has   claim_transferred.url "$ERR" "https://ghe.example.com/a/moved/issues/19"
+lacks claim_transferred.noclaim "$ERR" "issue_queue.sh claim"
+
+# 여러 호스트의 행과 맞으면 장부·원격을 바꾸지 않고 호스트를 붙인 명령을 알린다.
+newcase hostless_ambiguous
+{ rowu ghe.example.com/a/b 7 "$GHU"; rowu github.com/a/b 7 https://github.com/a/b/issues/7; } > "$RD_ISSUE_LEDGER"; BEFORE="$(ledger)"
+run release a/b 7
+check hostless_ambiguous.rc "$RC" 2
+has   hostless_ambiguous.cand1 "$ERR" "issue_queue.sh release ghe.example.com/a/b 7"
+has   hostless_ambiguous.cand2 "$ERR" "issue_queue.sh release github.com/a/b 7"
+run link a/b 7 2026-11-16-x
+check hostless_ambiguous.link "$RC/$(glog)" "2/"
+check hostless_ambiguous.ledger "$(ledger)" "$BEFORE"
+
 # ---- lock / link / release ----
 newcase lock_timeout
 mkdir "$RD_ISSUE_LEDGER.lock"
@@ -536,14 +619,54 @@ has   close_fr_url.close "$(glog)" "issue close 7 --repo github.com/a/b"
 check close_fr_url.rows "$(ledger | cut -f1 | tr '\n' ' ')" "a/b ghe.example.com/a/b "
 has   close_fr_url.keep_notice "$ERR" "호스트 없는 선점 행 a/b#7 이 남았습니다"
 
-# 호스트 없는 값은 같은 키(호스트 없는 행)만 지운다. 결과 URL 은 gh 가 돌려준 html_url 이다.
+# 호스트 없는 값은 같은 키(호스트 없는 옛 행)와 html_url 키(claim 이 쓴 행)만 지운다. 결과 URL 은 gh 가 돌려준 html_url 이다.
 newcase close_fr_ledger_gh_host
 detail 'a/b#7'; resp api_repos_a_b_issues_7 "$(iju closed https://ghe.example.com/a/b/issues/7)"
-{ rowu a/b 7 https://github.com/a/b/issues/7; rowu github.com/a/b 7 https://github.com/a/b/issues/7; } > "$RD_ISSUE_LEDGER"
+{ rowu a/b 7 https://github.com/a/b/issues/7; rowu github.com/a/b 7 https://github.com/a/b/issues/7; rowu ghe.example.com/a/b 7 https://ghe.example.com/a/b/issues/7; } > "$RD_ISSUE_LEDGER"
 run close-fr "$R/detail.md" --skip-closed --commit-url "$CURL"
 check close_fr_ledger_gh_host.rc "$RC" 0
 check close_fr_ledger_gh_host.url "$OUT" "skipped-closed https://ghe.example.com/a/b/issues/7"
 check close_fr_ledger_gh_host.rows "$(ledger | cut -f1 | tr '\n' ' ')" "github.com/a/b "
+
+# 두 키(적힌 키·html_url 키)의 정리가 모두 실패하면 키마다 ledger-left 줄을 낸다. 안내대로 forget 하면 두 행만 지워진다.
+newcase close_fr_two_keys_lock
+detail 'a/b#7'; resp api_repos_a_b_issues_7 "$(iju closed https://ghe.example.com/a/b/issues/7)"
+{ rowu a/b 7 https://github.com/a/b/issues/7; rowu ghe.example.com/a/b 7 https://ghe.example.com/a/b/issues/7; rowu github.com/a/b 7 https://github.com/a/b/issues/7; } > "$RD_ISSUE_LEDGER"
+mkdir "$RD_ISSUE_LEDGER.lock"
+run close-fr "$R/detail.md" --skip-closed --commit-url "$CURL"
+rmdir "$RD_ISSUE_LEDGER.lock"
+check close_fr_two_keys_lock.rc "$RC" 10
+check close_fr_two_keys_lock.left "$(printf '%s\n' "$OUT" | grep '^ledger-left')" "ledger-left ghe.example.com/a/b 7
+ledger-left a/b 7"
+run forget ghe.example.com/a/b 7; RC1=$RC
+run forget a/b 7
+check close_fr_two_keys_lock.forget "$RC1/$RC/$(ledger | cut -f1 | tr '\n' ' ')" "0/0/github.com/a/b "
+run forget a/b 7
+check close_fr_two_keys_lock.rerun "$RC/$(ledger | cut -f1 | tr '\n' ' ')" "0/github.com/a/b "
+
+# html_url 키의 행이라도 다른 FR 에 연결돼 있으면 지우지 않는다 — 호스트 없는 옛 FR 을 다른 기본 호스트에서 발행하는 경우.
+newcase close_fr_other_fr_row
+detail 'a/b#7'; resp api_repos_a_b_issues_7 "$(iju closed https://github.com/a/b/issues/7)"
+{ printf 'a/b\t7\thttps://github.com/a/b/issues/7\tdetail\t2026-11-16T00:00:00Z\n'; printf 'github.com/a/b\t7\thttps://github.com/a/b/issues/7\t2026-11-21-public\t2026-11-16T00:00:00Z\n'; } > "$RD_ISSUE_LEDGER"
+run close-fr "$R/detail.md" --skip-closed --commit-url "$CURL"
+check close_fr_other_fr_row.rc "$RC" 0
+check close_fr_other_fr_row.rows "$(ledger | cut -f1,4 | tr '\t\n' '  ')" "github.com/a/b 2026-11-21-public "
+has   close_fr_other_fr_row.notice "$ERR" "다른 FR 에 연결된 선점 행 github.com/a/b#7 은 남겼습니다"
+lacks close_fr_other_fr_row.noforget "$OUT" "ledger-left"
+check close_fr_other_fr_row.out "$OUT" "skipped-closed https://github.com/a/b/issues/7
+kept-other-fr github.com/a/b 7 2026-11-21-public"
+# --skip-closed 없이는 결과 줄을 내지 않는다(같은 장부·상세로 같은 분기에 닿게 한다).
+{ printf 'a/b\t7\thttps://github.com/a/b/issues/7\tdetail\t2026-11-16T00:00:00Z\n'; printf 'github.com/a/b\t7\thttps://github.com/a/b/issues/7\t2026-11-21-public\t2026-11-16T00:00:00Z\n'; } > "$RD_ISSUE_LEDGER"
+run close-fr "$R/detail.md" --commit-url "$CURL"
+lacks close_fr_other_fr_row.noskip "$OUT" "kept-other-fr"
+# 발행은 상세를 임시 파일로 넘긴다 — 상세 첫 줄(`# 날짜 이름`)로 FR 을 알아, 이 FR 의 html_url 키 행만 지운다.
+printf '# 2026-11-20 legacy\n- status: done\n- github-issue: a/b#7\n' > "$C/tmp.XXXX1"
+printf 'github.com/a/b\t7\thttps://github.com/a/b/issues/7\t2026-11-20-legacy\t2026-11-16T00:00:00Z\n' > "$RD_ISSUE_LEDGER"
+run close-fr "$C/tmp.XXXX1" --skip-closed --commit-url "$CURL"
+check close_fr_other_fr_row.same_fr_tmpname "$RC/$(ledger)" "0/"
+{ printf 'a/b\t7\thttps://github.com/a/b/issues/7\t2026-11-19-other\t2026-11-16T00:00:00Z\n'; printf 'github.com/a/b\t7\thttps://github.com/a/b/issues/7\t2026-11-19-other\t2026-11-16T00:00:00Z\n'; } > "$RD_ISSUE_LEDGER"
+run close-fr "$C/tmp.XXXX1" --skip-closed --commit-url "$CURL"
+check close_fr_other_fr_row.other_tmpname "$RC/$(ledger | cut -f1,4 | tr '\t\n' '  ')" "0/github.com/a/b 2026-11-19-other "
 
 # --skip-closed(archive) 출력에는 남긴 호스트 없는 행을 `kept-row` 줄로 더한다.
 newcase close_fr_kept_row_line

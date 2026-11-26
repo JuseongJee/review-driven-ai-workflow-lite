@@ -71,7 +71,8 @@ git clone --depth 1 git@github.com:owner/ai-dev-template.git "$TMPL/template" ||
 
 # .git 을 제외한 배포본 루트 전체를 복사한다.
 # 골라 복사하면 .claude/(hook 설정)·WORKING_WITH_AI.md·.gitignore 를 빠뜨린다.
-rm -rf "$TMPL/template/.git"
+# README.md 는 배포 저장소의 안내 화면이라 옮기지 않는다(내 저장소의 README 가 아님).
+rm -rf "$TMPL/template/.git" "$TMPL/template/README.md"
 cp -R "$TMPL/template/." ./
 
 rm -rf "$TMPL"

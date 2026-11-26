@@ -214,6 +214,12 @@ grep -q 'SCOPE NARROWING (this session has passed 6 turns)' "$TMP/n8.txt"; chk $
 grep -q 'data loss or a security problem in any environment' "$TMP/n8.txt"; chk $? "축소: 데이터 손실·보안은 환경과 상관없이 보호"
 grep -qF '"범위 밖: <location> — <content> — <reason>"' "$TMP/n8.txt"; chk $? "축소: 범위 밖 줄 형식"
 grep -q 'remove it from Open Issues' "$TMP/n8.txt"; chk $? "축소: 범위 밖이 된 열린 이의를 Open Issues 에서 뺌"
+build_review_prompt "$TMP/n8d.txt" \
+  "$SD" "$SD/SESSION.md" "$SD/CHECKPOINT.md" "$SD/USER_ACTION.md" \
+  "$SD/turns/001_claude.md" "$SD/turns/008_reviewer.md" \
+  diff-review "TARGET.md" "goal" "20" 008 2>/dev/null
+grep -qF -- '- Final diff review: points on the "맞닿은 곳" list in the PR body are not uncommon environments. A "맞닿은 곳:" finding, or a defect at one of those points, blocks closure like (1)-(4): keep it open even if every other objection is out of scope.' "$TMP/n8d.txt"; chk $? "축소: diff review 턴 008 지시에 맞닿은 곳 보호 조항"
+! grep -q '맞닿은 곳' "$TMP/n8.txt"; chk $? "축소: request review 턴 008 지시에는 맞닿은 곳 보호 조항 없음"
 
 # 출처 두 곳: REQUEST Constraints 줄, short-title 이 같고 promote 의 base-commit 에 없던 세션의 Reviewer 턴 줄
 printf '\n## Branch Context\n- short-title: oos-task\n' >> "$TMP/$SD/SESSION.md"
@@ -258,6 +264,11 @@ PROJECT_ROOT="$TMP/wt" build_review_prompt "$TMP/d5.txt" "$WS" "$WS/SESSION.md" 
   "$WS/turns/001_author.md" "$WS/turns/002_reviewer.md" spec-plan-review "TARGET.md" "goal" "20" "002" 2>/dev/null
 grep -qF -- '- 20261120_120500_request-review 턴 008: 범위 밖: c.sh:1 — 기본 체크아웃 REQUEST 리뷰 결정 — 드문 환경' "$TMP/d5.txt"; chk $? "범위 밖: 기본 체크아웃에 남은 같은 작업 REQUEST 리뷰 결정이 worktree 리뷰에 전달"
 ! grep -q '기본 체크아웃 옛 작업 결정' "$TMP/d5.txt"; chk $? "범위 밖: worktree 리뷰에도 기본 체크아웃의 base-commit 에 있던 옛 작업 줄은 제외"
+# 같은 조건(앞선 세션 Reviewer 턴의 범위 밖 줄이 채워진 상태)에서 diff-review 지시에만 맞닿은 곳 우선 문장이 붙는다
+PROJECT_ROOT="$TMP/wt" build_review_prompt "$TMP/d6.txt" "$WS" "$WS/SESSION.md" "$WS/CHECKPOINT.md" "$WS/USER_ACTION.md" \
+  "$WS/turns/001_author.md" "$WS/turns/002_reviewer.md" diff-review "TARGET.md" "goal" "20" "002" 2>/dev/null
+grep -qF -- '- Final diff review: a line from an earlier reviewer turn does not cover a point on the "맞닿은 곳" list in the PR body. Review that point as usual. A line marked "결정: 사람" still applies.' "$TMP/d6.txt"; chk $? "범위 밖: diff-review 지시에는 앞선 Reviewer 줄이 맞닿은 곳을 덮지 않는다는 문장"
+! grep -q 'Final diff review: a line from an earlier reviewer turn' "$TMP/d5.txt"; chk $? "범위 밖: spec-plan-review 지시에는 맞닿은 곳 우선 문장 없음"
 git -C "$TMP" worktree remove --force "$TMP/wt" 2>/dev/null
 # base-commit 이 없으면(promote 를 거치지 않은 작업) 다른 세션의 줄을 물려받지 않는다
 printf 'short-title=oos-task\n' > "$TMP/rd-workflow-workspace/.lifecycle/task-state"

@@ -176,7 +176,7 @@ _tl_branch_regs() {
 #   작업당 tasks_index_get 을 필드 수만큼 부르면 색인을 그 횟수만큼 다시 읽고 서브셸을 띄운다.
 #   색인을 쓴 뒤 같은 slug 의 값을 다시 읽어야 하면 이 함수를 다시 부른다.
 _tl_load_row() {  # <slug>
-  TL_FR_BRANCH=""; TL_STATE=""; TL_CHECKOUT=""; TL_WORKTREE=""; TL_LAUNCH=""; TL_LAUNCH_BACKEND=""
+  TL_FR_BRANCH=""; TL_STATE=""; TL_CHECKOUT=""; TL_WORKTREE=""; TL_LAUNCH=""; TL_LAUNCH_BACKEND=""; TL_LAUNCH_TAB=""
   local slug="$1" path line fields f k v
   _tasks_shared_dir_fill || :; path="$_TASKS_SD_VAL/tasks.local"
   [[ -f "$path" ]] || return 1
@@ -195,6 +195,7 @@ _tl_load_row() {  # <slug>
           worktree-path) TL_WORKTREE="$v" ;;
           launch) TL_LAUNCH="$v" ;;
           launch-backend) TL_LAUNCH_BACKEND="$v" ;;
+          launch-tab) TL_LAUNCH_TAB="$v" ;;
         esac
       done
       return 0
@@ -207,6 +208,32 @@ _tl_load_row() {  # <slug>
 _tl_evidence_ok() {  # <slug> <oid>
   _TL_EV="$(tasks_publish_evidence "$1" "$2" "$DEFAULT_BRANCH" "$REMOTE_MODE")"
   [[ "$_TL_EV" == "cleanup-pending" ]]
+}
+
+# 발행 큐 요청이 허가 슬롯을 쥔 상태(허가됨·발행 중·부분 완료)인지. 그렇다면 "<상태 표시><TAB><큐의 다음 행동>"
+#   (pq_label·_pq_next_action)을 stdout 에 내고 rc 0. 다음 행동은 큐가 실행 위치까지 정한다 — 허가됨·부분 완료는
+#   작업 worktree 의 체크아웃이 이 작업이면 그 worktree 의 run, 아니면 체크아웃을 되돌리는 길, worktree 가 없으면
+#   취소·다시 만들기(허가됨)나 recover(부분 완료)다.
+#   요청이 없거나 그 밖의 상태면 rc 1, 상태를 판정하지 못하면 rc 3.
+#   세 상태를 모두 보는 이유: 부분 완료는 발행 중에서만, 발행 중은 허가됨·부분 완료에서 worktree 안의 rd publish run
+#   으로만 들어간다(publish_queue.sh 의 state= 전이). 부분 완료만 보면 검사 뒤 발행 중 → 부분 완료 전이를 놓친다.
+#   요청 파일이 없으면 publish_queue.sh 를 부르지 않는다(pq_dir 가 큐 디렉터리를 만든다). publish_queue.sh 는
+#   하위 셸에서만 source 한다(_tl_queue_summary 와 같은 이유).
+_tl_queue_holding() {  # <slug>
+  _tasks_shared_dir_fill || return 1
+  [[ -f "$_TASKS_SD_VAL/publish-queue/${1}.req" ]] || return 1
+  (
+    set +e +u
+    source "$SCRIPT_DIR/publish_queue.sh" >/dev/null 2>&1 || exit 3
+    st="$(_pq_state_of "$1" 2>/dev/null)"; rc=$?
+    [[ "$rc" -eq 1 ]] && exit 1
+    [[ "$rc" -eq 0 ]] || exit 3
+    case "$st" in
+      granted|running|partial) ;;
+      *) exit 1 ;;
+    esac
+    printf '%s\t%s' "$(pq_label "$st")" "$(_pq_next_action "$1" "$st")"
+  )
 }
 
 _tl_cp_resolve() {  # <slug> — 지연 정리가 worktree·로컬 브랜치를 풀었으므로 그 정리 잔여 기록을 푼다
@@ -245,6 +272,18 @@ _tl_sweep_one() {  # <slug>
   # 2b) 남은 것이 있는데 기본 체크아웃이 아니면 삭제하지 않는다
   if [[ "$_TL_DEFAULT_CHECKOUT" -ne 1 ]]; then
     _tl_hold "$slug" "기본 체크아웃이 아닌 worktree 에서 실행되어 삭제하지 않음" "기본 체크아웃에서 rd task list 를 실행"
+    return 0
+  fi
+
+  # 2c) 발행 큐 요청이 허가 슬롯을 쥔 상태(허가됨·발행 중·부분 완료)면 worktree·브랜치를 남긴다 — 지우면 그 요청을
+  #     run 으로 이어 갈 수 없고, recover 의 재개 안내(worktree add)도 fr 브랜치가 있어야 한다. 요청은 슬롯을 쥔 채 남는다.
+  local qrc=0 qinfo
+  qinfo="$(_tl_queue_holding "$slug")" || qrc=$?
+  if [[ "$qrc" -eq 0 ]]; then
+    _tl_hold "$slug" "발행 요청이 「${qinfo%%$'\t'*}」 상태라 지우지 않음" "${qinfo#*$'\t'} 뒤 rd task list 를 다시 실행"
+    return 0
+  elif [[ "$qrc" -ne 1 ]]; then
+    _tl_hold "$slug" "발행 요청 상태를 판정하지 못함" "rd publish status ${slug} 로 확인한 뒤 rd task list 를 다시 실행"
     return 0
   fi
 
@@ -509,7 +548,8 @@ _tl_launch_action() {  # <slug> <launch-raw> <wt>
       printf '→ 확인: rd task resolve-launch %s\n' "$slug" ;;
     failed|none|*)
       if [[ -n "$wt" ]]; then
-        printf '→ %s\n' "$(session_launch_command "$wt" "$slug")"
+        # 선택은 행 순회 루프가 한 번 해 둔다(SL_MODEL·SL_EFFORT) — 명령 치환 안이라 여기서 부르지 않는다(spec D6).
+        printf '→ %s\n' "$(session_launch_command "$wt" "$slug" "${SL_MODEL-}" "${SL_EFFORT-}")"
       else
         printf '→ 확인: rd task resolve-launch %s\n' "$slug"
       fi
@@ -561,14 +601,12 @@ _tl_pr_review_rows() {
     }
     # fr 작업 줄의 set-status 는 --task <slug> 로 대상을 고정한다 — 현재 위치만으로 고르면, 목록 뒤에 색인 행이 사라졌을 때
     # 남은 다른 작업이 골라진다. --task 는 그 작업이 색인에 없으면 아무것도 바꾸지 않고 멈춘다.
-    # 기본 체크아웃 작업(no-fr)에는 Status 를 바꾸는 명령(rd task set-status·rd pr check --apply)과 rd pr check(조회)를
-    # 안내하지 않는다. 대상 선택(task_resolve_target)은 기본 체크아웃 작업을 고를 방법이 없다 — 색인에 진행 중 작업이 있으면
-    # 그 작업을 고르고, 색인 파일만 남았으면 막는다. 조회도 merge·수정 요청·닫힘 뒤에는 대상 미지정 상태 변경 명령을 다음
-    # 행동으로 내므로 같은 이유로 뺀다. 그래서 남은 일과 대상 제약, Status 와 무관한 PR 단위 행동(gh pr reopen)만 보인다.
-    _TL_NOFR_NOTE="Status 를 바꾸는 rd 명령(rd task set-status·rd pr check --apply)이 지금은 이 작업을 대상으로 고르지 못할 수 있습니다(후속 FR nofr-task-target-resolution)"
+    # 기본 체크아웃 작업(fr-branch=null)은 색인에 없어 --task 로 고를 수 없으므로 접미사 없이 기본 체크아웃 경로에서 실행하게 한다.
+    # 대상 선택은 기본 체크아웃의 task-state 가 진행 중 작업이면 그 작업을 고르고, 목록 뒤에 그 작업이 끝났으면(대기 중)
+    # 색인의 다른 작업을 자동으로 고르지 않고 멈춘다(change spec D2·D3).
     # 작업 하나의 표 줄을 rows 에 더한다. <slug> <작업 경로> <fr-branch 값(fr/<slug> 또는 null)> <tip 커밋(빈 값 허용)>
     _tl_pr_task_rows() {
-      local slug="$1" wt="$2" fr_ref="$3" tip_c="$4" cdq
+      local slug="$1" wt="$2" fr_ref="$3" tip_c="$4" cdq task_opt=""
       cdq="cd $(_tl_q "$wt") &&"
       if [[ "$tp_loaded" == 0 ]]; then
         source "$SCRIPT_DIR/_team_publish_common.sh" >/dev/null 2>&1 \
@@ -622,17 +660,9 @@ _tl_pr_review_rows() {
             pushed)
               srows="${srows}${slug}	${r_path}	-	push 완료	→ 반영 끝: 팀 브랜치 ${r_branch} 에 push 했습니다"$'\n' ;;
             merged)
-              if [[ "$fr_ref" == null ]]; then
-                srows="${srows}${slug}	${r_path}	${r_url}	merge 반영됨	→ 포인터 반영 완료 / 남은 PR 이 모두 반영되면 Status 를 아카이브 보류로 옮겨야 합니다 / ${_TL_NOFR_NOTE}"$'\n'
-              else
-                srows="${srows}${slug}	${r_path}	${r_url}	merge 반영됨	→ 모든 PR 이 반영되면 rd pr check --apply 가 Status 를 옮깁니다"$'\n'
-              fi ;;
+              srows="${srows}${slug}	${r_path}	${r_url}	merge 반영됨	→ 모든 PR 이 반영되면 rd pr check --apply 가 Status 를 옮깁니다"$'\n' ;;
             closed)
-              if [[ "$fr_ref" == null ]]; then
-                srows="${srows}${slug}	${r_path}	${r_url}	기록상 닫힘	→ 이 줄은 원격을 조회하지 않습니다 / 지금 상태는 PR 링크에서 확인하고, 링크에서도 닫혀 있으면 다시 올리려면 gh pr reopen $(_tl_q "$r_url") / ${_TL_NOFR_NOTE}"$'\n'
-              else
-                srows="${srows}${slug}	${r_path}	${r_url}	닫힘	→ 닫힌 PR 입니다: ${cdq} bash rd-workflow/scripts/rd pr check"$'\n'
-              fi ;;
+              srows="${srows}${slug}	${r_path}	${r_url}	닫힘	→ 닫힌 PR 입니다: ${cdq} bash rd-workflow/scripts/rd pr check"$'\n' ;;
             open)
               res="$(tp_pr_state "$r_url" 2>/dev/null)" || res=""
               # 빈 칸이 이어지므로 read 가 아니라 cut 으로 자른다(탭은 IFS 공백이라 빈 칸이 합쳐진다).
@@ -640,27 +670,17 @@ _tl_pr_review_rows() {
               case "$verdict" in
                 MERGED)
                   # 대상 판정에 실패한 작업은 --apply 가 rc 2 로 멈추므로 실행할 수 없는 명령을 안내하지 않는다.
-                  if [[ -n "$t_failed" && "$fr_ref" == null ]]; then
-                    srows="${srows}${slug}	${r_path}	${r_url}	merge 됨	→ merge 됨: 아래 대상 판정 실패를 먼저 해결해야 합니다 / ${_TL_NOFR_NOTE}"$'\n'
-                  elif [[ -n "$t_failed" ]]; then
+                  if [[ -n "$t_failed" ]]; then
                     srows="${srows}${slug}	${r_path}	${r_url}	merge 됨	→ merge 됨: 아래 대상 판정 실패를 먼저 해결해야 rd pr check --apply 가 진행됩니다"$'\n'
-                  elif [[ "$fr_ref" == null ]]; then
-                    srows="${srows}${slug}	${r_path}	${r_url}	merge 됨	→ merge 됨: submodule 포인터 반영과 Status 전이가 남았습니다 / ${_TL_NOFR_NOTE}"$'\n'
                   else
                     srows="${srows}${slug}	${r_path}	${r_url}	merge 됨	→ merge 됨: ${cdq} bash rd-workflow/scripts/rd pr check --apply"$'\n'
                   fi ;;
                 CHANGES_REQUESTED)
-                  if [[ "$fr_ref" == null ]]; then
-                    srows="${srows}${slug}	${r_path}	${r_url}	수정 요청	→ 수정 요청: ${summary:-(의견 없음)} / 반영하려면 기본 체크아웃의 Status 를 구현 중으로 되돌립니다 / ${_TL_NOFR_NOTE}"$'\n'
-                  else
-                    srows="${srows}${slug}	${r_path}	${r_url}	수정 요청	→ 수정 요청: ${summary:-(의견 없음)} / 반영하려면 ${cdq} bash rd-workflow/scripts/rd task set-status \"구현 중\" --task $(_tl_q "$slug")"$'\n'
-                  fi ;;
+                  # 기본 체크아웃 작업은 --task 를 붙이지 않는다(위 주석).
+                  task_opt=""; [[ "$fr_ref" == null ]] || task_opt=" --task $(_tl_q "$slug")"
+                  srows="${srows}${slug}	${r_path}	${r_url}	수정 요청	→ 수정 요청: ${summary:-(의견 없음)} / 반영하려면 ${cdq} bash rd-workflow/scripts/rd task set-status \"구현 중\"${task_opt}"$'\n' ;;
                 CLOSED)
-                  if [[ "$fr_ref" == null ]]; then
-                    srows="${srows}${slug}	${r_path}	${r_url}	닫힘	→ PR 이 merge 없이 닫혔습니다 / 다시 올리려면 PR 링크에서 재개할 수 있는지 확인한 뒤 gh pr reopen $(_tl_q "$r_url") / ${_TL_NOFR_NOTE}"$'\n'
-                  else
-                    srows="${srows}${slug}	${r_path}	${r_url}	닫힘	→ PR 이 merge 없이 닫혔습니다: ${cdq} bash rd-workflow/scripts/rd pr check"$'\n'
-                  fi ;;
+                  srows="${srows}${slug}	${r_path}	${r_url}	닫힘	→ PR 이 merge 없이 닫혔습니다: ${cdq} bash rd-workflow/scripts/rd pr check"$'\n' ;;
                 OPEN)
                   srows="${srows}${slug}	${r_path}	${r_url}	검토 대기	→ 팀의 검토·merge 를 기다립니다"$'\n' ;;
                 *)
@@ -823,6 +843,15 @@ while IFS= read -r slug; do
   [[ "$checked_out" == "yes" ]] && action_wt="$wt"
   # 빈 값을 `none` 으로 바꾸지 않는다 — 표시(label)가 이미 빈 값을 "확인 필요"(unknown)로
   # 다루므로, 행동만 `none`(수동 기동 권유)으로 갈리면 같은 행이 서로 다른 말을 한다.
+  # 수동 기동 명령을 낼 첫 행에서 모델·effort 를 한 번만 정한다(claude --help 를 목록당 1회로 묶는다).
+  case "$launch_raw" in
+    ok|launching|unknown|"") ;;
+    *)
+      if [[ -n "$action_wt" && "${_TL_SELECTION_DONE:-0}" -eq 0 ]]; then
+        session_launch_selection
+        _TL_SELECTION_DONE=1
+      fi ;;
+  esac
   action="$(_tl_launch_action "$slug" "$launch_raw" "$action_wt")"
 
   # 세션 이름은 32자에서 잘린다. 잘린 slug 의 행에만 실제 이름을 보여 호출 세션이 그 이름으로
@@ -830,7 +859,12 @@ while IFS= read -r slug; do
   # 기록된 기동 백엔드의 명령을 짚는다 — hc 는 `hc get·attach`, 그 밖(빈 값 포함)은 herdr.
   name_action=""
   agent_name="$(session_agent_name "$slug")"
-  if [[ "$agent_name" != "$slug" ]]; then
+  if [[ "$TL_LAUNCH_BACKEND" == "orca" ]]; then
+    # Orca 는 이름을 쓰지 않는다 — 조회에 쓰는 handle 을 보인다(spec D8).
+    case "$launch_raw" in
+      ok|unknown|launching|"") [[ -z "$TL_LAUNCH_TAB" ]] || name_action="→ Orca 세션: ${TL_LAUNCH_TAB}" ;;
+    esac
+  elif [[ "$agent_name" != "$slug" ]]; then
     case "$launch_raw" in
       ok|unknown|launching|"")
         if [[ "$TL_LAUNCH_BACKEND" == "hc" ]]; then

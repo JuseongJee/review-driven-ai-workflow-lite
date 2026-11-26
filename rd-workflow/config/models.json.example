@@ -13,5 +13,23 @@
       "model": null,
       "effort": null
     }
+  },
+  "headless": {
+    "claude": {
+      "model": null,
+      "effort": null
+    }
+  },
+  "session": {
+    "claude": {
+      "model": null,
+      "effort": null
+    }
+  },
+  "subagent": {
+    "claude": {
+      "model": null,
+      "effort": null
+    }
   }
 }

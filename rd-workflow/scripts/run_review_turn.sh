@@ -102,6 +102,17 @@ load_review_config() {
   load_review_config_once
 }
 
+# available_review_tools — 이 설치에 어댑터가 있는 리뷰 도구 이름을 「·」 로 이어 낸다(없으면 「없음」).
+available_review_tools() {
+  local f out=""
+  for f in "${script_dir}"/adapter_*.sh; do
+    [[ -f "$f" ]] || continue
+    f="${f##*/adapter_}"; f="${f%.sh}"
+    out="${out:+${out}·}${f}"
+  done
+  printf '%s' "${out:-없음}"
+}
+
 # --- 도구별 설정 조회 ---
 # 시그니처·null/missing 계약 불변 — 내부만 REVIEW_CFG_KV 조회로 교체.
 # jq 재호출 없음 (spec AC 3).
@@ -631,11 +642,38 @@ session_unresolved_confirmed() {
 #   rc 1  = 거부 (다음 행동 안내를 stderr 에 냄)
 # 이 함수는 SESSION 을 쓰지 않습니다 (전환은 apply_author_handoff, 모든 검사 통과 뒤).
 # 전역 STATUS·CURRENT_OWNER·TURNS_DIR 를 읽습니다. 서브셸로 부르면 HANDOFF_TURN_FILE 이 사라집니다.
+# closed_session_notice <session-dir> — 종결(closed) 세션 거부 안내.
+# 종결 세션은 --reopen·--decision 으로 다시 열지 않습니다. 재확인은 새 세션으로 하고,
+# diff 리뷰는 마지막으로 리뷰한 head 를 base 로 주어 그 뒤의 변경만 리뷰합니다.
+closed_session_notice() {
+  local head
+  echo "리뷰 세션이 종결됐습니다 (status=closed). 종결된 세션은 --reopen·--decision 으로 다시 열지 않습니다. 다시 리뷰하려면 새 세션을 만드십시오." >&2
+  if [[ "$REVIEW_TYPE" != "diff-review" ]]; then
+    echo "  bash rd-workflow/scripts/prepare_review_pipeline.sh 로 새 세션을 만드십시오." >&2
+    return 0
+  fi
+  head="$(session_branch_field "${1}/SESSION.md" "review-head-oid" 2>/dev/null || true)"
+  [[ -n "$head" ]] || head="<마지막으로 리뷰한 커밋>"
+  echo "  종결 뒤 고친 내용을 재확인받는 순서:" >&2
+  echo "  1. bash rd-workflow/scripts/rd task set-status \"구현 중\" 후 수정을 커밋합니다 (이미 커밋했으면 건너뜁니다)." >&2
+  echo "  2. bash rd-workflow/scripts/rd task set-status \"검증 중\" → verify_record.sh 로 검증 → bash rd-workflow/scripts/rd task set-status \"diff review 대기\"" >&2
+  echo "  3. bash rd-workflow/scripts/prepare_review_pipeline.sh diff --base ${head}" >&2
+  echo "     (마지막으로 리뷰한 커밋 뒤의 변경만 리뷰합니다. --base 를 빼면 diff 전체를 처음부터 다시 리뷰합니다.)" >&2
+  echo "  4. 새 세션을 만든 뒤 상태 파일(task-state·CURRENT_TASK.md)을 커밋합니다. 종결된 세션이 최신인 동안에는 커밋 게이트가 'diff review 대기' 커밋을 막습니다." >&2
+  echo "  5. 새 세션의 turns/001_author.md 를 쓰고 bash rd-workflow/scripts/run_review_turn.sh <새 세션> 을 실행합니다." >&2
+}
+
 classify_session_for_reviewer() {
   local session_dir="$1" rel latest base num role next
   HANDOFF_TURN_FILE=""
   rel="${session_dir#${project_root}/}"
 
+  # closed 세션은 옵션이 무엇이든 아래 closed 안내로 갑니다. 「옵션 없이 다시 실행」 을 안내하면
+  # 그대로 따른 다음 실행이 다시 closed 로 거부되기 때문입니다.
+  if [[ "$STATUS" == "closed" ]]; then
+    closed_session_notice "$session_dir"
+    return 1
+  fi
   if [[ -n "$REOPEN_REASON" && "$STATUS" != "awaiting-user" ]]; then
     echo "--reopen 은 awaiting-user 로 수렴한 세션에만 씁니다 (status=${STATUS}). --reopen 없이 다시 실행하십시오." >&2
     return 1
@@ -666,10 +704,6 @@ classify_session_for_reviewer() {
         echo "리뷰 세션을 다시 열 수 없습니다 — 수렴한 세션이 아닙니다 (${REOPEN_UNRESOLVED_REASON}). 미해결 이의가 남은 세션은 사람이 결정한 뒤 --decision \"<사용자 결정>\" 으로 이어 가십시오." >&2
         return 1
       fi
-      ;;
-    closed)
-      echo "리뷰 세션이 종결됐습니다 (status=closed). 다시 리뷰하려면 bash rd-workflow/scripts/prepare_review_pipeline.sh 로 새 세션을 만드십시오." >&2
-      return 1
       ;;
     awaiting-author)
       if [[ "$CURRENT_OWNER" != "Author" && "$CURRENT_OWNER" != "Claude" ]]; then
@@ -889,6 +923,110 @@ pending_override_notice() {
   fi
 }
 
+# print_finding_trend <session-dir> — 턴 한도에 닿았을 때 Reviewer 턴별 지적 추세를 stderr 에 표로 냅니다.
+#   지적은 `## Findings` 절의 `- F<번호>` 줄이고, 새 지적은 앞 Reviewer 턴에 없던 번호입니다.
+#   수렴 판단과 권장안은 Author 가 정합니다(FILE_BASED_REVIEW_PIPELINE.md 「턴 한도 도달」). 표시 전용이며 실패해도 결과를 바꾸지 않습니다.
+print_finding_trend() {
+  local sd="$1" f n ids id new cnt nnew oos seen=" " rows=() max=10 skip
+  # 옛 이름(NNN_codex.md)과 새 이름(NNN_reviewer.md)이 섞인 세션도 턴 번호순으로 셉니다.
+  while IFS= read -r f; do
+    [[ -n "$f" && -f "$f" ]] || continue
+    n="$(basename "$f")"; n="${n:0:3}"
+    ids="$(awk '/^## Findings[[:space:]]*$/ { f = 1; next } f && /^## / { exit }
+      f && match($0, /^[[:space:]]*- F[0-9]+/) { s = substr($0, RSTART, RLENGTH); sub(/^[[:space:]]*- /, "", s); if (!(s in u)) { u[s] = 1; print s } }' "$f" 2>/dev/null)"
+    cnt=0; nnew=0; new=""
+    for id in $ids; do
+      cnt=$((cnt + 1))
+      if [[ "$seen" != *" ${id} "* ]]; then nnew=$((nnew + 1)); new="${new:+$new }${id}"; seen="${seen}${id} "; fi
+    done
+    oos="$(_rc_oos_lines "$f" | grep -c . || true)"
+    rows+=("$(printf '  %s  %4s  %7s  %7s  %s' "$n" "$cnt" "$nnew" "${oos:-0}" "${new:--}")")
+  done < <(for f in "$sd"/turns/[0-9][0-9][0-9]_reviewer.md "$sd"/turns/[0-9][0-9][0-9]_codex.md; do
+             [[ -f "$f" ]] && printf '%s\t%s\n' "$(basename "$f")" "$f"
+           done | sort | cut -f2-)
+  [[ "${#rows[@]}" -gt 0 ]] || return 0
+  {
+    echo "지적 추세 (Reviewer 턴별, 새 지적 = 앞 턴에 없던 번호):"
+    echo "  턴   지적  새 지적  범위 밖  새 지적 번호"
+    skip=$(( ${#rows[@]} - max ))
+    if [[ "$skip" -gt 0 ]]; then
+      echo "  (앞 ${skip}턴 생략)"
+      printf '%s\n' "${rows[@]:$skip}"
+    else
+      printf '%s\n' "${rows[@]}"
+    fi
+    echo "  사람에게 묻기 전에 이 표와 수렴 판단을 보이십시오. 새 지적이 턴마다 나오거나 같은 계열이 반복되면 연장이 아니라 「범위 밖으로 넘기고 종결」 을 권장안으로 둡니다."
+  } >&2
+}
+
+# _sq <text> — 사람이 복사해 실행할 작은따옴표 인자로 바꿉니다. 대화형 zsh·bash 의 이력 참조(!)와 $·` 가 모두 글자 그대로 남습니다.
+#   글 안의 작은따옴표는 '\'' 로 닫고 다시 엽니다.
+_sq() { local q="'\\''"; printf "'%s'" "${1//\'/$q}"; }
+
+# 종결 결정 뒤 확인 턴의 --decision 표식입니다. override_confirm_steps 가 안내 명령에 넣고, confirm_turn_closable 이 찾습니다.
+CONFIRM_MARK="(종결 결정 — 리뷰 뒤 변경 확인)"
+
+# _latest_turn_file <session-dir> — 번호가 가장 큰 턴 파일 이름(없으면 빈 값).
+_latest_turn_file() {
+  local f
+  for f in "$1"/turns/[0-9][0-9][0-9]_*.md; do [[ -f "$f" ]] && basename "$f"; done | sort | tail -1
+}
+
+# confirm_turn_closable <session-dir> — 사람의 종결 결정 뒤 확인 턴을 마치고 Reviewer 가 Author 에게 넘긴 세션인지 봅니다.
+#   종결 결정은 확인 턴 전에 이미 내려졌으므로, 이 세션은 awaiting-author 여도 --override 를 받습니다.
+#   조건: Status awaiting-author, 최신 턴이 Reviewer 턴, Reopen History 의 마지막 재개 줄(--decision·--reopen)이
+#   결정 재개이고 결정 본문이 ${CONFIRM_MARK} 로 끝남. 재개 종류는 기록 머리(「- 날짜 시각 NNN_*.md 뒤 …재개: 」)로 가립니다.
+#   옵션 없는 Author 인계는 재개 줄을 남기지 않으므로 그 뒤 확인 턴을 이어도 결정이 유지되고, 다른 --decision·--reopen 이 오면 풀립니다.
+#   근거는 대조하지 않습니다. 확인 턴의 보호 범주 이의를 사람에게 다시 물어 받은 새 근거로 종결할 수 있어야 하고,
+#   awaiting-user 의 --override 도 사람의 말을 그대로 근거로 받습니다. rc 0 = 받음 / rc 1 = 아님
+_REOPEN_HEAD_RE='^- [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} [0-9]{3}_[a-z]+\.md 뒤 '
+_last_reopen_line() {
+  extract_section "$SESSION_FILE" "Reopen History" | grep -E "${_REOPEN_HEAD_RE}(사용자 결정으로 )?재개: " | tail -1
+}
+confirm_turn_closable() {
+  local sd="$1" line
+  [[ "$STATUS" == "awaiting-author" ]] || return 1
+  [[ "$(_latest_turn_file "$sd")" =~ ^[0-9]{3}_(reviewer|codex)\.md$ ]] || return 1
+  line="$(_last_reopen_line)"
+  [[ "$line" =~ ${_REOPEN_HEAD_RE}사용자\ 결정으로\ 재개:\ (.*)$ ]] || return 1
+  [[ "${BASH_REMATCH[1]}" == *" ${CONFIRM_MARK}" ]]
+}
+
+# override_confirm_steps <session-dir> — 사람이 종결을 정했지만 마지막 리뷰 뒤 보호 경로가 바뀐 세션의 다음 명령 순서.
+#   종결 결정은 다시 묻지 않습니다. 바뀐 부분만 리뷰어 확인 1회를 받고, 그 결과로 seal 또는 같은 근거의 --override 를 합니다.
+#   턴 한도를 넘는 확인 턴이면 필요한 --extend-turns 를 함께 냅니다(전역 turn_limit·OVERRIDE_TEXT 를 읽습니다).
+override_confirm_steps() {
+  local sd="$1" rel qrel latest n=0 author reviewer ext="" step1 run
+  rel="${sd#${project_root}/}"; qrel="$(_sq "$rel")"
+  latest="$(_latest_turn_file "$sd")"
+  [[ "$latest" =~ ^([0-9]{3})_ ]] && n=$((10#${BASH_REMATCH[1]}))
+  if [[ "$latest" =~ ^[0-9]{3}_(author|claude)\.md$ ]]; then
+    # 이미 써 둔 Author 턴이 다음 Reviewer 에게 넘길 턴입니다(실행기도 이 턴을 넘깁니다).
+    author="$latest"; reviewer="$(printf '%03d' $((n + 1)))"
+    step1="리뷰 뒤 바뀐 내용을 대기 중인 Author 턴 ${rel}/turns/${author} 에 반영합니다."
+  else
+    author="$(printf '%03d' $((n + 1)))_author.md"; reviewer="$(printf '%03d' $((n + 2)))"
+    step1="리뷰 뒤 바뀐 내용을 Author 턴 ${rel}/turns/${author} 로 씁니다."
+  fi
+  if [[ "$turn_limit" =~ ^[0-9]+$ && $((10#$reviewer)) -gt "$turn_limit" ]]; then
+    ext=" --extend-turns $((10#$reviewer - turn_limit))"
+  fi
+  # awaiting-author(확인 턴을 이미 마친 세션)는 --decision 을 받지 않습니다. 옵션 없는 인계가 확인 턴을 돌리고 종결 결정은 유지됩니다.
+  if [[ "$STATUS" == "awaiting-author" ]]; then
+    run="bash rd-workflow/scripts/run_review_turn.sh ${qrel}${ext}"
+  else
+    run="bash rd-workflow/scripts/run_review_turn.sh ${qrel} --decision $(_sq "${OVERRIDE_TEXT} ${CONFIRM_MARK}")${ext}"
+  fi
+  echo "  사람의 종결 결정은 다시 묻지 않습니다. 리뷰 뒤 바뀐 부분만 리뷰어 확인 1회(턴 ${reviewer})를 받고 종결합니다."
+  echo "    1. ${step1}"
+  echo "    2. ${run}"
+  echo "    3. 확인 턴이 이의 없음으로 끝나면 그대로 종결 상태입니다. 이의가 남았고(awaiting-author 여도 됩니다) 새 이의가 기본 사용 경로 결함·데이터 손실·보안이 아니면"
+  echo "       다시 묻지 않고 bash rd-workflow/scripts/run_review_turn.sh ${qrel} --override $(_sq "$OVERRIDE_TEXT") 로 종결합니다."
+  echo "       새 이의가 그 셋 가운데 하나이면 그 이의를 보이고 사람에게 다시 묻습니다. 사람이 그래도 종결하면 그 사람의 말을 근거로 --override 를 실행합니다."
+  echo "    4. 트리가 바뀌었으므로 seal 전에 현재 트리의 검증 증거를 남깁니다: bash rd-workflow/scripts/verify_record.sh -- <이 저장소의 검증 명령>"
+  echo "       그다음 bash rd-workflow/scripts/rd review seal ${qrel} 로 종결 마커를 만듭니다."
+}
+
 # override_seal_precheck <session-dir> — 종결해도 rd review seal 이 거부할 세션을 종결 전에 거릅니다.
 #   새 검증으로 고칠 수 없는 두 조건만 봅니다: 실제로 실행된 리뷰어 턴 기록, 마지막 리뷰 뒤 보호 경로 변경.
 #   reviewed OID 가 있는 diff-review 세션만 대상입니다(seal 이 이 두 검사를 하는 세션과 같습니다).
@@ -951,7 +1089,7 @@ override_seal_precheck() {
     if [[ "$policy" == "pinned" ]]; then
       echo "  이 세션은 리뷰 head 가 고정(pinned)돼 --decision 으로도 같은 head 를 다시 봅니다. bash rd-workflow/scripts/prepare_review_pipeline.sh diff 로 새 세션을 만들어 바뀐 내용을 리뷰하십시오." >&2
     else
-      echo "$next" >&2
+      override_confirm_steps "$sd" >&2
     fi
     return 1
   fi
@@ -967,8 +1105,8 @@ override_seal_precheck() {
 apply_user_override() {
   local session_dir="$1" rel tmp rc st cr basis_line trail_nl=1 cp_file cp_tmp cp_bak note resume=0
   rel="${session_dir#${project_root}/}"
-  if [[ "$STATUS" != "awaiting-user" ]]; then
-    echo "--override 는 사람 결정을 기다리는 awaiting-user 세션에만 씁니다 (status=${STATUS})." >&2
+  if [[ "$STATUS" != "awaiting-user" ]] && ! confirm_turn_closable "$session_dir"; then
+    echo "--override 는 사람 결정을 기다리는 awaiting-user 세션과 종결 결정 뒤 확인 턴을 마친 세션에만 씁니다 (status=${STATUS})." >&2
     return 1
   fi
   # 이전 --override 가 CHECKPOINT 를 정리한 뒤 SESSION 교체 전에 멈췄으면 SESSION 기록만 이어 씁니다.
@@ -1408,6 +1546,7 @@ if [[ -n "$EXTEND_TURNS" ]]; then
 fi
 if [[ "$limit_reached" == "1" ]]; then
   echo "session already reached the turn limit (${turn_limit}): $relative_session_dir" >&2
+  print_finding_trend "$session_dir" || true
   if [[ "$handoff_pending" == "1" ]]; then
     echo "  사람이 더 이어 가기로 정했으면 늘릴 턴 수를 --extend-turns <N> 으로 붙여 다시 실행하십시오." >&2
   fi
@@ -1534,7 +1673,7 @@ for tool in $PRIORITY; do
   adapter="${script_dir}/adapter_${tool}.sh"
 
   if [[ ! -f "$adapter" ]]; then
-    echo "어댑터 없음, 건너뜀: $tool" >&2
+    echo "어댑터 없음, 건너뜀: $tool — 이 설치의 리뷰 도구는 $(available_review_tools) 입니다. review-tools.json 우선순위에서 빼려면 /review-config setup" >&2
     continue
   fi
 
@@ -1849,6 +1988,10 @@ echo "effort override: $(compute_effort_status)"
 
 # --- 리뷰 비용·범위 밖 (review-loop-formal-closure) — 표시 전용, fail-open ---
 review_cost_line "$session_dir" "${metric_tokens:--}" >&2 2>/dev/null || true
+# 이 Reviewer 턴으로 턴 한도에 닿아 사람에게 넘어가면 지적 추세를 보입니다.
+if [[ "$updated_status" == "awaiting-user" && "$NEXT_TURN_INDEX" -ge "$turn_limit" ]]; then
+  print_finding_trend "$session_dir" || true
+fi
 oos_out="$(session_out_of_scope "$session_dir" 2>/dev/null)" || oos_out=""
 if [[ -n "$oos_out" ]]; then
   {

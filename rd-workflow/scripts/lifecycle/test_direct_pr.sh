@@ -11,7 +11,7 @@
 # bash 3.2 호환.
 set -uo pipefail
 
-export HERDR_ENV= HC_TERMINAL_ID= RD_CHILD_SESSION=1
+export HERDR_ENV= HC_TERMINAL_ID= ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE= RD_CHILD_SESSION=1
 unset project_root TASK_STATE_PATH
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always
@@ -36,6 +36,26 @@ TMP="$(cd "$TMP" && pwd -P)"
 trap 'rm -rf "${TMP:?}"' EXIT
 cd "$TMP"
 export GIT_CEILING_DIRECTORIES="$(dirname "$TMP")"
+
+# 실제 ps 를 쓸 수 없는 환경(Codex 샌드박스는 /bin/ps 실행과 프로세스 목록 조회를 막는다)에서는
+# rd task list 의 점유 판정이 늘 판정불가로 보류돼 정리 흐름(t_evidence_*_cleanup)을 검증할 수 없다. 그때만 lsof 가 본 pid 를 내는
+# 대역 ps 를 PATH 앞에 둔다(test_tasks_list.sh 와 같은 대역). 대역 디렉터리는 fixture 저장소($W) 밖에 둔다.
+# 병렬 묶음은 이 PATH 를 물려받아 대역을 다시 만들지 않는다.
+if ! ps -U "$(id -u)" -o pid=,uid=,stat= >/dev/null 2>&1; then
+  mkdir "$TMP/ps-stub" || exit 1
+  cat > "$TMP/ps-stub/ps" <<'PS_STUB_EOF'
+#!/usr/bin/env bash
+# 대역 ps — tasks_path_occupied 의 `ps -U <uid> -o pid=,uid=,stat=` 호출에만 답한다.
+# 그 밖의 형식은 샌드박스의 실제 ps 처럼 실패한다(publish_queue.sh 의 다른 ps 호출).
+if [[ "$#" -ne 4 || "$1" != "-U" || "$3" != "-o" || "$4" != "pid=,uid=,stat=" ]]; then
+  echo "ps(대역): 지원하지 않는 형식: $*" >&2; exit 1
+fi
+lsof -a -u "$2" -d cwd -Fp 2>/dev/null | sed -n 's/^p//p' | awk -v u="$2" '{ print $1, u, "S" }'
+PS_STUB_EOF
+  chmod +x "$TMP/ps-stub/ps"
+  export PATH="$TMP/ps-stub:$PATH"
+  echo "  NOTE: 실제 ps 를 쓸 수 없는 환경 — lsof 기반 대역 ps 로 정상 정리 흐름을 검증합니다"
+fi
 
 # 공용 함수를 source 합니다. team_publish.sh 는 project_root 에 rd-workflow-workspace/ 가 있어야 source 됩니다.
 mkdir -p "$TMP/pr0/rd-workflow-workspace"
@@ -567,9 +587,13 @@ want t_untracked_blocks && t_untracked_blocks
 t_remote_ahead_stops() {
   local tip0 r0
   mk_direct pr; setup_fake_gh
+  # 착수 표시가 원격 fr 에 이미 있으므로, 다른 작업자의 이력이 먼저 있었다는 전제를 만들려고 표시 ref 를 지우고 올립니다.
+  git --git-dir="$ORIGIN" update-ref -d "refs/heads/$FRB" || { fail "t_remote_ahead_stops: 준비 실패(착수 표시 삭제)"; return; }
   origin_push_other "$FRB" other.txt "다른 작업" || { fail "t_remote_ahead_stops: 준비 실패"; return; }
   tip0="$(fr_tip)"; r0="$(git -C "$R" reflog show "$FRB" | wc -l | tr -d ' ')"
-  run_ar
+  # 이 상황은 archive 의 중복 발행 확인(같은 이름의 다른 이력)이 먼저 멈춥니다(test_archive_worktree.sh DD4 가 봅니다).
+  #   여기서는 그 확인을 넘긴 뒤에도 PR 발행이 원격 fr 을 force push 하지 않는지 봅니다.
+  run_ar --allow-duplicate-publish "PR 발행 경로 확인"
   eq "t_remote_ahead_stops: rc 1" "$AR_RC" "1"
   ok "t_remote_ahead_stops: force push 안 함 안내" "force push 하지 않습니다" "$(ar_out)"
   eq "t_remote_ahead_stops: fr tip 불변" "$(fr_tip)" "$tip0"
@@ -810,6 +834,24 @@ want t_apply_squash && t_apply_squash
 t_apply_rebase() { apply_merged rebase; }
 want t_apply_rebase && t_apply_rebase
 
+# push.followTags=true 여도 PR 발행·apply 의 push 가 로컬 태그(ft-old)를 원격에 보내지 않습니다 (archive.sh 발행 push 와 같은 이유).
+t_no_follow_tags() {
+  mk_direct pr; setup_fake_gh
+  git -C "$R" config push.followTags true
+  git -C "$R" tag -a ft-old -m ft-old "$(og main)" || { fail "t_no_follow_tags: 준비 — ft-old 태그 생성 실패"; return; }
+  run_ar
+  eq "t_no_follow_tags: PR 발행 rc 0" "$AR_RC" "0"
+  eq "t_no_follow_tags: 원격 fr == 로컬 fr (PR 발행 push 가 돌았음)" "$(og "$FRB")" "$(fr_tip)"
+  eq "t_no_follow_tags: PR 발행 push 가 로컬 태그를 보내지 않음" "$(git --git-dir="$ORIGIN" rev-parse -q --verify refs/tags/ft-old)" ""
+  fake_merge merge || { fail "t_no_follow_tags: 준비 — fake_merge 실패"; return; }
+  run_pr check --task "$SLUG" --apply
+  eq "t_no_follow_tags: apply rc 0" "$DPR_RC" "0"
+  eq "t_no_follow_tags: 원격 발행 태그 1개" "$(origin_tag_count)" "1"
+  eq "t_no_follow_tags: 원격 fr 삭제 (삭제 push 가 돌았음)" "$(og "$FRB")" ""
+  eq "t_no_follow_tags: apply 의 push 가 로컬 태그를 보내지 않음" "$(git --git-dir="$ORIGIN" rev-parse -q --verify refs/tags/ft-old)" ""
+}
+want t_no_follow_tags && t_no_follow_tags
+
 t_apply_not_merged() {
   publish_pr
   fake_merge merge || { fail "t_apply_not_merged: 준비 실패"; return; }
@@ -889,8 +931,17 @@ want t_apply_tag_push_fail_retry && t_apply_tag_push_fail_retry
 # 발행 큐 경로 — 허가된 요청을 rd publish run 으로 실행해 PR 만 올라가면 done 으로 기록합니다 (spec D3a).
 # 요청·허가 단계는 test_publish_queue.sh 의 mkstate 와 같이 큐 함수(pq_set·pq_slot_set)로 만듭니다.
 pq_in_wt() { ( cd "$WT" && project_root="$WT" bash "$WT/rd-workflow/scripts/lifecycle/publish_queue.sh" "$@" ) 2>&1; }
+# run 은 발행 진입 때 ps 로 프로세스 그룹을 기록하고, ps 가 실패하면 진입을 거부합니다(제품의 안전한 쪽 동작).
+# ps 를 쓸 수 없는 환경(샌드박스 등)에서는 아래 세 사례가 검증하려는 결과에 닿지 못하고, 일부 단언은 거부 때문에 우연히 통과합니다.
+# 그래서 사례 전체를 건너뛰고 표식을 냅니다(test_publish_queue 의 PQ_NEEDS_PS 와 같은 시험). 위 대역 ps 는 이 형식에 답하지 않습니다.
+pq_env_skip() {
+  ps -o pgid= -p $$ >/dev/null 2>&1 && return 1
+  printf 'env-skip: test_direct_pr %s — ps 를 쓸 수 없는 환경(프로세스 그룹 확인 불가)\n' "$1" >&2
+  return 0
+}
 t_queue_pr_done() {
   local out rc main0 head
+  pq_env_skip t_queue_pr_done && return 0
   mk_direct pr; setup_fake_gh
   main0="$(og main)"; head="$(git -C "$WT" rev-parse HEAD)"
   ( cd "$WT" && project_root="$WT" bash -c 'source "$1"; pq_set "$2" state=granted head="$3" seq=1 worktree="$4" fr-branch="$5"; pq_slot_set "$2"' \
@@ -907,6 +958,7 @@ want t_queue_pr_done && t_queue_pr_done
 
 t_queue_pr_p9_fail() {
   local out rc head pqs="$WT/rd-workflow/scripts/lifecycle/publish_queue.sh"
+  pq_env_skip t_queue_pr_p9_fail && return 0
   mk_direct pr; setup_fake_gh
   head="$(git -C "$WT" rev-parse HEAD)"
   ( cd "$WT" && project_root="$WT" bash -c 'source "$1"; pq_set "$2" state=granted head="$3" seq=1 worktree="$4" fr-branch="$5"; pq_slot_set "$2"' \
@@ -929,6 +981,7 @@ want t_queue_pr_p9_fail && t_queue_pr_p9_fail
 # 재발행(열린 PR 의 본문 갱신)에서 P9 edit 가 실패하면 이전 발행의 pr-url 이 남아 있어도 끝난 요청으로 보지 않는다.
 t_queue_pr_republish_edit_fail() {
   local out rc head pqs="$WT/rd-workflow/scripts/lifecycle/publish_queue.sh"
+  pq_env_skip t_queue_pr_republish_edit_fail && return 0
   publish_pr
   run_pr reopen --task "$SLUG"
   review_and_hold || { fail "t_queue_pr_republish_edit_fail: 준비 실패(재리뷰)"; return; }
@@ -1073,18 +1126,27 @@ t_reopen_merged_rc1() {
 want t_reopen_merged_rc1 && t_reopen_merged_rc1
 
 t_closed_rollback() {
-  local rc=0
+  local rc=0 cmd
   publish_pr
   set_pr_col 2 CLOSED
   run_pr check --task "$SLUG"
   eq "t_closed_rollback: rc 0" "$DPR_RC" "0"
   ok "t_closed_rollback: gh pr reopen" "gh pr reopen" "$(pr_out)"
-  ok "t_closed_rollback: promote_rollback" "promote_rollback.sh --task demo" "$(pr_out)"
-  ok "t_closed_rollback: 원격 fr 삭제 명령 전문" "git push origin --delete $FRB" "$(pr_out)"
+  ok "t_closed_rollback: b 항목 설명(원격 fr 은 rollback 이 지움)" "원격 fr 브랜치가 이 작업의 커밋이면 함께 지웁니다" "$(pr_out)"
+  no "t_closed_rollback: 따로 잇는 원격 삭제 없음" "git push origin --delete" "$(pr_out)"
   # 기본 체크아웃에서 조회해도 Issue 줄은 그 PR 이 연결한 Issue 로 만듭니다.
   eq "t_closed_rollback: 대상 작업의 Issue 선점 풀기" "$(closed_issue_no)" "7"
-  ( cd "$R" && bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task "$SLUG" ) >"$TMP/rb.out" 2>&1 || rc=$?
-  eq "t_closed_rollback: promote_rollback rc 0" "$rc" "0"
+  # 폐기 명령은 기본 체크아웃으로 cd 하는 독립된 줄이고, 원격 fr 삭제는 rollback 이 직접 합니다.
+  # 화면의 그 줄 전체를 저장소 밖 폴더에서 그대로 실행해도 이 작업만 정리돼야 합니다.
+  cmd="$(grep -E '^ +cd .*promote_rollback\.sh' "$DPR_OUT" | head -1)"
+  eq "t_closed_rollback: 폐기 명령 줄" "${cmd#"${cmd%%[! ]*}"}" "cd $(in_repo dpr_shq "$(cd "$R" && pwd -P)") && bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task demo"
+  ( cd "$TMP" && eval "$cmd" ) >"$TMP/rb.out" 2>&1 || rc=$?
+  eq "t_closed_rollback: 폐기 명령 rc 0" "$rc" "0"
+  eq "t_closed_rollback: 원격 fr 삭제됨" "$(og "$FRB")" ""
+  # git 메타데이터를 다른 저장소 안에 둔 체크아웃(--separate-git-dir)이면 common dir 의 부모가 그 다른 저장소입니다 — cd 를 안내하지 않습니다.
+  git init -q "$TMP/rb-other" && git init -q --separate-git-dir "$TMP/rb-other/meta.git" "$TMP/rb-sep" || { fail "t_closed_rollback: 준비 실패(separate-git-dir)"; return; }
+  cmd="$(in_repo dpr_rollback_cmd demo "$TMP/rb-sep")"
+  eq "t_closed_rollback: 다른 저장소로 cd 하지 않음" "$cmd" "기본 체크아웃에서 bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task demo"
 }
 want t_closed_rollback && t_closed_rollback
 
@@ -1907,9 +1969,12 @@ t_sync_ignored_file() {
     && echo incoming >"$R/rd-local.env" && echo slot-file >"$R/slot" && mkdir -p "$R/deep" && echo x >"$R/deep/x" \
     && git -C "$R" add -f rd-local.env slot deep/x && git -C "$R" commit -q -m "기본 쪽이 rd-local.env·slot·deep/x 추적" \
     && git -C "$R" push -q origin main || { fail "t_sync_ignored_file: 준비 실패(무시 파일)"; return; }
-  s0="$(refs_snap_nort)"
+  # 작업 worktree 의 복구 지점(ORIG_HEAD)은 refs_snap 에 잡히지 않으므로 따로 봅니다 — 서명 판정의 시험 병합이 덮어쓰지 않아야 합니다.
+  git -C "$WT" update-ref ORIG_HEAD "$(git -C "$WT" rev-parse HEAD~1)" || { fail "t_sync_ignored_file: 준비 실패(ORIG_HEAD)"; return; }
+  s0="$(refs_snap_nort)"; local oh0; oh0="$(git -C "$WT" rev-parse ORIG_HEAD)"
   run_pr sync --task "$SLUG"
   eq "t_sync_ignored_file: rc 1" "$DPR_RC" "1"
+  eq "t_sync_ignored_file: ORIG_HEAD 불변" "$(git -C "$WT" rev-parse ORIG_HEAD)" "$oh0"
   ok "t_sync_ignored_file: 경로 안내" "    rd-local.env" "$(pr_out)"
   ok "t_sync_ignored_file: 접두 경로 안내" "    slot/한글" "$(pr_out)"
   ok "t_sync_ignored_file: 상위 경로 안내" "    deep" "$(pr_out)"
@@ -2065,6 +2130,98 @@ t_sync_finish_other_branch() {
 }
 want t_sync_finish_other_branch && t_sync_finish_other_branch
 
+# 브랜치 mergeOptions 의 --squash 는 --ff-only 와 함께 HEAD 를 두고 rc 0 을 냅니다 — 마무리 이동이 실제로 옮겨야 합니다.
+t_sync_squash_mergeoptions() {
+  sync_fixture || { fail "t_sync_squash_mergeoptions: 준비 실패"; return; }
+  set_pr_col 6 CONFLICTING
+  # 저장소 기본은 서명 확인을 켜고 이 브랜치만 해제한 경우도 정상 진행합니다(git 이 실제로 적용하는 값을 따름).
+  git -C "$R" config merge.verifySignatures true
+  git -C "$R" config "branch.$FRB.mergeOptions" '--squash --no-verify-signatures'
+  run_pr sync --task "$SLUG"
+  eq "t_sync_squash_mergeoptions: rc 0" "$DPR_RC" "0"
+  eq "t_sync_squash_mergeoptions: 작업 worktree HEAD == 원격 fr" "$(git -C "$WT" rev-parse HEAD)" "$(og "$FRB")"
+  eq "t_sync_squash_mergeoptions: 작업 트리 깨끗" "$(git -C "$WT" status --porcelain --untracked-files=all)" ""
+}
+want t_sync_squash_mergeoptions && t_sync_squash_mergeoptions
+
+# 서명 확인 설정이면 서명 없는 병합 커밋으로 옮길 수 없으므로 push 전에 멈춥니다.
+t_sync_verifysig_stops() {
+  local s0 i0
+  sync_fixture || { fail "t_sync_verifysig_stops: 준비 실패"; return; }
+  set_pr_col 6 CONFLICTING
+  git -C "$R" config merge.verifySignatures true
+  # 작업 worktree 에 끝나지 않은 병합(작업 트리는 깨끗)이 있으면 서명 판정이 가려지므로 그보다 먼저 멈춥니다.
+  # MERGE_HEAD 는 pseudoref 라 update-ref 로 쓸 수 없어 파일로 둡니다.
+  local mh; mh="$(git -C "$WT" rev-parse --path-format=absolute --git-path MERGE_HEAD)" && git -C "$WT" rev-parse HEAD~1 >"$mh" || { fail "t_sync_verifysig_stops: 준비 실패(MERGE_HEAD)"; return; }
+  s0="$(refs_snap)"; i0="$(idx_snap)"
+  run_pr sync --task "$SLUG"
+  eq "t_sync_verifysig_stops: 진행 중 병합 rc 1" "$DPR_RC" "1"
+  eq "t_sync_verifysig_stops: 진행 중 병합 ref 불변" "$(refs_snap)" "$s0"
+  eq "t_sync_verifysig_stops: 진행 중 병합 색인 불변" "$(idx_snap)" "$i0"
+  ok "t_sync_verifysig_stops: 진행 중 병합 안내" "끝나지 않은 병합(MERGE_HEAD)이 있습니다 — 아무것도 바꾸지 않았습니다" "$(pr_out)"
+  rm -f "$mh"
+  # 실제 cherry-pick 이 빈 변경으로 멈춘 상태(작업 트리는 깨끗, CHERRY_PICK_HEAD 남음)에서는 git 이 서명 검사 전에 병합을 거부합니다 — 판정 불가로 멈춥니다.
+  git -C "$WT" -c user.name=t -c user.email=t@x cherry-pick HEAD >/dev/null 2>&1
+  git -C "$WT" rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null || { fail "t_sync_verifysig_stops: 준비 실패(cherry-pick)"; return; }
+  s0="$(refs_snap)"; i0="$(idx_snap)"
+  run_pr sync --task "$SLUG"
+  eq "t_sync_verifysig_stops: 진행 중 cherry-pick rc 1" "$DPR_RC" "1"
+  eq "t_sync_verifysig_stops: 진행 중 cherry-pick ref 불변" "$(refs_snap)" "$s0"
+  eq "t_sync_verifysig_stops: 진행 중 cherry-pick 색인 불변" "$(idx_snap)" "$i0"
+  ok "t_sync_verifysig_stops: 진행 중 cherry-pick 안내" "git merge 를 시험할 수 없어 마무리 이동이 될지 알 수 없습니다 — 아무것도 바꾸지 않았습니다" "$(pr_out)"
+  ok "t_sync_verifysig_stops: 진행 중 cherry-pick 취소 안내" "git cherry-pick --abort" "$(pr_out)"
+  git -C "$WT" cherry-pick --abort >/dev/null 2>&1
+  s0="$(refs_snap)"; i0="$(idx_snap)"
+  run_pr sync --task "$SLUG"
+  eq "t_sync_verifysig_stops: rc 1" "$DPR_RC" "1"
+  eq "t_sync_verifysig_stops: ref 불변" "$(refs_snap)" "$s0"
+  eq "t_sync_verifysig_stops: 색인 불변" "$(idx_snap)" "$i0"
+  ok "t_sync_verifysig_stops: 아무것도 바꾸지 않음" "아무것도 바꾸지 않았습니다" "$(pr_out)"
+  ok "t_sync_verifysig_stops: 기본 브랜치 서명 확인 먼저" "git verify-commit origin/main" "$(pr_out)"
+  ok "t_sync_verifysig_stops: reopen 순서" "rd pr reopen --task demo" "$(pr_out)"
+  # 브랜치 mergeOptions=--squash 가 함께 있어도 안내된 병합이 실제 병합 커밋을 만들게 --no-squash 를 붙입니다.
+  ok "t_sync_verifysig_stops: 병합 안내 --no-squash" "git merge --no-squash origin/main" "$(pr_out)"
+  ok "t_sync_verifysig_stops: 설정을 끈 뒤 재실행" "설정을 끌 수 있으면 끈 뒤 다시 실행하십시오: bash rd-workflow/scripts/rd pr sync --task demo" "$(pr_out)"
+  # 판정은 git 이 실제로 적용하는 값을 따릅니다 — 표기(따옴표·이스케이프·약칭·CR 구분)와 해제·옵션 인자를 git 과 같게 읽습니다.
+  vchk() {  # 기대(on|off) mergeOptions 이름
+    local rc; git -C "$R" config "branch.$FRB.mergeOptions" "$2"; in_repo dpr_verifysig_on "$WT" "$FRB"; rc=$?
+    if { [[ "$1" == on ]] && [[ $rc -eq 0 ]]; } || { [[ "$1" == off ]] && [[ $rc -eq 1 ]]; }; then pass "t_sync_verifysig_stops: $3 → $1"; else fail "t_sync_verifysig_stops: $3 를 $1 로 읽지 못함 (rc $rc)"; fi
+  }
+  local h0; h0="$(git -C "$WT" rev-parse HEAD)"
+  git -C "$R" config --unset merge.verifySignatures
+  vchk on '"--verify-signatures"' "따옴표 mergeOptions"
+  vchk on '--verify-signature' "약칭 mergeOptions"
+  vchk on '--verify\-signatures' "이스케이프 mergeOptions"
+  vchk on $'--squash\r--verify-signatures' "CR 구분 mergeOptions"
+  vchk off '--verify' "--verify(훅 옵션)"
+  vchk off '-m --verify-signatures' "-m 값의 --verify-signatures"
+  git -C "$R" config merge.verifySignatures true
+  vchk off '--no-verify-signatures' "설정 true + 브랜치 해제"
+  vchk on '-m --no-verify-signatures' "설정 true + -m 값의 --no-verify-signatures"
+  eq "t_sync_verifysig_stops: 판정 뒤 작업 worktree HEAD 불변" "$(git -C "$WT" rev-parse HEAD)" "$h0"
+  eq "t_sync_verifysig_stops: 판정 뒤 작업 트리 깨끗" "$(git -C "$WT" status --porcelain --untracked-files=all)" ""
+}
+want t_sync_verifysig_stops && t_sync_verifysig_stops
+
+# push 뒤 이어 가기에서 서명 오류로 막히면 보존 브랜치 절차가 아니라 서명 설정 안내입니다.
+t_sync_finish_verifysig() {
+  local out rc
+  sync_fixture || { fail "t_sync_finish_verifysig: 준비 실패"; return; }
+  set_pr_col 6 CONFLICTING
+  SL="$(fr_tip)"; sync_ok || { fail "t_sync_finish_verifysig: 준비 실패(sync)"; return; }
+  SM="$(fr_tip)"
+  git -C "$WT" reset -q --keep "$SL" && git -C "$R" config merge.verifySignatures true || { fail "t_sync_finish_verifysig: 준비 실패(설정)"; return; }
+  rc=0; out="$(dp_call _dp_sync_finish "$SM" 2>&1)" || rc=$?
+  eq "t_sync_finish_verifysig: rc 1" "$rc" "1"
+  eq "t_sync_finish_verifysig: 로컬 fr 그대로" "$(fr_tip)" "$SL"
+  ok "t_sync_finish_verifysig: 서명 안내" "서명 확인 설정이 켜져 있어" "$out"
+  no "t_sync_finish_verifysig: 보존 절차 없음" "rd-sync-keep/" "$out"
+  # 덮어쓸 파일 목록에 같은 문자열이 든 경로가 있어도 서명 거부로 보지 않습니다(파일 이동 안내로 가야 함).
+  in_repo dpr_sig_refused "$(printf 'error: The following untracked working tree files would be overwritten by merge:\n\tGPG signature.txt\nAborting\n')" \
+    && fail "t_sync_finish_verifysig: 파일 경로를 서명 거부로 읽음" || pass "t_sync_finish_verifysig: 파일 경로는 서명 거부 아님"
+}
+want t_sync_finish_verifysig && t_sync_finish_verifysig
+
 t_sync_push_lease() {
   local cand rc out
   sync_fixture || { fail "t_sync_push_lease: 준비 실패"; return; }
@@ -2180,20 +2337,218 @@ t_sync_overlay_rc2() {
 }
 want t_sync_overlay_rc2 && t_sync_overlay_rc2
 
-t_p4_warning_wording() {
+echo "== 발행 자동 병합 (change spec 2026-11-21-2200) =="
+
+# as_record_conflict — 기본 쪽과 작업 쪽이 FUTURE_REQUESTS.md 에 서로 다른 행을 더해 기록 파일만 충돌하는 상태를 만듭니다.
+#   기본 쪽에 인덱스를 먼저 두고 작업 쪽이 그것을 병합한 뒤 행을 더합니다(없으면 양쪽이 같은 파일을 처음 추가해 P4 에서 멈춤).
+as_record_conflict() {
+  frq_table base-row >"$R/$FRQ"; git -C "$R" add "$FRQ" && git -C "$R" commit -q -m "FR 등록" && git -C "$R" push -q origin main || return 1
+  git -C "$WT" fetch -q origin main && git -C "$WT" merge -q --no-edit origin/main >/dev/null || return 1
+  frq_table base-row fr-row >"$WT/$FRQ"; git -C "$WT" commit -q -am "기록: FR 행" || return 1
+  frq_table base-row main-row >"$R/$FRQ"; git -C "$R" commit -q -am "기본 쪽 기록" && git -C "$R" push -q origin main
+}
+# as_main_add <경로> <내용> — 기본 쪽에만 파일 하나를 더해 push 합니다(무시 규칙이 있어도 추적하도록 add -f).
+as_main_add() { printf '%s\n' "$2" >"$R/$1"; git -C "$R" add -f -- "$1" && git -C "$R" commit -q -m "기본 쪽 $1" && git -C "$R" push -q origin main; }
+# nparents <커밋> — 그 커밋과 부모 OID 개수(병합 3, 되돌리기 2).
+nparents() { git -C "$R" rev-list --parents -n 1 "$1" 2>/dev/null | wc -w | tr -d ' '; }
+# as_exclude <경로> — 공용 git 디렉터리의 info/exclude 에 무시 규칙을 더합니다(작업 worktree 에도 적용).
+as_exclude() { local d; d="$(git -C "$R" rev-parse --git-common-dir)"; [[ "$d" == /* ]] || d="$R/$d"; mkdir -p "$d/info" && printf '%s\n' "$1" >>"$d/info/exclude"; }
+# pr_head_col — 가짜 gh 의 마지막 PR 행의 head 칸(PR 생성 당시 원격 fr OID).
+pr_head_col() { awk -F'\t' '{h = $4} END {print h}' "$FAKE/prs.tsv"; }
+
+t_autosync_publish() {
+  local out m p1 p2 t line
+  mk_direct pr; setup_fake_gh
+  as_record_conflict && as_main_add main-only.txt main || { fail "t_autosync_publish: 준비 실패"; return; }
+  run_ar; out="$(ar_out)"
+  eq "t_autosync_publish: rc 0" "$AR_RC" "0"
+  eq "t_autosync_publish: pr create 1" "$(gh_count 'pr create')" "1"
+  m="$(og "$FRB")"
+  eq "t_autosync_publish: 원격 fr 은 부모 둘" "$(nparents "$m")" "3"
+  eq "t_autosync_publish: PR 생성 당시 head = 병합 커밋" "$(pr_head_col)" "$m"
+  eq "t_autosync_publish: pr-head = 원격 fr" "$(in_repo dpr_index_get "$SLUG" pr-head)" "$m"
+  eq "t_autosync_publish: pr-sent = 원격 fr" "$(in_repo dpr_index_get "$SLUG" pr-sent)" "$m"
+  eq "t_autosync_publish: 로컬 fr = 원격 fr" "$(fr_tip)" "$m"
+  eq "t_autosync_publish: worktree HEAD = 원격 fr" "$(git -C "$WT" rev-parse HEAD)" "$m"
+  p1="$(git -C "$R" rev-parse -q --verify "$m^1")"; p2="$(git -C "$R" rev-parse -q --verify "$m^2")"
+  eq "t_autosync_publish: 첫 부모는 되돌리기 커밋" "$(git -C "$R" log -1 --format=%s "$p1" 2>/dev/null)" "chore(lifecycle): archive demo metadata 정리"
+  eq "t_autosync_publish: 둘째 부모 = origin/main" "$p2" "$(og main)"
+  t="$(RD_MERGE_RESOLVE_QUIET=1 in_repo dpr_sync_tree "$R" "$p1" "$p2" 2>/dev/null)"
+  eq "t_autosync_publish: 트리 = dpr_sync_tree 결과" "$(git -C "$R" rev-parse "$m^{tree}")" "$t"
+  ok "t_autosync_publish: FRQ 작업 쪽 행" "| fr-row |" "$(git -C "$R" show "$m:$FRQ" 2>/dev/null)"
+  ok "t_autosync_publish: FRQ 기본 쪽 행" "| main-row |" "$(git -C "$R" show "$m:$FRQ" 2>/dev/null)"
+  eq "t_autosync_publish: main-only.txt 존재" "$(cat "$WT/main-only.txt" 2>/dev/null)" "main"
+  in_repo dpr_verified_has "$SLUG" "$m" && pass "t_autosync_publish: pr-verified 에 병합 커밋" || fail "t_autosync_publish: pr-verified 에 병합 커밋 없음 ($(in_repo dpr_index_get "$SLUG" pr-verified))"
+  eq "t_autosync_publish: worktree 깨끗" "$(git -C "$WT" status --porcelain --untracked-files=all)" ""
+  ok "t_autosync_publish: 자동 병합 줄" "기록 파일 충돌을 자동 병합했습니다" "$out"
+  line="$(printf '%s\n' "$out" | grep '해소한 기록 파일:')"
+  ok "t_autosync_publish: 해소한 기록 파일 줄에 FRQ" "해소한 기록 파일: $FRQ" "$line"
+  no "t_autosync_publish: 충돌 경고 없음" "충돌로 보입니다" "$out"
+  ph "$m"
+  eq "t_autosync_publish: dpr_published_head rc 0" "$PH_RC" "0"
+  eq "t_autosync_publish: dpr_published_head = 첫 부모" "$PH_OUT" "$p1"
+  run_pr check --task "$SLUG"
+  ok "t_autosync_publish: rd pr check PR 검토 중" "PR 검토 중: https://github.com/acme/demo/pull/1" "$(pr_out)"
+}
+want t_autosync_publish && t_autosync_publish
+
+t_autosync_no_conflict() {
   local out
   mk_direct pr; setup_fake_gh
-  frq_table base-row >"$R/$FRQ"; git -C "$R" add "$FRQ" && git -C "$R" commit -q -m "FR 등록" && git -C "$R" push -q origin main || { fail "t_p4_warning_wording: 준비 실패"; return; }
-  git -C "$WT" fetch -q origin main && git -C "$WT" merge -q --no-edit origin/main >/dev/null || { fail "t_p4_warning_wording: 준비 실패(병합)"; return; }
-  frq_table base-row fr-row >"$WT/$FRQ"; git -C "$WT" commit -q -am "기록: FR 행" || { fail "t_p4_warning_wording: 준비 실패(기록)"; return; }
-  frq_table base-row main-row >"$R/$FRQ"; git -C "$R" commit -q -am "기본 쪽 기록" && git -C "$R" push -q origin main || { fail "t_p4_warning_wording: 준비 실패(기본 쪽)"; return; }
+  # 기본 브랜치가 CURRENT_TASK.md 를 바꿉니다. 작업 tip 은 이 파일을 바꿔 충돌하지만, 되돌리기 커밋은 공통 조상과 같게
+  # 되돌리므로 충돌하지 않습니다 — 판정이 되돌리기 커밋 기준인지(변이 M3)를 가릅니다.
+  as_main_add other.txt other && as_main_add CURRENT_TASK.md "# 기본 쪽에서 갱신한 CURRENT_TASK" \
+    || { fail "t_autosync_no_conflict: 준비 실패"; return; }
   run_ar; out="$(ar_out)"
-  eq "t_p4_warning_wording: rc 0" "$AR_RC" "0"
-  ok "t_p4_warning_wording: 경고" "기록 파일이 충돌합니다" "$out"
-  ok "t_p4_warning_wording: sync 안내" "PR 이 올라간 뒤 bash rd-workflow/scripts/rd pr sync --task demo" "$out"
-  no "t_p4_warning_wording: reopen 없음" "rd pr reopen" "$out"
+  eq "t_autosync_no_conflict: rc 0" "$AR_RC" "0"
+  eq "t_autosync_no_conflict: 원격 fr 은 부모 하나" "$(nparents "$(og "$FRB")")" "2"
+  no "t_autosync_no_conflict: 자동 병합 줄 없음" "자동 병합했습니다" "$out"
 }
-want t_p4_warning_wording && t_p4_warning_wording
+want t_autosync_no_conflict && t_autosync_no_conflict
+
+t_autosync_fallback_config() {
+  local out
+  mk_direct pr; setup_fake_gh
+  as_record_conflict || { fail "t_autosync_fallback_config: 준비 실패"; return; }
+  git -C "$R" config merge.renormalize true
+  run_ar; out="$(ar_out)"
+  eq "t_autosync_fallback_config: rc 0" "$AR_RC" "0"
+  eq "t_autosync_fallback_config: 원격 fr 은 부모 하나" "$(nparents "$(og "$FRB")")" "2"
+  ok "t_autosync_fallback_config: fallback 경고" "자동 병합을 하지 못했습니다" "$out"
+  ok "t_autosync_fallback_config: 사유" "병합 동작을 바꾸는 설정" "$out"
+  ok "t_autosync_fallback_config: 충돌 파일" "archive:     $FRQ" "$out"
+  ok "t_autosync_fallback_config: check 안내" "확인: bash rd-workflow/scripts/rd pr check --task demo" "$out"
+  ok "t_autosync_fallback_config: 사유를 푼 뒤 sync 안내" "사유를 풀 수 있으면(설정·속성 제거) 그 뒤 bash rd-workflow/scripts/rd pr sync --task demo" "$out"
+}
+want t_autosync_fallback_config && t_autosync_fallback_config
+
+t_autosync_fallback_ignored() {
+  local out
+  mk_direct pr; setup_fake_gh
+  as_record_conflict && as_main_add cache.bin main || { fail "t_autosync_fallback_ignored: 준비 실패"; return; }
+  as_exclude cache.bin && printf 'local\n' >"$WT/cache.bin" || { fail "t_autosync_fallback_ignored: 준비 실패(무시 파일)"; return; }
+  run_ar; out="$(ar_out)"
+  eq "t_autosync_fallback_ignored: rc 0" "$AR_RC" "0"
+  eq "t_autosync_fallback_ignored: 원격 fr 은 부모 하나" "$(nparents "$(og "$FRB")")" "2"
+  ok "t_autosync_fallback_ignored: fallback 경고" "자동 병합을 하지 못했습니다" "$out"
+  ok "t_autosync_fallback_ignored: 파일 이름" "cache.bin" "$out"
+  ok "t_autosync_fallback_ignored: 옮긴 뒤 sync 안내" "이 파일들을 작업 worktree 밖으로 옮긴 뒤, PR 이 올라가면 bash rd-workflow/scripts/rd pr sync --task demo" "$out"
+  eq "t_autosync_fallback_ignored: 무시 파일 보존" "$(cat "$WT/cache.bin" 2>/dev/null)" "local"
+}
+want t_autosync_fallback_ignored && t_autosync_fallback_ignored
+
+t_autosync_fallback_verifysig() {
+  local out
+  mk_direct pr; setup_fake_gh
+  as_record_conflict || { fail "t_autosync_fallback_verifysig: 준비 실패"; return; }
+  git -C "$R" config merge.verifySignatures true
+  run_ar; out="$(ar_out)"
+  eq "t_autosync_fallback_verifysig: rc 0" "$AR_RC" "0"
+  eq "t_autosync_fallback_verifysig: 원격 fr 은 부모 하나" "$(nparents "$(og "$FRB")")" "2"
+  ok "t_autosync_fallback_verifysig: 서명 사유" "merge.verifySignatures" "$out"
+  ok "t_autosync_fallback_verifysig: 마무리 이동도 막힘 안내" "이 설정에서는 rd pr sync 의 마무리 이동도 막힙니다" "$out"
+  ok "t_autosync_fallback_verifysig: reopen 순서" "rd pr reopen --task demo" "$out"
+  ok "t_autosync_fallback_verifysig: 설정을 끈 뒤 sync" "설정을 끌 수 있으면 끈 뒤 bash rd-workflow/scripts/rd pr sync --task demo" "$out"
+}
+want t_autosync_fallback_verifysig && t_autosync_fallback_verifysig
+
+t_autosync_resume() {
+  local tip0 m out1 out2 hooks n0
+  mk_direct pr; setup_fake_gh
+  as_record_conflict && as_main_add main-only.txt main && as_main_add cache.bin main || { fail "t_autosync_resume: 준비 실패"; return; }
+  # 클라이언트 pre-push 훅: 호출마다 한 줄을 남깁니다(같은 OID push 는 원격 훅에 보이지 않음). 기존 훅이 있으면 먼저 부릅니다.
+  hooks="$(git -C "$R" rev-parse --git-path hooks)"; [[ "$hooks" == /* ]] || hooks="$R/$hooks"
+  mkdir -p "$hooks"
+  [[ -e "$hooks/pre-push" ]] && mv "$hooks/pre-push" "$hooks/pre-push.orig"
+  printf '#!/bin/sh\necho push >>"%s"\nif [ -x "%s" ]; then exec "%s" "$@"; fi\nexit 0\n' "$TMP/pushes.log" "$hooks/pre-push.orig" "$hooks/pre-push.orig" >"$hooks/pre-push"
+  chmod +x "$hooks/pre-push"
+  : >"$TMP/pushes.log"
+  tip0="$(fr_tip)"
+  run_ar
+  m="$(og "$FRB")"
+  [[ "$AR_RC" == 0 && "$(nparents "$m")" == 3 ]] || { fail "t_autosync_resume: 준비 실패(첫 발행) — $(ar_out)"; return; }
+  [[ -s "$TMP/pushes.log" ]] && pass "t_autosync_resume: pre-push 훅이 push 를 기록" || fail "t_autosync_resume: pre-push 훅 기록 없음"
+  # 끊김 재현: push 뒤 브랜치 이동·PR 생성 전에 끊긴 상태
+  git -C "$WT" reset -q --keep "$tip0" && in_repo dpr_index_set "$SLUG" "pr-url=" "pr-sent=" && : >"$FAKE/prs.tsv" \
+    || { fail "t_autosync_resume: 준비 실패(끊김 재현)"; return; }
+  code_conflict || { fail "t_autosync_resume: 준비 실패(코드 충돌)"; return; }
+  as_exclude cache.bin && printf 'local\n' >"$WT/cache.bin" || { fail "t_autosync_resume: 준비 실패(무시 파일)"; return; }
+  : >"$TMP/pushes.log"
+  n0="$(gh_count 'pr create')"
+  run_ar; out1="$(ar_out)"
+  eq "t_autosync_resume: 첫 재발행 rc 1" "$AR_RC" "1"
+  eq "t_autosync_resume: 첫 재발행 무시 파일 보존" "$(cat "$WT/cache.bin" 2>/dev/null)" "local"
+  eq "t_autosync_resume: 첫 재발행 원격 fr 불변" "$(og "$FRB")" "$m"
+  eq "t_autosync_resume: 첫 재발행 pr-head 불변" "$(in_repo dpr_index_get "$SLUG" pr-head)" "$m"
+  ok "t_autosync_resume: 첫 재발행 파일 이름" "cache.bin" "$out1"
+  ok "t_autosync_resume: 첫 재발행 다시 요청 안내" "같은 발행 요청을 다시 하십시오" "$out1"
+  no "t_autosync_resume: 첫 재발행 재개 충돌 경고 없음" "이어 간 head 가" "$out1"
+  mv "$WT/cache.bin" "$TMP/cache.bin.moved"
+  run_ar; out2="$(ar_out)"
+  eq "t_autosync_resume: 둘째 재발행 rc 0" "$AR_RC" "0"
+  eq "t_autosync_resume: 재개는 push 하지 않음" "$(cat "$TMP/pushes.log")" ""
+  eq "t_autosync_resume: 둘째 재발행 원격 fr 불변" "$(og "$FRB")" "$m"
+  eq "t_autosync_resume: 둘째 재발행 로컬 fr = 원격 fr" "$(fr_tip)" "$m"
+  eq "t_autosync_resume: 재개 뒤 pr create 1" "$(( $(gh_count 'pr create') - n0 ))" "1"
+  eq "t_autosync_resume: PR 생성 당시 head = 병합 커밋" "$(pr_head_col)" "$m"
+  ok "t_autosync_resume: 재개 충돌 경고" "이어 간 head 가 origin/main 과 충돌합니다" "$out2"
+  ok "t_autosync_resume: 재개 충돌 확인 안내" "rd pr check --task demo" "$out2"
+}
+want t_autosync_resume && t_autosync_resume
+
+# 발행 큐의 충돌 관문 (spec D9). push 뒤 끊긴 PR 발행은 로컬 기본 브랜치에 코드 충돌이 있어도 큐가 막지 않습니다.
+#   (가) 요청 진입점 (나) 허가 뒤 실행 재검증 진입점 (다) 대조: 원격 fr 이 검증되지 않은 병합 커밋이면 충돌로 막습니다.
+#   호출 세션 색인(launch=ok·caller-id)이 없으면 요청이 충돌 검사 전에 rc 10 사용자 승인 분기로 빠집니다.
+t_autosync_queue_gate() {
+  local tip0 m x out rc pqs
+  mk_direct pr; setup_fake_gh
+  pqs="$WT/rd-workflow/scripts/lifecycle/publish_queue.sh"
+  as_record_conflict || { fail "t_autosync_queue_gate: 준비 실패"; return; }
+  tip0="$(fr_tip)"
+  run_ar
+  m="$(og "$FRB")"
+  [[ "$AR_RC" == 0 && "$(nparents "$m")" == 3 ]] || { fail "t_autosync_queue_gate: 준비 실패(첫 발행) — $(ar_out)"; return; }
+  # 끊김 재현: push 뒤 브랜치 이동·PR 생성 전에 끊긴 상태. code_conflict 는 로컬 main 에서 커밋해 push 합니다(로컬 main = origin/main).
+  git -C "$WT" reset -q --keep "$tip0" && in_repo dpr_index_set "$SLUG" "pr-url=" "pr-sent=" && : >"$FAKE/prs.tsv" \
+    || { fail "t_autosync_queue_gate: 준비 실패(끊김 재현)"; return; }
+  code_conflict || { fail "t_autosync_queue_gate: 준비 실패(코드 충돌)"; return; }
+  in_repo tasks_index_upsert "$SLUG" launch=ok caller-backend=herdr caller-id=wX:p1 >/dev/null \
+    || { fail "t_autosync_queue_gate: 준비 실패(호출 세션 색인)"; return; }
+  # (가) 요청 진입점 — 뒤 단계(호출 세션 판정·큐 기록)의 결과는 보지 않습니다.
+  out="$( cd "$WT" && bash rd-workflow/scripts/rd publish request 2>&1 )"
+  ok "t_autosync_queue_gate: (가) 요청 재개 줄" "재개: 원격 $FRB 끝(" "$out"
+  no "t_autosync_queue_gate: (가) 요청이 충돌로 막지 않음" "병합 충돌하는 파일" "$out"
+  # (나) 허가 뒤 실행 재검증 진입점 — 충돌 검사보다 앞의 실패로 통과하지 않게 rc 0 을 봅니다.
+  out="$( cd "$WT" && project_root="$WT" bash -c 'source "$1"; _pq_reverify "$2" granted "$3"' _ "$pqs" "$SLUG" "$tip0" 2>&1 )"; rc=$?
+  eq "t_autosync_queue_gate: (나) 재검증 rc 0" "$rc" "0"
+  ok "t_autosync_queue_gate: (나) 재검증 재개 줄" "재개: 원격 $FRB 끝(" "$out"
+  # (다) 대조 — 모양은 같지만 pr-verified 에 없는 병합 커밋을 원격 fr 끝으로 둡니다.
+  x="$(commit_on "$(git -C "$R" rev-parse "$m^1")" "$OMAIN" -- "$(git -C "$R" rev-parse "$m^{tree}")" "$SYNC_SUBJ")" \
+    && git -C "$R" push -q --no-verify -f origin "$x:refs/heads/$FRB" \
+    || { fail "t_autosync_queue_gate: 준비 실패(검증되지 않은 원격 끝)"; return; }
+  out="$( cd "$WT" && bash rd-workflow/scripts/rd publish request 2>&1 )"
+  ok "t_autosync_queue_gate: (다) 재개 아님은 충돌로 막음" "병합 충돌하는 파일" "$out"
+  ok "t_autosync_queue_gate: (다) 충돌 파일 app.txt" "  - app.txt" "$out"
+}
+want t_autosync_queue_gate && t_autosync_queue_gate
+
+t_autosync_republish() {
+  local m
+  publish_pr
+  [[ "$AR_RC" == 0 ]] || { fail "t_autosync_republish: 준비 실패(발행) — $(ar_out)"; return; }
+  run_pr reopen --task "$SLUG"
+  [[ "$DPR_RC" == 0 ]] || { fail "t_autosync_republish: 준비 실패(reopen) — $(pr_out)"; return; }
+  as_record_conflict || { fail "t_autosync_republish: 준비 실패(기록 충돌)"; return; }
+  review_and_hold || { fail "t_autosync_republish: 준비 실패(seal)"; return; }
+  run_ar
+  m="$(og "$FRB")"
+  eq "t_autosync_republish: rc 0" "$AR_RC" "0"
+  eq "t_autosync_republish: pr create 1" "$(gh_count 'pr create')" "1"
+  eq "t_autosync_republish: pr edit 1" "$(gh_count 'pr edit')" "1"
+  eq "t_autosync_republish: pr-head = 원격 fr" "$(in_repo dpr_index_get "$SLUG" pr-head)" "$m"
+  eq "t_autosync_republish: 원격 fr 은 부모 둘" "$(nparents "$m")" "3"
+}
+want t_autosync_republish && t_autosync_republish
 
 echo
 echo "결과: PASS=$PASS FAIL=$FAIL (소요 $((SECONDS - T0))초)"

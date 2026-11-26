@@ -19,6 +19,8 @@ source "$SCRIPT_DIR/_tasks_index.sh"
 source "$SCRIPT_DIR/session_launch.sh"
 source "$SCRIPT_DIR/../_task_common.sh"
 source "$SCRIPT_DIR/../_submodule_common.sh"
+source "$SCRIPT_DIR/_dup_guard.sh"
+source "$SCRIPT_DIR/_team_publish_common.sh"
 
 # ===========================================================================
 # promote.sh — 재설계 (task-4-brief). 이제 이 스크립트는 **기본 브랜치에 어떤 커밋도
@@ -308,11 +310,32 @@ _carry_name_ok() {  # <rel>
       rest="${rel#"$ws"/raw-captures/}"; [[ "$rest" != */* ]] || return 1
       re="^[0-9]{4}-[0-9]{2}-[0-9]{2}-(request|spec|plan)-${SLUG}\.md$"; base="$rest" ;;
     "$ws"/handoffs/review_pipeline/*/*)
-      rest="${rel#"$ws"/handoffs/review_pipeline/}"
-      re="^[0-9]{8}_[0-9]{6}_[0-9]{4}-${SLUG}-spec-plan-review$"; base="${rest%%/*}" ;;
+      rest="${rel#"$ws"/handoffs/review_pipeline/}"; base="${rest%%/*}"
+      # request-review 세션은 이름에 slug 가 없다 — 그 세션의 SESSION.md 기록으로만 귀속한다.
+      if [[ "$base" =~ ^[0-9]{8}_[0-9]{6}_request-review$ ]]; then
+        _carry_request_session_ok "$project_root/$ws/handoffs/review_pipeline/$base/SESSION.md"
+        return
+      fi
+      # fr 브랜치에서 다른 작업의 plan 을 검토한 세션은 시각 뒤에 그 브랜치의 작업 slug 가 붙는다
+      # (init_review_pipeline.sh). 귀속은 여전히 끝부분 `_<HHMM>-<slug>-spec-plan-review` 의 정확한 일치로 정한다.
+      re="^[0-9]{8}_[0-9]{6}_([a-z0-9._-]+_)?[0-9]{4}-${SLUG}-spec-plan-review$" ;;
     *) return 1 ;;
   esac
   [[ "$base" =~ $re ]]
+}
+
+# request-review 세션의 귀속 — prepare_review_pipeline.sh 가 쓴 `## Branch Context` 가
+# 이 작업의 slug(정확히 일치)이고 fr 브랜치 밖(`fr-branch: null`, 즉 기본 체크아웃)에서
+# 만든 세션일 때만 이 작업의 것으로 본다. `unknown`·다른 slug·SESSION.md 없음은 귀속 불가다.
+# `unknown` 은 short-title 부재 표식이지만 slug 로도 허용되므로 slug 쪽에서 먼저 배제한다.
+_carry_request_session_ok() {  # <SESSION.md 경로>
+  [[ "$SLUG" != "unknown" && -f "$1" ]] || return 1
+  awk -v slug="$SLUG" '
+    /^## /{ in_ctx = ($0 == "## Branch Context"); next }
+    in_ctx && $0 == "- short-title: " slug { st = 1 }
+    in_ctx && $0 == "- fr-branch: null" { fb = 1 }
+    END { exit !(st && fb) }
+  ' "$1"
 }
 
 # D3 — REQUEST.md 는 이름으로 귀속할 수 없어 Source FR 집합이 작업의 것과 같을 때만 후보다.
@@ -371,10 +394,54 @@ _promote_carry_scan() {  # <T>
   while IFS= read -r c; do
     [[ -n "$c" ]] || continue
     if [[ "$mode" == "blocked" ]]; then _carry_row skip "$c" "$blocked_why"; continue; fi
+    if _carry_session_busy "$P" "$c"; then
+      _carry_row skip "$c" "리뷰 턴이 실행 중이거나 Reviewer 차례(awaiting-reviewer)인 세션 — 턴이 끝난 뒤 같은 promote 명령을 다시 실행하십시오"
+      continue
+    fi
     if [[ "$mode" == "inplace" ]]; then _carry_row carry2 "$c" ""; continue; fi
     _carry_classify "$P" "$T" "$c"
   done <<< "$cands"
+  _carry_keep_sessions_whole
   return 0
+}
+
+# 리뷰 턴이 돌고 있는 세션은 옮기지 않는다 — 리뷰어가 원본 경로에 턴을 쓰는 중이라 옮기면 그 턴이
+# 저장되지 못한다. 상태 전환 잠금(.state.lock)이 있거나 Status 가 awaiting-reviewer 이면 실행 중으로 본다.
+# 실행이 실패해 awaiting-reviewer 로 남은 세션도 보존 쪽으로 판정한다(재실행으로 이어 갈 수 있다).
+_carry_session_busy() {  # <P> <rel>
+  local pfx="rd-workflow-workspace/handoffs/review_pipeline/" s
+  [[ "$2" == "$pfx"*/* ]] || return 1
+  s="${2#"$pfx"}"; s="$1/$pfx${s%%/*}"
+  [[ -e "$s/.state.lock" ]] && return 0
+  [[ -f "$s/SESSION.md" ]] || return 1
+  awk '/^## /{ in_st = ($0 == "## Status"); next }
+       in_st && NF && $0 !~ /^<!--/ { found = ($1 == "awaiting-reviewer"); exit }
+       END { exit !found }' "$s/SESSION.md"
+}
+
+# 리뷰 세션은 폴더 하나가 한 단위다 — 일부 파일만 옮기면 양쪽 모두 필수 파일이 빠진 세션이 되고,
+# SESSION.md 를 옮겨 지우면 재실행 때 귀속 근거도 사라진다. 세션 안에 건너뛰는 파일이 하나라도
+# 있으면 그 세션의 나머지 파일도 건너뛰어 원본에 통째로 남긴다.
+_carry_keep_sessions_whole() {
+  local pfx="rd-workflow-workspace/handoffs/review_pipeline/"
+  [[ -n "$_CARRY_ROWS" ]] || return 0
+  _CARRY_ROWS="$(printf '%s' "$_CARRY_ROWS" | awk -F'\t' -v OFS='\t' -v pfx="$pfx" '
+    function sess(rel,   r) {
+      if (index(rel, pfx) != 1) return ""
+      r = substr(rel, length(pfx) + 1)
+      if (index(r, "/") == 0) return ""
+      return substr(r, 1, index(r, "/") - 1)
+    }
+    { cls[NR] = $1; rel[NR] = $2; why[NR] = $3; s = sess($2); if ($1 == "skip" && s != "") bad[s] = 1 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        s = sess(rel[i])
+        if (cls[i] != "skip" && s != "" && (s in bad)) {
+          cls[i] = "skip"; why[i] = "같은 리뷰 세션의 다른 파일을 건너뜀 — 세션을 나누지 않고 원본에 그대로 둠"
+        }
+        print cls[i], rel[i], why[i]
+      }
+    }')"$'\n'
 }
 
 # D5 — 분류 순서: ③ 정리만 → (index 보호) → ② 커밋만 → ① 복사 후 커밋 → ④ 건너뜀.
@@ -410,6 +477,39 @@ _carry_classify() {  # <P> <T> <rel>
   return 0
 }
 
+# 이관한 리뷰 세션의 원본 폴더 마무리(worktree 모드). git 대상 파일이 원본에 하나도 남지 않은
+# 세션만 다룬다 — 남았으면 정리 단계가 보존한 것이라 세션을 나누지 않는다.
+#  - git 이 무시하는 리뷰 런타임 기록(.codex_output.log·.review_wait_status 등)은 커밋하지 않고
+#    대상 세션 폴더로 옮긴다. 대상에 같은 경로가 있으면 덮어쓰지 않고 원본에 남긴다.
+#  - 빈 turns/ 와 빈 세션 폴더를 지운다. 리뷰 실행의 잠금(.state.lock 빈 폴더)은 건드리지 않는다.
+# 결과는 clean_out(호출자의 지역 변수)에 줄로 더한다.
+_carry_finish_sessions() {  # <P> <T>
+  local P="$1" T="$2" pfx="rd-workflow-workspace/handoffs/review_pipeline/" seen="" cls rel why s f
+  while IFS=$'\t' read -r cls rel why; do
+    case "$cls" in carry1|carry2|done3) ;; *) continue ;; esac
+    [[ "$rel" == "$pfx"*/* ]] || continue
+    s="${rel#"$pfx"}"; s="${s%%/*}"
+    case $'\n'"$seen" in *$'\n'"$s"$'\n'*) continue ;; esac
+    seen="${seen}${s}"$'\n'
+    [[ -d "$P/$pfx$s" ]] || continue
+    if [[ -n "$(git -C "$P" ls-files --others --exclude-standard -- "$pfx$s" 2>/dev/null)" ]]; then
+      continue
+    fi
+    while IFS= read -r -d '' f; do
+      if [[ -e "$T/$f" || -L "$T/$f" ]]; then
+        clean_out="${clean_out}  원본 정리: 보존(대상에 같은 경로 있음, git 제외 파일): ${f}"$'\n'
+      elif mkdir -p "$(dirname "$T/$f")" 2>/dev/null && mv "$P/$f" "$T/$f" 2>/dev/null; then
+        clean_out="${clean_out}  원본 정리: 로컬 파일 이동(git 제외, 커밋 안 함): ${f}"$'\n'
+      else
+        clean_out="${clean_out}  원본 정리: 보존(이동 실패, git 제외 파일): ${f}"$'\n'
+      fi
+    done < <(git -C "$P" ls-files -z --others --ignored --exclude-standard -- "$pfx$s" 2>/dev/null)
+    rmdir "$P/$pfx$s/turns" 2>/dev/null || true
+    rmdir "$P/$pfx$s" 2>/dev/null || true
+  done <<< "$_CARRY_ROWS"
+  return 0
+}
+
 _carry_actionable() {
   case "$_CARRY_ROWS" in
     carry1$'\t'*|carry2$'\t'*|done3$'\t'*|*$'\n'carry1$'\t'*|*$'\n'carry2$'\t'*|*$'\n'done3$'\t'*) return 0 ;;
@@ -434,7 +534,7 @@ _promote_carry_docs() {  # <T>
     echo "promote: 문서 이관 — 대상 없음"
     return 0
   fi
-  local P T mode="worktree" cls rel why n=0 tmp hash="커밋 없음" files_out="" clean_out="" d
+  local P T mode="worktree" cls rel why n=0 tmp hash="커밋 없음" files_out="" clean_out="" d sess
   local -a adds=()
   P="$(cd "$project_root" && pwd -P)"
   T="$(cd "$1" && pwd -P)"
@@ -455,6 +555,16 @@ _promote_carry_docs() {  # <T>
     _CARRY_TMP=""
   done <<< "$_CARRY_ROWS"
 
+  # 옮긴 리뷰 세션에 turns/ 를 만든다 — 빈 폴더는 git 이 옮기지 못하고, 없으면 대상에서
+  # 첫 턴을 쓰거나 run_review_turn.sh 로 이어 갈 수 없다.
+  while IFS=$'\t' read -r cls rel why; do
+    case "$cls" in carry1|carry2|done3) ;; *) continue ;; esac
+    case "$rel" in rd-workflow-workspace/handoffs/review_pipeline/*/*) ;; *) continue ;; esac
+    sess="${rel#rd-workflow-workspace/handoffs/review_pipeline/}"
+    mkdir -p "$T/rd-workflow-workspace/handoffs/review_pipeline/${sess%%/*}/turns" 2>/dev/null \
+      || _carry_fail "turns 디렉터리를 만들지 못했습니다: ${sess%%/*}"
+  done <<< "$_CARRY_ROWS"
+
   # 커밋 (경로 한정 — 사용자의 무관한 staged 변경을 건드리지 않는다)
   while IFS=$'\t' read -r cls rel why; do
     case "$cls" in carry1|carry2) adds+=("$rel") ;; esac
@@ -468,6 +578,13 @@ _promote_carry_docs() {  # <T>
   fi
 
   # 원본 정리 (D10 — worktree 모드, 정리 직전 HEAD blob 과 원본이 같을 때만)
+  # 리뷰 세션의 SESSION.md 는 맨 뒤에 지운다 — 정리가 도중에 끊겨도 귀속 근거가 원본에 남아
+  # 같은 명령의 재실행이 나머지 정리를 이어받는다(SESSION.md 가 없으면 세션을 후보로 못 찾는다).
+  local rows_ordered
+  rows_ordered="$(printf '%s' "$_CARRY_ROWS" | awk -F'\t' '
+    $2 ~ /^rd-workflow-workspace\/handoffs\/review_pipeline\/[^\/]+\/SESSION\.md$/ { last = last $0 "\n"; next }
+    { print }
+    END { printf "%s", last }')"
   while IFS=$'\t' read -r cls rel why; do
     case "$cls" in
       carry1|carry2|done3) n=$((n + 1)); files_out="${files_out}  이관 완료: ${rel}"$'\n' ;;
@@ -496,7 +613,8 @@ _promote_carry_docs() {  # <T>
     else
       clean_out="${clean_out}  원본 정리: 보존(정리 실패): ${rel}"$'\n'
     fi
-  done <<< "$_CARRY_ROWS"
+  done <<< "$rows_ordered"
+  if [[ "$mode" == "worktree" ]]; then _carry_finish_sessions "$P" "$T"; fi
 
   echo "promote: 문서 이관 — ${n}건 → ${TARGET_BRANCH} (${hash})"
   printf '%s' "$files_out"
@@ -504,6 +622,76 @@ _promote_carry_docs() {  # <T>
   return 0
 }
 
+
+# ---------------------------------------------------------------------------
+# 중복 착수 확인 보조 — 이어 가기(resume·handoff_retry·carry_retry)와 duplicate 갈래가 쓴다.
+#   _promote_task_stems  : 이 작업 task-state 의 source-fr 에서 FR stem 목록(살아 있는 worktree 의 파일, 없으면 fr tip blob)
+#   _promote_dup_scan_run: dup_scan 을 돌려 _dup_lines·_dup_rc·_dup_why 를 채운다
+#   _promote_dup_has_claimed: 발견 가운데 같은 slug 의 다른 이력(claimed)이 있으면 0
+# ---------------------------------------------------------------------------
+_promote_task_stems() {
+  local rel="rd-workflow-workspace/.lifecycle/task-state" v=""
+  if [[ -n "$WT_ALIVE_PATH" ]]; then
+    v="$(awk -F'=' '$1=="source-fr"{sub(/^[^=]+=/,""); print; exit}' "$WT_ALIVE_PATH/$rel" 2>/dev/null || true)"
+  else
+    v="$(git show "${TARGET_BRANCH}:${rel}" 2>/dev/null \
+      | awk -F'=' '$1=="source-fr"{sub(/^[^=]+=/,""); print; exit}' || true)"
+  fi
+  dup_stems_from_source_fr "${v:--}"
+}
+_promote_dup_scan_run() {  # <stems>
+  local _t _e
+  _dup_lines=""; _dup_rc=0; _dup_why=""
+  _t="$(mktemp "${TMPDIR:-/tmp}/rd-dup-out.XXXXXX")" || { echo "promote: 임시 파일 생성 실패" >&2; exit 1; }
+  _e="$(mktemp "${TMPDIR:-/tmp}/rd-dup-err.XXXXXX")" || { rm -f "$_t"; echo "promote: 임시 파일 생성 실패" >&2; exit 1; }
+  dup_scan "$project_root" "$SLUG" "$1" start >"$_t" 2>"$_e" || _dup_rc=$?
+  _dup_lines="$(cat "$_t")"
+  _dup_why="$(head -1 "$_e")"
+  rm -f "$_t" "$_e"
+  return 0
+}
+_promote_dup_local_run() {  # <stems> — dup_local_inprogress 를 돌려 _dup_lines·_dup_rc·_dup_why 를 채운다
+  local _e
+  _dup_lines=""; _dup_rc=0; _dup_why=""
+  _e="$(mktemp "${TMPDIR:-/tmp}/rd-dup-lerr.XXXXXX")" || { echo "promote: 임시 파일 생성 실패" >&2; exit 1; }
+  _dup_lines="$(dup_local_inprogress "$MAIN_WT_PATH" "$1" 2>"$_e")" || _dup_rc=$?
+  _dup_why="$(head -1 "$_e")"
+  rm -f "$_e"
+  return 0
+}
+_promote_dup_has_claimed() {  # <발견 줄들>
+  printf '%s\n' "$1" | awk -F'\t' '$1=="claimed"{f=1} END{exit !f}'
+}
+_promote_dup_trace_warn() {  # <발견 줄들>
+  local _l
+  echo "promote: 중복 확인 경고 — 같은 작업의 다른 흔적이 있습니다(이어 가기라 계속합니다):" >&2
+  while IFS= read -r _l; do
+    [[ -n "$_l" ]] || continue
+    printf '  - %s\n' "${_l#*$'\t'}" >&2
+  done <<EOF_DUPW
+$1
+EOF_DUPW
+}
+_promote_dup_own_line() {
+  [[ "$DUP_REMOTE_SLUG_OWN" == 1 ]] || return 0
+  echo "promote: 착수 표시 — origin 의 fr/${SLUG} 에 이미 이 작업의 착수 표시가 있습니다(${DUP_REMOTE_SLUG_OID:0:7})."
+}
+# _promote_claim_push — 착수 커밋을 원격 fr/<slug> 에 올리고 결과를 낸다. 반환 1 이면 호출부가 exit 1 한다.
+_promote_claim_push() {
+  local _start _repl="" _ahead="" _rc=0 _why=""
+  _start="$(dup_start_commit "$project_root" "$SLUG")" || {
+    echo "promote: 중복 확인 경고 — 착수 표시를 원격에 올리지 못했습니다(착수 커밋을 찾지 못했습니다). 다른 clone 은 이 착수를 모릅니다. 같은 promote 명령을 다시 실행하면 다시 시도합니다." >&2
+    return 0
+  }
+  [[ "$DUP_REMOTE_SLUG_LEFTOVER" == 1 ]] && _repl="$DUP_REMOTE_SLUG_OID"
+  if [[ -n "$DUP_DEF_OID" ]] && git -C "$project_root" cat-file -e "${DUP_DEF_OID}^{commit}" 2>/dev/null; then
+    _ahead="$(git -C "$project_root" rev-list --count "${_start}^" "^${DUP_DEF_OID}" 2>/dev/null)" || _ahead=""
+  else
+    _ahead="all"
+  fi
+  _why="$(dup_claim_push "$project_root" "$SLUG" "$_start" "$_repl" 2>&1 >/dev/null)" || _rc=$?
+  dup_claim_report "$_rc" "$SLUG" "$_start" "$_why" "$_repl" "$_ahead"
+}
 
 # ---------------------------------------------------------------------------
 # 4. D11 판정표 — 현재 상태를 확정한다 (읽기 전용, 색인을 쓰지 않는다).
@@ -709,12 +897,53 @@ case "$DECISION" in
       # 이관 중단 뒤 같은 명령 재실행(AC8) — 이관 가능한 문서가 남아 있으면 이어받는다.
       DECISION=carry_retry
     else
+      # 오프라인 착수 뒤 같은 명령으로 착수 표시를 복구하는 경로(spec D4 duplicate). 원격 모드에서만 한다.
+      _dup_recovered=0
+      if [[ "$REMOTE_MODE" == "remote" ]]; then
+        _promote_dup_scan_run "$(_promote_task_stems)"
+        _dup_need=0
+        if [[ "$_dup_rc" -eq 1 ]]; then
+          _promote_dup_trace_warn "$_dup_lines"
+          if _promote_dup_has_claimed "$_dup_lines"; then
+            echo "  같은 이름의 다른 이력이 원격에 있어 이 작업은 발행 요청이 거절됩니다." >&2
+          fi
+        elif [[ "$_dup_rc" -eq 3 ]]; then
+          echo "promote: 중복 확인 경고 — 원격 중복 확인을 하지 못했습니다(${_dup_why}). 확인 없이 진행합니다 — 발행 요청 때 다시 확인합니다." >&2
+          dup_timeout_hint "$_dup_why" >&2
+        fi
+        if [[ "$_dup_rc" -ne 3 ]] && ! { [[ "$_dup_rc" -eq 1 ]] && _promote_dup_has_claimed "$_dup_lines"; } \
+           && { [[ -z "$DUP_REMOTE_SLUG_OID" ]] || [[ "$DUP_REMOTE_SLUG_LEFTOVER" == 1 ]]; }; then
+          _dup_need=1
+        fi
+        if [[ "$_dup_need" -eq 1 ]]; then
+          if [[ "$DRY_RUN" -eq 1 ]]; then
+            echo "promote: (dry-run) 착수 표시를 다시 올릴 예정입니다: fr/${SLUG}"
+          elif tasks_lock_acquire promote "$SLUG"; then
+            # 락 안에서 로컬 ref 를 다시 읽는다 — rollback 이 그새 브랜치를 지웠으면 올리지 않는다.
+            _dup_crc=0
+            if git rev-parse --verify -q "$FR_REF" >/dev/null 2>&1; then
+              _promote_claim_push || _dup_crc=$?
+              [[ "$_dup_crc" -eq 0 ]] && _dup_recovered=1
+            fi
+            tasks_lock_release
+            [[ "$_dup_crc" -eq 0 ]] || exit 1
+          else
+            echo "promote: 중복 확인 경고 — 다른 작업이 색인을 쓰는 중이라 착수 표시를 다시 시도하지 않았습니다. 잠시 뒤 같은 명령을 다시 실행하십시오." >&2
+          fi
+        else
+          _promote_dup_own_line
+        fi
+      fi
       # 이관할 것이 없거나 skip 뿐이면 현행 거부를 유지하되, 보류 사유를 먼저 보여 준다.
       while IFS=$'\t' read -r _cls _crel _cwhy; do
         [[ "$_cls" == "skip" ]] || continue
         echo "promote: 문서 이관 보류 — ${_crel}: ${_cwhy}" >&2
       done <<< "$_CARRY_ROWS"
-      echo "promote: '${SLUG}' 는 이미 진행 중입니다 (fr-branch=${TARGET_BRANCH}) — 아무것도 바꾸지 않습니다." >&2
+      if [[ "$_dup_recovered" -eq 1 ]]; then
+        echo "promote: '${SLUG}' 는 이미 진행 중입니다 (fr-branch=${TARGET_BRANCH}) — 로컬 작업은 바꾸지 않습니다." >&2
+      else
+        echo "promote: '${SLUG}' 는 이미 진행 중입니다 (fr-branch=${TARGET_BRANCH}) — 아무것도 바꾸지 않습니다." >&2
+      fi
       echo "  다음 중 하나를 선택하세요:" >&2
       echo "    1) 그 작업을 계속 진행합니다: bash rd-workflow/scripts/rd task list" >&2
       echo "    2) 세션 기동을 다시 확인합니다: bash rd-workflow/scripts/rd task resolve-launch ${SLUG}" >&2
@@ -800,6 +1029,63 @@ if [[ "$NEED_CONTENT" -eq 1 ]]; then
     exit 1
   fi
 fi
+
+# 중복 착수 확인 위치 ① (락 밖, 빠른 판정) — 새 착수에서 같은 FR·slug 의 다른 착수·발행·로컬 진행을 찾으면
+# 아무것도 만들지 않고 멈춘다. --dry-run 도 같은 판정을 낸다(원격 조사는 공유 ref 를 바꾸지 않는다).
+# 원격 조사 실패(rc 3)는 경고 뒤 계속한다 — 착수 표시를 건너뛰도록 CLAIM_SKIP 을 세운다.
+CLAIM_SKIP=""
+DUP_STEMS=""
+case "$DECISION" in
+  fresh|reinit|reinit_noattach)
+    DUP_STEMS="$(dup_stems_from_source_fr "$SOURCE_FR_VAL")"
+    _promote_dup_local_run "$DUP_STEMS"
+    if [[ "$_dup_rc" -eq 1 ]]; then
+      dup_stop_report "$SLUG" "$_dup_lines"
+      exit 1
+    elif [[ "$_dup_rc" -eq 3 ]]; then
+      echo "promote: 중복 확인 경고 — 로컬 진행 확인을 하지 못했습니다. 확인 없이 진행합니다." >&2
+      [[ -n "$_dup_why" ]] && echo "  사유: ${_dup_why}" >&2
+    fi
+    if [[ "$REMOTE_MODE" == "remote" ]]; then
+      _promote_dup_scan_run "$DUP_STEMS"
+      if [[ "$_dup_rc" -eq 1 ]]; then
+        dup_stop_report "$SLUG" "$_dup_lines"
+        exit 1
+      elif [[ "$_dup_rc" -eq 3 ]]; then
+        echo "promote: 중복 확인 경고 — 원격 중복 확인을 하지 못했습니다(${_dup_why}). 확인 없이 진행합니다 — 발행 요청 때 다시 확인합니다." >&2
+        dup_timeout_hint "$_dup_why" >&2
+        CLAIM_SKIP=1
+      fi
+    fi
+    ;;
+  resume|handoff_retry|carry_retry)
+    # 이어 가기 — 같은 slug 의 다른 이력(claimed)이면 멈추고, 그 밖의 흔적은 경고만 낸다. 로컬 진행 확인은 하지 않는다
+    # (이 작업 자신이 진행 중으로 나온다). 표시가 없거나 발행 뒤 남은 브랜치면 푸시 지점에서 올린다(CLAIM_CONT).
+    CLAIM_CONT=""
+    if [[ "$REMOTE_MODE" == "remote" ]]; then
+      DUP_STEMS="$(_promote_task_stems)"
+      _promote_dup_scan_run "$DUP_STEMS"
+      if [[ "$_dup_rc" -eq 1 ]]; then
+        if _promote_dup_has_claimed "$_dup_lines"; then
+          dup_stop_report "$SLUG" "$_dup_lines"
+          exit 1
+        fi
+        _promote_dup_trace_warn "$_dup_lines"
+      elif [[ "$_dup_rc" -eq 3 ]]; then
+        echo "promote: 중복 확인 경고 — 원격 중복 확인을 하지 못했습니다(${_dup_why}). 확인 없이 진행합니다 — 발행 요청 때 다시 확인합니다." >&2
+        dup_timeout_hint "$_dup_why" >&2
+        CLAIM_SKIP=1
+      fi
+      if [[ "$_dup_rc" -ne 3 ]]; then
+        if [[ -z "$DUP_REMOTE_SLUG_OID" || "$DUP_REMOTE_SLUG_LEFTOVER" == 1 ]]; then
+          CLAIM_CONT=1
+        else
+          _promote_dup_own_line
+        fi
+      fi
+    fi
+    ;;
+esac
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "would ${DECISION}: fr-branch=${TARGET_BRANCH} worktree=${TARGET_DIR} (branch=${NEED_BRANCH} attach=${NEED_ATTACH} content=${NEED_CONTENT})"
@@ -907,6 +1193,22 @@ if ! _promote_name_collision_check; then
   exit 1
 fi
 
+# 중복 착수 확인 위치 ② (락 안, 최종 로컬 판정) — 같은 clone 의 두 promote 가 다른 slug 로 같은 FR 을
+# 동시에 착수하면, 락을 먼저 쥔 쪽의 착수 기록이 락 해제 전에 끝나므로 뒤쪽이 여기서 멈춘다.
+case "$DECISION" in
+  fresh|reinit|reinit_noattach)
+    _promote_dup_local_run "$DUP_STEMS"
+    if [[ "$_dup_rc" -eq 1 ]]; then
+      dup_stop_report "$SLUG" "$_dup_lines"
+      _STEP789_DONE=1
+      exit 1
+    elif [[ "$_dup_rc" -eq 3 ]]; then
+      echo "promote: 중복 확인 경고 — 로컬 진행 확인을 하지 못했습니다. 확인 없이 진행합니다." >&2
+      [[ -n "$_dup_why" ]] && echo "  사유: ${_dup_why}" >&2
+    fi
+    ;;
+esac
+
 # 5. base-commit — 기본 브랜치 tip OID (branch 생성 시에만 실제로 쓰이지만, resolve 는
 #    항상 해 둔다 — 새 브랜치의 시작점 판단에 쓰인다).
 BASE_TIP="$(git rev-parse --verify "refs/heads/${DEFAULT_BRANCH}")" || {
@@ -938,6 +1240,52 @@ if [[ "$NEED_BRANCH" -eq 1 ]]; then
   echo "promote: branch $TARGET_BRANCH 생성 (base=${BASE_TIP})"
 fi
 
+# _promote_manual_lag_notice <worktree> — 반영 방식 manual 인 submodule 의 gitlink 가 팀 원격 기본 브랜치 끝과 다르면 알린다
+#   (FR archive-gitlink-team-default-branch). manual 방식은 팀 반영을 사용자가 하므로 gitlink 가 지난 작업 커밋에 남을 수 있고,
+#   새 worktree 의 submodule 은 그 gitlink 로 시작한다. gitlink 는 옮기지 않는다 — 옮기면 작업 diff 에 gitlink 변경이 섞이고
+#   리뷰 기준점이 바뀐다. 알림과 명령 전문만 낸다. 판정하지 못하면 한 줄로 알리고 착수는 계속한다. 항상 rc 0.
+_PROMOTE_LAG_WT=""
+_promote_manual_lag_notice() {
+  local wt="$1" raw rec path gl mode base bp rc st br tip cnt dir qd wb
+  # 이 저장소의 gitlink 만 본다(submodule 안의 중첩 submodule 은 대상이 아니다). -z 출력이라 경로를 그대로 읽는다.
+  raw="$(mktemp "${TMPDIR:-/tmp}/rd-promote-lag.XXXXXX")" || return 0
+  git -C "$wt" ls-tree -r -z HEAD > "$raw" 2>/dev/null || { rm -f "$raw"; return 0; }
+  while IFS= read -r -d '' rec; do
+    [[ "$rec" == "160000 commit "* && "$rec" == *$'\t'* ]] || continue
+    path="${rec#*$'\t'}"; gl="${rec%%$'\t'*}"; gl="${gl##* }"
+    rc=0; mode="$(tp_config "$wt" "$path" mode 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 && "$mode" == manual ]] || continue
+    rc=0; base="$(tp_config "$wt" "$path" base 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || base=""
+    dir="$wt/$path"
+    _rd_is_repo_root "$dir" || continue
+    echo "promote: submodule ${path} 의 gitlink 를 팀 기본 브랜치와 비교합니다 (git ls-remote, 최대 ${RD_TP_LAG_TIMEOUT:-20}초)" >&2
+    # 명령 치환 없이 부른다 — 하위 셸이면 실패 원인(_TP_LAG_CAUSE)이 돌아오지 않는다.
+    rc=0; tp_manual_lag "$dir" "$gl" "$base" >/dev/null || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      echo "promote: submodule ${path} 를 팀 기본 브랜치와 비교하지 못해 알림을 건너뜁니다 — ${_TP_LAG_CAUSE}" >&2
+      continue
+    fi
+    IFS=$'\t' read -r st br tip cnt <<<"$_TP_LAG_RESULT"
+    [[ "$st" != same ]] || continue
+    rc=0; bp="$(tp_config "$wt" "$path" branch_prefix 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || bp=""
+    qd="$(printf '%q' "$dir")"; wb="$(printf '%q' "${bp}${SLUG}")"
+    {
+      if [[ "$st" == behind ]]; then
+        echo "promote: 주의 — submodule ${path} 의 gitlink ${gl:0:7} 가 팀 기본 브랜치 origin/${br} 끝(${tip:0:7})보다 ${cnt} 커밋 뒤입니다 (반영 방식 manual)."
+      else
+        echo "promote: 주의 — submodule ${path} 의 gitlink ${gl:0:7} 는 팀 기본 브랜치 origin/${br} 에 없는 커밋입니다 (반영 방식 manual, 기본 브랜치 끝 ${tip:0:7})."
+      fi
+      echo "promote:   이 worktree 의 submodule 은 그 커밋에서 시작합니다. promote 는 gitlink 를 옮기지 않습니다."
+      # FETCH_HEAD 로 딴다 — 단일 브랜치 복제는 fetch origin <브랜치> 뒤에도 origin/<브랜치> 가 생기지 않는다.
+      echo "promote:   팀 기본 브랜치 끝에서 작업 브랜치를 따려면: git -C ${qd} fetch origin $(printf '%q' "refs/heads/$br") && git -C ${qd} switch --no-overwrite-ignore -c ${wb} FETCH_HEAD"
+    } >&2
+  done < "$raw"
+  rm -f "$raw"
+  return 0
+}
+
 # 8. worktree 부착
 if [[ "$NEED_ATTACH" -eq 1 ]]; then
   if [[ "$NO_WORKTREE" -eq 1 ]]; then
@@ -967,6 +1315,8 @@ if [[ "$NEED_ATTACH" -eq 1 ]]; then
           echo "  필요하면 worktree 에서: bash rd-workflow/scripts/rd submodule init [<경로>...]"
         } >&2
       fi
+      # 팀 원격 비교는 작업 락을 푼 뒤에 한다(11단계 뒤) — 느린 원격이 다른 작업의 착수·발행을 막지 않게 한다.
+      _PROMOTE_LAG_WT="$TARGET_DIR"
     fi
   fi
 fi
@@ -1054,6 +1404,24 @@ fi
 
 _STEP789_DONE=1
 
+# 착수 표시 — 착수 커밋 하나를 원격 fr/<slug> 에 올린다(spec D3·D4). 2단계 공유 락 안이다.
+#   새 착수는 항상, 이어 가기는 표시가 없거나 발행 뒤 남은 브랜치일 때(CLAIM_CONT). 반환 1(동시 착수)이면 세션 없이 멈춘다.
+if [[ "$REMOTE_MODE" == "remote" && -z "$CLAIM_SKIP" ]] \
+   && { [[ "$NEED_CONTENT" -eq 1 ]] || [[ "${CLAIM_CONT:-}" == 1 ]]; }; then
+  _promote_claim_push || {
+    # 동시 착수로 밀렸다 — 안내하는 promote_rollback.sh --task 가 이 작업을 찾도록 색인 행을 남긴다.
+    # 세션을 띄우지 않았으므로 launch=none 이다. 키는 정상 착수의 색인 쓰기와 같다.
+    # 이어 가기처럼 행이 이미 있으면 건드리지 않는다 — 기존 launch=unknown·launching 이 rollback 의 기동 상태 보호에 쓰인다.
+    if ! tasks_index_get "$SLUG" fr-branch >/dev/null 2>&1; then
+      _claim_nw=""
+      [[ "$NO_WORKTREE" -eq 1 ]] && _claim_nw="yes"
+      tasks_index_upsert "$SLUG" fr-branch="$TARGET_BRANCH" worktree-path="$TARGET_DIR" checkout=yes \
+        ${_claim_nw:+no-worktree="$_claim_nw"} launch=none || true
+    fi
+    exit 1
+  }
+fi
+
 # 9.5 문서 이관 — 착수 커밋 직후, 색인·기동 판정 전. 실패하면 exit 4 로 기동 없이 멈춘다.
 _promote_carry_docs "$TARGET_DIR"
 
@@ -1100,6 +1468,9 @@ _promote_handoff_fail() {  # <원인>
     rm -f "$_HANDOFF_TMP"
     _HANDOFF_TMP=""
   fi
+  # 수동 명령을 만들면 선택·CLI 확인(claude --help)이 돈다 — 작업 색인 락을 쥔 채 기다리지 않게 먼저 푼다.
+  # EXIT 정리는 LOCK_HELD=0 이라 다시 풀지 않는다.
+  [[ "${LOCK_HELD:-0}" -eq 1 ]] && { tasks_lock_release; LOCK_HELD=0; }
   echo "promote: 인계 파일을 기록하지 못했습니다 — ${1} (색인·기동은 건드리지 않았습니다)." >&2
   echo "  작업 디렉터리: ${TARGET_DIR}" >&2
   echo "  복구 방법 중 하나를 고르세요:" >&2
@@ -1144,35 +1515,51 @@ if [[ -n "$HANDOFF_SRC" ]]; then
   _promote_write_handoff
 fi
 
+# 내가 rd 가 Orca 로 띄운 자식 세션인지 판정한다(rc 0 자식 / 1 아님). Orca 는 기동 세션에 env 를 못 넘기므로
+# 내 정체 값(터미널 handle, 채팅 structured-agent-session-<id>)이 색인 행의 launch-tab 과 같고 그 행의
+# launch-backend 가 orca 인지 본다. 색인은 git common dir 공유라 같은 저장소의 모든 worktree 가 본다.
+_promote_is_orca_child() {
+  local ids="" slug tab be
+  [[ -n "${ORCA_TERMINAL_HANDLE:-}" ]] && ids="${ORCA_TERMINAL_HANDLE}"
+  [[ -n "${ORCA_AGENT_SESSION_ID:-}" ]] && ids="${ids} structured-agent-session-${ORCA_AGENT_SESSION_ID}"
+  [[ -n "$ids" ]] || return 1
+  while IFS= read -r slug; do
+    [[ -n "$slug" ]] || continue
+    be="$(tasks_index_get "$slug" launch-backend)" || continue
+    [[ "$be" == "orca" ]] || continue
+    tab="$(tasks_index_get "$slug" launch-tab)" || continue
+    [[ -n "$tab" ]] || continue
+    case " $ids " in *" $tab "*) return 0 ;; esac
+  done < <(tasks_index_all_slugs)
+  return 1
+}
+
 LAUNCH_TOKEN=""
 if [[ -n "$_SKIP_LAUNCH_REASON" ]]; then
   echo "promote: ${_SKIP_LAUNCH_REASON} — 새로 기동하지 않습니다." >&2
   echo "  확인: bash rd-workflow/scripts/rd task resolve-launch ${SLUG}" >&2
   echo "promote: 기존 세션의 모델은 확인하지 않습니다 — 새 기동이 없습니다(${_SKIP_LAUNCH_REASON})."
-  _SESSION_MODEL=""
   tasks_index_upsert "$SLUG" fr-branch="$TARGET_BRANCH" worktree-path="$TARGET_DIR" checkout=yes \
     ${_NW_FLAG:+no-worktree="$_NW_FLAG"}
 else
-  _SESSION_MODEL_SRC="" _SESSION_MODEL=""
-  IFS=$'\t' read -r _SESSION_MODEL_SRC _SESSION_MODEL < <(session_launch_model "$TARGET_DIR")
-  case "$_SESSION_MODEL_SRC" in
-    env)     _SESSION_MODEL_LABEL="RD_SESSION_MODEL" ;;
-    config)  _SESSION_MODEL_LABEL="model-strategy.json" ;;
-    inherit) _SESSION_MODEL_LABEL="현재 세션 상속" ;;
-    *)       _SESSION_MODEL_LABEL="미지정 — CLI 기본값" ;;
-  esac
-  echo "promote: 다음 기동에 사용할 모델 — ${_SESSION_MODEL:-미지정} (출처: ${_SESSION_MODEL_LABEL})"
   LAUNCH_TOKEN="$(date -u '+%Y-%m-%d-%H%M')-$$"
   # 기동 대상 백엔드는 예약과 같은 upsert 에 남긴다(spec D2). 기동 도중 끝나거나 결과를 기록하지
   # 못해도 resolve-launch 가 올바른 대상을 조회한다. `none` 도 써서 이전 기동의 값을 덮어쓴다.
-  if [[ -n "${RD_CHILD_SESSION:-}" ]]; then _LAUNCH_BACKEND="none"; else _LAUNCH_BACKEND="$(session_launch_backend)"; fi
-  # 호출 세션 식별(D2) — 백엔드가 herdr·hc 일 때만 남긴다. 값이 비면 쓰지 않는다.
+  # 깊이 1 제한: herdr·hc 는 RD_CHILD_SESSION 으로, Orca 는 세션 정체로 자식을 가린다(change spec D6).
+  _CHILD_DETECTED=""
+  if [[ -n "${RD_CHILD_SESSION:-}" ]]; then _LAUNCH_BACKEND="none"
+  else
+    _LAUNCH_BACKEND="$(session_launch_backend)"
+    if [[ "$_LAUNCH_BACKEND" == "orca" ]] && _promote_is_orca_child; then _LAUNCH_BACKEND="none"; _CHILD_DETECTED=1; fi
+  fi
+  # 호출 세션 식별(D2) — 백엔드가 herdr·hc·orca 일 때만 남긴다. 값이 비면 쓰지 않는다.
   #   자식 세션은 위에서 백엔드가 `none` 이 되므로 여기서 따로 거르지 않는다.
   _CALLER_KV=()
   _caller_id=""
   case "$_LAUNCH_BACKEND" in
     herdr) _caller_id="${HERDR_PANE_ID:-}" ;;
     hc)    _caller_id="${HC_TERMINAL_ID:-}" ;;
+    orca)  _caller_id="${ORCA_TERMINAL_HANDLE:-${ORCA_AGENT_SESSION_ID:-}}" ;;
   esac
   if [[ -n "$_caller_id" ]]; then
     _CALLER_KV=(caller-backend="$_LAUNCH_BACKEND" caller-id="$_caller_id")
@@ -1185,6 +1572,9 @@ fi
 # 11. 락 해제 — 세션 기동보다 앞선다(예약은 이미 기록됐다). 기동은 락 밖에서 돈다 —
 #     기동 무응답이 다른 작업의 착수·마감을 막지 않게 한다.
 [[ "${LOCK_HELD:-0}" -eq 1 ]] && { tasks_lock_release; LOCK_HELD=0; }
+
+# 11b. 반영 방식 manual 인 submodule 의 gitlink 를 팀 기본 브랜치와 비교해 알린다(락 밖, 8단계에서 새 worktree 를 만들었을 때만).
+[[ -z "${_PROMOTE_LAG_WT:-}" ]] || _promote_manual_lag_notice "$_PROMOTE_LAG_WT"
 
 # 12. 세션 기동 (락 밖). **판정을 복제하지 않고 항상 session_launch 를 부른다** —
 #     자동 기동을 지원하지 않는 환경이거나 이미 자식 세션이면 그 함수 자신이 그것을 판단해
@@ -1204,12 +1594,16 @@ fi
 
 if [[ -n "$LAUNCH_TOKEN" ]]; then
   REQUEST_HANDOFF_PATH="${TARGET_DIR}/REQUEST.md"
+  # 모델·effort 선택과 출처 줄 — 락 밖에서 한다(선택이 claude --help 를 부른다, spec D8). 새 기동이 없는 경로는 여기 오지 않는다.
+  session_launch_selection
+  echo "promote: ${SL_LINE}"
   # session_launch 가 만든 탭 식별자를 임시 파일로 받는다(stdout 은 결과 한 줄 계약이라 쓰지 않는다).
   _LAUNCH_META="$(mktemp "${TMPDIR:-/tmp}/rd-launch-meta.XXXXXX" 2>/dev/null)" || _LAUNCH_META=""
-  LAUNCH_RESULT="$(RD_LAUNCH_META_FILE="$_LAUNCH_META" session_launch "$TARGET_DIR" "$SLUG" "$REQUEST_HANDOFF_PATH" "$_SESSION_MODEL" "$_LAUNCH_BACKEND")"
-  _LAUNCH_TAB=""
+  LAUNCH_RESULT="$(RD_LAUNCH_META_FILE="$_LAUNCH_META" RD_CHILD_DETECTED="$_CHILD_DETECTED" session_launch "$TARGET_DIR" "$SLUG" "$REQUEST_HANDOFF_PATH" "$SL_MODEL" "$_LAUNCH_BACKEND" "$SL_EFFORT")"
+  _LAUNCH_TAB=""; _LAUNCH_PANE=""
   if [[ -n "$_LAUNCH_META" && -f "$_LAUNCH_META" ]]; then
     _LAUNCH_TAB="$(sed -n 's/^launch-tab=//p' "$_LAUNCH_META" | head -n 1)"
+    _LAUNCH_PANE="$(sed -n 's/^launch-pane=//p' "$_LAUNCH_META" | head -n 1)"
     rm -f "$_LAUNCH_META"
   fi
   # 락은 유한 재시도한다 — rc=1(다른 명령이 잠깐 점유)만 0.25초 간격 최대 20회(약 5초).
@@ -1228,7 +1622,7 @@ if [[ -n "$LAUNCH_TOKEN" ]]; then
     _cur_token="$(tasks_index_get "$SLUG" launch-token 2>/dev/null)" || _cur_token=""
     if [[ "$_cur_token" == "$LAUNCH_TOKEN" ]]; then
       # 새 기동이므로 launch-tab 은 항상 덮어쓴다 — 값이 없으면 빈 값으로 옛 탭을 가리키지 않게 한다.
-      tasks_index_upsert "$SLUG" launch="$LAUNCH_RESULT" launch-tab="$_LAUNCH_TAB"
+      tasks_index_upsert "$SLUG" launch="$LAUNCH_RESULT" launch-tab="$_LAUNCH_TAB" launch-pane="$_LAUNCH_PANE"
     fi
     tasks_lock_release
     _rec_ok=1
@@ -1247,7 +1641,10 @@ if [[ -n "$LAUNCH_TOKEN" ]]; then
   fi
   if [[ "$LAUNCH_RESULT" == "ok" || "$LAUNCH_RESULT" == "unknown" ]]; then
     _agent_name="$(session_agent_name "$SLUG")"
-    if [[ "$_agent_name" != "$SLUG" ]]; then
+    if [[ "${_LAUNCH_BACKEND:-}" == "orca" ]]; then
+      # Orca 는 이름을 쓰지 않는다 — 확인·조회에 쓰는 handle 을 보인다(spec D8).
+      [[ -z "${_LAUNCH_TAB:-}" ]] || echo "promote: Orca 세션: ${_LAUNCH_TAB}"
+    elif [[ "$_agent_name" != "$SLUG" ]]; then
       if [[ "${_LAUNCH_BACKEND:-}" == "hc" ]]; then
         echo "promote: hc 세션 이름 — ${_agent_name}"
       else

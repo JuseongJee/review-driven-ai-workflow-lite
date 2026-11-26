@@ -14,6 +14,10 @@
 #                             (publish-ready 는 세션과 wrapper 사이의 내부 토큰 — wrapper 가 발행 결과로 바꾼다)
 #   BASH_DEFAULT_TIMEOUT_MS  자식 세션의 Bash 기본 timeout(ms). 미설정·빈 값이면 7500000 을 넘긴다.
 #                            비어 있지 않은 값은 그대로 전달한다 (BASH_MAX_TIMEOUT_MS 는 건드리지 않는다)
+#   RD_HEADLESS_CLAUDE_MODEL  (사용자) 무인 claude -p 세션의 --model 값. 미설정이면 인자를 넘기지 않는다 (CLI 기본값)
+#   RD_HEADLESS_CLAUDE_EFFORT (사용자) 무인 claude -p 세션의 --effort 값. 미설정이면 인자를 넘기지 않는다
+#   RD_HEADLESS_FIXED_MODEL / RD_HEADLESS_FIXED_EFFORT / RD_HEADLESS_FIXED_LINE
+#                            (ralph_drain 내부) FIXED_LINE 이 비어 있지 않으면 앞의 둘을 그대로 인자로 쓰고 다시 해석하지 않는다
 #   RD_FR_WALL_MINUTES       이 호출 1회의 경과 시간 상한(분, 소수 허용). 0 은 상한 없음.
 #                            미설정이면 config/loop-guard.json 의 wall_minutes, 그것도 없으면 240.
 #   RD_FR_WALL_GRACE_SECONDS 상한 도달 뒤 TERM 에서 KILL 까지의 유예(1~120 정수, 기본 30). 발행 단계 상한도 같은 유예를 쓴다
@@ -372,6 +376,20 @@ if [[ "${RD_AUTOPILOT_HEADLESS_NO_INVOKE:-0}" != "1" ]]; then
     fi
   fi
   echo "autopilot_headless: BASH_DEFAULT_TIMEOUT_MS=${EFFECTIVE_TIMEOUT_MS} (${TIMEOUT_SOURCE})" >&2
+  # 모델·effort 인자: ralph_drain 이 해석해 넘긴 고정 값이 있으면 그대로, 없으면 여기서 해석한다 (비strict — 경고 후 계속).
+  HEADLESS_ARGS=(); HL_LINE=""
+  if [[ -n "${RD_HEADLESS_FIXED_LINE:-}" ]]; then
+    [[ -n "${RD_HEADLESS_FIXED_MODEL:-}" ]] && HEADLESS_ARGS+=(--model "$RD_HEADLESS_FIXED_MODEL")
+    [[ -n "${RD_HEADLESS_FIXED_EFFORT:-}" ]] && HEADLESS_ARGS+=(--effort "$RD_HEADLESS_FIXED_EFFORT")
+    HL_LINE="$RD_HEADLESS_FIXED_LINE"
+  elif source "${SCRIPT_DIR}/model_select.sh" 2>/dev/null && ms_resolve_headless 0; then
+    [[ -n "$MS_HL_MODEL_ARG" ]] && HEADLESS_ARGS+=(--model "$MS_HL_MODEL_ARG")
+    [[ -n "$MS_HL_EFFORT_ARG" ]] && HEADLESS_ARGS+=(--effort "$MS_HL_EFFORT_ARG")
+    HL_LINE="$MS_HL_LINE"
+  else
+    echo "autopilot_headless: 경고 — model_select.sh 를 읽지 못해 모델·effort 인자 없이 기동합니다" >&2
+  fi
+  [[ -n "$HL_LINE" ]] && echo "autopilot_headless: ${HL_LINE}" >&2
   # 2. claude -p 헤드리스 기동 (max-turns 미설정 — 실연 truncation 방지)
   # timeout 은 claude 명령 앞 접두 env 로만 넘긴다 (wrapper 환경에 export 하지 않는다).
   # 경과 시간 상한(중단 조건 8): claude 를 자체 프로세스 그룹의 백그라운드 작업으로 띄우고 폴링으로 감시한다.
@@ -412,6 +430,7 @@ if [[ "${RD_AUTOPILOT_HEADLESS_NO_INVOKE:-0}" != "1" ]]; then
     BASH_DEFAULT_TIMEOUT_MS="$EFFECTIVE_TIMEOUT_MS" \
     python3 -c "$PY_SETSID_EXEC" \
       claude -p "$CLAUDE_PROMPT" \
+      ${HEADLESS_ARGS[@]+"${HEADLESS_ARGS[@]}"} \
       --permission-mode bypassPermissions \
       --output-format json </dev/null >"$RESULT_FILE" &
     CHILD=$!
@@ -422,6 +441,7 @@ if [[ "${RD_AUTOPILOT_HEADLESS_NO_INVOKE:-0}" != "1" ]]; then
     RD_AUTOPILOT_OUTCOME_FILE="$OUTCOME_FILE" \
     BASH_DEFAULT_TIMEOUT_MS="$EFFECTIVE_TIMEOUT_MS" \
     claude -p "$CLAUDE_PROMPT" \
+      ${HEADLESS_ARGS[@]+"${HEADLESS_ARGS[@]}"} \
       --permission-mode bypassPermissions \
       --output-format text &
     CHILD=$!

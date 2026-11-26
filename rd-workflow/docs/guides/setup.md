@@ -71,20 +71,18 @@ bash rd-workflow/scripts/install_claude_skills.sh project
 
 ```bash
 command -v codex &>/dev/null && echo "codex: 설치됨" || echo "codex: 없음"
-command -v gemini &>/dev/null && echo "gemini: 설치됨" || echo "gemini: 없음"
 ```
 
-**하나 이상 설치된 경우**: 교차 리뷰가 가능합니다. 아래 설정에서 우선순위를 조정하세요.
+**설치된 경우**: 교차 리뷰가 가능합니다. 아래 설정에서 우선순위를 조정하세요.
 
-**모두 없는 경우**: Claude self-review로 동작합니다. 다른 모델로 교차 리뷰하면 품질이 크게 올라가므로 나중에라도 설치를 권장합니다.
+**없는 경우**: Claude self-review로 동작합니다. 다른 모델로 교차 리뷰하면 품질이 크게 올라가므로 나중에라도 설치를 권장합니다.
 
 `rd-workflow/config/review-tools.json.example`을 `review-tools.json`으로 복사해서 시작하세요.
 
 ```json
 {
-  "default_priority": ["codex", "gemini", "claude"],
+  "default_priority": ["codex", "claude"],
   "tools": {
-    "gemini": { "bin": null, "model": null },
     "codex": { "bin": null },
     "claude": { "bin": null, "self_review_warning": true }
   }

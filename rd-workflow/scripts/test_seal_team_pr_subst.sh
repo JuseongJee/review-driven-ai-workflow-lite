@@ -8,6 +8,7 @@ set -uo pipefail
 
 export HERDR_ENV=
 export HC_TERMINAL_ID=
+export ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE=
 export RD_CHILD_SESSION=1
 unset project_root TASK_STATE_PATH
 

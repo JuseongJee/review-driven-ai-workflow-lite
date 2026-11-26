@@ -11,6 +11,8 @@ source "$SCRIPT_DIR/_tasks_index.sh"
 source "$SCRIPT_DIR/_merge_precheck.sh"
 # 팀 저장소 반영 설정·대상 판정 공용 함수(rd pr 과 공유) — archive 게이트(D10)가 쓴다.
 source "$SCRIPT_DIR/_team_publish_common.sh"
+# 직접 설치 PR 발행 공용 판정(_dpr_cleanup_shape 등) — Step -1 의 재시도 판정과 아래 archive_publish 사전 거부가 쓴다.
+source "$SCRIPT_DIR/_direct_pr_common.sh"
 
 # _archive_read_field_at <worktree-path> <key> — 다른 worktree 의 task-state 를
 # **cd 없이 경로로 직접** 읽는다. `state_read_field` 는 source 시점에 확정된
@@ -37,7 +39,7 @@ _archive_read_field_at() {
 # 이 배열을 그대로 전달한다.
 ORIG_ARGS=("$@")
 
-DRY_RUN=0; FORCE_DIRTY=0; NO_REMOTE=0; FR_BRANCH_OVERRIDE=""; FORCE_SKIP_REVIEW=0; SKIP_REASON=""; ALLOW_STATUS=0; STATUS_REASON=""; ALLOW_GITLINK=0; GITLINK_REASON=""; ALLOW_UNPUB=0; UNPUB_REASON=""; TASK_SLUG_ARG=""
+DRY_RUN=0; FORCE_DIRTY=0; NO_REMOTE=0; FR_BRANCH_OVERRIDE=""; FORCE_SKIP_REVIEW=0; SKIP_REASON=""; ALLOW_STATUS=0; STATUS_REASON=""; ALLOW_GITLINK=0; GITLINK_REASON=""; ALLOW_UNPUB=0; UNPUB_REASON=""; ALLOW_DUP=0; DUP_REASON=""; TASK_SLUG_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fr-branch) FR_BRANCH_OVERRIDE="$2"; shift 2 ;;
@@ -65,10 +67,95 @@ while [[ $# -gt 0 ]]; do
       # --allow-gitlink-drop 과 같은 모양 — 사유 누락은 빈 값으로 두고 archive_team_publish_gate 가 차단한다.
       if [[ $# -ge 2 && "$2" != -* ]]; then UNPUB_REASON="$2"; shift 2; else shift 1; fi
       ;;
-    -h|--help) printf '%s\n' "usage: archive.sh [--fr-branch <ref>] [--task <slug>] [--no-remote] [--force-dirty] [--force-skip-review-check <사유>] [--allow-status-mismatch <사유>] [--allow-gitlink-drop <사유>] [--allow-unpublished-submodule <사유>] [--dry-run]"; exit 0 ;;
+    --allow-duplicate-publish)
+      ALLOW_DUP=1
+      # 같은 모양 — 사유 누락은 빈 값으로 두고 중복 확인 게이트가 차단한다.
+      if [[ $# -ge 2 && "$2" != -* ]]; then DUP_REASON="$2"; shift 2; else shift 1; fi
+      ;;
+    -h|--help) printf '%s\n' "usage: archive.sh [--fr-branch <ref>] [--task <slug>] [--no-remote] [--force-dirty] [--force-skip-review-check <사유>] [--allow-status-mismatch <사유>] [--allow-gitlink-drop <사유>] [--allow-unpublished-submodule <사유>] [--allow-duplicate-publish <사유>] [--dry-run]"; exit 0 ;;
     *) printf 'archive: unknown arg: %s\n' "$1" >&2; exit 1 ;;
   esac
 done
+
+# ---------------------------------------------------------------------------
+# no-fr 발행 재시도 판정 공용 함수 (change spec 2026-11-22-2100 D3) — Step -1 이 쓰고, 팀 저장소 반영 게이트(D8)와
+# 작업 이름 안내(D9)도 같은 사슬 탐색을 쓴다. 아래 두 함수의 본문은 test_archive_submodule.sh 가 이름으로 꺼내 부르므로 바꾸지 않는다.
+# ---------------------------------------------------------------------------
+_archive_status_at() {  # <커밋> — 그 커밋의 task-state Status(읽지 못하면 빈 값)
+  git show "$1:rd-workflow-workspace/.lifecycle/task-state" 2>/dev/null | awk -F= '$1=="status"{sub(/^[^=]+=/,""); print; exit}'
+}
+_archive_only_lifecycle_paths() {  # <커밋> — 부모 하나이고 바뀐 경로가 lifecycle_metadata_paths 뿐이면 rc 0
+  local c="$1" parents changed allowed p
+  parents="$(git rev-list --parents -n 1 "$c" 2>/dev/null)" || return 1
+  set -- $parents
+  [[ "$#" -eq 2 ]] || return 1
+  changed="$(git diff-tree --no-commit-id --name-only -r --no-renames --ignore-submodules=none "$1" 2>/dev/null)" || return 1
+  [[ -n "$changed" ]] || return 1
+  allowed="$(lifecycle_metadata_paths)" || return 1
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    case "
+$allowed
+" in *"
+$p
+"*) ;; *) return 1 ;; esac
+  done <<EOF_ALP
+$changed
+EOF_ALP
+  return 0
+}
+_archive_field_at() {  # <커밋> <키> — 그 커밋 task-state 의 한 칸(읽지 못하면 빈 값)
+  git show "$1:rd-workflow-workspace/.lifecycle/task-state" 2>/dev/null | awk -F= -v k="$2" '$1==k{sub(/^[^=]+=/,""); print; exit}'
+}
+# _archive_nofr_retry_commit — cwd 저장소 HEAD 에서 첫 부모를 따라 「재시도 사슬」 을 지나 첫 정리 커밋 C1 에 닿으면 그 OID 를
+#   stdout 으로 내고 rc 0, 아니면 rc 1(출력 없음). 최대 20 커밋까지 본다.
+#   사슬 커밋 X: 부모 하나, task-state Status `대기 중`·fr-branch `null`. 바뀐 경로는 정리 제목 커밋이면 lifecycle_metadata_paths 와
+#   $RD_TEAM_PR_RECORD 뿐, 그 밖의 커밋이면 lifecycle_metadata_paths 뿐이다. 어긋나면 그 자리에서 멈춘다(아님).
+#   X 의 제목이 「chore(lifecycle): archive <이름> metadata 정리」 이고 X 의 부모가 Status `아카이브 보류`·fr-branch `null` 이면 X 가 C1 이다
+#   (이때 _dpr_cleanup_shape 도 맞아야 한다). 그 밖의 사슬 커밋(작업 이름 복구 커밋, 두 번째 이후 정리 커밋)은 지나간다.
+_archive_nofr_retry_commit() {
+  local root x parents p c pf allowed subj name pst pfr n=0 re
+  re='^chore\(lifecycle\): archive (.+) metadata 정리$'
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  x="$(git rev-parse -q --verify HEAD 2>/dev/null)" || return 1
+  while [[ "$n" -lt 20 ]]; do
+    n=$((n + 1))
+    parents="$(git rev-list --parents -n 1 "$x" 2>/dev/null)" || return 1
+    set -- $parents
+    [[ "$#" -eq 2 ]] || return 1
+    pf="$2"
+    [[ "$(_archive_status_at "$x")" == "대기 중" && "$(_archive_field_at "$x" fr-branch)" == "null" ]] || return 1
+    subj="$(git log -1 --format=%s "$x" 2>/dev/null)" || return 1
+    if [[ "$subj" =~ $re ]]; then
+      name="${BASH_REMATCH[1]}"
+      pst="$(_archive_status_at "$pf")"
+      pfr="$(_archive_field_at "$pf" fr-branch)"
+      if [[ "$pst" == "아카이브 보류" && "$pfr" == "null" ]]; then
+        _dpr_cleanup_shape "$root" "$x" "$name" >/dev/null 2>&1 || return 1
+        printf '%s\n' "$x"
+        return 0
+      fi
+      c="$(git diff-tree --no-commit-id --name-only -r --no-renames --ignore-submodules=none "$x" 2>/dev/null)" || return 1
+      [[ -n "$c" ]] || return 1
+      allowed="$(lifecycle_metadata_paths)
+$RD_TEAM_PR_RECORD" || return 1
+      while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        case "
+$allowed
+" in *"
+$p
+"*) ;; *) return 1 ;; esac
+      done <<EOF_RC
+$c
+EOF_RC
+    else
+      _archive_only_lifecycle_paths "$x" || return 1
+    fi
+    x="$pf"
+  done
+  return 1
+}
 
 # ---------------------------------------------------------------------------
 # Step -1 — 대상 확정과 기본 worktree 재실행 (spec D5)
@@ -174,24 +261,33 @@ if [[ -z "${RD_ARCHIVE_REEXEC:-}" ]]; then
   project_root="$CALLER_WT"
   source "$SCRIPT_DIR/../_task_common.sh"
 
-  _tr_out=""
-  if ! _tr_out="$(task_resolve_target read "$TASK_SLUG_ARG")"; then
-    exit 1
-  fi
-  _tr_kind="${_tr_out%%$'\t'*}"
-  _tr_val="${_tr_out#*$'\t'}"
-
+  # 대상 판정 순서 (change spec 2026-11-22-2100 D3·D5·D6):
+  #   (가) --task      — task_resolve_target 으로 확인하고 slug 가 곧 fr-branch 다.
+  #   (나) --fr-branch — 대상이 명시된 것으로 보고 task_resolve_target 을 부르지 않는다.
+  #   (다) 기본 체크아웃 작업의 발행 재시도 상태 — 호출 체크아웃 자신이 대상이고 task_resolve_target 을 부르지 않는다.
+  #   (라) 그 밖     — task_resolve_target read. 작업이 없는 위치에서 진행 중 작업이 있으면 자동으로 고르지 않고 멈춘다.
   if [[ -n "$TASK_SLUG_ARG" ]]; then
+    if ! task_resolve_target read "$TASK_SLUG_ARG" >/dev/null; then
+      exit 1
+    fi
     # 명시 대상은 slug 자체가 곧 fr-branch 다 — 어느 worktree 의 파일도 읽지 않는다.
     # 읽기 권위는 fr tip 이고 쓰기 위치는 발행 worktree 다 — 호출 위치는 둘 중
     # 무엇도 아니므로 여기서 어떤 파일도 읽을 필요가 없다(spec D13).
     [[ -z "$FR_BRANCH_OVERRIDE" ]] && FR_BRANCH_OVERRIDE="fr/${TASK_SLUG_ARG}"
-  elif [[ "$_tr_kind" == "ref" ]]; then
-    [[ -z "$FR_BRANCH_OVERRIDE" ]] && FR_BRANCH_OVERRIDE="$_tr_val"
-  elif [[ "$_tr_val" != "$CALLER_WT" ]]; then
-    # 색인이 CALLER_WT 가 아닌 다른 작업을 단일 대상으로 자동 선택했다 — 그 worktree
-    # 의 파일을 경로로 직접 읽는다(cd 로 옮겨가지 않는다 — 위 TASK_STATE_PATH 함정 회피).
-    [[ -z "$FR_BRANCH_OVERRIDE" ]] && FR_BRANCH_OVERRIDE="$(_archive_read_field_at "$_tr_val" fr-branch)"
+  elif [[ -n "$FR_BRANCH_OVERRIDE" ]]; then
+    :
+  else
+    _archive_retry_c1=""
+    if [[ "$(cd "$CALLER_WT" && pwd -P)" == "$(cd "$PUBLISH_WT" && pwd -P)" \
+      && "$(_archive_read_field_at "$CALLER_WT" fr-branch)" == "null" ]]; then
+      _archive_retry_c1="$(cd "$CALLER_WT" && _archive_nofr_retry_commit)" || _archive_retry_c1=""
+    fi
+    if [[ -n "$_archive_retry_c1" ]]; then
+      printf 'archive: 기본 체크아웃 작업의 발행 재시도로 봅니다 (정리 커밋 %s) — 다른 작업을 발행하려면 --task <작업 이름> 을 붙이십시오\n' \
+        "$(git -C "$CALLER_WT" rev-parse --short=7 "$_archive_retry_c1")"
+    elif ! task_resolve_target read "" >/dev/null; then
+      exit 1
+    fi
   fi
   # 그 외(대상이 CALLER_WT 자기 자신) — FR_BRANCH_OVERRIDE 를 강제하지 않는다. 아래
   # 기존 "FR identity source-of-truth" 블록이 CALLER_WT 에 바인딩된
@@ -447,7 +543,6 @@ REMOTE_MODE="$REMOTE_MODE_RAW"
 # 직접 설치 PR 발행(archive_publish=pr) 사전 거부 — 어떤 커밋·태그·push 보다 먼저, dry-run 도 같은 검사를 거친다 (change spec D2).
 # 락은 위에서 이미 잡았지만 저장소를 바꾸지 않는다. 판정은 fr tip(no-fr 은 HEAD)에 커밋된 workflow.json 으로 한다.
 # fr 브랜치가 이미 없으면(발행 끝난 재실행) 설정을 읽을 곳이 없으므로 push 로 두고 아래 「이미 archive 완료」 안전망이 처리한다.
-source "$SCRIPT_DIR/_direct_pr_common.sh"
 _ARCHIVE_DPR_MODE="push"
 _dpr_commit="HEAD"
 if [[ "$BRANCH_MODE" == "fr" ]]; then
@@ -511,7 +606,7 @@ AUDIT_LOG="$CURRENT_WT/rd-workflow-workspace/.lifecycle/review-skip-audit.log"
 #   (리뷰한 범위) → (다) 기준점부터 tip 까지 바뀐 gitlink(seal 마커로 기준점을 정했으면 리뷰한 끝 커밋까지 바뀐 경로만,
 #   tp_reviewed_head) 마다 tip 의 포인터가 submodule 의 origin/<대상 브랜치> 의 조상이거나 같아야 한다.
 #   대상 브랜치는 team_publish.base, 비면 submodule 의 origin/HEAD 가 가리키는 브랜치다. gh 는 쓰지 않는다.
-#   팀 원격 조회(set-head·fetch)는 시작 줄을 먼저 내고 RD_MERGE_FETCH_TIMEOUT 상한을 둔다(rd_run_limited).
+#   팀 원격 조회(set-head·fetch)는 시작 줄을 먼저 내고 RD_MERGE_FETCH_TIMEOUT 상한을 둔다(_rd_run_limited).
 #   (나)의 실패와 (다)의 반영되지 않은 포인터·판정 불가는 같은 우회 처리를 거친다: --allow-unpublished-submodule <사유>
 #   (audit 기록, 기록 실패는 차단). 플래그가 없으면 거부한다(fail-closed).
 #   return 0=진행, 1=차단.
@@ -569,7 +664,7 @@ _archive_tpg_remote() {
   shift 2
   _ARCHIVE_TPG_CAUSE=""
   rd_git_noprompt_env "$dir"
-  rd_run_limited "$_ARCHIVE_TPG_LIM" "$errf" "${RD_GIT_NOPROMPT_ENV[@]}" git -C "$dir" "$@" >/dev/null || rc=$?
+  _rd_run_limited "$_ARCHIVE_TPG_LIM" "$errf" "${RD_GIT_NOPROMPT_ENV[@]}" git -C "$dir" "$@" >/dev/null || rc=$?
   [[ "$rc" -ne 0 ]] || return 0
   if [[ "$rc" -eq 124 ]]; then
     _ARCHIVE_TPG_CAUSE="${_ARCHIVE_TPG_LIM}초 안에 끝나지 않았습니다"
@@ -780,52 +875,20 @@ archive_review_precheck "$FORCE_SKIP_REVIEW" "$SKIP_REASON" "$SLUG" "$AUDIT_LOG"
 #
 #   no-fr 의 정리 커밋 뒤 재실행 — Step 4 정리 커밋은 review-session·base-commit 을 지운다. push 실패 같은 부분 성공 뒤
 #   재실행에서 그 HEAD 를 판정하면 기준점이 없어 거부되므로, 정리 커밋임을 확인한 경우에만 정리 전 커밋을 tip 으로 둔다.
-#   그 커밋은 첫 실행이 판정한 커밋과 같다(같은 seal 마커·review-session·workflow.json). 판정 기준(모두 맞아야 함):
-#     (1) 정리 커밋 C 가 _dpr_cleanup_shape(_direct_pr_common.sh) 모양이다 — 제목이 Step 4 의 「chore(lifecycle): archive
-#         <SLUG> metadata 정리」, 부모 하나, 부모의 task-state Status 가 `아카이브 보류`, 바뀐 경로가 lifecycle_metadata_paths
-#         와 팀 PR 기록 경로뿐.
-#     (2) C 의 task-state Status 가 `대기 중` 이다(Step 4 가 쓴 값).
-#     (3) C 는 HEAD 이거나 HEAD 의 부모다. 부모일 때 HEAD 는 부모 하나이고, 바뀐 경로가 lifecycle_metadata_paths 뿐이며,
-#         Status 가 `대기 중` 이다 — slug 단계가 요구하는 `rd task set-title` 복구를 커밋한 경우다.
-#   하나라도 맞지 않으면 종전대로 HEAD 를 판정한다(재실행 때 다른 short-title 을 주면 (1)의 제목이 달라 이쪽이다).
-_archive_status_at() {  # <커밋> — 그 커밋의 task-state Status(읽지 못하면 빈 값)
-  git show "$1:rd-workflow-workspace/.lifecycle/task-state" 2>/dev/null | awk -F= '$1=="status"{sub(/^[^=]+=/,""); print; exit}'
-}
-_archive_only_lifecycle_paths() {  # <커밋> — 부모 하나이고 바뀐 경로가 lifecycle_metadata_paths 뿐이면 rc 0
-  local c="$1" parents changed allowed p
-  parents="$(git rev-list --parents -n 1 "$c" 2>/dev/null)" || return 1
-  set -- $parents
-  [[ "$#" -eq 2 ]] || return 1
-  changed="$(git diff-tree --no-commit-id --name-only -r --no-renames --ignore-submodules=none "$1" 2>/dev/null)" || return 1
-  [[ -n "$changed" ]] || return 1
-  allowed="$(lifecycle_metadata_paths)" || return 1
-  while IFS= read -r p; do
-    [[ -n "$p" ]] || continue
-    case "
-$allowed
-" in *"
-$p
-"*) ;; *) return 1 ;; esac
-  done <<EOF_ALP
-$changed
-EOF_ALP
-  return 0
-}
+#   그 커밋은 첫 실행이 판정한 커밋과 같다(같은 seal 마커·review-session·workflow.json). 판정(change spec 2026-11-22-2100 D8):
+#   _archive_nofr_retry_commit 이 거슬러 올라가 찾은 첫 정리 커밋 C1 의 제목 이름이 이번 SLUG 와 같으면 C1 의 부모를 tip 으로 둔다.
+#   push 가 두 번 이상 실패한 사슬(C1→R1→C2→R2)도 C1 까지 올라간다. 그 밖(이름이 다르거나 사슬이 아님)은 종전대로 HEAD 를 판정한다
+#   (재실행 때 다른 short-title 을 주면 이름이 달라 이쪽이다).
 _archive_nofr_gate_tip() {  # HEAD OID 또는 확인된 정리 커밋의 부모 OID 를 stdout 으로. HEAD 를 읽지 못하면 rc 1.
-  local head c root
+  local head c1 subj re
   head="$(git rev-parse HEAD 2>/dev/null)" || return 1
-  root="$(git rev-parse --show-toplevel 2>/dev/null)" || { printf '%s\n' "$head"; return 0; }
-  for c in "$head" "$(git rev-parse -q --verify "${head}^1" 2>/dev/null || true)"; do
-    [[ -n "$c" ]] || continue
-    if [[ "$c" != "$head" ]]; then
-      _archive_only_lifecycle_paths "$head" || break
-      [[ "$(_archive_status_at "$head")" == "대기 중" ]] || break
+  re='^chore\(lifecycle\): archive (.+) metadata 정리$'
+  if c1="$(_archive_nofr_retry_commit)"; then
+    subj="$(git log -1 --format=%s "$c1" 2>/dev/null)" || subj=""
+    if [[ "$subj" =~ $re && "${BASH_REMATCH[1]}" == "$SLUG" ]]; then
+      git rev-parse "${c1}^1" 2>/dev/null && return 0
     fi
-    if _dpr_cleanup_shape "$root" "$c" "$SLUG" >/dev/null 2>&1 && [[ "$(_archive_status_at "$c")" == "대기 중" ]]; then
-      git rev-parse "${c}^1" 2>/dev/null && return 0
-      break
-    fi
-  done
+  fi
   printf '%s\n' "$head"
 }
 # _archive_nofr_name_hint — no-fr 재실행이 기준점을 못 찾을 때 원인 후보(첫 실행의 작업 이름)와 복구 순서를 stderr 로 안내한다 (spec D8).
@@ -888,6 +951,17 @@ _archive_nofr_name_hint() {
     fi
     return 0
   done
+  # 위 두 분기에서 아무것도 안내하지 않았을 때만(change spec 2026-11-22-2100 D9) — push 가 두 번 이상 실패한 사슬은 정리 커밋이 HEAD 에서 멀다.
+  #   사슬 탐색은 기록 경로만 바꾼 `대기 중` 커밋을 지나가므로 복구 커밋을 하나 더 얹어도 C1 에 닿는다(고쳐 쓰기 불필요).
+  c="$(_archive_nofr_retry_commit)" || return 0
+  subj="$(git log -1 --format=%s "$c" 2>/dev/null)" || return 0
+  [[ "$subj" =~ $re ]] || return 0
+  name="${BASH_REMATCH[1]}"
+  [[ "$name" != "$SLUG" ]] || return 0
+  [[ "$(normalize_slug "$name" 2>/dev/null)" == "$name" ]] || return 0
+  printf 'archive:   원인 후보: 첫 실행의 작업 이름은 %s 인데 이번 실행은 %s 입니다 — 정리 커밋을 알아보지 못해 기준점을 찾지 못했습니다.\n' "$name" "$SLUG" >&2
+  recov='bash rd-workflow/scripts/rd task set-title '"$name"' --force (복구 전용)'
+  printf 'archive:   다시 실행: %s → git commit -m "chore(lifecycle): %s 작업 이름 복구" -- rd-workflow-workspace/.lifecycle/task-state CURRENT_TASK.md → archive.sh 재실행\n' "$recov" "$name" >&2
   return 0
 }
 if [[ "$BRANCH_MODE" == "fr" ]]; then
@@ -896,6 +970,93 @@ else
   _tpg_tip="$(_archive_nofr_gate_tip)" || { printf 'archive: HEAD 를 읽을 수 없어 팀 저장소 반영 여부를 판정하지 못했습니다 — 발행하지 않습니다.\n' >&2; exit 1; }
 fi
 archive_team_publish_gate "$_tpg_tip" || exit 1
+
+# 중복 발행 확인 (FR archive-direct-dup-recheck) — 게이트 다음, 병합 전. 판정은 rd publish request 와 같다(_dup_guard.sh dup_scan publish).
+#   다른 곳에서 발행(published)·같은 slug 의 다른 이력(claimed)은 멈추고, 다른 slug 의 같은 FR 착수(claimed-fr)는 경고만, 원격 조사 실패는
+#   경고 뒤 계속한다. 원격 모드가 아니면(--no-remote 포함) 돌지 않는다. 큐 경유 실행은 request 가 이미 확인했으므로 건너뛴다.
+# _archive_via_queue — 이 archive 가 발행 큐(publish_queue.sh _exec)가 띄운 것이면 rc 0.
+#   큐는 archive 로 exec 하기 직전 요청 파일에 state=running 과 archive-pgid(그 프로세스 그룹)를 기록한다. 재실행 자식도 같은 그룹이다.
+#   ps·요청 파일을 읽지 못하면 직접 실행으로 본다(확인을 한 번 더 돌 뿐 발행을 잘못 통과시키지 않는다).
+_archive_via_queue() {
+  local d f pg st apg
+  d="$(tasks_shared_dir 2>/dev/null)" || return 1
+  f="$d/publish-queue/${SLUG}.req"
+  [[ -f "$f" ]] || return 1
+  st="$(awk 'index($0,"state=")==1{sub(/^[^=]*=/,""); print; exit}' "$f" 2>/dev/null)" || return 1
+  apg="$(awk 'index($0,"archive-pgid=")==1{sub(/^[^=]*=/,""); print; exit}' "$f" 2>/dev/null)" || return 1
+  pg="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')" || return 1
+  [[ "$st" == running && -n "$pg" && "$apg" == "$pg" ]]
+}
+# _archive_dup_gate — rc 0 계속 / 1 멈춤(안내는 stderr).
+_archive_dup_gate() {
+  local base stems found rc=0 errf why kind msg pub="" cl="" frl="" audit_dir
+  [[ "$REMOTE_MODE" == "remote" ]] || return 0
+  if _archive_via_queue; then return 0; fi
+  source "$SCRIPT_DIR/_dup_guard.sh"
+  if [[ "$BRANCH_MODE" == "fr" ]]; then base="$FR_BRANCH"; else base="HEAD"; fi
+  base="$(git rev-parse --verify -q "${base}^{commit}" 2>/dev/null)" || base=""
+  if [[ -z "$base" ]]; then
+    printf 'archive: WARNING — 발행 대상 커밋을 읽지 못해 원격 중복 확인을 하지 못했습니다 — 확인 없이 계속합니다.\n' >&2
+    return 0
+  fi
+  stems="$(dup_stems_from_source_fr "$(_dup_task_source_fr "$CURRENT_WT" "$base")" "$CURRENT_WT" "$base")"
+  errf="$(mktemp "${TMPDIR:-/tmp}/rd-archive-dup.XXXXXX")" || {
+    printf 'archive: WARNING — 임시 파일을 만들지 못해 원격 중복 확인을 하지 못했습니다 — 확인 없이 계속합니다.\n' >&2
+    return 0
+  }
+  # 원격 조회는 명령마다 상한이 있고(공통 조회·객체 받기, 같은 FR 의 다른 작업마다 태그 조회·받기) 그동안 공유 락을 쥔다 — 시작을 알린다.
+  printf 'archive: 원격 중복 확인 중 — 같은 FR 의 다른 발행·착수를 origin 에서 찾습니다 (원격 명령마다 최대 %s초, RD_DUP_CHECK_TIMEOUT)\n' "$(dup_timeout)" >&2
+  found="$(dup_scan "$CURRENT_WT" "$SLUG" "$stems" publish "$base" 2>"$errf")" || rc=$?
+  why="$(head -1 "$errf" 2>/dev/null)"
+  rm -f "$errf"
+  if [[ "$rc" -eq 3 ]]; then
+    printf 'archive: WARNING — 원격 중복 확인을 하지 못했습니다(%s) — 확인 없이 계속합니다.\n' "$why" >&2
+    dup_timeout_hint "$why" | sed 's/^/archive:/' >&2
+    return 0
+  fi
+  [[ "$rc" -eq 1 ]] || return 0
+  while IFS=$'\t' read -r kind msg; do
+    [[ -n "$kind" ]] || continue
+    case "$kind" in
+      published) pub="${pub}archive:   - ${msg}
+" ;;
+      claimed) cl="${cl}archive:   - ${msg}
+" ;;
+      claimed-fr) frl="${frl}archive:   - ${msg}
+" ;;
+    esac
+  done <<ARCHIVE_DUP_EOF
+$found
+ARCHIVE_DUP_EOF
+  if [[ -z "$pub$cl" ]]; then
+    printf 'archive: WARNING — 다른 clone 에서 같은 FR 이 진행 중입니다 — 먼저 발행하는 쪽이 이깁니다:\n%s' "$frl" >&2
+    return 0
+  fi
+  if [[ "$ALLOW_DUP" -eq 1 ]]; then
+    if [[ -z "$DUP_REASON" ]]; then
+      printf 'archive: --allow-duplicate-publish 사유 필수\n' >&2
+      return 1
+    fi
+    audit_dir="$(dirname "$AUDIT_LOG")"
+    if ! mkdir -p "$audit_dir" 2>/dev/null \
+      || ! printf '%s | %s | [dup-publish] %s | %s\n' "$(date '+%Y-%m-%d %H:%M')" "$SLUG" "$DUP_REASON" "<세션없음>" >> "$AUDIT_LOG" 2>/dev/null; then
+      printf 'archive: audit log 기록에 실패했습니다 (%s) — 우회 사유를 남길 수 없어 차단합니다.\n' "$AUDIT_LOG" >&2
+      return 1
+    fi
+    printf 'archive: WARNING — 같은 작업의 다른 구현이 있지만 발행합니다 (사유: %s). audit log 기록.\n%s%s' "$DUP_REASON" "$pub" "$cl" >&2
+    return 0
+  fi
+  {
+    printf 'archive: 발행하지 않습니다 — 같은 작업의 다른 구현이 있습니다 (상태 변경 없음):\n%s%s' "$pub" "$cl"
+    if [[ "$BRANCH_MODE" == "fr" ]]; then
+      printf 'archive:   다음 행동: 이 작업을 버릴지 정하십시오. 버리면 기본 체크아웃에서 bash rd-workflow/scripts/lifecycle/promote_rollback.sh --task %q 를 실행합니다.\n' "$SLUG"
+    fi
+    [[ -n "$cl" ]] && printf 'archive:   같은 이름의 원격 브랜치가 다른 이력입니다 — 확인: git ls-remote origin %q\n' "refs/heads/fr/$SLUG"
+    printf 'archive:   두 구현을 모두 발행해야 하면 --allow-duplicate-publish "<사유>" 로 이 검사만 건너뛰십시오 (audit 기록).\n'
+  } >&2
+  return 1
+}
+_archive_dup_gate || exit 1
 
 # Step 2 — archive content 휴리스틱 (warning만)
 # no-fr 모드에는 fr tip 이 없으므로 같은 휴리스틱을 현재 HEAD 의 마지막 커밋에 적용합니다.
@@ -1055,6 +1216,121 @@ _archive_gl_print_notes() {
 # _archive_gl_note <줄> — 재실행 안내 한 줄을 ARCHIVE_GL_RESUME_NOTES 에 더한다.
 _archive_gl_note() { ARCHIVE_GL_RESUME_NOTES="${ARCHIVE_GL_RESUME_NOTES}$1"$'\n'; }
 
+# _archive_gl_fetch <wt> <path> <oid> — <wt>/<path> submodule 저장소에 <oid> 커밋이 없으면, 이 컴퓨터에서 그 커밋을 직접 가진
+#   git dir(rd_gl_src → RD_GL_SRC)에서 로컬 fetch 로 받는다. ref·체크아웃은 바꾸지 않는다(FETCH_HEAD 만 씀).
+#   있는지는 alternates 없이 대상 저장소에서 본다. 상한은 RD_MERGE_FETCH_TIMEOUT(초, 기본 60)이고 _rd_run_limited 가 건다.
+#   rc 0 이미 있거나 받음(받았으면 _ARCHIVE_GL_FETCHED=1) / 1 받지 못함 — 원인 한 줄을 _ARCHIVE_GL_CAUSE 에 둔다.
+#   대상이 submodule 저장소의 최상위인지는 호출부가 본다.
+#   호출 위치: _archive_gl_acquire(gitlink 충돌 자동 해소), archive_submodule_carry(Step 6.5 체크아웃 갱신 전).
+_ARCHIVE_GL_CAUSE=""
+_ARCHIVE_GL_FETCHED=0
+_archive_gl_fetch() {
+  local wt="$1" path="$2" oid="$3" dir lim errf frc=0
+  dir="$wt/$path"
+  _ARCHIVE_GL_CAUSE=""; _ARCHIVE_GL_FETCHED=0
+  env -u GIT_ALTERNATE_OBJECT_DIRECTORIES git -C "$dir" cat-file -e "${oid}^{commit}" 2>/dev/null && return 0
+  if ! rd_gl_src "$wt" "$path" "$oid"; then
+    _ARCHIVE_GL_CAUSE="이 커밋을 직접 가진 저장소를 이 컴퓨터에서 찾지 못했습니다"
+    return 1
+  fi
+  lim="${RD_MERGE_FETCH_TIMEOUT:-60}"
+  [[ "$lim" =~ ^[0-9]+$ && "$lim" -gt 0 ]] || lim=60
+  errf="$(mktemp "${TMPDIR:-/tmp}/rd-gl-acq.XXXXXX")" || errf=/dev/null
+  _rd_run_limited "$lim" "$errf" env -u GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_TERMINAL_PROMPT=0 \
+    git -C "$dir" fetch --quiet --no-recurse-submodules "$RD_GL_SRC" "$oid" >/dev/null || frc=$?
+  if [[ "$frc" -eq 124 ]]; then
+    _ARCHIVE_GL_CAUSE="기본 체크아웃 submodule 로 받는 fetch 가 ${lim}초 안에 끝나지 않아 중단했습니다"
+  elif [[ "$frc" -ne 0 ]]; then
+    _ARCHIVE_GL_CAUSE="$(sed -n 1p "$errf" 2>/dev/null)"
+    [[ -n "$_ARCHIVE_GL_CAUSE" ]] || _ARCHIVE_GL_CAUSE="git fetch 종료 코드 $frc"
+  elif ! env -u GIT_ALTERNATE_OBJECT_DIRECTORIES git -C "$dir" cat-file -e "${oid}^{commit}" 2>/dev/null; then
+    _ARCHIVE_GL_CAUSE="받은 뒤에도 기본 체크아웃 submodule 에 커밋 객체가 없습니다"
+  fi
+  [[ "$errf" == /dev/null ]] || rm -f "$errf"
+  [[ -z "$_ARCHIVE_GL_CAUSE" ]] || return 1
+  _ARCHIVE_GL_FETCHED=1
+  return 0
+}
+
+# _archive_gl_known_remote <기본 worktree> <oid> — 이 저장소의 submodule git dir(공통 git dir 의 modules·worktrees 아래, 작업 worktree 의
+#   submodule 포함) 중 <oid> 커밋을 가진 곳에서 그 커밋이 원격 추적 ref 나 태그로 닿으면 rc 0(팀 원격에 있다고 봄), 아니면 1.
+#   네트워크 조회는 하지 않는다. 그래서 뒤처진 원격 추적 ref·push 하지 않은 태그로 틀릴 수 있고, 그때는 정리 판정이 worktree 를 보존한다.
+_archive_gl_known_remote() {
+  local wt="$1" oid="$2" cdir pool rest o g r
+  declare -F _rd_git_common_dir >/dev/null 2>&1 && declare -F _rd_submodule_object_pool >/dev/null 2>&1 || return 1
+  cdir="$(_rd_git_common_dir "$wt" 2>/dev/null)" || return 1
+  pool="$(_rd_submodule_object_pool "$cdir")" || return 1
+  rest="$pool"
+  while [[ -n "$rest" ]]; do
+    o="${rest%%:*}"
+    if [[ "$rest" == *:* ]]; then rest="${rest#*:}"; else rest=""; fi
+    [[ -n "$o" ]] || continue
+    g="${o%/objects}"
+    env -u GIT_ALTERNATE_OBJECT_DIRECTORIES git --git-dir="$g" cat-file -e "${oid}^{commit}" 2>/dev/null || continue
+    r="$(env -u GIT_ALTERNATE_OBJECT_DIRECTORIES git --git-dir="$g" rev-list -n 1 "$oid" --not --remotes --tags 2>/dev/null)" || continue
+    [[ -n "$r" ]] || return 0
+  done
+  return 1
+}
+
+# archive_submodule_carry <기본 worktree> <발행 커밋> — Step 6.5 체크아웃 갱신 전에, 발행 커밋의 직접 gitlink 마다 기본 worktree 의
+#   submodule 저장소에 그 커밋이 없으면 이 컴퓨터에서 그 커밋을 가진 저장소(작업 worktree 의 submodule 등)에서 로컬 fetch 로 옮긴다
+#   (FR archive-carry-worktree-submodule-commits). 옮기지 않으면 submodule update 가 원격에서 받으려다 `not our ref` 로 실패하고,
+#   worktree 를 지우면 gitlink 가 가리키는 커밋을 잃는다.
+#   팀 원격에 없는 커밋이면 기본 worktree 의 submodule 에 브랜치 rd-archive/<SLUG> 를 만들어 남긴다(사용자 결정 2026-11-25 —
+#   HEAD 만 가리키면 submodule 을 옮긴 뒤 reflog 만료로 잃을 수 있다). 「팀 원격에 없음」 은 기본 쪽 저장소의 브랜치·태그·원격 추적
+#   ref 와, 이 저장소의 다른 submodule git dir 의 원격 추적 ref·태그 어디에서도 닿지 않는다는 뜻이다(네트워크 조회는 하지 않는다).
+#   이름이 이미 있으면 rd-archive/<SLUG>-<커밋 7자> 를 쓴다. 정리 판정(_rd_unpushed_commits)은 이 브랜치로 닿는 커밋을 안전으로 본다.
+#   이 판정은 로컬 ref 만 보므로 틀릴 수 있다(뒤처진 원격 추적 ref, push 하지 않은 태그). 틀려서 브랜치를 만들지 않아도
+#   정리 판정이 기본 쪽 원격 추적 ref 를 근거로 쓰지 않고 원격 tag 를 조회하므로, 원격에 없는 커밋이면 worktree 를 보존한다.
+#   초기화되지 않은 경로는 건드리지 않는다. 실패는 안내 줄(stderr)만 내고 계속한다 — 체크아웃 갱신이 정리 잔여로 남기고, 정리 판정이
+#   worktree 를 보존한다. 중첩 submodule 의 커밋은 옮기지 않는다(그 경우도 정리 판정이 worktree 를 보존한다).
+archive_submodule_carry() {
+  local wt="$1" oid="$2" raw rec path gl dir qd r b cur br
+  raw="$(mktemp "${TMPDIR:-/tmp}/rd-archive-carry.XXXXXX")" || return 0
+  git -C "$wt" ls-tree -r -z "$oid" > "$raw" 2>/dev/null || { rm -f "$raw"; return 0; }
+  while IFS= read -r -d '' rec; do
+    [[ "$rec" == "160000 commit "* && "$rec" == *$'\t'* ]] || continue
+    path="${rec#*$'\t'}"; gl="${rec%%$'\t'*}"; gl="${gl##* }"
+    dir="$wt/$path"
+    _rd_is_repo_root "$dir" || continue
+    qd="$(printf '%q' "$dir")"
+    if ! _archive_gl_fetch "$wt" "$path" "$gl" </dev/null; then
+      printf 'archive: submodule %s 의 작업 커밋 %s 를 기본 체크아웃 submodule 로 옮기지 못했습니다 — %s\n' "$path" "${gl:0:7}" "$_ARCHIVE_GL_CAUSE" >&2
+      continue
+    fi
+    if [[ "$_ARCHIVE_GL_FETCHED" == 1 ]]; then
+      printf 'archive: submodule %s 의 작업 커밋 %s 를 %s 에서 기본 체크아웃 submodule 로 옮겼습니다\n' "$path" "${gl:0:7}" "$RD_GL_SRC"
+    fi
+    # 이미 브랜치·태그·원격 추적 ref 로 닿거나, 이 저장소의 다른 submodule git dir(작업 worktree 쪽 등)의 원격 추적 ref·태그로
+    #   닿으면(팀 원격에 있음) 브랜치를 만들지 않는다. 이번 발행에서 커밋을 옮겼는지와 무관하게 같은 판정을 한다 — 기본 쪽에
+    #   커밋을 미리 받아 둔 경우에도 작업 쪽에서 릴리스 태그로만 push 한 커밋을 알아본다.
+    #   판정 명령이 실패하면 닿지 않는 쪽(브랜치를 만듦)으로 본다.
+    r="$(git -C "$dir" rev-list -n 1 "$gl" --not --branches --tags --remotes 2>/dev/null)" || r=fail
+    [[ -n "$r" ]] || continue
+    ! _archive_gl_known_remote "$wt" "$gl" || continue
+    br=""
+    for b in "rd-archive/${SLUG:-archive}" "rd-archive/${SLUG:-archive}-${gl:0:7}"; do
+      cur="$(git -C "$dir" rev-parse -q --verify "refs/heads/$b" 2>/dev/null)" || cur=""
+      [[ -z "$cur" ]] || continue
+      if git -C "$dir" update-ref "refs/heads/$b" "$gl" "" 2>/dev/null; then br="$b"; break; fi
+    done
+    if [[ -z "$br" ]]; then
+      printf 'archive: submodule %s 의 커밋 %s 가 팀 원격에 없는데 브랜치로 남기지 못했습니다(rd-archive/%s 이름을 쓸 수 없음). 정리 판정이 작업 worktree 를 보존합니다. 남기려면: git -C %s branch <이름> %s\n' \
+        "$path" "${gl:0:7}" "${SLUG:-archive}" "$qd" "$gl" >&2
+      continue
+    fi
+    printf 'archive: submodule %s 의 커밋 %s 가 팀 원격에 없어 기본 체크아웃 submodule 에 브랜치 %s 로 남겼습니다\n' "$path" "${gl:0:7}" "$br"
+    if git -C "$dir" remote get-url origin >/dev/null 2>&1; then
+      printf 'archive:   팀 저장소에 올리려면: git -C %s push --no-follow-tags origin %s\n' "$qd" "$(printf '%q' "$br")"
+    else
+      printf 'archive:   팀 저장소에 올리려면 팀 원격을 추가한 뒤: git -C %s push --no-follow-tags <원격 이름> %s\n' "$qd" "$(printf '%q' "$br")"
+    fi
+  done < "$raw"
+  rm -f "$raw"
+  return 0
+}
+
 # _archive_gl_acquire <path> <자손 OID> — 기본 체크아웃 submodule 에 자손 커밋 객체를 확보하고 재실행 안내를 모은다 (spec D1-4 (1)(2)).
 #   해소 뒤 발행이 Step 6 등에서 멈추면 상위 git status 가 ` M <path>` 를 보여 재실행이 Step 0 clean 검사에 막힌다.
 #   그래서 사용자가 체크아웃을 자손 커밋으로 옮길 수 있게 객체를 받아 두고, 그 명령을 안내한다.
@@ -1064,32 +1340,13 @@ _archive_gl_note() { ARCHIVE_GL_RESUME_NOTES="${ARCHIVE_GL_RESUME_NOTES}$1"$'\n'
 #   확보에 실패하면 원인 한 줄(stderr)과, 안내 줄 대신 복구 절차((가) push (나) fetch origin <ref> (다) checkout)를 모은다.
 #   모든 명령의 경로·URL·ref 인자는 printf %q 로 써서 출력 그대로 실행된다.
 _archive_gl_acquire() {
-  local path="$1" oid="$2" wt="${CURRENT_WT:-$PWD}" dir abs top lim errf frc=0 cause="" kind="" url br qd qo
+  local path="$1" oid="$2" wt="${CURRENT_WT:-$PWD}" dir abs top cause="" kind="" url br qd qo
   dir="$wt/$path"
   abs="$(cd "$dir" 2>/dev/null && pwd -P)" || abs=""
   top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || top=""
   [[ -n "$abs" && -n "$top" && "$top" == "$abs" ]] || return 0
   qd="$(printf '%q' "$dir")"; qo="$(printf '%q' "$oid")"
-  if ! env -u GIT_ALTERNATE_OBJECT_DIRECTORIES git -C "$dir" cat-file -e "${oid}^{commit}" 2>/dev/null; then
-    if rd_gl_src "$wt" "$path" "$oid"; then
-      lim="${RD_MERGE_FETCH_TIMEOUT:-60}"
-      [[ "$lim" =~ ^[0-9]+$ && "$lim" -gt 0 ]] || lim=60
-      errf="$(mktemp "${TMPDIR:-/tmp}/rd-gl-acq.XXXXXX")" || errf=/dev/null
-      rd_run_limited "$lim" "$errf" env -u GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_TERMINAL_PROMPT=0 \
-        git -C "$dir" fetch --quiet --no-recurse-submodules "$RD_GL_SRC" "$oid" >/dev/null || frc=$?
-      if [[ "$frc" -eq 124 ]]; then
-        cause="기본 체크아웃 submodule 로 받는 fetch 가 ${lim}초 안에 끝나지 않아 중단했습니다"
-      elif [[ "$frc" -ne 0 ]]; then
-        cause="$(sed -n 1p "$errf" 2>/dev/null)"
-        [[ -n "$cause" ]] || cause="git fetch 종료 코드 $frc"
-      elif ! env -u GIT_ALTERNATE_OBJECT_DIRECTORIES git -C "$dir" cat-file -e "${oid}^{commit}" 2>/dev/null; then
-        cause="받은 뒤에도 기본 체크아웃 submodule 에 커밋 객체가 없습니다"
-      fi
-      [[ "$errf" == /dev/null ]] || rm -f "$errf"
-    else
-      cause="이 커밋을 직접 가진 저장소를 이 컴퓨터에서 찾지 못했습니다"
-    fi
-  fi
+  _archive_gl_fetch "$wt" "$path" "$oid" || cause="$_ARCHIVE_GL_CAUSE"
   if [[ -z "$cause" ]]; then
     _archive_gl_note "archive:   발행이 중간에 멈춰 다시 실행해야 하면: git -C ${qd} status 로 바꾼 내용이 없는지 확인한 뒤 git -C ${qd} checkout --detach ${qo}"
     return 0
@@ -1107,7 +1364,7 @@ _archive_gl_acquire() {
   else
     if [[ -n "$RD_GL_SRC" ]]; then
       # -C 로 submodule 디렉터리에서 실행합니다 — origin 이 상대 URL(../team.git)이면 (나)의 fetch 와 같은 기준으로 풀립니다.
-      _archive_gl_note "archive:     (가) git -C ${qd} $(printf '%q' "--git-dir=$RD_GL_SRC") push $(printf '%q' "$url") $(printf '%q' "${oid}:refs/heads/${br}")"
+      _archive_gl_note "archive:     (가) git -C ${qd} $(printf '%q' "--git-dir=$RD_GL_SRC") push --no-follow-tags $(printf '%q' "$url") $(printf '%q' "${oid}:refs/heads/${br}")"
     else
       _archive_gl_note "archive:     (가) 이 커밋을 가진 저장소에서 ${url} 의 ${br} 로 push 하십시오"
     fi
@@ -1445,6 +1702,11 @@ archive_close_issues() {
         # 호스트 없는 선점 행은 어느 호스트인지 확정할 수 없어 지우지 않았다 — 남은 사실과 원격을 건드리지 않는 정리 명령을 보인다.
         "kept-row "*) kr="${line#kept-row }"
           printf 'archive: 장부에 호스트 없는 선점 행 %s#%s 이 남았습니다 — 같은 Issue 면 bash rd-workflow/scripts/issue_queue.sh forget %s 로 장부 행만 지우십시오\n' "${kr% *}" "${kr##* }" "$kr" ;;
+        # html_url 키의 행이 다른 FR 의 선점이라 남겼다 — 결함이 아니라 그 FR 의 선점이므로 사실만 알린다(정리 명령 없음).
+        "kept-other-fr "*) read -r ko_key ko_num ko_fr <<EOF_KO
+${line#kept-other-fr }
+EOF_KO
+          printf 'archive: 다른 FR(%s)에 연결된 선점 행 %s#%s 은 남겼습니다 — 그 FR 의 선점입니다\n' "$ko_fr" "$ko_key" "$ko_num" ;;
         # 원격 처리는 끝났고 장부 정리만 실패했다 — 경고 뒤에 Issue 마다 복사해 실행할 forget 줄을 낸다.
         "ledger-left "*) left="${left}${line#ledger-left }"$'\n' ;;
       esac
@@ -1539,13 +1801,14 @@ else
       _archive_gl_print_notes
     elif [[ -n "$_conf" ]] && [[ -z "$(printf '%s\n' "$_conf" | grep -vxF -e "$_SM" -e "$_IDX" -e "$_CT" -e "$_VE" -e "$_TS")" ]]; then
       # 다섯 경로 안의 충돌은 경로마다 rd_merge_resolve_record(_merge_precheck.sh)로 푼다 (change spec 2026-11-19-1430 D2).
-      #   규칙: stage_metrics.tsv = 줄 합집합 (change spec 2026-10-29-1800) / CURRENT_TASK.md = main 쪽(stage 2) —
+      #   규칙: stage_metrics.tsv = 줄 합집합 (change spec 2026-10-29-1800, 공통 조상에 파일이 없는 add/add 는 헤더 한 번 + 행 합집합 —
+      #   FR stage-metrics-add-add-auto-resolve) / CURRENT_TASK.md = main 쪽(stage 2) —
       #   발행이 이 파일을 어차피 기준 상태로 되돌리므로 fr 쪽 내용은 버려도 잃는 것이 없다 (2026-10-30-1245 D1) /
       #   FUTURE_REQUESTS.md = 행 집합 병합 (spec D7) / verify-evidence·task-state = 발행 줄기 쪽(stage 3).
       #   작업 트리·인덱스는 임시 파일에서 병합·검증을 모두 마친 뒤에만 바꾼다 — 하나라도 실패하면 충돌 상태를 그대로 두고
       #   종전처럼 멈춘다. 그 밖의 파일이 섞인 충돌은 이 분기에 오지 않는다.
       _only_idx=0; [[ "$_conf" == "$_IDX" ]] && _only_idx=1
-      _rb=""; _ro=""; _rt=""; _rp=(); _rf=()
+      _rb=""; _ro=""; _rt=""; _rp=(); _rf=(); _sm_addadd=0
       _sm_stop() {  # _sm_stop [사유] — 임시 파일을 지우고 충돌 상태를 둔 채 중단한다
         rm -f "$_rb" "$_ro" "$_rt" ${_rf[@]+"${_rf[@]}"}
         if (( _only_idx )); then
@@ -1584,6 +1847,7 @@ else
         _sm_stage 3 "$_p" "$_rt"; _a3="$_stage_arg"
         RD_MERGE_RESOLVE_QUIET=1 rd_merge_resolve_record "$_p" "$_a1" "$_a2" "$_a3" "$_res" \
           || _sm_stop "$RD_MERGE_RESOLVE_WHY"
+        [[ "$_p" != "$_SM" ]] || _sm_addadd="$RD_MERGE_RESOLVE_SM_ADDADD"
       done
       # 결과 반영 순서는 종전과 같다: stage_metrics.tsv → CURRENT_TASK.md → verify-evidence → task-state → 인덱스.
       for _p in "$_SM" "$_CT" "$_VE" "$_TS" "$_IDX"; do
@@ -1609,7 +1873,12 @@ else
       for _p in "$_SM" "$_CT" "$_IDX" "$_VE" "$_TS"; do
         printf '%s\n' "$_conf" | grep -qxF -e "$_p" || continue
         case "$_p" in
-          "$_SM") printf 'archive: stage_metrics.tsv 충돌을 줄 합집합으로 해결했습니다 (git merge-file --union)\n' ;;
+          "$_SM")
+            if [[ "$_sm_addadd" == 1 ]]; then
+              printf 'archive: stage_metrics.tsv 충돌을 줄 합집합으로 해결했습니다 (공통 조상에 파일 없음 — 헤더 한 번, 기본 브랜치 행 뒤에 줄기의 새 행)\n'
+            else
+              printf 'archive: stage_metrics.tsv 충돌을 줄 합집합으로 해결했습니다 (git merge-file --union)\n'
+            fi ;;
           "$_CT") printf 'archive: CURRENT_TASK.md 충돌을 main 쪽으로 해결했습니다 (발행이 이 파일을 기준 상태로 되돌립니다)\n' ;;
           "$_IDX") printf 'archive: FUTURE_REQUESTS.md 충돌을 행 집합 병합으로 해결했습니다 (merge_fr_index.sh)\n' ;;
           "$_VE") printf 'archive: verify-evidence 충돌을 발행 줄기 쪽으로 해결했습니다 (seal 에 쓴 증거를 남깁니다)\n' ;;
@@ -1998,6 +2267,11 @@ _ais_rc=0; archive_issue_source_frs "$PUBLISH_OID" || _ais_rc=$?
 # **검증된 OID 를 명시적으로 push 한다.** `git push origin <branch>` 는 실행 시점의
 # 로컬 tip 을 해석하므로, 검사 이후 전진한 미검증 커밋이 함께 나간다.
 # `${PUBLISH_OID}` 의 중괄호는 refspec 문자열에서 변수 경계를 명확히 하기 위한 것이다.
+#
+# 이 Step 과 Step 9 의 push 는 모두 `--no-follow-tags` 를 쓴다. 사용자 설정 push.followTags=true 는
+# 기본 브랜치 push·태그 push·원격 fr 브랜치 삭제 push 어디서든 원격에 없는 로컬 annotated 태그를
+# 함께 올린다(실측). 그러면 발행 태그가 기본 브랜치 push 와 함께 먼저 나가고, 이번 발행과 무관한
+# 로컬 태그까지 원격에 올라간다. 각 push 는 지정한 ref 하나만 바꾼다.
 if [[ "$REMOTE_MODE" == "remote" ]]; then
   DEFAULT_BRANCH="$(get_default_branch)" || { printf 'archive: 기본 브랜치 결정 실패 — push 중단\n' >&2; exit 1; }
 
@@ -2005,7 +2279,7 @@ if [[ "$REMOTE_MODE" == "remote" ]]; then
   # 경우 재실행이 같은 실패를 반복하고, 사용자를 force push 라는 잘못된 처방으로 민다
   # (FR publish-clone-failure-init-fallback 이 같은 유형을 기록했다).
   _push_out=""
-  if ! _push_out="$(git push origin "${PUBLISH_OID}:refs/heads/${DEFAULT_BRANCH}" 2>&1)"; then
+  if ! _push_out="$(git push --no-follow-tags origin "${PUBLISH_OID}:refs/heads/${DEFAULT_BRANCH}" 2>&1)"; then
     printf 'archive: %s push 실패\n' "$DEFAULT_BRANCH" >&2
     printf '%s\n' "$_push_out" | sed 's/^/archive:   git: /' >&2
     case "$_push_out" in
@@ -2029,7 +2303,7 @@ if [[ "$REMOTE_MODE" == "remote" ]]; then
   # 로컬 tag 를 다시 해석해 그 사이 force-move 된 미검증 커밋이 원격 tag 로 나간다
   # (위 TAG_OID 주석 참조). `${TAG_OID}` 의 중괄호는 refspec 문자열에서 변수 경계를
   # 명확히 하기 위한 것이다.
-  git push origin "${TAG_OID}:refs/tags/${TARGET_TAG}" \
+  git push --no-follow-tags origin "${TAG_OID}:refs/tags/${TARGET_TAG}" \
     || { printf 'archive: tag push 실패 — 재실행으로 복구\n' >&2; exit 1; }
 
   # tag push **직후** 로컬 tag ref 를 다시 읽어 캡처한 OID 와 비교한다.
@@ -2187,6 +2461,8 @@ fi
 # 「modified: <경로> (new commits)」 를 보이고 `git add -A` 가 발행을 되돌립니다. no-fr 은 건너뜁니다.
 # 갱신하지 않았거나 실패한 항목은 정리 잔여 `submodule` 로 기록하고 계속합니다(종료 코드에 영향 없음).
 if [[ "$BRANCH_MODE" == "fr" ]]; then
+  # 체크아웃 갱신 전에 작업 worktree 의 submodule 에만 있는 커밋을 기본 worktree 의 submodule 로 옮긴다(FR archive-carry-worktree-submodule-commits).
+  archive_submodule_carry "$PUBLISH_WT" "$PUBLISH_OID"
   _ss_file="$(mktemp "${TMPDIR:-/tmp}/rd-archive-sync.XXXXXX")" || _ss_file=""
   _ss_rc=1
   [[ -z "$_ss_file" ]] || { rd_submodule_checkout_sync "$PUBLISH_WT" "$PUBLISH_OID" > "$_ss_file" 2>/dev/null && _ss_rc=0 || _ss_rc=$?; }
@@ -2457,8 +2733,9 @@ if [[ "$BRANCH_MODE" == "fr" && "$REMOTE_MODE" == "remote" ]]; then
           "git log --oneline $REMOTE_OID --not $MERGE_BASE_COMMIT"
       else
         # 고정한 원격 tip 을 lease 로 지정 — 검증~push 사이 원격 이동을 막는다.
+        # 삭제 push 도 push.followTags 가 로컬 태그를 함께 올리므로 --no-follow-tags 를 쓴다(Step 6 주석).
         REMOTE_PUSH_OUT=""; REMOTE_PUSH_RC=0
-        REMOTE_PUSH_OUT="$(git push --force-with-lease="refs/heads/$FR_BRANCH:$REMOTE_OID" \
+        REMOTE_PUSH_OUT="$(git push --no-follow-tags --force-with-lease="refs/heads/$FR_BRANCH:$REMOTE_OID" \
           origin ":refs/heads/$FR_BRANCH" 2>&1)" || REMOTE_PUSH_RC=$?
         printf '%s\n' "$REMOTE_PUSH_OUT" | sed 's/^/archive: remote-branch-delete: /'
         if [[ "$REMOTE_PUSH_RC" -eq 0 ]]; then
@@ -2467,7 +2744,7 @@ if [[ "$BRANCH_MODE" == "fr" && "$REMOTE_MODE" == "remote" ]]; then
           # 이 시점에 로컬 ref 는 이미 삭제되었을 수 있으나 복구하지 않는다.
           # 로컬 삭제는 ancestor 검증을 통과했으므로 그 ref 의 모든 커밋이 base 에 포함되어 커밋 손실이 없다.
           safety_violation "remote-branch" "$FR_BRANCH" \
-            "lease 거부 또는 push 실패 (rc=$REMOTE_PUSH_RC) — 원격 tip 이동 의심. 아래로 현재 원격 tip 을 확인한 뒤 필요하면 git push origin --delete 로 삭제하십시오" \
+            "lease 거부 또는 push 실패 (rc=$REMOTE_PUSH_RC) — 원격 tip 이동 의심. 아래로 현재 원격 tip 을 확인하십시오. 병합을 확인한 tip $REMOTE_OID 그대로이면 git push --no-follow-tags --force-with-lease=refs/heads/$FRQ:$REMOTE_OID origin :refs/heads/$FRQ 로 삭제하고, 다르면 새 커밋이 $MERGE_BASE_COMMIT 에 들어갔는지 확인하기 전에는 지우지 마십시오" \
             "git ls-remote origin refs/heads/$FRQ"
         fi
       fi
@@ -2506,6 +2783,59 @@ else
   fi
 fi
 
+# ---- 반영 방식 manual 인 submodule 의 gitlink 안내 (FR archive-gitlink-team-default-branch) ----
+# manual 방식은 팀 반영(PR·머지)을 사용자가 하므로 발행 gitlink 가 작업 커밋에 남는다. 그 커밋이 팀 기본 브랜치에 없으면
+# 기본 체크아웃과 다음 promote 의 worktree 가 팀 기본 브랜치와 다른 코드를 본다. 발행은 이미 끝났으므로 막지 않고 한 번 안내한다.
+# 발행 커밋의 manual gitlink 전부를 본다(이전 발행이 남긴 포인터도 기본 체크아웃을 낡게 한다). 기본 브랜치 이력 안에서 뒤처진
+# 포인터는 안내하지 않는다(다음 promote 가 알린다). 원격 조회에 실패한 경로는 원인과 함께 한 줄로 알리고 건너뛴다.
+# 팀 원격 비교는 작업 락을 푼 뒤, 완료 줄을 낸 뒤에 한다 — 정리 잔여 기록과 요약까지 끝났고 남은 일은 종료뿐이다.
+# 느린 원격이 다른 작업을 막지 않게 한다.
+# 안내 묶음의 첫 줄(「archive: 안내 — 반영 방식 manual」)과 끝 줄(「archive:   반영 방식 설정:」)은 _autopilot_publish.sh 가
+# 무인 발행 결과로 옮겨 적는 범위의 표식이다. 바꾸면 그쪽도 함께 바꾼다.
+archive_manual_gitlink_notice() {
+  local wt="$1" oid="$2" raw rec path gl mode base rc st br tip cnt dir qd list="" cmds="" paths="" keys="" k
+  raw="$(mktemp "${TMPDIR:-/tmp}/rd-archive-lag.XXXXXX")" || return 0
+  git -C "$wt" ls-tree -r -z "$oid" > "$raw" 2>/dev/null || { rm -f "$raw"; return 0; }
+  while IFS= read -r -d '' rec; do
+    [[ "$rec" == "160000 commit "* && "$rec" == *$'\t'* ]] || continue
+    path="${rec#*$'\t'}"; gl="${rec%%$'\t'*}"; gl="${gl##* }"
+    rc=0; mode="$(tp_config "$wt" "$path" mode 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 && "$mode" == manual ]] || continue
+    rc=0; base="$(tp_config "$wt" "$path" base 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || base=""
+    dir="$wt/$path"
+    _rd_is_repo_root "$dir" || continue
+    printf 'archive: submodule %s 의 발행 gitlink 를 팀 기본 브랜치와 비교합니다 (git ls-remote, 최대 %s초)\n' "$path" "${RD_TP_LAG_TIMEOUT:-20}" >&2
+    # 명령 치환 없이 부른다 — 하위 셸이면 실패 원인(_TP_LAG_CAUSE)이 돌아오지 않는다.
+    rc=0; tp_manual_lag "$dir" "$gl" "$base" >/dev/null || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      printf 'archive: submodule %s 를 팀 기본 브랜치와 비교하지 못해 안내를 건너뜁니다 — %s\n' "$path" "$_TP_LAG_CAUSE" >&2
+      continue
+    fi
+    IFS=$'\t' read -r st br tip cnt <<<"$_TP_LAG_RESULT"
+    [[ "$st" == outside ]] || continue
+    qd="$(printf '%q' "$dir")"
+    list="${list}archive:   - ${path}: ${gl:0:7} 가 origin/${br} 에 없습니다"$'\n'
+    # --no-overwrite-ignore: 팀 브랜치가 추적하기 시작한 경로에 무시된 로컬 파일이 있으면 덮어쓰지 않고 멈춘다.
+    # FETCH_HEAD 로 옮긴다 — 단일 브랜치 복제는 fetch origin <브랜치> 뒤에도 origin/<브랜치> 가 생기지 않는다.
+    cmds="${cmds}archive:     git -C ${qd} fetch origin $(printf '%q' "refs/heads/$br") && git -C ${qd} checkout --no-overwrite-ignore --detach FETCH_HEAD"$'\n'
+    paths="${paths} $(printf '%q' "$path")"
+    k="$(tp_config_key "$wt" "$path" mode)"
+    case " ${keys} " in *" ${k} "*) ;; *) keys="${keys:+$keys }${k}" ;; esac
+  done < "$raw"
+  rm -f "$raw"
+  [[ -n "$list" ]] || return 0
+  printf 'archive: 안내 — 반영 방식 manual 인 submodule 의 발행 gitlink 가 팀 기본 브랜치에 없는 커밋입니다. 기본 체크아웃과 다음 작업이 팀 기본 브랜치와 다른 코드를 봅니다.\n'
+  printf '%s' "$list"
+  printf 'archive:   팀 PR 이 머지되면 gitlink 를 기본 브랜치 머지 결과로 옮기십시오(기본 체크아웃에서, 경로마다):\n'
+  printf '%s' "$cmds"
+  # 경로를 준 commit 은 그 경로만 커밋한다 — 기본 체크아웃에 스테이징해 둔 다른 변경이 섞이지 않는다.
+  # --literal-pathspecs: 경로의 [ ] * ? 를 패턴으로 읽어 다른 submodule 까지 커밋하지 않게 한다.
+  printf 'archive:     그다음 git --literal-pathspecs -C %s commit -m "chore: submodule 포인터를 팀 기본 브랜치 머지 결과로 옮김" --%s\n' "$(printf '%q' "$wt")" "$paths"
+  printf 'archive:   반영 방식 설정: rd-workflow/config/workflow.json 의 %s 를 pr 로 바꾸면 rd pr open 이 PR 을 올리고 rd pr check --apply 가 머지 뒤 gitlink 를 머지 커밋으로 옮깁니다.\n' "$keys"
+  return 0
+}
+
 # ---- 정리 잔여 요약 (stdout) ----
 # 종료 코드 0 의 의미가 "완전 정리 완료" 에서 "core 성공(잔여 가능)" 으로 넓어지므로,
 # 잔여가 조용히 지나가지 않도록 종료 직전에 사유와 복구 명령을 함께 출력한다.
@@ -2524,6 +2854,15 @@ EOF
 else
   printf 'archive: 완료. tag=%s\n' "$TARGET_TAG"
 fi
+
+# 완료 줄 뒤에 비교한다. 무인 발행(_autopilot_publish.sh)은 시간 상한에 걸린 실행을 완료 줄만으로 성공으로 보지 않는다.
+# 완료 줄 뒤에 비교 시작 줄(「의 발행 gitlink 를 팀 기본 브랜치와 비교합니다」)이 있으면 남은 일이 이 안내뿐이었다고 보고
+# 발행 성공으로 기록한다. 순서나 그 문구를 바꾸면 그쪽도 함께 바꾼다.
+if [[ "${ARCHIVE_LOCK_HELD:-0}" -eq 1 ]]; then
+  tasks_lock_release || true
+  ARCHIVE_LOCK_HELD=0
+fi
+archive_manual_gitlink_notice "$PUBLISH_WT" "$PUBLISH_OID"
 
 if [[ "$SAFETY_VIOLATION" -eq 1 ]]; then
   # 보존 범위를 정확히 표현한다 — 이미 검증을 통과해 삭제된 ref 는 복구하지 않는다(AC10).

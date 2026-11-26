@@ -3,16 +3,28 @@
 #   공통 계약은 "worktree 생성 + 기동 명령 제시" 이고, herdr 에서만 실제 기동까지 한다.
 #   자식 세션이 또 세션을 띄우지 않도록 RD_CHILD_SESSION 으로 깊이를 1 로 제한한다.
 
-session_launch_command() {  # <worktree-path> <slug> [<model>]
-  local model="${3-}"
+# 모델·effort 선택은 model_select.sh 의 ms_resolve_session 이 칸을 읽는다(spec 2026-11-22-1010 D3·D4).
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/model_select.sh"
+
+# 기동 인자 배열 _SL_ARGS 를 채운다: 모델이 있으면 --model, effort 가 있으면 --effort (순서 고정).
+# 호출자는 늘 ${_SL_ARGS[@]+"${_SL_ARGS[@]}"} 로 펼친다 — bash 3.2 set -u 에서 빈 배열 방어(review F8).
+_session_launch_build_args() {  # <model> <effort>
+  _SL_ARGS=()
+  if [[ -n "${1-}" ]]; then _SL_ARGS+=(--model "$1"); fi
+  if [[ -n "${2-}" ]]; then _SL_ARGS+=(--effort "$2"); fi
+  return 0
+}
+
+session_launch_command() {  # <worktree-path> <slug> [<model> [<effort>]]
+  local model="${3-}" effort="${4-}" _a
   if [[ $# -lt 3 ]]; then
-    IFS=$'\t' read -r _ model < <(session_launch_model "$1")
+    session_launch_selection
+    model="$SL_MODEL"; effort="$SL_EFFORT"
   fi
-  if [[ -n "$model" ]]; then
-    printf 'cd %q && claude --model %q\n' "$1" "$model"
-  else
-    printf 'cd %q && claude\n' "$1"
-  fi
+  _session_launch_build_args "$model" "$effort"
+  printf 'cd %q && claude' "$1"
+  for _a in ${_SL_ARGS[@]+"${_SL_ARGS[@]}"}; do printf ' %q' "$_a"; done
+  printf '\n'
 }
 
 session_launch_status_hint() {  # <launch> [<slug>]
@@ -42,22 +54,51 @@ task_launch_label() {  # <launch-raw>
 }
 
 
-# 세션을 기동·조회할 백엔드를 정합니다 (stdout: herdr | hc | none).
+# 세션을 기동·조회할 백엔드를 정합니다 (stdout: herdr | hc | orca | none).
 #   터미널 herdr 가 먼저입니다 — `HERDR_ENV` 와 `HC_TERMINAL_ID` 가 함께 있으면 herdr app 터미널
 #   안에서 터미널 herdr 를 띄운 경우이고, 사용자가 보는 화면은 안쪽 herdr 이기 때문입니다.
 #   환경 변수만으로 정하지 않고 명령 존재도 함께 봅니다(없는 명령을 권하지 않기 위함, F1).
+#   herdr 와 Orca 변수가 함께 있으면 변수만으로 가리지 않고 조상 프로세스를 봅니다. Orca 데몬을
+#   herdr pane 에서 띄우면 `HERDR_*` 가 모든 Orca 터미널에 새어(2026-11-24 실측: terminal-host 의
+#   env 에 HERDR_ENV=1·HERDR_PANE_ID 가 있음) herdr 밖인데도 herdr 로 판정됩니다. 그러면 세션이
+#   사용자가 보지 않는 herdr 에 뜹니다. 조상으로 가릴 수 없으면 아래 변수 순서를 따릅니다.
 session_launch_backend() {
+  if session_backend_usable herdr && session_backend_usable orca \
+     && [[ "$(_session_launch_host_by_ancestry)" == orca ]]; then
+    printf 'orca\n'; return 0
+  fi
   if session_backend_usable herdr; then printf 'herdr\n'
   elif session_backend_usable hc; then printf 'hc\n'
+  elif session_backend_usable orca; then printf 'orca\n'
   else printf 'none\n'
   fi
 }
 
-# 그 백엔드를 이 셸에서 실제로 호출할 수 있는지 (rc 0/1). herdr·hc 외의 값은 쓸 수 없음입니다.
+# 이 셸을 실제로 감싸는 멀티플렉서를 조상 프로세스에서 찾습니다 (stdout: herdr | orca | 빈 값).
+#   부모를 따라 올라가 먼저 만나는 쪽이 안쪽입니다. herdr pane 의 셸은 `herdr server` 의 자식이고,
+#   Orca 터미널의 셸은 `…/orca/daemon-host/…/terminal-host…` 의 자식입니다(2026-11-24 실측).
+#   채팅 에이전트는 `Orca.app/Contents/MacOS/orca-provider-exec` 의 자식입니다(M8).
+#   ps 가 실패하거나 둘 다 없으면 빈 값입니다. 깊이 상한 40 은 무한 루프 방어입니다.
+_session_launch_host_by_ancestry() {
+  local p=$$ i cmd
+  for ((i = 0; i < 40; i++)); do
+    cmd="$(ps -o command= -p "$p" 2>/dev/null)" || return 0
+    case "$cmd" in
+      *"herdr server"*) printf 'herdr\n'; return 0 ;;
+      *"/orca/daemon-host/"*|*"Orca.app/Contents/"*) printf 'orca\n'; return 0 ;;
+    esac
+    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+    [[ "$p" =~ ^[0-9]+$ ]] && (( p > 1 )) || return 0
+  done
+  return 0
+}
+
+# 그 백엔드를 이 셸에서 실제로 호출할 수 있는지 (rc 0/1). herdr·hc·orca 외의 값은 쓸 수 없음입니다.
 session_backend_usable() {  # <backend>
   case "${1-}" in
     herdr) [[ -n "${HERDR_ENV:-}" ]] && command -v herdr >/dev/null 2>&1 ;;
     hc)    [[ -n "${HC_TERMINAL_ID:-}" ]] && command -v hc >/dev/null 2>&1 ;;
+    orca)  [[ -n "${ORCA_AGENT_SESSION_ID:-}${ORCA_TERMINAL_HANDLE:-}" ]] && command -v orca >/dev/null 2>&1 ;;
     *)     return 1 ;;
   esac
 }
@@ -330,6 +371,10 @@ session_handoff_deliver() {  # <slug> <worktree-path> <request-path> [<backend>]
     _session_handoff_deliver_hc "$slug"
     return $?
   fi
+  if [[ "$backend" == orca ]]; then
+    _session_handoff_deliver_orca "$slug" "$wt"
+    return $?
+  fi
   local agent_name handoff outfile errfile rc psecs
   agent_name="$(_session_launch_agent_name "$slug")"
   local hfile=""
@@ -412,12 +457,13 @@ session_handoff_request_path() {  # <worktree-path>
   printf '%s/REQUEST.md\n' "$1"
 }
 
-session_launch() {  # <worktree-path> <slug> <request-path> [<model>] [<backend>] → stdout: launch 상태
+session_launch() {  # <worktree-path> <slug> <request-path> [<model>] [<backend>] [<effort>] → stdout: launch 상태
   local wt="$1" slug="$2" req="$3"
   local timeout="${RD_LAUNCH_TIMEOUT:-5}"
-  local model="${4-}"
+  local model="${4-}" effort="${6-}"
   if [[ $# -lt 4 ]]; then
-    IFS=$'\t' read -r _ model < <(session_launch_model "$wt")
+    session_launch_selection
+    model="$SL_MODEL"; effort="$SL_EFFORT"
   fi
 
   # 테스트 seam — 예약(launch-token)·완료-기록 로직을 실제 herdr 없이 태우기 위함이다.
@@ -451,9 +497,9 @@ session_launch() {  # <worktree-path> <slug> <request-path> [<model>] [<backend>
     return 0
   fi
 
-  if [[ -n "${RD_CHILD_SESSION:-}" ]]; then
+  if [[ -n "${RD_CHILD_SESSION:-}" || -n "${RD_CHILD_DETECTED:-}" ]]; then
     printf '세션 기동을 건너뜁니다 — 이미 자식 세션입니다(깊이 1 제한).\n' >&2
-    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model")" >&2
+    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model" "$effort")" >&2
     printf 'none\n'; return 0
   fi
   # 5번째 인자가 있으면 판정을 다시 하지 않고 그 백엔드를 씁니다(spec D2) — promote 가 색인에
@@ -462,11 +508,15 @@ session_launch() {  # <worktree-path> <slug> <request-path> [<model>] [<backend>
   [[ -n "$backend" ]] || backend="$(session_launch_backend)"
   if ! session_backend_usable "$backend"; then
     printf '자동 기동을 하지 않았습니다. 아래 명령으로 시작하십시오.\n' >&2
-    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model")" >&2
+    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model" "$effort")" >&2
     printf 'none\n'; return 0
   fi
   if [[ "$backend" == hc ]]; then
-    _session_launch_hc "$wt" "$slug" "$req" "$model"
+    _session_launch_hc "$wt" "$slug" "$req" "$model" "$effort"
+    return 0
+  fi
+  if [[ "$backend" == orca ]]; then
+    _session_launch_orca "$wt" "$slug" "$req" "$model" "$effort"
     return 0
   fi
   # herdr 경로: tab create(cwd·env·label 을 인자로 직접 전달) → agent start → agent prompt.
@@ -492,7 +542,7 @@ session_launch() {  # <worktree-path> <slug> <request-path> [<model>] [<backend>
   # stdout 한 줄이므로 exit 로 프로세스를 죽이면 호출부가 빈 값을 색인에 기록한다.
   outfile="$(mktemp)" || {
     printf '자동 기동에 실패했습니다(%s). 아래 명령으로 시작하십시오.\n' "임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2
-    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model")" >&2
+    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model" "$effort")" >&2
     printf 'failed\n'; return 0
   }
   _session_launch_run_with_timeout "$timeout" "$outfile" \
@@ -502,7 +552,7 @@ session_launch() {  # <worktree-path> <slug> <request-path> [<model>] [<backend>
   if [[ $rc -ne 0 ]]; then
     rm -f "$outfile"
     printf '자동 기동에 실패했습니다(tab create, rc=%s). 아래 명령으로 시작하십시오.\n' "$rc" >&2
-    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model")" >&2
+    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model" "$effort")" >&2
     printf 'failed\n'; return 0
   fi
   pane_id="$(_session_launch_parse_pane_id "$outfile")"
@@ -517,7 +567,7 @@ session_launch() {  # <worktree-path> <slug> <request-path> [<model>] [<backend>
     # 대상을 알 수 없다. tab_id 를 건졌으면 그 tab 은 닫아 빈 tab 을 남기지 않는다.
     [[ -n "$tab_id" ]] && _session_launch_close_tab_best_effort "$tab_id"
     printf '자동 기동에 실패했습니다(pane id 를 응답에서 찾지 못했습니다). 아래 명령으로 시작하십시오.\n' >&2
-    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model")" >&2
+    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model" "$effort")" >&2
     printf 'failed\n'; return 0
   fi
 
@@ -542,13 +592,14 @@ session_launch() {  # <worktree-path> <slug> <request-path> [<model>] [<backend>
       # tab 은 이미 만들어졌고 agent 는 아직 안 붙었다 — 위 갈래와 같은 정리를 한다.
       _session_launch_close_tab_best_effort "$tab_id"
       printf '자동 기동에 실패했습니다(%s). 아래 명령으로 시작하십시오.\n' "임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2
-      printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model")" >&2
+      printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model" "$effort")" >&2
       printf 'failed\n'; return 0
     }
     errfile="$(mktemp)" || errfile=""
-    if [[ -n "$model" ]]; then
+    _session_launch_build_args "$model" "$effort"
+    if [[ ${#_SL_ARGS[@]} -gt 0 ]]; then
       RD_SL_ERRFILE="${errfile:-/dev/null}" _session_launch_run_with_timeout "$((ssecs + 5))" "$outfile" \
-        herdr agent start "$agent_name" --kind claude --pane "$pane_id" --timeout "$((ssecs * 1000))" -- --model "$model"
+        herdr agent start "$agent_name" --kind claude --pane "$pane_id" --timeout "$((ssecs * 1000))" -- ${_SL_ARGS[@]+"${_SL_ARGS[@]}"}
     else
       RD_SL_ERRFILE="${errfile:-/dev/null}" _session_launch_run_with_timeout "$((ssecs + 5))" "$outfile" \
         herdr agent start "$agent_name" --kind claude --pane "$pane_id" --timeout "$((ssecs * 1000))"
@@ -601,7 +652,7 @@ session_launch() {  # <worktree-path> <slug> <request-path> [<model>] [<backend>
     # agent 가 붙지 못한 tab 은 빈 셸만 남으므로 최선을 다해 닫는다(worktree 는 건드리지 않는다).
     _session_launch_close_tab_best_effort "$tab_id"
     printf '자동 기동에 실패했습니다(agent start, rc=%s). 아래 명령으로 시작하십시오.\n' "$rc" >&2
-    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model")" >&2
+    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model" "$effort")" >&2
     printf 'failed\n'; return 0
   fi
 
@@ -660,13 +711,13 @@ _session_launch_hc_expose() {  # <address> <space> <slug>
 }
 
 # hc 갈래의 기동 (spec D3) — 결과는 stdout 한 줄(ok|failed|unknown)입니다.
-_session_launch_hc() {  # <worktree-path> <slug> <request-path> <model>
-  local wt="$1" slug="$2" req="$3" model="${4-}"
+_session_launch_hc() {  # <worktree-path> <slug> <request-path> <model> [<effort>]
+  local wt="$1" slug="$2" req="$3" model="${4-}" effort="${5-}"
   local agent_name outfile rc space address kind reason hfile handoff
   agent_name="$(_session_launch_agent_name "$slug")"
   outfile="$(mktemp)" || {
     printf '자동 기동에 실패했습니다(%s). 아래 명령으로 시작하십시오.\n' "임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2
-    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model")" >&2
+    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model" "$effort")" >&2
     printf 'failed\n'; return 0
   }
   # 1) tab 을 만들 space — 현재 세션의 라벨(M11). 못 읽으면 라벨 없이 기동합니다.
@@ -679,7 +730,8 @@ _session_launch_hc() {  # <worktree-path> <slug> <request-path> <model>
   local -a run_args=(run --bg --json --no-notify --name "$agent_name" --cwd "$wt" --outlive-parent)
   [[ -n "$space" ]] && run_args+=(--label "herdr.space=$space")
   run_args+=(env RD_CHILD_SESSION=1 claude)
-  [[ -n "$model" ]] && run_args+=(--model "$model")
+  _session_launch_build_args "$model" "$effort"
+  run_args+=(${_SL_ARGS[@]+"${_SL_ARGS[@]}"})
   run_args+=("$handoff")
   _session_launch_hc_call "${RD_LAUNCH_TIMEOUT:-5}" "$outfile" "${run_args[@]}"
   rc=$?
@@ -700,7 +752,7 @@ _session_launch_hc() {  # <worktree-path> <slug> <request-path> <model>
   if [[ -n "$kind" ]]; then
     # 터미널이 만들어지지 않았음이 확실한 구조화된 오류뿐입니다.
     printf '자동 기동에 실패했습니다(hc run: %s). 아래 명령으로 시작하십시오.\n' "$kind" >&2
-    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model")" >&2
+    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model" "$effort")" >&2
     printf 'failed\n'; return 0
   fi
   # 3) tab 이름 — 신뢰 다이얼로그처럼 사람이 승인해야 하는 경우에도 slug tab 을 바로 찾게 대기보다 먼저 합니다.
@@ -728,7 +780,7 @@ _session_launch_hc() {  # <worktree-path> <slug> <request-path> <model>
     rm -f "$outfile"
     if [[ "$rc" -eq 0 && "$state" == finished ]]; then
       printf '세션이 바로 종료됐습니다 — 마지막 출력: hc read %s. 아래 명령으로 시작하십시오.\n' "$agent_name" >&2
-      printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model")" >&2
+      printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model" "$effort")" >&2
       printf 'failed\n'; return 0
     fi
     if [[ "$rc" -eq 0 && "$state" == live ]]; then
@@ -746,6 +798,256 @@ _session_launch_hc() {  # <worktree-path> <slug> <request-path> <model>
   printf '첫 메시지 처리를 %s초 안에 확인하지 못했습니다 — 신뢰 확인 다이얼로그가 떠 있을 수 있습니다.\n' "$ssecs" >&2
   printf '앱 화면의 %s 에서 승인하면 claude 가 인계문을 스스로 처리합니다. 승인 뒤: bash rd-workflow/scripts/rd task resolve-launch %s\n' "$tab_ref" "$slug" >&2
   printf 'unknown\n'; return 0
+}
+
+# ---- Orca 갈래 (change spec D3·D4·D5) -----------------------------------------------
+# 내부 헬퍼: 색인에서 launch-tab·launch-pane 을 읽습니다 (stdout: 두 줄). 색인 함수가 없는 호출 환경이면 빈 줄입니다.
+_session_launch_orca_index_ids() {  # <slug>
+  local t="" p=""
+  if declare -F tasks_index_get >/dev/null 2>&1; then
+    t="$(tasks_index_get "$1" launch-tab 2>/dev/null)" || t=""
+    p="$(tasks_index_get "$1" launch-pane 2>/dev/null)" || p=""
+  fi
+  printf '%s\n%s\n' "$t" "$p"
+}
+
+# 내부 헬퍼: 처리 시작 여부를 읽습니다 (stdout 한 줄: `<found>\t<state>\t<has-assistant>`, state 가 비면 `-`).
+#   chat: `agent read` 응답 — entries 의 role=assistant 유무와 state.
+#   terminal: `agent list` 응답 — paneKey 가 <pane> 인 항목의 state 와 lastAssistantMessage 유무.
+_session_launch_orca_turn() {  # <chat|terminal> <json-file> [<pane>]
+  command -v python3 >/dev/null 2>&1 || { printf '0\t-\t0\n'; return 0; }
+  python3 -I - "$@" <<'PYEOF5'
+import json, sys
+mode, path = sys.argv[1], sys.argv[2]
+pane = sys.argv[3] if len(sys.argv) > 3 else ""
+found, state, has = 0, "-", 0
+try:
+    with open(path, encoding="utf-8") as f:
+        d = json.load(f)
+    if d.get("ok") is True:
+        r = d["result"]
+        if mode == "chat":
+            found = 1
+            s = r.get("state")
+            state = s if isinstance(s, str) and s else "-"
+            es = r.get("entries")
+            if isinstance(es, list):
+                has = 1 if any(isinstance(e, dict) and e.get("role") == "assistant" for e in es) else 0
+        else:
+            for a in r.get("agents") or []:
+                if isinstance(a, dict) and pane and a.get("paneKey") == pane:
+                    found = 1
+                    s = a.get("state")
+                    state = s if isinstance(s, str) and s else "-"
+                    m = a.get("lastAssistantMessage")
+                    has = 1 if isinstance(m, str) and m else 0
+                    break
+except Exception:
+    found, state, has = 0, "-", 0
+print("%d\t%s\t%d" % (found, state.replace("\t", " ").replace("\n", " "), has))
+PYEOF5
+}
+
+# 인계 처리 판정 (spec D4) — 인계문은 기동 호출에 이미 실렸으므로 **보내지 않고** 처리 여부만 조회합니다.
+#   <tab> <pane> 을 주면 색인을 읽지 않습니다(기동 직후에는 색인에 아직 없음). 없으면 색인의 launch-tab·launch-pane 을 씁니다.
+#   return 0 처리 시작 / 2 시간 안에 확인하지 못함(안내는 stderr)
+_session_handoff_deliver_orca() {  # <slug> <worktree-path> [<launch-tab> [<launch-pane>]]
+  local slug="$1" tab="${3-}" pane="${4-}" outfile rc psecs deadline left per mode id found state has
+  if [[ -z "$tab" ]]; then
+    { IFS= read -r tab; IFS= read -r pane; } < <(_session_launch_orca_index_ids "$slug")
+  fi
+  psecs="$(_session_launch_timeout_secs RD_LAUNCH_PROMPT_TIMEOUT 15)"
+  printf '시작 프롬프트 처리 확인: %s — 첫 턴 시작을 최대 %s초 기다립니다.\n' "$slug" "$psecs" >&2
+  case "$tab" in
+    structured-agent-session-?*) mode=chat; id="${tab#structured-agent-session-}" ;;
+    term_?*)                     mode=terminal; id="" ;;
+    *)                           mode="" ;;
+  esac
+  deadline=$(( SECONDS + psecs ))
+  while [[ -n "$mode" ]]; do
+    left=$(( deadline - SECONDS ))
+    (( left > 0 )) || break
+    per="${RD_LAUNCH_TIMEOUT:-5}"
+    [[ "$per" =~ ^[0-9]+$ ]] || per=5
+    (( per > left )) && per="$left"
+    outfile="$(mktemp)" || break
+    if [[ "$mode" == chat ]]; then
+      _session_launch_run_with_timeout "$per" "$outfile" orca agent read "$id" --json
+    else
+      _session_launch_run_with_timeout "$per" "$outfile" orca agent list --json
+    fi
+    rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      IFS=$'\t' read -r found state has < <(_session_launch_orca_turn "$mode" "$outfile" "$pane")
+      if [[ "$found" == 1 ]] && { [[ "$state" == working || "$state" == done ]] || [[ "$has" == 1 ]]; }; then
+        rm -f "$outfile"; return 0
+      fi
+    fi
+    rm -f "$outfile"
+    (( deadline - SECONDS > 1 )) || break
+    sleep 1
+  done
+  printf '첫 메시지가 아직 처리되지 않았습니다. Orca 사이드바의 fr/%s 아래 에이전트에서 확인 창을 승인하면 claude 가 인계문을 스스로 처리합니다. 문구를 붙여 넣지 마십시오. 승인 뒤 bash rd-workflow/scripts/rd task resolve-launch %s 를 실행하십시오.\n' "$slug" "$slug" >&2
+  return 2
+}
+
+# 내부 헬퍼: `agent launch` 응답을 읽어 변수에 담습니다. 못 읽은 값은 빈 값입니다.
+#   사용: `_session_launch_orca_parse <json-file> -- ok handle pane prompt opid code msg`
+_session_launch_orca_parse() {  # <json-file> -- <var>...
+  local _f="$1"; shift 2
+  # operationId 는 성공 응답은 result 아래에 있다(M5). 실패 응답의 위치는 실측하지 못해 최상위·error 아래도 읽는다.
+  local _op1 _op2 _op3 _ok _h _p _po _c _m
+  _session_launch_hc_read "$_f" ok result.outcome.handle result.outcome.paneKey result.prompt.outcome \
+    result.operationId operationId error.operationId error.code error.message -- _ok _h _p _po _op1 _op2 _op3 _c _m
+  printf -v "$1" '%s' "$_ok"; printf -v "$2" '%s' "$_h"; printf -v "$3" '%s' "$_p"; printf -v "$4" '%s' "$_po"
+  printf -v "$5" '%s' "${_op1:-${_op2:-$_op3}}"; printf -v "$6" '%s' "$_c"; printf -v "$7" '%s' "$_m"
+}
+
+# Orca 갈래의 기동 (spec D3). 기동과 인계가 `agent launch --prompt` 한 번이므로 인계문을 따로 보내지 않습니다.
+_session_launch_orca() {  # <worktree-path> <slug> <request-path> <model> [<effort>] → stdout: launch 상태
+  local wt="$1" slug="$2" req="$3" model="${4-}" effort="${5-}"
+  local outfile rc hfile handoff ssecs
+  local ok handle pane prompt opid code msg
+  if [[ -n "$effort" && -z "$model" ]]; then
+    printf '모델이 정해지지 않아 effort(%s)를 넘기지 않습니다 — Orca 의 --effort 는 --model 과 함께만 받습니다.\n' "$effort" >&2
+    effort=""
+  fi
+  hfile="$(session_handoff_file_path "$wt")" || hfile=""
+  [[ -n "$hfile" && -f "$hfile" ]] || hfile=""
+  handoff="$(session_handoff_text "$slug" "$req" "$wt" "$hfile" "$(session_handoff_autopilot "$wt")")"
+  local -a largs=(agent launch --agent claude --worktree "path:$wt" --prompt "$handoff")
+  _session_launch_build_args "$model" "$effort"
+  largs+=(${_SL_ARGS[@]+"${_SL_ARGS[@]}"})
+  largs+=(--json)
+  ssecs="$(_session_launch_timeout_secs RD_LAUNCH_START_TIMEOUT 60)"
+  printf 'Orca 세션 기동: %s — 기동 응답을 최대 %s초 기다립니다.\n' "$slug" "$((ssecs + 5))" >&2
+  outfile="$(mktemp)" || {
+    printf '자동 기동에 실패했습니다(%s). 아래 명령으로 시작하십시오.\n' "임시 파일 생성 실패 (mktemp rc≠0, TMPDIR='${TMPDIR:-}')" >&2
+    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model" "$effort")" >&2
+    printf 'failed\n'; return 0
+  }
+  _session_launch_run_with_timeout "$((ssecs + 5))" "$outfile" orca "${largs[@]}"
+  rc=$?
+  _session_launch_orca_parse "$outfile" -- ok handle pane prompt opid code msg
+  local replayed=0
+  if [[ "$rc" -ne 124 && ( "$rc" -ne 0 || "$ok" != true ) && -n "$opid" ]]; then
+    # 응답이 실패인데 operationId 가 있으면 세션이 만들어졌을 수 있다 — 같은 명령을 한 번만 재생한다.
+    printf 'Orca 기동 응답이 실패(rc=%s)였지만 operationId 가 있어 같은 기동을 한 번 재생합니다.\n' "$rc" >&2
+    replayed=1
+    _session_launch_run_with_timeout "$((ssecs + 5))" "$outfile" orca "${largs[@]}" --retry-launch "$opid"
+    rc=$?
+    _session_launch_orca_parse "$outfile" -- ok handle pane prompt opid code msg
+  fi
+  rm -f "$outfile"
+  local unknown_note=0
+  if [[ "$rc" -eq 124 ]]; then
+    printf '기동 응답이 시간 안에 오지 않았습니다 — 세션이 떴을 수 있습니다. Orca 사이드바를 먼저 확인하십시오.\n' >&2
+    unknown_note=1
+  elif [[ "$rc" -eq 0 && "$ok" == true && -n "$handle" ]]; then
+    :
+  elif [[ "$replayed" -eq 1 ]]; then
+    printf '재생한 기동도 성공하지 못했습니다(rc=%s) — 세션이 떴을 수 있습니다. Orca 사이드바를 먼저 확인하십시오.\n' "$rc" >&2
+    unknown_note=1
+  elif [[ "$ok" == false ]]; then
+    printf '자동 기동에 실패했습니다(orca agent launch: %s %s). 아래 명령으로 시작하십시오.\n' "${code:-오류}" "$msg" >&2
+    printf '%s\n' "$(session_launch_command "$wt" "$slug" "$model" "$effort")" >&2
+    printf 'failed\n'; return 0
+  else
+    printf '기동 응답을 해석하지 못했습니다(rc=%s) — 세션이 떴을 수 있습니다. Orca 사이드바를 먼저 확인하십시오.\n' "$rc" >&2
+    unknown_note=1
+  fi
+  if [[ "$unknown_note" -eq 1 ]]; then
+    printf '확인·인계: bash rd-workflow/scripts/rd task resolve-launch %s\n' "$slug" >&2
+    printf 'unknown\n'; return 0
+  fi
+  # 세션이 떴다 — 호출부(promote)가 색인에 남기도록 메타 파일에 화면 식별자를 쓴다.
+  if [[ -n "${RD_LAUNCH_META_FILE:-}" ]]; then
+    { printf 'launch-tab=%s\n' "$handle"; [[ -n "$pane" ]] && printf 'launch-pane=%s\n' "$pane"; } > "$RD_LAUNCH_META_FILE" 2>/dev/null || true
+  fi
+  if [[ "$prompt" != journaled && "$prompt" != handed-to-terminal ]]; then
+    printf '세션은 떴지만 인계 도착을 확인하지 못했습니다 — Orca 사이드바의 fr/%s 아래 에이전트에 인계 문구가 있는지 먼저 확인하고, 없을 때만 아래 문구를 붙여 넣으십시오.\n' "$slug" >&2
+    printf '%s\n' "$handoff" >&2
+    printf '확인·인계: bash rd-workflow/scripts/rd task resolve-launch %s\n' "$slug" >&2
+    printf 'unknown\n'; return 0
+  fi
+  if _session_handoff_deliver_orca "$slug" "$wt" "$handle" "$pane"; then
+    printf 'ok\n'; return 0
+  fi
+  printf 'unknown\n'; return 0
+}
+
+# 내부 헬퍼: `agent show` 의 places 가 <wt> 를 가리키는지 읽습니다 (stdout: match|other|empty, 못 읽으면 빈 출력).
+#   worktreeId 는 `<repoId>::<경로>` 이므로 `::` 뒤 경로를 비교합니다.
+_session_launch_orca_places_match() {  # <json-file> <wt>
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 -I - "$1" "$2" <<'PYEOF6'
+import json, os, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        d = json.load(f)
+    p = d["result"]["places"]
+    if not isinstance(p, list):
+        raise ValueError
+    wt = sys.argv[2]
+    rp = os.path.realpath(wt)
+    if not p:
+        print("empty")
+    else:
+        hit = False
+        for x in p:
+            w = x.get("worktreeId") if isinstance(x, dict) else None
+            if isinstance(w, str):
+                path = w.split("::", 1)[-1]
+                if path == wt or os.path.realpath(path) == rp:
+                    hit = True
+        print("match" if hit else "other")
+except Exception:
+    pass
+PYEOF6
+}
+
+# Orca 갈래의 생존 조회 (spec D5). `launch-tab` 접두로 화면 종류를 가립니다. 조회만 하고 보내지 않습니다.
+_session_probe_orca() {  # <slug> <worktree-path>
+  local slug="$1" wt="${2:-}" tab pane outfile rc ok conn tpath code m
+  { IFS= read -r tab; IFS= read -r pane; } < <(_session_launch_orca_index_ids "$slug")
+  # worktree 경로가 비어도(Orca 에서 workspace 를 지워 worktree 가 사라진 경우 — 2026-11-24 실측) 세션이 없다는
+  #   응답(places 없음·agent_unknown·connected:false)은 경로와 무관하게 dead 입니다. 세션이 있는데 경로를 모르면 unknown 입니다.
+  [[ -n "$tab" ]] || { printf 'unknown\n'; return 0; }
+  outfile="$(mktemp)" || { printf 'unknown\n'; return 0; }
+  case "$tab" in
+    structured-agent-session-?*)
+      _session_launch_run_with_timeout "${RD_LAUNCH_TIMEOUT:-5}" "$outfile" orca agent show "${tab#structured-agent-session-}" --json
+      rc=$?
+      _session_launch_hc_read "$outfile" error.code -- code
+      m="$(_session_launch_orca_places_match "$outfile" "$wt")"
+      rm -f "$outfile"
+      if [[ "$code" == agent_unknown ]]; then printf 'dead\n'; return 0; fi
+      if [[ "$rc" -ne 0 ]]; then printf 'unknown\n'; return 0; fi
+      case "$m" in
+        match)       printf 'alive\n' ;;
+        empty)       printf 'dead\n' ;;
+        other)       if [[ -n "$wt" ]]; then printf 'dead\n'; else printf 'unknown\n'; fi ;;
+        *)           printf 'unknown\n' ;;
+      esac ;;
+    term_?*)
+      _session_launch_run_with_timeout "${RD_LAUNCH_TIMEOUT:-5}" "$outfile" orca terminal show --terminal "$tab" --json
+      rc=$?
+      _session_launch_hc_read "$outfile" ok result.terminal.connected result.terminal.worktreePath -- ok conn tpath
+      rm -f "$outfile"
+      if [[ "$rc" -ne 0 || "$ok" != true ]]; then printf 'unknown\n'; return 0; fi
+      if [[ "$conn" == false ]]; then printf 'dead\n'; return 0; fi
+      if [[ "$conn" == true && -n "$tpath" && -n "$wt" ]]; then
+        # 채팅 갈래(places_match)와 같이 물리 경로로도 비교한다 — symlink 로 가리킨 같은 worktree 를 다른 것으로 보지 않는다.
+        local tp wp
+        tp="$(cd "$tpath" 2>/dev/null && pwd -P)" || tp=""
+        wp="$(cd "$wt" 2>/dev/null && pwd -P)" || wp=""
+        if [[ "$tpath" == "$wt" || ( -n "$tp" && "$tp" == "$wp" ) ]]; then printf 'alive\n'; else printf 'dead\n'; fi
+        return 0
+      fi
+      printf 'unknown\n' ;;
+    *) rm -f "$outfile"; printf 'unknown\n' ;;
+  esac
+  return 0
 }
 
 # hc 갈래의 생존 조회 (spec D4). 생존·종료는 `state` 로만 가르고 `status.state` 는 쓰지 않습니다.
@@ -780,6 +1082,10 @@ session_probe() {  # <slug> [worktree-path] [backend] → stdout: alive|dead|unk
   fi
   if [[ "$backend" == hc ]]; then
     _session_probe_hc "$slug" "$wt"
+    return 0
+  fi
+  if [[ "$backend" == orca ]]; then
+    _session_probe_orca "$slug" "$wt"
     return 0
   fi
 
@@ -1004,6 +1310,20 @@ PYEOF4
   printf 'unknown\t이름 조회 성공 — worktree 밖 cwd\n'
 }
 
+# Orca 갈래의 이름 조회 관측 (spec D5). 생존 판정은 `_session_probe_orca` 와 같습니다 — dead 는 absent, alive 는 alive, 그 밖은 unknown.
+#   stdout 계약은 session_observe_name 과 같습니다. 세 번째 인자(물리 경로)는 probe 가 스스로 구하므로 쓰지 않습니다.
+session_observe_name_orca() {  # <slug> <wt> <wt-physical>
+  local slug="$1" wt="$2" p
+  if ! session_backend_usable orca; then printf 'unknown\tOrca 사용 불가\n'; return 0; fi
+  p="$(_session_probe_orca "$slug" "$wt")"
+  case "$p" in
+    dead)  printf 'absent\n' ;;
+    alive) printf 'alive\tOrca 세션 %s 생존\n' "$slug" ;;
+    *)     printf 'unknown\tOrca 세션 조회 판정 불가\n' ;;
+  esac
+  return 0
+}
+
 # hc(herdr app) 갈래의 이름 조회 관측 (spec C6-4). stdout 계약은 session_observe_name 과 같습니다.
 #   부재는 구조화된 not_found 와 끝난 터미널(state=finished)뿐입니다. live 인데 cwd 가 worktree 밖이거나
 #   비어 있으면 성공한 이름 조회이므로 부재로 약화하지 않고 판정 불가로 둡니다(F1).
@@ -1048,6 +1368,7 @@ session_ended_judge() {  # <slug> <wt> <agents-status> <agents-file> <procs-stat
   case "$backend" in
     herdr) obs="$(session_observe_name "$slug" "$wt" "$wtp")" ;;
     hc)    obs="$(session_observe_name_hc "$slug" "$wt" "$wtp")"; ast="ok" ;;
+    orca)  obs="$(session_observe_name_orca "$slug" "$wt" "$wtp")"; ast="ok" ;;
     *)     printf 'unknown\t기동 백엔드 기록 이상(%s)\n' "$backend"; return 0 ;;
   esac
   case "$obs" in
@@ -1066,15 +1387,6 @@ session_ended_judge() {  # <slug> <wt> <agents-status> <agents-file> <procs-stat
     *) printf 'unknown\t관측 상태 이상\n'; return 0 ;;
   esac
   printf 'ended\n'
-}
-
-session_launch_model_valid() {
-  case "$1" in
-    opus|sonnet|haiku|fable) return 0 ;;
-  esac
-  [[ "$1" =~ ^claude-[a-z0-9]+(-[a-z0-9]+)*$ ]] && return 0
-  [[ "$1" =~ ^fable-[a-z0-9]+(-[a-z0-9]+)*$ ]] && return 0
-  return 1
 }
 
 _session_launch_json_get() {  # <file> <key>
@@ -1121,15 +1433,16 @@ PYEOF
 # 파싱 백엔드 순서가 `_session_launch_json_get` 과 반대(python3 우선)인 것은 의도적이다.
 # 대상이 JSONL 이라 마지막 줄이 쓰이는 중이면 잘려 있을 수 있는데, python3 은 줄 단위로
 # 건너뛰고 jq 는 스트림 전체를 중단한다.
-_session_launch_transcript_models() {  # <transcript> → stdout: 파일 순서의 model 값들
-  local file="$1"
+_session_launch_transcript_values() {  # <transcript> <model|effort> → stdout: 파일 순서의 값들
+  local file="$1" kind="$2"
   if command -v python3 >/dev/null 2>&1; then
-    python3 - "$file" <<'PYEOF'
+    python3 - "$file" "$kind" <<'PYEOF'
 import json, sys
 try:
     f = open(sys.argv[1], encoding="utf-8", errors="replace")
 except OSError:
     sys.exit(1)
+kind = sys.argv[2]
 with f:
     for line in f:
         line = line.strip()
@@ -1141,25 +1454,37 @@ with f:
             continue  # 쓰이는 중인 마지막 줄 등 — 건너뛴다
         if not isinstance(rec, dict) or rec.get("isSidechain"):
             continue
-        msg = rec.get("message")
-        if not isinstance(msg, dict):
-            continue
-        model = msg.get("model")
-        if isinstance(model, str) and model:
-            print(model)
+        if kind == "effort":
+            # effort 는 assistant 기록의 최상위 필드만 본다(2026-11-22 실측). 다른 종류의 기록·perTurnEffort 는 쓰지 않는다.
+            if rec.get("type") != "assistant":
+                continue
+            val = rec.get("effort")
+        else:
+            msg = rec.get("message")
+            if not isinstance(msg, dict):
+                continue
+            val = msg.get("model")
+        if isinstance(val, str) and val:
+            print(val)
 PYEOF
     return 0
   fi
   if command -v jq >/dev/null 2>&1; then
-    jq -r 'select(.isSidechain | not) | (.message? | objects | .model?) | strings' \
-      "$file" 2>/dev/null || true
+    if [[ "$kind" == "effort" ]]; then
+      jq -r 'select(.isSidechain | not) | select(.type? == "assistant") | .effort? | strings' \
+        "$file" 2>/dev/null || true
+    else
+      jq -r 'select(.isSidechain | not) | (.message? | objects | .model?) | strings' \
+        "$file" 2>/dev/null || true
+    fi
     return 0
   fi
   return 1
 }
 
-# 현재 세션의 모델 (stdout). 찾지 못하면 비어 있는 상태로 1 을 반환한다.
-_session_launch_inherited_model() {
+# 현재 세션의 모델·effort (stdout). 찾지 못하면 비어 있는 상태로 1 을 반환한다. 칸마다 따로 한다(spec D5).
+_session_launch_inherited() {  # <model|effort>
+  local kind="$1"
   local sid="${CLAUDE_CODE_SESSION_ID:-}"
   [[ -n "$sid" ]] || return 1
   # 세션 ID 는 UUID 다. 경로 구분자·상위 참조가 섞였으면 글롭 밖을 가리키므로 거부한다.
@@ -1178,57 +1503,145 @@ _session_launch_inherited_model() {
   done
   [[ "${#matches[@]}" -eq 1 ]] || return 1
 
-  local models=() line
+  local vals=() line
   while IFS= read -r line; do
-    [[ -n "$line" ]] && models+=("$line")
-  done < <(_session_launch_transcript_models "${matches[0]}")
-  [[ "${#models[@]}" -gt 0 ]] || return 1
+    [[ -n "$line" ]] && vals+=("$line")
+  done < <(_session_launch_transcript_values "${matches[0]}" "$kind")
+  [[ "${#vals[@]}" -gt 0 ]] || return 1
 
-  # 뒤에서부터 첫 번째 **유효한** 값. 유효성 판정은 기존 함수를 그대로 쓴다 —
-  # 모든 세션에 1건씩 섞여 있는 `<synthetic>` 은 여기서 탈락한다.
-  local i
-  for (( i = ${#models[@]} - 1; i >= 0; i-- )); do
-    if session_launch_model_valid "${models[$i]}"; then
-      printf '%s\n' "${models[$i]}"
-      return 0
+  # 뒤에서부터 첫 번째 **유효한** 값. 모델은 별칭·고정 이름만(모든 세션에 1건씩 섞인 `<synthetic>` 탈락),
+  # effort 는 Claude 고정 단계 5개만 받는다.
+  local i v cls
+  for (( i = ${#vals[@]} - 1; i >= 0; i-- )); do
+    v="${vals[$i]}"
+    if [[ "$kind" == "effort" ]]; then
+      case "$v" in
+        low|medium|high|xhigh|max) printf '%s\n' "$v"; return 0 ;;
+      esac
+    else
+      cls="$(ms_classify claude model "$v")"
+      case "$cls" in
+        alias|pinned) printf '%s\n' "$v"; return 0 ;;
+      esac
     fi
   done
   return 1
 }
 
-session_launch_model() {
-  local wt="$1" cfg raw
-  if [[ -n "${RD_SESSION_MODEL:-}" ]]; then
-    if session_launch_model_valid "$RD_SESSION_MODEL"; then
-      printf 'env\t%s\n' "$RD_SESSION_MODEL"; return 0
-    fi
-    printf '세션 모델(RD_SESSION_MODEL=%s)이 허용 범위를 벗어나 미지정으로 둡니다.\n' \
-      "$RD_SESSION_MODEL" >&2
-    printf 'default\t\n'; return 0
-  fi
-  cfg="${wt}/rd-workflow/config/model-strategy.json"
-  if [[ -f "$cfg" ]]; then
-    if ! raw="$(_session_launch_json_get "$cfg" session_model)"; then
-      printf '세션 모델 설정 파일을 읽지 못했습니다(%s) — 미지정으로 둡니다.\n' "$cfg" >&2
-      printf 'default\t\n'; return 0
-    fi
-    if [[ -n "$raw" ]]; then
-      if session_launch_model_valid "$raw"; then
-        printf 'config\t%s\n' "$raw"; return 0
+# 작업 세션의 모델·effort 선택 (spec D4·D7·D8). 호출 셸에서 직접 부른다(명령 치환 안에서 부르면 전역이 사라진다).
+#   채우는 전역: SL_MODEL·SL_EFFORT(넘길 값, 없으면 빈 값), SL_MODEL_LABEL·SL_EFFORT_LABEL(출처 표기),
+#   SL_LINE(`다음 기동에 사용할 모델 — … · effort — … (출처: …)`, `promote: ` 접두 없음). 경고는 stderr, 항상 rc 0.
+#   칸마다 순서: 환경 변수 > models.json > model-strategy.json 옛 키(모델만) > 부모 세션 상속 > 미지정.
+#   `default`·무효 값은 상속하지 않는다. 설정 루트는 호출 체크아웃(`project_root`) 이고 대상 worktree 가 아니다(D6).
+session_launch_selection() {
+  local root="${project_root:-$_MS_PROJECT_ROOT}"
+  local mlabel="" elabel="" ival="" mval="" raw cfg cls
+  SL_MODEL=""; SL_EFFORT=""; SL_MODEL_LABEL=""; SL_EFFORT_LABEL=""; SL_LINE=""
+  ms_resolve_session "$root"
+
+  # ---- 모델
+  local mstate="$MS_SS_MODEL_STATE"
+  if [[ "$mstate" == "unset" ]]; then
+    # 옛 키 — 늘 호출 체크아웃의 model-strategy.json (RD_MODELS_CONFIG 와 무관).
+    cfg="${root}/rd-workflow/config/model-strategy.json"
+    local legacy="" legacy_bad=0
+    if [[ -f "$cfg" ]]; then
+      if ! raw="$(_session_launch_json_get "$cfg" session_model)"; then
+        printf '세션 모델 설정 파일을 읽지 못했습니다(%s) — 미지정으로 둡니다.\n' "$cfg" >&2
+        legacy_bad=1
+      else
+        legacy="$raw"
       fi
-      printf '세션 모델 설정(%s=%s)이 허용 범위를 벗어나 미지정으로 둡니다.\n' "$cfg" "$raw" >&2
-      printf 'default\t\n'; return 0
     fi
+    if [[ "$legacy_bad" -eq 1 ]]; then
+      mstate="invalid"
+    elif [[ -n "$legacy" ]]; then
+      cls="$(ms_classify claude model "$legacy")"
+      case "$cls" in
+        alias|pinned)
+          mval="$legacy"; mlabel="model-strategy.json(옛 키)"; mstate="value"
+          [[ "$cls" == pinned ]] && echo "⚠️  model-strategy.json(옛 키) 의 모델 '${legacy}' 은 고정 이름입니다 — 고정됨, 낡을 수 있음." >&2
+          echo "ℹ️  세션 모델을 model-strategy.json(옛 키)에서 읽었습니다 — models.json 의 session.claude.model 로 옮기십시오." >&2 ;;
+        default)
+          mstate="default"
+          echo "ℹ️  세션 모델을 model-strategy.json(옛 키)에서 읽었습니다 — models.json 의 session.claude.model 로 옮기십시오." >&2 ;;
+        *)
+          printf '세션 모델 설정(%s=%s)이 허용 범위를 벗어나 미지정으로 둡니다.\n' "$cfg" "$legacy" >&2
+          mstate="invalid" ;;
+      esac
+    else
+      # 상속 — 고정 ID 에도 고정 경고를 내지 않는다.
+      if mval="$(_session_launch_inherited model)" && [[ -n "$mval" ]]; then
+        mlabel="현재 세션 상속"; mstate="value"
+      else
+        mval=""; mstate="invalid"
+      fi
+    fi
+  else
+    if [[ "$mstate" == "value" ]]; then
+      mval="$MS_SS_MODEL_ARG"
+      case "$MS_SS_MODEL_SRC" in env) mlabel="RD_SESSION_MODEL" ;; *) mlabel="models.json" ;; esac
+    fi
+  fi
+  case "$mstate" in
+    value)   SL_MODEL="$mval"; SL_MODEL_LABEL="$mlabel" ;;
+    default) SL_MODEL_LABEL="default 지정 — CLI 기본값" ;;
+    *)       SL_MODEL_LABEL="미지정 — CLI 기본값" ;;
+  esac
+
+  # ---- effort
+  local estate="$MS_SS_EFFORT_STATE"
+  case "$estate" in
+    value)
+      SL_EFFORT="$MS_SS_EFFORT_ARG"
+      case "$MS_SS_EFFORT_SRC" in env) elabel="RD_SESSION_EFFORT" ;; *) elabel="models.json" ;; esac ;;
+    unset)
+      if ival="$(_session_launch_inherited effort)" && [[ -n "$ival" ]]; then
+        SL_EFFORT="$ival"; elabel="현재 세션 상속"
+      fi ;;
+  esac
+  if [[ -n "$SL_EFFORT" ]]; then
+    SL_EFFORT_LABEL="$elabel"
+    _session_launch_effort_supported || SL_EFFORT_LABEL="CLI 미지원으로 뺌, ${elabel}"
+  elif [[ "$estate" == "default" ]]; then
+    SL_EFFORT_LABEL="default 지정 — CLI 기본값"
+  else
+    SL_EFFORT_LABEL="미지정 — CLI 기본값"
   fi
 
-  # 최하위 fallback — 명시 설정이 없을 때만 현재 세션의 모델을 상속한다. 설정이 있으면
-  # 위에서 이미 반환했으므로 기존 두 경로의 동작은 바뀌지 않는다. 상속에 실패하면
-  # 종전과 같은 미지정으로 수렴한다(새 실패 모드를 만들지 않는다).
-  local inherited
-  if inherited="$(_session_launch_inherited_model)" && [[ -n "$inherited" ]]; then
-    printf 'inherit\t%s\n' "$inherited"; return 0
+  # ---- 표시 한 줄 (D8)
+  local mpart epart
+  mpart="${SL_MODEL:-미지정} (출처: ${SL_MODEL_LABEL})"
+  if [[ -n "$SL_EFFORT" ]]; then
+    epart="${SL_EFFORT} (출처: ${SL_EFFORT_LABEL})"
+  elif [[ "$SL_EFFORT_LABEL" == "CLI 미지원으로 뺌, "* ]]; then
+    epart="CLI 기본값 (${SL_EFFORT_LABEL})"
+  else
+    epart="미지정 (출처: ${SL_EFFORT_LABEL})"
   fi
-  printf 'default\t\n'; return 0
+  SL_LINE="다음 기동에 사용할 모델 — ${mpart} · effort — ${epart}"
+  return 0
+}
+
+# D7 — `claude --help` 에 --effort 가 있는지 확인한다. SL_EFFORT 가 비어 있지 않을 때만 부른다.
+#   없으면 경고 후 SL_EFFORT 를 비우고 rc 1. 시간 초과·rc≠0·claude 없음은 확인하지 못한 것이라 effort 를 유지한다(rc 0).
+_session_launch_effort_supported() {
+  command -v claude >/dev/null 2>&1 || return 0
+  local hf rc=0 out=""
+  hf="$(mktemp)" || return 0
+  _session_launch_run_with_timeout "${RD_LAUNCH_TIMEOUT:-5}" "$hf" claude --help || rc=$?
+  out="$(cat "$hf" 2>/dev/null || true)"
+  rm -f "$hf"
+  if [[ "$rc" -ne 0 ]]; then
+    echo "⚠️  Claude CLI 의 --effort 지원을 확인하지 못했습니다 — effort 를 그대로 넘깁니다." >&2
+    return 0
+  fi
+  case "$out" in
+    *--effort*) return 0 ;;
+  esac
+  echo "⚠️  Claude CLI 가 --effort 를 받지 않습니다 — claude update 로 올리거나 models.json 의 session.claude.effort(또는 RD_SESSION_EFFORT)를 default 로 두십시오. effort 없이 기동합니다." >&2
+  SL_EFFORT=""
+  return 1
 }
 
 # ---- 탭 닫기 판정·호출 세션 생존 (읽기 + 조건부 tab close) -----------------------
@@ -1286,6 +1699,10 @@ session_tab_close_if_ended() {  # <slug>
   fi
   backend="$(tasks_index_get "$slug" launch-backend 2>/dev/null || true)"
   tab="$(tasks_index_get "$slug" launch-tab 2>/dev/null || true)"
+  if [[ "$backend" == orca ]]; then
+    # 채팅은 CLI 로 닫을 수 없고 터미널만 닫으면 화면 종류에 따라 동작이 갈린다(spec D7). " — " 앞까지만 목록에 보인다.
+    printf 'Orca 사이드바의 fr/%s 아래 에이전트는 직접 닫아 주십시오(채팅은 CLI 로 닫을 수 없습니다)\n' "$slug"; return 1
+  fi
   if [[ "$backend" != herdr ]]; then
     printf '백엔드가 herdr 가 아님 — 탭을 닫지 않음\n'; return 1
   fi
@@ -1346,6 +1763,22 @@ PYEOF5
   return 0
 }
 
+# 내부 헬퍼: Orca 응답 JSON 의 `places` 배열 길이를 읽습니다 (stdout: 정수, 못 읽으면 빈 출력).
+_session_launch_orca_places_count() {  # <json-file>
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 -I - "$1" <<'PYEOF4'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        d = json.load(f)
+    p = d["result"]["places"]
+    if isinstance(p, list):
+        print(len(p))
+except Exception:
+    pass
+PYEOF4
+}
+
 # 호출 세션이 살아 있는지 판정한다 (change spec D13).
 #   return 0 생존 / 1 소실 / 2 판정 불가 (판정 불가는 소실로 보지 않는다)
 session_caller_alive() {  # <backend> <id>
@@ -1371,6 +1804,30 @@ session_caller_alive() {  # <backend> <id>
         finished) return 1 ;;
         *)        return 2 ;;
       esac ;;
+    orca)
+      command -v orca >/dev/null 2>&1 || { rm -f "$out"; return 2; }
+      local ok conn code n
+      if [[ "$id" == term_* ]]; then
+        # 터미널 handle — 닫힌 터미널은 connected:false 로 응답하고(M10), 모르는 handle 은 terminal_handle_stale(M13)이다.
+        _session_launch_run_with_timeout "${RD_LAUNCH_TIMEOUT:-5}" "$out" orca terminal show --terminal "$id" --json
+        _session_launch_hc_read "$out" ok result.terminal.connected error.code -- ok conn code
+        rm -f "$out"
+        [[ "$ok" == true ]] || return 2
+        case "$conn" in
+          true)  return 0 ;;
+          false) return 1 ;;
+          *)     return 2 ;;
+        esac
+      fi
+      _session_launch_run_with_timeout "${RD_LAUNCH_TIMEOUT:-5}" "$out" orca agent show "$id" --json
+      rc=$?
+      _session_launch_hc_read "$out" error.code -- code
+      n="$(_session_launch_orca_places_count "$out")"
+      rm -f "$out"
+      [[ "$code" == agent_unknown ]] && return 1
+      [[ "$rc" -eq 0 && -n "$n" ]] || return 2
+      if [[ "$n" -gt 0 ]]; then return 0; fi
+      return 1 ;;
     *) rm -f "$out"; return 2 ;;
   esac
 }

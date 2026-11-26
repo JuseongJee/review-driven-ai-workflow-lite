@@ -47,8 +47,10 @@ TMP="$(cd "$TMP" && pwd -P)"
   : > rd-workflow-workspace/.gitkeep && \
   cp -R "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/lifecycle/. rd-workflow/scripts/lifecycle/ && \
   cp -R "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/hooks/. rd-workflow/scripts/hooks/ && \
+  cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/model_select.sh rd-workflow/scripts/ && \
   cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_state_common.sh rd-workflow/scripts/ && \
   cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_task_common.sh rd-workflow/scripts/ && \
+  cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_fr_status.sh rd-workflow/scripts/ && \
   cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/_submodule_common.sh rd-workflow/scripts/ && \
   cp "$PROJECT_ROOT"/_ROOT_FILES/rd-workflow/scripts/rd rd-workflow/scripts/ && \
   git add -A && \
@@ -583,7 +585,7 @@ fi
 git -C "$REPO" symbolic-ref HEAD refs/heads/main
 
 # ---------------------------------------------------------------------------
-# 정리 대기 행 지연 정리 (S1~S9) — 발행 증거가 있고 worktree 가 깨끗·비점유·미잠금일 때만
+# 정리 대기 행 지연 정리 (S1~S10) — 발행 증거가 있고 worktree 가 깨끗·비점유·미잠금일 때만
 # worktree·로컬 브랜치·색인 행을 지운다. 하나라도 어긋나면 전부 보존하고 사유를 출력한다.
 # 기본 브랜치가 main 이고 origin 이 없어 local-only 증거(merge + 계보가 맞는 tag)를 쓴다.
 # ---------------------------------------------------------------------------
@@ -602,6 +604,16 @@ _sw_br()  { git -C "$TMP" rev-parse --verify --quiet "refs/heads/fr/$1" >/dev/nu
 _sw_all_kept() { _sw_reg "$1" && _sw_br "$1" && _has_row "$1"; }
 _sw_all_gone() { ! _sw_reg "$1" && ! _sw_br "$1" && ! _has_row "$1"; }
 _sw_run() { bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true; }
+# _cwd_wait <pid> <dir> — 대역 프로세스의 CWD 가 <dir> 로 잡힐 때까지 기다린다(고정 sleep 0.5 는 부하에서 점유가 잡히기 전에 판정이 돌 수 있다).
+#   상한 20초는 멈춤 방지 장치다. 닿으면 호출부가 준비 실패를 FAIL 로 남긴다.
+_cwd_wait() {
+  local want i=0; want="$(cd "$2" && pwd -P)"
+  while [[ "$i" -lt 200 ]]; do
+    lsof -a -p "$1" -d cwd -Fn 2>/dev/null | grep -qxF "n$want" && return 0
+    sleep 0.1; i=$((i + 1))
+  done
+  return 1
+}
 _sw_cleanup() {  # 보존된 fixture 를 강제로 치운다(다음 케이스에 영향 없게)
   git -C "$TMP" worktree unlock "$TMP/.worktrees/$1" 2>/dev/null || true
   git -C "$TMP" worktree remove --force "$TMP/.worktrees/$1" 2>/dev/null || true
@@ -622,10 +634,10 @@ fi
 # S2 점유 — worktree 안에서 sleep 이 CWD 를 잡고 있으면 보존한다
 _sw_mk s2
 ( cd "$TMP/.worktrees/s2" && exec sleep 30 ) & _sw_pid=$!
-sleep 0.5
+_cwd_wait "$_sw_pid" "$TMP/.worktrees/s2" || fail "S2 준비: 대역 프로세스의 CWD 가 20초 안에 worktree 로 잡히지 않음"
 out="$(_sw_run)"
 kill "$_sw_pid" 2>/dev/null || true; wait "$_sw_pid" 2>/dev/null || true
-if _sw_all_kept s2 && grep -E '^정리 보류: s2 — ' <<<"$out" | grep -q '점유' \
+if _sw_all_kept s2 && grep -E '^정리 보류: s2 — ' <<<"$out" | grep -q '점유 — 세션이' \
    && grep -E '^정리 보류: s2 ' <<<"$out" | grep -q '재시도: '; then
   pass "S2 점유된 worktree 는 보존되고 점유 사유와 재시도 안내가 나온다"
 else
@@ -695,14 +707,30 @@ rc=0; ( PATH="$STUB_LSOF:$PATH"; tasks_path_occupied "$TMP" ) || rc=$?
 # S7b 권한 제한 — 조회는 성공했지만 살아 있는 내 계정 pid 하나가 lsof 출력에서 빠지면 rc 2
 # ps·lsof 를 모두 스텁으로 고정한다 — 실제 프로세스 목록의 일시적 읽기 불가가 결과를 가리지 못하게 한다.
 # 대상은 어느 프로세스의 CWD 도 아닌 빈 디렉터리다($TMP 는 이 테스트 셸의 CWD 라 점유(rc 0)로 읽힌다).
+# _s7_recheck <재조회 출력> — 스냅샷에는 내 계정의 살아 있는(S) pid 를 두고, CWD 조회 뒤의 상태 재조회
+# (`ps -o stat=,uid=`)만 인자로 바꾼다. lsof 출력에서는 그 pid 가 빠진다.
 mkdir -p "$TMP/.s7b-empty"
-rc=0
-( sleep 30 & _spid=$!
-  ps() { printf '%s %s S\n%s %s S\n' "$_spid" "$(id -u)" "$$" "$(id -u)"; }
-  lsof() { printf 'p%s\nn/\n' "$$"; }
-  tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
-  kill "$_spid" 2>/dev/null; exit "$_r" ) || rc=$?
-[[ "$rc" -eq 2 ]] && pass "S7b 살아 있는 내 계정 pid 의 CWD 를 못 읽었으면 rc 2" || fail "S7b rc=$rc (기대 2)"
+_s7_recheck() {  # <재조회 출력>
+  ( sleep 30 & _spid=$!
+    _now="$1"
+    ps() { if [[ "$1" == "-o" ]]; then echo "$_now"; else printf '%s %s S\n%s %s S\n' "$_spid" "$(id -u)" "$$" "$(id -u)"; fi; }
+    lsof() { printf 'p%s\nn/\n' "$$"; }
+    tasks_path_occupied "$TMP/.s7b-empty"; _r=$?
+    kill "$_spid" 2>/dev/null; exit "$_r" )
+}
+rc=0; _s7_recheck "S $(id -u)" || rc=$?
+[[ "$rc" -eq 2 ]] && pass "S7b 재조회에도 살아 있는 내 계정 pid 의 CWD 를 못 읽었으면 rc 2" || fail "S7b rc=$rc (기대 2)"
+
+# S7i·S7j 스냅샷 뒤 상태가 바뀜 — 스냅샷에서는 내 계정의 살아 있는(S) pid 가 CWD 조회 전에 회수 전 좀비(Z)가 되거나(S7i)
+# setuid 프로그램을 exec 해 유효 uid 가 다른 계정이 되면(S7j) CWD 를 못 읽어도 판정불가로 세지 않는다(rc 1).
+rc=0; _s7_recheck "Z+ $(id -u)" || rc=$?
+[[ "$rc" -eq 1 ]] && pass "S7i 스냅샷 뒤 좀비가 된 pid 는 CWD 를 못 읽어도 판정불가로 세지 않는다 (rc 1)" || fail "S7i rc=$rc (기대 1)"
+if [[ "$(id -u)" -eq 0 ]]; then
+  echo "  SKIP: S7j root 로 실행 중이라 유효 uid 가 다른 프로세스를 스텁으로 만들 수 없음"
+else
+  rc=0; _s7_recheck "R 0" || rc=$?
+  [[ "$rc" -eq 1 ]] && pass "S7j 스냅샷 뒤 setuid exec 로 유효 uid 가 바뀐 pid 는 판정불가로 세지 않는다 (rc 1)" || fail "S7j rc=$rc (기대 1)"
+fi
 
 # S7d CWD 경로 읽기 실패 — `p<pid>` 는 있어도 `n` 줄이 오류 설명이면 읽은 것으로 치지 않아 rc 2
 # 모든 pid 가 `p` 줄은 있으므로, rc 2 는 오직 경로 검증 때문에 나온다(ps·lsof 스텁 고정).
@@ -797,7 +825,149 @@ else
   fail "S6 원격 보존 실패: $out"
 fi
 _sw_cleanup s6
-printf '  (S1~S9 소요 %d초)\n' "$((SECONDS - _SW_T0))"
+
+# S10 발행 큐 요청 — 발행 증거가 있어도 그 작업의 발행 요청이 허가 슬롯을 쥔 상태(허가됨·발행 중·부분 완료)면
+#   보존하고 큐의 다음 행동을 낸다. 발행 중을 보는 이유: 부분 완료는 발행 중에서만 넘어온다(검사 뒤 전이).
+#   worktree 만 먼저 없어진 부분 완료는 브랜치·행을 남기고 recover 를 안내한다(recover 의 재개 안내가 브랜치를 쓴다).
+#   허가됨의 run 은 작업 worktree 에서만 돌므로 그 worktree 를 안내하고, worktree 가 없으면 cancel 과 worktree 를
+#   다시 만드는 명령을 안내한다 — 그 명령을 실제로 실행해 worktree 가 돌아오는지 본다. 디렉터리만 지워지고 git 등록이
+#   남았으면 add 가 거부되므로 add 대신 등록 확인·정리를 안내하는지 본다(요청과 다른 경로의 fr 브랜치 등록, 링크
+#   경로로 적힌 요청의 detached 등록). 등록 없이 경로에 파일이 남은 경우도 add 대신 파일을 옮기라고 안내하는지 본다.
+#   요청이 그 밖의 상태(done)면 요청 파일이 있어도 정리한다 — 발행을 마친 작업에는 모두 요청 파일이 남는다.
+#   run 은 그 worktree 의 task-state short-title 로 slug 를 정하므로, worktree 에 short-title=s10 을 둔다(promote 가
+#   fr 브랜치에 남기는 상태). short-title 이 다르면(다른 커밋을 체크아웃) run 대신 체크아웃 확인을 안내하는지 본다.
+_sw_mk s10
+_sw_q="$(git -C "$TMP" rev-parse --path-format=absolute --git-common-dir)/rd-workflow/publish-queue"
+mkdir -p "$_sw_q"
+_sw_req() { printf 'slug=s10\nstate=%s\nworktree=%s\nfr-branch=fr/s10\n' "$1" "${2:-$TMP/.worktrees/s10}" >"$_sw_q/s10.req"; }
+_sw_ts() { mkdir -p "$TMP/.worktrees/s10/rd-workflow-workspace/.lifecycle" && printf 'short-title=%s\n' "$1" >"$TMP/.worktrees/s10/rd-workflow-workspace/.lifecycle/task-state"; }
+_sw_ts s10
+_sw_req partial
+out="$(_sw_run)"
+if _sw_all_kept s10 && grep -E '^정리 보류: s10 — ' <<<"$out" | grep -q '「부분 완료」' \
+   && grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF "작업 worktree($TMP/.worktrees/s10)에서 rd publish run"; then
+  pass "S10 발행 요청이 부분 완료면 보존되고 그 worktree 의 rd publish run 안내가 나온다"
+else
+  fail "S10 부분 완료 보존 실패: $out"
+fi
+_sw_req running
+out="$(_sw_run)"
+if _sw_all_kept s10 && grep -E '^정리 보류: s10 — ' <<<"$out" | grep -q '「발행 중」' \
+   && grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF "rd publish recover s10"; then
+  pass "S10 발행 요청이 발행 중이면 보존되고 rd publish recover 안내가 나온다"
+else
+  fail "S10 발행 중 보존 실패: $out"
+fi
+_sw_req granted
+out="$(_sw_run)"
+if _sw_all_kept s10 && grep -E '^정리 보류: s10 — ' <<<"$out" | grep -q '「허가됨」' \
+   && grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF "재시도: 작업 worktree($TMP/.worktrees/s10)에서 rd publish run 뒤"; then
+  pass "S10 발행 요청이 허가됨이면 보존되고 그 worktree 의 rd publish run 안내가 나온다"
+else
+  fail "S10 허가됨 보존 실패: $out"
+fi
+_sw_ts -
+out="$(_sw_run)"
+if _sw_all_kept s10 && grep -E '^정리 보류: s10 — ' <<<"$out" | grep -q '「허가됨」' \
+   && grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF "재시도: 작업 worktree($TMP/.worktrees/s10)의 task-state 가 이 작업(s10)이 아니라 거기서 rd publish run 이 slug 를 정하지 못함 — 버리려면 rd publish cancel s10, 발행을 마치려면 git -C '$TMP/.worktrees/s10' status 로 그 worktree 의 체크아웃을 확인해 fr 브랜치(fr/s10)로 되돌린 뒤" \
+   && ! grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF "작업 worktree($TMP/.worktrees/s10)에서 rd publish run"; then
+  pass "S10 허가됨 worktree 의 체크아웃이 이 작업이 아니면 run 대신 cancel·체크아웃 확인을 안내한다"
+else
+  fail "S10 다른 체크아웃의 허가됨 안내 실패: $out"
+fi
+_sw_req partial
+out="$(_sw_run)"
+if _sw_all_kept s10 && grep -E '^정리 보류: s10 — ' <<<"$out" | grep -q '「부분 완료」' \
+   && grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF "재시도: 작업 worktree($TMP/.worktrees/s10)의 task-state 가 이 작업(s10)이 아니라 거기서 rd publish run 이 slug 를 정하지 못함 — git -C '$TMP/.worktrees/s10' status 로 그 worktree 의 체크아웃을 확인해 fr 브랜치(fr/s10)로 되돌린 뒤 그 worktree 에서 rd publish run 으로 복구 뒤 rd task list 를 다시 실행" \
+   && ! grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF "작업 worktree($TMP/.worktrees/s10)에서 rd publish run" \
+   && ! grep -E '^정리 보류: s10 ' <<<"$out" | grep -qE 'rd publish (recover|cancel)'; then
+  pass "S10 부분 완료 worktree 의 체크아웃이 이 작업이 아니면 run 대신 체크아웃 확인을 안내하고, 받지 않는 recover·cancel 은 내지 않는다"
+else
+  fail "S10 다른 체크아웃의 부분 완료 안내 실패: $out"
+fi
+# 요청이 적은 경로와 다른 곳에 fr 브랜치의 등록이 남은 경우(git worktree move 로 옮긴 worktree) — add 는 그 브랜치를
+#   쓰는 등록이 있으면 경로와 상관없이 거부하므로, 경로 대조로는 못 찾는 이 등록을 브랜치 대조로 찾아야 한다.
+_sw_req granted "$TMP/.worktrees/s10-before-move"
+rm -rf "$TMP/.worktrees/s10"
+out="$(_sw_run)"
+if _sw_reg s10 && _sw_br s10 && _has_row s10 \
+   && grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF "worktree 가 없고 그 경로나 fr 브랜치(fr/s10)를 쓰는 git 등록($TMP/.worktrees/s10)이 남아 지금은 다시 만들 수 없음 — 버리려면 rd publish cancel s10, 발행을 마치려면 git -C " \
+   && grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF " worktree list 로 그 등록을 확인해 정리" \
+   && ! grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF 'worktree add'; then
+  pass "S10 디렉터리만 없고 요청과 다른 경로에 fr 브랜치 등록이 남은 허가됨은 worktree add 대신 등록 확인·정리를 안내한다"
+else
+  fail "S10 등록만 남은 허가됨 안내 실패: $out"
+fi
+git -C "$TMP" worktree prune
+# 같은 경로의 등록이 fr 브랜치를 쓰지 않아도(detached HEAD) add 는 그 경로를 거부한다 — 브랜치 대조로는 못 찾으므로
+#   경로로 찾아야 한다. 요청은 심볼릭 링크를 거친 경로로 적는다 — 링크 안에서 rd publish request 를 부르면 요청에는
+#   링크 경로가, git 등록에는 실제 경로가 남는다. 요청 경로를 실제 경로로 풀지 않으면 이 등록을 놓친다.
+#   경로 이름에는 리터럴 \t 를 넣는다 — 경로를 awk -v 로 넘기면 이스케이프가 풀려 같은 등록을 놓친다.
+_sw_al="$(mktemp -d)" || { echo "test_tasks_list.sh: 링크 경로 디렉터리 생성 실패 (TMPDIR='${TMPDIR:-}')" >&2; exit 1; }
+ln -s "$TMP" "$_sw_al/repo"
+git -C "$TMP" worktree add -q --detach "$TMP/.worktrees/"'s10\tx' >/dev/null 2>&1
+rm -rf "$TMP/.worktrees/"'s10\tx'
+_sw_req granted "$_sw_al/repo/.worktrees/"'s10\tx'
+out="$(_sw_run)"
+if _sw_reg 's10\tx' && _sw_br s10 && _has_row s10 \
+   && grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF "worktree 가 없고 그 경로나 fr 브랜치(fr/s10)를 쓰는 git 등록($TMP/.worktrees/"'s10\tx)이 남아 지금은 다시 만들 수 없음' \
+   && ! grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF 'worktree add'; then
+  pass "S10 요청 경로(링크·백슬래시 포함)에 fr 브랜치가 아닌 등록이 남은 허가됨도 worktree add 대신 등록 확인·정리를 안내한다"
+else
+  fail "S10 같은 경로의 다른 등록 안내 실패: $out"
+fi
+rm -rf "$_sw_al"
+git -C "$TMP" worktree prune
+_sw_req partial
+out="$(_sw_run)"
+if ! _sw_reg s10 && _sw_br s10 && _has_row s10 \
+   && grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF "worktree 없음 — rd publish recover s10"; then
+  pass "S10 worktree 없는 부분 완료는 브랜치·행이 보존되고 rd publish recover 안내가 나온다"
+else
+  fail "S10 worktree 없는 부분 완료 보존 실패: $out"
+fi
+# 등록은 없어도 그 경로에 파일이 남으면(git 연결만 끊긴 디렉터리) add 가 거부한다 — 파일을 지우지 않고 옮기라고
+#   안내하는지 본다. 파일은 두 경우다: 이름이 개행 하나인 파일(ls 출력을 명령 치환으로 받으면 사라진다)과 점으로
+#   시작하는 파일만 남은 경우(.DS_Store, glob 이 기본으로 건너뛴다). 그다음 파일을 치워 빈 디렉터리를 남긴다 — 빈
+#   디렉터리에는 add 가 되므로 아래 단언이 add 명령을 본다.
+_sw_files_case() {  # <파일 이름> <설명>
+  printf '작업 파일\n' >"$TMP/.worktrees/s10/$1"
+  _sw_req granted
+  out="$(_sw_run)"
+  if ! _sw_reg s10 && _sw_br s10 && _has_row s10 && [[ -f "$TMP/.worktrees/s10/$1" ]] \
+     && grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF "worktree 경로($TMP/.worktrees/s10)에 git 이 worktree 로 알지 못하는 파일이 남아 지금은 다시 만들 수 없음 — 버리려면 rd publish cancel s10, 발행을 마치려면 그 경로의 파일을 확인해 다른 곳으로 옮겨 경로를 비움" \
+     && ! grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF 'worktree add'; then
+    pass "S10 등록 없이 경로에 파일($2)이 남은 허가됨은 worktree add 대신 파일을 옮기라고 안내하고 파일을 남긴다"
+  else
+    fail "S10 파일($2)이 남은 경로의 허가됨 안내 실패: $out"
+  fi
+  rm -f "$TMP/.worktrees/s10/$1"
+}
+mkdir -p "$TMP/.worktrees/s10"
+_sw_files_case $'\n' '이름이 개행 하나'
+_sw_files_case .DS_Store '점으로 시작하는 파일만'
+_sw_req granted
+out="$(_sw_run)"
+_sw_add="$(grep -E '^정리 보류: s10 ' <<<"$out" | sed -n 's/.*발행을 마치려면 \(git .* worktree add .*\) 로 다시 만든 뒤 그 worktree 에서 rd publish run.*/\1/p')" || true
+if [[ -n "$_sw_add" ]]; then eval "$_sw_add" >/dev/null 2>&1 || true; fi
+if _sw_br s10 && _has_row s10 \
+   && grep -E '^정리 보류: s10 — ' <<<"$out" | grep -q '「허가됨」' \
+   && grep -E '^정리 보류: s10 ' <<<"$out" | grep -qF "worktree 없음 — 버리려면 rd publish cancel s10, " \
+   && _sw_reg s10 && [[ "$(git -C "$TMP/.worktrees/s10" symbolic-ref --short HEAD 2>/dev/null)" == fr/s10 ]]; then
+  pass "S10 worktree 없는 허가됨은 브랜치·행이 보존되고, 안내한 worktree add 명령이 fr 브랜치의 worktree 를 되살린다"
+else
+  fail "S10 worktree 없는 허가됨 보존·안내 실패 (worktree add 명령: ${_sw_add:-없음}): $out"
+fi
+_sw_req done
+out="$(_sw_run)"
+if _sw_all_gone s10 && grep -qE '^정리됨: s10 — (worktree·)?로컬 브랜치 제거, 색인 행 삭제$' <<<"$out"; then
+  pass "S10 발행 요청이 done 이면 요청 파일이 있어도 정리된다"
+else
+  fail "S10 done 요청 정리 실패: $out"
+  _sw_cleanup s10
+fi
+rm -f "$_sw_q/s10.req"
+printf '  (S1~S10 소요 %d초)\n' "$((SECONDS - _SW_T0))"
 
 # T6·T6b — _tl_sweep_pending 은 행마다 락을 잡고 풀며, 발행 대기 표지가 살아 있으면 양보한다.
 #   함수만 추출해 별도 임시 저장소에서 스텁과 함께 돌린다(이 저장소·공유 락과 무관).
@@ -917,7 +1087,7 @@ STUBEOF
 }
 hc_resolve() {  # <slug> [env...] — hc 대역을 PATH 앞에 두고 resolve-launch 를 실행한다
   local slug="$1"; shift
-  ( cd "$REPO" && env HERDR_ENV= "$@" PATH="$HCT:$PATH" bash rd-workflow/scripts/rd task resolve-launch "$slug" 2>&1 )
+  ( cd "$REPO" && env HERDR_ENV= ORCA_AGENT_SESSION_ID= ORCA_TERMINAL_HANDLE= "$@" PATH="$HCT:$PATH" bash rd-workflow/scripts/rd task resolve-launch "$slug" 2>&1 )
 }
 
 # 처리 전(turn=0)에는 ok 로 바꾸지 않는다
@@ -980,7 +1150,7 @@ TBEOF
 tb_holder() {  # <slug> — worktree 를 cwd 로 잡는 대역 프로세스(탭 셸 흉내)
   ( cd "$TMP/.worktrees/$1" && exec sleep 30 ) & TB_PID=$!; disown "$TB_PID" 2>/dev/null || true
   echo "$TB_PID" > "$TB/holder.pid"
-  sleep 0.5
+  _cwd_wait "$TB_PID" "$TMP/.worktrees/$1" || fail "tb_holder 준비($1): 대역 프로세스의 CWD 가 20초 안에 worktree 로 잡히지 않음"
 }
 tb_holder_stop() { kill "${TB_PID:-0}" 2>/dev/null || true; wait "${TB_PID:-0}" 2>/dev/null || true; TB_PID=""; }
 tb_run() { PATH="$TB/bin:$PATH" bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true; }
@@ -1150,7 +1320,7 @@ fi
 # 같은 작업에서 rd pr check(조회)도 같은 안내를 냅니다(두 조회는 따로 구현돼 있습니다).
 out="$(cd "$_prr" && PATH="$GH_DIR:$_PR_OLD_PATH" bash rd-workflow/scripts/rd pr check 2>&1 || true)"
 if [[ "$out" == *"대상 판정 실패"* && "$out" == *"$(printf 'merge 됨\t아래 대상 판정 실패를 먼저 해결해야 rd pr check --apply 가 진행됩니다')"* \
-      && "$out" != *"$(printf 'merge 됨\tbash rd-workflow/scripts/rd pr check --apply')"* ]]; then
+      && "$out" != *"&& bash rd-workflow/scripts/rd pr check --apply"* ]]; then
   pass "rd pr check 도 merge 된 PR 과 대상 판정 실패가 함께 있으면 --apply 실행을 안내하지 않는다"
 else
   fail "rd pr check 의 merge 됨 + 대상 판정 실패 행동 줄: $out"
@@ -1175,7 +1345,7 @@ fi
 out="$(cd "$_prr" && PATH="$GH_DIR:$_PR_OLD_PATH" bash rd-workflow/scripts/rd pr check 2>&1 || true)"
 if [[ "$out" == *"대상 판정 실패"*"리뷰 기준점 4444444 를 쓸 수 없습니다"*"복구: tip 의 조상 중"* \
       && "$out" == *"$(printf 'merge 됨\t아래 대상 판정 실패를 먼저 해결해야 rd pr check --apply 가 진행됩니다')"* \
-      && "$out" != *"$(printf 'merge 됨\tbash rd-workflow/scripts/rd pr check --apply')"* ]]; then
+      && "$out" != *"&& bash rd-workflow/scripts/rd pr check --apply"* ]]; then
   pass "기준점을 쓸 수 없으면 rd pr check 가 원인·복구를 보이고 --apply 실행을 안내하지 않는다"
 else
   fail "기준점 실패의 rd pr check 행동 줄: $out"
@@ -1198,6 +1368,23 @@ else
   fail "PR 검토 중 없는데 표·호출: $out / $(cat "$GH_DIR/calls.log")"
 fi
 _pr_cleanup prn
+
+# t_list_direct_gh_timeout: 직접 설치 PR(색인 pr-head == fr 끝, pr-url)의 gh 조회도 상한 안에 끝나고 조회 실패로 보인다.
+# 없으면 새는 실수: _tl_pr_info 를 고치다 tp_gh 를 gh 로 바꾸거나 상한을 빠뜨리면 gh 가 늦은 만큼 rd task list 가 멈춥니다.
+# 팀 overlay 경로(t_list_gh_timeout)와 조회 함수가 달라 따로 봅니다. 상한 판정은 t_list_gh_timeout 과 같이 가짜 gh 수명(120초)과 비교합니다.
+_pr_mk dpt
+( cd "$TMP/.worktrees/dpt" && bash rd-workflow/scripts/rd task set-status "대기 중" --force >/dev/null 2>&1 )
+tasks_index_upsert dpt pr-mode=direct pr-head="$(git -C "$TMP" rev-parse fr/dpt)" pr-url=https://example.test/x/13/slow
+_t0=$SECONDS
+out="$(PATH="$GH_DIR:$_PR_OLD_PATH" RD_PR_CHECK_TIMEOUT=1 bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
+_el=$((SECONDS - _t0))
+if [[ "$_el" -lt 120 && "$(grep -F 'dpt' <<<"$out" | head -1)" == *"PR 검토 중"* \
+      && "$out" == *"→ PR 상태 조회 실패 — bash rd-workflow/scripts/rd pr check --task dpt"* ]]; then
+  pass "직접 설치 PR 의 gh 시간 초과: ${_el}초 만에 끝나고 조회 실패로 표시한다"
+else
+  fail "직접 설치 PR 의 gh 시간 초과 처리: ${_el}초 / $out"
+fi
+_pr_cleanup dpt
 
 # t_list_nofr_pr_review: fr 브랜치 없이 기본 체크아웃에서 한 작업(fr-branch=null)이 PR 검토 중이면 색인이 비어도 표에 나온다.
 # 없으면 새는 실수: no-fr 작업은 색인에 없어 표가 비고, 빈 색인이면 「진행 중인 작업이 없습니다」 로 끝나 열린 PR 을 놓칩니다.
@@ -1223,37 +1410,65 @@ if [[ "$out" == *"PR 검토 중"* && "$out" == *"nfx"*"sub/m"*"https://example.t
 else
   fail "no-fr PR 검토 중 표: $out"
 fi
-# t_list_nofr_no_state_cmd: 기본 체크아웃 작업 줄에는 Status 를 바꾸는 명령(set-status·--apply)과 그것을 다음 행동으로 내는 조회(rd pr check)를
-# 안내하지 않고, 남은 일과 대상 제약(후속 FR)만 보인다. 기록이 merge 반영됨(state=merged)인 줄도 같다.
-# 없으면 새는 실수: 그 명령들의 대상 선택은 색인에 진행 중 작업이 있으면 그 작업을 고르므로, 안내대로 따라가면 다른 작업의 Status 가 바뀝니다.
-_nf_note="이 작업을 대상으로 고르지 못할 수 있습니다(후속 FR nofr-task-target-resolution)"
+# t_list_nofr_no_state_cmd: 기본 체크아웃 작업 줄은 fr 작업 줄과 같은 다음 행동을 기본 체크아웃 경로에서 안내하고,
+# set-status 에는 --task 를 붙이지 않는다(change spec D7·AC9). 기록이 merge 반영됨(state=merged)·기록상 닫힘(closed)인 줄도 같다.
+# 없으면 새는 실수: 대상 제약 문구가 남거나 다음 행동 명령이 빠지면, 고를 수 있게 된 작업의 PR 을 사용자가 손으로 옮겨야 합니다.
+_nf_c="cd '$TMP' && bash rd-workflow/scripts/rd"
 _nf_line="$(grep -F 'nfx' <<<"$out" || true)"
 _nf_n="$(grep -F 'sub/n' <<<"$out" || true)"; _nf_o="$(grep -F 'sub/o' <<<"$out" || true)"; _nf_p="$(grep -F 'sub/p' <<<"$out" || true)"
 _nf_q="$(grep -F 'sub/q' <<<"$out" || true)"; _nf_r="$(grep -F 'sub/r' <<<"$out" || true)"
-if [[ "$_nf_n" == *"수정 요청"*"$_nf_note"* \
-      && "$_nf_o" == *"merge 됨: submodule 포인터 반영과 Status 전이가 남았습니다 / "*"$_nf_note"* \
-      && "$_nf_p" == *"merge 반영됨"*"포인터 반영 완료"*"$_nf_note"* \
-      && "$_nf_q" == *"https://example.test/x/11/closed  기록상 닫힘 "*"→ 이 줄은 원격을 조회하지 않습니다 / 지금 상태는 PR 링크에서 확인하고, 링크에서도 닫혀 있으면 다시 올리려면 gh pr reopen 'https://example.test/x/11/closed' / Status 를 바꾸는 rd 명령"*"$_nf_note"* \
-      && "$_nf_r" != *"기록상"* \
-      && "$_nf_r" == *"https://example.test/x/12/gone"*" 닫힘 "*"→ PR 이 merge 없이 닫혔습니다 / 다시 올리려면 PR 링크에서 재개할 수 있는지 확인한 뒤 gh pr reopen 'https://example.test/x/12/gone' / Status 를 바꾸는 rd 명령"*"$_nf_note"* \
-      && "$_nf_line" != *'set-status "구현 중"'* && "$_nf_line" != *"&& bash rd-workflow/scripts/rd pr check"* ]]; then
-  pass "기본 체크아웃 작업 줄은 Status 를 바꾸는 명령·조회 대신 남은 일과 대상 제약을 보인다"
+if [[ "$_nf_n" == *"→ 수정 요청: (의견 없음) / 반영하려면 ${_nf_c} task set-status \"구현 중\"" && "$_nf_n" != *"--task"* \
+      && "$_nf_o" == *"→ merge 됨: ${_nf_c} pr check --apply" \
+      && "$_nf_p" == *"merge 반영됨"*"→ 모든 PR 이 반영되면 rd pr check --apply 가 Status 를 옮깁니다" \
+      && "$_nf_q" == *"https://example.test/x/11/closed"*"→ 닫힌 PR 입니다: ${_nf_c} pr check" \
+      && "$_nf_r" == *"https://example.test/x/12/gone"*"→ PR 이 merge 없이 닫혔습니다: ${_nf_c} pr check" \
+      && "$_nf_line" != *"후속 FR nofr-task-target-resolution"* && "$_nf_line" != *"대상으로 고르지 못할 수 있습니다"* ]]; then
+  pass "기본 체크아웃 작업 줄은 fr 작업과 같은 다음 행동을 기본 체크아웃 경로에서 안내하고 set-status 에 --task 가 없다"
 else
   fail "no-fr 행동 줄: $_nf_line"
 fi
+# 수정 요청 줄의 명령(「반영하려면 」 뒤)을 그대로 뽑아 아래 실행 단언에 쓴다.
+_nf_cmd="${_nf_n#*반영하려면 }"; _nf_cmd="${_nf_cmd%"${_nf_cmd##*[![:space:]]}"}"
 # t_list_nofr_target_fail: 기본 체크아웃 작업의 반영 대상 기준점을 정할 수 없으면(base-commit=null, seal 마커 없음) merge 줄은
-# --apply 대신 대상 제약을 보이고, 대상 판정 실패 줄은 복구를 기본 체크아웃에서 하라고 경로를 보인다.
+# --apply 실행 명령 없이 대상 판정 실패를 먼저 해결하라고 안내하고, 대상 판정 실패 줄은 복구를 기본 체크아웃에서 하라고 경로를 보인다.
 # 없으면 새는 실수: 공통 실패 분기가 --apply 를 다음 행동으로 지목하고, 다른 worktree 에서 본 사용자가 set-base 를 엉뚱한 task-state 에 씁니다.
 awk -F= '$1=="base-commit"{print "base-commit=null"; next} {print}' "$_nf_ts" > "$TMP/.nf-ts.tmp" && mv "$TMP/.nf-ts.tmp" "$_nf_ts"
 git -C "$TMP" add -f "$_nf_ts"; git -C "$TMP" commit -q -m "nofr base-commit null"
 out="$(PATH="$GH_DIR:$_PR_OLD_PATH" bash "$SCRIPT_DIR/tasks_list.sh" 2>&1 || true)"
 _nf_o="$(grep -F 'sub/o' <<<"$out" || true)"; _nf_f="$(grep -F '대상 판정 실패' <<<"$out" | grep -F 'nfx' || true)"
-if [[ "$_nf_o" == *"아래 대상 판정 실패를 먼저 해결해야 합니다 / "*"$_nf_note"* && "$_nf_o" != *"--apply 가 진행됩니다"* \
+if [[ "$_nf_o" == *"→ merge 됨: 아래 대상 판정 실패를 먼저 해결해야 rd pr check --apply 가 진행됩니다"* \
+      && "$_nf_o" != *"&& bash rd-workflow/scripts/rd pr check --apply"* && "$_nf_o" != *"후속 FR nofr-task-target-resolution"* \
       && "$_nf_f" == *"복구 명령은 기본 체크아웃에서 실행합니다: cd '$TMP' &&"* ]]; then
-  pass "기본 체크아웃 작업의 대상 판정 실패는 merge 줄에 대상 제약을, 실패 줄에 복구 위치를 보인다"
+  pass "기본 체크아웃 작업의 대상 판정 실패는 merge 줄에 실행 명령을 내지 않고, 실패 줄에 복구 위치를 보인다"
 else
   fail "no-fr 대상 판정 실패: $_nf_o / $_nf_f"
 fi
+# t_list_nofr_cmd_run: 수정 요청 줄의 명령을 그대로 실행하면 기본 체크아웃 작업의 Status 가 구현 중이 되고, 목록 뒤에 그 작업이 끝나
+# (대기 중) 색인에 진행 중 작업이 있으면 같은 명령이 아무것도 바꾸지 않고 멈춘다(AC9). rd 를 두 번 부른다(1~2초).
+# 없으면 새는 실수: 안내 명령이 기본 체크아웃 작업을 고르지 못하거나, 끝난 뒤 다시 실행했을 때 색인의 다른 작업 Status 를 바꿉니다.
+_nf_rc=0; ( bash -c "$_nf_cmd" ) >/dev/null 2>&1 || _nf_rc=$?
+_nf_st1="$(awk -F= '$1=="status"{sub(/^[^=]+=/,""); print; exit}' "$_nf_ts")"
+if [[ "$_nf_cmd" == "${_nf_c} task set-status \"구현 중\"" && "$_nf_rc" == 0 && "$_nf_st1" == "구현 중" ]]; then
+  pass "수정 요청 줄의 명령을 그대로 실행하면 기본 체크아웃 작업의 Status 가 구현 중이 된다"
+else
+  fail "no-fr 안내 명령 실행: cmd=[$_nf_cmd] rc=$_nf_rc status=$_nf_st1"
+fi
+awk -F= '$1=="status"{print "status=대기 중"; next} {print}' "$_nf_ts" > "$TMP/.nf-ts.tmp" && mv "$TMP/.nf-ts.tmp" "$_nf_ts"
+# _pr_mk 는 sub/m gitlink 커밋을 만드는데 기본 체크아웃 HEAD 가 이미 같은 gitlink 를 담아 빈 커밋이 되므로 직접 만든다.
+git -C "$TMP" branch fr/nfo HEAD
+git -C "$TMP" worktree add -q "$TMP/.worktrees/nfo" fr/nfo
+tasks_index_upsert nfo fr-branch=fr/nfo worktree-path="$TMP/.worktrees/nfo" checkout=yes launch=ok
+printf 'schema=1\nshort-title=nfo\nstatus=PR 검토 중\nfr-branch=fr/nfo\nworktree-path=%s\nsource-fr=-\nreview-session=null\nbase-commit=null\n' \
+  "$TMP/.worktrees/nfo" > "$TMP/.worktrees/nfo/rd-workflow-workspace/.lifecycle/task-state"
+_nf_snap() { cat "$_nf_ts" "$TMP/CURRENT_TASK.md" "$TMP/.worktrees/nfo/rd-workflow-workspace/.lifecycle/task-state" "$TMP/.worktrees/nfo/CURRENT_TASK.md" 2>&1; }
+_nf_before="$(_nf_snap)"
+_nf_rc=0; ( bash -c "$_nf_cmd" ) >/dev/null 2>&1 || _nf_rc=$?
+if [[ "$_nf_rc" != 0 && "$(_nf_snap)" == "$_nf_before" && "$_nf_before" == *"status=PR 검토 중"* ]]; then
+  pass "기본 체크아웃 작업이 끝난 뒤 같은 명령은 색인의 진행 중 작업을 고르지 않고 아무것도 바꾸지 않고 멈춘다"
+else
+  fail "no-fr 끝난 뒤 안내 명령: rc=$_nf_rc / $(diff <(printf '%s\n' "$_nf_before") <(_nf_snap))"
+fi
+_pr_cleanup nfo
 # t_list_nofr_not_pr_review: 기본 체크아웃 작업이 PR 검토 중이 아니면(열린 기록이 남아 있어도) 그 작업 줄도 gh 호출도 없다(AC3).
 # 없으면 새는 실수: Status 조건이 빠지면 수정하러 구현 중으로 돌아간 작업의 PR 을 목록이 계속 조회·표시합니다.
 awk -F= '$1=="status"{print "status=구현 중"; next} {print}' "$_nf_ts" > "$TMP/.nf-ts.tmp" && mv "$TMP/.nf-ts.tmp" "$_nf_ts"
